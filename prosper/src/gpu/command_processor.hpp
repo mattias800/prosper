@@ -12,7 +12,10 @@
 #include "pm4_decode.hpp"
 #include <cstdint>
 #include <memory>
+#include <algorithm>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace prosper::gpu {
@@ -20,9 +23,103 @@ namespace prosper::gpu {
 // A {register offset, value} pair — the element type of a Set*RegistersIndirect array.
 struct ShaderReg { uint32_t offset; uint32_t value; };
 
+// #2395: the register files used to be `std::unordered_map<uint32_t, uint32_t>`, and the cost was
+// not lookup — it was the COPY. `command_processor.cpp` snapshots GpuState on every dirty draw
+// (five sites) with `snap->cx = cx; snap->sh = sh; snap->uc = uc;`, and copying an unordered_map
+// allocates one heap node PER ENTRY. A perf profile of Blue Prince gameplay at 3.3-4.0 fps put
+// 16.98% of all CPU in __memmove_avx512 and 19.73% in the allocator — ~37%, from this one choice,
+// scaling with draw count.
+//
+// A sorted flat vector copies as a single contiguous allocation plus one memcpy, which is what a
+// per-draw snapshot needs. Lookups become a branch-predictable binary search over a few hundred
+// cache-adjacent entries instead of a hash plus a pointer-chase into scattered nodes.
+//
+// This is a DROP-IN for the operations the codebase actually uses (measured: 44 `count`, 21
+// `find`/`end`, 1 `size`, 3 `operator[]`, and zero iteration over the maps). `find` returns a real
+// vector const_iterator, so `it->second` and `it == f.end()` keep working unchanged.
+//
+// The sparse contract is preserved exactly and is the thing to be careful about: an offset that was
+// never written must remain ABSENT (`find() == end()`, `count() == 0`), not read as 0. Every lookup
+// here goes through the same presence test as before; nothing invents a zero.
+//
+// ONE LIFETIME RULE DID CHANGE, and it is the only behavioural difference from the unordered_map:
+// `std::unordered_map::insert` does not invalidate references or pointers to existing elements.
+// `std::vector::insert` invalidates BOTH references and iterators when it reallocates. So this is
+// fine before the swap and undefined behaviour after it:
+//
+//     uint32_t& v = f[a];
+//     f[b] = x;            // may reallocate
+//     v = y;               // dangling
+//
+// No caller in the tree does that today -- every `find` result is consumed immediately with no
+// intervening mutation -- but nothing in the type stops the next one, so it is written down here
+// rather than left to be rediscovered. Raised in review by Wren, who went looking for the pattern
+// specifically because it is what a map-to-vector swap silently changes.
+class RegisterFile {
+public:
+    using value_type = std::pair<uint32_t, uint32_t>;
+    using const_iterator = std::vector<value_type>::const_iterator;
+
+    const_iterator begin() const { return entries_.begin(); }
+    const_iterator end() const { return entries_.end(); }
+    size_t size() const { return entries_.size(); }
+    bool empty() const { return entries_.empty(); }
+    void clear() { entries_.clear(); }
+
+    const_iterator find(uint32_t offset) const {
+        const auto it = lower(offset);
+        return (it != entries_.end() && it->first == offset) ? it : entries_.end();
+    }
+    size_t count(uint32_t offset) const { return find(offset) != entries_.end() ? 1u : 0u; }
+
+    // Same contract as std::unordered_map::at — THROWS on an absent offset rather than inserting or
+    // reading zero. Kept faithful because tests use it as an assertion that a register was written;
+    // returning 0 for a missing one would turn those into silent passes.
+    const uint32_t& at(uint32_t offset) const {
+        const auto it = find(offset);
+        if (it == entries_.end()) throw std::out_of_range("RegisterFile::at: register not set");
+        return it->second;
+    }
+    uint32_t& at(uint32_t offset) {
+        const auto it = lower(offset);
+        if (it == entries_.end() || it->first != offset)
+            throw std::out_of_range("RegisterFile::at: register not set");
+        return it->second;
+    }
+
+    // Erases an offset, making it ABSENT again (not zero). Used by tests that check the
+    // fallback path taken when a register was never written.
+    size_t erase(uint32_t offset) {
+        const auto it = lower(offset);
+        if (it == entries_.end() || it->first != offset) return 0;
+        entries_.erase(it);
+        return 1;
+    }
+
+    // Inserts a zero-valued entry when absent, matching std::unordered_map::operator[]. Register
+    // writes arrive in bursts of ascending offsets (SET_*_REG writes a consecutive run), so the
+    // common insert lands at or near the end and the memmove is short.
+    uint32_t& operator[](uint32_t offset) {
+        const auto it = lower(offset);
+        if (it != entries_.end() && it->first == offset) return it->second;
+        return entries_.insert(it, value_type{offset, 0u})->second;
+    }
+
+private:
+    std::vector<value_type>::iterator lower(uint32_t offset) {
+        return std::lower_bound(entries_.begin(), entries_.end(), offset,
+                                [](const value_type& e, uint32_t k) { return e.first < k; });
+    }
+    const_iterator lower(uint32_t offset) const {
+        return std::lower_bound(entries_.begin(), entries_.end(), offset,
+                                [](const value_type& e, uint32_t k) { return e.first < k; });
+    }
+    std::vector<value_type> entries_;   // sorted by offset, unique
+};
+
 // Folded GPU state after replaying a command stream.
 struct GpuState {
-    std::unordered_map<uint32_t, uint32_t> cx, sh, uc;   // register files by offset
+    RegisterFile cx, sh, uc;   // register files by offset (#2395: was unordered_map)
     // PROSPER_UDPROV=1 (issue #305) or an armed resource-provenance selector (#1853): per-SH-register
     // last-write provenance. Resolved register VALUES cannot distinguish "this draw's bind wrote this dword"
     // from "a previous pipeline's bind wrote it and no newer write arrived" — which is exactly the

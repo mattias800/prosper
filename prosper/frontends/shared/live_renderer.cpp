@@ -6033,8 +6033,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             else if (cpu_needed_same_batch) bucket = kSameBatchCpu;
                             else if (sampled_exact_later && feedback_later) bucket = kFeedback;
                             ++counts[bucket];
-                            bytes[bucket] += static_cast<uint64_t>(gw) * gh *
-                                prosper::test::backend_color_bytes_per_pixel(pass_format);
+                            // #2398: bill bytes only when colour pixels are ACTUALLY requested.
+                            // #2283 narrowed the readback to `want_color_readback` (the same
+                            // any_of over pass_bases used at the call below) and this accounting
+                            // never followed it -- so a depth-only pass, whose slot bases are all
+                            // zero and which therefore lands in the `no_base` bucket BY
+                            // CONSTRUCTION, was billed a full frame of colour it never copied.
+                            //
+                            // That is not a rounding error: on Blue Prince it reported 15.6 GB
+                            // against `no_base` and made depth passes look like the frame-rate
+                            // wall. The count was right; the column that made it actionable was
+                            // measuring a world from before #2283. An instrument that drifts from
+                            // the code it measures reads as evidence, which is worse than silence.
+                            const bool billed_color = std::any_of(
+                                pass_bases.begin(),
+                                pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
+                                [](uint64_t slot_base) { return slot_base != 0; });
+                            if (billed_color)
+                                bytes[bucket] += static_cast<uint64_t>(gw) * gh *
+                                    prosper::test::backend_color_bytes_per_pixel(pass_format);
                             static std::atomic<uint64_t> last_report{0};
                             const uint64_t t = ++c_total;
                             if (t >= last_report.load(std::memory_order_relaxed) + 200) {
@@ -7398,6 +7415,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             totals.dcc_materialize_ms / nsub,
                             static_cast<double>(totals.dcc_materialize_surfaces) / nsub,
                             totals.dcc_materialize_bytes / (nsub * 1024.0 * 1024.0));
+                    // #2395: the shader-analysis cache's counters existed and were read by NOTHING
+                    // outside two unit tests, so at runtime the cache was unobservable. A profile of
+                    // Blue Prince gameplay put ~17% of all CPU in rdna2_walk / make_shader_compile_key /
+                    // resolve_dynamic_fetch -- i.e. shaders being re-analysed during steady-state play --
+                    // and there was no way to tell WHY without rebuilding with instrumentation.
+                    //
+                    // `invalidations` is the discriminator and the reason this line exists. The cache is
+                    // keyed on the guest CODE ADDRESS and validated by memcmp, so:
+                    //   misses high, invalidations ~0  -> cold or capacity-bound (see evict/entries)
+                    //   invalidations high             -> the guest reuses addresses for DIFFERENT code,
+                    //                                     so every reuse costs a full re-analysis. That
+                    //                                     is a keying problem, not a sizing one, and no
+                    //                                     amount of cache MB fixes it.
+                    // Those two call for opposite fixes, which is exactly why the number has to be
+                    // visible rather than inferred from a flame graph.
+                    {
+                        const prosper::gpu::ShaderAnalysisCacheStats sa =
+                            prosper::gpu::shader_analysis_cache_stats();
+                        const uint64_t lookups = sa.hits + sa.misses;
+                        fprintf(stderr,
+                                "[render-timing] shader_analysis hits=%llu misses=%llu (%.1f%% hit) "
+                                "invalidations=%llu evictions=%llu bypasses=%llu entries=%llu %.1f MiB\n",
+                                (unsigned long long)sa.hits, (unsigned long long)sa.misses,
+                                lookups ? 100.0 * (double)sa.hits / (double)lookups : 0.0,
+                                (unsigned long long)sa.invalidations, (unsigned long long)sa.evictions,
+                                (unsigned long long)sa.bypasses, (unsigned long long)sa.entries,
+                                sa.bytes / (1024.0 * 1024.0));
+                    }
                     // pass_control, split (#2266). `pre` and `post` are the per-group work either
                     // side of build_resources+backend; `other` is the SIGNED remainder -- groups that
                     // returned before reaching the render, the tail after the group loop, and the

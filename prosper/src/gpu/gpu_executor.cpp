@@ -178,7 +178,7 @@ private:
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
 // shaders place descriptors in the extended user SGPRs s16..s31 (e.g. vertex buffers at s16/s18).
 static constexpr uint32_t kUserSgprs = 32;
-void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t base, uint32_t out[kUserSgprs]) {
+void read_user_sgprs(const RegisterFile& sh, uint32_t base, uint32_t out[kUserSgprs]) {
     for (uint32_t i = 0; i < kUserSgprs; i++) { auto it = sh.find(base + i); out[i] = it == sh.end() ? 0u : it->second; }
 }
 
@@ -812,7 +812,13 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
 
     if (!code || !dwords) return analyze();
     auto& cache = shader_analysis_cache();
-    if (getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE")) {
+    // #2395: was a getenv PER LOOKUP -- 1,697,925 of them in one Blue Prince gameplay run,
+    // and `getenv` showed at 1.34% of total CPU in a profile of that run. The environment
+    // cannot change under a running process, so reading it once is not merely an
+    // optimisation, it is the correct semantics. Same hoist as #2214 did for the live
+    // renderer's per-resource reads.
+    static const bool bypass_analysis_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
+    if (bypass_analysis_cache) {
         std::lock_guard lock(cache.mutex);
         ++cache.stats.bypasses;
         return analyze();
@@ -976,7 +982,10 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     key.vertices_per_instance = stage == ShaderProgramStage::Vertex && resources
         ? resources->vertices_per_instance : 0u;
     key.has_resource_table = resources != nullptr;
-    key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
+    // #2395: also once, not per key. make_shader_compile_key is 4.52% of total CPU in Blue
+    // Prince gameplay and runs per draw per stage.
+    static const bool force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
+    key.force_position_w = force_position_w;
     key.capture_position = stage == ShaderProgramStage::Vertex && capture_position;
     key.has_pixel_inputs = stage != ShaderProgramStage::Compute && pixel_inputs != nullptr;
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
@@ -4797,7 +4806,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
     if (failures) failures->clear();
     if (st.dispatches.empty()) return {};
     namespace P = prosper::agc::Pm4;
-    auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
+    auto rd = [](const RegisterFile& regs, uint32_t off) {
         auto it = regs.find(off);
         return it == regs.end() ? 0u : it->second;
     };
@@ -5468,7 +5477,7 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     }
 
     namespace P = prosper::agc::Pm4;
-    auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
+    auto rd = [](const RegisterFile& regs, uint32_t off) {
         auto it = regs.find(off); return it == regs.end() ? 0u : it->second;
     };
     size_t matched = 0;

@@ -18,7 +18,7 @@ namespace {
 namespace P = prosper::agc::Pm4;
 
 // Read a register value from a class file (0 if unset).
-uint32_t rd(const std::unordered_map<uint32_t, uint32_t>& file, uint32_t off) {
+uint32_t rd(const RegisterFile& file, uint32_t off) {
     auto it = file.find(off);
     return it == file.end() ? 0u : it->second;
 }
