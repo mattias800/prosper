@@ -170,6 +170,15 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME compute_phase_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_compute_phase_report.py")
+  # stack_profile's frame classifier, against RECORDED gdb output. Deliberately needs no gdb and no
+  # ptrace: an end-to-end variant would skip silently wherever ptrace is unavailable, and a silently
+  # skipped test is indistinguishable from a passing one. What it pins is the case that already
+  # produced a wrong answer once — a versioned glibc symbol (`pthread_cond_wait@@GLIBC_2.3.2`) that
+  # defeated the `$`-anchored plumbing patterns, so a libc internal was named as the application's
+  # blocking site. Reverting only the version-stripping fix fails four of these cases.
+  add_test(NAME stack_profile_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_stack_profile.py")
   if(GIT_EXECUTABLE)
     # The provenance GATE: refuses to quote a measurement from a build that is not the revision the
     # author thinks it is. Pure argument/exit-status contract, no build required — but it resolves

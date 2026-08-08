@@ -511,6 +511,35 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   First result: `docs/RENDERER_PERFORMANCE_2026_07.md` § Astro Bot compute decomposition.
 - **`perf/ab_compute.sh`** — A/B one `PROSPER_*` switch against a routed live run, refusing to
   measure while another `prosper-app` holds the GPU and stamping commit/route/reps onto the result.
+- **`perf/stack_profile.py`** — when a title is slow because threads are **waiting**, this names the
+  code location each one waits at, by periodically attaching gdb and aggregating stacks per thread.
+  It is the second half of a pair: read `/proc` first for *how much* a thread blocks (cheap, high
+  rate), then use this for *where* (expensive, low rate).
+  ```bash
+  python3 tools/perf/stack_profile.py --pid $(pgrep -x prosper-app) --samples 12 --interval 5
+  ```
+  Three things about it are deliberate, and each came from a measured failure during bring-up:
+  - **`/proc` alone cannot answer "which lock".** A mutex wait and a condition-variable wait are the
+    same state, the same `wchan` (`futex_do_wait`) and the same syscall (202). On a purpose-built
+    control with three threads blocked in three known functions, `/proc` reported two of them
+    identically; the stack separated them. Do not conclude *which* primitive from `wchan`.
+  - **Run gdb on the same side of the container boundary as the target.** Measured both ways:
+    host+host works, distrobox+distrobox works, and **host process + in-container gdb is
+    `ptrace: Operation not permitted`**. Since `prosper-app` normally runs inside distrobox, run this
+    inside the same container. The rule is *same namespace*, not *always the host*. This matters
+    because the denial produces **no stacks**, which is byte-identical to a process with nothing
+    blocked — so a mis-sited gdb reads as a clean result. The tool detects that case by name; it
+    counts any empty sample as FAILED, prints the failed count even when zero, and exits non-zero if
+    every sample failed rather than printing an empty report that reads clean.
+  - **Every sample stops the process** (~90 ms on a 4-thread toy, more on prosper). The report prints
+    total stopped time as a share of wall clock *before* any finding, and warns above 10%, because a
+    profiler that quietly steals wall clock will manufacture the frame-rate problem you came to find.
+
+  `test_stack_profile.py` self-tests the classifier against **recorded** gdb output, so it needs no
+  gdb and cannot skip silently. Its fixture is the real output that broke the first version: glibc
+  reports `pthread_cond_wait@@GLIBC_2.3.2`, whose version suffix defeated the `$`-anchored patterns,
+  so libc internals were reported as the application's blocking site — a wrong answer that looks
+  entirely plausible, and was caught only because the control had known-correct answers to contradict.
 
 Verification here is agentic-first (see `docs/VERIFICATION.md`): prefer a
 programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballing.
