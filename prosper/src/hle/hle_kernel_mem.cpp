@@ -83,6 +83,25 @@ std::unordered_map<uint64_t, AmprCbState> g_ampr_cb_state;
 // same footing as the `bc.eq` term in apr_submit_common. The `count <= 0xffff` bound is NOT
 // redundant and does have a discriminating arm.
 //
+// KNOWN FALSE-POSITIVE CLASS, raised by Marlow in review and recorded because it cannot be fixed by
+// range-checking: a GUEST POINTER can satisfy the packed arm. The guest VA range is
+// 0x2000000000-0x9fc0000000, so any pointer whose LOW 32 BITS land in [0x20, 0x100000] -- the first
+// MiB of every 4 GiB-aligned window -- decomposes into a plausible count and capacity. That defeats
+// the "pointer-valued arguments are outside this conservative bound" guard in ampr_cb_capacity_arg
+// directly above, because taking the low 32 bits discards exactly the high bits that made a pointer
+// recognisable.
+//
+// It is not separable by value, and that is the part worth knowing before anyone tries: GTA V's own
+// packed a2 values (0x6400001370, 0x5f00001610, 0x9c000022b0) are themselves numerically inside the
+// guest VA range, so a "reject anything that looks like a pointer" test would reject the very calls
+// this exists to accept. Distinguishing them needs a signal other than the 64-bit value -- the
+// calling NID, or a constructor shape captured from a title that passes a pointer here.
+//
+// Accepted deliberately: no title has been observed to pass that shape, the change is additive for
+// every title that works today, and the consequence of a false positive is a cursor tracked for a
+// buffer that does not want one -- not a wrong answer to the guest. Revisit if a title regresses in
+// AMPR submit timing.
+//
 // CONFIDENCE: MED -- the shape is inferred from one title's live capture, with no disassembly of the
 // guest-side constructor yet. What would raise it: a second title with the same packing, or the
 // constructor's own code showing the two fields written separately.
