@@ -211,6 +211,13 @@ def _prepare_inferior_log(path):
     if any(c.isspace() for c in resolved):
         sys.exit("hle_calls: --inferior-log path must not contain whitespace (this driver "
                  "interpolates it into a gdb command line unquoted): %s" % resolved)
+    # A DIRECTORY fails opaquely otherwise (#2054): the isfile() guard below skips creation, gdb
+    # then fails inside `run` with a message that never names --inferior-log, and the reader is left
+    # debugging the launch. Named here, where the cause is known.
+    if os.path.isdir(resolved):
+        sys.exit("hle_calls: --inferior-log %s is a directory; pass a file path (gdb opens this "
+                 "path for the inferior's stdio and will fail inside `run` with a message that "
+                 "does not mention --inferior-log)" % resolved)
     try:
         if not os.path.exists(resolved) or os.path.isfile(resolved):
             with open(resolved, "w"):

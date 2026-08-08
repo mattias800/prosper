@@ -282,7 +282,15 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **not** exist. Needs no rebuild and no gating env var: it enumerates handlers out of the binary by
   their shared six-`unsigned long` signature and counts them with non-stopping gdb breakpoints.
   Always pair a surprising zero with a handler you know fires — see the README's note on the
-  `hit_count` trap that made all 151 handlers read zero. See `hle_calls/README.md`.
+  `hit_count` trap that made all 151 handlers read zero.
+  **`--values`** additionally records each handler's RETURN value, which is what turns a census into
+  evidence about *behaviour* rather than only traffic — the recurring bug shape here is a handler
+  answering `SCE_OK` for work it never did, and a call count cannot see that.
+  **`--launch`** starts the process under gdb instead of attaching, so the window covers init: the
+  handlers a title calls once, before anything could attach, are reachable only this way.
+  Every `--values` run prints a `positive-control=` verdict on its own value capture — read it first,
+  because `VOID` and `unchecked` mean the run cannot support an inference from an ABSENT value, and
+  they look nothing like a failure. See `hle_calls/README.md`.
 - **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
   `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
   "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,

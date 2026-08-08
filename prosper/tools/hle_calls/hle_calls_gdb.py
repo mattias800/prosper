@@ -105,6 +105,11 @@ CONTROL_LOGIN = 0
 CONTROL_NO_EVENT = 0x80960007
 
 counts = {}
+# How many of CONTROL's calls passed a NON-NULL out-pointer (#2054). The LOGIN is delivered only
+# `if (a0 && ...)`, so a guest polling with nullptr consumes none and gets NO_EVENT forever with no
+# defect anywhere -- and the loudest verdict this tool prints could not tell that from a real one.
+# Counted for the CONTROL handler only: it is one register read on one handler, not on every call.
+control_eligible = 0
 values = {}                     # name -> {return value: count}
 order = []                      # leading calls, in call order
 state = {"ticks": 0, "calls": 0, "finish_failures": 0, "exited": False}
@@ -145,8 +150,19 @@ class _Counter(gdb.Breakpoint):
         counts[name] = 0
 
     def stop(self):
+        global control_eligible
         counts[self.hle_name] += 1
         state["calls"] += 1
+        if self.hle_name == CONTROL:
+            # a0 is the first integer argument, so $rdi under SysV -- the same frame the finish
+            # breakpoint below already uses. Failure to read it must not disturb the count: an
+            # unreadable register leaves the eligibility unknown for that call, which is strictly
+            # better than guessing either way.
+            try:
+                if int(gdb.parse_and_eval("$rdi")) & 0xFFFFFFFFFFFFFFFF:
+                    control_eligible += 1
+            except Exception:
+                pass
         if len(order) < ORDER_N:
             order.append((state["calls"], self.hle_name))
         if VALUES:
@@ -179,7 +195,8 @@ def _positive_control():
     coverage at all. The test asserts on the SAME function this calls -- a copy would test itself.
     """
     return _control.positive_control(MODE, VALUES, counts, values,
-                                     CONTROL, CONTROL_LOGIN, CONTROL_NO_EVENT)
+                                     CONTROL, CONTROL_LOGIN, CONTROL_NO_EVENT,
+                                     control_eligible)
 
 
 
