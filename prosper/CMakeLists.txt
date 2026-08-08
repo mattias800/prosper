@@ -118,6 +118,14 @@ if(Python3_Interpreter_FOUND)
   # test reads the produced bytes at their gABI offsets; nothing else can see this class of bug.
   add_test(NAME il2cpp_prx_to_elf_header
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/il2cpp/test_prx_to_elf.py")
+  # hle_calls decides, per run, whether a reader should TRUST an entire measurement -- a nine-state
+  # verdict machine whose most consequential branch is VOID vs VIOLATED ("this run cannot say" vs
+  # "distrust every value in it"). It had no test at all, because hle_calls_gdb.py does `import gdb`
+  # at module scope and nothing in it was reachable outside a gdb process. #2053 lifted the verdict
+  # into hle_calls_control.py, which the gdb script now forwards to, so this asserts on the code that
+  # actually runs rather than on a copy.
+  add_test(NAME hle_calls_positive_control
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/hle_calls/test_hle_calls.py")
   add_test(NAME snapshot_guard_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snapshot.py")
   add_test(NAME gpu_replay_regress_logic
