@@ -3545,12 +3545,26 @@ int main() {
         }
         printf("  [ok]   2D_ARRAY image_atomic_add recompiles AND validates as an atomic buffer\n");
 
-        // Scan the constant pool for a 32-bit OpConstant with this literal.
-        const auto has_u32_constant = [](const std::vector<uint32_t>& spv, uint32_t value) {
+        // Is `value` used as a MULTIPLIER -- does some OpIMul take the constant carrying it?
+        //
+        // Mere PRESENCE of the constant is not a discriminator, and assuming it was is how two
+        // earlier versions of this arm passed while the layer was deleted from the index: the
+        // bounds check `coords[1] < height` already puts `height` in the constant pool, so it is
+        // there either way. Only the arrayed index MULTIPLIES by it, in (z*height + y).
+        const auto multiplies_by = [](const std::vector<uint32_t>& spv, uint32_t value) {
+            uint32_t constant_id = 0;
             for (size_t w = 5; w + 1 < spv.size();) {
                 const uint32_t count = spv[w] >> 16, op = spv[w] & 0xffffu;
                 if (!count || w + count > spv.size()) break;
-                if (op == 43u && count == 4u && spv[w + 3] == value) return true;
+                if (op == 43u && count == 4u && spv[w + 3] == value) { constant_id = spv[w + 2]; break; }
+                w += count;
+            }
+            if (!constant_id) return false;
+            for (size_t w = 5; w + 1 < spv.size();) {
+                const uint32_t count = spv[w] >> 16, op = spv[w] & 0xffffu;
+                if (!count || w + count > spv.size()) break;
+                if (op == 132u && count == 5u &&                      // OpIMul
+                    (spv[w + 3] == constant_id || spv[w + 4] == constant_id)) return true;
                 w += count;
             }
             return false;
@@ -3560,14 +3574,16 @@ int main() {
         // x + y*width for every layer, every layer aliases layer 0, and the dispatch produces a
         // silently wrong result rather than being skipped: strictly worse than the bug it replaces.
         // `height` (3) appears only if the layer was multiplied in.
-        if (!has_u32_constant(layered_spv, 97u)) {
+        if (!multiplies_by(layered_spv, 97u)) {
             printf("  [FAIL] the 2D_ARRAY atomic index does not multiply by height -- every layer "
                    "aliases layer 0\n");
             return 1;
         }
-        if (has_u32_constant(atomic_add_spv, 97u)) {
-            printf("  [FAIL] the discriminator is void: the NON-arrayed module also carries the "
-                   "height constant, so its presence proves nothing\n");
+        // Paired negative, so the discriminator's own validity is checked rather than assumed:
+        // the 1x1 non-arrayed fixture must NOT multiply by its own height.
+        if (multiplies_by(atomic_add_spv, 1u)) {
+            printf("  [FAIL] the discriminator is void: the NON-arrayed index also multiplies by "
+                   "its height, so the arrayed result proves nothing\n");
             return 1;
         }
         printf("  [ok]   the layer reaches the index (height constant present only when arrayed)\n");
