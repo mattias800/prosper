@@ -37,6 +37,31 @@ Selectors: `MESA_VK_TRACE_FRAME=<n>`, `MESA_VK_TRACE_TRIGGER=<file>` (create the
 `MESA_VK_TRACE_PER_SUBMIT=1`, `RADV_THREAD_TRACE_BUFFER_SIZE=<MiB>`. Other backends: `rra` (ray
 tracing), `rmv` (memory), `ctxroll`.
 
+### Use the TRIGGER, not a frame ordinal — and capture the regime you mean
+
+**A frame number is not portable across runs, and a title with performance regimes makes it actively
+misleading.** Both halves cost a capture here:
+
+* `MESA_VK_TRACE_FRAME=900` on Blue Prince lands at **t ~ 5 s**, because the load phase runs at
+  108-223 flips/s while the collapse runs at 3.2. That capture is a **menu frame** — the wrong regime
+  for any performance question, and nothing in the file says so.
+* `MESA_VK_TRACE_FRAME=7500`, chosen from a previous run's counters, produced **no capture at all**:
+  that run reached only 6,763 presents before it ended. Two runs of the same route pace differently.
+
+Use the trigger file and fire it when the condition you care about is true:
+
+```bash
+out=~/work/rgp; mkdir -p $out; cd $out; rm -f $out/trigger
+MESA_VK_TRACE=rgp MESA_VK_TRACE_TRIGGER=$out/trigger ... ./build/prosper-app <DUMP> &
+sleep 110          # or wait for whatever marks the regime -- a log line, a flip rate, a screenshot
+touch $out/trigger
+```
+
+**Sanity-check the regime from the capture's own size.** On Blue Prince the menu frame is **1.8 MB**
+and the collapsed frame is **35.9 MB** — a 20x difference, matching ~12 draws/submit against ~4,060.
+A capture that is far smaller than expected is very likely the wrong phase, and that is the cheapest
+check available before anyone spends time reading it.
+
 **Reading it needs the RGP GUI** (free download from AMD, Linux build available). There is no headless
 reader, so an agent can *produce* a capture but a human opens it. Say so when handing one over rather
 than implying you read it.
