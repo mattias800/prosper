@@ -1149,6 +1149,11 @@ struct BackendPassTiming {
     uint32_t width = 0, height = 0;
     uint64_t target = 0;
     size_t draws = 0;
+    // Draws in this pass whose colour write mask is non-zero. #2283 turns on whether a
+    // no-colour-base pass is depth-only: extents that look like shadow maps are circumstantial, a
+    // mask of 0 on every draw is the direct check. Counted rather than inferred so a single
+    // colour-writing draw in such a pass is visible instead of averaged away.
+    size_t colour_writing_draws = 0;
     bool ended = false;
 };
 
@@ -1166,7 +1171,7 @@ inline std::vector<BackendPassTiming>& backend_pass_timings() {
 
 inline void backend_pass_timing_begin(VkDevice dev, VkCommandBuffer cmd, double period_ns,
                                       uint32_t valid_bits, uint32_t width, uint32_t height,
-                                      uint64_t target, size_t draws) {
+                                      uint64_t target, size_t draws, size_t colour_writing_draws) {
     if (!backend_pass_timing_enabled() || !dev || !cmd || period_ns <= 0.0 || !valid_bits) return;
     VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     info.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1176,7 +1181,8 @@ inline void backend_pass_timing_begin(VkDevice dev, VkCommandBuffer cmd, double 
     vkCmdResetQueryPool(cmd, pool, 0, 2);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
     backend_pass_timings().push_back(
-        BackendPassTiming{dev, pool, period_ns, valid_bits, width, height, target, draws, false});
+        BackendPassTiming{dev, pool, period_ns, valid_bits, width, height, target, draws,
+                          colour_writing_draws, false});
 }
 
 inline void backend_pass_timing_end(VkCommandBuffer cmd) {
@@ -1214,9 +1220,11 @@ inline void backend_pass_timing_report(bool completed, double envelope_ms = -1.0
             const double ms = static_cast<double>(ticks) * record.period_ns / 1'000'000.0;
             total += ms;
             ++reported;
-            fprintf(stderr, "[pass-timing] pass=%zu %ux%u target=0x%llx draws=%zu device=%.4f ms\n",
+            fprintf(stderr,
+                    "[pass-timing] pass=%zu %ux%u target=0x%llx draws=%zu cwm_draws=%zu device=%.4f ms\n",
                     reported - 1, record.width, record.height,
-                    (unsigned long long)record.target, record.draws, ms);
+                    (unsigned long long)record.target, record.draws,
+                    record.colour_writing_draws, ms);
         }
         // The count of passes that could NOT be read is printed even when it is zero. A per-pass
         // report whose passes silently go missing looks like a frame with fewer, cheaper passes --
@@ -6102,7 +6110,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     backend_pass_timing_begin(dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits,
                               rpbi.renderArea.extent.width, rpbi.renderArea.extent.height,
-                              color_target ? color_target->persistent_id : 0, dv.size());   // #2333
+                              color_target ? color_target->persistent_id : 0, dv.size(),
+                              [&] {   // #2283: colour-writing draws, counted not inferred
+                                  size_t n = 0;
+                                  for (size_t i = 0; i < dv.size() && i < draws.size(); ++i)
+                                      if (draws[i].ps && draws[i].ps->color_write_mask) ++n;
+                                  return n;
+                              }());   // #2333
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
