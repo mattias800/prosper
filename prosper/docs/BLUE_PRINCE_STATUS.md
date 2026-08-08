@@ -301,6 +301,43 @@ that counter, while the same session had already written "2,108 draws cost 156 m
 compared against each other; the project owner watched a live run and said it plainly was not 30+.
 **Before quoting a frame rate here, state the regime and cross-check it against draws/submit.**
 
+**It recurred on 2026-08-08, so here is the arithmetic that produces the wrong number, measured.**
+An independent Linux cross-check (`prosper-app`, `SDL_VIDEODRIVER=offscreen`, default switches,
+`PROSPER_IME_AUTOKEY=1`, 252 s, master `53273364`) puts hard figures on the two failure modes:
+
+| window | flips/s | presents/s | draws/s |
+| --- | ---: | ---: | ---: |
+| 0 -> 40 s (load/menu) | **108-223** | 108-223 | ~1,800 |
+| 40 s -> 252 s (steady) | **3.17-3.33** *(upper bound -- see route)* | 6.34-6.57 | ~14,000 |
+
+**That 3.20 is not "the Linux figure", it is this route's figure.** It was measured through
+`prosper-app` under `SDL_VIDEODRIVER=offscreen` on the IME-autokey route: offscreen presentation
+skips real window/compositor cost and an autokey route is not interactive play, so both make it
+**cheaper than what a person sees**. Quoted without that attached it will be read as a platform
+comparison, which is exactly the class of error this section exists to stop.
+
+Steady state is **3.20 flips/s** across 21 consecutive 10 s windows, never leaving 3.17-3.33. Two
+things follow, and each on its own is enough to manufacture a wrong answer:
+
+1. **Presents run at exactly 2x flips** in the steady state (6.39 vs 3.20). So the `[app]` present
+   counter does not merely fail to track drawing -- on this title it reports **double** the rate the
+   user sees, before any averaging.
+2. **`cumulative / total elapsed` lands exactly on the number that keeps being published**:
+   `7715 flips / 251.8 s = 30.6`, and `8387 presents / 251.8 s = 33.3`. That is one counter divided
+   by one wall-clock, averaging a ~200 fps load phase against a 3.2 fps steady phase.
+
+The phase boundary is **sharp** -- 108 flips/s in the window ending at t=40.4 s, 3.10 in the next.
+So a window that straddles it is not a compromise between the two regimes, it is a fiction. The
+author of this cross-check produced 8.13 flips/s on the first pass by starting the window at t=30 s,
+inside the fast phase, and only caught it by computing per-window rates instead of one aggregate.
+**Compute per-window rates first; quote an aggregate only after the windows show a single regime.**
+
+Three independent figures for the same steady state, deliberately not reconciled by picking one:
+the project owner playing interactively reports **~1.5 fps**, the Windows lane's flip counter
+**~1.07 fps** (938 ms frame, #2215), and this headless Linux arm **3.20 fps**. The Linux number is
+the outlier on the *fast* side and should be read as an upper bound: offscreen presentation and an
+autokey route are both cheaper than interactive play.
+
 **60 FPS is not reachable by CPU work alone on this workload (#2276).** `gpu_device` measures
 **30-45 ms/submit** against a 16.7 ms budget, so a renderer with zero CPU cost lands near 30 FPS as
 the frame is currently submitted. `PROSPER_RENDER_SCALE=2` did **not** reduce it (43.47 vs 45.24 at
