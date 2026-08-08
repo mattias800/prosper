@@ -1194,7 +1194,7 @@ inline void backend_pass_timing_end(VkCommandBuffer cmd) {
 // Called only after the batch's fence has proved completion -- reading a timestamp query whose
 // commands may still be executing returns NOT_READY, and treating that as 0 ms would understate
 // exactly the passes that took longest.
-inline void backend_pass_timing_report(bool completed) {
+inline void backend_pass_timing_report(bool completed, double envelope_ms = -1.0) {
     if (!backend_pass_timing_enabled()) return;
     auto& records = backend_pass_timings();
     if (records.empty()) return;
@@ -1221,8 +1221,23 @@ inline void backend_pass_timing_report(bool completed) {
         // The count of passes that could NOT be read is printed even when it is zero. A per-pass
         // report whose passes silently go missing looks like a frame with fewer, cheaper passes --
         // which is a conclusion, not an absence of data.
-        fprintf(stderr, "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms\n",
-                reported, unreadable, total);
+        // The reconciliation, printed per BATCH rather than left to cross-run arithmetic.
+        // Summing per-pass times over a whole run and comparing against a cumulative average
+        // compares two different populations and cannot distinguish "this instrument covers a
+        // subset of device work" from "the envelopes overlap so their sum was never a total".
+        // Against the SAME batch's own envelope the question is local and has one answer:
+        // coverage below 100% is work inside this command buffer that is not in a render pass
+        // (compute, blits, readback copies), and coverage above 100% means the per-pass
+        // intervals overlap each other.
+        if (envelope_ms >= 0.0) {
+            const double coverage = envelope_ms > 0.0 ? total / envelope_ms * 100.0 : 0.0;
+            fprintf(stderr,
+                    "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms envelope=%.3f ms coverage=%.1f%%\n",
+                    reported, unreadable, total, envelope_ms, coverage);
+        } else {
+            fprintf(stderr, "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms\n",
+                    reported, unreadable, total);
+        }
     }
     for (const BackendPassTiming& record : records)
         if (record.pool) vkDestroyQueryPool(record.dev, record.pool, nullptr);
@@ -1431,7 +1446,10 @@ public:
                 }
             }
             release_gpu_timestamp();
-            backend_pass_timing_report(state == BackendSubmissionState::Complete);   // #2333
+            // Passed the envelope this batch just measured, so the two instruments are compared
+            // against each other on identical work rather than across a run (#2333).
+            backend_pass_timing_report(state == BackendSubmissionState::Complete,
+                                       result.gpu_timestamp_samples ? result.gpu_device_ms : -1.0);
             vkDestroyFence(dev, fence, nullptr);
             commands_.clear();
             finish_persistent_state(state == BackendSubmissionState::Complete);
