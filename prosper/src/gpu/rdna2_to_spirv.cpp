@@ -41,7 +41,7 @@ inline std::string reject_words_text(const Rdna2Inst& in) {
     char buf[16];
     for (uint32_t i = 0; i < count; ++i) {
         std::snprintf(buf, sizeof buf, "%08x", in.words[i]);
-        if (i) out += (char)44;
+        if (i) out += ',';
         out += buf;
     }
     return out;
