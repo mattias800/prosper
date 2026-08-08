@@ -85,6 +85,12 @@ UNRESOLVED = re.compile(r"^\?+$")
 # that thread, the second is a real finding about the program.
 UNRESOLVED_ONLY = "(no symbolized frame -- gdb resolved nothing in this stack)"
 
+# A thread whose stack produced NO frames at all. Distinct again: `UNRESOLVED_ONLY` means gdb
+# walked the stack and could not name the frames; this means nothing was parsed for the thread.
+# Both are tool failures for that thread and neither is a finding about the program -- which is
+# the whole reason they are not allowed to share the "pure library wait" label.
+NO_FRAMES = "(no frames parsed for this thread -- tool failure, not a finding)"
+
 # C++ wait wrappers. These are plumbing exactly like the C ones, but they are TEMPLATED --
 # `std::condition_variable::__wait_until_impl<std::chrono::duration<long, std::ratio<1l, ...> > >`
 # -- so an anchored `$` pattern over the whole symbol cannot match them. Matched by prefix.
@@ -224,13 +230,30 @@ def blocking_site(frames, depth: int):
     for i, fn in enumerate(frames):
         if is_plumbing(fn) or UNRESOLVED.match(fn):
             continue
-        # Callers below may themselves be unresolved; drop those from the displayed chain
-        # rather than padding the site with `??`.
-        chain = [f for f in frames[i:] if not UNRESOLVED.match(f)][:depth]
-        return " <- ".join(chain)
-    if frames and all(UNRESOLVED.match(f) for f in frames):
+        # `<-` reads as "called by", so the displayed chain must stay CONTIGUOUS. An earlier
+        # version filtered `??` out of the middle, turning ["answer", "??", "caller2"] into
+        # "answer <- caller2" -- which asserts an adjacency that does not exist. Truncate at
+        # the first unresolved caller instead and mark the cut, so the gap is visible.
+        chain, truncated = [], False
+        for f in frames[i:]:
+            if UNRESOLVED.match(f):
+                truncated = True
+                break
+            chain.append(f)
+            if len(chain) == depth:
+                break
+        site = " <- ".join(chain)
+        if truncated and len(chain) < depth:
+            site += " <- ..."      # callers below exist but did not resolve
+        return site
+    # No named site. Three different reasons, and only one of them is a statement about the
+    # PROGRAM -- so they must not share a label. An earlier version collapsed all three into
+    # "pure library wait", which claims a finding in the two cases that support none.
+    if not frames:
+        return NO_FRAMES
+    if any(UNRESOLVED.match(f) for f in frames):
         return UNRESOLVED_ONLY
-    return None
+    return None            # genuinely all plumbing: a real finding about the program
 
 
 def main() -> int:

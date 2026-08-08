@@ -173,6 +173,54 @@ class TestReviewFindings(unittest.TestCase):
             self.assertFalse(sp.is_plumbing(sym), f"{sym} must NOT be swallowed as plumbing")
 
 
+class TestOutcomesThatAreNotFindings(unittest.TestCase):
+    """Second review pass: three ways to have no named site, only ONE of which is a finding.
+
+    Collapsing them shares a label that asserts something about the program in the two cases
+    that support nothing. This is the tool's own central thesis -- "I did not measure" must
+    never render as "there was nothing to measure" -- applied one level below where the first
+    pass stopped.
+    """
+
+    def test_all_plumbing_is_a_real_finding_and_keeps_the_None_outcome(self):
+        # This one IS a statement about the program: every frame resolved, and all were waits.
+        self.assertIsNone(sp.blocking_site(["pthread_cond_wait", "sem_wait"], 2))
+
+    def test_plumbing_plus_unresolved_is_not_a_pure_library_wait(self):
+        # Frames genuinely did not resolve, so "pure library wait" is one possibility of several.
+        self.assertEqual(sp.blocking_site(["pthread_cond_wait", "??", "??"], 2),
+                         sp.UNRESOLVED_ONLY)
+
+    def test_empty_stack_has_its_own_outcome(self):
+        self.assertEqual(sp.blocking_site([], 2), sp.NO_FRAMES)
+
+    def test_the_three_outcomes_are_all_distinct(self):
+        outcomes = {
+            sp.blocking_site(["pthread_cond_wait", "sem_wait"], 2),   # all plumbing -> None
+            sp.blocking_site(["pthread_cond_wait", "??"], 2),          # -> UNRESOLVED_ONLY
+            sp.blocking_site([], 2),                                   # -> NO_FRAMES
+        }
+        self.assertEqual(len(outcomes), 3, "the three no-site outcomes must not share a label")
+
+
+class TestChainContiguity(unittest.TestCase):
+    """`<-` reads as 'called by', so an elided middle frame asserts a false adjacency."""
+
+    def test_unresolved_middle_frame_truncates_rather_than_eliding(self):
+        site = sp.blocking_site(["real_answer", "??", "caller2"], 3)
+        self.assertNotIn("real_answer <- caller2", site,
+                         "eliding `??` claims real_answer is called by caller2, which is false")
+        self.assertTrue(site.startswith("real_answer"))
+        self.assertIn("...", site, "the truncation must be visible")
+
+    def test_contiguous_named_callers_are_still_joined(self):
+        self.assertEqual(sp.blocking_site(["a", "b", "c"], 3), "a <- b <- c")
+
+    def test_depth_reached_before_the_gap_needs_no_marker(self):
+        # Truncation by --depth is not a gap in the data, so it must not be marked as one.
+        self.assertEqual(sp.blocking_site(["a", "b", "??"], 2), "a <- b")
+
+
 class TestFailureIsNotAResult(unittest.TestCase):
     """A sample that yields nothing must be a FAILURE, never 'nothing was blocked'."""
 
