@@ -2795,6 +2795,13 @@ HLE(k_barrier_destroy) {
     // than via SCE_PTHREAD_ALIAS because this body is Sony-only -- there is no
     // `pthread_barrier_destroy` registration -- and its sibling k_barrier_init already returns
     // kSceKernelError* directly.
+    //
+    // This NARROWS the window; it does not close it, and the same qualification applies to the
+    // condvar half that landed first. A thread can register as a waiter between this check and the
+    // `pt_claim_slot` below, and it would then be retired out from under. Closing it needs the
+    // peek and the claim to be one atomic step -- possible, since both are lock-free atomics rather
+    // than lock-holders, but not cheap. What the check buys is the case the guest actually hits:
+    // threads ALREADY parked when the destroy arrives. Raised in review of this PR by Marlow.
     if (auto* existing = (pthread_barrier_t*)pt_peek_slot(a0))
         if (guest_barrier_has_waiters(existing)) return prosper::hle::kSceKernelErrorEBUSY;
     if (void* b = pt_claim_slot(a0)) retire_sync_object(b, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); });   // #2176
