@@ -117,17 +117,22 @@ first second. Rendered frames spread the shots evenly across the run.
 ## Guest environment
 
 Reaching a rendering frame loop needs the render-frontier guest switches. This tool defaults
-`PROSPER_GUEST_FS=1` and `PROSPER_GUEST_ARGS=-force-gfx-direct` (Unity/Messenger recipe) if unset. For
-other titles set the appropriate env first, e.g. a UE4 title:
+`PROSPER_GUEST_ARGS=-force-gfx-direct` (Unity/Messenger recipe) if unset. For other titles set the
+appropriate env first, e.g. a UE4 title:
 
 ```bash
 PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 screenshot /path/PPSA01885-app0
 ```
 
-`PROSPER_GUEST_FS=1` is named above because the tool really does set it, not because a run needs it:
-guest `%fs` TLS is **on by default** on Linux (since #825) and Windows (since #624), and is opted out
-of with `PROSPER_NO_GUEST_FS=1`. `PROSPER_GUEST_FS` is read only on macOS/Rosetta. Do not carry it
-into a new recipe (#2095).
+`PROSPER_GUEST_FS` is **no longer set on Linux or Windows** (#2098). Guest `%fs` TLS is **on by
+default** there — Linux since #825, Windows since #624 — and the variable that exists is the
+opt-OUT, `PROSPER_NO_GUEST_FS=1`. The name is read at exactly one place in the tree,
+`guest_tls.cpp:46`, inside `#ifdef __APPLE__`, where it opts in to Rosetta trap-mode `%fs`
+emulation; the tool still sets it there, because on macOS dropping it would turn trap mode off.
+
+Do not carry it into a new recipe (#2095). Setting it on Linux or Windows is harmless at runtime and
+misleading in the way that matters: it turns a default-on path into one people believe they are
+enabling, so nobody checks it when guest TLS is the actual cause.
 
 ## Example
 

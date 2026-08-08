@@ -91,7 +91,9 @@ else
     dump="$(cd "$dump" && pwd)"
     mkdir -p "$savedata_dir"
     savedata_dir="$(cd "$savedata_dir" && pwd)"
-    export PROSPER_GUEST_FS=1
+    # PROSPER_GUEST_FS is not set: it is read at guest_tls.cpp:46 only under
+    # `#ifdef __APPLE__`. On Linux (`:58`) guest TLS is ON by default and the variable
+    # that exists is the opt-OUT PROSPER_NO_GUEST_FS (#2098).
     export PROSPER_GUEST_ARGS="$guest_args"
     export PROSPER_SAVEDATA_DIR="$savedata_dir"
     args+=(--dump "$dump")

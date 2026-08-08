@@ -108,7 +108,9 @@ $runArgs = @()
 if ($TestPattern) {
     $runArgs += '--test-pattern'
 } else {
-    $env:PROSPER_GUEST_FS = '1'
+    # PROSPER_GUEST_FS is not set: guest_tls.cpp reads it only under `#ifdef __APPLE__`.
+    # On Windows (`:240`) guest TLS is ON by default; the real switch is the opt-OUT
+    # PROSPER_NO_GUEST_FS (#2098).
     $env:PROSPER_GUEST_ARGS = $GuestArgs
     if ($SavedataDir) { $env:PROSPER_SAVEDATA_DIR = [IO.Path]::GetFullPath($SavedataDir) }
     $runArgs += @('--dump', $Dump)

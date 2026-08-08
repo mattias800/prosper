@@ -47,7 +47,7 @@ $captureRoute = [IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot 'reach-first-gameplay-capture.pad'))
 
 $controlledEnvironment = @(
-    'PROSPER_CAPTURE_TITLE', 'PROSPER_GUEST_FS', 'PROSPER_GUEST_ARGS',
+    'PROSPER_CAPTURE_TITLE', 'PROSPER_GUEST_ARGS',
     'PROSPER_PAD_SCRIPT', 'PROSPER_PAD_SCRIPT_LOG', 'PROSPER_SAVEDATA_DIR',
     'PROSPER_PROGRESS', 'PROSPER_GPU_TIMELINE', 'PROSPER_RENDER',
     'PROSPER_NO_FRAME_DUMPS', 'PROSPER_PRESENT_EVERY', 'PROSPER_RENDER_EVERY',
@@ -72,7 +72,7 @@ function Set-RunEnvironment {
     Reset-ControlledEnvironment
     $common = @{
         PROSPER_CAPTURE_TITLE = 'PPSA15552'
-        PROSPER_GUEST_FS = '1'
+        # PROSPER_GUEST_FS omitted: Apple-only, never read on Windows (#2098).
         PROSPER_GUEST_ARGS = ''
         PROSPER_PAD_SCRIPT = "@$($Spec.Route)"
         PROSPER_PAD_SCRIPT_LOG = '1'

@@ -40,7 +40,9 @@ echo "# route=$ROUTE  reps=$REPS  seconds=$SECS  off_switch=$SWITCH"
 echo "# started=$(date -u +%Y-%m-%dT%H:%M:%SZ)  logs=$OUT"
 
 run() { # $1=label  $2=extra env ("" for ON)
-  env SDL_AUDIO_DRIVER=dummy PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+  # PROSPER_GUEST_FS dropped: read only under `#ifdef __APPLE__` (guest_tls.cpp:46); this is a
+  # Linux A/B and guest TLS is ON by default there (#2098).
+  env SDL_AUDIO_DRIVER=dummy PROSPER_GUEST_ARGS=-force-gfx-direct \
       PROSPER_RENDER=1 PROSPER_VULKAN_LIB=libvulkan.so.1 PROSPER_RENDER_TIMING=1 $2 \
       PROSPER_PAD_SCRIPT="@$ROUTE" \
       timeout "$SECS" ./build-linux/prosper-app --dump "$DUMP" > "$OUT/$1.log" 2>&1

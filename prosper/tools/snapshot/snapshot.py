@@ -802,7 +802,11 @@ def capture(entry, run_log=None):
     # Defaults every title needs to reach the frame loop, then the render/target knobs. The manifest
     # entry's own `env` wins so a title can add its specific switches.
     env.update({
-        "PROSPER_GUEST_FS": "1",
+        # PROSPER_GUEST_FS is Apple-only (#2098): guest_tls.cpp reads it at :46 inside
+        # `#ifdef __APPLE__` to opt in to Rosetta trap mode. Linux/Windows read the OPT-OUT
+        # PROSPER_NO_GUEST_FS and have guest TLS on by default, so setting it there taught a
+        # false model. Kept for darwin, where dropping it would turn trap mode off.
+        **({"PROSPER_GUEST_FS": "1"} if sys.platform == "darwin" else {}),
         "PROSPER_GUEST_ARGS": "-force-gfx-direct",
         "PROSPER_RENDER": "1",
         "PROSPER_RENDER_EVERY": "1",     # render every draw submit -> frame_<F> == F-th draw submit
@@ -901,7 +905,8 @@ def capture_content(entry, run_log=None):
         raise RuntimeError("sample_seconds must be positive")
     env = dict(os.environ)
     env.update({
-        "PROSPER_GUEST_FS": "1", "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        **({"PROSPER_GUEST_FS": "1"} if sys.platform == "darwin" else {}),   # Apple-only (#2098)
+        "PROSPER_GUEST_ARGS": "-force-gfx-direct",
         "PROSPER_RENDER": "1", "PROSPER_RENDER_EVERY": "1", "PROSPER_RENDER_FIRST": "0",
         "PROSPER_RENDER_SCALE": str(scale), "PROSPER_FAULT_ONSTACK": "1",
     })

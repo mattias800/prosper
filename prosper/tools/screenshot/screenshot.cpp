@@ -388,7 +388,19 @@ int main(int argc, char** argv) {
     int pad = 2; for (int m = count - 1, d = 1; ; m /= 10, d++) { if (m < 10) { if (d > pad) pad = d; break; } }
 
     // Sane render-frontier defaults (don't override if the caller set them for another title).
+    // PROSPER_GUEST_FS is APPLE-ONLY, and setting it anywhere else taught a false model (#2098).
+    // guest_tls.cpp reads this name at exactly one place -- `:46`, inside `#ifdef __APPLE__`, where
+    // it opts IN to Rosetta trap-mode %fs emulation. Linux (`:58`) and Windows (`:240`) read
+    // `PROSPER_NO_GUEST_FS` instead: guest TLS is ON by default there and the real variable is the
+    // opt-OUT. Setting it on those platforms was harmless and misleading in the way that matters --
+    // this file is where an agent copies a recipe from, and a run that appears to enable something
+    // is a run nobody re-checks when guest TLS is the actual cause.
+    //
+    // Guarded rather than deleted, because on macOS deleting it is NOT a no-op: it would turn trap
+    // mode off and take guest TLS with it.
+#ifdef __APPLE__
     set_environment("PROSPER_GUEST_FS",   "1", false);
+#endif
     set_environment("PROSPER_GUEST_ARGS", "-force-gfx-direct", false);
     if (warmup_seconds_set) {
         char delay_ms[32];

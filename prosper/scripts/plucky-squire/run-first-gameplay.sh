@@ -42,7 +42,8 @@ mkdir -- "$run_dir/save0" "$run_dir/savedata"
 run_dir="$(CDPATH='' cd -- "$run_dir" && pwd)"
 dump_dir="$(CDPATH='' cd -- "$dump_dir" && pwd)"
 
-export PROSPER_GUEST_FS=1
+# PROSPER_GUEST_FS omitted: Apple-only (guest_tls.cpp:46); Linux defaults guest TLS ON and
+# reads the opt-OUT PROSPER_NO_GUEST_FS instead (#2098).
 export PROSPER_GUEST_ARGS="${PROSPER_GUEST_ARGS:--force-gfx-direct}"
 export PROSPER_RENDER=1
 export PROSPER_RENDER_EVERY=1
