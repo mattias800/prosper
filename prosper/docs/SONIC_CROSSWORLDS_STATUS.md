@@ -436,6 +436,19 @@ Measured across three identical arms on one binary lineage, `PROSPER_DBG=1`, 240
 | `[mimg-unresolved]` / `[mubuf-unresolved]` | 0 / 0 | 0 / 0 | 0 / 0 |
 | composite | `666f7b3f` → `0d70a70a` → `8bf1b518` | **identical** | **identical** |
 
+**That table counts one log line, and a fifth failure prints a different one.** `[compute] skip
+unsupported program` is the recompiler's message. A program that recompiles *successfully* and then
+fails descriptor validation prints `[compute] skip invalid descriptor contract` instead, and has
+never been in the total above — so the population is **one larger than every census here states**.
+On master at `7a493df2` the split is **3** `skip unsupported program` (#2218 took one more of the
+four) plus **1** descriptor-contract, and the offline capture records exactly that: four declined
+dispatches per frame, `reason=shader-recompile` x3 and `reason=descriptor-contract` x1, in submits
+8022/8039 and 8023/8040 of the repeating frame. Ask a capture for
+`--bundle-extract-submit N out.prgcap` then `--inspect-only out.prgcap`; do **not** use the replay's
+`operations=A/B` field, which is a replay setting over a decode count and can never report a decline
+(instrument trap 141).
+
+
 The composite row is a `tools/screenshot` arm (`--seconds 30 --count 9`, default switches, no
 diagnostics) rather than the `boot_trace` arm, so the pixels are measured on a run that carries no
 instrument at all. It reproduces the recorded hash sequence byte for byte, which is the arm's own
@@ -468,6 +481,62 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **THE DESCRIPTOR-CONTRACT SKIP IS NOT A STALE CACHED SPIR-V.** The hypothesis was that the program
+  compiled once against a single-layer resolution, was cached by `recompile_compute_shader_cached`,
+  and is validated on later dispatches against the two-layer resource -- which would make it a
+  general recompile-time vs bind-time divergence rather than a title-local gap. A/B on one
+  `boot_trace` binary, 75 s per arm, `PROSPER_DBG=1 PROSPER_RENDER_TIMING=1`, arm B adding
+  `PROSPER_NO_SHADER_CACHE=1`:
+
+  | arm | shaders hit | miss | bypass | `skip invalid descriptor contract` | `skip unsupported program` |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | cache on | 21.1 | 1.1 | 0.0 | 1 | 3 |
+  | cache off | 0.0 | 0.0 | **22.2** | 1 | 3 |
+
+  The lever provably moved -- every compile in arm B is fresh against the live table -- and the
+  failure population is unchanged in both class and count. Note the counts are by **class**, not by
+  program address: guest code addresses are run-local and every one of them differs between the two
+  arms, so an address-keyed comparison across runs is void (this cost the first pass of this very
+  A/B). #2265.
+
+- **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS, AND THE ATOMIC ONE
+  IS NOT A MISSING FEATURE -- IT IS THREE COPIES OF ONE PREDICATE THAT DISAGREE.** Program
+  `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56), every one
+  `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
+  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. The dispatch is
+  full-screen: `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **Four** sites
+  independently encode which image-atomic image shapes are supported, and **#2272 generalised exactly
+  one of them** to 2D_ARRAY (line numbers as of `7a493df2`):
+
+  | site | where | 2D_ARRAY accepted? |
+  | --- | --- | --- |
+  | coverage predicate | `src/gpu/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
+  | lowering gate | `src/gpu/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
+  | validator carve-out | `src/gpu/shader_resources.cpp:1031` (`r.img_dim == 1 && r.depth == 1`) | no |
+  | backend materialization | `frontends/shared/live_compute.cpp:4304` (same clause) | no |
+
+  So the lowering emits the buffer-backed binding for a 2D_ARRAY atomic and the validator then
+  rejects that exact binding as `WrongType`. That is why the capture shows `recompiled=yes` with
+  `descriptors=20` **and** a descriptor-contract failure -- a pair that reads as contradictory until
+  the three sites are read together. Buffer-flattening is the **designed** path for
+  `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483` requires
+  `kind == StorageBuffer` with `atomic_access` and `report.ok()`); it exists as the RADV
+  image-atomic workaround. **This is #2293's defect one iteration later** -- that PR is titled *"the
+  image-atomic opcode list existed in THREE places and all three had to agree"*, and the same triple
+  now disagrees on the *dimension* predicate instead of the opcode list. **Do NOT simply widen sites
+  1 and 3: the `compute_atomic_buffer` index is still `coords[0] + coords[1]*width` with the layer in
+  neither the index nor the bound**, so relaxing the validator alone makes this dispatch *run* and
+  every layer atomically accumulates into layer 0's texels -- a silent wrong result on a device-scope
+  atomic, strictly worse than the current skip, and it would read as progress in a screenshot. Correct
+  order: teach the backend's detile/retile to cover the layers, fold the layer into the shader index
+  and bound to match the layout it produces, **then** widen the predicates. Note the backing
+  allocation is **already** large enough -- the resource reports `available=66355200` and
+  `3840*2160*2*4 = 66,355,200` exactly -- so sizing is not the obstacle; the **layout** is.
+  `tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel)` (`src/gpu/tile.hpp:81`) takes
+  no depth or layer argument, so the detile behind the atomic buffer view is inherently 2D and the
+  tiled **array slice pitch** is the open unknown that needs evidence rather than an assumed
+  `width*height`. Tracked on **#2265**,
+  which owns this chain; Refs #2272 / #2293.
 - **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
   storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
   `Sw4KbS`, tile mode 5), and the frozen composite is a single colour, so the LUT looked like the
