@@ -96,6 +96,7 @@ void ampr_cb_destroy_320(uint64_t cb) {
         g_ampr_cb_state.erase(it);
 }
 
+
 uint64_t ampr_cb_capacity(uint64_t cb) {
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
@@ -108,6 +109,30 @@ uint64_t ampr_cb_offset(uint64_t cb) {
     return it == g_ampr_cb_state.end() ? 0 : it->second.offset;
 }
 }
+
+// Last Ampr command-buffer (address/size) seen at init: the APR read-submit path inits its request
+// with (req, cbSize, 0, cbBuf, poolCtx, 3) — the actual read COMMAND (file offset / dest / size)
+// lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
+// Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
+//
+// Atomic because GetSize now reads them as a PAIR — it serves g_apr_last_cb_size only when a0
+// matches g_apr_last_cb — and both are written from arbitrary guest threads. A torn read that
+// matched a freshly stored cb against the previous size would hand that cb a too-small capacity,
+// which is precisely the failure this fix exists to remove. Relaxed is enough: the pair is a hint,
+// nothing is published through it, and a stale-but-consistent read is harmless.
+//
+// Defined HERE -- OUTSIDE the anonymous namespace above, and above the
+// `#if defined(__linux__) || defined(__APPLE__)` platform split -- rather than inside the POSIX arm
+// where it used to live. Both arms implement `sceAmprCommandBufferGetSize` and both must answer it
+// identically: a capacity is a fact about the guest's buffer, not about the host prosper happens to
+// be running on (#1970). While the pair was POSIX-only, the Windows arm could not see a capacity
+// prosper had already recorded and answered the roomy default -- the OVER-large direction, which
+// risks a guest appending past the end of a real buffer rather than merely stalling.
+//
+// The anonymous namespace matters and is not a style point: hle_file.cpp declares these `extern`
+// (`prosper::g_apr_last_cb`), so internal linkage does not fail to compile -- it fails to LINK, and
+// only for the targets that pull in hle_file.cpp. A syntax-only check passes happily.
+std::atomic<uint64_t> g_apr_last_cb{0}, g_apr_last_cb_size{0};
 
 // The ReadFile builder lives in hle_file.cpp; expose the one state transition it shares with the
 // other AMPR builders without exposing the map itself.
@@ -1742,17 +1767,6 @@ HLE(k_ampr_ok) { return 0; }
 // the APR read destination from a begin-cursor we never populate (k_ampr_ok returns 0 without
 // writing outputs) — i.e. whether the stale value in *(a1)/*(a2) is where the bogus
 // req+0x20 = freed-pool-block pointer comes from.
-// Last Ampr command-buffer (address/size) seen at init: the APR read-submit path inits its request
-// with (req, cbSize, 0, cbBuf, poolCtx, 3) — the actual read COMMAND (file offset / dest / size)
-// lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
-// Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
-//
-// Atomic because GetSize now reads them as a PAIR — it serves g_apr_last_cb_size only when a0
-// matches g_apr_last_cb — and both are written from arbitrary guest threads. A torn read that
-// matched a freshly stored cb against the previous size would hand that cb a too-small capacity,
-// which is precisely the failure this fix exists to remove. Relaxed is enough: the pair is a hint,
-// nothing is published through it, and a stale-but-consistent read is harmless.
-std::atomic<uint64_t> g_apr_last_cb{0}, g_apr_last_cb_size{0};
 // Per-cb capacity, recorded at init (issue #208 follow-up). Live-captured init flavors carry the
 // size in different args: the APR read flow uses a1; Pathless's IoStore batch uses a2=0x560; and
 // DOLL's IoStore batch uses a5=0x720. The
@@ -5294,14 +5308,29 @@ HLE(k_query_memory_protection) {
 // Windows yet. Pure size/offset queries below keep their platform-independent return contracts.
 HLE(k_ampr_ok) { return 0; }
 HLE(k_ampr_init) {
-    ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
-                      a2 >= 0x20 && a2 <= 0x100000); // match the POSIX 3.20 discriminator
+    // Same legacy (a3 = cb, a1 = size) recording as the POSIX arm (#1970). Without it the pair
+    // stays empty on Windows and GetSize below can never take its matched branch, so a capacity
+    // legible only through this shape would be discarded.
+    if (a3 > 0xffff && a1 && a1 <= 0x10000) { g_apr_last_cb = a3; g_apr_last_cb_size = a1; }
+    // The `a0 > 0xffff` plausibility guard is the POSIX arm's too, and its absence here was a
+    // second divergence found while fixing the first: ampr_cb_construct only rejects a0 == 0, so a
+    // small non-zero a0 -- an SDK flow passing a handle or a count where POSIX declines to guess a
+    // cb address -- created a bogus capacity entry on Windows and none on POSIX. Same shared map,
+    // two different contents (#1970).
+    if (a0 > 0xffff)
+        ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
+                          a2 >= 0x20 && a2 <= 0x100000); // match the POSIX 3.20 discriminator
     return 0;
 }
 HLE(k_ampr_reset) { ampr_cb_reset(a0); return 0; }
 HLE(k_ampr_destruct) { ampr_cb_destroy_320(a0); return 0; }
 HLE(k_ampr_getsize) {
     if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
+    // Byte-for-byte the POSIX arm's contract (#1970). The `a0 == g_apr_last_cb` test is NOT
+    // optional bookkeeping: serving the pair for any OTHER buffer is #1960, which hung The
+    // Forgotten City's IoService thread forever on a 129-byte answer. Matched, it recovers a real
+    // capacity; unmatched, the roomy default is the only safe answer for an unknown one.
+    if (a0 && a0 == g_apr_last_cb && g_apr_last_cb_size) return g_apr_last_cb_size;
     return 0x10000;
 }
 HLE(k_ampr_measure_write_equeue) { return 20; }

@@ -51,20 +51,15 @@ int main() {
 
     CHECK(get_size(kRecordedCb, 0, 0, 0, 0, 0) == kRecordedSize,
           "a cb with a legible capacity still reports exactly that capacity");
-#if defined(__linux__) || defined(__APPLE__)
-    // POSIX-only, and deliberately so rather than by oversight. `hle_kernel_mem.cpp` is a platform
-    // split: `g_apr_last_cb`/`g_apr_last_cb_size` are defined inside the POSIX arm and recorded by
-    // its `k_ampr_init`, so the Windows arm's `k_ampr_getsize` has no legacy path to preserve — it
-    // has always returned the unknown-capacity default unconditionally. Windows therefore never had
-    // the bug this file guards, and also never had this behaviour to keep. Asserting it there is
-    // asserting a mechanism that does not exist. Tracked as #1970; the arms below are not guarded
-    // because they are the actual fix and must hold on every platform.
+    // Unguarded since #1970. This arm used to be `#if defined(__linux__) || defined(__APPLE__)`
+    // because `g_apr_last_cb`/`g_apr_last_cb_size` lived inside the POSIX arm of the platform
+    // split, so Windows had no legacy path to assert. That guard was not a property of the test —
+    // it was the defect, written down: the two arms answered one guest ABI question differently,
+    // and Windows discarded a capacity prosper had already recorded. The pair is now defined above
+    // the split and recorded by both `k_ampr_init`s, so this holds everywhere. If it ever needs a
+    // platform guard again, the divergence has come back rather than the test having got stricter.
     CHECK(get_size(kLegacyCb, 0, 0, 0, 0, 0) == kRecordedSize,
-          "the legacy global still answers for the cb it was recorded against");
-#else
-    (void)kLegacyCb;
-    std::printf("  [skip] legacy-global arm: the Windows arm has no g_apr_last_cb path (#1970)\n");
-#endif
+          "the legacy global answers for the cb it was recorded against, on every platform");
 
     // PPSA03026's IoService cb: a1 is zero and a2/a5 are guest pointers far above any plausible
     // command-buffer capacity, so no capacity can be recovered from the constructor arguments.
