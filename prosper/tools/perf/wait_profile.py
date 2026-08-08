@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """wait_profile -- where is every thread's time going, and what is it BLOCKED ON?
 
+LINUX ONLY. It reads /proc/<pid>/task/*/{stat,wchan,syscall}, which do not exist on Windows
+or macOS -- there `thread_ids()` simply returns empty. Stated here because the failure is
+otherwise a silent one: a Windows reader gets an empty report rather than an explanation,
+and an empty report from a wait profiler reads like a process that is not waiting.
+
 The question this answers is the one prosper keeps needing and could not ask: *nothing is
 working, so what is everything waiting for?* Blue Prince runs at ~3.2 fps with the GPU 96% idle
 (#2215), which is not a "make it faster" problem at all -- it is a wait, and no timer in the tree
