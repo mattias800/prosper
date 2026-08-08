@@ -562,7 +562,9 @@ namespace {
         int n = 0;
         for (int i = 1; i < scan && n < kWant; i++) {
             const uint64_t v = frame[i];
-            if (!guest_va_in_module(v)) continue;
+            // guest_va_in_module_code: the weak form accepts BOOT_STUB, so an import
+            // trampoline's address would be recovered as the dmem caller (#2045).
+            if (!guest_va_in_module_code(v)) continue;
             if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
             ra[n++] = v;
         }
@@ -2700,7 +2702,9 @@ namespace {
         int n = 0;
         for (int i = 1; i < scan && n < kWant; i++) {
             const uint64_t v = frame[i];
-            if (!guest_va_in_module(v)) continue;
+            // guest_va_in_module_code: the weak form accepts BOOT_STUB, so an import
+            // trampoline's address would be recovered as the dmem caller (#2045).
+            if (!guest_va_in_module_code(v)) continue;
             if (n && ra[n - 1] == v) continue;      // collapse an adjacent duplicate spill
             ra[n++] = v;
         }

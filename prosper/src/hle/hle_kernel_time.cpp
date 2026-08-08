@@ -1124,7 +1124,9 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
             for (int i = 0; i < 160; i++) {
                 uint64_t v = sp[i];
-                if (!prosper::guest_va_in_module(v)) continue;   // any fixed guest module (#1659)
+                // _code: the weak form accepts BOOT_STUB, and the call-shape check below is
+                // explicitly written for an in-eboot thunk rather than the stub region (#2045).
+                if (!prosper::guest_va_in_module_code(v)) continue;   // any fixed guest module (#1659)
                 // A genuine caller is a return address preceded by a call: `call rel32` (0xe8 at v-5,
                 // any target — the import call goes through an in-eboot thunk, NOT straight to the
                 // stub region, so no target filter) or an indirect `call` (0xff at v-6/-3/-2).
