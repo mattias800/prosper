@@ -186,6 +186,27 @@ int main() {
         CHECK(v.reason == AvpChromaReason::MatchedSiblingLumaPlane);
     }
 
+    // #2034: the same one-layer-2D-array predicate now gates the native R8 luma upload in
+    // live_renderer.cpp, not only the chroma classifier. R-Type Delta declares its AvPlayer
+    // LUMA plane as dim=5/depth=1, which the old `img_dim == 1u` test missed -- so every movie
+    // frame was CPU-expanded to RGBA8 and moved 4x the bytes it needed.
+    {
+        ShaderResource luma = rtype_luma_plane();
+        CHECK(prosper::frontend::avp_plane_is_one_layer_2d(luma));   // dim=5, depth=1
+        ShaderResource plain = luma; plain.img_dim = 1;
+        CHECK(prosper::frontend::avp_plane_is_one_layer_2d(plain));  // the historical dim=1 case
+
+        // A REAL array must still fail, or the fast path would upload one layer of many and
+        // silently drop the rest. Each rejection is asserted on its own so a predicate that
+        // stopped checking one of them cannot hide behind the others.
+        ShaderResource deep = luma;  deep.depth = 2;
+        CHECK(!prosper::frontend::avp_plane_is_one_layer_2d(deep));
+        ShaderResource strided = luma; strided.layer_stride_bytes = 0x1000;
+        CHECK(!prosper::frontend::avp_plane_is_one_layer_2d(strided));
+        ShaderResource mipped = luma;  mipped.layer_mip_offset_bytes = 0x40;
+        CHECK(!prosper::frontend::avp_plane_is_one_layer_2d(mipped));
+    }
+
     if (!failures) std::printf("avplayer_plane_policy: OK\n");
     return failures ? 1 : 0;
 }
