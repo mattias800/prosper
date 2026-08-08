@@ -48,6 +48,32 @@ def main():
     code += b"\xc7\x05" + rel32(site, 10, slot) + b"\x00\x00\x00\x00"    # mov DWORD [rip+d],0 stored
     site += 10
     code += b"\x80\x3d" + rel32(site, 7, slot) + b"\x01"                  # cmp BYTE [rip+d],1  cmpb
+    site += 7
+    # #2025: four forms that were not decoded, and every one of them occurs around a std::vector's
+    # _M_finish. The `add [rip+d],imm8` is push_back/pop_back advancing the pointer; while it was
+    # missed, "who touches this vector" answered with reads only and looked complete.
+    code += b"\x48\x2b\x05" + rel32(site, 7, slot)                       # sub rax,[rip+d]     r
+    site += 7
+    code += b"\x48\x3b\x05" + rel32(site, 7, slot)                       # cmp rax,[rip+d]     r
+    site += 7
+    code += b"\x4c\x3b\x35" + rel32(site, 7, slot)                       # cmp r14,[rip+d]     r
+    site += 7
+    code += b"\x48\x83\x05" + rel32(site, 8, slot) + b"\x08"             # add [rip+d],8      rw
+    site += 8
+    code += b"\x48\x83\x2d" + rel32(site, 8, slot) + b"\x08"             # sub [rip+d],8      rw
+    site += 8
+    code += b"\x48\x83\x3d" + rel32(site, 8, slot) + b"\x00"             # cmp [rip+d],0       r
+    site += 8
+    code += b"\xc5\xfc\x11\x05" + rel32(site, 8, slot)                   # vmovups [rip+d],ymm w
+    site += 8
+    code += b"\xc5\xf8\x10\x05" + rel32(site, 8, slot)                   # vmovups xmm,[rip+d] r
+    site += 8
+    # High registers (ymm8-15 / xmm8-15) invert VEX.R, giving c5 7c / c5 78. Pinning R=1 missed
+    # them: 876 of 14,722 such instructions on a real eboot, 6.0% (#2025 review). Encodings that
+    # differ only in R must decode to the SAME kind -- the register number is not the reference.
+    code += b"\xc5\x7c\x11\x05" + rel32(site, 8, slot)   # vmovups [rip+d],ymm8+  w
+    site += 8
+    code += b"\xc5\x78\x10\x05" + rel32(site, 8, slot)   # vmovups xmm8+,[rip+d]  r
     raw[0x100:0x100 + len(code)] = code
 
     # #1314: a seven-byte reference ending exactly at the executable PT_LOAD boundary must be
@@ -71,9 +97,42 @@ def main():
             (0x1026, "storeb"),
             (0x102d, "stored"),
             (0x1037, "cmpb"),
+            # #2025
+            (0x103e, "sub"),
+            (0x1045, "cmp"),
+            (0x104c, "cmp"),
+            (0x1053, "addi"),
+            (0x105b, "subi"),
+            (0x1063, "cmpi"),
+            (0x106b, "vstorey"),
+            (0x1073, "vloadx"),
+            (0x107b, "vstorey"),   # c5 7c: ymm8-15, same kind as c5 fc
+            (0x1083, "vloadx"),    # c5 78: xmm8-15, same kind as c5 f8
         }
         actual = set(module.code_xref[slot])
         assert actual == expected, (actual, expected)
+
+        # The classification is the other half of #2025: the tool's usual question is "who WRITES
+        # this", and the four missed forms included the only writers. Assert the classes rather than
+        # merely that the forms decode -- a form decoded into the wrong class is still a wrong answer
+        # to that question.
+        by_kind = {k: XREF.access(k) for _, k in actual}
+        assert by_kind["addi"] == "rw" and by_kind["subi"] == "rw", by_kind
+        assert by_kind["vstorey"] == "w" and by_kind["vloadx"] == "r", by_kind
+        assert by_kind["sub"] == "r" and by_kind["cmp"] == "r" and by_kind["cmpi"] == "r", by_kind
+        # Nothing may fall through to the unknown class: an unclassified kind would print '?' and
+        # silently drop out of the write/read counts the summary line reports.
+        unknown = sorted(k for _, k in actual if XREF.access(k) == "?")
+        assert not unknown, unknown
+        # The summary this drives: writers must be visible. Asserted as the exact SET rather than a
+        # count -- a count is satisfied by the wrong six kinds, and the point of #2025 is precisely
+        # which forms land in this bucket. `addi`/`subi`/`vstorey` are the ones that were missing.
+        writers = {k for _, k in actual if XREF.access(k) in ("w", "rw")}
+        assert writers == {"store", "storeb", "stored", "addi", "subi", "vstorey"}, sorted(writers)
+        # A VEX form differing only in the R bit must not decode to a different kind or width:
+        # the referenced address does not depend on which register the instruction uses.
+        vex = sorted(k for _, k in actual if k.startswith("v"))
+        assert vex == ["vloadx", "vloadx", "vstorey", "vstorey"], vex
         assert module.code_xref[direct_target] == [(0x1000, "call")]
         assert module.code_xref[tail_slot] == [(tail_site, "storeb")]
     finally:

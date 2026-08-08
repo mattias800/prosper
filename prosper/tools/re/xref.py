@@ -6,6 +6,12 @@
 #   - rip-relative load/store REX.W/REX.WR 8d|8b|89 modrm(rip) <disp32>
 #   - indirect call/jump     ff /2|/4 modrm(rip) <disp32>
 #   - byte/dword store-imm   c6 05 <disp32> <imm8>  /  c7 05 <disp32> <imm32>   (storeb/stored)
+#   - ALU reg,[rip+d32]      48/4c 2b|3b|03 /r <disp32>                        (sub/cmp/add, reads)
+#   - ALU [rip+d32],imm8     48/4c 83 /r <disp32> <imm8>                       (addi..cmpi, mostly writes)
+#   - VEX vmovups            c5 f8|fc 10|11 /r <disp32>                        (vload/vstore x/y)
+# Every reference is printed with an access class (r / w / rw / & / x). The tool is usually asked
+# "who WRITES this", and the forms on the three lines above were the ones missing (#2025) -- all
+# four are mutators, so an answer made only of reads looked complete instead of partial.
 #   - byte compare-imm       80 3d <disp32> <imm8>                              (cmpb)
 #   - data pointers          absolute pointers stored in data, emitted as
 #                            R_X86_64_RELATIVE relocations (DT_RELA / DT_SCE_RELA)
@@ -40,6 +46,28 @@ import struct, sys
 from collections import defaultdict
 
 MODRM_RIP = {0x05, 0x0d, 0x15, 0x1d, 0x25, 0x2d, 0x35, 0x3d}   # mod=00, rm=101 (rip-rel), reg=any
+
+# What each decoded form DOES to the referenced address. The tool's usual question is "who writes X",
+# and #2025 was the case where that could not be answered: every missed form was a mutator, so an
+# answer made only of reads looked complete. Printing the class makes a read-only answer visibly
+# read-only instead of merely short.
+#   r  reads it      w  writes it      rw  read-modify-write      &  takes its address
+#   x  transfers control through it (the slot itself is read)
+ACCESS = {
+    'lea': '&', 'load': 'r', 'store': 'w',
+    'call': 'x', 'call*': 'x', 'jmp*': 'x',
+    'storeb': 'w', 'stored': 'w', 'cmpb': 'r',
+    'sub': 'r', 'cmp': 'r', 'add': 'r',
+    'addi': 'rw', 'ori': 'rw', 'adci': 'rw', 'sbbi': 'rw',
+    'andi': 'rw', 'subi': 'rw', 'xori': 'rw', 'cmpi': 'r',
+    'vloadx': 'r', 'vloady': 'r', 'vstorex': 'w', 'vstorey': 'w',
+    'reloc': '&',
+}
+
+
+def access(kind):
+    """Access class for a decoded kind; '?' for anything not classified rather than a guess."""
+    return ACCESS.get(kind, '?')
 
 
 class Module:
@@ -148,6 +176,44 @@ class Module:
                     disp = struct.unpack_from('<i', d, i + 2)[0]
                     site = v + i
                     self.code_xref[site + 7 + disp].append((site, 'cmpb'))
+                elif (i + 7 <= n and b in (0x48, 0x4c) and
+                        d[i + 1] in (0x2b, 0x3b, 0x03) and d[i + 2] in MODRM_RIP):
+                    # ALU reg, [rip+disp32] -- 7 bytes. `2b` sub, `3b` cmp, `03` add: the register is
+                    # the destination, so the memory operand is READ. These are why "who touches X"
+                    # answered with reads only in #2025 -- the container-size comparisons around a
+                    # std::vector's _M_finish decode as none of the forms above.
+                    disp = struct.unpack_from('<i', d, i + 3)[0]
+                    site = v + i
+                    kind = {0x2b: 'sub', 0x3b: 'cmp', 0x03: 'add'}[d[i + 1]]
+                    self.code_xref[site + 7 + disp].append((site, kind))
+                elif (i + 8 <= n and b in (0x48, 0x4c) and
+                        d[i + 1] == 0x83 and d[i + 2] in MODRM_RIP):
+                    # ALU [rip+disp32], imm8  (83 /r) -- 8 bytes. The read-modify-WRITE family, and
+                    # the one that made #2025 biased: `add [rip+d32], imm8` is how a std::vector's
+                    # _M_finish advances, so push_back/pop_back were invisible while every read of
+                    # the same address was reported. /7 is cmp, which does not write.
+                    reg = (d[i + 2] >> 3) & 7
+                    disp = struct.unpack_from('<i', d, i + 3)[0]
+                    site = v + i
+                    kind = ('addi', 'ori', 'adci', 'sbbi', 'andi', 'subi', 'xori', 'cmpi')[reg]
+                    self.code_xref[site + 8 + disp].append((site, kind))
+                elif (i + 8 <= n and b == 0xc5 and (d[i + 1] & 0x7b) == 0x78 and
+                        d[i + 2] in (0x10, 0x11) and d[i + 3] in MODRM_RIP):
+                    # VEX.128/256 vmovups xmm/ymm, [rip+disp32] (0x10, load) and the store form
+                    # (0x11) -- 8 bytes with the 2-byte VEX prefix. A vectorised struct copy writes
+                    # its destination through exactly this and through none of the forms above.
+                    #
+                    # The second VEX byte is R vvvv L pp. Masking 0x7b keeps vvvv=1111 and pp=00
+                    # (the unused-register, no-prefix encoding vmovups uses) while accepting BOTH
+                    # values of R and L -- so c5 f8/fc (xmm0-7/ymm0-7) and c5 78/7c (xmm8-15/
+                    # ymm8-15) all decode. Pinning R=1 by testing d[i+1] in (0xf8, 0xfc) missed the
+                    # high registers: measured on a clean 34.1 MB PPSA24651 eboot, 876 of 14,722
+                    # such instructions (6.0%) fell through, 869 of them loads (#2025 review).
+                    disp = struct.unpack_from('<i', d, i + 4)[0]
+                    site = v + i
+                    wide = 'y' if (d[i + 1] & 0x04) else 'x'      # L bit, not equality
+                    kind = ('vload' if d[i + 2] == 0x10 else 'vstore') + wide
+                    self.code_xref[site + 8 + disp].append((site, kind))
 
 
 def find_immediate_builds(m, needle, span=0x60):
@@ -302,9 +368,19 @@ def main():
             print(f"   ptr stored at 0x{s:x}")
         if mode == 'to':
             crefs = m.code_xref.get(addr, [])
-            print(f"code references to 0x{addr:x}: {len(crefs)}")
+            # Summarise by access class first. "who WRITES this" is the usual question, and an
+            # answer made entirely of reads is the failure #2025 records -- it looked complete
+            # because nothing said otherwise. Now it says so on its own line.
+            writers = sum(1 for _, k in crefs if access(k) in ('w', 'rw'))
+            readers = sum(1 for _, k in crefs if access(k) == 'r')
+            taken = sum(1 for _, k in crefs if access(k) == '&')
+            print(f"code references to 0x{addr:x}: {len(crefs)} "
+                  f"({writers} write, {readers} read, {taken} address-taken)")
+            if crefs and writers == 0:
+                print("   note: NO writer found. Either the address is written by a form this "
+                      "decoder does not know, or it is genuinely read-only (#2025).")
             for s, k in crefs[:32]:
-                print(f"   {k:4s} at 0x{s:x}  (in func 0x{m.func_start(s):x})")
+                print(f"   [{access(k):2s}] {k:7s} at 0x{s:x}  (in func 0x{m.func_start(s):x})")
     elif mode == 'from':
         start = m.func_start(addr)
         print(f"references made by func 0x{start:x} (window from 0x{addr:x}):")
@@ -314,7 +390,7 @@ def main():
             for s, k in sites:
                 if addr <= s < addr + 0x800 and tgt not in seen:
                     seen.add(tgt)
-                    print(f"   {k:4s} -> 0x{tgt:x}")
+                    print(f"   [{access(k):2s}] {k:7s} -> 0x{tgt:x}")
     return 0
 
 
