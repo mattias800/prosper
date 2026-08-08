@@ -67,6 +67,13 @@ def main():
     code += b"\xc5\xfc\x11\x05" + rel32(site, 8, slot)                   # vmovups [rip+d],ymm w
     site += 8
     code += b"\xc5\xf8\x10\x05" + rel32(site, 8, slot)                   # vmovups xmm,[rip+d] r
+    site += 8
+    # High registers (ymm8-15 / xmm8-15) invert VEX.R, giving c5 7c / c5 78. Pinning R=1 missed
+    # them: 876 of 14,722 such instructions on a real eboot, 6.0% (#2025 review). Encodings that
+    # differ only in R must decode to the SAME kind -- the register number is not the reference.
+    code += b"\xc5\x7c\x11\x05" + rel32(site, 8, slot)   # vmovups [rip+d],ymm8+  w
+    site += 8
+    code += b"\xc5\x78\x10\x05" + rel32(site, 8, slot)   # vmovups xmm8+,[rip+d]  r
     raw[0x100:0x100 + len(code)] = code
 
     # #1314: a seven-byte reference ending exactly at the executable PT_LOAD boundary must be
@@ -99,6 +106,8 @@ def main():
             (0x1063, "cmpi"),
             (0x106b, "vstorey"),
             (0x1073, "vloadx"),
+            (0x107b, "vstorey"),   # c5 7c: ymm8-15, same kind as c5 fc
+            (0x1083, "vloadx"),    # c5 78: xmm8-15, same kind as c5 f8
         }
         actual = set(module.code_xref[slot])
         assert actual == expected, (actual, expected)
@@ -120,6 +129,10 @@ def main():
         # which forms land in this bucket. `addi`/`subi`/`vstorey` are the ones that were missing.
         writers = {k for _, k in actual if XREF.access(k) in ("w", "rw")}
         assert writers == {"store", "storeb", "stored", "addi", "subi", "vstorey"}, sorted(writers)
+        # A VEX form differing only in the R bit must not decode to a different kind or width:
+        # the referenced address does not depend on which register the instruction uses.
+        vex = sorted(k for _, k in actual if k.startswith("v"))
+        assert vex == ["vloadx", "vloadx", "vstorey", "vstorey"], vex
         assert module.code_xref[direct_target] == [(0x1000, "call")]
         assert module.code_xref[tail_slot] == [(tail_site, "storeb")]
     finally:

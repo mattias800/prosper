@@ -197,14 +197,21 @@ class Module:
                     site = v + i
                     kind = ('addi', 'ori', 'adci', 'sbbi', 'andi', 'subi', 'xori', 'cmpi')[reg]
                     self.code_xref[site + 8 + disp].append((site, kind))
-                elif (i + 8 <= n and b == 0xc5 and d[i + 1] in (0xf8, 0xfc) and
+                elif (i + 8 <= n and b == 0xc5 and (d[i + 1] & 0x7b) == 0x78 and
                         d[i + 2] in (0x10, 0x11) and d[i + 3] in MODRM_RIP):
                     # VEX.128/256 vmovups xmm/ymm, [rip+disp32] (0x10, load) and the store form
                     # (0x11) -- 8 bytes with the 2-byte VEX prefix. A vectorised struct copy writes
                     # its destination through exactly this and through none of the forms above.
+                    #
+                    # The second VEX byte is R vvvv L pp. Masking 0x7b keeps vvvv=1111 and pp=00
+                    # (the unused-register, no-prefix encoding vmovups uses) while accepting BOTH
+                    # values of R and L -- so c5 f8/fc (xmm0-7/ymm0-7) and c5 78/7c (xmm8-15/
+                    # ymm8-15) all decode. Pinning R=1 by testing d[i+1] in (0xf8, 0xfc) missed the
+                    # high registers: measured on a clean 34.1 MB PPSA24651 eboot, 876 of 14,722
+                    # such instructions (6.0%) fell through, 869 of them loads (#2025 review).
                     disp = struct.unpack_from('<i', d, i + 4)[0]
                     site = v + i
-                    wide = 'y' if d[i + 1] == 0xfc else 'x'
+                    wide = 'y' if (d[i + 1] & 0x04) else 'x'      # L bit, not equality
                     kind = ('vload' if d[i + 2] == 0x10 else 'vstore') + wide
                     self.code_xref[site + 8 + disp].append((site, kind))
 
