@@ -50,6 +50,20 @@
 #endif
 #include "../host/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
 
+// #2371: a 64-bit stat, portably. MinGW's `struct stat::st_size` is FOUR BYTES and `::stat()`
+// fails outright with EOVERFLOW (errno 132) on any file larger than 2 GiB -- measured on GTA V's
+// 3,018,098,688-byte `update/update.rpf`. Every size taken from a 32-bit stat on Windows is
+// therefore either wrong or absent for large archives, and the failure is silent: the caller sees
+// "no such file" rather than "size did not fit".
+#ifdef _WIN32
+#define PROSPER_STAT ::_stat64
+using ProsperStat = struct _stat64;
+#else
+#define PROSPER_STAT ::stat
+using ProsperStat = struct stat;
+#endif
+
+
 #if defined(_WIN32) && defined(__MINGW32__)
 // MinGW's UCRT import library exposes this API, but its current headers omit the declaration.
 extern "C" _invalid_parameter_handler __cdecl
@@ -1690,7 +1704,15 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 }
 
 #ifndef _WIN32
+// #2371: 64-bit on Windows. MinGW's `struct stat::st_size` is 4 bytes and `::stat()` fails with
+// EOVERFLOW on any file over 2 GiB, so a guest that stats a large archive was told it does not
+// exist. GTA V ships a 3,018,098,688-byte `update/update.rpf`. `to_sce_stat64` already existed for
+// exactly this and was simply not used here.
+#ifdef _WIN32
+HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+#else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+#endif
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
                filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1);
@@ -2158,8 +2180,11 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         std::string host = guest.empty() ? std::string() : translate(guest.c_str());
         uint64_t size = 0; uint32_t id = 0;
 #ifndef _WIN32
-        struct stat st;
-        bool found = !host.empty() && ::stat(host.c_str(), &st) == 0;
+        ProsperStat st;
+        // #2371: 64-bit, same reason -- this `size` is handed straight back to the guest through
+        // out_sizes, so a >2 GiB archive reported as missing here is a content gap from its point
+        // of view rather than a stat failure.
+        bool found = !host.empty() && PROSPER_STAT(host.c_str(), &st) == 0;
 #else
         struct _stat64 st;
         bool found = !host.empty() && ::_stat64(host.c_str(), &st) == 0;
@@ -2176,7 +2201,7 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
             const std::string raw_guest = "/app0/raw/" + guest.substr(6);
             std::string raw_host = translate(raw_guest.c_str());
 #ifndef _WIN32
-            found = !raw_host.empty() && ::stat(raw_host.c_str(), &st) == 0;
+            found = !raw_host.empty() && PROSPER_STAT(raw_host.c_str(), &st) == 0;
 #else
             found = !raw_host.empty() && ::_stat64(raw_host.c_str(), &st) == 0;
 #endif
