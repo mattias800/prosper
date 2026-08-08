@@ -382,6 +382,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_reallocalign PRIVATE prosper_core)
   add_test(NAME reallocalign COMMAND test_reallocalign)
 
+  # #2178: no Sony pthread spelling may return a bare FreeBSD errno.
+  add_executable(test_sce_pthread_encoding tests/test_sce_pthread_encoding.cpp)
+  target_link_libraries(test_sce_pthread_encoding PRIVATE prosper_core)
+  add_test(NAME sce_pthread_encoding COMMAND test_sce_pthread_encoding)
+
   add_executable(test_reallocf tests/test_reallocf.cpp)
   target_link_libraries(test_reallocf PRIVATE prosper_core)
   add_test(NAME reallocf COMMAND test_reallocf)

@@ -2623,6 +2623,34 @@ SCE_PTHREAD_ALIAS(k_sce_sem_wait,     k_sem_wait)
 SCE_PTHREAD_ALIAS(k_sce_sem_trywait,  k_sem_trywait)
 SCE_PTHREAD_ALIAS(k_sce_sem_post,     k_sem_post)
 SCE_PTHREAD_ALIAS(k_sce_sem_getvalue, k_sem_getvalue)
+
+// #2178: the rest of the sweep. Every body below returns a BARE FreeBSD errno on at least one path
+// -- verified per body rather than assumed: `once` 0x16; `create` 12 and fbsd_errno(r); `attr_init`
+// 12; `setguardsize` 0x16 and fbsd_errno(rc); `set/getdetachstate` 0x16; `getname` 3 and 14;
+// `rename` 22 and 3; `key_create` 0x16, ENOMEM and fbsd_errno(r) -- and NONE of them encodes in
+// place, so every Sony spelling registered straight onto one handed the guest a value in the wrong
+// space. That is #1984's shape, the one that killed Oregon Trail until 38619f29.
+//
+// Worth restating because it is why this is a sweep and not a fix: the answer must not depend on
+// which spelling the guest happened to call, and a family where three members encode and the fourth
+// does not is the #1873 defect with a different subject.
+SCE_PTHREAD_ALIAS(k_sce_pthread_once,          k_pthread_once)
+SCE_PTHREAD_ALIAS(k_sce_pthread_create,        k_pthread_create)
+SCE_PTHREAD_ALIAS(k_sce_attr_init,             k_attr_init)
+SCE_PTHREAD_ALIAS(k_sce_attr_setguardsize,     k_attr_setguardsize)
+SCE_PTHREAD_ALIAS(k_sce_attr_setdetachstate,   k_attr_setdetachstate)
+SCE_PTHREAD_ALIAS(k_sce_attr_getdetachstate,   k_attr_getdetachstate)
+// DELIBERATELY NOT SWEPT: scePthreadGetname / Rename / SetName.
+//
+// They match the rule -- `k_pthread_getname` returns bare 3 and 14, `k_pthread_rename` bare 22 and
+// 3 -- and applying it makes them encode like every other Sony spelling. But `test_pthread_names`
+// already asserts the BARE values (`== 3` for ESRCH, `== 14` for EFAULT), and changing a passing
+// test so it agrees with a change is how a wrong change gets ratified.
+//
+// The test carries no rationale for those values, so it is weak evidence -- but it is evidence, and
+// the honest resolution needs something neither of us has here: a capture of what the real
+// libkernel returns. Left bare and raised on #2178 rather than settled by whoever edits last.
+SCE_PTHREAD_ALIAS(k_sce_key_create,            k_key_create)
 // The same bodies under their POSIX spellings, split along the RETURN-CONVENTION axis rather than
 // the encoding one (#2182). k_sem_* return the error NUMBER, which is right for scePthreadSem* and
 // wrong for sem_*: C11 7.26 and FreeBSD sem_wait(3) both specify "return -1, number left in errno".
@@ -4334,25 +4362,25 @@ void register_kernel_hle() {
     R("scePthreadBarrierDestroy", k_barrier_destroy);
     R("scePthreadBarrierattrInit", k_attr_noop);  R("scePthreadBarrierattrDestroy", k_attr_noop);
     R("scePthreadBarrierattrSetpshared", k_attr_noop);
-    R("scePthreadOnce", k_pthread_once);             R("pthread_once", k_pthread_once);
+    R("scePthreadOnce", k_sce_pthread_once);             R("pthread_once", k_pthread_once);
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
     R("scePthreadYield", k_pthread_yield);
     R("__stack_chk_fail", k_stack_chk_fail);   // diagnostic: log the guest canary on a canary-check failure
-    R("scePthreadCreate", k_pthread_create);
+    R("scePthreadCreate", k_sce_pthread_create);
     R("scePthreadJoin", k_pthread_join);
     R("scePthreadDetach", k_pthread_detach);
     R("scePthreadExit", k_pthread_exit);
-    R("scePthreadAttrInit", k_attr_init);
+    R("scePthreadAttrInit", k_sce_attr_init);
     R("scePthreadAttrDestroy", k_attr_destroy);
     R("scePthreadAttrSetstack", k_sce_attr_setstack);            // encoded (#2183)
     R("scePthreadAttrSetstacksize", k_sce_attr_setstacksize);    // encoded (#2183)
-    R("scePthreadAttrSetguardsize", k_attr_setguardsize);
+    R("scePthreadAttrSetguardsize", k_sce_attr_setguardsize);
     R("scePthreadAttrSetinheritsched", k_attr_noop);
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
     R("scePthreadAttrSetschedparam", k_log_attr_setschedparam);
-    R("scePthreadAttrSetdetachstate", k_attr_setdetachstate);   // was no-op -> detached threads leaked
-    R("scePthreadAttrGetdetachstate", k_attr_getdetachstate);   // was MISSING -> uninitialized *state
+    R("scePthreadAttrSetdetachstate", k_sce_attr_setdetachstate);   // was no-op -> detached threads leaked
+    R("scePthreadAttrGetdetachstate", k_sce_attr_getdetachstate);   // was MISSING -> uninitialized *state
     R("scePthreadAttrGetschedparam", k_attr_getschedparam);
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
@@ -4371,7 +4399,7 @@ void register_kernel_hle() {
     R("pthread_set_name_np", k_pthread_rename);
     R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
-    R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);
+    R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_sce_key_create);
     R("pthread_key_delete", k_key_delete);   R("scePthreadKeyDelete", k_key_delete);
     R("pthread_getspecific", k_getspecific); R("scePthreadGetspecific", k_getspecific);
     R("pthread_setspecific", k_setspecific); R("scePthreadSetspecific", k_setspecific);
@@ -4450,7 +4478,12 @@ void register_kernel_hle() {
     Hle::register_fn("g0VTBxfJyu0", (HleFn)k_attr_noop, "sceKernelGetCurrentCpu");
     Hle::register_fn("Tz4RNUCBbGI", (HleFn)k_attr_noop, "_sceKernelRtldThreadAtexitIncrement");
     Hle::register_fn("jh+8XiK4LeE", (HleFn)k_attr_noop, "sceKernelIsAddressSanitizerEnabled");
-    Hle::register_fn("El+cQ20DynU", (HleFn)k_attr_setguardsize, "scePthreadAttrSetguardsize");
+    // #2178: the Sony wrapper, not the raw body. This explicit-NID line registers the SAME NID
+    // as the R("scePthreadAttrSetguardsize", ...) above and runs later, so it silently won --
+    // the sweep re-pointed the name-based registration and this one put the bare-errno body
+    // straight back. Caught by the invariant test rather than by reading, which is the whole
+    // argument for asserting the property over the family instead of listing instances.
+    Hle::register_fn("El+cQ20DynU", (HleFn)k_sce_attr_setguardsize, "scePthreadAttrSetguardsize");
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory
     register_kernel_time_hle();   // time/clock + C11 threads + stubs
