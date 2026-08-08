@@ -23,10 +23,45 @@
 # Verified on Linux/RADV through tools/screenshot, default launch, --seconds 30 --count 9 (270 s), on
 # master at ad5f5132 + c477d938. Two runs, identical CRC set, sampling counts differing by one.
 #
-# This does NOT reach a title screen -- the run still ends black. It is progression within the boot
-# sequence. Extending it toward the title screen is the obvious next step and needs someone to watch
-# where it stalls next.
-f200-400:cross
-f600-800:cross
-f1000-1200:cross
-f1400-20000:cross
+# This does NOT reach a title screen. It reaches the auto-save notice, which on SEGA titles sits just
+# before one, so extending it is worth another pass -- watch where it stalls next and add pulses there.
+#
+# One observation, flagged rather than claimed: the auto-save notice renders LETTERBOXED into a
+# horizontal band, with the top and bottom thirds black, rather than filling the 3840x2160 target. That
+# may be the title's own presentation for this notice or it may be a viewport/scissor defect; it has not
+# been checked against hardware, and nothing else in this sequence shows it.
+# Pulses all the way through, NOT a trailing hold. The first version of this route ended with
+# `f1400-20000:cross` and stopped advancing at the legal screen -- for a reason the route created
+# rather than one the title has, since a hold produces no further transitions. Replacing it with
+# continued pulses reached a seventh state: the game's own auto-save notice (824976b1), checkered
+# background, "Saving" spinner and all. That is past the boot logos and into the title's own UI.
+f200-300:cross
+f400-500:cross
+f600-700:cross
+f800-900:cross
+f1000-1100:cross
+f1200-1300:cross
+f1400-1500:cross
+f1600-1700:cross
+f1800-1900:cross
+f2000-2100:cross
+f2200-2300:cross
+f2400-2500:cross
+f2600-2700:cross
+f2800-2900:cross
+f3000-3100:cross
+f3200-3300:cross
+f3400-3500:cross
+f3600-3700:cross
+f3800-3900:cross
+f4000-4100:cross
+f4200-4300:cross
+f4400-4500:cross
+f4600-4700:cross
+f4800-4900:cross
+f5000-5100:cross
+f5200-5300:cross
+f5400-5500:cross
+f5600-5700:cross
+f5800-5900:cross
+f6000-6100:cross
