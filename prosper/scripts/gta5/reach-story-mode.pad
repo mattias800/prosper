@@ -31,15 +31,31 @@ f2200-2220:cross
 f2400-2420:cross
 
 # --- ONLINE -> GTA+ -> STORY, then enter -------------------------------------------------------
+# FOUR R1 presses, not two, and the reason is measured: in one run only ONE of two registered, the
+# menu stayed on GTA+, and the following Cross entered GTA+ (an online feature) instead of STORY.
+# STORY is the RIGHTMOST tab -- the bar reads [L1] ONLINE GTA+ STORY [R1] -- so a press that lands
+# when already on STORY clamps rather than overshooting. Extra presses are therefore free in the
+# right-hand direction and are the cheap fix for an eaten input; two were not enough.
 f2600-2620:r1
-f2750-2770:r1
-f2900-2920:cross
+f2700-2720:r1
+f2800-2820:r1
+f2880-2900:r1
+f3000-3020:cross
 
 # A second Cross well after, in case the first landed during a transition. If STORY was already
 # entered, this lands on whatever the story flow presents (a save-slot or difficulty prompt), which
 # is progress rather than a wrong turn.
-f3200-3220:cross
+f3300-3320:cross
 f3600-3620:cross
+
+# Past the Story Mode entry: the flow presents a save-slot / "Resume Story" confirmation before the
+# world loads. Spaced pulses rather than a burst, same reason as above.
+f4000-4020:cross
+f4400-4420:cross
+f4800-4820:cross
+f5200-5220:cross
+f5600-5620:cross
+f6000-6020:cross
 
 # --- WHAT THIS ROUTE REACHES TODAY, and where it stops ------------------------------------------
 #
