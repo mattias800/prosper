@@ -142,7 +142,10 @@ class TestFailureIsNotAResult(unittest.TestCase):
     def test_container_ptrace_denial_is_named_specifically(self):
         _, _, err = self._run_with("", "ptrace: Operation not permitted.")
         self.assertIsNotNone(err)
-        self.assertIn("HOST", err, "the ptrace denial must tell the user where to run it")
+        # The message must state the *siting* rule, because the denial is otherwise silent:
+        # no stacks is byte-identical to a process with nothing blocked.
+        self.assertIn("container", err,
+                      "the ptrace denial must tell the user which side to run gdb on")
 
     def test_dead_process_is_named(self):
         _, _, err = self._run_with("", "ptrace: No such process.")
