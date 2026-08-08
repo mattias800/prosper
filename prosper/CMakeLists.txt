@@ -382,6 +382,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_reallocalign PRIVATE prosper_core)
   add_test(NAME reallocalign COMMAND test_reallocalign)
 
+  # #2168: a condvar destroy must refuse while a thread is parked inside it.
+  add_executable(test_cond_destroy_busy tests/test_cond_destroy_busy.cpp)
+  target_link_libraries(test_cond_destroy_busy PRIVATE prosper_core)
+  add_test(NAME cond_destroy_busy COMMAND test_cond_destroy_busy)
+
   # #2178: no Sony pthread spelling may return a bare FreeBSD errno.
   add_executable(test_sce_pthread_encoding tests/test_sce_pthread_encoding.cpp)
   target_link_libraries(test_sce_pthread_encoding PRIVATE prosper_core)

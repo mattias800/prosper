@@ -367,6 +367,16 @@ namespace {
         return pt_static_sentinel(prev) ? nullptr : prev;
     }
 
+    // The non-destructive counterpart of pt_claim_slot: reads the slot WITHOUT retiring it. Needed
+    // by a destroy that can legitimately refuse (#2168) -- claiming first and answering EBUSY after
+    // would leave the guest holding a handle it has been told is still live, pointing at storage
+    // prosper has already quarantined.
+    inline void* pt_peek_slot(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void* cur = __atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE);
+        return pt_static_sentinel(cur) ? nullptr : cur;
+    }
+
     inline void pt_report_destroyed(const char* what) {
         static std::atomic<unsigned> seen{0};
         if (seen.fetch_add(1) < 16)
@@ -377,6 +387,12 @@ namespace {
     struct GuestCondState {
         int32_t clock_id = 0;
         uint64_t generation = 0;
+        // #2168: FreeBSD's _thr_cond_destroy refuses a condvar that still has waiters
+        // (`cvp->__has_user_waiters || cvp->kcond.c_has_waiters` -> EBUSY). prosper kept no waiter
+        // count, so a guest destroying a condvar out from under a parked thread was told it
+        // succeeded and had its slot cleared, where hardware hands back EBUSY and keeps a working
+        // object.
+        uint32_t waiters = 0;
     };
     std::mutex g_guest_cond_state_mutex;
     std::unordered_map<pthread_cond_t*, GuestCondState> g_guest_cond_states;
@@ -394,6 +410,32 @@ namespace {
         auto found = g_guest_cond_states.find(cond);
         return found == g_guest_cond_states.end() ? GuestCondState{} : found->second;
     }
+    // Bracketing a wait. Registered on demand: a condvar can be waited on before anything
+    // registered it (a guest static initialiser), and a wait that is not counted would let the
+    // busy check below answer "no waiters" for a thread that is demonstrably parked.
+    void guest_cond_waiter_enter(pthread_cond_t* cond) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        ++g_guest_cond_states[cond].waiters;
+    }
+    void guest_cond_waiter_leave(pthread_cond_t* cond) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        auto found = g_guest_cond_states.find(cond);
+        if (found != g_guest_cond_states.end() && found->second.waiters)
+            --found->second.waiters;
+    }
+    bool guest_cond_has_waiters(pthread_cond_t* cond) {
+        std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
+        auto found = g_guest_cond_states.find(cond);
+        return found != g_guest_cond_states.end() && found->second.waiters > 0;
+    }
+    // RAII so an early return or a throw inside the wait cannot leak a waiter and wedge every
+    // later destroy of this condvar into a permanent EBUSY.
+    struct GuestCondWaiterScope {
+        pthread_cond_t* cond;
+        explicit GuestCondWaiterScope(pthread_cond_t* c) : cond(c) { guest_cond_waiter_enter(c); }
+        ~GuestCondWaiterScope() { guest_cond_waiter_leave(cond); }
+    };
+
     void guest_cond_advance(pthread_cond_t* cond) {
         std::lock_guard<std::mutex> lock(g_guest_cond_state_mutex);
         auto found = g_guest_cond_states.find(cond);
@@ -980,6 +1022,15 @@ SCE_PTHREAD_ALIAS(k_sce_condattr_getclock,     k_condattr_getclock)
 SCE_PTHREAD_ALIAS(k_sce_condattr_setpshared,   k_condattr_setpshared)
 SCE_PTHREAD_ALIAS(k_sce_condattr_getpshared,   k_condattr_getpshared)
 HLE(k_cond_destroy) {
+    // #2168: refuse a condvar that still has waiters, the way FreeBSD's _thr_cond_destroy does.
+    // Checked BEFORE pt_claim_slot, because claiming retires the slot -- answering EBUSY after
+    // clearing it would be the worst of both: the guest keeps a handle it is told is still live,
+    // pointing at storage prosper has already quarantined.
+    if (auto* existing = (pthread_cond_t*)pt_peek_slot(a0)) {
+        if (guest_cond_has_waiters(existing))
+            // Bare errno here; the Sony spelling encodes it via SCE_PTHREAD_ALIAS below.
+            return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EBusy);
+    }
     if (auto* cond = (pthread_cond_t*)pt_claim_slot(a0)) {   // #2176: claim, then retire
         // Quarantined, not freed, and the host `pthread_cond_destroy` runs at reclaim rather than
         // here — see the contract block above k_mutex_destroy and sync_retire.hpp (#2042). A thread
@@ -991,11 +1042,15 @@ HLE(k_cond_destroy) {
     }
     return 0;
 }
+// #2168 makes this body fallible, so the Sony spelling needs the encoding split -- previously it
+// was registered straight onto k_cond_destroy with the comment "always 0", which was true until now.
+SCE_PTHREAD_ALIAS(k_sce_cond_destroy, k_cond_destroy)
 HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
 HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_broadcast(c); } return 0; }
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) {
+          GuestCondWaiterScope waiting(c);   // #2168 -- covers every wait path in this body
           (void)interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
                                         nullptr, kGuestMutexCondWaitBookkeeping);
       } }
@@ -1013,6 +1068,13 @@ HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu
 HLE(k_cond_timedwait) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 22;                                   // EINVAL
+    // #2168: one scope for the WHOLE body, not one per call. Review found the count bracketed on
+    // k_cond_wait alone, which left this function's null-deadline branch -- an INDEFINITE park
+    // through the identical call -- invisible to the busy check, so a destroy retired the slot out
+    // from under a thread parked forever. Scoping the body rather than the call means a future
+    // branch added here cannot miss it; a future BODY still has to remember, which is why the three
+    // cond-wait bodies are the unit and there are exactly three.
+    GuestCondWaiterScope waiting(c);
     if (!a2) {
         int rc = interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
                                          nullptr, kGuestMutexCondWaitBookkeeping);
@@ -2497,6 +2559,7 @@ HLE(k_cond_timedwait_sce) {
     // where prosper actually tracks ownership -- the registry is Windows-only, and on POSIX the
     // host already implements the FreeBSD contract itself.
     if (guest_mutex_not_owned_by_self(m)) return prosper::hle::kSceKernelErrorEPERM;
+    GuestCondWaiterScope waiting(c);   // #2168: this body parks too, and was not counted either
     timespec dl = abs_deadline_us(a2);
     int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
                                           nullptr, kGuestMutexCondWaitBookkeeping);
@@ -4325,7 +4388,7 @@ void register_kernel_hle() {
     R("scePthreadCondattrSetpshared", k_sce_condattr_setpshared);
     R("scePthreadCondattrGetpshared", k_sce_condattr_getpshared);
     R("scePthreadCondInit", k_sce_cond_init);
-    R("scePthreadCondDestroy", k_cond_destroy);                     // always 0
+    R("scePthreadCondDestroy", k_sce_cond_destroy);                 // EBUSY-capable since #2168
     R("scePthreadCondSignal", k_cond_signal);
     R("scePthreadCondBroadcast", k_cond_broadcast);
     R("scePthreadCondWait", k_cond_wait);
