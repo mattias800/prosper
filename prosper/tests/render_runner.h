@@ -1125,6 +1125,145 @@ inline constexpr uint64_t backend_timestamp_delta(uint64_t begin, uint64_t end,
     return (end - begin) & mask;
 }
 
+// --- per-pass GPU device time (#2333) -------------------------------------------------------
+//
+// The backend already measures ONE device-time envelope per submission batch. That answers "how
+// long did the GPU take" and cannot answer the question #2276 is actually stuck on: whether the
+// cost is rasterisation or the ~16 pass BOUNDARIES the work is split across. A single envelope is
+// the sum, and the sum is the same either way.
+//
+// So this records a timestamp pair around each render pass. Gated: the pool creation and the two
+// writes are real work, and this must not be paid on an ordinary run.
+//
+// It is deliberately one query pool PER PASS rather than one sized pool per command buffer. The
+// pass count is not known when the command buffer starts -- the collapsed Blue Prince state records
+// over a thousand passes into a single command buffer (#2333) -- so a pre-sized pool would either
+// cap the measurement silently or guess large. A diagnostic that silently stops recording after N
+// passes would report the surviving passes as though they were all of them, which is the exact
+// failure mode this instrument exists to avoid.
+struct BackendPassTiming {
+    VkDevice dev = VK_NULL_HANDLE;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    double period_ns = 0.0;
+    uint32_t valid_bits = 0;
+    uint32_t width = 0, height = 0;
+    uint64_t target = 0;
+    size_t draws = 0;
+    // Draws in this pass whose colour write mask is non-zero. #2283 turns on whether a
+    // no-colour-base pass is depth-only: extents that look like shadow maps are circumstantial, a
+    // mask of 0 on every draw is the direct check. Counted rather than inferred so a single
+    // colour-writing draw in such a pass is visible instead of averaged away.
+    size_t colour_writing_draws = 0;
+    bool ended = false;
+};
+
+inline bool backend_pass_timing_enabled() {
+    // Live getenv rather than a cached value: gpu_replay arms this per invocation, and a
+    // process-lifetime cache would make a second run in the same process silently unmeasured.
+    static const bool on = getenv("PROSPER_PASS_TIMING") != nullptr;
+    return on;
+}
+
+inline std::vector<BackendPassTiming>& backend_pass_timings() {
+    static std::vector<BackendPassTiming> records;
+    return records;
+}
+
+inline void backend_pass_timing_begin(VkDevice dev, VkCommandBuffer cmd, double period_ns,
+                                      uint32_t valid_bits, uint32_t width, uint32_t height,
+                                      uint64_t target, size_t draws, size_t colour_writing_draws) {
+    if (!backend_pass_timing_enabled() || !dev || !cmd || period_ns <= 0.0 || !valid_bits) return;
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = 2;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(dev, &info, nullptr, &pool) != VK_SUCCESS || !pool) return;
+    vkCmdResetQueryPool(cmd, pool, 0, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+    backend_pass_timings().push_back(
+        BackendPassTiming{dev, pool, period_ns, valid_bits, width, height, target, draws,
+                          colour_writing_draws, false});
+}
+
+inline void backend_pass_timing_end(VkCommandBuffer cmd) {
+    if (!backend_pass_timing_enabled() || !cmd) return;
+    auto& records = backend_pass_timings();
+    if (records.empty() || records.back().ended || !records.back().pool) return;
+    // Same reason as the batch envelope: make the closing timestamp depend on every command in the
+    // pass rather than on pipeline position alone, so this is one interval and not a lower bound.
+    //
+    // This barrier also ORDERS pass completions, so it can only ever produce non-overlapping
+    // measured intervals -- which means "coverage never exceeds 100%" is a statement about the
+    // measurement unless the barrier is removed and the result survives. It was, and it does:
+    // without this barrier, 10,715 batches still show 0 over 100% and a median coverage of 92.1%
+    // against 92.9% with it. The two agree within ~1 point, so the barrier is neither manufacturing
+    // the non-overlap nor materially inflating per-pass times.
+    //
+    // That is corroboration rather than proof: removing the barrier makes each interval a lower
+    // bound, which lowers sums and would MASK overlap rather than reveal it. So report per-pass
+    // non-overlap as a property of the measurement, not of the workload.
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 0, nullptr);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, records.back().pool, 1);
+    records.back().ended = true;
+}
+
+// Called only after the batch's fence has proved completion -- reading a timestamp query whose
+// commands may still be executing returns NOT_READY, and treating that as 0 ms would understate
+// exactly the passes that took longest.
+inline void backend_pass_timing_report(bool completed, double envelope_ms = -1.0) {
+    if (!backend_pass_timing_enabled()) return;
+    auto& records = backend_pass_timings();
+    if (records.empty()) return;
+    if (completed) {
+        double total = 0.0;
+        size_t reported = 0, unreadable = 0;
+        for (const BackendPassTiming& record : records) {
+            if (!record.ended) { ++unreadable; continue; }
+            uint64_t values[2] = {0, 0};
+            if (vkGetQueryPoolResults(record.dev, record.pool, 0, 2, sizeof(values), values,
+                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+                ++unreadable;
+                continue;
+            }
+            const uint64_t ticks =
+                backend_timestamp_delta(values[0], values[1], record.valid_bits);
+            const double ms = static_cast<double>(ticks) * record.period_ns / 1'000'000.0;
+            total += ms;
+            ++reported;
+            fprintf(stderr,
+                    "[pass-timing] pass=%zu %ux%u target=0x%llx draws=%zu cwm_draws=%zu device=%.4f ms\n",
+                    reported - 1, record.width, record.height,
+                    (unsigned long long)record.target, record.draws,
+                    record.colour_writing_draws, ms);
+        }
+        // The count of passes that could NOT be read is printed even when it is zero. A per-pass
+        // report whose passes silently go missing looks like a frame with fewer, cheaper passes --
+        // which is a conclusion, not an absence of data.
+        // The reconciliation, printed per BATCH rather than left to cross-run arithmetic.
+        // Summing per-pass times over a whole run and comparing against a cumulative average
+        // compares two different populations and cannot distinguish "this instrument covers a
+        // subset of device work" from "the envelopes overlap so their sum was never a total".
+        // Against the SAME batch's own envelope the question is local and has one answer:
+        // coverage below 100% is work inside this command buffer that is not in a render pass
+        // (compute, blits, readback copies), and coverage above 100% means the per-pass
+        // intervals overlap each other.
+        if (envelope_ms >= 0.0) {
+            const double coverage = envelope_ms > 0.0 ? total / envelope_ms * 100.0 : 0.0;
+            fprintf(stderr,
+                    "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms envelope=%.3f ms coverage=%.1f%%\n",
+                    reported, unreadable, total, envelope_ms, coverage);
+        } else {
+            fprintf(stderr, "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms\n",
+                    reported, unreadable, total);
+        }
+    }
+    for (const BackendPassTiming& record : records)
+        if (record.pool) vkDestroyQueryPool(record.dev, record.pool, nullptr);
+    records.clear();
+}
+
+
 // A successful queue submit followed by failed fence and queue-idle waits is not an ordinary
 // failure: Vulkan still owns every referenced resource, so those objects must be retained.
 enum class BackendSubmissionState { NotSubmitted, Complete, Pending };
@@ -1326,6 +1465,10 @@ public:
                 }
             }
             release_gpu_timestamp();
+            // Passed the envelope this batch just measured, so the two instruments are compared
+            // against each other on identical work rather than across a run (#2333).
+            backend_pass_timing_report(state == BackendSubmissionState::Complete,
+                                       result.gpu_timestamp_samples ? result.gpu_device_ms : -1.0);
             vkDestroyFence(dev, fence, nullptr);
             commands_.clear();
             finish_persistent_state(state == BackendSubmissionState::Complete);
@@ -5976,6 +6119,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool geom_active = geom_buf != VK_NULL_HANDLE && geom_counter != VK_NULL_HANDLE;
 
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
+    backend_pass_timing_begin(dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits,
+                              rpbi.renderArea.extent.width, rpbi.renderArea.extent.height,
+                              color_target ? color_target->persistent_id : 0, dv.size(),
+                              [&] {   // #2283: colour-writing draws, counted not inferred
+                                  // Gate-checked HERE, not only inside the callee. Arguments are
+                                  // evaluated before the call, so without this the loop ran on every
+                                  // pass of every DEFAULT run -- an O(draws) scan added to the hot
+                                  // path by a diagnostic that was switched off. Exactly the cost
+                                  // this instrument exists to find.
+                                  if (!backend_pass_timing_enabled()) return size_t{0};
+                                  size_t n = 0;
+                                  for (size_t i = 0; i < dv.size() && i < draws.size(); ++i)
+                                      if (draws[i].ps && draws[i].ps->color_write_mask) ++n;
+                                  return n;
+                              }());   // #2333
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -6026,6 +6184,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    backend_pass_timing_end(cmd);   // #2333
     // Fence waits used to provide the device-memory dependency between every target call. Batched
     // command buffers deliberately remove those intermediate waits, and command-buffer/submission
     // order alone permits action commands to overlap. Publish persistent attachment writes here so
