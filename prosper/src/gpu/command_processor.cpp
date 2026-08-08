@@ -35,6 +35,106 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 
 namespace prosper::gpu {
 
+// --- per-draw snapshot recycling (#2334) ----------------------------------------------------
+//
+// A draw's snapshot deep-copies the three register files. Copying an unordered_map into a FRESH
+// map allocates one node per entry; copying into a still-populated one REUSES the nodes it already
+// has (libstdc++ `_ReuseOrAllocNode`). Measured on a 245-entry map, the size of `cx`:
+//
+//     fresh destination each time : 246.0 allocations per copy
+//     reused destination          :   0.0
+//     reused, source mutating     :   1.0
+//
+// Blue Prince's collapsed state takes 900,000 snapshots in 100 s at ~347 entries each -- 312
+// million node allocations, ~3.12 million/second, and roughly half the saturated render thread
+// between the allocator and the copying (#2215). So the snapshots are recycled rather than
+// allocated, and the container is left alone: no `.cx`/`.sh`/`.uc` call site changes.
+//
+// THE RESET IS THE WHOLE CORRECTNESS ARGUMENT. `GpuState` has 25 top-level data members and a
+// snapshot site assigns only seven of them. On a fresh object the rest are default-constructed; on
+// a naively recycled one they would carry the PREVIOUS snapshot's values -- `draws`, `dispatches`,
+// `dma_copies`, `ordered_memory_effects`, and worst of all `last_snapshot_`, which is itself a
+// `shared_ptr<const GpuState>` and would chain every retired snapshot into the next one. Wrong
+// data, and unbounded retention, with nothing to make either visible.
+//
+// So a recycled object is reset by assigning a default-constructed `GpuState` over it, which
+// covers every member INCLUDING ones added after this was written -- the reset cannot silently
+// fall behind the struct. The three register maps are moved aside first and moved back after, so
+// exactly the nodes worth keeping survive the reset and nothing else does. Both moves are O(1)
+// pointer steals.
+namespace {
+
+struct GpuStateSnapshotPool {
+    std::mutex mutex;
+    std::vector<GpuState*> free_list;
+};
+GpuStateSnapshotPool& gpustate_snapshot_pool() {
+    static GpuStateSnapshotPool pool;
+    return pool;
+}
+// Bounded so a pathological submit cannot retain snapshots indefinitely; past this, released
+// objects are simply deleted. 256 is far above the live-snapshot count of any observed frame.
+constexpr size_t kGpuStateSnapshotPoolMax = 256;
+
+// Counters for the regression test, which asserts recycling actually happens rather than trusting
+// that it does -- a pool that silently never hits would leave every measurement above unchanged
+// and look exactly like this code working.
+std::atomic<uint64_t> g_gpustate_snapshot_acquires{0};
+std::atomic<uint64_t> g_gpustate_snapshot_pool_hits{0};
+
+void release_gpustate_snapshot(GpuState* state) {
+    if (!state) return;
+    // Reset EVERY member, then restore only the register files' node storage.
+    auto cx_nodes = std::move(state->cx);
+    auto sh_nodes = std::move(state->sh);
+    auto uc_nodes = std::move(state->uc);
+    *state = GpuState{};
+    state->cx = std::move(cx_nodes);
+    state->sh = std::move(sh_nodes);
+    state->uc = std::move(uc_nodes);
+    auto& pool = gpustate_snapshot_pool();
+    {
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        if (pool.free_list.size() < kGpuStateSnapshotPoolMax) {
+            pool.free_list.push_back(state);
+            return;
+        }
+    }
+    delete state;
+}
+
+}  // namespace
+
+std::shared_ptr<GpuState> acquire_gpustate_snapshot() {
+    g_gpustate_snapshot_acquires.fetch_add(1, std::memory_order_relaxed);
+    // PROSPER_NO_GPUSTATE_POOL: opt out, so the A/B for this change is single-variable on ONE
+    // binary rather than a comparison of two builds. Same reason as PROSPER_NO_SUBGROUP_SCAN_MEMO
+    // (#2259), PROSPER_NO_GDS_SCAN_MEMO (#2334) and PROSPER_NO_INDEX_ARENA (#2258). Read once:
+    // nothing arms this at runtime, and this is a per-draw path.
+    static const bool disabled = getenv("PROSPER_NO_GPUSTATE_POOL") != nullptr;
+    if (disabled) return std::make_shared<GpuState>();
+    GpuState* raw = nullptr;
+    {
+        auto& pool = gpustate_snapshot_pool();
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        if (!pool.free_list.empty()) {
+            raw = pool.free_list.back();
+            pool.free_list.pop_back();
+            g_gpustate_snapshot_pool_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!raw) raw = new GpuState();
+    return std::shared_ptr<GpuState>(raw, release_gpustate_snapshot);
+}
+
+// Test hook (#2334): recycling is invisible from outside -- same types, same behaviour, only fewer
+// allocations -- so the guard needs the counters to tell "the pool is working" from "the pool never
+// hits and everything still passes".
+void gpustate_snapshot_pool_stats(uint64_t& acquires, uint64_t& pool_hits) {
+    acquires = g_gpustate_snapshot_acquires.load(std::memory_order_relaxed);
+    pool_hits = g_gpustate_snapshot_pool_hits.load(std::memory_order_relaxed);
+}
+
 std::vector<RegWatchEntry> parse_reg_watch(const char* setting) {
     std::vector<RegWatchEntry> entries;
     if (!setting || !*setting) return entries;
@@ -4454,7 +4554,7 @@ void GpuState::apply(const Pm4Command& c) {
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
+                auto snap = acquire_gpustate_snapshot();   // recycled, not allocated (#2334)
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
@@ -4505,7 +4605,7 @@ void GpuState::apply(const Pm4Command& c) {
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
+                auto snap = acquire_gpustate_snapshot();   // recycled, not allocated (#2334)
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
@@ -4548,7 +4648,7 @@ void GpuState::apply(const Pm4Command& c) {
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
+                auto snap = acquire_gpustate_snapshot();   // recycled, not allocated (#2334)
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
@@ -4795,7 +4895,7 @@ void GpuState::apply(const Pm4Command& c) {
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
+                auto snap = acquire_gpustate_snapshot();   // recycled, not allocated (#2334)
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot
@@ -4827,7 +4927,7 @@ void GpuState::apply(const Pm4Command& c) {
                             rd(0xc8), rd(0x8b), rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f));
             }
             if (state_dirty_ || !last_snapshot_) {
-                auto snap = std::make_shared<GpuState>();
+                auto snap = acquire_gpustate_snapshot();   // recycled, not allocated (#2334)
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 snap->num_instances = num_instances;
                 snap->command_order = command_order;   // #305 instrument: order at snapshot

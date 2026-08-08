@@ -382,6 +382,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_reallocalign PRIVATE prosper_core)
   add_test(NAME reallocalign COMMAND test_reallocalign)
 
+  # Per-draw GpuState snapshot recycling (#2334): the reset is complete, and the recycling actually
+  # removes the per-entry allocations rather than silently allocating fresh every time.
+  add_executable(test_gpustate_pool tests/test_gpustate_pool.cpp)
+  target_link_libraries(test_gpustate_pool PRIVATE prosper_core)
+  add_test(NAME gpustate_pool COMMAND test_gpustate_pool)
+
   add_executable(test_reallocf tests/test_reallocf.cpp)
   target_link_libraries(test_reallocf PRIVATE prosper_core)
   add_test(NAME reallocf COMMAND test_reallocf)

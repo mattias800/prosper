@@ -349,6 +349,19 @@ struct RegWatchEntry {
 // so one bad entry cannot silently disable a whole watch. An empty/absent setting yields no entries.
 std::vector<RegWatchEntry> parse_reg_watch(const char* setting);
 
+// Per-draw snapshot recycling (#2334). Hands back a GpuState that is default-valued in every member
+// EXCEPT the three register files, which deliberately retain their node storage so the caller's
+// `snap->cx = cx` reuses those nodes instead of allocating one per entry. Returned through a
+// shared_ptr whose deleter resets the object and returns it to the pool.
+//
+// Exposed rather than kept file-local so the regression guard can inspect a recycled object
+// directly. That matters because recycling is invisible from outside -- same types, same behaviour,
+// only fewer allocations -- so a pool that never recycled, and a reset that leaked the previous
+// snapshot's `draws`/`last_snapshot_`, would both leave every externally observable property
+// unchanged. The guard checks the object, not the behaviour.
+std::shared_ptr<GpuState> acquire_gpustate_snapshot();
+void gpustate_snapshot_pool_stats(uint64_t& acquires, uint64_t& pool_hits);
+
 // Whether GpuState::sh_prov write provenance is being recorded for #305 or selected capture #1853.
 bool udprov_enabled();
 
