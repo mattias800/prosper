@@ -504,7 +504,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56), every one
   `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
   `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. The dispatch is
-  full-screen: `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. Three sites
+  full-screen: `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **Four** sites
   independently encode which image-atomic image shapes are supported, and **#2272 generalised exactly
   one of them** to 2D_ARRAY (line numbers as of `7a493df2`):
 
@@ -512,7 +512,8 @@ One line per falsified hypothesis, with the evidence that killed it.
   | --- | --- | --- |
   | coverage predicate | `src/gpu/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
   | lowering gate | `src/gpu/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
-  | validator carve-out | `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`) | no |
+  | validator carve-out | `src/gpu/shader_resources.cpp:1031` (`r.img_dim == 1 && r.depth == 1`) | no |
+  | backend materialization | `frontends/shared/live_compute.cpp:4304` (same clause) | no |
 
   So the lowering emits the buffer-backed binding for a 2D_ARRAY atomic and the validator then
   rejects that exact binding as `WrongType`. That is why the capture shows `recompiled=yes` with
@@ -527,8 +528,14 @@ One line per falsified hypothesis, with the evidence that killed it.
   neither the index nor the bound**, so relaxing the validator alone makes this dispatch *run* and
   every layer atomically accumulates into layer 0's texels -- a silent wrong result on a device-scope
   atomic, strictly worse than the current skip, and it would read as progress in a screenshot. Correct
-  order: fold the layer into the index (`(z*height + y)*width + x`) and the bound and require the
-  backing buffer to cover `width*height*depth*4`, **then** widen sites 1 and 3. Tracked on **#2265**,
+  order: teach the backend's detile/retile to cover the layers, fold the layer into the shader index
+  and bound to match the layout it produces, **then** widen the predicates. Note the backing
+  allocation is **already** large enough -- the resource reports `available=66355200` and
+  `3840*2160*2*4 = 66,355,200` exactly -- so sizing is not the obstacle; the **layout** is.
+  `tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel)` (`src/gpu/tile.hpp:81`) takes
+  no depth or layer argument, so the detile behind the atomic buffer view is inherently 2D and the
+  tiled **array slice pitch** is the open unknown that needs evidence rather than an assumed
+  `width*height`. Tracked on **#2265**,
   which owns this chain; Refs #2272 / #2293.
 - **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
   storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
