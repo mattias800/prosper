@@ -654,6 +654,48 @@ uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
     return std::min(declared_bytes, ceiling) & ~3u;
 }
 
+// #2215 instrument -- see live_renderer.hpp for why this is a process-wide slot rather than a
+// thread_local (the sampler asks from a different thread than the one it is asking about).
+std::atomic<unsigned long>& renderer_callback_tid() {
+    static std::atomic<unsigned long> tid{0};
+    return tid;
+}
+
+bool tid_is_in_renderer_callback(unsigned long native_tid) {
+    const unsigned long current = renderer_callback_tid().load(std::memory_order_relaxed);
+    return current != 0 && current == native_tid;
+}
+
+// Every callback ENTRY, not the ~0.6% of them a sampler happens to catch. See the self-check in
+// hle_kernel.cpp: a zero here is real evidence that the strong override never linked, whereas a zero
+// count of sampler sightings is just the ordinary outcome at this base rate (#2347).
+std::atomic<unsigned long long> g_renderer_callback_entries{0};
+
+extern "C" unsigned long long prosper_renderer_callback_entries() {
+    return g_renderer_callback_entries.load(std::memory_order_relaxed);
+}
+
+ScopedRendererCallbackTid::ScopedRendererCallbackTid() {
+    g_renderer_callback_entries.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    const unsigned long self = (unsigned long)GetCurrentThreadId();
+#else
+    const unsigned long self = (unsigned long)(uintptr_t)pthread_self();
+#endif
+    previous = renderer_callback_tid().exchange(self, std::memory_order_relaxed);
+}
+
+ScopedRendererCallbackTid::~ScopedRendererCallbackTid() {
+    renderer_callback_tid().store(previous, std::memory_order_relaxed);
+}
+
+// The strong definition that overrides prosper_core's weak stub once the live renderer is in
+// the link. Keeping the override here rather than in prosper_core is what lets a build WITHOUT
+// the renderer answer 0 truthfully instead of failing to link (#2215).
+extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
+    return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
+}
+
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
@@ -1109,6 +1151,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         [frame_dir, dump_bmps, invalidate_ds](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
+            // #2215 instrument: publish which thread is inside a submit-render callback right
+            // now, so the thread sampler can attribute its samples EXACTLY instead of guessing
+            // from a six-frame host-stack walk (a sample taken deep in ucrtbase loses the
+            // renderer frame off the end of that walk and is misfiled as "outside").
+            //
+            // Measured: 2.92 submits/flip x 181.8 ms = 530 ms/flip inside these callbacks
+            // against 938 ms/flip wall -- so ~43% of the collapsed frame is time when this
+            // callback is NOT running, and nothing has ever instrumented that half.
+            //
+            // One slot, not a set: the renderer already documents a single-present-thread
+            // contract (see g_rtt and the dp_submit statics above). A second concurrent caller
+            // would overwrite it, so the reader treats a mismatch as "outside" rather than
+            // asserting -- a wrong attribution is better than a crash in a diagnostic.
+            prosper::frontend::ScopedRendererCallbackTid scoped_renderer_tid;
             // Compute fast-clears update a target's DCC metadata between graphics spans. Associate
             // those ranges before draining the ordered guest-write notifications so a metadata write
             // cannot leave the previous frame's retained target authoritative.

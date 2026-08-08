@@ -71,6 +71,21 @@
 #endif
 
 namespace prosper {
+
+// #2215: is this OS thread inside a live submit-render callback right now? Defined weakly so
+// prosper_core keeps linking for every consumer that does not pull in the live renderer
+// (boot_trace without PROSPER_RENDER, the headless tests). Those builds report 0, which is
+// truthful there -- no renderer means no callback to be inside of.
+extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws);
+
+extern "C" __attribute__((weak)) int prosper_thread_in_renderer_callback(unsigned long) {
+    return 0;
+}
+// Callback ENTRIES, for the self-check below. Weak for the same reason and answering 0 the same
+// way -- which is precisely what makes "submitted, but zero entries" detectable.
+extern "C" __attribute__((weak)) unsigned long long prosper_renderer_callback_entries() {
+    return 0;
+}
 uint64_t sync_trace_tid_value(uint64_t native_tid) {
     return native_tid;
 }
@@ -3826,12 +3841,44 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
                 std::snprintf(wait_description + used, sizeof(wait_description) - used,
                               ";+%zu-more", captured_wait_count - captured_waits.size());
         }
+        const int in_renderer_now = prosper_thread_in_renderer_callback(native_id) ? 1 : 0;
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s "
-              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s guest-stack=%s host-stack=%s\n",
+              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s in-renderer=%d guest-stack=%s host-stack=%s\n",
               (unsigned long)native_id, (unsigned long long)pthread_id,
               describe_code_address(rip).c_str(), (unsigned long long)rip,
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
-              wait_description, guest_returns, host_returns);
+              wait_description, in_renderer_now,
+              guest_returns, host_returns);
+    }
+    // The instrument checks ITSELF, because its failure mode is silent and flattering.
+    // prosper_thread_in_renderer_callback is weak in prosper_core and strongly overridden by the
+    // live renderer. If that override ever fails to resolve -- a link order change, a build that
+    // omits the renderer while still submitting -- every sample reads 0 and the report says
+    // "the renderer is never running", which is exactly the shape of a confident zero (#2149).
+    //
+    // Zero sightings AND non-zero submits is a contradiction the sampler can detect about itself,
+    // so say so rather than emitting a clean-looking file. Reported once.
+    {
+        uint64_t submits = 0, draws = 0;
+        prosper_agc_submit_stats(&submits, &draws);
+        // What makes a zero here EVIDENCE rather than an ordinary outcome: this counts callback
+        // ENTRIES, which the renderer sees all of, not sampler sightings, which it sees almost none
+        // of. Measured on Blue Prince, the sampler lands inside a renderer callback in 0.07%-0.71%
+        // of samples (7 of 982, and 0 of 1427 in the very next run) -- so a self-check built on
+        // "did any sample read 1" fires on healthy runs, which is how the first version of this
+        // check behaved. Both arms were run rather than reasoned about. The entry count is
+        // thousands when the override links and exactly 0 when the weak stub answers, which is the
+        // contradiction actually worth printing.
+        static bool reported = false;
+        const unsigned long long entries = prosper_renderer_callback_entries();
+        if (!reported && submits > 0 && entries == 0) {
+            reported = true;
+            trace("[thread-trace] *** the renderer submitted %llu times but recorded 0 callback "
+                  "entries: the in-renderer classification is NOT working (the weak "
+                  "prosper_thread_in_renderer_callback stub is answering, so every sample reads 0). "
+                  "Do not read this file as \"the renderer never runs\" (#2347)\n",
+                  (unsigned long long)submits);
+        }
     }
     if (close_output) CloseHandle(output);
 #else
