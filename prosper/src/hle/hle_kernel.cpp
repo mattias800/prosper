@@ -71,6 +71,14 @@
 #endif
 
 namespace prosper {
+
+// #2215: is this OS thread inside a live submit-render callback right now? Defined weakly so
+// prosper_core keeps linking for every consumer that does not pull in the live renderer
+// (boot_trace without PROSPER_RENDER, the headless tests). Those builds report 0, which is
+// truthful there -- no renderer means no callback to be inside of.
+extern "C" __attribute__((weak)) int prosper_thread_in_renderer_callback(unsigned long) {
+    return 0;
+}
 uint64_t sync_trace_tid_value(uint64_t native_tid) {
     return native_tid;
 }
@@ -3827,11 +3835,12 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
                               ";+%zu-more", captured_wait_count - captured_waits.size());
         }
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s "
-              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s guest-stack=%s host-stack=%s\n",
+              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s in-renderer=%d guest-stack=%s host-stack=%s\n",
               (unsigned long)native_id, (unsigned long long)pthread_id,
               describe_code_address(rip).c_str(), (unsigned long long)rip,
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
-              wait_description, guest_returns, host_returns);
+              wait_description, prosper_thread_in_renderer_callback(native_id) ? 1 : 0,
+              guest_returns, host_returns);
     }
     if (close_output) CloseHandle(output);
 #else
