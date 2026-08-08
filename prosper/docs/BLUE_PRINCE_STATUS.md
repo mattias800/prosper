@@ -308,7 +308,13 @@ An independent Linux cross-check (`prosper-app`, `SDL_VIDEODRIVER=offscreen`, de
 | window | flips/s | presents/s | draws/s |
 | --- | ---: | ---: | ---: |
 | 0 -> 40 s (load/menu) | **108-223** | 108-223 | ~1,800 |
-| 40 s -> 252 s (steady) | **3.17-3.33** | 6.34-6.57 | ~14,000 |
+| 40 s -> 252 s (steady) | **3.17-3.33** *(upper bound -- see route)* | 6.34-6.57 | ~14,000 |
+
+**That 3.20 is not "the Linux figure", it is this route's figure.** It was measured through
+`prosper-app` under `SDL_VIDEODRIVER=offscreen` on the IME-autokey route: offscreen presentation
+skips real window/compositor cost and an autokey route is not interactive play, so both make it
+**cheaper than what a person sees**. Quoted without that attached it will be read as a platform
+comparison, which is exactly the class of error this section exists to stop.
 
 Steady state is **3.20 flips/s** across 21 consecutive 10 s windows, never leaving 3.17-3.33. Two
 things follow, and each on its own is enough to manufacture a wrong answer:
