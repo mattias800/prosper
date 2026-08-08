@@ -481,6 +481,21 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **RESTORING THE LAYERED ATOMIC DISPATCH DOES NOT MOVE THE COMPOSITE.** #2265's full-screen
+  `IMAGE_ATOMIC_ADD` dispatch was the strongest remaining candidate -- it writes the image the
+  presented frame is composed from, and unlike the four programs restored before it, it covers the
+  whole screen. With the fix (#2356) the gap is provably closed on a live boot: the
+  `skip invalid descriptor contract` line goes 1 -> **0**, the 20 `[compute-descriptor]` issues go to
+  **0**, and the staging trace reports `atomic-image buffer binding=37 ... bytes=66355200` **164
+  times** -- `3840*2160*2*4`, i.e. both layers, where a single-layer staging would read 33,177,600.
+  **The presented frame is unchanged.** `tools/screenshot`, default launch, `--seconds 8 --count 9`,
+  9 frames: composite CRCs are `666f7b3f` (x4) and `0d70a70a` (x5), **both already recorded above as
+  master values**, and the frames still show the SEGA logo on black. So the uniform-composite
+  frontier is not the compute inventory: five restored programs across two sessions have now left it
+  byte-identical. Look elsewhere before spending on the three remaining `skip unsupported program`
+  entries -- their restoration is worth doing on the charter's own grounds, but it should not be
+  expected to change the picture. #2356, Refs #2265 / #2013.
+
 - **THE DESCRIPTOR-CONTRACT SKIP IS NOT A STALE CACHED SPIR-V.** The hypothesis was that the program
   compiled once against a single-layer resolution, was cached by `recompile_compute_shader_cached`,
   and is validated on later dispatches against the two-layer resource -- which would make it a
