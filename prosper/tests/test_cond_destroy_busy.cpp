@@ -153,6 +153,54 @@ int main() {
     check(call(cond_destroy, (uint64_t)(uintptr_t)&cond_slot) == 0,
           "once the waiter has left, the destroy succeeds");
 
+    // --- the sibling entry point, which review found uncounted -----------------------------------
+    //
+    // `pthread_cond_timedwait(cond, mutex, NULL)` parks INDEFINITELY through the identical call that
+    // `pthread_cond_wait` makes. The first version of this fix bracketed the waiter count on
+    // `k_cond_wait` alone, so a thread parked here was invisible to the busy check and the destroy
+    // retired the slot out from under it -- the exact bug this file guards, reached through the
+    // sibling function.
+    //
+    // The arms above could not see it, because they park via `pthread_cond_wait`. Same lesson as the
+    // polling loop earlier in this file: a test cannot catch a state it never produces.
+    {
+        HleFn timedwait = by_name("pthread_cond_timedwait");
+        check(timedwait != nullptr, "pthread_cond_timedwait is registered");
+        uint64_t cond2 = 0, mutex2 = 0;
+        call(cond_init, (uint64_t)(uintptr_t)&cond2, 0);
+        call(mutex_init, (uint64_t)(uintptr_t)&mutex2, 0);
+
+        std::atomic<bool> parked{false}, released{false};
+        std::thread waiter2([&] {
+            call(mutex_lock, (uint64_t)(uintptr_t)&mutex2);
+            parked.store(true, std::memory_order_release);
+            timedwait((uint64_t)(uintptr_t)&cond2, (uint64_t)(uintptr_t)&mutex2, 0, 0, 0, 0);
+            call(mutex_unlock, (uint64_t)(uintptr_t)&mutex2);
+            released.store(true, std::memory_order_release);
+        });
+        while (!parked.load(std::memory_order_acquire)) std::this_thread::yield();
+        call(mutex_lock, (uint64_t)(uintptr_t)&mutex2);      // granted only once it is inside
+        call(mutex_unlock, (uint64_t)(uintptr_t)&mutex2);
+
+        check(call(cond_destroy, (uint64_t)(uintptr_t)&cond2) == 16,
+              "a thread parked via pthread_cond_timedwait(NULL) also counts as a waiter");
+
+        call(mutex_lock, (uint64_t)(uintptr_t)&mutex2);
+        call(cond_broadcast, (uint64_t)(uintptr_t)&cond2);
+        call(mutex_unlock, (uint64_t)(uintptr_t)&mutex2);
+        for (int spin = 0; spin < 1000 && !released.load(std::memory_order_acquire); ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!released.load(std::memory_order_acquire)) {
+            check(false, "the timedwait waiter did not wake within 5 s (#2168 regressed)");
+            waiter2.detach();
+            std::fprintf(stderr, "== FAIL ==\n");
+            return 1;
+        }
+        waiter2.join();
+        check(call(cond_destroy, (uint64_t)(uintptr_t)&cond2) == 0,
+              "and once it has left, that condvar destroys cleanly too");
+    }
+
     std::fprintf(stderr, failures ? "== FAIL ==\n" : "== PASS ==\n");
     return failures ? 1 : 0;
 }

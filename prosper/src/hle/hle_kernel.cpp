@@ -1035,7 +1035,7 @@ HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) {
-          GuestCondWaiterScope waiting(c);   // #2168
+          GuestCondWaiterScope waiting(c);   // #2168 -- covers every wait path in this body
           (void)interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
                                         nullptr, kGuestMutexCondWaitBookkeeping);
       } }
@@ -1053,6 +1053,13 @@ HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu
 HLE(k_cond_timedwait) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 22;                                   // EINVAL
+    // #2168: one scope for the WHOLE body, not one per call. Review found the count bracketed on
+    // k_cond_wait alone, which left this function's null-deadline branch -- an INDEFINITE park
+    // through the identical call -- invisible to the busy check, so a destroy retired the slot out
+    // from under a thread parked forever. Scoping the body rather than the call means a future
+    // branch added here cannot miss it; a future BODY still has to remember, which is why the three
+    // cond-wait bodies are the unit and there are exactly three.
+    GuestCondWaiterScope waiting(c);
     if (!a2) {
         int rc = interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
                                          nullptr, kGuestMutexCondWaitBookkeeping);
@@ -2537,6 +2544,7 @@ HLE(k_cond_timedwait_sce) {
     // where prosper actually tracks ownership -- the registry is Windows-only, and on POSIX the
     // host already implements the FreeBSD contract itself.
     if (guest_mutex_not_owned_by_self(m)) return prosper::hle::kSceKernelErrorEPERM;
+    GuestCondWaiterScope waiting(c);   // #2168: this body parks too, and was not counted either
     timespec dl = abs_deadline_us(a2);
     int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
                                           nullptr, kGuestMutexCondWaitBookkeeping);
