@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "gpu/gpu_execute.hpp"   // gpu::guest_readable — validate the guest C string (#1967)
 #include <map>
 #include <limits>
 #include <string>
@@ -388,6 +389,40 @@ JHLE(init_parameter2_set_file_buffer_size) {
     return 0;
 }
 JHLE(value_ctor) { if (auto* value = ptr<Value>(a0)) *value = Value{}; return a0; }
+// sce::Json::Value::Value(const char*) -- b9V6fmppLXY. NOT the same as setString: the argument is a
+// raw C string, not a Sony `String` object, and this constructs into caller-provided storage rather
+// than assigning to a live value.
+//
+// The dispatcher's `return 0` default is the safe answer for a status-returning function and is
+// actively unsafe for a CONSTRUCTOR: the guest reserves the storage (usually a stack slot), expects
+// the callee to write the object into it, and prosper wrote nothing -- so the guest went on to use
+// whatever residue was in that slot as a live Json::Value. A return value cannot make that safe,
+// which is why an unimplemented constructor has to be implemented rather than stubbed (#1967).
+//
+// The source pointer is validated rather than trusted, and the copy is bounded. This is a guest
+// pointer arriving at a C++ constructor: the same class as #1963, where `if (p)` let 0x80 through
+// and prosper faulted inside its own code. Constructing the EMPTY value first means a rejected or
+// empty string still leaves the guest a well-formed null Json::Value -- which is the whole point of
+// the fix -- instead of the uninitialised storage the stub left behind.
+JHLE(value_ctor_cstr) {
+    auto* value = ptr<Value>(a0);
+    if (!value) return a0;
+    *value = Value{};                      // a valid, empty Json::Value even if the text is rejected
+    if (!a1) return a0;                    // Value(nullptr) is a null value, not a crash
+    constexpr uint32_t kMaxJsonCString = 1u << 20;   // 1 MiB: a JSON scalar, not a document
+    uint32_t length = 0;
+    while (length < kMaxJsonCString &&
+           prosper::gpu::guest_readable(a1 + length, 1) &&
+           *reinterpret_cast<const char*>(static_cast<uintptr_t>(a1 + length)) != '\0')
+        ++length;
+    // An unterminated or unreadable string yields the empty value rather than a partial one: the
+    // guest asked for the text at that pointer, and prosper cannot honour half of it truthfully.
+    if (length == 0 || length == kMaxJsonCString) return a0;
+    value->type = ValueType::String;
+    value->data.string = new String{new std::string(
+        reinterpret_cast<const char*>(static_cast<uintptr_t>(a1)), length)};
+    return a0;
+}
 JHLE(value_dtor) { clear(ptr<Value>(a0)); return 0; }
 JHLE(value_assign) {
     auto* destination = ptr<Value>(a0); auto* source = ptr<const Value>(a1);
@@ -606,6 +641,7 @@ void register_json2_hle() {
     auto reg = [](const char* nid, HleFn fn, const char* name) { Hle::register_fn(nid, fn, name); };
     reg("-hJRce8wn1U", noop_self, "sceJsonMemAllocator::ctor");
     reg("qBMjqyBn3OM", value_ctor, "sceJsonValue::ctor");
+    reg("b9V6fmppLXY", value_ctor_cstr, "sceJsonValue::ctor(const char*)");
     reg("-wa17B7TGnw", value_ctor, "sceJsonValue::ctor");
     reg("WTtYf+cNnXI", value_dtor, "sceJsonValue::dtor");
     reg("0eUrW9JAxM0", value_dtor, "sceJsonValue::dtor");
@@ -620,6 +656,12 @@ void register_json2_hle() {
     reg("qSmqLXXCPas", string_ctor, "sceJsonString::ctor");
     reg("cG1VE2HMl6c", string_dtor, "sceJsonString::dtor");
     reg("cK6bYHf-Q5E", noop_self, "sceJsonInitializer::ctor");
+    // Both destructors own nothing prosper allocated -- Initializer and MemAllocator are guest-side
+    // scope objects here -- so a no-op is the CORRECT body, not a placeholder. Registered anyway so
+    // they resolve as deliberate rather than falling to the unimplemented path, where they cost a
+    // log line each and read as a gap (#1967).
+    reg("RujUxbr3haM", noop_zero, "sceJsonInitializer::dtor");
+    reg("OcAgPxcq5Vk", noop_zero, "sceJsonMemAllocator::dtor");
     reg("Cxwy7wHq4J0", noop_zero, "sceJsonInitializer::initializeV1");
     reg("00oCq0RwSAY", noop_zero, "sceJsonInitializer::setGlobalNullAccessCallback");
     reg("S5JxQnoGF3E", parse, "sceJsonParser::parse");

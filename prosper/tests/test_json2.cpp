@@ -196,6 +196,54 @@ int main() {
     call(string_dtor, &key);
     call(dtor, &object_value);
 
+    // --- #1967: sce::Json::Value::Value(const char*) ------------------------------------------
+    // The dispatcher's `return 0` default is safe for a status-returning function and unsafe for a
+    // CONSTRUCTOR: the guest reserves the storage and expects the callee to write the object into
+    // it. An unimplemented ctor therefore leaves the guest using stack residue as a live Value, and
+    // no return value can fix that -- which is why this had to be implemented rather than stubbed.
+    {
+        HleFn ctor_cstr = Hle::lookup("b9V6fmppLXY");
+        CHECK(ctor_cstr != nullptr, "Value(const char*) is registered");
+        if (ctor_cstr) {
+            // POISONED storage, not zeroed. A zeroed slot would let an unimplemented ctor pass this
+            // arm by accident -- type 0 is Null, which is a legal value -- so the arm has to start
+            // from something no correct constructor could leave behind.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, const_cast<char*>("hello"));
+            CHECK(v.type == 5, "Value(const char*) constructs a String value (type 5)");
+            auto* js = reinterpret_cast<void*>(call(get_string, &v));
+            auto* cs = js ? reinterpret_cast<const char*>(call(string_cstr, js)) : nullptr;
+            CHECK(cs && std::strcmp(cs, "hello") == 0,
+                  "Value(const char*) stores the text it was given");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
+            // A null argument is a null Value, not a crash -- and the storage must still be left
+            // well-formed, because the guest will destroy it either way.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, nullptr);
+            CHECK(v.type == 0, "Value(nullptr) constructs a Null value rather than faulting");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
+            // An unmapped-but-non-null pointer. 0x80 is the shape that actually occurs (a null base
+            // plus a field offset) and the one that walked into #1963 in libkernel. Reaching the
+            // next line at all is the assertion: an unvalidated read here does not fail, it faults.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, reinterpret_cast<void*>(static_cast<uintptr_t>(0x80)));
+            CHECK(v.type == 0, "Value(bad pointer) yields a well-formed Null value, not a fault");
+            call(dtor, &v);
+        }
+        // The two destructors this issue also names. They own nothing prosper allocated, so a no-op
+        // is the correct body -- the point is that they RESOLVE rather than falling to the
+        // unimplemented path, where each costs a log line and reads as a gap.
+        CHECK(Hle::lookup("RujUxbr3haM") != nullptr, "Initializer::~Initializer is registered");
+        CHECK(Hle::lookup("OcAgPxcq5Vk") != nullptr, "MemAllocator::~MemAllocator is registered");
+    }
+
     std::puts(failures ? "== FAIL ==" : "== PASS ==");
     return failures ? 1 : 0;
 }
