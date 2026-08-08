@@ -96,6 +96,10 @@ int main() {
         auto* p = (uint8_t*)(uintptr_t)memalign_fn(kAlign, kOld, 0, 0, 0, 0);
         if (p) {
             memset(p, 0xC3, kOld);
+            // Captured BEFORE the call, as an integer: after reallocalign the old block may be freed,
+            // and the diagnosis below reports whether the block MOVED without comparing against a
+            // pointer that no longer designates an object (#2297).
+            const uintptr_t old_addr = (uintptr_t)p;
             auto* small = (uint8_t*)(uintptr_t)reallocalign_fn(U(p), kNew, kAlign, 0, 0, 0);
             CHECK(small != nullptr, "reallocalign shrinks without reporting failure");
             if (small) {
@@ -125,8 +129,55 @@ int main() {
                 // running the loop anyway would print [ok] for an arm whose body never executed,
                 // which is precisely the vacuous pass this guard exists to prevent.
                 if (usable > kNew) {
-                    bool slack_clean = true;
-                    for (size_t i = kNew; i < usable && slack_clean; ++i) slack_clean = small[i] != 0xC3;
+                    // Count rather than short-circuit, and remember WHERE, so a failure carries its
+                    // own diagnosis. This arm has failed once in CI and passed on a rerun of the
+                    // identical commit (#2297); a bare assertion told the next reader only that an
+                    // "over-copy" had happened, which is a memory-corruption claim and sends them
+                    // hunting a bug that the implementation may not have. The three facts that
+                    // separate the candidate explanations are all cheap to print and impossible to
+                    // recover afterwards, because the run is gone.
+                    size_t first_bad = SIZE_MAX, bad_count = 0;
+                    for (size_t i = kNew; i < usable; ++i)
+                        if (small[i] == 0xC3) { if (first_bad == SIZE_MAX) first_bad = i; ++bad_count; }
+                    const bool slack_clean = bad_count == 0;
+                    if (!slack_clean) {
+                        // The "did NOT move" branch below reads as unreachable against the
+                        // interpretation printed after it, and it IS -- deliberately. It is a
+                        // CONTRADICTION DETECTOR, not dead code: allocate-before-free is what makes
+                        // the block always move, so if that string ever prints, the invariant has
+                        // stopped holding and every elimination below it is void. Deleting it as
+                        // unreachable would remove the only thing that could tell a reader the
+                        // diagnosis no longer applies.
+                        const bool moved = (uintptr_t)small != old_addr;
+                        printf("  [diag] over-copy guard FAILED — the facts, before you conclude anything:\n");
+                        printf("  [diag]   block %s (old=0x%llx new=0x%llx)\n",
+                               moved ? "MOVED" : "did NOT move — shrunk in place",
+                               (unsigned long long)old_addr, (unsigned long long)(uintptr_t)small);
+                        printf("  [diag]   usable=%zu kNew=%zu window=%zu bytes; %zu are 0xC3, first at +%zu\n",
+                               usable, kNew, usable - kNew, bad_count, first_bad - kNew);
+                        printf("  [diag]   slack:");
+                        for (size_t i = kNew; i < usable && i < kNew + 32; ++i) printf(" %02x", small[i]);
+                        printf("\n");
+                        // The interpretation, stated here rather than left to whoever is on call —
+                        // and stated as the ELIMINATIONS, because the three explanations a reader
+                        // reaches for first are all excluded by two lines of the implementation.
+                        // guest_reallocalign_portable allocates the replacement BEFORE freeing the
+                        // source on both branches (hle_libc.cpp:234 then :245; :226 then :229 on
+                        // Windows), and h_reallocalign at :362 is the only route in. So:
+                        //   - the block ALWAYS moves; an in-place shrink leaving the source's own
+                        //     bytes past kNew cannot occur
+                        //   - the destination cannot occupy recycled source memory, because the
+                        //     source is still live when the destination is allocated
+                        //   - a genuine over-copy cannot occur either: the copy is capped at the new
+                        //     size (`old_readable < size ? old_readable : size`)
+                        printf("  [diag]   Do NOT read this as an over-copy. Allocate-before-free\n"
+                               "  [diag]   (hle_libc.cpp:234 then :245) excludes all three of the usual\n"
+                               "  [diag]   explanations: the block always moves, the destination cannot reuse\n"
+                               "  [diag]   the still-live source, and the copy is already capped at the new size.\n"
+                               "  [diag]   What is left: 0xC3 from heap freed ELSEWHERE in this process, or\n"
+                               "  [diag]   USABLE() overreporting so this scan walks past the real allocation.\n"
+                               "  [diag]   Check `usable` against the allocation first. See #2297.\n");
+                    }
                     CHECK(slack_clean,
                           "the copy is capped by the NEW size — no source bytes past it (over-copy guard)");
                 } else {
