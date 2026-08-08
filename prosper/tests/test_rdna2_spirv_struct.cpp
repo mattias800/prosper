@@ -3579,11 +3579,26 @@ int main() {
                    "aliases layer 0\n");
             return 1;
         }
-        // Paired negative, so the discriminator's own validity is checked rather than assumed:
-        // the 1x1 non-arrayed fixture must NOT multiply by its own height.
-        if (multiplies_by(atomic_add_spv, 1u)) {
-            printf("  [FAIL] the discriminator is void: the NON-arrayed index also multiplies by "
-                   "its height, so the arrayed result proves nothing\n");
+        // Paired negative, so the discriminator's validity is checked rather than assumed -- and it
+        // must use the SAME distinctive constant, on a NON-arrayed shader, or it tests nothing. An
+        // earlier version asked whether the 1x1 fixture multiplies by 1; it does, because 1 is
+        // multiplied all over any module, and that arm then failed on correct code. Here the shape
+        // is 5x97 and non-arrayed, so 97 is present as a bound and must NOT be a multiplier: the 2D
+        // index is x + y*width and reaches only the WIDTH.
+        ShaderResourceTable rt_tall_2d;
+        std::vector<uint32_t> tall_backing(5u * 97u, 0u);
+        { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.format = DataFormat::Uint32; image.num_components = 1;
+          image.binding = 4; image.img_dim = 1; image.width = 5; image.height = 97;
+          image.depth = 1; image.sgpr_base = 0;
+          image.size = tall_backing.size() * sizeof(uint32_t);
+          image.host_data = reinterpret_cast<uint8_t*>(tall_backing.data());
+          image.host_data_size = image.size; rt_tall_2d.resources.push_back(image); }
+        const std::vector<uint32_t> tall_2d_spv = recompile_compute(
+            cs_image_atomic_add, std::size(cs_image_atomic_add), &rt_tall_2d, atomic_add_config);
+        if (tall_2d_spv.empty() || multiplies_by(tall_2d_spv, 97u)) {
+            printf("  [FAIL] the discriminator is void: a NON-arrayed 5x97 index also multiplies by "
+                   "97, so the arrayed result proves nothing\n");
             return 1;
         }
         printf("  [ok]   the layer reaches the index (height constant present only when arrayed)\n");
