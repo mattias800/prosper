@@ -85,6 +85,51 @@ int main() {
           "load-low-byte-twin");
     CHECK(is_loaded(kAppContent, 0, 0, 0, 0, 0) == kUnloaded, "id-key-is-not-byte-wide");
 
+    // ===== the *Internal entry points share the same state (#2128) ============================
+    // Unregistered, all eight fell to prosper_on_unimpl's `return 0` -- SUCCESS for this contract,
+    // recorded nowhere. A title that loaded through one of them and then called IsLoaded was told
+    // UNLOADED about a load prosper had just reported as succeeding: #2002's defect on a parallel
+    // path, and invisible to every assertion above because those drive only the plain spellings.
+    {
+        HleFn load_i    = Hle::lookup(nid_hash("sceSysmoduleLoadModuleInternal"));
+        HleFn load_arg  = Hle::lookup(nid_hash("sceSysmoduleLoadModuleInternalWithArg"));
+        HleFn unload_i  = Hle::lookup(nid_hash("sceSysmoduleUnloadModuleInternal"));
+        HleFn unload_a  = Hle::lookup(nid_hash("sceSysmoduleUnloadModuleInternalWithArg"));
+        HleFn isload_i  = Hle::lookup(nid_hash("sceSysmoduleIsLoadedInternal"));
+        HleFn by_name_l = Hle::lookup(nid_hash("sceSysmoduleLoadModuleByNameInternal"));
+        HleFn by_name_u = Hle::lookup(nid_hash("sceSysmoduleUnloadModuleByNameInternal"));
+        HleFn get_hand  = Hle::lookup(nid_hash("sceSysmoduleGetModuleHandleInternal"));
+        CHECK(load_i && load_arg && unload_i && unload_a && isload_i && by_name_l && by_name_u &&
+              get_hand, "all-eight-internal-entry-points-registered");
+
+        if (load_i && isload_i && unload_i && load_arg && unload_a) {
+            const uint64_t kInt = 0x0222;
+            // CROSS-SPELLING, which is the whole point: load through *Internal, query through the
+            // PLAIN one. A per-spelling map would satisfy a same-spelling round trip and still leave
+            // the contradiction this issue is about.
+            CHECK(load_i(kInt, 0, 0, 0, 0, 0) == 0, "internal-load-succeeds");
+            CHECK(is_loaded(kInt, 0, 0, 0, 0, 0) == 0, "internal-load-is-visible-to-plain-IsLoaded");
+            CHECK(isload_i(kInt, 0, 0, 0, 0, 0) == 0, "internal-load-is-visible-to-IsLoadedInternal");
+            CHECK(unload_i(kInt, 0, 0, 0, 0, 0) == 0 && is_loaded(kInt, 0, 0, 0, 0, 0) == kUnloaded,
+                  "internal-unload-is-visible-to-plain-IsLoaded");
+            // The WithArg forms carry (args, argp, pRes) after the id; the id is still a0, so they
+            // must record identically. Passing junk in the tail is the point of this arm.
+            CHECK(load_arg(kInt, 7, 0xDEAD, 0xBEEF, 0, 0) == 0 &&
+                  is_loaded(kInt, 0, 0, 0, 0, 0) == 0, "withArg-load-records-on-the-id");
+            CHECK(unload_a(kInt, 7, 0xDEAD, 0xBEEF, 0, 0) == 0 &&
+                  is_loaded(kInt, 0, 0, 0, 0, 0) == kUnloaded, "withArg-unload-records-on-the-id");
+        }
+
+        // The three that CANNOT be served honestly must not answer 0. For ByName the id-keyed map
+        // has no key to write; for GetModuleHandle a 0 is a valid handle shape the caller will
+        // dereference -- worse than the missing implementation it stands in for.
+        if (by_name_l && by_name_u && get_hand) {
+            CHECK(by_name_l(0, 0, 0, 0, 0, 0) != 0, "LoadModuleByName-refuses-rather-than-succeeds");
+            CHECK(by_name_u(0, 0, 0, 0, 0, 0) != 0, "UnloadModuleByName-refuses-rather-than-succeeds");
+            CHECK(get_hand(kAppContent, 0, 0, 0, 0, 0) != 0, "GetModuleHandleInternal-never-answers-0");
+        }
+    }
+
     printf(fails ? "== FAILURES: %d ==\n" : "== all checks passed ==\n", fails);
     return fails ? 1 : 0;
 }
