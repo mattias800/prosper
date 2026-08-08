@@ -310,6 +310,23 @@ uint64_t videoout_content_digest(uint64_t address, size_t bytes) {
 // slot) and cleared at unregister, so the geometry is immutable for the life of a generation, and
 // SetBufferAttribute(2) writes the caller's struct rather than the registry. Anything that makes a
 // registered set's dimensions mutable breaks this and must re-seed the baseline.
+// #2071: the guest_readable() below is the authorship baseline's gate, and it runs for EVERY
+// registered buffer on EVERY sceVideoOutRegisterBuffers, while holding g_display_mx -- the lock
+// sceVideoOutSubmitFlip blocks on.
+//
+// On a mapping-registry HIT it is an interval lookup and costs nothing. On a MISS it falls through
+// to the OS probe: one pipe write+read per 4 KiB page on Linux (~8,100 syscall pairs for a 3840x2160
+// buffer), or a VirtualQuery walk on Windows. And a miss does not amortise -- registration does not
+// run inside a submit scope, so cache_guest_readable_range declines to populate the persistent cache
+// and a re-registering title re-pays every time.
+//
+// That was recorded as UNMEASURED rather than shown-free, so measure it instead of guessing: the two
+// outcomes differ by orders of magnitude in wall time, which is a discriminator that needs no access
+// to the cache internals. A slow seed announces itself; a fast one costs one clock read per
+// registration, and registrations are rare.
+uint64_t g_videoout_seed_calls = 0, g_videoout_seed_slow = 0;
+double g_videoout_seed_ms = 0.0;
+
 void videoout_seed_authorship_locked(int slot, uint64_t address, uint32_t width, uint32_t height) {
     g_display.buffer_digest[slot] = 0;
     g_display.buffer_digest_valid[slot] = 0;
@@ -317,7 +334,30 @@ void videoout_seed_authorship_locked(int slot, uint64_t address, uint32_t width,
     const uint64_t pixels = (uint64_t)width * height;
     if (!address || !pixels || pixels > UINT32_MAX / 4) return;
     const uint32_t bytes = (uint32_t)(pixels * 4);
-    if (!gpu::guest_readable(address, bytes)) return;
+    const auto seed_t0 = std::chrono::steady_clock::now();
+    const bool readable = gpu::guest_readable(address, bytes);
+    const double seed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - seed_t0).count();
+    ++g_videoout_seed_calls;
+    g_videoout_seed_ms += seed_ms;
+    // 1 ms is far above a registry hit and far below a full-buffer page walk, so it separates the
+    // two without asserting what either costs.
+    if (seed_ms > 1.0) {
+        ++g_videoout_seed_slow;
+        if (g_videoout_seed_slow <= 8)
+            fprintf(stderr, "[videoout] scanout readability probe took %.2f ms for slot %d "
+                            "(%ux%u, %u bytes) -- this is the mapping-registry MISS path, under "
+                            "g_display_mx (#2071)\n", seed_ms, slot, width, height, bytes);
+    }
+    // State the DENOMINATOR, capped. "0 slow probes" is worth nothing without the number of seeds
+    // it is 0 out of -- that is the same empty-domain zero this issue's own "unmeasured, not
+    // shown-free" wording is guarding against.
+    if (g_videoout_seed_calls <= 4)
+        fprintf(stderr, "[videoout] scanout baseline seed #%llu: %.3f ms (%ux%u); slow so far %llu, "
+                        "total %.3f ms (#2071)\n",
+                (unsigned long long)g_videoout_seed_calls, seed_ms, width, height,
+                (unsigned long long)g_videoout_seed_slow, g_videoout_seed_ms);
+    if (!readable) return;
     g_display.buffer_digest[slot] = videoout_content_digest(address, bytes);
     g_display.buffer_digest_valid[slot] = 1;
 }
@@ -336,7 +376,18 @@ bool videoout_buffer_authored_locked(const VideoOutBufferSnapshot& buffer, size_
     g_display.buffer_authored[slot] = 1;
     return true;
 }
+
 } // namespace
+
+// #2071 measurement hook: how many scanout authorship baselines were seeded, how many took the slow
+// mapping-registry-MISS path, and the total wall time inside the readability gate. Reported so a
+// run can state "the miss path is dead here" as a number rather than as an absence of complaints.
+extern "C" void prosper_videoout_seed_stats(unsigned long long* calls, unsigned long long* slow,
+                                            double* total_ms) {
+    if (calls)    *calls    = g_videoout_seed_calls;
+    if (slow)     *slow     = g_videoout_seed_slow;
+    if (total_ms) *total_ms = g_videoout_seed_ms;
+}
 
 bool videoout_select_buffer(int buffer_index, VideoOutBufferSnapshot& out) {
     std::lock_guard<std::mutex> lk(g_display_mx);
