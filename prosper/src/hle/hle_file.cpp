@@ -50,6 +50,20 @@
 #endif
 #include "../host/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
 
+// #2371: a 64-bit stat, portably. MinGW's `struct stat::st_size` is FOUR BYTES and `::stat()`
+// fails outright with EOVERFLOW (errno 132) on any file larger than 2 GiB -- measured on GTA V's
+// 3,018,098,688-byte `update/update.rpf`. Every size taken from a 32-bit stat on Windows is
+// therefore either wrong or absent for large archives, and the failure is silent: the caller sees
+// "no such file" rather than "size did not fit".
+#ifdef _WIN32
+#define PROSPER_STAT ::_stat64
+using ProsperStat = struct _stat64;
+#else
+#define PROSPER_STAT ::stat
+using ProsperStat = struct stat;
+#endif
+
+
 #if defined(_WIN32) && defined(__MINGW32__)
 // MinGW's UCRT import library exposes this API, but its current headers omit the declaration.
 extern "C" _invalid_parameter_handler __cdecl
@@ -2158,8 +2172,11 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         std::string host = guest.empty() ? std::string() : translate(guest.c_str());
         uint64_t size = 0; uint32_t id = 0;
 #ifndef _WIN32
-        struct stat st;
-        bool found = !host.empty() && ::stat(host.c_str(), &st) == 0;
+        ProsperStat st;
+        // #2371: 64-bit, same reason -- this `size` is handed straight back to the guest through
+        // out_sizes, so a >2 GiB archive reported as missing here is a content gap from its point
+        // of view rather than a stat failure.
+        bool found = !host.empty() && PROSPER_STAT(host.c_str(), &st) == 0;
 #else
         struct _stat64 st;
         bool found = !host.empty() && ::_stat64(host.c_str(), &st) == 0;
@@ -2176,7 +2193,7 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
             const std::string raw_guest = "/app0/raw/" + guest.substr(6);
             std::string raw_host = translate(raw_guest.c_str());
 #ifndef _WIN32
-            found = !raw_host.empty() && ::stat(raw_host.c_str(), &st) == 0;
+            found = !raw_host.empty() && PROSPER_STAT(raw_host.c_str(), &st) == 0;
 #else
             found = !raw_host.empty() && ::_stat64(raw_host.c_str(), &st) == 0;
 #endif
