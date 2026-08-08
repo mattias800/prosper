@@ -129,6 +129,26 @@ int main() {
     CHECK(strcmp((const char*)sony_out.data(), renamed_again) == 0,
           "null rename preserves the previous name");
 
+    // #2178: scePthreadRename's failure is ENCODED, on the family rule -- every Sony libkernel
+    // spelling returns 0x80020000|errno -- and NOT on evidence specific to this function.
+    // CONFIDENCE: MED, and the rationale block above SCE_PTHREAD_ALIAS(k_sce_pthread_rename) in
+    // hle_kernel.cpp says why, including what the guest disassembly does and does not establish.
+    //
+    // Read this arm as guarding a DECISION, not as citing a measurement. It is here rather than
+    // left to the sweep because the Sony/POSIX split is a REGISTRATION property: pointing the name
+    // at the raw body again would restore the bare value silently, and every other arm in this file
+    // would still pass. If the decision is later shown wrong, this arm is where it is changed --
+    // which is the point of asserting it explicitly rather than leaving it implied.
+    CHECK(rename(0, (uint64_t)(uintptr_t)renamed_again, 0, 0, 0, 0) == 0x80020016ull,
+          "#2178: scePthreadRename on a null thread returns ENCODED EINVAL (0x80020016)");
+    CHECK(posix_rename(0, (uint64_t)(uintptr_t)renamed_again, 0, 0, 0, 0) == 22,
+          "#2178: ...while the POSIX spelling still returns the BARE errno, so the encoding went on "
+          "the Sony wrapper rather than the shared body");
+
+    // NOT swept, and this is deliberate: Getname's contract differs (its failures are lookup
+    // failures on a call whose success path writes through a buffer), and no guest caller found so
+    // far discriminates -- its only one does `test eax,eax`, where 3 and 0x80020003 are the same.
+    // These two assertions stand until a caller that branches on the value turns up (#2178).
     CHECK(getname(0, (uint64_t)(uintptr_t)sony_out.data(), 0, 0, 0, 0) == 3,
           "null thread returns ESRCH");
     CHECK(getname(thread, 0, 0, 0, 0, 0) == 14,

@@ -2714,6 +2714,43 @@ SCE_PTHREAD_ALIAS(k_sce_attr_getdetachstate,   k_attr_getdetachstate)
 // the honest resolution needs something neither of us has here: a capture of what the real
 // libkernel returns. Left bare and raised on #2178 rather than settled by whoever edits last.
 SCE_PTHREAD_ALIAS(k_sce_key_create,            k_key_create)
+
+// #2178: Rename and SetName encode, on the FAMILY RULE -- every Sony libkernel spelling returns
+// 0x80020000|errno -- and not on any evidence specific to these two. CONFIDENCE: MED.
+//
+// #2365 deliberately left the three name functions bare because neither side had evidence, and that
+// is still true: test_pthread_names' bare expectations are uncited, and the rule's own direct
+// evidence (the shipped libc.prx's C11 _Mtx_*/_Cnd_* wrappers comparing against encoded constants)
+// covers mutex and condvar only. What changes here is which default applies to a member of the
+// family with no evidence either way, not that evidence arrived.
+//
+// The one caller found in a dump is CONSISTENT WITH THIS AND DOES NOT DISCRIMINATE. Dragon Quest VII
+// (PPSA17942) logs the failure:
+//
+//   5fac7b7:  call   0x669b570              ; scePthreadRename
+//   5fac7bc:  test   eax,eax
+//   5fac7c0:  movsxd rdx,eax                ; the error, sign-extended into arg2
+//   5fac7c3:  lea    rsi,[rip+0x2299e72]    ; -> "…Failed in scePthreadRename(), 0x%08x"
+//
+// An earlier version of this comment read `0x%08x` as the guest naming the space it expects. It is
+// not: %08x ZERO-PADS to eight columns, so a bare 22 prints as 0x00000016 and an encoded one as
+// 0x80020016, and both render fine. `test eax,eax` above it is nonzero in either space too. So the
+// disassembly rules nothing out -- exactly the reason Getname below is not swept, applied one
+// paragraph higher up. (Caught in review by Marlow, who checked it precisely because it was a
+// citation raising certainty in a direction already believed.)
+//
+// SetName travels with it: same body, same contract, and no separate evidence is needed for a
+// function that IS this one under another name.
+//
+// GETNAME IS DELIBERATELY NOT SWEPT -- not because the evidence is weaker there, but because its
+// contract is different. Getname's documented failures are lookup failures (ESRCH) on a call whose
+// success path writes through a buffer, and #2365's split turns on the return CONVENTION rather
+// than the spelling. Rename fails the way the rest of the family fails; Getname's `== 3` stands
+// until a caller that discriminates turns up.
+//
+// What would settle either: a capture of what the real libkernel returns, or a guest that branches
+// on the value rather than only testing it against zero.
+SCE_PTHREAD_ALIAS(k_sce_pthread_rename,        k_pthread_rename)
 // The same bodies under their POSIX spellings, split along the RETURN-CONVENTION axis rather than
 // the encoding one (#2182). k_sem_* return the error NUMBER, which is right for scePthreadSem* and
 // wrong for sem_*: C11 7.26 and FreeBSD sem_wait(3) both specify "return -1, number left in errno".
@@ -4505,8 +4542,8 @@ void register_kernel_hle() {
     R("scePthreadSetschedparam", k_log_setschedparam);  R("scePthreadSetprio", k_log_setprio);
     R("scePthreadGetprio", k_getprio);
     R("scePthreadGetname", k_pthread_getname);
-    R("scePthreadRename", k_pthread_rename);
-    R("scePthreadSetName", k_pthread_rename);
+    R("scePthreadRename", k_sce_pthread_rename);
+    R("scePthreadSetName", k_sce_pthread_rename);
     R("pthread_getname_np", k_pthread_getname);
     R("pthread_rename_np", k_pthread_rename);
     R("pthread_set_name_np", k_pthread_rename);
