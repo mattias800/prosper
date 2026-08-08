@@ -666,7 +666,17 @@ bool tid_is_in_renderer_callback(unsigned long native_tid) {
     return current != 0 && current == native_tid;
 }
 
+// Every callback ENTRY, not the ~0.6% of them a sampler happens to catch. See the self-check in
+// hle_kernel.cpp: a zero here is real evidence that the strong override never linked, whereas a zero
+// count of sampler sightings is just the ordinary outcome at this base rate (#2347).
+std::atomic<unsigned long long> g_renderer_callback_entries{0};
+
+extern "C" unsigned long long prosper_renderer_callback_entries() {
+    return g_renderer_callback_entries.load(std::memory_order_relaxed);
+}
+
 ScopedRendererCallbackTid::ScopedRendererCallbackTid() {
+    g_renderer_callback_entries.fetch_add(1, std::memory_order_relaxed);
 #ifdef _WIN32
     const unsigned long self = (unsigned long)GetCurrentThreadId();
 #else
