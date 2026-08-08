@@ -485,10 +485,21 @@ One line per falsified hypothesis, with the evidence that killed it.
   recorded as "an instruction inventory"; one of the four is not an instruction problem at all.
   Program `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56),
   every one `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
-  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. Two independent
-  gates admit only single-layer non-array 2D: the coverage predicate at
-  `src/gpu/rdna2_to_spirv.cpp:15903` (`i.mimg_dim == 1u`) and the atomic-to-storage-buffer carve-out
-  at `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`). The dispatch is
+  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. **Three** gates
+  admit only single-layer non-array 2D: the lowering's own atomic gate at
+  `src/gpu/rdna2_to_spirv.cpp:10101` -- whose comment states the narrowing outright, *"the live Astro
+  Bot visibility image is an ordinary 2D R32_UINT surface ... fail-visible for every other image
+  shape"*, making CrossWorlds the second title to need it -- the coverage predicate at
+  `src/gpu/rdna2_to_spirv.cpp:15903` (`i.mimg_dim == 1u`), and the atomic-to-storage-buffer carve-out
+  at `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`). Buffer-flattening is the
+  **designed** path for `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483`
+  requires `kind == StorageBuffer` with `atomic_access` and `report.ok()`), so this is a working
+  lowering gated to one image shape rather than a broken one. **Open, and settle it before widening
+  any gate:** the `:10101` gate should have made this a `skip unsupported program`, yet the capture
+  records `recompiled=yes` with `descriptors=20` -- so either the shader was compiled and cached
+  against a single-layer resolution and validated later against the two-layer one (a recompile-time
+  vs bind-time divergence, which would be general), or those MIMG instructions never reached that
+  branch. The dispatch is
   full-screen -- `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **The same guest
   image is what the `#590` line defers** (`layered image deferred to #657`), so both of this title's
   remaining non-recompiler compute failures are one unsupported thing: multi-layer images. #2353,
