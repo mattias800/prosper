@@ -10303,6 +10303,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // index: Vulkan leaves an out-of-bounds image atomic undefined, robust
                         // buffer access does not cover atomics, and the 2D path's own comment
                         // records that RADV can spend seconds in one before resetting the device.
+                        //
+                        // `width`, `height` and `depth` are baked into the module as OpConstants,
+                        // which is only safe because all three are part of the shader cache key, so
+                        // a module compiled for one extent can never be reused against a smaller
+                        // one: `gpu_executor.cpp` sets `compiled.width`/`height` under
+                        // `atomic_extent` (an R32_UINT single-component storage image -- exactly
+                        // this case) and `compiled.depth`/`img_dim` under `storage_image`, and
+                        // `ShaderResourceCompileKey` has a defaulted member-wise `operator==`. Check
+                        // that still holds before baking a fourth quantity in here.
                         const uint32_t row = arrayed
                             ? b.ibin(Op_IAdd, coords[1],
                                      b.ibin(Op_IMul, coords[2], b.uconst(res->height)))
