@@ -18,6 +18,36 @@
 
 namespace prosper::gpu {
 
+// #2319: render exactly the dwords the instruction HAS, not a fixed two.
+//
+// `words[]` is `uint32_t words[5] = {0,...}`, so a ONE-dword instruction printed as
+// `words=bf860051,00000000` is indistinguishable from a two-dword instruction whose second dword
+// is genuinely zero. That defeats the purpose of printing raw words (#2312), which is that a
+// reader can name the instruction with one command:
+//
+//     echo '0x0e,0x16,0xea,0xbe' | llvm-mc -arch=amdgcn -mcpu=gfx1010 -disassemble
+//
+// A reader who takes `words=x,00000000` at face value feeds EIGHT bytes, and llvm-mc decodes a
+// second, entirely fictitious instruction from the zero dword -- output that looks exactly as
+// authoritative as the correct answer. On the CrossWorlds census pc=101 needed four bytes and
+// pc=2038 needed eight, and nothing in either line said which.
+//
+// Clamped to the array bound as well as to len_dwords: len_dwords comes from the decoder, and a
+// decode that failed badly enough to be rejected here is not a source to trust for indexing.
+inline std::string reject_words_text(const Rdna2Inst& in) {
+    const uint32_t count = std::min<uint32_t>(in.len_dwords ? in.len_dwords : 1u,
+                                              (uint32_t)(sizeof(in.words) / sizeof(in.words[0])));
+    std::string out;
+    char buf[16];
+    for (uint32_t i = 0; i < count; ++i) {
+        std::snprintf(buf, sizeof buf, "%08x", in.words[i]);
+        if (i) out += (char)44;
+        out += buf;
+    }
+    return out;
+}
+
+
 FragmentInterpolationLayout::FragmentInterpolationLayout() {
     for (auto& locations : parameter_locations) locations.fill(kUnusedLocation);
     system_locations.fill(kUnusedLocation);
@@ -13506,8 +13536,8 @@ bool emit_cfg_state_machine(
                         // so half the rejects from a run were unidentifiable and the two diagnostics
                         // could not be compared (#2309).
                         std::fprintf(stderr,
-                                     "[cfg-recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x\n",
-                                     in.pc, in.words[0], in.words[1],
+                                     "[cfg-recompile-reject] pc=%u words=%s len=%u fmt=%d op=0x%x\n",
+                                     in.pc, reject_words_text(in).c_str(), in.len_dwords,
                                      static_cast<int>(in.fmt), in.opcode);
                     return false;
                 }
@@ -14713,11 +14743,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG")) {
-                    fprintf(stderr, "[recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x "
+                    fprintf(stderr, "[recompile-reject] pc=%u words=%s fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
                                     "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
                                     "sext=%d/%d\n",
-                        in.pc, in.words[0], in.words[1], (int)in.fmt, in.opcode,
+                        in.pc, reject_words_text(in).c_str(), (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
                         in.src[0].value, (int)in.src[0].kind,
                         in.src[1].value, (int)in.src[1].kind,
