@@ -175,12 +175,19 @@ def imm():
 
         # Under 4 bytes the window floor cannot exist, so the query is refused rather than answered
         # with every plain occurrence of those bytes in the instruction stream.
-        try:
-            XREF.find_immediate_builds(module, b"cfg")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("a 3-byte needle must be refused, not answered")
+        #
+        # Every sub-4-byte length goes through the one guard, INCLUDING the empty needle (#2099).
+        # b"" used to return [] and print a clean "0 constructions" -- the misleading zero this mode
+        # exists to eliminate, reproduced inside the mode. The 3-byte case alone would not have
+        # caught it: they were two separate code paths, and only one was guarded.
+        for bad in (b"cfg", b"ab", b"a", b""):
+            try:
+                XREF.find_immediate_builds(module, bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    "a %d-byte needle (%r) must be refused, not answered" % (len(bad), bad))
     finally:
         if path:
             os.unlink(path)

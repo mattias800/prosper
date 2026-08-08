@@ -178,8 +178,13 @@ def find_immediate_builds(m, needle, span=0x60):
         those. The reported [lo:hi] sizes are how a reader tells the two cases apart.
     """
     n = len(needle)
-    if n == 0:
-        return []
+    # The empty needle refuses through the SAME guard as 1-3 bytes (#2099). It used to return [],
+    # which printed "inline-immediate constructions of '' (0 bytes): 0" -- a clean, confident zero,
+    # indistinguishable in form from a real "nothing builds this string". That is precisely the
+    # misleading zero this mode exists to eliminate, reproduced inside the mode itself, and it bites
+    # hardest where the mode is most useful: an agent scripting `imm` over parsed names gets the same
+    # answer for an unset variable as for a genuinely unreferenced string, with nothing separating
+    # them. The message below already reads correctly at n == 0.
     if n < 4:
         raise ValueError(
             "needle %r is %d byte(s); `imm` needs at least 4. Below that the >=4-byte window floor "
