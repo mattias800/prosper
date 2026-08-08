@@ -436,6 +436,19 @@ Measured across three identical arms on one binary lineage, `PROSPER_DBG=1`, 240
 | `[mimg-unresolved]` / `[mubuf-unresolved]` | 0 / 0 | 0 / 0 | 0 / 0 |
 | composite | `666f7b3f` → `0d70a70a` → `8bf1b518` | **identical** | **identical** |
 
+**That table counts one log line, and a fifth failure prints a different one.** `[compute] skip
+unsupported program` is the recompiler's message. A program that recompiles *successfully* and then
+fails descriptor validation prints `[compute] skip invalid descriptor contract` instead, and has
+never been in the total above — so the population is **one larger than every census here states**.
+On master at `7a493df2` the split is **3** `skip unsupported program` (#2218 took one more of the
+four) plus **1** descriptor-contract, and the offline capture records exactly that: four declined
+dispatches per frame, `reason=shader-recompile` x3 and `reason=descriptor-contract` x1, in submits
+8022/8039 and 8023/8040 of the repeating frame. Ask a capture for
+`--bundle-extract-submit N out.prgcap` then `--inspect-only out.prgcap`; do **not** use the replay's
+`operations=A/B` field, which is a replay setting over a decode count and can never report a decline
+(instrument trap 141).
+
+
 The composite row is a `tools/screenshot` arm (`--seconds 30 --count 9`, default switches, no
 diagnostics) rather than the `boot_trace` arm, so the pixels are measured on a run that carries no
 instrument at all. It reproduces the recorded hash sequence byte for byte, which is the arm's own
@@ -468,6 +481,139 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **RUNG 2 REACHED -- THE TITLE SCREEN RENDERS COMPLETELY, AND "THE COMPOSITE GOES UNIFORM" WAS NEVER
+  THE RIGHT DESCRIPTION.** With denser pulses on the route above (`scripts/sonic-crossworlds/`), the
+  full sequence is **black -> SEGA -> Unreal Engine -> CRIWARE -> licensor -> auto-save notice ->
+  TITLE SCREEN -> player-profile menu -> white**. The title screen is complete at 3840x2160: the 3D
+  scene, every character, the track, the logo, `PRESS`, `License Information`, `(C)SEGA` and version
+  `1.1.2`. **Reproduced across two independent 560 s runs.** Note the composite CRC does **not**
+  match between them -- the scene is animated -- so the comparison is by content signature:
+  **113,524 / 113,676** distinct sampled colours at 99.6% coverage in the first run against
+  **113,476 / 114,379** at 99.6% in the second, at the same sample positions. For scale this document
+  records the SEGA logo at 1,373 colours.
+  *Method worth reusing:* opening twenty 4K frames is expensive, so the unexamined ones were **scored
+  before being opened** -- distinct sampled colours and non-black ratio -- and the two that stood two
+  orders of magnitude above the rest were the only ones opened. A CRC tells you frames differ; it does
+  not tell you which one is worth looking at.
+  **The defect is now per-screen, not global.** The title screen's scene renders; the profile menu's
+  UI composites correctly (rank badge, account name, BACK / VIEW PLAYER / NEXT) while its central
+  content panel stays black. So "no scene-geometry pass" is a statement about *some* screens. The
+  terminal white state and the letterboxed auto-save notice remain unexplained. Rung 3 (gameplay) is
+  not reached. #2013.
+
+- **THE TITLE WAS WAITING FOR A BUTTON, AND THE RENDERER WAS FINE ALL ALONG.** The one item this
+  document listed as untested -- *"any input route -- nothing has been shown to respond to a pad
+  yet"* -- is the one that moves. With `scripts/sonic-crossworlds/advance-boot-logos.pad` the title
+  renders, in order and correctly at 3840x2160, the **Unreal Engine** logo (`42763e4a`), the
+  **CRIWARE** logo (`5170ed80`) and the **legal / licensor text screen** (`b3b61854`). **None of the
+  three had ever been observed on this title**; four independent no-pad observations -- two arms of
+  mine and the two master arms above -- show only black / SEGA logo / black. Two pad arms produce an
+  identical CRC set with sampling counts differing by one.
+  **The edge is the mechanism.** An arm holding Cross continuously from frame 0, with delivery
+  confirmed from the guest's own read (`[pad] pad_read_state call#512 connected=1 buttons=0x4000`),
+  advanced nothing over 170 s. A held button is not a press: the guest needs a neutral->pressed
+  transition. That distinction is why every earlier "input does nothing" impression was wrong.
+  **Strong but not airtight:** nine samples over 270 s would very likely have caught one of these
+  screens had they played regardless of input, and four no-pad observations caught none -- but a
+  same-session alternating A/B has not been run. **It does not reach a title screen** -- it reaches
+  the game's own **auto-save notice** (`824976b1`) -- and past that, with denser pulses, **the title
+  screen itself** and then the player-profile menu. *The route's own shape was the limiter at first:* an earlier
+  version ended in a long hold and stopped at the legal screen, which by the edge mechanism above is
+  a limit the route created rather than one the title has -- continued pulses reached the notice.
+  Flagged and not claimed: that notice renders **letterboxed** into a horizontal band rather than
+  filling the target, which may be its own presentation or a viewport defect; unchecked against
+  hardware. #2013.
+
+- **NO UNIMPLEMENTED NID IS BEING POLLED -- THIS IS NOT SONIC FRONTIERS' WALL.** That title's
+  four-session black screen was one unregistered NID answering `SCE_OK` and being called **1,319
+  times** (#2023), so the same census was the obvious first move here. It comes back clean:
+  `PROSPER_PROGRESS=5 PROSPER_PROGRESS_UNIMPL=1`, `boot_trace`, 120 s, **12 distinct unimplemented
+  functions** and the only one with any volume at all is `libScePosix::Xs9hdiD7sAA` at **127** calls
+  -- `pthread_setschedparam` per `../PS5-3.20_Libs`, i.e. the title setting thread priorities and
+  getting a benign success. Everything else is called once or twice, `libScePlayGo` included (2 and
+  1), so a content-availability wait is not what is happening either.
+  **And the frame loop is healthy, not stalled:** over the same run, presents climb steadily to
+  1,287 in 119 s (~10.8/s), flips to 403, `draws_cum` to 11,749 and dispatches to 17,500. *Read
+  `draws_last` carefully* -- it is the draws in the **last submit**, not in the heartbeat interval,
+  so its frequent `0` is not "the title stopped drawing": `draws_cum` rises by ~425 every 5 s
+  throughout. The title runs, draws ~85 times a second, dispatches ~140 times a second, presents,
+  and shows black. #2013.
+
+- **RESTORING THE LAYERED ATOMIC DISPATCH DOES NOT MOVE THE COMPOSITE.** #2265's full-screen
+  `IMAGE_ATOMIC_ADD` dispatch was the strongest remaining candidate -- it writes the image the
+  presented frame is composed from, and unlike the four programs restored before it, it covers the
+  whole screen. With the fix (#2356) the gap is provably closed on a live boot: the
+  `skip invalid descriptor contract` line goes 1 -> **0**, the 20 `[compute-descriptor]` issues go to
+  **0**, and the staging trace reports `atomic-image buffer binding=37 ... bytes=66355200` **164
+  times** -- `3840*2160*2*4`, i.e. both layers, where a single-layer staging would read 33,177,600.
+  **The presented frame is byte-identical to master across the whole documented route.**
+  `tools/screenshot`, default launch, `--seconds 30 --count 9` (270 s -- the same arm as the composite
+  row above): all **three** master states reproduce exactly, `666f7b3f` (x1), `0d70a70a` (x1) and
+  `8bf1b518` (x7). Frames were opened rather than judged by hash: `666f7b3f` and `8bf1b518` are both
+  black (different CRCs, visually identical) and `0d70a70a` is the SEGA logo on black, so the route
+  is black -> logo -> black and stays there. **Match the window to the claim:** a first pass at
+  `--seconds 8 --count 9` (72 s) ends on the logo and never reaches `8bf1b518` at all, so it cannot
+  speak to the post-logo state that #2013 is about -- the arm was re-run at 270 s for that reason.
+  Five restored programs across two sessions have now left the composite byte-identical. Look elsewhere before spending on the three remaining `skip unsupported program`
+  entries -- their restoration is worth doing on the charter's own grounds, but it should not be
+  expected to change the picture. #2356, Refs #2265 / #2013.
+
+- **THE DESCRIPTOR-CONTRACT SKIP IS NOT A STALE CACHED SPIR-V.** The hypothesis was that the program
+  compiled once against a single-layer resolution, was cached by `recompile_compute_shader_cached`,
+  and is validated on later dispatches against the two-layer resource -- which would make it a
+  general recompile-time vs bind-time divergence rather than a title-local gap. A/B on one
+  `boot_trace` binary, 75 s per arm, `PROSPER_DBG=1 PROSPER_RENDER_TIMING=1`, arm B adding
+  `PROSPER_NO_SHADER_CACHE=1`:
+
+  | arm | shaders hit | miss | bypass | `skip invalid descriptor contract` | `skip unsupported program` |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | cache on | 21.1 | 1.1 | 0.0 | 1 | 3 |
+  | cache off | 0.0 | 0.0 | **22.2** | 1 | 3 |
+
+  The lever provably moved -- every compile in arm B is fresh against the live table -- and the
+  failure population is unchanged in both class and count. Note the counts are by **class**, not by
+  program address: guest code addresses are run-local and every one of them differs between the two
+  arms, so an address-keyed comparison across runs is void (this cost the first pass of this very
+  A/B). #2265.
+
+- **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS, AND THE ATOMIC ONE
+  IS NOT A MISSING FEATURE -- IT IS THREE COPIES OF ONE PREDICATE THAT DISAGREE.** Program
+  `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56), every one
+  `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
+  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. The dispatch is
+  full-screen: `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **Four** sites
+  independently encode which image-atomic image shapes are supported, and **#2272 generalised exactly
+  one of them** to 2D_ARRAY (line numbers as of `7a493df2`):
+
+  | site | where | 2D_ARRAY accepted? |
+  | --- | --- | --- |
+  | coverage predicate | `src/gpu/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
+  | lowering gate | `src/gpu/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
+  | validator carve-out | `src/gpu/shader_resources.cpp:1031` (`r.img_dim == 1 && r.depth == 1`) | no |
+  | backend materialization | `frontends/shared/live_compute.cpp:4304` (same clause) | no |
+
+  So the lowering emits the buffer-backed binding for a 2D_ARRAY atomic and the validator then
+  rejects that exact binding as `WrongType`. That is why the capture shows `recompiled=yes` with
+  `descriptors=20` **and** a descriptor-contract failure -- a pair that reads as contradictory until
+  the three sites are read together. Buffer-flattening is the **designed** path for
+  `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483` requires
+  `kind == StorageBuffer` with `atomic_access` and `report.ok()`); it exists as the RADV
+  image-atomic workaround. **This is #2293's defect one iteration later** -- that PR is titled *"the
+  image-atomic opcode list existed in THREE places and all three had to agree"*, and the same triple
+  now disagrees on the *dimension* predicate instead of the opcode list. **Do NOT simply widen sites
+  1 and 3: the `compute_atomic_buffer` index is still `coords[0] + coords[1]*width` with the layer in
+  neither the index nor the bound**, so relaxing the validator alone makes this dispatch *run* and
+  every layer atomically accumulates into layer 0's texels -- a silent wrong result on a device-scope
+  atomic, strictly worse than the current skip, and it would read as progress in a screenshot. Correct
+  order: teach the backend's detile/retile to cover the layers, fold the layer into the shader index
+  and bound to match the layout it produces, **then** widen the predicates. Note the backing
+  allocation is **already** large enough -- the resource reports `available=66355200` and
+  `3840*2160*2*4 = 66,355,200` exactly -- so sizing is not the obstacle; the **layout** is.
+  `tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel)` (`src/gpu/tile.hpp:81`) takes
+  no depth or layer argument, so the detile behind the atomic buffer view is inherently 2D and the
+  tiled **array slice pitch** is the open unknown that needs evidence rather than an assumed
+  `width*height`. Tracked on **#2265**,
+  which owns this chain; Refs #2272 / #2293.
 - **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
   storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
   `Sw4KbS`, tile mode 5), and the frozen composite is a single colour, so the LUT looked like the
@@ -705,18 +851,31 @@ first *Ruled out* row. Everything below is what remains.
    `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm. The same argument now
    applies to the four restored **compute** programs, and with more force: restoring them changed the
    skip count and not one pixel.
-2. **The four compute programs still skipped**, in ascending cost — the charter names a skipped
-   LUT/exposure dispatch as a documented way a whole composite collapses, and half the population is
-   already gone without effect, so this is the cheapest remaining way to finish the argument:
+2. **The three compute programs still skipped** — and **lower this in priority than its position
+   suggests.** The argument for it was that a skipped LUT/exposure dispatch is a documented way a
+   whole composite collapses. That argument is now spent on this title: **five** restored programs
+   across two sessions have left the composite byte-identical, the most recent (#2356) being a
+   *full-screen* dispatch writing the image the presented frame is composed from. Restore them
+   because the charter requires unsupported ops to be implemented, not because they are expected to
+   change the picture. In ascending cost:
    - `s_flbit_i32_b64 vcc_lo, s[14:15]` — a **value-tracking** gap, not a missing opcode. The
      lowering exists and takes its `ok = false` arm because `s14`/`s15` are unknown at that pc.
    - `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` — a cross-lane DPP row control, in the
      **2,348-dword** program (the one that stopped on `v_ceil_f16_sdwa`), not in either of the
      programs this lane restored.
-   - `image_atomic_add … dim:SQ_RSRC_IMG_2D_ARRAY` — the deferred arrayed-image work in
-     [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md), shared with `image_sample_lz d16`.
    - the 12,916-dword all-zero `code_addr`, which is not a program and should not be counted as one.
-3. **Then re-measure the composite.** It has not moved through any change so far: black to t≈20 s,
-   SEGA logo (`0d70a70a`, 1,373 colours), then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) —
-   including both arms of the #2132 A/B and all three arms of this lane's compute work, where the
-   reject and skip counts differ and the pixels do not.
+3. **Re-measuring the composite is no longer a pending step -- it has been done and it is a
+   `## Ruled out` row.** The route is black to t~20 s, the SEGA logo (`0d70a70a`, 1,373 colours),
+   then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) -- note that is (1,0,1) out of 255, i.e.
+   **near-black, not magenta**, which is easy to misread from the numbers alone. Byte-identical
+   across both arms of the #2132 A/B, all three arms of the earlier compute work, and #2356, where
+   the reject and skip counts differ and the pixels do not. **Match the window to the claim**: a
+   short arm ends on the logo and never reaches `8bf1b518` at all, so use the 270 s
+   `--seconds 30 --count 9` arm for any composite comparison.
+
+4. **What has NOT been examined, and is where the evidence now points.** A steady-state frame carries
+   **25 draws and 39 computes with no scene-geometry pass at all** (full inventory on #2303). The
+   graphics-descriptor and control-flow frontiers are closed, every pipeline recompiles, and the
+   compute inventory is now spent -- so the question is no longer "why is submitted work dropped"
+   but **"why does the guest submit so little"**, which is a CPU/logic-side question rather than a
+   renderer one. Nothing has been shown to respond to a pad yet either. Start there.

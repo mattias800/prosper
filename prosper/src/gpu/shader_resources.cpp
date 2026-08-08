@@ -1023,15 +1023,18 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         }
         const ShaderResource& r = *matches.front();
         SpirvDescriptorKind actual = resource_kind(r);
+        // #2265: the shape test is shared with the lowering gate and the backend materialization so
+        // the three cannot drift again -- see shader_resource_supports_atomic_image_buffer. The size
+        // bound is LOGICAL (width*height*layers*4): a descriptor's `size` is the linear extent, not
+        // the tiled physical footprint, which is larger. Measured on CrossWorlds' 3840x2160x2 R32
+        // image: size = 66,355,200 = w*h*depth*4 exactly, while the tiled footprint is 66,846,720.
         const bool atomic_image_buffer =
             expected_stage == SpirvShaderStage::Compute &&
             d.kind == SpirvDescriptorKind::StorageBuffer && d.atomic_access &&
             actual == SpirvDescriptorKind::StorageImage &&
-            r.format == DataFormat::Uint32 && r.num_components == 1 &&
-            r.img_dim == 1 && r.depth == 1 && !r.depth_compare &&
-            !r.in_mip_tail && !r.compression_enabled &&
-            r.width && r.height &&
-            static_cast<uint64_t>(r.width) * r.height * sizeof(uint32_t) <= r.size;
+            shader_resource_supports_atomic_image_buffer(r) &&
+            static_cast<uint64_t>(r.width) * r.height *
+                    shader_resource_atomic_image_layers(r) * sizeof(uint32_t) <= r.size;
         if (actual != d.kind && !atomic_image_buffer) {
             report.issues.push_back({DescriptorIssueCode::WrongType, true, d.set, d.binding,
                                      d.kind, actual, d.required_bytes, r.size});

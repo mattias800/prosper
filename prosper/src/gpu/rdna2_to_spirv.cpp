@@ -10207,15 +10207,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // had not. `res->depth` is the layer COUNT for an arrayed view, so it is required to
                 // be exactly 1 only in the non-arrayed case.
                 const bool atomic_2d_array = in.mimg_dim == SQ_DIM_2D_ARRAY && arrayed && !ms;
+                // #2265: the RESOURCE half is now shader_resource_supports_atomic_image_buffer,
+                // shared with the descriptor validator and the backend materialization. Those three
+                // had drifted -- #2272 widened this gate over the array layer and left the other
+                // two on the single-layer clause, so this lowering emitted a StorageBuffer binding
+                // that its own validator then rejected as WrongType and the dispatch was skipped
+                // every frame. The INSTRUCTION half stays here, because only this site sees it.
                 if (is_atomic &&
                     ((in.mimg_dim != SQ_DIM_2D && !atomic_2d_array) || ms || in.len_dwords < 2 ||
                      in.mimg_unorm || in.mimg_dmask != 1u ||
-                     (!arrayed && (res->img_dim != 1u || res->depth != 1u)) ||
-                     (arrayed && (res->img_dim != SQ_DIM_2D_ARRAY || !res->depth)) ||
-                     res->depth_compare ||
-                     res->format != DataFormat::Uint32 || components != 1u ||
-                     !res->width || !res->height || res->in_mip_tail ||
-                     res->compression_enabled)) {
+                     arrayed != (res->img_dim == SQ_DIM_2D_ARRAY) ||
+                     !shader_resource_supports_atomic_image_buffer(*res))) {
                     ok = false;
                     return true;
                 }
@@ -10294,12 +10296,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint16_t atomic_op = spirv_atomic;
                     uint32_t result;
                     if (compute_atomic_buffer) {
+                        // #2265: the backend stages an arrayed view as layers tightly packed in
+                        // layer-major order (live_compute.cpp detiles each slice from its physical
+                        // stride into w*h*4 of linear), so the flat index is
+                        // (z*height + y)*width + x. The layer MUST be in the bound as well as the
+                        // index: Vulkan leaves an out-of-bounds image atomic undefined, robust
+                        // buffer access does not cover atomics, and the 2D path's own comment
+                        // records that RADV can spend seconds in one before resetting the device.
+                        //
+                        // `width`, `height` and `depth` are baked into the module as OpConstants,
+                        // which is only safe because all three are part of the shader cache key, so
+                        // a module compiled for one extent can never be reused against a smaller
+                        // one: `gpu_executor.cpp` sets `compiled.width`/`height` under
+                        // `atomic_extent` (an R32_UINT single-component storage image -- exactly
+                        // this case) and `compiled.depth`/`img_dim` under `storage_image`, and
+                        // `ShaderResourceCompileKey` has a defaulted member-wise `operator==`. Check
+                        // that still holds before baking a fourth quantity in here.
+                        const uint32_t row = arrayed
+                            ? b.ibin(Op_IAdd, coords[1],
+                                     b.ibin(Op_IMul, coords[2], b.uconst(res->height)))
+                            : coords[1];
                         const uint32_t index = b.ibin(
                             Op_IAdd, coords[0],
-                            b.ibin(Op_IMul, coords[1], b.uconst(res->width)));
+                            b.ibin(Op_IMul, row, b.uconst(res->width)));
                         uint32_t active = b.land(
                             b.ucmp(Op_ULessThan, coords[0], b.uconst(res->width)),
                             b.ucmp(Op_ULessThan, coords[1], b.uconst(res->height)));
+                        if (arrayed)
+                            active = b.land(active,
+                                            b.ucmp(Op_ULessThan, coords[2],
+                                                   b.uconst(res->depth ? res->depth : 1u)));
                         if (rs.exec_narrowed) active = b.land(rs.exec, active);
                         result = b.cbuf_atomic_rtn(
                             atomic_op, index, vread(vd), res->binding,
@@ -16027,9 +16053,18 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                                msaa_address_shape;
                     }
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
-                    if (i.opcode == 0x0fu || i.opcode == 0x11u)                // image_atomic_swap/add R32_UINT 2D
-                        return i.mimg_dim == 1u && i.mimg_dmask == 1u &&
-                               !i.mimg_unorm && i.len_dwords == 2u;
+                    if (i.opcode == 0x0fu || i.opcode == 0x11u)   // image_atomic_swap/add R32_UINT 2D / 2D_ARRAY
+                        // #2265: 2D_ARRAY (dim 5) admitted alongside 2D. This is the COVERAGE
+                        // predicate -- it decides whether the instruction counts as supported for
+                        // the census, and it was the last of the four sites still reporting the
+                        // arrayed form as unsupported after #2272 widened the lowering. A 2D_ARRAY
+                        // arrayed atomic reaches its layer through the address VGPRs, not through a
+                        // longer ENCODING: CrossWorlds' own instruction is `dim=5 ... len=2`, so
+                        // `len_dwords` is the NSA-vs-packed encoding length and pinning it to 3 for
+                        // dim 5 would reject exactly the instruction this admits. Matches the
+                        // lowering gate, which rejects only `len_dwords < 2`.
+                        return (i.mimg_dim == 1u || i.mimg_dim == 5u) && i.mimg_dmask == 1u &&
+                               !i.mimg_unorm && i.len_dwords >= 2u;
                     if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D
                     if (i.opcode == 0x60u)                                     // fragment image_get_lod 2D
                         return i.mimg_dim == 1u && i.len_dwords == 2u &&

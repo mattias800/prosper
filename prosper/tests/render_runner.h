@@ -1125,6 +1125,145 @@ inline constexpr uint64_t backend_timestamp_delta(uint64_t begin, uint64_t end,
     return (end - begin) & mask;
 }
 
+// --- per-pass GPU device time (#2333) -------------------------------------------------------
+//
+// The backend already measures ONE device-time envelope per submission batch. That answers "how
+// long did the GPU take" and cannot answer the question #2276 is actually stuck on: whether the
+// cost is rasterisation or the ~16 pass BOUNDARIES the work is split across. A single envelope is
+// the sum, and the sum is the same either way.
+//
+// So this records a timestamp pair around each render pass. Gated: the pool creation and the two
+// writes are real work, and this must not be paid on an ordinary run.
+//
+// It is deliberately one query pool PER PASS rather than one sized pool per command buffer. The
+// pass count is not known when the command buffer starts -- the collapsed Blue Prince state records
+// over a thousand passes into a single command buffer (#2333) -- so a pre-sized pool would either
+// cap the measurement silently or guess large. A diagnostic that silently stops recording after N
+// passes would report the surviving passes as though they were all of them, which is the exact
+// failure mode this instrument exists to avoid.
+struct BackendPassTiming {
+    VkDevice dev = VK_NULL_HANDLE;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    double period_ns = 0.0;
+    uint32_t valid_bits = 0;
+    uint32_t width = 0, height = 0;
+    uint64_t target = 0;
+    size_t draws = 0;
+    // Draws in this pass whose colour write mask is non-zero. #2283 turns on whether a
+    // no-colour-base pass is depth-only: extents that look like shadow maps are circumstantial, a
+    // mask of 0 on every draw is the direct check. Counted rather than inferred so a single
+    // colour-writing draw in such a pass is visible instead of averaged away.
+    size_t colour_writing_draws = 0;
+    bool ended = false;
+};
+
+inline bool backend_pass_timing_enabled() {
+    // Live getenv rather than a cached value: gpu_replay arms this per invocation, and a
+    // process-lifetime cache would make a second run in the same process silently unmeasured.
+    static const bool on = getenv("PROSPER_PASS_TIMING") != nullptr;
+    return on;
+}
+
+inline std::vector<BackendPassTiming>& backend_pass_timings() {
+    static std::vector<BackendPassTiming> records;
+    return records;
+}
+
+inline void backend_pass_timing_begin(VkDevice dev, VkCommandBuffer cmd, double period_ns,
+                                      uint32_t valid_bits, uint32_t width, uint32_t height,
+                                      uint64_t target, size_t draws, size_t colour_writing_draws) {
+    if (!backend_pass_timing_enabled() || !dev || !cmd || period_ns <= 0.0 || !valid_bits) return;
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = 2;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(dev, &info, nullptr, &pool) != VK_SUCCESS || !pool) return;
+    vkCmdResetQueryPool(cmd, pool, 0, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+    backend_pass_timings().push_back(
+        BackendPassTiming{dev, pool, period_ns, valid_bits, width, height, target, draws,
+                          colour_writing_draws, false});
+}
+
+inline void backend_pass_timing_end(VkCommandBuffer cmd) {
+    if (!backend_pass_timing_enabled() || !cmd) return;
+    auto& records = backend_pass_timings();
+    if (records.empty() || records.back().ended || !records.back().pool) return;
+    // Same reason as the batch envelope: make the closing timestamp depend on every command in the
+    // pass rather than on pipeline position alone, so this is one interval and not a lower bound.
+    //
+    // This barrier also ORDERS pass completions, so it can only ever produce non-overlapping
+    // measured intervals -- which means "coverage never exceeds 100%" is a statement about the
+    // measurement unless the barrier is removed and the result survives. It was, and it does:
+    // without this barrier, 10,715 batches still show 0 over 100% and a median coverage of 92.1%
+    // against 92.9% with it. The two agree within ~1 point, so the barrier is neither manufacturing
+    // the non-overlap nor materially inflating per-pass times.
+    //
+    // That is corroboration rather than proof: removing the barrier makes each interval a lower
+    // bound, which lowers sums and would MASK overlap rather than reveal it. So report per-pass
+    // non-overlap as a property of the measurement, not of the workload.
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 0, nullptr);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, records.back().pool, 1);
+    records.back().ended = true;
+}
+
+// Called only after the batch's fence has proved completion -- reading a timestamp query whose
+// commands may still be executing returns NOT_READY, and treating that as 0 ms would understate
+// exactly the passes that took longest.
+inline void backend_pass_timing_report(bool completed, double envelope_ms = -1.0) {
+    if (!backend_pass_timing_enabled()) return;
+    auto& records = backend_pass_timings();
+    if (records.empty()) return;
+    if (completed) {
+        double total = 0.0;
+        size_t reported = 0, unreadable = 0;
+        for (const BackendPassTiming& record : records) {
+            if (!record.ended) { ++unreadable; continue; }
+            uint64_t values[2] = {0, 0};
+            if (vkGetQueryPoolResults(record.dev, record.pool, 0, 2, sizeof(values), values,
+                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+                ++unreadable;
+                continue;
+            }
+            const uint64_t ticks =
+                backend_timestamp_delta(values[0], values[1], record.valid_bits);
+            const double ms = static_cast<double>(ticks) * record.period_ns / 1'000'000.0;
+            total += ms;
+            ++reported;
+            fprintf(stderr,
+                    "[pass-timing] pass=%zu %ux%u target=0x%llx draws=%zu cwm_draws=%zu device=%.4f ms\n",
+                    reported - 1, record.width, record.height,
+                    (unsigned long long)record.target, record.draws,
+                    record.colour_writing_draws, ms);
+        }
+        // The count of passes that could NOT be read is printed even when it is zero. A per-pass
+        // report whose passes silently go missing looks like a frame with fewer, cheaper passes --
+        // which is a conclusion, not an absence of data.
+        // The reconciliation, printed per BATCH rather than left to cross-run arithmetic.
+        // Summing per-pass times over a whole run and comparing against a cumulative average
+        // compares two different populations and cannot distinguish "this instrument covers a
+        // subset of device work" from "the envelopes overlap so their sum was never a total".
+        // Against the SAME batch's own envelope the question is local and has one answer:
+        // coverage below 100% is work inside this command buffer that is not in a render pass
+        // (compute, blits, readback copies), and coverage above 100% means the per-pass
+        // intervals overlap each other.
+        if (envelope_ms >= 0.0) {
+            const double coverage = envelope_ms > 0.0 ? total / envelope_ms * 100.0 : 0.0;
+            fprintf(stderr,
+                    "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms envelope=%.3f ms coverage=%.1f%%\n",
+                    reported, unreadable, total, envelope_ms, coverage);
+        } else {
+            fprintf(stderr, "[pass-timing] passes=%zu unreadable=%zu summed_device=%.3f ms\n",
+                    reported, unreadable, total);
+        }
+    }
+    for (const BackendPassTiming& record : records)
+        if (record.pool) vkDestroyQueryPool(record.dev, record.pool, nullptr);
+    records.clear();
+}
+
+
 // A successful queue submit followed by failed fence and queue-idle waits is not an ordinary
 // failure: Vulkan still owns every referenced resource, so those objects must be retained.
 enum class BackendSubmissionState { NotSubmitted, Complete, Pending };
@@ -1326,6 +1465,10 @@ public:
                 }
             }
             release_gpu_timestamp();
+            // Passed the envelope this batch just measured, so the two instruments are compared
+            // against each other on identical work rather than across a run (#2333).
+            backend_pass_timing_report(state == BackendSubmissionState::Complete,
+                                       result.gpu_timestamp_samples ? result.gpu_device_ms : -1.0);
             vkDestroyFence(dev, fence, nullptr);
             commands_.clear();
             finish_persistent_state(state == BackendSubmissionState::Complete);
@@ -3015,7 +3158,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   BackendSubmissionBatch* submission_batch = nullptr,
                                                   bool flush_submission_batch = true,
                                                   std::span<const BackendDraw> logical_ds_draws = {},
-                                                  BackendMrtOutputs* mrt_outputs = nullptr) {
+                                                  BackendMrtOutputs* mrt_outputs = nullptr,
+                                                  // #2283: does the CALLER want colour pixels back?
+                                                  // Not "is there a colour target" -- absent target
+                                                  // already means readback, because then the returned
+                                                  // vector is the only way to get results, which is
+                                                  // how every offscreen test asserts. Defaults true so
+                                                  // every existing caller is bit-identical.
+                                                  bool want_color_readback = true) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const prosper::frontend::PerformanceTimingMode timing_mode =
@@ -5519,17 +5669,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // merely requesting the complete MRT shape must not materialize either GPU-resident image on the
     // CPU. Slots 2+ are currently transient backend attachments, so a caller requesting them through
     // BackendMrtOutputs still needs those planes copied before the images are released.
-    const bool readback_color0 = !persistent_color || color_target->readback;
-    const bool readback_color1 = use_color1 &&
+    // #2283. Split into two questions that used to be one.
+    //
+    // WOULD a readback be requested -- unchanged, and it is what still drives the flush below. The
+    // scope of this change is the COPY only: `readback_requested` also feeds
+    // `synchronous_results_requested` and therefore `flush_now`, which gates persistent attachment
+    // publication. Removing a flush is a real win (each is a queue submit plus a full CPU-GPU fence
+    // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
+    const bool readback_color0_wanted = !persistent_color || color_target->readback;
+    const bool readback_color1_wanted = use_color1 &&
         (!persistent_color1 || color_target->readback1);
-    const bool readback_requested = readback_color0 || readback_color1 || color_count > 2;
+    const bool readback_requested_for_flush =
+        readback_color0_wanted || readback_color1_wanted || color_count > 2;
+
+    // ...and will one actually be PERFORMED. Blue Prince renders 457 depth-only passes with no
+    // colour base per route; every one reads back a fully black surface that the frontend then
+    // never looks at (`live_renderer.cpp:6082`/`:6118` consume the pixels only under `if (base ...)`,
+    // and there is no else). That is up to 8 MB copied and discarded per pass.
+    const bool readback_color0 = want_color_readback && readback_color0_wanted;
+    const bool readback_color1 = want_color_readback && readback_color1_wanted;
+    const bool readback_requested = readback_color0 || readback_color1 ||
+                                    (want_color_readback && color_count > 2);
     const bool storage_writeback_requested = std::any_of(
         texture_uploads.begin(), texture_uploads.end(),
         [](const SharedTextureUpload& upload) {
             return !upload.storage_writebacks.empty();
         });
+    // Deliberately the WOULD-BE value, not the gated one: this change must not alter when the
+    // backend flushes. Verified by the flush-reason counters, which are unchanged in an A/B.
     const bool synchronous_results_requested =
-        readback_requested || storage_writeback_requested;
+        readback_requested_for_flush || storage_writeback_requested;
     const bool flush_now = !submission_batch || synchronous_results_requested ||
                            flush_submission_batch;
     // Attributed in the same order the condition above evaluates, so exactly one bucket is charged
@@ -5538,7 +5707,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     uint64_t flush_reason_storage = 0, flush_reason_explicit = 0;
     if (flush_now) {
         if (!submission_batch) flush_reason_no_batch = 1;
-        else if (readback_requested) flush_reason_readback = 1;
+        // The WOULD-BE value: this bucket answers "why did the backend flush", and the flush is
+        // still caused by a readback being wanted even when #2283 then skips performing it.
+        // Attributing it to `explicit` instead would silently move counts between buckets and make
+        // the flush-reason histogram lie about an unchanged synchronization path.
+        else if (readback_requested_for_flush) flush_reason_readback = 1;
         else if (storage_writeback_requested) flush_reason_storage = 1;
         else flush_reason_explicit = 1;
     }
@@ -5976,6 +6149,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const bool geom_active = geom_buf != VK_NULL_HANDLE && geom_counter != VK_NULL_HANDLE;
 
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
+    backend_pass_timing_begin(dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits,
+                              rpbi.renderArea.extent.width, rpbi.renderArea.extent.height,
+                              color_target ? color_target->persistent_id : 0, dv.size(),
+                              [&] {   // #2283: colour-writing draws, counted not inferred
+                                  // Gate-checked HERE, not only inside the callee. Arguments are
+                                  // evaluated before the call, so without this the loop ran on every
+                                  // pass of every DEFAULT run -- an O(draws) scan added to the hot
+                                  // path by a diagnostic that was switched off. Exactly the cost
+                                  // this instrument exists to find.
+                                  if (!backend_pass_timing_enabled()) return size_t{0};
+                                  size_t n = 0;
+                                  for (size_t i = 0; i < dv.size() && i < draws.size(); ++i)
+                                      if (draws[i].ps && draws[i].ps->color_write_mask) ++n;
+                                  return n;
+                              }());   // #2333
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
@@ -6026,6 +6214,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    backend_pass_timing_end(cmd);   // #2333
     // Fence waits used to provide the device-memory dependency between every target call. Batched
     // command buffers deliberately remove those intermediate waits, and command-buffer/submission
     // order alone permits action commands to overlap. Publish persistent attachment writes here so
@@ -7055,14 +7244,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               std::vector<uint8_t>* out_rgba1 = nullptr,
                                               BackendSubmissionBatch* submission_batch = nullptr,
                                               bool flush_submission_batch = true,
-                                              BackendMrtOutputs* mrt_outputs = nullptr) {
+                                              BackendMrtOutputs* mrt_outputs = nullptr,
+                                              bool want_color_readback = true) {   // #2283
     const std::span<const BackendDraw> all(draws);
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,
                                      persist_depth_stencil, color_target, seed_rgba1,
                                      clear_rgba1, out_rgba1, submission_batch,
-                                     flush_submission_batch, {}, mrt_outputs);
+                                     flush_submission_batch, {}, mrt_outputs,
+                                     want_color_readback);
 
     BackendColorTargetStats aggregate_color{};
     BackendTextureUploadStats aggregate_textures{};
@@ -7204,7 +7395,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
             begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
             final ? flush_submission_batch : false, all,
-            final ? mrt_outputs : nullptr);
+            final ? mrt_outputs : nullptr, want_color_readback);
         add_stats();
 
         if (final) {

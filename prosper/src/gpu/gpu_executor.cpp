@@ -6074,6 +6074,16 @@ struct ParallelDrawContext {
     uint32_t max_shader_dwords = 0;
     bool retain_shared_shader_words = false;
     bool parent_readable_active = false;
+    // PROSPER_DESCRIPTOR_VALIDATE, read ONCE for this submit and handed to every worker (#2287).
+    // Previously each worker read it twice per draw, and on Windows getenv takes a process-wide
+    // lock, so the cost was contention across workers rather than a constant per call.
+    //
+    // Read here rather than assumed unset. It is in parallel_draw_diagnostic_active's list, so this
+    // path only runs when the variable is clear and passing nullptr would be correct TODAY -- but
+    // that would make descriptor validation depend on a diagnostic list it has no visible
+    // relationship to, and removing the entry from that list would silently stop validating instead
+    // of failing. One getenv per submit costs nothing and owes nothing to that coupling.
+    const char* descriptor_validate_mode = nullptr;
     std::vector<ParallelDrawSlot> slots;
     std::vector<ParallelWorkerMeasurement> measurements;
 };
@@ -6095,7 +6105,7 @@ void parallel_draw_worker_execute(void* opaque, size_t draw_index, size_t) {
     slot.realized = realize_draw_item(
         state.state_at_draw(draw_index), &draw, draw.index_count,
         context.max_shader_dwords, false, slot.item, nullptr,
-        context.retain_shared_shader_words);
+        context.retain_shared_shader_words, &context.descriptor_validate_mode);
     if (slot.realized) {
         slot.item.draw_index = draw_index;
         slot.item.command_order = draw.command_order;
@@ -6161,6 +6171,7 @@ std::vector<DrawItem> realize_gpustate_draws_parallel(
     context.max_shader_dwords = max_shader_dwords;
     context.retain_shared_shader_words = retain_shared_shader_words;
     context.parent_readable_active = g_guest_readable_cache.active;
+    context.descriptor_validate_mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");   // once, not per draw
     context.slots.resize(st.draws.size());
     context.measurements.resize(worker_count + 1);
 

@@ -6,6 +6,7 @@
 // present layer (present_write_frame → present_readback). All the boot-time diagnostics
 // (PROSPER_RENDER_*, PROSPER_DUMP_*, PROSPER_TESTTEX, …) are preserved and remain env-gated.
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -125,5 +126,31 @@ bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
 // caller explicitly requests dumps.
 void register_live_renderer(const std::string& frame_dir = ".",
                             bool dump_bmps = kFrameDumpsByDefault);
+
+// #2215: which OS thread is currently inside a live submit-render callback, or 0.
+//
+// The thread sampler in hle_kernel.cpp suspends OTHER threads to read their context, so a
+// thread_local cannot answer this — the question is asked from a different thread than the one it
+// is about. A single process-wide slot can be, and one slot is enough because the renderer already
+// documents a single-present-thread contract.
+//
+// This exists to split the collapsed frame exactly. Measured on Blue Prince: 530 ms/flip inside
+// these callbacks against 938 ms/flip wall, so ~43% of the frame is time the renderer is not
+// running at all — and attributing that half by inspecting a six-frame host-stack walk misfiles
+// any sample taken deep inside ucrtbase, because the renderer frame falls off the end.
+std::atomic<unsigned long>& renderer_callback_tid();
+
+// True when `native_tid` is the thread currently inside a submit-render callback. A mismatch reads
+// as "outside": if a second thread ever entered concurrently it would overwrite the slot, and a
+// diagnostic that reports the wrong bucket is better than one that asserts.
+bool tid_is_in_renderer_callback(unsigned long native_tid);
+
+// RAII publisher. Restores the PREVIOUS value rather than clearing to 0, so a nested or re-entrant
+// callback cannot leave the slot empty while an outer one is still running.
+struct ScopedRendererCallbackTid {
+    unsigned long previous;
+    ScopedRendererCallbackTid();
+    ~ScopedRendererCallbackTid();
+};
 
 } // namespace prosper::frontend

@@ -654,6 +654,48 @@ uint32_t buffer_upload_bytes(uint32_t declared_bytes) {
     return std::min(declared_bytes, ceiling) & ~3u;
 }
 
+// #2215 instrument -- see live_renderer.hpp for why this is a process-wide slot rather than a
+// thread_local (the sampler asks from a different thread than the one it is asking about).
+std::atomic<unsigned long>& renderer_callback_tid() {
+    static std::atomic<unsigned long> tid{0};
+    return tid;
+}
+
+bool tid_is_in_renderer_callback(unsigned long native_tid) {
+    const unsigned long current = renderer_callback_tid().load(std::memory_order_relaxed);
+    return current != 0 && current == native_tid;
+}
+
+// Every callback ENTRY, not the ~0.6% of them a sampler happens to catch. See the self-check in
+// hle_kernel.cpp: a zero here is real evidence that the strong override never linked, whereas a zero
+// count of sampler sightings is just the ordinary outcome at this base rate (#2347).
+std::atomic<unsigned long long> g_renderer_callback_entries{0};
+
+extern "C" unsigned long long prosper_renderer_callback_entries() {
+    return g_renderer_callback_entries.load(std::memory_order_relaxed);
+}
+
+ScopedRendererCallbackTid::ScopedRendererCallbackTid() {
+    g_renderer_callback_entries.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    const unsigned long self = (unsigned long)GetCurrentThreadId();
+#else
+    const unsigned long self = (unsigned long)(uintptr_t)pthread_self();
+#endif
+    previous = renderer_callback_tid().exchange(self, std::memory_order_relaxed);
+}
+
+ScopedRendererCallbackTid::~ScopedRendererCallbackTid() {
+    renderer_callback_tid().store(previous, std::memory_order_relaxed);
+}
+
+// The strong definition that overrides prosper_core's weak stub once the live renderer is in
+// the link. Keeping the override here rather than in prosper_core is what lets a build WITHOUT
+// the renderer answer 0 truthfully instead of failing to link (#2215).
+extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
+    return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
+}
+
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
@@ -1109,6 +1151,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         [frame_dir, dump_bmps, invalidate_ds](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
+            // #2215 instrument: publish which thread is inside a submit-render callback right
+            // now, so the thread sampler can attribute its samples EXACTLY instead of guessing
+            // from a six-frame host-stack walk (a sample taken deep in ucrtbase loses the
+            // renderer frame off the end of that walk and is misfiled as "outside").
+            //
+            // Measured: 2.92 submits/flip x 181.8 ms = 530 ms/flip inside these callbacks
+            // against 938 ms/flip wall -- so ~43% of the collapsed frame is time when this
+            // callback is NOT running, and nothing has ever instrumented that half.
+            //
+            // One slot, not a set: the renderer already documents a single-present-thread
+            // contract (see g_rtt and the dp_submit statics above). A second concurrent caller
+            // would overwrite it, so the reader treats a mismatch as "outside" rather than
+            // asserting -- a wrong attribution is better than a crash in a diagnostic.
+            prosper::frontend::ScopedRendererCallbackTid scoped_renderer_tid;
             // Compute fast-clears update a target's DCC metadata between graphics spans. Associate
             // those ranges before draining the ordered guest-write notifications so a metadata write
             // cannot leave the previous frame's retained target authoritative.
@@ -2635,8 +2691,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // VK_FORMAT_R8_UNORM sampled image consumes. Expanding every byte to RGBA on the
                         // CPU multiplied Astro Bot's 3840x3240 FMV traffic by four and cost 26-31 ms per
                         // frame. Keep the historical grayscale broadcast through the image-view swizzle.
+                        // img_dim is tested through avp_plane_is_one_layer_2d rather than
+                        // `== 1u`: a title may declare a single-channel plane as a ONE-LAYER 2D
+                        // ARRAY (dim 5, depth 1), which is the same memory and the same sampled
+                        // values but missed this fast path and was CPU-expanded to RGBA8 --
+                        // R-Type Delta (PPSA26414) ships its AvPlayer luma plane that way, so
+                        // every movie frame moved 4x the bytes it needed (#2034). The helper
+                        // also requires no layer stride and no layer mip offset, so a REAL
+                        // multi-layer array still fails and keeps the expanded path.
                         const bool native_r8_sampled =
-                            r.cls == RC::Texture && r.img_dim == 1u &&
+                            r.cls == RC::Texture && prosper::frontend::avp_plane_is_one_layer_2d(r) &&
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components == 1 && r.tile_mode == 0u &&
                             !r.compression_enabled && !linear_padded_read;
@@ -6038,7 +6102,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,
                         batch_backend_submits ? &backend_submission : nullptr,
-                        pass_i == items.size(), &mrt_outputs);
+                        pass_i == items.size(), &mrt_outputs,
+                        // #2283: only ask for colour pixels when something will read them.
+                        //
+                        // Keyed on the UNION of every bound slot, not on colour-0 alone. Review
+                        // caught that: `gpx`'s only consumer is indeed inside an `if (base ...)`
+                        // pair with no else, but `gpx` is not all the call returns. `mrt_outputs`
+                        // is filled by the same call and its consumer is keyed per slot on
+                        // `pass_bases[slot]`, where an EMPTY vector is not a no-op -- it calls
+                        // `surface.rgba.reset()` and drops that surface's cached pixels.
+                        //
+                        // `mrt_count` does not depend on `base`, so a pass with colour-0 unbound
+                        // and colour-1 bound is reachable by construction -- the same sparse export
+                        // hole the MRT loop already acknowledges, at slot 0 instead of slot 1. On
+                        // `base != 0` alone such a pass would silently lose a live colour-1 RTT.
+                        // Structural rather than observed, which is exactly why the 457/457
+                        // depth-only measurement could not clear it: that evidence is all slot 0.
+                        //
+                        // Depth-only passes have every slot zero, so the win is unchanged.
+                        // Keyed on the base rather than the draws' colour write masks for the
+                        // separate reason that 457/457 is evidence about THIS route, and a future
+                        // title could legally mix a colour-writing draw into a pass that has a base.
+                        /*want_color_readback=*/std::any_of(
+                            pass_bases.begin(),
+                            pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
+                            [](uint64_t slot_base) { return slot_base != 0; }));
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
