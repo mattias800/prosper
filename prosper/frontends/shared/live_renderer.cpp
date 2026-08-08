@@ -2635,8 +2635,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // VK_FORMAT_R8_UNORM sampled image consumes. Expanding every byte to RGBA on the
                         // CPU multiplied Astro Bot's 3840x3240 FMV traffic by four and cost 26-31 ms per
                         // frame. Keep the historical grayscale broadcast through the image-view swizzle.
+                        // img_dim is tested through avp_plane_is_one_layer_2d rather than
+                        // `== 1u`: a title may declare a single-channel plane as a ONE-LAYER 2D
+                        // ARRAY (dim 5, depth 1), which is the same memory and the same sampled
+                        // values but missed this fast path and was CPU-expanded to RGBA8 --
+                        // R-Type Delta (PPSA26414) ships its AvPlayer luma plane that way, so
+                        // every movie frame moved 4x the bytes it needed (#2034). The helper
+                        // also requires no layer stride and no layer mip offset, so a REAL
+                        // multi-layer array still fails and keeps the expanded path.
                         const bool native_r8_sampled =
-                            r.cls == RC::Texture && r.img_dim == 1u &&
+                            r.cls == RC::Texture && prosper::frontend::avp_plane_is_one_layer_2d(r) &&
                             r.format == prosper::gpu::DataFormat::Unorm8 &&
                             r.num_components == 1 && r.tile_mode == 0u &&
                             !r.compression_enabled && !linear_padded_read;
