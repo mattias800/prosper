@@ -5321,9 +5321,26 @@ HLE(k_ampr_init) {
     if (a0 > 0xffff)
         ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
                           a2 >= 0x20 && a2 <= 0x100000); // match the POSIX 3.20 discriminator
+    // The POSIX arm logs this call; this arm did not, so a Windows run could not answer
+    // "was the command buffer ever CONSTRUCTED?" at all -- and that is the question a zero
+    // GetCurrentOffset raises (#2384). Same tag as POSIX so one grep works on both.
+    ampr_arglog("8aI7R7WaOlc(CommandBufferConstructor)", a0, a1, a2, a3, a4, a5);
     return 0;
 }
 HLE(k_ampr_reset) { ampr_cb_reset(a0); return 0; }
+// Two NIDs that the Windows arm answers with the shared `k_ampr_ok` (a bare `return 0`).
+// They get NAMED stubs purely so PROSPER_AMPRLOG can see them: a shared handler cannot carry
+// a per-NID tag, so routing both through k_ampr_ok made them invisible -- and these two are
+// exactly where a Windows run diverges from POSIX (#2384: POSIX has k_ampr_begin and
+// k_ampr_push_map here). Behavior is UNCHANGED -- still `return 0` -- because porting those
+// two handlers is a separate, behavioral change that needs its own evidence and review.
+// Being able to SEE the divergence in a log is the prerequisite for fixing it.
+HLE(k_ampr_apr_cb_construct_stub) {
+    return ampr_arglog("a8uLzYY--tM(AprCommandBufferConstructor, WINDOWS STUB)", a0, a1, a2, a3, a4, a5);
+}
+HLE(k_ampr_set_buffer_stub) {
+    return ampr_arglog("N-FSPA4S3nI(SetBuffer, WINDOWS STUB)", a0, a1, a2, a3, a4, a5);
+}
 HLE(k_ampr_destruct) { ampr_cb_destroy_320(a0); return 0; }
 HLE(k_ampr_getsize) {
     if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
@@ -5706,8 +5723,8 @@ void register_kernel_mem_hle() {
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
     // libSceAmpr / APR command-buffer trio + teardown — no-op stubs on Windows (area:ue4).
     Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init, "sceAmprCommandBufferConstructor");
-    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferConstructor");
-    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_ok, "sceAmprCommandBufferSetBuffer");
+    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_apr_cb_construct_stub, "sceAmprAprCommandBufferConstructor");
+    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_set_buffer_stub, "sceAmprCommandBufferSetBuffer");
     Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_reset, "sceAmprCommandBufferReset");
     Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_reset, "sceAmprCommandBufferClearBuffer");
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
