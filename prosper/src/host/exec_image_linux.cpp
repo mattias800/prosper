@@ -3176,7 +3176,21 @@ void install_trap_handler() {
             mb3w_arm_current_thread(base);
         };
     }
-    if (g_faultmem || g_skip_null_companion || g_null_page) ensure_probe_pipe();
+    // UNCONDITIONAL (#2078). This used to be gated on
+    // `g_faultmem || g_skip_null_companion || g_null_page`, and the gate was wrong because it does
+    // not cover every consumer: `nullpage_deep_dump` also runs from the WORKER-FAULT path (:2782),
+    // which no flag guards -- that call site exists precisely because those faults "land here, not
+    // on the nullpage path".
+    //
+    // Without the pipe, `probe_readable` returns false for EVERY address (:612 short-circuits on
+    // `g_probe_pipe[1] < 0`), so an ordinary worker-fault report loses its `insn @rip` line and all
+    // sixteen register memory windows -- including `rsp`, which is the faulting thread's own stack
+    // and cannot be unreadable. The report still prints four bare register lines, so it looks like a
+    // report that ran and found nothing rather than one whose probe was disabled.
+    //
+    // It must be created HERE and not from the handler: `ensure_probe_pipe` guards a magic static,
+    // whose initialisation lock is not async-signal-safe. Cost when unused is one pipe pair.
+    ensure_probe_pipe();
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
     if (const char* pk = getenv("PROSPER_PEEK")) {
