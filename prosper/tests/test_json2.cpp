@@ -6,6 +6,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -30,6 +36,47 @@ uint64_t call(HleFn fn, const void* a0 = nullptr, const void* a1 = nullptr,
     return fn(reinterpret_cast<uintptr_t>(a0), reinterpret_cast<uintptr_t>(a1), a2, a3, 0, 0);
 }
 } // namespace
+
+// A two-page reservation whose FIRST page is readable and whose second is not. Used to build a
+// string that runs flush into unmapped memory -- the case that separates "refuse" from "hand
+// back a truncated prefix". Portable because the behaviour under test is not platform-specific;
+// guarding the arm to one OS would leave the other silently uncovered (the #1970 shape).
+size_t probe_page_size() {
+#ifdef _WIN32
+    SYSTEM_INFO si{}; GetSystemInfo(&si); return si.dwPageSize;
+#else
+    return (size_t)sysconf(_SC_PAGESIZE);
+#endif
+}
+
+char* reserve_two_pages_first_readable() {
+    const size_t page = probe_page_size();
+#ifdef _WIN32
+    auto* base = static_cast<char*>(VirtualAlloc(nullptr, page * 2, MEM_RESERVE, PAGE_NOACCESS));
+    if (!base) return nullptr;
+    if (!VirtualAlloc(base, page, MEM_COMMIT, PAGE_READWRITE)) {
+        VirtualFree(base, 0, MEM_RELEASE); return nullptr;
+    }
+    return base;
+#else
+    auto* base = static_cast<char*>(
+        mmap(nullptr, page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (base == MAP_FAILED) return nullptr;
+    if (mprotect(base, page, PROT_READ | PROT_WRITE) != 0) {
+        munmap(base, page * 2); return nullptr;
+    }
+    return base;
+#endif
+}
+
+void release_two_pages(char* base) {
+    const size_t page = probe_page_size();
+#ifdef _WIN32
+    (void)page; VirtualFree(base, 0, MEM_RELEASE);
+#else
+    munmap(base, page * 2);
+#endif
+}
 
 int main() {
     std::puts("== test_json2 ==");
@@ -195,6 +242,85 @@ int main() {
     call(dtor, &string_value);
     call(string_dtor, &key);
     call(dtor, &object_value);
+
+    // --- #1967: sce::Json::Value::Value(const char*) ------------------------------------------
+    // The dispatcher's `return 0` default is safe for a status-returning function and unsafe for a
+    // CONSTRUCTOR: the guest reserves the storage and expects the callee to write the object into
+    // it. An unimplemented ctor therefore leaves the guest using stack residue as a live Value, and
+    // no return value can fix that -- which is why this had to be implemented rather than stubbed.
+    {
+        HleFn ctor_cstr = Hle::lookup("b9V6fmppLXY");
+        CHECK(ctor_cstr != nullptr, "Value(const char*) is registered");
+        if (ctor_cstr) {
+            // POISONED storage, not zeroed. A zeroed slot would let an unimplemented ctor pass this
+            // arm by accident -- type 0 is Null, which is a legal value -- so the arm has to start
+            // from something no correct constructor could leave behind.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, const_cast<char*>("hello"));
+            CHECK(v.type == 5, "Value(const char*) constructs a String value (type 5)");
+            auto* js = reinterpret_cast<void*>(call(get_string, &v));
+            auto* cs = js ? reinterpret_cast<const char*>(call(string_cstr, js)) : nullptr;
+            CHECK(cs && std::strcmp(cs, "hello") == 0,
+                  "Value(const char*) stores the text it was given");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
+            // Value("") is a String whose text is empty, NOT Null. Returning Null here would be a
+            // silent wrong answer rather than a refusal: getType() would report 0 where the guest
+            // constructed a string, and every later getString() would disagree with the ctor.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, const_cast<char*>(""));
+            CHECK(v.type == 5, "Value(\"\") constructs an empty String (type 5), not Null");
+            auto* js = reinterpret_cast<void*>(call(get_string, &v));
+            auto* cs = js ? reinterpret_cast<const char*>(call(string_cstr, js)) : nullptr;
+            CHECK(cs && cs[0] == 0, "Value(\"\") stores empty text");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
+            // A null argument is a null Value, not a crash -- and the storage must still be left
+            // well-formed, because the guest will destroy it either way.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, nullptr);
+            CHECK(v.type == 0, "Value(nullptr) constructs a Null value rather than faulting");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
+            // An unmapped-but-non-null pointer. 0x80 is the shape that actually occurs (a null base
+            // plus a field offset) and the one that walked into #1963 in libkernel. Reaching the
+            // next line at all is the assertion: an unvalidated read here does not fail, it faults.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, reinterpret_cast<void*>(static_cast<uintptr_t>(0x80)));
+            CHECK(v.type == 0, "Value(bad pointer) yields a well-formed Null value, not a fault");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
+            // UNTERMINATED: readable text running flush into an unmapped page with no NUL.
+            // Built by reserving two pages and making only the first accessible, so the bytes
+            // are genuinely readable up to a hard boundary. A truncated construction here is a
+            // wrong ANSWER rather than a refusal, and the earlier code produced exactly that.
+            char* base = reserve_two_pages_first_readable();
+            if (base) {
+                const size_t page = probe_page_size();
+                std::memset(base, 0x41, page);          // a page of "A", no terminator
+                JsonValue v;
+                std::memset(&v, 0xA5, sizeof v);
+                call(ctor_cstr, &v, base + page - 8);   // 8 readable bytes, then nothing
+                CHECK(v.type == 0,
+                      "Value(unterminated) refuses rather than constructing a truncated String");
+                call(dtor, &v);
+                release_two_pages(base);
+            }
+        }
+        // The two destructors this issue also names. They own nothing prosper allocated, so a no-op
+        // is the correct body -- the point is that they RESOLVE rather than falling to the
+        // unimplemented path, where each costs a log line and reads as a gap.
+        CHECK(Hle::lookup("RujUxbr3haM") != nullptr, "Initializer::~Initializer is registered");
+        CHECK(Hle::lookup("OcAgPxcq5Vk") != nullptr, "MemAllocator::~MemAllocator is registered");
+    }
 
     std::puts(failures ? "== FAIL ==" : "== PASS ==");
     return failures ? 1 : 0;
