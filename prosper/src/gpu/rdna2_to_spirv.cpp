@@ -13440,8 +13440,21 @@ bool emit_cfg_state_machine(
                 if (handled && ok) record_scalar_write(state, in);
                 if (!handled || !ok) {
                     if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
-                                     in.pc, static_cast<int>(in.fmt), in.opcode);
+                        // The raw INSTRUCTION WORDS, because without them this line cannot be acted
+                        // on. `fmt` and `op` are our decoder's own labels, so they identify the
+                        // instruction only if you already trust the decode -- and a reject is
+                        // precisely the case where you should not. The word is ground truth and
+                        // names the instruction in one command:
+                        //     llvm-mc -arch=amdgcn -mcpu=gfx1010 -show-encoding
+                        // assemble the candidate and compare, exactly as #2275 identified the image
+                        // atomics and #2309 identified s_cbranch_vccz from `bf860051`.
+                        // Its sibling at the ALU reject site already prints these; this one did not,
+                        // so half the rejects from a run were unidentifiable and the two diagnostics
+                        // could not be compared (#2309).
+                        std::fprintf(stderr,
+                                     "[cfg-recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x\n",
+                                     in.pc, in.words[0], in.words[1],
+                                     static_cast<int>(in.fmt), in.opcode);
                     return false;
                 }
                 // Ordinary scalar B64 logicals already produced an exact nonzero SCC id above.
