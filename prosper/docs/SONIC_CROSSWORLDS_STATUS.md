@@ -481,6 +481,26 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **RUNG 2 REACHED -- THE TITLE SCREEN RENDERS COMPLETELY, AND "THE COMPOSITE GOES UNIFORM" WAS NEVER
+  THE RIGHT DESCRIPTION.** With denser pulses on the route above (`scripts/sonic-crossworlds/`), the
+  full sequence is **black -> SEGA -> Unreal Engine -> CRIWARE -> licensor -> auto-save notice ->
+  TITLE SCREEN -> player-profile menu -> white**. The title screen is complete at 3840x2160: the 3D
+  scene, every character, the track, the logo, `PRESS`, `License Information`, `(C)SEGA` and version
+  `1.1.2`. **Reproduced across two independent 560 s runs.** Note the composite CRC does **not**
+  match between them -- the scene is animated -- so the comparison is by content signature:
+  **113,524 / 113,676** distinct sampled colours at 99.6% coverage in the first run against
+  **113,476 / 114,379** at 99.6% in the second, at the same sample positions. For scale this document
+  records the SEGA logo at 1,373 colours.
+  *Method worth reusing:* opening twenty 4K frames is expensive, so the unexamined ones were **scored
+  before being opened** -- distinct sampled colours and non-black ratio -- and the two that stood two
+  orders of magnitude above the rest were the only ones opened. A CRC tells you frames differ; it does
+  not tell you which one is worth looking at.
+  **The defect is now per-screen, not global.** The title screen's scene renders; the profile menu's
+  UI composites correctly (rank badge, account name, BACK / VIEW PLAYER / NEXT) while its central
+  content panel stays black. So "no scene-geometry pass" is a statement about *some* screens. The
+  terminal white state and the letterboxed auto-save notice remain unexplained. Rung 3 (gameplay) is
+  not reached. #2013.
+
 - **THE TITLE WAS WAITING FOR A BUTTON, AND THE RENDERER WAS FINE ALL ALONG.** The one item this
   document listed as untested -- *"any input route -- nothing has been shown to respond to a pad
   yet"* -- is the one that moves. With `scripts/sonic-crossworlds/advance-boot-logos.pad` the title
@@ -496,8 +516,8 @@ One line per falsified hypothesis, with the evidence that killed it.
   **Strong but not airtight:** nine samples over 270 s would very likely have caught one of these
   screens had they played regardless of input, and four no-pad observations caught none -- but a
   same-session alternating A/B has not been run. **It does not reach a title screen** -- it reaches
-  the game's own **auto-save notice** (`824976b1`, checkered background and "Saving" spinner), which
-  on SEGA titles sits just before one. *The route's own shape was the limiter at first:* an earlier
+  the game's own **auto-save notice** (`824976b1`) -- and past that, with denser pulses, **the title
+  screen itself** and then the player-profile menu. *The route's own shape was the limiter at first:* an earlier
   version ended in a long hold and stopped at the legal screen, which by the edge mechanism above is
   a limit the route created rather than one the title has -- continued pulses reached the notice.
   Flagged and not claimed: that notice renders **letterboxed** into a horizontal band rather than
