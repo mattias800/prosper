@@ -2542,10 +2542,13 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
             if (apr_peek(a4 + o, &pv)) fprintf(stderr, "[apr]   desc+0x%02x = 0x%016llx\n", o, (unsigned long long)pv);
         // The real read command lives in the Ampr command buffer registered at init (a3 of the
         // (req, cbSize, 0, cbBuf, poolCtx, 3) init call); "CB offset 40" is decimal 40 = 0x28 into it.
-        // g_apr_last_cb is defined in hle_kernel_mem.cpp, which is entirely #ifdef __linux__ (the whole
-        // Ampr/APR path is Linux-only), so this diagnostic must be Linux-only too or MinGW fails to
-        // link (undefined reference to prosper::g_apr_last_cb).
-#ifndef _WIN32
+        // This block used to be #ifndef _WIN32, on the stated grounds that hle_kernel_mem.cpp is
+        // "entirely #ifdef __linux__ (the whole Ampr/APR path is Linux-only)" and MinGW would fail to
+        // link. That was already wrong about the path -- hle_kernel_mem.cpp has a full Windows Ampr
+        // arm -- and right only about the SYMBOL: g_apr_last_cb happened to be defined inside the
+        // POSIX half of the platform split. It is now defined above the split (#1970), so the guard
+        // has no reason left and the diagnostic runs on both. apr_peek is a local lambda already used
+        // unguarded a few lines above, so nothing else here was platform-bound.
         if (g_apr_last_cb) {
             fprintf(stderr, "[apr]   cb=0x%llx size=0x%llx\n",
                     (unsigned long long)g_apr_last_cb, (unsigned long long)g_apr_last_cb_size);
@@ -2556,7 +2559,6 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
                     fprintf(stderr, "[apr]   cb+0x%02llx = 0x%016llx\n", (unsigned long long)o,
                             (unsigned long long)pv);
         }
-#endif
     }
     // a3 is the APR file id (read1 a3=1 global.utoc, read2 a3=3 pakchunk2-ps5.utoc, read3 a3=4
     // pakchunk1-ps5.pak — read3's stack record is pure frame residue, which is what proved a3 is
