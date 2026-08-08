@@ -340,10 +340,27 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     `.prperf` with `tools/perf/performance_capture_report.py` (it reports by **time**; the record counts
     are not load), and the bundle with `tools/gpu_replay --bundle`.
 
-    **Read the F8 report before optimising anything.** Worked example (#2215, 2026-08-07): Blue Prince at
-    1 fps, and the capture said `gpu-device` was **2.2%** of the frame while `renderer-resource` was 47%
-    — and that `buffer copy`, the leaf two lanes were optimising because it dominates in *gameplay*, was
-    **2.4%** during the collapse. Two different problems that looked like one.
+    **Read the F8 report before optimising anything — and check the capture can SEE the leaf you are
+    reading.** Worked example (#2215, 2026-08-07): Blue Prince at 1 fps, and the capture said
+    `gpu-device` was **2.2%** of the frame while `renderer-resource` was 47%. That half stands.
+
+    The same example used to end "and `buffer copy` was **2.4%** during the collapse". **That number was
+    wrong, and this line kept publishing it for a day after it was retracted.** The capture predated
+    #2243's backend sub-buckets, so the only buffer figure in it was the *frontend* materializer's,
+    while the leaf two lanes were actually optimising — `res_buffer_copy_ms`, the backend memcpy at
+    `tests/render_runner.h:5199` — was invisible to it. Re-captured with the sub-buckets live and the
+    collapse confirmed by flip rate (1.59/s): `setup_resources 801.9ms [buffer=673.4 (copy=539.2) …]`,
+    i.e. **~67%**, not 2.4%. Two independent instruments agree it is large in the collapsed regime and
+    on both platforms — `PROSPER_RENDER_TIMING` gives copy/backend **15.7%** on Linux and **18.5%** on
+    Windows, and `perf` puts the same leaf at 17.6% of the saturated Linux worker.
+
+    **The lesson is not the arithmetic, it is the propagation.** The 2.4% was corrected on #2215 the
+    same day it was posted; the charter was not, so the retracted figure went on steering people from
+    the document they read *first*, and the other lane reports it is what sent them chasing five dead
+    hypotheses. A correction that lives only in an issue thread is not a correction to the charter —
+    if a number here came from your measurement and your measurement changes, the charter is part of
+    the fix, not follow-up work. **A stale figure carries the charter's authority, which is exactly the
+    authority it no longer deserves.**
 - **Reaching the running frame loop:** `PROSPER_GUEST_ARGS=-force-gfx-direct`, plus `PROSPER_RENDER=1`
   to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
   - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
