@@ -41,6 +41,20 @@ struct ShaderReg { uint32_t offset; uint32_t value; };
 // The sparse contract is preserved exactly and is the thing to be careful about: an offset that was
 // never written must remain ABSENT (`find() == end()`, `count() == 0`), not read as 0. Every lookup
 // here goes through the same presence test as before; nothing invents a zero.
+//
+// ONE LIFETIME RULE DID CHANGE, and it is the only behavioural difference from the unordered_map:
+// `std::unordered_map::insert` does not invalidate references or pointers to existing elements.
+// `std::vector::insert` invalidates BOTH references and iterators when it reallocates. So this is
+// fine before the swap and undefined behaviour after it:
+//
+//     uint32_t& v = f[a];
+//     f[b] = x;            // may reallocate
+//     v = y;               // dangling
+//
+// No caller in the tree does that today -- every `find` result is consumed immediately with no
+// intervening mutation -- but nothing in the type stops the next one, so it is written down here
+// rather than left to be rediscovered. Raised in review by Wren, who went looking for the pattern
+// specifically because it is what a map-to-vector swap silently changes.
 class RegisterFile {
 public:
     using value_type = std::pair<uint32_t, uint32_t>;
