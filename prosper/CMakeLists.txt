@@ -1461,6 +1461,16 @@ if(TARGET prosper_core)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
 
+      # The per-draw internal-GDS scan memo (#2334). Two registrations of ONE binary: the second
+      # sets the opt-out, so the pair proves the memo both fires and can be turned off, on a single
+      # build. Both must PASS -- the binary flips its own expectation from the environment.
+      add_executable(test_gds_scan_memo tests/test_gds_scan_memo.cpp)
+      target_link_libraries(test_gds_scan_memo PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME gds_scan_memo COMMAND test_gds_scan_memo)
+      add_test(NAME gds_scan_memo_disabled COMMAND test_gds_scan_memo)
+      set_tests_properties(gds_scan_memo_disabled PROPERTIES
+                           ENVIRONMENT "PROSPER_NO_GDS_SCAN_MEMO=1")
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       add_executable(test_recompiled_fragment tests/test_recompiled_fragment.cpp)
       target_link_libraries(test_recompiled_fragment PRIVATE prosper_core Vulkan::Vulkan)

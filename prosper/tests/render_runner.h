@@ -2961,6 +2961,44 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
     return true;
 }
 
+// fragment_spirv_uses_internal_gds walks the ENTIRE SPIR-V module and builds two unordered_maps,
+// and both call sites below invoke it once per DRAW on a module that changes only when the shader
+// does. On Blue Prince's collapsed Day One state (~4,048 draws/submit) it measured 5.64% of the
+// saturated render thread, plus the allocator churn of two map constructions per draw (#2334).
+//
+// Memoized on fs_identity -- the same key, and for the same reason, as the subgroup-scan memo
+// (#2259) further down: DrawItem identities come from the shader-recompile cache as
+// `cache.next_identity++` (src/gpu/gpu_executor.cpp), a monotonic counter that is never reset,
+// never decremented and untouched by eviction. So an identity denotes one module for the life of
+// the process -- an evicted shader recompiles to a NEW identity, which misses here and refills,
+// and the stale entry is simply never looked up again. The counter starts at 1, so identity 0 is
+// never minted and the identity-0 fallthrough below cannot collide with a real module.
+//
+// The memoized value is a pure function of the module words alone -- it reads no device state --
+// so a hit is exactly what the call would have returned.
+//
+// PROSPER_NO_GDS_SCAN_MEMO: opt out, so the A/B for this change is single-variable on ONE binary
+// rather than a comparison of two builds, matching PROSPER_NO_SUBGROUP_SCAN_MEMO (#2259),
+// PROSPER_NO_INDEX_ARENA (#2258) and the PROSPER_NO_BACKEND_* family.
+inline bool fragment_uses_internal_gds_memoized(uint64_t fs_identity,
+                                                const std::vector<uint32_t>& fs_words) {
+    static const bool no_gds_scan_memo = getenv("PROSPER_NO_GDS_SCAN_MEMO") != nullptr;
+    if (!fs_identity || no_gds_scan_memo)
+        return prosper::gpu::fragment_spirv_uses_internal_gds(fs_words);
+    static thread_local std::unordered_map<uint64_t, bool> gds_scan_memo;
+    constexpr size_t kGdsScanMemoMaxEntries = 4096;
+    const auto found = gds_scan_memo.find(fs_identity);
+    if (found != gds_scan_memo.end()) return found->second;
+    const bool uses = prosper::gpu::fragment_spirv_uses_internal_gds(fs_words);
+    // Cleared wholesale rather than aged, for the same reason as the subgroup-scan memo: there is no
+    // LRU bookkeeping worth paying for on a path this hot, and a clear means this memo has STOPPED
+    // WORKING (the scans are paid again in full, plus the churn) rather than that a threshold was
+    // brushed. 523 distinct shaders per submit leaves ample headroom against 4,096.
+    if (gds_scan_memo.size() >= kGdsScanMemoMaxEntries) gds_scan_memo.clear();
+    gds_scan_memo.emplace(fs_identity, uses);
+    return uses;
+}
+
 // `submission_batch` is an explicit live-renderer ownership scope. Calls with no requested CPU
 // readback may return after recording; `flush_submission_batch` submits every accumulated command
 // buffer in order, waits once, and releases all retained resources. Omitting the batch preserves the
@@ -3920,7 +3958,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<std::vector<FrameResource>> effective_resources(draws.size());
     for (size_t i = 0; i < draws.size(); ++i) {
         effective_resources[i] = draws[i].R;
-        if (prosper::gpu::fragment_spirv_uses_internal_gds(draws[i].fs_words())) {
+        if (fragment_uses_internal_gds_memoized(draws[i].fs_identity, draws[i].fs_words())) {
             FrameResource gds;
             gds.set = 1;
             gds.binding = 0;
@@ -4131,7 +4169,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
         const bool uses_internal_gds =
-            prosper::gpu::fragment_spirv_uses_internal_gds(bd_fs);
+            fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
         if (required_fragment_subgroup_size &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
