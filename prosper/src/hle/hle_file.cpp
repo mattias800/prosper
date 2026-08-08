@@ -1704,15 +1704,7 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 }
 
 #ifndef _WIN32
-// #2371: 64-bit on Windows. MinGW's `struct stat::st_size` is 4 bytes and `::stat()` fails with
-// EOVERFLOW on any file over 2 GiB, so a guest that stats a large archive was told it does not
-// exist. GTA V ships a 3,018,098,688-byte `update/update.rpf`. `to_sce_stat64` already existed for
-// exactly this and was simply not used here.
-#ifdef _WIN32
-HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
-#else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
-#endif
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? errno : 0;
                if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
                filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1);
