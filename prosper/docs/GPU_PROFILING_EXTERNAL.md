@@ -83,12 +83,43 @@ GUI) and `librenderdoc.so`, no `renderdoc.so` python module. So the scripted-ana
 `renderdoccmd capture` triggers on a keypress rather than a frame ordinal, which makes it awkward
 headless; RGP's `MESA_VK_TRACE_FRAME` is the better automated capture.
 
+## `radeontop` — the 60-second "is this even GPU-bound?" triage
+
+Verified, and it is the cheapest useful answer in this document: **no capture, no GUI, one run, any
+title.** Install with `dnf install radeontop`.
+
+```bash
+# 1. Start the title. 2. Sample INSIDE the regime you care about, never across a phase boundary.
+radeontop -d - -l 60
+```
+
+Measured on *Blue Prince* in its collapsed regime (t > 70 s, 60 samples) against a `vkcube` control:
+
+| | `gpu` mean | max | `spi` | `cb` | `sclk` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `vkcube` (control) | **56.31%** | 66.67% | 29.64% | 11.17% | 99.95% |
+| Blue Prince, collapsed | **4.17%** | 7.50% | 3.43% | 1.32% | 38.1% |
+
+**Blue Prince at ~3.2 fps leaves the GPU ~96% idle.** Combined with #2215's measured 30-45 ms/submit
+`gpu_device`, that means those submits are long because they **wait**, not because they work — a
+synchronisation question rather than a shading-cost one, and the two have completely different fixes.
+
+### Run the control. It is one command and it is not optional here.
+
+`radeontop` prints **"Unknown Radeon card"** on this STRIX_HALO APU, so a low reading is ambiguous between
+*the GPU is idle* and *radeontop cannot read this chip*. `vkcube` renders continuously; if the counters
+move for it, they are live.
+
+**The control also found dead counters.** `ta` (texture addresser) and `ee` read **0.00% under vkcube**,
+which certainly samples a texture — so they are not readable on this hardware. **Trust `gpu`, `spi`, `cb`,
+`sx`, `sclk`. Do not quote `ta` or `ee`.** A triage step that silently reads zero on an unsupported block
+is worse than no triage step, and that distinction exists only because a control ran.
+
 ## Also available, free, not yet explored
 
 | tool | install | for |
 | --- | --- | --- |
 | `umr` | `dnf install umr` | AMD GPU register/ring debugger — hangs and resets |
-| `radeontop` | `dnf install radeontop` | coarse live GPU utilisation |
 | `perf` | installed | CPU side; already used across this project |
 
 ## The `/tmp` warning, and it is the charter's own
