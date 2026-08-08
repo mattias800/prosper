@@ -481,6 +481,21 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **NO UNIMPLEMENTED NID IS BEING POLLED -- THIS IS NOT SONIC FRONTIERS' WALL.** That title's
+  four-session black screen was one unregistered NID answering `SCE_OK` and being called **1,319
+  times** (#2023), so the same census was the obvious first move here. It comes back clean:
+  `PROSPER_PROGRESS=5 PROSPER_PROGRESS_UNIMPL=1`, `boot_trace`, 120 s, **12 distinct unimplemented
+  functions** and the only one with any volume at all is `libScePosix::Xs9hdiD7sAA` at **127** calls
+  -- `pthread_setschedparam` per `../PS5-3.20_Libs`, i.e. the title setting thread priorities and
+  getting a benign success. Everything else is called once or twice, `libScePlayGo` included (2 and
+  1), so a content-availability wait is not what is happening either.
+  **And the frame loop is healthy, not stalled:** over the same run, presents climb steadily to
+  1,287 in 119 s (~10.8/s), flips to 403, `draws_cum` to 11,749 and dispatches to 17,500. *Read
+  `draws_last` carefully* -- it is the draws in the **last submit**, not in the heartbeat interval,
+  so its frequent `0` is not "the title stopped drawing": `draws_cum` rises by ~425 every 5 s
+  throughout. The title runs, draws ~85 times a second, dispatches ~140 times a second, presents,
+  and shows black. #2013.
+
 - **RESTORING THE LAYERED ATOMIC DISPATCH DOES NOT MOVE THE COMPOSITE.** #2265's full-screen
   `IMAGE_ATOMIC_ADD` dispatch was the strongest remaining candidate -- it writes the image the
   presented frame is composed from, and unlike the four programs restored before it, it covers the
@@ -793,18 +808,31 @@ first *Ruled out* row. Everything below is what remains.
    `[rtt] PRESENT SOURCE EXTENT MISMATCH` still fires once early in every arm. The same argument now
    applies to the four restored **compute** programs, and with more force: restoring them changed the
    skip count and not one pixel.
-2. **The four compute programs still skipped**, in ascending cost — the charter names a skipped
-   LUT/exposure dispatch as a documented way a whole composite collapses, and half the population is
-   already gone without effect, so this is the cheapest remaining way to finish the argument:
+2. **The three compute programs still skipped** — and **lower this in priority than its position
+   suggests.** The argument for it was that a skipped LUT/exposure dispatch is a documented way a
+   whole composite collapses. That argument is now spent on this title: **five** restored programs
+   across two sessions have left the composite byte-identical, the most recent (#2356) being a
+   *full-screen* dispatch writing the image the presented frame is composed from. Restore them
+   because the charter requires unsupported ops to be implemented, not because they are expected to
+   change the picture. In ascending cost:
    - `s_flbit_i32_b64 vcc_lo, s[14:15]` — a **value-tracking** gap, not a missing opcode. The
      lowering exists and takes its `ok = false` arm because `s14`/`s15` are unknown at that pc.
    - `v_mov_b32_dpp v10, v4 row_xmask:4 bound_ctrl:1` — a cross-lane DPP row control, in the
      **2,348-dword** program (the one that stopped on `v_ceil_f16_sdwa`), not in either of the
      programs this lane restored.
-   - `image_atomic_add … dim:SQ_RSRC_IMG_2D_ARRAY` — the deferred arrayed-image work in
-     [`RECOMPILER_REMAINING.md`](RECOMPILER_REMAINING.md), shared with `image_sample_lz d16`.
    - the 12,916-dword all-zero `code_addr`, which is not a program and should not be counted as one.
-3. **Then re-measure the composite.** It has not moved through any change so far: black to t≈20 s,
-   SEGA logo (`0d70a70a`, 1,373 colours), then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) —
-   including both arms of the #2132 A/B and all three arms of this lane's compute work, where the
-   reject and skip counts differ and the pixels do not.
+3. **Re-measuring the composite is no longer a pending step -- it has been done and it is a
+   `## Ruled out` row.** The route is black to t~20 s, the SEGA logo (`0d70a70a`, 1,373 colours),
+   then a single-colour `RGB(1,0,1)` frame (`8bf1b518`) -- note that is (1,0,1) out of 255, i.e.
+   **near-black, not magenta**, which is easy to misread from the numbers alone. Byte-identical
+   across both arms of the #2132 A/B, all three arms of the earlier compute work, and #2356, where
+   the reject and skip counts differ and the pixels do not. **Match the window to the claim**: a
+   short arm ends on the logo and never reaches `8bf1b518` at all, so use the 270 s
+   `--seconds 30 --count 9` arm for any composite comparison.
+
+4. **What has NOT been examined, and is where the evidence now points.** A steady-state frame carries
+   **25 draws and 39 computes with no scene-geometry pass at all** (full inventory on #2303). The
+   graphics-descriptor and control-flow frontiers are closed, every pipeline recompiles, and the
+   compute inventory is now spent -- so the question is no longer "why is submitted work dropped"
+   but **"why does the guest submit so little"**, which is a CPU/logic-side question rather than a
+   renderer one. Nothing has been shown to respond to a pad yet either. Start there.
