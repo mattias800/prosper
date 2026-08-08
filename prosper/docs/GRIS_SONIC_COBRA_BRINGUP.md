@@ -948,7 +948,9 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_NO_COMPUTE=1 \
   changed.** The same run's software breakpoints caught the writes at `eboot+0x55b428`/`+0x55b480`
   immediately. There was no positive control that the watchpoint could fire at all, so its zero is
   **void** rather than negative — do not use `watch` on guest memory here without first arming it on an
-  address you are about to write yourself.
+  address you are about to write yourself. Nothing about this is specific to Sonic Origins, so it is
+  also **instrument trap 140** in `GAME_COMPAT_ORCHESTRATION.md`, which is where a lane working
+  another title will find it (#2100).
 - **`xref.py to <string VA>` cannot see a string built from immediates**, and the zero it returns is
   indistinguishable from "nothing uses this". `xref.py imm '<string>'` is the query for that, added with
   this section; `tools/re/README.md` documents both numbers and why neither is sufficient alone.
