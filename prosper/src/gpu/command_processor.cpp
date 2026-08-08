@@ -69,8 +69,21 @@ struct GpuStateSnapshotPool {
     std::vector<GpuState*> free_list;
 };
 GpuStateSnapshotPool& gpustate_snapshot_pool() {
-    static GpuStateSnapshotPool pool;
-    return pool;
+    // Deliberately leaked, and this is load-bearing rather than laziness. A snapshot's lifetime is
+    // owned by a shared_ptr that can outlive any particular scope, so the deleter may run during
+    // STATIC DESTRUCTION -- after a function-local `static GpuStateSnapshotPool pool` would already
+    // have been destroyed. Pushing into that destroyed vector is a write through freed storage.
+    //
+    // Windows caught it and Linux did not: `agc_submit_to_gpustate` failed with
+    // 0xc0000374 (STATUS_HEAP_CORRUPTION) at teardown while every assertion in it passed, and the
+    // same tree was 225/225 green on Linux. Destruction order is not something either platform
+    // promises here, so the fix is to remove the dependency rather than to rely on the ordering
+    // that happens to work.
+    //
+    // The leak is bounded by kGpuStateSnapshotPoolMax objects and lives until process exit, which
+    // is exactly when it stops mattering. Deleting them at exit is what would be unsafe.
+    static GpuStateSnapshotPool* pool = new GpuStateSnapshotPool();
+    return *pool;
 }
 // Bounded so a pathological submit cannot retain snapshots indefinitely; past this, released
 // objects are simply deleted. 256 is far above the live-snapshot count of any observed frame.
