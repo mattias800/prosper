@@ -18,7 +18,8 @@ CONTROL_NO_EVENT = 0x80960007
 
 def positive_control(mode, values_enabled, counts, values,
                      control=CONTROL, control_login=CONTROL_LOGIN,
-                     control_no_event=CONTROL_NO_EVENT):
+                     control_no_event=CONTROL_NO_EVENT,
+                     control_eligible_calls=None):
     """Verdict on this run's value capture -- `(token, note)`, note "" when nothing is wrong.
 
     The control is `s_user_getevent`, whose contract is derivable from the source before any run:
@@ -39,6 +40,14 @@ def positive_control(mode, values_enabled, counts, values,
     A missing LOGIN in launch mode is only VIOLATED when every one of the control's calls was
     captured. If any return was lost, a miss and a loss are indistinguishable and the verdict is VOID
     -- an instrument that cannot tell those apart must not pick one.
+
+    `control_eligible_calls` is how many of the control's calls passed a NON-NULL out-pointer, or
+    None when the caller did not record it (#2054). It exists because the loudest verdict this
+    machine prints has a BENIGN cause it could not otherwise distinguish: hle_service.cpp delivers
+    the LOGIN only `if (a0 && delivered.exchange(1) == 0)`, so a guest that polls
+    sceUserServiceGetEvent(nullptr) consumes no LOGIN and gets NO_EVENT forever, with no defect
+    anywhere -- and the tool would tell it to throw away a perfectly good value set. Zero eligible
+    calls is therefore a distinct, non-accusatory state rather than a violation.
     """
     if not values_enabled:
         return ("unchecked(values-off)",
@@ -77,14 +86,32 @@ def positive_control(mode, values_enabled, counts, values,
                 "LOGIN long before gdb could attach. Do not discard this run's values over it -- "
                 "but note that nothing in it independently confirms the mechanism either; only "
                 "--launch can.")
+    # Before deciding a missing LOGIN is anyone's fault, ask whether the control was ever ELIGIBLE
+    # to deliver one (#2054). This is checked ahead of the VOID/VIOLATED split because it is not a
+    # weaker form of either: those two ask "can I tell a miss from a loss", and this asks whether
+    # there was anything to miss.
+    if control_eligible_calls == 0:
+        return ("absent(control-never-eligible)",
+                "every one of %s's %d calls passed a NULL out-pointer, and the LOGIN is delivered "
+                "only when that pointer is non-null -- so no LOGIN was consumed and none could be "
+                "captured. NOT a defect and not a reason to distrust this run's values, but nothing "
+                "in it confirms the value-capture mechanism either." % (control, calls))
     if captured != calls:
         return ("VOID(%d-returns-for-%d-calls)" % (captured, calls),
                 "the launch window covered init yet captured no LOGIN -- but only %d returns were "
                 "recorded for %s's %d calls, so a lost value and a wrong one are indistinguishable "
                 "here. This run neither confirms nor refutes the mechanism."
                 % (captured, control, calls))
+    if control_eligible_calls is None:
+        return ("VIOLATED(launch-window-no-login)",
+                "the window started at the first instruction and captured all %d %s returns, none "
+                "of them the once-per-process LOGIN. Distrust every value in this run -- UNLESS the "
+                "guest only ever passed a null event pointer, which returns NO_EVENT without "
+                "consuming the LOGIN. This run did not record the out-pointer, so that benign case "
+                "cannot be excluded here (#2054)." % (calls, control))
     return ("VIOLATED(launch-window-no-login)",
             "the window started at the first instruction and captured all %d %s returns, none of "
-            "them the once-per-process LOGIN. Distrust every value in this run -- unless the guest "
-            "only ever passed a null event pointer, which returns NO_EVENT without consuming the "
-            "LOGIN." % (calls, control))
+            "them the once-per-process LOGIN, and %d of those calls passed a NON-NULL out-pointer "
+            "and were therefore eligible to receive it. The benign null-pointer explanation is "
+            "excluded. Distrust every value in this run."
+            % (calls, control, control_eligible_calls))

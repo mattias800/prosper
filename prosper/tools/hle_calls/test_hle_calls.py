@@ -90,6 +90,44 @@ def main():
           "VIOLATED(unexpected-ret-0x1)",
           "a value ranked out of the displayed top-6 still violates")
 
+    # ===== the benign cause of the loudest verdict (#2054) ====================================
+    # hle_service.cpp delivers the LOGIN only `if (a0 && delivered.exchange(1) == 0)`. A guest that
+    # polls sceUserServiceGetEvent(nullptr) consumes no LOGIN and gets NO_EVENT forever, with no
+    # defect anywhere -- and the tool told it to distrust a perfectly good value set. That is the
+    # same failure shape #2035 was opened to fix, relocated.
+    launch_all_noevent = ("launch", True, {CONTROL: 6}, {CONTROL: {N: 6}})
+
+    # Not recorded -> unchanged verdict, but the note must SAY the benign case is unexcluded.
+    tok_unknown, note_unknown = positive_control(*launch_all_noevent, control_eligible_calls=None)
+    check(tok_unknown == "VIOLATED(launch-window-no-login)", "no a0 data keeps the old verdict")
+    check("cannot be excluded" in note_unknown, "no a0 data says the benign case is unexcluded")
+
+    # Every call passed NULL -> a distinct, NON-ACCUSATORY state. This is the whole point.
+    tok_null, note_null = positive_control(*launch_all_noevent, control_eligible_calls=0)
+    check(tok_null == "absent(control-never-eligible)", "all-null out-pointers is absent(), not VIOLATED")
+    check("NOT a defect" in note_null, "the all-null verdict says plainly it is not a defect")
+
+    # At least one eligible call -> a genuine violation, and the note must say the benign case is
+    # EXCLUDED rather than repeating the hedge. A verdict that hedges when it need not is as useless
+    # as one that accuses when it should not.
+    tok_real, note_real = positive_control(*launch_all_noevent, control_eligible_calls=6)
+    check(tok_real == "VIOLATED(launch-window-no-login)", "an eligible call keeps the violation")
+    check("excluded" in note_real and "cannot be excluded" not in note_real,
+          "with a0 recorded the violation states the benign case is EXCLUDED")
+
+    # Eligibility must not override the VOID split: a lost return still makes miss and loss
+    # indistinguishable, whatever the pointer was. Kills placing the new state after the VOID check.
+    check(positive_control("launch", True, {CONTROL: 6}, {CONTROL: {N: 5}}, control_eligible_calls=6)[0]
+          == "VOID(5-returns-for-6-calls)", "an eligible call does not turn a lost return into a violation")
+    # ...and the all-null state DOES take precedence over VOID, because it asks a prior question:
+    # not "can I tell a miss from a loss" but "was there anything to miss".
+    check(positive_control("launch", True, {CONTROL: 6}, {CONTROL: {N: 5}}, control_eligible_calls=0)[0]
+          == "absent(control-never-eligible)", "all-null precedes the VOID split")
+
+    # Eligibility is irrelevant once a LOGIN was actually seen.
+    check(positive_control("launch", True, {CONTROL: 3}, {CONTROL: {L: 1, N: 2}}, control_eligible_calls=0)[0]
+          == "ok", "a captured LOGIN outranks any eligibility count")
+
     # A note must accompany every non-ok verdict: a bare token tells a reader nothing to act on.
     for mode, ve, c, v in (("launch", False, {}, {}), ("launch", True, {}, {}),
                            ("launch", True, {CONTROL: 0}, {}),
