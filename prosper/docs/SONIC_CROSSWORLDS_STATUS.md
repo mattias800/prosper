@@ -436,6 +436,19 @@ Measured across three identical arms on one binary lineage, `PROSPER_DBG=1`, 240
 | `[mimg-unresolved]` / `[mubuf-unresolved]` | 0 / 0 | 0 / 0 | 0 / 0 |
 | composite | `666f7b3f` → `0d70a70a` → `8bf1b518` | **identical** | **identical** |
 
+**That table counts one log line, and a fifth failure prints a different one.** `[compute] skip
+unsupported program` is the recompiler's message. A program that recompiles *successfully* and then
+fails descriptor validation prints `[compute] skip invalid descriptor contract` instead, and has
+never been in the total above — so the population is **one larger than every census here states**.
+On master at `7a493df2` the split is **3** `skip unsupported program` (#2218 took one more of the
+four) plus **1** descriptor-contract, and the offline capture records exactly that: four declined
+dispatches per frame, `reason=shader-recompile` x3 and `reason=descriptor-contract` x1, in submits
+8022/8039 and 8023/8040 of the repeating frame. Ask a capture for
+`--bundle-extract-submit N out.prgcap` then `--inspect-only out.prgcap`; do **not** use the replay's
+`operations=A/B` field, which is a replay setting over a decode count and can never report a decline
+(instrument trap 141).
+
+
 The composite row is a `tools/screenshot` arm (`--seconds 30 --count 9`, default switches, no
 diagnostics) rather than the `boot_trace` arm, so the pixels are measured on a run that carries no
 instrument at all. It reproduces the recorded hash sequence byte for byte, which is the arm's own
@@ -467,6 +480,19 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 ## Ruled out
 
 One line per falsified hypothesis, with the evidence that killed it.
+
+- **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS.** The frontier was
+  recorded as "an instruction inventory"; one of the four is not an instruction problem at all.
+  Program `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56),
+  every one `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
+  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. Two independent
+  gates admit only single-layer non-array 2D: the coverage predicate at
+  `src/gpu/rdna2_to_spirv.cpp:15903` (`i.mimg_dim == 1u`) and the atomic-to-storage-buffer carve-out
+  at `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`). The dispatch is
+  full-screen -- `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **The same guest
+  image is what the `#590` line defers** (`layered image deferred to #657`), so both of this title's
+  remaining non-recompiler compute failures are one unsupported thing: multi-layer images. #2353,
+  Refs #657 / #590.
 
 - **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
   storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
