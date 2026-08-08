@@ -7,9 +7,32 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
+
+
+def _drop_readonly(func, path, _exc):
+    """rmtree error handler: clear the read-only attribute and retry the failed operation.
+
+    Git marks every loose object under `.git/objects` read-only, and Windows refuses to unlink a
+    read-only file -- so a plain `shutil.rmtree` over a scratch repository dies with
+    `PermissionError: [WinError 5] Access is denied` on the first object it reaches (#2286). POSIX
+    decides unlink from the *directory's* permissions, so the same tree removes without complaint
+    there, which is why this only ever failed on the Windows lane.
+    """
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_tree(path: Path) -> None:
+    """`shutil.rmtree` that survives Git's read-only loose objects on Windows."""
+    # `onexc` is 3.12+; `onerror` is the older spelling, still accepted and identical in arity.
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_drop_readonly)
+    else:
+        shutil.rmtree(path, onerror=_drop_readonly)
 
 
 def run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
@@ -93,7 +116,7 @@ def main() -> int:
 
     scratch = args.scratch_root.resolve()
     if scratch.exists():
-        shutil.rmtree(scratch)
+        remove_tree(scratch)
     scratch.mkdir(parents=True)
 
     source = scratch / "repo"
@@ -159,6 +182,13 @@ def main() -> int:
     build(args.cmake, nongit_build)
     if query(nongit_build) != "unknown":
         raise AssertionError("non-Git build did not use the unknown revision fallback")
+
+    # Remove the scratch tree on SUCCESS only -- a failing run must keep its repositories and
+    # build directories for post-mortem. Doing it here is also what keeps `remove_tree` covered:
+    # every green run deletes a real repository with read-only loose objects (plus a linked
+    # worktree), so a regression in the read-only handling fails `build_revision_refresh` on
+    # Windows instead of waiting to surface as a confusing setup-time error on the *next* run.
+    remove_tree(scratch)
 
     print(f"build revision refreshed {revision_a[:12]} -> {revision_b[:12]} with identical trees")
     return 0
