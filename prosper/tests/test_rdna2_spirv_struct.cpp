@@ -3496,6 +3496,125 @@ int main() {
         return 1;
     }
     printf("  [ok]   compute atomic-buffer view rejects an undersized image backing\n");
+
+    // --- #2265: IMAGE_ATOMIC_ADD on a 2D_ARRAY R32_UINT image ----------------------------------
+    // Sonic Racing: CrossWorlds issues this on a default launch against a two-layer 3840x2160 R32
+    // image and the whole full-screen dispatch was skipped every frame. The cause was not a missing
+    // feature: #2272 widened the LOWERING gate over the array layer while the descriptor validator
+    // and the backend materialization kept the single-layer clause, so the recompiler emitted a
+    // StorageBuffer binding that its own validator rejected as WrongType.
+    //
+    // The instruction is the 2D fixture above with DIM changed from 1 to 5. `mimg_dim` is
+    // `(word0 >> 3) & 0x7` (rdna2_decode.cpp:675), so bits [5:3] go 001 -> 101 and the low byte goes
+    // 0x08 -> 0x28 -- which is exactly the low byte of CrossWorlds' own `f0440128`. Its `len` is 2,
+    // not 3: an arrayed atomic reaches its layer through the address VGPRs, not a longer encoding.
+    {
+        const uint32_t cs_atomic_add_2d_array[] = {
+            0x7e000280u, 0x7e020280u, 0x7e120281u,
+            0xf0442128u, 0x00000900u,
+            0xbf810000u,
+        };
+        // Height is 97 -- prime, and chosen so its appearance in the constant pool CANNOT be
+        // incidental. The first version of this arm used height 3 and was VOID: a 3 occurs in the
+        // module for unrelated reasons, so deleting the layer from the index left the arm passing.
+        // The discriminator is only as good as the improbability of the constant it looks for.
+        // The 2D index is x + y*width and never needs `height`; the arrayed index is
+        // x + (z*height + y)*width and cannot avoid it.
+        ShaderResourceTable rt_layered;
+        std::vector<uint32_t> layered_backing(5u * 97u * 2u, 0u);
+        { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.format = DataFormat::Uint32; image.num_components = 1;
+          image.binding = 4; image.img_dim = 5; image.width = 5; image.height = 97;
+          image.depth = 2; image.sgpr_base = 0;
+          image.size = layered_backing.size() * sizeof(uint32_t);
+          image.host_data = reinterpret_cast<uint8_t*>(layered_backing.data());
+          image.host_data_size = image.size; rt_layered.resources.push_back(image); }
+
+        const std::vector<uint32_t> layered_spv = recompile_compute(
+            cs_atomic_add_2d_array, std::size(cs_atomic_add_2d_array),
+            &rt_layered, atomic_add_config);
+        const DescriptorValidationReport layered_report = validate_spirv_descriptor_interface(
+            layered_spv, &rt_layered, 0, SpirvShaderStage::Compute, false);
+        if (layered_spv.empty() || !layered_report.ok() ||
+            layered_report.descriptors.size() != 1 ||
+            layered_report.descriptors[0].kind != SpirvDescriptorKind::StorageBuffer ||
+            !layered_report.descriptors[0].atomic_access) {
+            printf("  [FAIL] 2D_ARRAY image_atomic_add did not recompile into an accepted "
+                   "atomic-buffer contract (this is the #2265 skip)\n");
+            return 1;
+        }
+        printf("  [ok]   2D_ARRAY image_atomic_add recompiles AND validates as an atomic buffer\n");
+
+        // Is `value` used as a MULTIPLIER -- does some OpIMul take the constant carrying it?
+        //
+        // Mere PRESENCE of the constant is not a discriminator, and assuming it was is how two
+        // earlier versions of this arm passed while the layer was deleted from the index: the
+        // bounds check `coords[1] < height` already puts `height` in the constant pool, so it is
+        // there either way. Only the arrayed index MULTIPLIES by it, in (z*height + y).
+        const auto multiplies_by = [](const std::vector<uint32_t>& spv, uint32_t value) {
+            uint32_t constant_id = 0;
+            for (size_t w = 5; w + 1 < spv.size();) {
+                const uint32_t count = spv[w] >> 16, op = spv[w] & 0xffffu;
+                if (!count || w + count > spv.size()) break;
+                if (op == 43u && count == 4u && spv[w + 3] == value) { constant_id = spv[w + 2]; break; }
+                w += count;
+            }
+            if (!constant_id) return false;
+            for (size_t w = 5; w + 1 < spv.size();) {
+                const uint32_t count = spv[w] >> 16, op = spv[w] & 0xffffu;
+                if (!count || w + count > spv.size()) break;
+                if (op == 132u && count == 5u &&                      // OpIMul
+                    (spv[w + 3] == constant_id || spv[w + 4] == constant_id)) return true;
+                w += count;
+            }
+            return false;
+        };
+
+        // MUTATION ARM 1 -- the layer must reach the INDEX. Without it the lowering computes
+        // x + y*width for every layer, every layer aliases layer 0, and the dispatch produces a
+        // silently wrong result rather than being skipped: strictly worse than the bug it replaces.
+        // `height` (3) appears only if the layer was multiplied in.
+        if (!multiplies_by(layered_spv, 97u)) {
+            printf("  [FAIL] the 2D_ARRAY atomic index does not multiply by height -- every layer "
+                   "aliases layer 0\n");
+            return 1;
+        }
+        // Paired negative, so the discriminator's validity is checked rather than assumed -- and it
+        // must use the SAME distinctive constant, on a NON-arrayed shader, or it tests nothing. An
+        // earlier version asked whether the 1x1 fixture multiplies by 1; it does, because 1 is
+        // multiplied all over any module, and that arm then failed on correct code. Here the shape
+        // is 5x97 and non-arrayed, so 97 is present as a bound and must NOT be a multiplier: the 2D
+        // index is x + y*width and reaches only the WIDTH.
+        ShaderResourceTable rt_tall_2d;
+        std::vector<uint32_t> tall_backing(5u * 97u, 0u);
+        { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.format = DataFormat::Uint32; image.num_components = 1;
+          image.binding = 4; image.img_dim = 1; image.width = 5; image.height = 97;
+          image.depth = 1; image.sgpr_base = 0;
+          image.size = tall_backing.size() * sizeof(uint32_t);
+          image.host_data = reinterpret_cast<uint8_t*>(tall_backing.data());
+          image.host_data_size = image.size; rt_tall_2d.resources.push_back(image); }
+        const std::vector<uint32_t> tall_2d_spv = recompile_compute(
+            cs_image_atomic_add, std::size(cs_image_atomic_add), &rt_tall_2d, atomic_add_config);
+        if (tall_2d_spv.empty() || multiplies_by(tall_2d_spv, 97u)) {
+            printf("  [FAIL] the discriminator is void: a NON-arrayed 5x97 index also multiplies by "
+                   "97, so the arrayed result proves nothing\n");
+            return 1;
+        }
+        printf("  [ok]   the layer reaches the index (height constant present only when arrayed)\n");
+
+        // MUTATION ARM 2 -- the layer must reach the SIZE BOUND. A backing sized for one layer must
+        // be rejected; the pre-#2265 check was width*height*4 <= size and would accept it.
+        ShaderResourceTable one_layer_backing = rt_layered;
+        one_layer_backing.resources[0].size = 5u * 97u * sizeof(uint32_t);
+        if (validate_spirv_descriptor_interface(layered_spv, &one_layer_backing, 0,
+                                                SpirvShaderStage::Compute, false).ok()) {
+            printf("  [FAIL] a two-layer atomic image was accepted against one layer of backing\n");
+            return 1;
+        }
+        printf("  [ok]   the size bound counts every layer, not just the first\n");
+    }
+
     ShaderResourceTable compressed_atomic_image = rt_atomic_image;
     compressed_atomic_image.resources[0].compression_enabled = true;
     const DescriptorValidationReport compressed_atomic_report =

@@ -361,6 +361,38 @@ constexpr bool shader_resource_uses_native_2d_storage_image(
             !resource.depth_compare);
 }
 
+// The RESOURCE half of "may this R32_UINT storage image be lowered to a detiled linear atomic SSBO"
+// (the RADV image-atomic workaround: RADV hangs/reset-poisons the device on a compute R32_UINT image
+// atomic, so compute reaches the image through a buffer view instead).
+//
+// This lives in one place because it has already drifted twice. #2293 was titled "the image-atomic
+// opcode list existed in THREE places and all three had to agree"; #2272 then generalised the
+// LOWERING gate over the array layer and left the descriptor validator and the backend
+// materialization on the single-layer clause, so a shader compiled into a binding its own validator
+// rejected -- Sonic Racing: CrossWorlds' full-screen dispatch, skipped every frame (#2265). Callers
+// add their own INSTRUCTION-side conditions (dmask, unorm, length); this answers only the question
+// that every site was answering separately and differently.
+//
+// `depth` is the layer COUNT for an arrayed view, so it is pinned to 1 only in the non-arrayed case;
+// dim 5 is SQ 2D_ARRAY. A layered resource additionally requires the caller to stage every layer --
+// see shader_resource_atomic_image_layers below, and note that the slice stride is NOT
+// width*height*bpe for a tiled surface.
+constexpr bool shader_resource_supports_atomic_image_buffer(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::StorageImage &&
+           resource.format == DataFormat::Uint32 &&
+           (resource.num_components ? resource.num_components : 1u) == 1u &&
+           (resource.img_dim == 1u ? resource.depth == 1u
+                                   : (resource.img_dim == 5u && resource.depth >= 1u)) &&
+           !resource.depth_compare && !resource.in_mip_tail &&
+           !resource.compression_enabled && resource.width && resource.height;
+}
+
+// Layer count to stage for such a resource: an arrayed view carries `depth` layers, a plain 2D one
+// carries exactly one regardless of what `depth` happens to hold.
+constexpr uint32_t shader_resource_atomic_image_layers(const ShaderResource& resource) {
+    return resource.img_dim == 5u ? (resource.depth ? resource.depth : 1u) : 1u;
+}
+
 // A null BVH is represented by a bounded host-owned marker. The front-half creates this only after
 // proving that a mapped zero pointer feeds the complete descriptor inside an EXEC-guarded region.
 // The exact shape survives capture/replay without adding a capture-format field and cannot alias a
