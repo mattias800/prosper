@@ -523,11 +523,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
     same state, the same `wchan` (`futex_do_wait`) and the same syscall (202). On a purpose-built
     control with three threads blocked in three known functions, `/proc` reported two of them
     identically; the stack separated them. Do not conclude *which* primitive from `wchan`.
-  - **Run it on the HOST.** Inside distrobox/toolbox, gdb cannot ptrace a host process
-    (`Operation not permitted`) — and that failure produces *no stacks*, which is byte-identical to a
-    process with nothing blocked. The tool detects this case by name; it counts any empty sample as
-    FAILED, prints the failed count even when zero, and exits non-zero if every sample failed rather
-    than printing an empty report that reads clean.
+  - **Run gdb on the same side of the container boundary as the target.** Measured both ways:
+    host+host works, distrobox+distrobox works, and **host process + in-container gdb is
+    `ptrace: Operation not permitted`**. Since `prosper-app` normally runs inside distrobox, run this
+    inside the same container. The rule is *same namespace*, not *always the host*. This matters
+    because the denial produces **no stacks**, which is byte-identical to a process with nothing
+    blocked — so a mis-sited gdb reads as a clean result. The tool detects that case by name; it
+    counts any empty sample as FAILED, prints the failed count even when zero, and exits non-zero if
+    every sample failed rather than printing an empty report that reads clean.
   - **Every sample stops the process** (~90 ms on a 4-thread toy, more on prosper). The report prints
     total stopped time as a share of wall clock *before* any finding, and warns above 10%, because a
     profiler that quietly steals wall clock will manufacture the frame-rate problem you came to find.

@@ -36,12 +36,20 @@ failing and stderr had been discarded. So:
 A tool that cannot distinguish "I did not measure" from "there was nothing to measure" is
 not a negative result, it is a void one.
 
-PTRACE MUST RUN WHERE THE PROCESS LIVES
----------------------------------------
-On a distrobox/toolbox setup, run this on the HOST. Inside the container gdb fails with
-`ptrace: Operation not permitted` for host processes -- which, per the above, previously
-looked exactly like a healthy idle process. The tool detects this specific error and names
-it rather than reporting an empty profile.
+RUN THIS WHERE THE TARGET RUNS
+-------------------------------
+gdb must be on the same side of the container boundary as the process. Measured both ways
+on this box:
+
+    process on host      + gdb on host       -> works
+    process in distrobox + gdb in distrobox  -> works
+    process on host      + gdb in distrobox  -> ptrace: Operation not permitted
+
+So for a `prosper-app` launched inside distrobox, run this inside the same container; for a
+host process, run it on the host. The rule is "same namespace", not "always the host" -- and
+getting that backwards costs nothing but confusion, because per the section above the denial
+produces an empty profile that reads like a healthy process. The tool detects this specific
+error and names it.
 """
 
 from __future__ import annotations
@@ -117,8 +125,9 @@ def gdb_stacks(pid: int, gdb: str, timeout: float):
 
     if "Operation not permitted" in blob:
         return {}, stopped, (
-            "ptrace: Operation not permitted -- run this on the HOST, not inside "
-            "distrobox/toolbox (a container cannot ptrace a host process)"
+            "ptrace: Operation not permitted -- run gdb on the SAME side of the container "
+            "boundary as the target (a container cannot ptrace a host process; "
+            "in-container gdb against an in-container prosper-app works)"
         )
     if "No such process" in blob or "not being run" in blob:
         return {}, stopped, f"pid {pid} is gone"
