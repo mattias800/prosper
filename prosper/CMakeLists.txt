@@ -998,6 +998,13 @@ if(TARGET prosper_core)
   add_executable(test_guest_read_cache_disabled tests/test_guest_read_cache_disabled.cpp)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
   add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
+  # #2387: guest_writable's range cache. The first case is the one that matters -- a read-only
+  # mapping, deliberately warmed into the READABLE cache first, must still be refused for write.
+  # A shared cache (or a writable path that consulted the readable registry) passes every other
+  # assertion here and fails only that one, silently corrupting guest memory in production.
+  add_executable(test_guest_writable_cache tests/test_guest_writable_cache.cpp)
+  target_link_libraries(test_guest_writable_cache PRIVATE prosper_core)
+  add_test(NAME guest_writable_cache COMMAND test_guest_writable_cache)
 
   if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_write_watch tests/test_guest_write_watch.cpp)
