@@ -17,6 +17,7 @@
 // Both halves fail without the fix: (1) elapses ~0 ms against the unimplemented stub, and (2)
 // returns 0 rather than -1.
 #include "../src/hle/dispatch.hpp"
+#include "../src/hle/sce_errno.hpp"
 #include "../src/hle/nid.hpp"
 #include <chrono>
 #include <cerrno>
@@ -101,7 +102,13 @@ int main() {
                                       (uint64_t)(uintptr_t)tv, 0);
         printf("  select(4, &readfds, ...) -> %lld (errno=%d)\n", (long long)(int64_t)rc, errno);
         CHECK((int64_t)rc == -1, "select with a readfds set fails visibly (-1), never a false 0");
-        CHECK(errno == ENOSYS, "select sets errno=ENOSYS for the unimplemented descriptor query");
+        // FreeBSD ENOSYS (78), NOT the host constant: the guest reads this slot through
+        // __error() and compares against its own numbering (host ENOSYS is 38 on Linux, 40 on
+        // MinGW). Writing `ENOSYS` here would assert the host value and pass on exactly the
+        // code #2296 is about. On a host whose ENOSYS is already 78 (Darwin) this arm cannot
+        // distinguish -- the printf above shows which case a given run is.
+        CHECK(errno == (int)prosper::hle::FreeBsdErrno::ENoSys,
+              "select publishes FreeBSD ENOSYS (78) for the unimplemented descriptor query");
     }
     {
         uint64_t fdset[16] = {0};

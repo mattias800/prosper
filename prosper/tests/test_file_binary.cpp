@@ -34,6 +34,12 @@ static int fails = 0;
 static constexpr uint64_t kGuestFDupFd = 0;
 static constexpr uint64_t kGuestFGetFd = 1;
 static constexpr uint64_t kGuestFSetFd = 2;
+// FreeBSD's ENOTSUP, spelled out because the host's <errno.h> is the WRONG source here: the
+// guest reads prosper's errno slot through __error() and compares against FreeBSD's numbering, so
+// an arm written as `errno == ENOTSUP` asserts the host value and passes on exactly the code #2296
+// is about. Host values measured: Linux 95, MinGW-w64 UCRT 129, Darwin 45 (see the coincidence
+// note printed below -- on Darwin these arms cannot distinguish, and say so rather than pretending).
+static constexpr int kFreeBsdENotSupp = 45;
 static constexpr uint64_t kGuestFGetFl = 3;
 static constexpr uint64_t kGuestFSetFl = 4;
 static constexpr uint64_t kGuestFdCloExec = 1;
@@ -49,6 +55,12 @@ static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
 
 int main() {
     std::printf("== test_file_binary ==\n");
+    // Say up front whether the ENOTSUP arms below can distinguish a FreeBSD publish from a host
+    // one. They cannot on a host whose ENOTSUP is already 45 (Darwin) -- a green run there is
+    // silent about #2296 rather than evidence for it, and a reader should not have to guess which.
+    std::printf("  [note] host ENOTSUP=%d, FreeBSD=%d -- ENOTSUP arms %s here\n",
+                ENOTSUP, kFreeBsdENotSupp,
+                ENOTSUP == kFreeBsdENotSupp ? "CANNOT distinguish" : "discriminate");
     // PROSPER_DENY_SUBSTR (#1237): armed for the whole process BEFORE any guest file op (the
     // substring list is cached on first use). The unique marker cannot collide with any other
     // path this test opens; the case-variant open below proves matching is case-insensitive
@@ -472,9 +484,10 @@ int main() {
     uint64_t dir_fd_flags = dir_fd >= 0 && fcntl_fn
         ? fcntl_fn((uint64_t)dir_fd, kGuestFGetFd, 0, 0, 0, 0)
         : 0;
-    CHECK(clear_dir_cloexec == -1 && clear_dir_errno == ENOTSUP &&
+    CHECK(clear_dir_cloexec == -1 && clear_dir_errno == kFreeBsdENotSupp &&
               dir_fd_flags == kGuestFdCloExec,
-          "Windows directory fcntl rejects an unrepresentable close-on-exec change");
+          "Windows directory fcntl rejects an unrepresentable close-on-exec change "
+          "with FreeBSD's ENOTSUP");
 #endif
 
     // Darwin's getdents compatibility path owns a duplicated descriptor behind DIR*. A raw
@@ -793,9 +806,9 @@ int main() {
     uint64_t flags_after_sync_change = fcntl_fn && fd >= 0
         ? fcntl_fn((uint64_t)fd, kGuestFGetFl, 0, 0, 0, 0)
         : ~uint64_t{0};
-    CHECK(unsupported_sync_change == -1 && errno == ENOTSUP &&
+    CHECK(unsupported_sync_change == -1 && errno == kFreeBsdENotSupp &&
               (flags_after_sync_change & kGuestOSync) == 0,
-          "fcntl rejects an unsupported O_SYNC change instead of reporting false success");
+          "fcntl rejects an unsupported O_SYNC change with FreeBSD's ENOTSUP, not the host's");
 #else
     // UCRT exposes neither F_GETFL nor F_SETFL. Until the secondary Windows host grows an
     // equivalent descriptor-status layer, report that limitation instead of fake success.
@@ -809,9 +822,9 @@ int main() {
         ? (int64_t)kernel_fcntl_fn((uint64_t)fd, kGuestFSetFl,
                                    kGuestONonblock | kGuestOAppend, 0, 0, 0)
         : 0;
-    CHECK(guest_flags == -1 && getfl_errno == ENOTSUP &&
-              set_flags == -1 && errno == ENOTSUP,
-          "Windows fcntl status commands fail explicitly instead of returning false success");
+    CHECK(guest_flags == -1 && getfl_errno == kFreeBsdENotSupp &&
+              set_flags == -1 && errno == kFreeBsdENotSupp,
+          "Windows fcntl status commands fail explicitly with FreeBSD's ENOTSUP, not the host's");
 #endif
 
     int64_t set_fd_flags = fcntl_fn && fd >= 0

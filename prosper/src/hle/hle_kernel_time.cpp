@@ -469,10 +469,15 @@ uint64_t select_unsupported(const char* fn, uint64_t nfds,
                 (unsigned long long)writefds, (unsigned long long)exceptfds, n,
                 no_sets ? "  <- examines no descriptor; likely a sleep, but unobserved: report it"
                         : "");
-    // Follows the existing libScePosix wrapper convention in hle_file.cpp: set the host errno that
-    // __error()/h_errno_location hands back and return -1. Whether that number should be translated
-    // to FreeBSD's is the separate concern tracked by #1612, not something to diverge on here.
-    errno = ENOSYS;
+    // Follows the existing libScePosix wrapper convention in hle_file.cpp: set the errno that
+    // __error()/h_errno_location hands back and return -1. The number must be FREEBSD's, because
+    // that is what the guest compares against: host ENOSYS is 38 on Linux and 40 on MinGW, while
+    // the guest tests for 78, so an untranslated write sends it down a generic-error path instead
+    // of the fallback branch its author wrote (#2296). Nothing re-converts this slot -- k_select
+    // and k_pselect return this value straight through -- so publishing FreeBSD's here is the
+    // whole fix for this call. (This comment used to cite #1612; that issue is closed and was
+    // about the `0x80020000|errno` RETURN encoding, a different slot with the same trap.)
+    hle::set_guest_errno(ENOSYS);
     return (uint64_t)(int64_t)-1;
 }
 } // namespace
