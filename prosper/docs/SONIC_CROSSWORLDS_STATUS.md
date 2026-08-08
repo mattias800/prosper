@@ -488,11 +488,15 @@ One line per falsified hypothesis, with the evidence that killed it.
   `skip invalid descriptor contract` line goes 1 -> **0**, the 20 `[compute-descriptor]` issues go to
   **0**, and the staging trace reports `atomic-image buffer binding=37 ... bytes=66355200` **164
   times** -- `3840*2160*2*4`, i.e. both layers, where a single-layer staging would read 33,177,600.
-  **The presented frame is unchanged.** `tools/screenshot`, default launch, `--seconds 8 --count 9`,
-  9 frames: composite CRCs are `666f7b3f` (x4) and `0d70a70a` (x5), **both already recorded above as
-  master values**, and the frames still show the SEGA logo on black. So the uniform-composite
-  frontier is not the compute inventory: five restored programs across two sessions have now left it
-  byte-identical. Look elsewhere before spending on the three remaining `skip unsupported program`
+  **The presented frame is byte-identical to master across the whole documented route.**
+  `tools/screenshot`, default launch, `--seconds 30 --count 9` (270 s -- the same arm as the composite
+  row above): all **three** master states reproduce exactly, `666f7b3f` (x1), `0d70a70a` (x1) and
+  `8bf1b518` (x7). Frames were opened rather than judged by hash: `666f7b3f` and `8bf1b518` are both
+  black (different CRCs, visually identical) and `0d70a70a` is the SEGA logo on black, so the route
+  is black -> logo -> black and stays there. **Match the window to the claim:** a first pass at
+  `--seconds 8 --count 9` (72 s) ends on the logo and never reaches `8bf1b518` at all, so it cannot
+  speak to the post-logo state that #2013 is about -- the arm was re-run at 270 s for that reason.
+  Five restored programs across two sessions have now left the composite byte-identical. Look elsewhere before spending on the three remaining `skip unsupported program`
   entries -- their restoration is worth doing on the charter's own grounds, but it should not be
   expected to change the picture. #2356, Refs #2265 / #2013.
 
