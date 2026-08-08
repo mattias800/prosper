@@ -2168,6 +2168,56 @@ std::atomic<void (*)(uint64_t)> g_win_key_delete_after_host_hook{nullptr};
 // winpthreads invokes key destructors with the Microsoft x64 ABI, but every guest callback uses
 // the PS5/FreeBSD SysV ABI. Emit one tiny Microsoft-ABI thunk per live key so winpthreads can retain
 // its normal destructor iteration semantics while the callback value is delivered in guest RDI.
+// #1020: run ONE guest pthread-key destructor with the scePthreadExit escape armed.
+//
+// win_thread_trampoline arms the longjmp only around the guest ENTRY call and clears it before
+// returning. winpthreads then runs the key destructors, so a destructor that calls scePthreadExit
+// found `win_thread_exit_armed()` false, fell through to host pthread_exit, and took the whole
+// process down through RtlRaiseStatus -- the exact failure #997/#1003 removed for the normal case,
+// still reachable from this one. The trampoline's setjmp frame is gone by then, so the escape has
+// to be re-established HERE, around the destructor itself.
+//
+// POSIX says calling pthread_exit from a destructor is undefined. Undefined is not a licence to
+// kill the process: the destructor is abandoned, its remaining work skipped, and the thread
+// continues its ordinary teardown -- which is what a guest doing this on real hardware would see,
+// and is in any case strictly better than exit 0xC00000FF with no diagnostic.
+//
+// The jump buffer and arm flag are SAVED and RESTORED, so a destructor invoked while another guest
+// call up the stack is armed cannot steal that frame's escape.
+// The setjmp lives ALONE in this helper, and deliberately so: GCC cannot interleave
+// __builtin_setjmp with any other exception region in the same function on MinGW -- putting
+// the logging or the std::atomic below into it makes the assembler reject the output with
+// ".seh_handlerdata used outside of .seh_proc block". Nothing here but the jump and the call.
+// Returns true when control arrived back via longjmp rather than by a normal return.
+__attribute__((noinline)) static bool win_run_key_destructor_armed(uint64_t guest_destructor, uint64_t value) {
+    if (__builtin_setjmp(t_thread_exit_jb) != 0) return true;
+    t_thread_exit_armed = 1;
+    prosper_call_guest_sysv(guest_destructor, value, 0);
+    return false;
+}
+
+extern "C" uint64_t prosper_win_key_destructor_call(uint64_t guest_destructor, uint64_t value) {
+    void* saved_jb[5];
+    std::memcpy(saved_jb, t_thread_exit_jb, sizeof saved_jb);
+    const int saved_armed = t_thread_exit_armed;
+    const uint64_t saved_rv = t_thread_exit_rv;
+
+    const bool exited = win_run_key_destructor_armed(guest_destructor, value);
+    if (exited) {
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) == 0)
+            fprintf(stderr,
+                    "[libkernel] a guest pthread-key destructor called scePthreadExit; "
+                    "abandoning it and continuing thread teardown (POSIX undefined; "
+                    "killing the process is worse -- #1020)\n");
+    }
+
+    std::memcpy(t_thread_exit_jb, saved_jb, sizeof saved_jb);
+    t_thread_exit_armed = saved_armed;
+    t_thread_exit_rv = saved_rv;
+    return 0;
+}
+
 void* win_make_key_destructor_thunk(uint64_t guest_destructor) {
     auto* code = static_cast<uint8_t*>(VirtualAlloc(
         nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -2186,12 +2236,15 @@ void* win_make_key_destructor_thunk(uint64_t guest_destructor) {
     byte(0x48); byte(0x85); byte(0xc9);                 // test rcx, rcx
     byte(0x74); byte(0x24);                             // je final ret
 
-    // rcx=value -> prosper_call_guest_sysv(guest_destructor, value, 0).
+    // rcx=value -> prosper_win_key_destructor_call(guest_destructor, value).
+    // Was a direct call to prosper_call_guest_sysv; it now goes through the helper above so the
+    // scePthreadExit escape is armed for the destructor (#1020). Same MS-ABI shape, so the byte
+    // sequence is unchanged apart from the target -- r8 is still zeroed and simply ignored.
     byte(0x48); byte(0x89); byte(0xca);                 // mov rdx, rcx
     byte(0x48); byte(0xb9); qword(guest_destructor);    // mov rcx, guest_destructor
     byte(0x45); byte(0x31); byte(0xc0);                 // xor r8d, r8d
     byte(0x48); byte(0xb8);
-    qword((uint64_t)(uintptr_t)&prosper_call_guest_sysv); // mov rax, ABI bridge
+    qword((uint64_t)(uintptr_t)&prosper_win_key_destructor_call);   // mov rax, armed bridge
     byte(0x48); byte(0x83); byte(0xec); byte(0x28);     // shadow space + call alignment
     byte(0xff); byte(0xd0);                             // call rax
     byte(0x48); byte(0x83); byte(0xc4); byte(0x28);
