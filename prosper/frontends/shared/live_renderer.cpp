@@ -6038,7 +6038,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,
                         batch_backend_submits ? &backend_submission : nullptr,
-                        pass_i == items.size(), &mrt_outputs);
+                        pass_i == items.size(), &mrt_outputs,
+                        // #2283: only ask for colour pixels when something will read them. Every
+                        // consumer of the returned vector below is inside an `if (base ...)` guard
+                        // and there is no else, so with base==0 the readback is copied, wrapped in
+                        // a shared_ptr, and dropped. Keyed on the BASE rather than on the draws'
+                        // colour write masks: 457 of 457 such passes are depth-only on this route,
+                        // but that is evidence about this route, and a future title could legally
+                        // mix a colour-writing draw into a pass that has a base.
+                        /*want_color_readback=*/base != 0);
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
