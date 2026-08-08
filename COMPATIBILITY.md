@@ -22,7 +22,7 @@ Last updated: 2026-08-06
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
 | *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo; the boot sequence then holds on a white screen before a title screen | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; the menu heading draws the wrong string | [#1891](https://github.com/mattias800/prosper/issues/1891) |
-| *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K SEGA logo; the composite goes uniform before a title screen | [#1895](https://github.com/mattias800/prosper/issues/1895) |
+| *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and main menu | [#1873](https://github.com/mattias800/prosper/issues/1873) |
@@ -144,12 +144,25 @@ logo belongs, and a panel that opens over the menu renders almost none of its te
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
 
-<p align="center"><img src="assets/screenshots/sonic-crossworlds-sega-logo.png" alt="Sonic Racing: CrossWorlds — SEGA logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-crossworlds-title.png" alt="Sonic Racing: CrossWorlds — title screen"></p>
 
-A default launch reaches the game's SEGA logo, composited by the live renderer at 3840×2160. The
-engine keeps producing frames afterwards, but the composite becomes a single uniform colour before a
-title screen is reached. See [`docs/SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md)
-and the [tracker](https://github.com/mattias800/prosper/issues/1895).
+The title screen, composited by the live renderer at 3840×2160 — the full 3D scene, every character,
+the track and the UI.
+
+**It needs controller input to get there.** A default launch with no pad stops at the SEGA logo, which
+is what this title was recorded as doing for months: the engine keeps producing frames and the composite
+stays black, so every renderer diagnostic reads healthy while nothing advances. The title is simply
+waiting for a button. With `prosper/scripts/sonic-crossworlds/advance-boot-logos.pad` it walks the whole
+sequence — SEGA logo, Unreal Engine, CRIWARE, the licensor screen, the auto-save notice, the title
+screen, and into the player-profile menu.
+
+One detail that matters if you write your own route: **a held button is not a press.** Holding Cross
+advances nothing; the guest needs a neutral→pressed transition, so the route uses short pulses.
+
+Beyond the title screen the profile menu renders its UI correctly but leaves the central content panel
+black, and the sequence eventually holds on white. See
+[`docs/SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md) and the
+[tracker](https://github.com/mattias800/prosper/issues/1895).
 
 ## Terminator 2D: NO FATE — `PPSA25872`
 
