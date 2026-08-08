@@ -1879,6 +1879,7 @@ namespace { bool wa_log() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; re
 extern "C" int prosper_reserved_range_state(uint64_t addr);   // defined below (lazy-commit tracking)
 HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
     (void)a0;
+    ampr_arglog("j0+3uJMxYJY(WriteAddress)", a0, a1, a2, a3, a4, a5);
     if (!a1) return 0;
     uint64_t value = a2;
     struct iovec local { &value, sizeof(value) };
@@ -5358,8 +5359,20 @@ HLE(k_ampr_submit_plain) {           // eE4Szl8sil8: same submit, no result slot
                 (unsigned long long)a2, (unsigned long long)a3);
     return apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0, /*write_result_outputs=*/false);
 }
-HLE(k_ampr_get_current_offset) { return ampr_cb_offset(a0); }
-HLE(k_ampr_measure_write_address) { return 32; }
+// These two logged on POSIX and were SILENT on Windows, which is worse than not logging at all:
+// PROSPER_AMPRLOG=1 on a Windows GTA V (PPSA04263) run reported ZERO GetCurrentOffset calls beside
+// 47 submits, and the honest reading of that -- "the guest never calls it" -- was a property of the
+// INSTRUMENT. Adding these two lines turned the same run into one call, immediately before the
+// fault, which is what located the wall (#2384). A diagnostic whose coverage depends on the host
+// platform manufactures a per-platform difference in the SUBJECT. Bodies unchanged.
+HLE(k_ampr_get_current_offset) {
+    ampr_arglog("GnxKOHEawhk(GetCurrentOffset)", a0, a1, a2, a3, a4, a5);
+    return ampr_cb_offset(a0);
+}
+HLE(k_ampr_measure_write_address) {
+    ampr_arglog("4fgtGfXDrFc(MeasureWriteAddress)", a0, a1, a2, a3, a4, a5);
+    return 32;
+}
 
 // APR command-buffer WriteAddress (NID j0+3uJMxYJY) — the completion-notification write (#1149).
 // Windows sibling of the POSIX handler above (full contract documented there): write `value` (a2)
@@ -5367,6 +5380,7 @@ HLE(k_ampr_measure_write_address) { return 32; }
 // mapped target is skipped rather than faulting the emulator (mirrors windows_prepare_guest_write).
 HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
     (void)a0; (void)a3;
+    ampr_arglog("j0+3uJMxYJY(WriteAddress)", a0, a1, a2, a3, a4, a5);
     if (a1) {
         MEMORY_BASIC_INFORMATION mbi{};
         constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
