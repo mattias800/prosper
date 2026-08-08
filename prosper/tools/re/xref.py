@@ -25,6 +25,12 @@
 # function at <addr> reference".
 #
 # Input is a FLATTENED ELF (p_offset==p_vaddr) as produced by tools/il2cpp/prx_to_elf.py.
+# Handing it the SELF instead (`eboot.bin` as it ships) is REFUSED, not answered — see #2346. It used
+# to parse the SCE container header as though it were an ELF and report 0 references for every
+# address, which is the one answer this tool must never produce by accident: "who writes X" answered
+# with 0 reads as "nobody writes X", and that is a conclusion strong enough to redirect an
+# investigation. Flatten first:
+#     python3 tools/il2cpp/prx_to_elf.py <DUMP>/eboot.bin /tmp/eboot.elf
 # Runtime address = module_load_base + VA (e.g. eboot base 0x410000000; it moved from
 # 0x400000000 in #825 — see prosper/src/host/boot_program.hpp for the authoritative set).
 #
@@ -70,12 +76,47 @@ def access(kind):
     return ACCESS.get(kind, '?')
 
 
+ELF_MAGIC = b'\x7fELF'
+SELF_MAGIC = b'\x4f\x15\x3d\x1d'   # PS5/PS4 SELF container (eboot.bin, *.sprx as shipped)
+
+
+class BadModule(ValueError):
+    """The input is not a module this tool can answer questions about.
+
+    Raised instead of returning zeros. #2346: handed an `eboot.bin` (a SELF), this tool used to read
+    e_phoff/phnum straight out of the SCE container header -- on a real one that yields phnum=45792
+    with phentsize=0 -- build an empty segment table, and then answer **0 references** for every
+    address, including the target of a direct `call`. That output is indistinguishable from a true
+    negative, and a true negative ("nobody writes this address") is precisely what people run this
+    tool to establish. One was nearly reported as a finding on #2345.
+    """
+
+
 class Module:
     def __init__(self, path):
         self.raw = open(path, 'rb').read()
         raw = self.raw
+        # Refuse before parsing, not after. Everything below reads fixed offsets that exist in ANY
+        # file long enough, so without this the tool cannot fail -- it can only answer wrongly.
+        if len(raw) < 0x40:
+            raise BadModule(f"{path}: {len(raw)} bytes is too short to be an ELF")
+        if raw[:4] == SELF_MAGIC:
+            raise BadModule(
+                f"{path} is a SELF container, not a module ELF. Flatten it first:\n"
+                f"    python3 tools/il2cpp/prx_to_elf.py {path} <out.elf>\n"
+                f"and run this tool on <out.elf>. (Answering the question on the SELF would mean "
+                f"reporting 0 references for every address -- see #2346.)")
+        if raw[:4] != ELF_MAGIC:
+            raise BadModule(f"{path}: not an ELF (magic {raw[:4].hex()}), and not a SELF either")
         e_phoff, = struct.unpack_from('<Q', raw, 0x20)
         phentsize, phnum = struct.unpack_from('<HH', raw, 0x36)
+        # A well-formed ELF64 program header is exactly 56 bytes. A garbage phentsize (0 on a SELF)
+        # makes the loop below re-read one offset phnum times and produce nonsense segments.
+        if phentsize != 56:
+            raise BadModule(f"{path}: e_phentsize is {phentsize}, not 56 — this is not an ELF64")
+        if not phnum or e_phoff + phnum * phentsize > len(raw):
+            raise BadModule(f"{path}: program header table (phoff=0x{e_phoff:x}, phnum={phnum}) "
+                            f"does not fit in {len(raw)} bytes")
         self.segs = []          # (va, foff, filesz, flags)
         self.dyn_va = 0
         for i in range(phnum):
@@ -84,7 +125,30 @@ class Module:
                 self.segs.append((va, off, fs, fl))
             elif t == 2:
                 self.dyn_va = va
+        if not self.segs:
+            raise BadModule(f"{path}: no PT_LOAD segments — nothing to search")
+        if not any(fl & 1 for _, _, _, fl in self.segs):
+            raise BadModule(f"{path}: no executable PT_LOAD segment — every code reference this "
+                            f"tool decodes lives in one, so every answer would be 0")
         self._build()
+        # The backstop, and the reason it is here rather than in a comment: the checks above reject
+        # the input shapes we KNOW about, and a silent zero is exactly the failure that arrives in a
+        # shape nobody anticipated. A real PS5 module has thousands of internal references; a decoder
+        # that finds none of them has failed, whatever the file claimed to be. So make the tool
+        # detect its own invalidity instead of trusting that the magic check was sufficient.
+        #
+        # The size threshold is load-bearing and was found by the guard firing on a legitimate input:
+        # the premise "a module with no references at all has failed" is only true at MODULE scale.
+        # A small hand-built ELF -- this repo's own `imm` test fixture is 256 bytes of executable
+        # segment -- can honestly contain no reference of any decoded form. Refusing those would
+        # trade a silent wrong answer for a loud wrong refusal, which is not an improvement. 64 KiB
+        # is far below any real PS5 eboot/PRX and far above any fixture.
+        exec_bytes = sum(fs for _, _, fs, fl in self.segs if fl & 1)
+        if exec_bytes >= 0x10000 and not self.code_xref and not self.data_xref:
+            raise BadModule(
+                f"{path}: parsed as an ELF, but ZERO references of any kind were decoded across "
+                f"{exec_bytes} bytes of executable segment. That is not a plausible module - "
+                f"refusing rather than answering 0 for every address (#2346).")
 
     def foff(self, va):
         for v, o, fs, fl in self.segs:
@@ -327,7 +391,13 @@ def main():
     if len(sys.argv) < 4:
         print(__doc__)
         return 1
-    m = Module(sys.argv[1])
+    try:
+        m = Module(sys.argv[1])
+    except BadModule as exc:
+        # Non-zero exit as well as the message: a caller that pipes this into a report must not be
+        # able to mistake a refusal for an empty result set (#2346).
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
     mode = sys.argv[2]
     if mode == 'imm':
         text = sys.argv[3]
