@@ -77,7 +77,18 @@ def access(kind):
 
 
 ELF_MAGIC = b'\x7fELF'
-SELF_MAGIC = b'\x4f\x15\x3d\x1d'   # PS5/PS4 SELF container (eboot.bin, *.sprx as shipped)
+# PS5/PS4 SELF container (eboot.bin, *.sprx as shipped). TWO magics are in use, and knowing only
+# the first made this tool refuse GTA V's (PPSA04263) eboot outright -- "not an ELF ... and not a
+# SELF either" -- while prosper's own parser read the same file without complaint. That gap cost a
+# live investigation its best instrument: "who references address X" was exactly the question at
+# hand (#2396), and the hand-rolled byte scan used in its place produced FALSE POSITIVES, because a
+# scan that does not decode instructions cannot tell a reference from four coincidental bytes.
+#
+# Taken from prosper's own SELF parser (src/self/module.cpp:89), which is the authoritative list
+# here, rather than from a guess about what the second magic denotes.
+SELF_MAGICS = (b'\x4f\x15\x3d\x1d',   # 0x1D3D154F
+               b'\x54\x14\xf5\xee')   # 0xEEF51454
+SELF_MAGIC = SELF_MAGICS[0]   # retained: existing references to this name still resolve
 
 
 class BadModule(ValueError):
@@ -100,14 +111,15 @@ class Module:
         # file long enough, so without this the tool cannot fail -- it can only answer wrongly.
         if len(raw) < 0x40:
             raise BadModule(f"{path}: {len(raw)} bytes is too short to be an ELF")
-        if raw[:4] == SELF_MAGIC:
+        if raw[:4] in SELF_MAGICS:
             raise BadModule(
                 f"{path} is a SELF container, not a module ELF. Flatten it first:\n"
                 f"    python3 tools/il2cpp/prx_to_elf.py {path} <out.elf>\n"
                 f"and run this tool on <out.elf>. (Answering the question on the SELF would mean "
                 f"reporting 0 references for every address -- see #2346.)")
         if raw[:4] != ELF_MAGIC:
-            raise BadModule(f"{path}: not an ELF (magic {raw[:4].hex()}), and not a SELF either")
+            raise BadModule(f"{path}: not an ELF (magic {raw[:4].hex()}), and not a SELF either "
+                            f"(known SELF magics: {[m.hex() for m in SELF_MAGICS]})")
         e_phoff, = struct.unpack_from('<Q', raw, 0x20)
         phentsize, phnum = struct.unpack_from('<HH', raw, 0x36)
         # A well-formed ELF64 program header is exactly 56 bytes. A garbage phentsize (0 on a SELF)
