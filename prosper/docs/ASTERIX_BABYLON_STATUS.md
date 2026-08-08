@@ -19,9 +19,10 @@ Current verified rung: **2 — title screen reached and rendered**
 ## The splash deadlock and what fixed it (2026-08-05)
 
 The title screen is reached by a default `screenshot` route with no title-specific switches
-(`PROSPER_RENDER=1`, the tool's own `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`
-defaults — `PROSPER_GUEST_FS` is inert here, read only on macOS/Rosetta, and is named only because
-`screenshot` sets it). Two independent bounded runs reproduce it.
+(`PROSPER_RENDER=1`, the tool's own `PROSPER_GUEST_ARGS=-force-gfx-direct`
+defaults). Two independent bounded runs reproduce it. `PROSPER_GUEST_FS` used to be named here
+because `screenshot` set it; since #2098 it no longer does on Linux or Windows, where the variable
+is never read — guest TLS is on by default and the opt-out is `PROSPER_NO_GUEST_FS`.
 
 `sceAvPlayerJumpToTime` (`XC9wM+xULz8`) was unregistered, so the dispatcher's default `0` reached the
 guest as a completed seek. Three things had to be true together before the title could advance, and

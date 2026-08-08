@@ -99,7 +99,10 @@ def one_run(args, i):
     log = tempfile.NamedTemporaryFile(prefix=f"hangprobe_run{i}_", suffix=".log", delete=False).name
     env = dict(os.environ)
     env.update({
-        "PROSPER_INITLOG": "1", "PROSPER_GUEST_FS": "1",
+        "PROSPER_INITLOG": "1",
+        # Apple-only (#2098): read at guest_tls.cpp:46 under `#ifdef __APPLE__`. Linux and Windows
+        # read the opt-OUT PROSPER_NO_GUEST_FS and default guest TLS ON.
+        **({"PROSPER_GUEST_FS": "1"} if sys.platform == "darwin" else {}),
         "PROSPER_GUEST_ARGS": "-force-gfx-direct", "PROSPER_RENDER": "1",
         "PROSPER_NO_FRAME_DUMPS": "1", "PROSPER_SAVE0": save,
     })

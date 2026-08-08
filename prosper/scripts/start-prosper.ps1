@@ -36,7 +36,9 @@ if ($TestPattern) {
 
     $SavedataDir = [IO.Path]::GetFullPath($SavedataDir)
     New-Item -ItemType Directory -Path $SavedataDir -Force | Out-Null
-    $env:PROSPER_GUEST_FS = '1'
+    # PROSPER_GUEST_FS is not set: guest_tls.cpp reads it only under `#ifdef __APPLE__`.
+    # On Windows (`:240`) guest TLS is ON by default; the real switch is the opt-OUT
+    # PROSPER_NO_GUEST_FS (#2098).
     $env:PROSPER_GUEST_ARGS = $GuestArgs
     $env:PROSPER_SAVEDATA_DIR = $SavedataDir
     $runArgs += @('--dump', $Dump)
