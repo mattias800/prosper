@@ -497,7 +497,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   failure population is unchanged in both class and count. Note the counts are by **class**, not by
   program address: guest code addresses are run-local and every one of them differs between the two
   arms, so an address-keyed comparison across runs is void (this cost the first pass of this very
-  A/B). #2353.
+  A/B). #2265.
 
 - **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS, AND THE ATOMIC ONE
   IS NOT A MISSING FEATURE -- IT IS THREE COPIES OF ONE PREDICATE THAT DISAGREE.** Program
@@ -522,9 +522,14 @@ One line per falsified hypothesis, with the evidence that killed it.
   `kind == StorageBuffer` with `atomic_access` and `report.ok()`); it exists as the RADV
   image-atomic workaround. **This is #2293's defect one iteration later** -- that PR is titled *"the
   image-atomic opcode list existed in THREE places and all three had to agree"*, and the same triple
-  now disagrees on the *dimension* predicate instead of the opcode list. Fix: make sites 1 and 3
-  admit what site 2 already emits, with the size check taking the layer count into account.
-  #2353, Refs #2272 / #2293 / #657 / #590.
+  now disagrees on the *dimension* predicate instead of the opcode list. **Do NOT simply widen sites
+  1 and 3: the `compute_atomic_buffer` index is still `coords[0] + coords[1]*width` with the layer in
+  neither the index nor the bound**, so relaxing the validator alone makes this dispatch *run* and
+  every layer atomically accumulates into layer 0's texels -- a silent wrong result on a device-scope
+  atomic, strictly worse than the current skip, and it would read as progress in a screenshot. Correct
+  order: fold the layer into the index (`(z*height + y)*width + x`) and the bound and require the
+  backing buffer to cover `width*height*depth*4`, **then** widen sites 1 and 3. Tracked on **#2265**,
+  which owns this chain; Refs #2272 / #2293.
 - **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
   storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
   `Sw4KbS`, tile mode 5), and the frozen composite is a single colour, so the LUT looked like the
