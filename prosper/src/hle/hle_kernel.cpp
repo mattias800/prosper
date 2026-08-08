@@ -2340,7 +2340,7 @@ HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
         if (const unsigned n = refused.fetch_add(1); n < 8)
             fprintf(stderr,
                     "[libkernel] sceKernelCreateEventFlag: REFUSED unwritable out-pointer 0x%llx "
-                    "(attr=0x%llx init=0x%llx) -> EINVAL; the guest passed a pointer prosper cannot "
+                    "(attr=0x%llx init=0x%llx) -> EFAULT; the guest passed a pointer prosper cannot "
                     "store through, which is a guest-side null/uninitialised object, not a prosper "
                     "defect (#1963; %u so far%s)\n",
                     (unsigned long long)a0, (unsigned long long)a2, (unsigned long long)a3,
