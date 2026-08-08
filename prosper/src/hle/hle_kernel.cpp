@@ -20,6 +20,7 @@
 #include "sync_futex.hpp"
 #include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "../gpu/mb3_freelist.hpp"
+#include "../gpu/gpu_execute.hpp"   // gpu::guest_writable — validate guest out-pointers (#1963)
 #include "../host/exec_image.hpp"
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t
@@ -2315,9 +2316,44 @@ namespace {
     }
 }
 HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
+    // The out-pointer is guest-supplied, so it must be VALIDATED and not merely tested non-null.
+    // `if (a0)` rejects exactly zero, which lets through the shape that actually occurs: a null base
+    // plus a field offset. Little Nightmares III (PPSA05143) calls this with ef = 0x80 because its
+    // audio-thread singleton is null and the event flag lives at `this + 0x80` — 0x80 passes a
+    // non-null test, and prosper then faults inside its own code writing to address 0x80.
+    //
+    // The fault report that produces is worse than the fault: `rbp` IS the bad pointer, so the
+    // rbp-based guest walker returns ZERO frames, and the rip is host code mislabelled as
+    // `eboot+0x…` (instrument trap 22). Nothing in it names the API, and identifying it took
+    // addr2line on the host binary. Refusing here costs one branch and names itself. (#1963)
+    //
+    // EFAULT, not EINVAL: prosper already draws that distinction on consecutive lines in
+    // hle_service.cpp's sceKernelGetRandomNumber -- `size > kRandomMaxBytes` is EINVAL (a bad
+    // VALUE) and `!svc_ptrish(buf)` is EFAULT (a bad POINTER), with the comment below them stating
+    // that an unmapped or unwritable guest buffer must return an error rather than take down the
+    // emulator. A bad out-pointer is that case exactly, and FreeBSD agrees. No title evidence
+    // exists either way -- we have no Sony body and the guest almost certainly only tests non-zero
+    // -- so internal consistency is the tiebreaker. CONFIDENCE: MED on the exact code, HIGH that
+    // refusing beats faulting.
+    if (!a0 || !gpu::guest_writable(a0, sizeof(void*))) {
+        static std::atomic<unsigned> refused{0};
+        if (const unsigned n = refused.fetch_add(1); n < 8)
+            fprintf(stderr,
+                    "[libkernel] sceKernelCreateEventFlag: REFUSED unwritable out-pointer 0x%llx "
+                    "(attr=0x%llx init=0x%llx) -> EFAULT; the guest passed a pointer prosper cannot "
+                    "store through, which is a guest-side null/uninitialised object, not a prosper "
+                    "defect (#1963; %u so far%s)\n",
+                    (unsigned long long)a0, (unsigned long long)a2, (unsigned long long)a3,
+                    n + 1, n == 7 ? ", further reports suppressed" : "");
+        return prosper::hle::kSceKernelErrorEFAULT;
+    }
+    // Allocate only AFTER the destination is known good: the old order built the object first and
+    // then dropped it on the floor whenever the store did not happen, leaking one EventFlag (plus
+    // its mutex and condvar) per refused call.
     auto* e = (EventFlag*)calloc(1, sizeof(EventFlag));
+    if (!e) return prosper::hle::kSceKernelErrorENOMEM;   // was an unchecked null deref
     pthread_mutex_init(&e->m, nullptr); pthread_cond_init(&e->c, nullptr); e->bits = a3;
-    if (a0) *(void**)(uintptr_t)a0 = e;
+    *(void**)(uintptr_t)a0 = e;
     return 0;
 }
 HLE(k_ef_delete)  {

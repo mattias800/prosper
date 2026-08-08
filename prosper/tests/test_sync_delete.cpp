@@ -6,6 +6,7 @@
 // waiter, delete from the main thread, and assert the waiter wakes with EACCES and nothing crashes.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "../src/hle/sce_errno.hpp"   // kSceKernelErrorEINVAL (#1963)
 #include <cstdio>
 #include <cstdint>
 #include <cinttypes>
@@ -114,6 +115,34 @@ int main() {
           "ef/sema fns registered");
     if (!(ef_create && ef_poll && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal)) {
         printf("== FAIL ==\n"); return 1;
+    }
+
+    // --- #1963: sceKernelCreateEventFlag must VALIDATE its out-pointer, not merely test it
+    //     non-null. 0x80 is the exact value Little Nightmares III passes (a null audio-thread
+    //     singleton plus the field offset `this + 0x80`); it is non-zero, so the old `if (a0)`
+    //     accepted it and prosper faulted writing to address 0x80 — inside its own code, with a
+    //     report naming neither the API nor a usable guest frame.
+    //
+    //     This arm is only meaningful because the value is UNMAPPED-but-non-null. A plain null
+    //     would be caught by the old code too, so an arm using 0 would pass without the fix and
+    //     prove nothing. Reaching the handler at all is the assertion: if the guard regresses, this
+    //     test does not fail — it CRASHES, which is still a red result and is exactly the failure
+    //     the fix exists to remove.
+    {
+        const uint64_t bad_out_ptr = 0x80;
+        const uint64_t rc = ef_create(bad_out_ptr, 0, 0x20, 0, 0, 0);
+        CHECK(rc == prosper::hle::kSceKernelErrorEFAULT,
+              "CreateEventFlag refuses a non-null but unwritable out-pointer with EFAULT");
+        // A refusal must not have published anything: the handler returns before allocating, so
+        // there is no object to leak and nothing was written anywhere.
+    }
+    // The success path must still work — a guard that refuses everything would pass the arm above.
+    {
+        void* slot = nullptr;
+        const uint64_t rc = ef_create((uint64_t)(uintptr_t)&slot, 0, 0x20, 0x5a5a, 0, 0);
+        CHECK(rc == 0 && slot != nullptr,
+              "CreateEventFlag still succeeds through a writable out-pointer");
+        if (slot) ef_delete((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0);
     }
 
     // --- EventFlag: park a thread on an infinite wait for a bit-pattern that never gets set, then
