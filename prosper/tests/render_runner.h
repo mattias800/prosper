@@ -3158,7 +3158,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                   BackendSubmissionBatch* submission_batch = nullptr,
                                                   bool flush_submission_batch = true,
                                                   std::span<const BackendDraw> logical_ds_draws = {},
-                                                  BackendMrtOutputs* mrt_outputs = nullptr) {
+                                                  BackendMrtOutputs* mrt_outputs = nullptr,
+                                                  // #2283: does the CALLER want colour pixels back?
+                                                  // Not "is there a colour target" -- absent target
+                                                  // already means readback, because then the returned
+                                                  // vector is the only way to get results, which is
+                                                  // how every offscreen test asserts. Defaults true so
+                                                  // every existing caller is bit-identical.
+                                                  bool want_color_readback = true) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const prosper::frontend::PerformanceTimingMode timing_mode =
@@ -5662,17 +5669,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // merely requesting the complete MRT shape must not materialize either GPU-resident image on the
     // CPU. Slots 2+ are currently transient backend attachments, so a caller requesting them through
     // BackendMrtOutputs still needs those planes copied before the images are released.
-    const bool readback_color0 = !persistent_color || color_target->readback;
-    const bool readback_color1 = use_color1 &&
+    // #2283. Split into two questions that used to be one.
+    //
+    // WOULD a readback be requested -- unchanged, and it is what still drives the flush below. The
+    // scope of this change is the COPY only: `readback_requested` also feeds
+    // `synchronous_results_requested` and therefore `flush_now`, which gates persistent attachment
+    // publication. Removing a flush is a real win (each is a queue submit plus a full CPU-GPU fence
+    // wait) and it is a different change with different risk, so it is deliberately NOT taken here.
+    const bool readback_color0_wanted = !persistent_color || color_target->readback;
+    const bool readback_color1_wanted = use_color1 &&
         (!persistent_color1 || color_target->readback1);
-    const bool readback_requested = readback_color0 || readback_color1 || color_count > 2;
+    const bool readback_requested_for_flush =
+        readback_color0_wanted || readback_color1_wanted || color_count > 2;
+
+    // ...and will one actually be PERFORMED. Blue Prince renders 457 depth-only passes with no
+    // colour base per route; every one reads back a fully black surface that the frontend then
+    // never looks at (`live_renderer.cpp:6082`/`:6118` consume the pixels only under `if (base ...)`,
+    // and there is no else). That is up to 8 MB copied and discarded per pass.
+    const bool readback_color0 = want_color_readback && readback_color0_wanted;
+    const bool readback_color1 = want_color_readback && readback_color1_wanted;
+    const bool readback_requested = readback_color0 || readback_color1 ||
+                                    (want_color_readback && color_count > 2);
     const bool storage_writeback_requested = std::any_of(
         texture_uploads.begin(), texture_uploads.end(),
         [](const SharedTextureUpload& upload) {
             return !upload.storage_writebacks.empty();
         });
+    // Deliberately the WOULD-BE value, not the gated one: this change must not alter when the
+    // backend flushes. Verified by the flush-reason counters, which are unchanged in an A/B.
     const bool synchronous_results_requested =
-        readback_requested || storage_writeback_requested;
+        readback_requested_for_flush || storage_writeback_requested;
     const bool flush_now = !submission_batch || synchronous_results_requested ||
                            flush_submission_batch;
     // Attributed in the same order the condition above evaluates, so exactly one bucket is charged
@@ -5681,7 +5707,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     uint64_t flush_reason_storage = 0, flush_reason_explicit = 0;
     if (flush_now) {
         if (!submission_batch) flush_reason_no_batch = 1;
-        else if (readback_requested) flush_reason_readback = 1;
+        // The WOULD-BE value: this bucket answers "why did the backend flush", and the flush is
+        // still caused by a readback being wanted even when #2283 then skips performing it.
+        // Attributing it to `explicit` instead would silently move counts between buckets and make
+        // the flush-reason histogram lie about an unchanged synchronization path.
+        else if (readback_requested_for_flush) flush_reason_readback = 1;
         else if (storage_writeback_requested) flush_reason_storage = 1;
         else flush_reason_explicit = 1;
     }
@@ -7214,14 +7244,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               std::vector<uint8_t>* out_rgba1 = nullptr,
                                               BackendSubmissionBatch* submission_batch = nullptr,
                                               bool flush_submission_batch = true,
-                                              BackendMrtOutputs* mrt_outputs = nullptr) {
+                                              BackendMrtOutputs* mrt_outputs = nullptr,
+                                              bool want_color_readback = true) {   // #2283
     const std::span<const BackendDraw> all(draws);
     if (!persist_depth_stencil ||
         depth_feedback_split_index(all, W, H) == all.size())
         return render_draw_pass_rgba(all, W, H, seed_rgba, clear_rgba,
                                      persist_depth_stencil, color_target, seed_rgba1,
                                      clear_rgba1, out_rgba1, submission_batch,
-                                     flush_submission_batch, {}, mrt_outputs);
+                                     flush_submission_batch, {}, mrt_outputs,
+                                     want_color_readback);
 
     BackendColorTargetStats aggregate_color{};
     BackendTextureUploadStats aggregate_textures{};
@@ -7363,7 +7395,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
             begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
             final ? flush_submission_batch : false, all,
-            final ? mrt_outputs : nullptr);
+            final ? mrt_outputs : nullptr, want_color_readback);
         add_stats();
 
         if (final) {

@@ -6102,7 +6102,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,
                         batch_backend_submits ? &backend_submission : nullptr,
-                        pass_i == items.size(), &mrt_outputs);
+                        pass_i == items.size(), &mrt_outputs,
+                        // #2283: only ask for colour pixels when something will read them.
+                        //
+                        // Keyed on the UNION of every bound slot, not on colour-0 alone. Review
+                        // caught that: `gpx`'s only consumer is indeed inside an `if (base ...)`
+                        // pair with no else, but `gpx` is not all the call returns. `mrt_outputs`
+                        // is filled by the same call and its consumer is keyed per slot on
+                        // `pass_bases[slot]`, where an EMPTY vector is not a no-op -- it calls
+                        // `surface.rgba.reset()` and drops that surface's cached pixels.
+                        //
+                        // `mrt_count` does not depend on `base`, so a pass with colour-0 unbound
+                        // and colour-1 bound is reachable by construction -- the same sparse export
+                        // hole the MRT loop already acknowledges, at slot 0 instead of slot 1. On
+                        // `base != 0` alone such a pass would silently lose a live colour-1 RTT.
+                        // Structural rather than observed, which is exactly why the 457/457
+                        // depth-only measurement could not clear it: that evidence is all slot 0.
+                        //
+                        // Depth-only passes have every slot zero, so the win is unchanged.
+                        // Keyed on the base rather than the draws' colour write masks for the
+                        // separate reason that 457/457 is evidence about THIS route, and a future
+                        // title could legally mix a colour-writing draw into a pass that has a base.
+                        /*want_color_readback=*/std::any_of(
+                            pass_bases.begin(),
+                            pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
+                            [](uint64_t slot_base) { return slot_base != 0; }));
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
