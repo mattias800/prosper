@@ -401,6 +401,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_sce_pthread_encoding PRIVATE prosper_core)
   add_test(NAME sce_pthread_encoding COMMAND test_sce_pthread_encoding)
 
+  # #2168 (barrier half): a barrier destroy must refuse while threads are parked.
+  add_executable(test_barrier_destroy_busy tests/test_barrier_destroy_busy.cpp)
+  target_link_libraries(test_barrier_destroy_busy PRIVATE prosper_core)
+  add_test(NAME barrier_destroy_busy COMMAND test_barrier_destroy_busy)
+
   add_executable(test_reallocf tests/test_reallocf.cpp)
   target_link_libraries(test_reallocf PRIVATE prosper_core)
   add_test(NAME reallocf COMMAND test_reallocf)

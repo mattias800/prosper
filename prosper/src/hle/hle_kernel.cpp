@@ -2752,11 +2752,61 @@ POSIX_SEM_ALIAS(k_posix_sem_getvalue, k_sem_getvalue)
 // No POSIX spelling is registered on either body, so both encode in place (#2178). The serial
 // thread's -1 is NOT an errno and must survive untouched: sce_pthread_rc passes it through because
 // its high bits are set, which is exactly the case the pass-through guard exists for.
+// #2168 (barrier half). FreeBSD's pthread_barrier_destroy refuses a barrier that still has waiters
+// (`bar->b_waiters > 0` -> EBUSY) and does not free it. prosper kept no waiter count, so a guest
+// destroying a barrier out from under parked threads was told it succeeded and had its slot cleared.
+//
+// Deliberately the same shape as the condvar half (#2359): one registry keyed by the host object, an
+// RAII scope around the wait so an early return cannot leak a waiter and wedge every later destroy
+// into a permanent EBUSY, and the busy check BEFORE pt_claim_slot so a refusal leaves the guest a
+// working object rather than a handle to storage prosper has already quarantined.
+//
+// The barrier is the easier of the two to get right and the worse one to get wrong: every waiter is
+// parked until the count is reached, so destroying underneath them strands ALL of them, not one.
+std::mutex g_guest_barrier_waiters_mutex;
+std::unordered_map<pthread_barrier_t*, uint32_t> g_guest_barrier_waiters;
+
+struct GuestBarrierWaiterScope {
+    pthread_barrier_t* barrier;
+    explicit GuestBarrierWaiterScope(pthread_barrier_t* b) : barrier(b) {
+        std::lock_guard<std::mutex> lock(g_guest_barrier_waiters_mutex);
+        ++g_guest_barrier_waiters[b];
+    }
+    ~GuestBarrierWaiterScope() {
+        std::lock_guard<std::mutex> lock(g_guest_barrier_waiters_mutex);
+        auto found = g_guest_barrier_waiters.find(barrier);
+        if (found != g_guest_barrier_waiters.end() && found->second && !--found->second)
+            g_guest_barrier_waiters.erase(found);
+    }
+};
+
+inline bool guest_barrier_has_waiters(pthread_barrier_t* b) {
+    std::lock_guard<std::mutex> lock(g_guest_barrier_waiters_mutex);
+    auto found = g_guest_barrier_waiters.find(b);
+    return found != g_guest_barrier_waiters.end() && found->second > 0;
+}
+
 HLE(k_barrier_init)    { if (!a0 || a2 == 0) return prosper::hle::kSceKernelErrorEINVAL; auto* b = (pthread_barrier_t*)calloc(1, sizeof(pthread_barrier_t)); pthread_barrier_init(b, nullptr, (unsigned)a2); *(void**)(uintptr_t)a0 = b; return 0; }
-HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return prosper::hle::kSceKernelErrorEINVAL; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : sce_pthread_rc(fbsd_errno(rc)); }
+HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return prosper::hle::kSceKernelErrorEINVAL; GuestBarrierWaiterScope waiting(b); /* #2168 */ int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : sce_pthread_rc(fbsd_errno(rc)); }
 // Quarantined, not freed (#2042) — `pthread_barrier_wait` parks every arriving thread inside the
 // object, the widest window in the family. See the contract block above k_mutex_destroy.
-HLE(k_barrier_destroy) { if (void* b = pt_claim_slot(a0)) retire_sync_object(b, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); }); return 0; }   // #2176
+HLE(k_barrier_destroy) {
+    // #2168: refuse while threads are parked, and BEFORE claiming the slot. Encoded in place rather
+    // than via SCE_PTHREAD_ALIAS because this body is Sony-only -- there is no
+    // `pthread_barrier_destroy` registration -- and its sibling k_barrier_init already returns
+    // kSceKernelError* directly.
+    //
+    // This NARROWS the window; it does not close it, and the same qualification applies to the
+    // condvar half that landed first. A thread can register as a waiter between this check and the
+    // `pt_claim_slot` below, and it would then be retired out from under. Closing it needs the
+    // peek and the claim to be one atomic step -- possible, since both are lock-free atomics rather
+    // than lock-holders, but not cheap. What the check buys is the case the guest actually hits:
+    // threads ALREADY parked when the destroy arrives. Raised in review of this PR by Marlow.
+    if (auto* existing = (pthread_barrier_t*)pt_peek_slot(a0))
+        if (guest_barrier_has_waiters(existing)) return prosper::hle::kSceKernelErrorEBUSY;
+    if (void* b = pt_claim_slot(a0)) retire_sync_object(b, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); });   // #2176
+    return 0;
+}
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony
