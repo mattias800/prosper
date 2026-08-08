@@ -1179,8 +1179,11 @@ if(TARGET prosper_core)
 
     # Live Vulkan renderer on Windows (PROSPER_RENDER=1): with the Vulkan SDK present, wire the same
     # shared DrawItem->Vulkan compositor boot_trace uses on Linux so the guest's SubmitDcb draws
-    # execute + present + dump frames. Mirrors the UNIX block below (boot_trace + prosper_live_renderer
-    # only; the extra replay/screenshot tools stay Linux-first for now). See docs/PORTING.md "Windows".
+    # execute + present + dump frames. Mirrors the UNIX block below. `gpu_replay` is built here too
+    # since #2331: the F9/scheduled bundle grab already worked on Windows, so a Windows investigation
+    # could produce a several-hundred-MiB .prgbundle and then have no way to open it -- the documented
+    # "capture, then replay offline" loop was half-available, and the half that was missing was the
+    # half that answers the question. See docs/PORTING.md "Windows".
     if(NOT TARGET Vulkan::Vulkan)
       find_package(Vulkan QUIET)
     endif()
@@ -1211,6 +1214,19 @@ if(TARGET prosper_core)
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+
+      # Local-only realized-submit replayer (#514), on Windows since #2331. Same target as the UNIX
+      # block below, including the -Werror=switch gate: gpu_replay maps LiveTargetPixelFormat itself
+      # in inspect_live_target, and an unhandled member there falls through to the seed's Rgba8Unorm
+      # default and makes --inspect-only mislabel the seed -- sending an investigation down the wrong
+      # path using its own instrument. That failure mode is not platform-specific, so neither is the
+      # gate.
+      add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
+      target_include_directories(gpu_replay PRIVATE src tests)
+      target_link_libraries(gpu_replay PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(gpu_replay PRIVATE -Werror=switch)
+      endif()
     else()
       message(STATUS "Vulkan not found — Windows boot_trace built without the live renderer")
     endif()
