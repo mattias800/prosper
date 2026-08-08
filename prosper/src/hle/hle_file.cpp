@@ -2608,8 +2608,31 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // bytes): offsets 0x7af4a965/0x7af4a964. Reads are clamped to EOF like a host pread (empty
     // pakchunk2 placeholders complete with 0 bytes, status 0 — the model the engine already
     // accepted). CONFIDENCE: HIGH (offset+size confirmed on 8 live reads across 3 file kinds).
+    // #2371: MUST be a 64-bit stat. On MinGW `struct stat::st_size` is FOUR BYTES and `::stat()`
+    // fails outright with EOVERFLOW (errno 132) on any file larger than 2 GiB, leaving fsize at 0 --
+    // measured directly on GTA V's `update/update.rpf`, which is 3,018,098,688 bytes:
+    //
+    //     ::stat     rc=-1 errno=132 st_size=0  sizeof(st_size)=4
+    //     ::_stat64  rc=0            st_size=3018098688
+    //
+    // With fsize==0 the clamp below turns EVERY read of that file into zero bytes, and the request
+    // still reports success -- so the guest parses an unfilled buffer. GTA V dies on its own
+    // assertion doing exactly that (a 3-bit field reads 0, RAGE traps with `int 0x41`), never
+    // reaching its title screen on Windows. Linux is unaffected: its `stat` is 64-bit.
+    //
+    // A short read reported as OK is the worst available failure: it is indistinguishable from a
+    // successful read of zeros, which is why this cost a full investigation from the crash backwards
+    // rather than being caught at the I/O layer.
     uint64_t fsize = 0;
-    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
+    {
+#ifdef _WIN32
+        struct _stat64 st {};
+        if (::_stat64(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size;
+#else
+        struct stat st {};
+        if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size;
+#endif
+    }
     // #2139: this was Linux-only because the discriminator read the guest stack directly, which the
     // Windows import bridge makes impossible — its stub converts SysV->MS-x64 and CALLs the handler,
     // inserting a frame plus shadow space (the #672 class of bug). But that same bridge already
