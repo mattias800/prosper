@@ -344,6 +344,20 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     1 fps, and the capture said `gpu-device` was **2.2%** of the frame while `renderer-resource` was 47%
     — and that `buffer copy`, the leaf two lanes were optimising because it dominates in *gameplay*, was
     **2.4%** during the collapse. Two different problems that looked like one.
+    - **Those figures are Windows/NVIDIA, and the `buffer copy` one does NOT hold on Linux/AMD.** On Linux
+      the same leaf is **~15%** of the collapsed render work, corroborated by two independent instruments
+      on one run: prosper's own `res_buffer_copy_ms` (`copy=1.68` against `total=11.55` ms/submit over
+      6,275 submits = 14.5%) and external `perf` sampling resolved to the line
+      (`render_runner.h:5199`, 851 of 4,825 worker samples = 17.6%). That is 10.5 s of `memcpy` in a
+      110 s run. #2289 records why the platforms diverge here at all — Windows pays a
+      texture-revalidation `memcmp` that Linux does not.
+      **So do not read the 2.4% as a reason to skip buffer copy without naming your platform first.**
+      An unqualified per-title performance share is the thing that sent #2343 through five dead
+      hypotheses; a share is only meaningful with its platform, its phase and its denominator attached
+      (#2343). The same trap has a sharper edge inside one log: `[render-timing]` prints a leaf called
+      `buffer` under **both** the frontend `build_resources` phase (0.34 ms/submit here) and the
+      **backend** `backend-submit resources` phase (2.11, of which `copy=1.68`). They are different
+      measurements with the same name, and picking the wrong one turns a 15% into a 3%.
 - **Reaching the running frame loop:** `PROSPER_GUEST_ARGS=-force-gfx-direct`, plus `PROSPER_RENDER=1`
   to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
   - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
