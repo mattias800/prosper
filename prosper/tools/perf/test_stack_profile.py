@@ -117,6 +117,62 @@ class TestBlockingSite(unittest.TestCase):
         self.assertEqual(threads[910932][0], "known")
 
 
+class TestReviewFindings(unittest.TestCase):
+    """Three cases the hand-built control could not produce, found by review of a live run.
+
+    The control ran where gdb resolved libc and where no C++ wait wrappers appeared, so all
+    three were structurally inexpressible in it -- the exact "positive control drawn from the
+    same source as the null" shape CLAUDE.md warns about. The frame NAMES below are verbatim
+    from stack_profile's own output on a live prosper-app (Blue Prince, 87 threads); the
+    surrounding gdb line formatting is reconstructed, which is faithful because the classifier
+    only ever sees the names.
+    """
+
+    def test_unresolved_frames_are_never_the_reported_site(self):
+        # `set auto-solib-add off` yields `??` for unloaded libraries. The live run printed
+        # `?? <- ??` as the blocking site for four threads.
+        self.assertEqual(sp.blocking_site(["??", "??", "prosper::disk_worker_loop"], 2),
+                         "prosper::disk_worker_loop")
+
+    def test_stack_of_only_unresolved_frames_says_so(self):
+        # Distinct from "all plumbing": here the TOOL failed for this thread, and reporting it
+        # as a finding about the program would be a fabrication.
+        self.assertEqual(sp.blocking_site(["??", "??", "??"], 3), sp.UNRESOLVED_ONLY)
+        self.assertIsNotNone(sp.UNRESOLVED_ONLY)
+
+    def test_cxx_condition_variable_wrappers_are_plumbing(self):
+        # The live run reported this chain as GfxFlipThread's blocking SITE. It is the wait
+        # machinery itself -- the tool named the thing it exists to skip.
+        frames = [
+            "std::__condvar::wait_until",
+            "std::condition_variable::__wait_until_impl<std::chrono::duration<long, std::ratio<1l, 1000000000l> > >",
+            "std::condition_variable::wait_until<std::chrono::duration<long, std::ratio<1l, 1000000000l> > >",
+            "prosper::gfx_flip_wait_for_work",
+        ]
+        self.assertEqual(sp.blocking_site(frames, 1), "prosper::gfx_flip_wait_for_work")
+
+    def test_cxx_sleep_wrappers_are_plumbing(self):
+        frames = [
+            "std::this_thread::sleep_for<long, std::ratio<1l, 1000000000l> >",
+            "std::this_thread::sleep_until<std::chrono::_V2::steady_clock, std::chrono::duration<long, std::ratio<1l, 1000000000l> > >",
+            "prosper::fmod_audio_out_tick",
+        ]
+        self.assertEqual(sp.blocking_site(frames, 1), "prosper::fmod_audio_out_tick")
+
+    def test_gthread_wrappers_are_plumbing(self):
+        # `__gthread_cond_wait` is the one that reads as already-covered but is not: the `_*`
+        # prefix eats the underscores, and then `pthread_cond_\w+` needs a literal "pthread".
+        for sym in ("__gthread_cond_wait", "__gthread_mutex_lock"):
+            self.assertTrue(sp.is_plumbing(sym), f"{sym} must classify as plumbing")
+
+    def test_a_real_application_frame_is_still_not_plumbing(self):
+        # The paired negative: the widened filter must not swallow the answers.
+        for sym in ("prosper::test::readback_persistent_color_target",
+                    "prosper::k_wait_on_address",
+                    "std::vector<unsigned char, std::allocator<unsigned char> >::assign<unsigned char const*, void>"):
+            self.assertFalse(sp.is_plumbing(sym), f"{sym} must NOT be swallowed as plumbing")
+
+
 class TestFailureIsNotAResult(unittest.TestCase):
     """A sample that yields nothing must be a FAILURE, never 'nothing was blocked'."""
 
