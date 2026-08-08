@@ -277,6 +277,30 @@ published and retracted the same day: it compared 40 validations against 4,449 r
 it small without computing the cost. `watch_reuse = 0.0` — the write watch never once returns
 `Unchanged`, so every persistent hit falls to exact comparison (26,261 validations, 79.8 GiB a run).
 
+**THIS TITLE HAS THREE PERFORMANCE REGIMES THAT DIFFER BY ~50x. State which one a number is
+from, or the number means nothing.** Measured on one run that logged frame rate and draw activity
+together (RTX 4090 / Windows, default launch):
+
+| on screen | draws/submit | cost | `[app] … fps` |
+| --- | ---: | ---: | ---: |
+| main menu | ~12 | trivial | **64.0** |
+| **real gameplay** | **~2,100** | **156 ms/submit** | **single digits** |
+| FMV collapse (#2215) | ~2,250 | 938 ms/frame | 1.2-1.6 |
+
+Median across 70 render windows is **12.2** draws/submit and the max is **2,258**, so an unqualified
+average over a run is dominated by the menu and says nothing about gameplay.
+
+**The `[app]` counter is a PRESENT rate, not a render rate** — the line reads
+`fps (N frames, gpu-present)`. During the menu it reports a sustained 64.0 while a frame captured
+inside that window is **entirely black, one distinct colour**. Nothing is being drawn; presents
+continue regardless.
+
+This is recorded because it was believed and published. A session quoted "30-39 fps gameplay" from
+that counter, while the same session had already written "2,108 draws cost 156 ms/submit" into the
+#2276 discussion -- which is ~6 fps. Two numbers about the same title, in the same session, never
+compared against each other; the project owner watched a live run and said it plainly was not 30+.
+**Before quoting a frame rate here, state the regime and cross-check it against draws/submit.**
+
 **60 FPS is not reachable by CPU work alone on this workload (#2276).** `gpu_device` measures
 **30-45 ms/submit** against a 16.7 ms budget, so a renderer with zero CPU cost lands near 30 FPS as
 the frame is currently submitted. `PROSPER_RENDER_SCALE=2` did **not** reduce it (43.47 vs 45.24 at
