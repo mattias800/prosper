@@ -1,0 +1,67 @@
+# Sonic Racing: CrossWorlds (PPSA08804): carry the boot sequence past the SEGA logo.
+#
+# Before this route the title was recorded at rung 1 -- "the SEGA logo renders, the composite then goes
+# uniform" -- and every diagnostic said the renderer was healthy: 0 dropped pipelines, 0 unresolved
+# descriptors, a clean unimplemented-NID census, and a presenting loop at ~10.8 flips/s. It was waiting
+# for a button.
+#
+# With this route the title renders, in order and correctly at 3840x2160: the SEGA logo, the **Unreal
+# Engine** logo (crc 42763e4a), the **CRIWARE** logo (5170ed80) and the **legal / licensor text screen**
+# (b3b61854). None of those three had ever been observed on this title; four independent no-pad
+# observations -- two arms of mine and the two master arms recorded in SONIC_CROSSWORLDS_STATUS.md --
+# show only black / SEGA logo / black.
+#
+# THE EDGE IS THE POINT, and it is the whole finding. An earlier arm held Cross continuously from frame 0
+# (`f0-20000:cross`), with delivery confirmed from the guest's own read (`[pad] pad_read_state call#512
+# connected=1 buttons=0x4000`), and advanced NOTHING over 170 s. The guest needs a neutral->pressed
+# TRANSITION; a held button is not a press. So the presses below are bounded windows separated by
+# neutral gaps, not one long hold.
+#
+# Frame anchors rather than seconds: this title runs at roughly 3.7 host frames/s during the logo
+# sequence, so wall-clock anchors drift badly between runs while frame anchors do not.
+#
+# Verified on Linux/RADV through tools/screenshot, default launch, --seconds 30 --count 9 (270 s), on
+# master at ad5f5132 + c477d938. Two runs, identical CRC set, sampling counts differing by one.
+#
+# This does NOT reach a title screen. It reaches the auto-save notice, which on SEGA titles sits just
+# before one, so extending it is worth another pass -- watch where it stalls next and add pulses there.
+#
+# One observation, flagged rather than claimed: the auto-save notice renders LETTERBOXED into a
+# horizontal band, with the top and bottom thirds black, rather than filling the 3840x2160 target. That
+# may be the title's own presentation for this notice or it may be a viewport/scissor defect; it has not
+# been checked against hardware, and nothing else in this sequence shows it.
+# Pulses all the way through, NOT a trailing hold. The first version of this route ended with
+# `f1400-20000:cross` and stopped advancing at the legal screen -- for a reason the route created
+# rather than one the title has, since a hold produces no further transitions. Replacing it with
+# continued pulses reached a seventh state: the game's own auto-save notice (824976b1), checkered
+# background, "Saving" spinner and all. That is past the boot logos and into the title's own UI.
+f200-300:cross
+f400-500:cross
+f600-700:cross
+f800-900:cross
+f1000-1100:cross
+f1200-1300:cross
+f1400-1500:cross
+f1600-1700:cross
+f1800-1900:cross
+f2000-2100:cross
+f2200-2300:cross
+f2400-2500:cross
+f2600-2700:cross
+f2800-2900:cross
+f3000-3100:cross
+f3200-3300:cross
+f3400-3500:cross
+f3600-3700:cross
+f3800-3900:cross
+f4000-4100:cross
+f4200-4300:cross
+f4400-4500:cross
+f4600-4700:cross
+f4800-4900:cross
+f5000-5100:cross
+f5200-5300:cross
+f5400-5500:cross
+f5600-5700:cross
+f5800-5900:cross
+f6000-6100:cross

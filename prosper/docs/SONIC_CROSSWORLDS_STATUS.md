@@ -481,6 +481,29 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **THE TITLE WAS WAITING FOR A BUTTON, AND THE RENDERER WAS FINE ALL ALONG.** The one item this
+  document listed as untested -- *"any input route -- nothing has been shown to respond to a pad
+  yet"* -- is the one that moves. With `scripts/sonic-crossworlds/advance-boot-logos.pad` the title
+  renders, in order and correctly at 3840x2160, the **Unreal Engine** logo (`42763e4a`), the
+  **CRIWARE** logo (`5170ed80`) and the **legal / licensor text screen** (`b3b61854`). **None of the
+  three had ever been observed on this title**; four independent no-pad observations -- two arms of
+  mine and the two master arms above -- show only black / SEGA logo / black. Two pad arms produce an
+  identical CRC set with sampling counts differing by one.
+  **The edge is the mechanism.** An arm holding Cross continuously from frame 0, with delivery
+  confirmed from the guest's own read (`[pad] pad_read_state call#512 connected=1 buttons=0x4000`),
+  advanced nothing over 170 s. A held button is not a press: the guest needs a neutral->pressed
+  transition. That distinction is why every earlier "input does nothing" impression was wrong.
+  **Strong but not airtight:** nine samples over 270 s would very likely have caught one of these
+  screens had they played regardless of input, and four no-pad observations caught none -- but a
+  same-session alternating A/B has not been run. **It does not reach a title screen** -- it reaches
+  the game's own **auto-save notice** (`824976b1`, checkered background and "Saving" spinner), which
+  on SEGA titles sits just before one. *The route's own shape was the limiter at first:* an earlier
+  version ended in a long hold and stopped at the legal screen, which by the edge mechanism above is
+  a limit the route created rather than one the title has -- continued pulses reached the notice.
+  Flagged and not claimed: that notice renders **letterboxed** into a horizontal band rather than
+  filling the target, which may be its own presentation or a viewport defect; unchecked against
+  hardware. #2013.
+
 - **NO UNIMPLEMENTED NID IS BEING POLLED -- THIS IS NOT SONIC FRONTIERS' WALL.** That title's
   four-session black screen was one unregistered NID answering `SCE_OK` and being called **1,319
   times** (#2023), so the same census was the obvious first move here. It comes back clean:
