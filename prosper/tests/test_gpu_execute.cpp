@@ -11,6 +11,22 @@
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
 #include "test_scratch.h"
+
+// #2287 uses these to capture the validator's own stderr output; MSVC/MinGW spell the POSIX names
+// with a leading underscore.
+#ifdef _WIN32
+#include <io.h>
+#define PROSPER_DUP _dup
+#define PROSPER_DUP2 _dup2
+#define PROSPER_FILENO _fileno
+#define PROSPER_CLOSE _close
+#else
+#include <unistd.h>
+#define PROSPER_DUP dup
+#define PROSPER_DUP2 dup2
+#define PROSPER_FILENO fileno
+#define PROSPER_CLOSE close
+#endif
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -577,6 +593,69 @@ int main() {
         CHECK(made3 && it3.vertex_count == 3u, "non-zero vertex-count draw still realizes");
         CHECK(made3 && it3.raw_draw_count == 3u && !it3.raw_indexed,
               "#1256: realize_draw_item records the raw non-indexed draw-packet count (3) for capture");
+
+        // #2287: realize_draw_item resolves PROSPER_DESCRIPTOR_VALIDATE from the caller's hoisted
+        // value when given one, and reads the environment only when it is not. The parallel draw
+        // workers call this once per draw, and on Windows getenv takes a process-wide lock, so two
+        // reads per draw per worker is contention that grows with the worker count.
+        //
+        // The obvious test here is an EQUIVALENCE -- "hoisted strict behaves like live strict" --
+        // and it is worthless on this fixture. Measured, not assumed: this state realizes
+        // identically under `strict` and `off`, so all three equivalence arms passed while the
+        // parameter was being ignored. That is exactly #2130, and it is why the observable below is
+        // the validator's OUTPUT rather than its verdict.
+        //
+        // `mode=all` prints a `[descriptor]` line even when the report is clean, whereas an unset
+        // mode returns on the first line and prints nothing. So a hoisted `all` against an unset
+        // environment produces output that CANNOT be produced by ignoring the parameter.
+        {
+            auto set_mode = [](const char* v) {
+#ifdef _WIN32
+                _putenv_s("PROSPER_DESCRIPTOR_VALIDATE", v);
+#else
+                if (*v) setenv("PROSPER_DESCRIPTOR_VALIDATE", v, 1);
+                else unsetenv("PROSPER_DESCRIPTOR_VALIDATE");
+#endif
+            };
+            // Capture stderr around one realization and return what it wrote.
+            auto realize_capturing = [&](const char* const* hoisted) {
+                const std::string path =
+                    (prosper_test::test_scratch_dir() / "descriptor_mode_probe.txt").string();
+                fflush(stderr);
+                const int saved = PROSPER_DUP(PROSPER_FILENO(stderr));
+                FILE* sink = fopen(path.c_str(), "w");
+                PROSPER_DUP2(PROSPER_FILENO(sink), PROSPER_FILENO(stderr));
+                DrawItem item;
+                realize_draw_item(st, nullptr, /*vcount_hint*/3u, 0x10000u, /*log*/false,
+                                  item, nullptr, false, hoisted);
+                fflush(stderr);
+                PROSPER_DUP2(saved, PROSPER_FILENO(stderr));
+                PROSPER_CLOSE(saved);
+                fclose(sink);
+                std::string text;
+                if (FILE* f = fopen(path.c_str(), "rb")) {
+                    char buf[512];
+                    size_t n;
+                    while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+                    fclose(f);
+                }
+                return text;
+            };
+
+            set_mode("");                                   // environment says: validation OFF
+            const char* const verbose_mode = "all";
+            const std::string hoisted_out = realize_capturing(&verbose_mode);
+            CHECK(hoisted_out.find("[descriptor]") != std::string::npos,
+                  "#2287: realize_draw_item uses the caller's hoisted validation mode -- a hoisted "
+                  "'all' validates even though the environment is unset");
+
+            // The control, and the half that makes the arm above mean something: same fixture, same
+            // unset environment, no hoisted value. Ignoring the parameter would produce THIS.
+            const std::string live_out = realize_capturing(nullptr);
+            CHECK(live_out.find("[descriptor]") == std::string::npos,
+                  "#2287: with no hoisted value the environment is still what decides, and it is "
+                  "unset here, so nothing is validated");
+        }
 
         GpuState rect = st;
         rect.uc[P::VGT_PRIMITIVE_TYPE] = 7;

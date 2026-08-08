@@ -987,10 +987,24 @@ inline void trace_color_state_if_requested(const RenderState& rs,
 // states) and renders vcount_hint vertices non-indexed. Returns false (and leaves `out` untouched) if
 // the draw is a no-op (no PGM bound, recompile failed, or no color/depth/stencil effect). Shared by the default
 // (folded-state, one item) and PROSPER_PERDRAW (per-draw) paths so their per-draw handling is identical.
+// `hoisted_validate_mode` (#2287): a POINTER to a PROSPER_DESCRIPTOR_VALIDATE value the caller
+// already read once for the whole submit, or nullptr to read it here as before. The extra
+// indirection is what distinguishes "the caller hoisted it and it was unset" (non-null pointer to a
+// null string) from "the caller did not hoist" (null pointer) -- a plain `const char*` cannot say
+// both, and defaulting the ambiguous case to "off" would silently disable validation for every
+// caller that had not been converted.
+//
+// Why it is worth plumbing rather than reading here: this function is called once per draw from
+// parallel_draw_worker_execute, and on Windows getenv takes a process-wide lock on every call, so
+// two reads per draw across every worker is contention rather than a per-call constant -- and it
+// gets worse with more workers, which is the opposite of what parallelising the loop is for.
+// #2285 removed the equivalent pair from the serial build_bds path and measured the unit at
+// 1.26 us/call, 5.49 ms/submit at the 2,179 draws/submit this title reaches in the FMV phase.
 inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
                               uint32_t max_shader_dwords, bool log, DrawItem& out,
                               OperationRealizationFailure* failure = nullptr,
-                              bool retain_shared_shader_words = false) {
+                              bool retain_shared_shader_words = false,
+                              const char* const* hoisted_validate_mode = nullptr) {
     RenderState rs = extract_render_state(ds);
     if (failure) {
         *failure = {};
@@ -1387,8 +1401,17 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
         return false;
     }
-    if (!validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0, SpirvShaderStage::Vertex) ||
-        !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1, SpirvShaderStage::Fragment)) {
+    // One read per submit when the caller hoisted it, one per call otherwise -- never one per draw
+    // per stage on a parallel worker (#2287). The read stays LIVE either way, deliberately not
+    // PROSPER_ENV_VALUE: test_shader_resources.cpp and test_gpu_capture_render.cpp arm this variable
+    // at runtime, and a process-lifetime cache would make those arms vacuous rather than failing --
+    // the #2214 defect that check_cached_env.py gates.
+    const char* const validate_mode = hoisted_validate_mode ? *hoisted_validate_mode
+                                                            : getenv("PROSPER_DESCRIPTOR_VALIDATE");
+    if (!validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0, SpirvShaderStage::Vertex,
+                                              validate_mode) ||
+        !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1, SpirvShaderStage::Fragment,
+                                              validate_mode)) {
         if (failure) failure->reason = RealizationFailureReason::DescriptorContract;
         if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
                                 "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
