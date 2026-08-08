@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """stack_profile — name the code location where each thread is blocked.
 
+LINUX ONLY, like its sibling `wait_profile.py`. It drives `gdb -p` and checks /proc/<pid>, so
+the Windows and macOS lanes cannot run it at all. Stated in the first line because these two
+tools are now the standard way to answer "why is this title stalled" in this project, and half
+the lanes can run neither -- a reader on those platforms should learn that here rather than
+from an empty report.
+
 `wait_profile.py` answers *how much* each thread waits, cheaply, by reading /proc.
 It cannot answer *where*, and the gap is not a detail: a mutex wait and a condition-variable
 wait are the SAME `/proc` state, the same `wchan` (`futex_do_wait`) and the same syscall
