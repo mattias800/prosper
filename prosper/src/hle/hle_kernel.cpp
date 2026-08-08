@@ -2714,6 +2714,31 @@ SCE_PTHREAD_ALIAS(k_sce_attr_getdetachstate,   k_attr_getdetachstate)
 // the honest resolution needs something neither of us has here: a capture of what the real
 // libkernel returns. Left bare and raised on #2178 rather than settled by whoever edits last.
 SCE_PTHREAD_ALIAS(k_sce_key_create,            k_key_create)
+
+// #2178: Rename and SetName, settled by GUEST DISASSEMBLY rather than by the encoding rule's
+// analogy. #2365 deliberately left the three name functions bare because neither side had evidence:
+// test_pthread_names' bare expectations are uncited, and the rule's own evidence (the shipped
+// libc.prx's C11 _Mtx_*/_Cnd_* wrappers comparing against encoded constants) covers mutex and
+// condvar only.
+//
+// Dragon Quest VII (PPSA17942) settles it for Rename. Its one caller logs the failure:
+//
+//   5fac7b7:  call   0x669b570              ; scePthreadRename
+//   5fac7bc:  test   eax,eax
+//   5fac7c0:  movsxd rdx,eax                ; the error, sign-extended into arg2
+//   5fac7c3:  lea    rsi,[rip+0x2299e72]    ; -> "…Failed in scePthreadRename(), 0x%08x"
+//
+// `0x%08x`. Eight-digit hex is how a Sony error code is printed -- 0x80020016 fills it exactly --
+// and a bare errno would be `%d`, which this same binary uses elsewhere for plain integers. The
+// guest states in its own diagnostic which space it expects.
+//
+// SetName travels with it: same body, same contract, and no separate evidence is needed for a
+// function that IS this one under another name.
+//
+// GETNAME IS DELIBERATELY NOT SWEPT. Its only caller in that dump does `test eax,eax` and nothing
+// else, so 3 and 0x80020003 are indistinguishable there. The evidence that settles Rename does not
+// reach it, and test_pthread_names' `== 3` stands until a caller that discriminates turns up.
+SCE_PTHREAD_ALIAS(k_sce_pthread_rename,        k_pthread_rename)
 // The same bodies under their POSIX spellings, split along the RETURN-CONVENTION axis rather than
 // the encoding one (#2182). k_sem_* return the error NUMBER, which is right for scePthreadSem* and
 // wrong for sem_*: C11 7.26 and FreeBSD sem_wait(3) both specify "return -1, number left in errno".
@@ -4455,8 +4480,8 @@ void register_kernel_hle() {
     R("scePthreadSetschedparam", k_log_setschedparam);  R("scePthreadSetprio", k_log_setprio);
     R("scePthreadGetprio", k_getprio);
     R("scePthreadGetname", k_pthread_getname);
-    R("scePthreadRename", k_pthread_rename);
-    R("scePthreadSetName", k_pthread_rename);
+    R("scePthreadRename", k_sce_pthread_rename);
+    R("scePthreadSetName", k_sce_pthread_rename);
     R("pthread_getname_np", k_pthread_getname);
     R("pthread_rename_np", k_pthread_rename);
     R("pthread_set_name_np", k_pthread_rename);
