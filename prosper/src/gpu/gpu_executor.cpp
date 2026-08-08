@@ -7213,10 +7213,20 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          "spans=%.1f shaders: hit=%.1f miss=%.1f bypass=%.1f "
                          "decode: hit=%.1f miss=%.1f invalid=%.1f "
                          "readable: hit=%.1f/%.1f os=%.1f "
-                         "avg_ms: total=%.2f realize_draws=%.2f tables=%.2f shader_lookup=%.2f "
-                         "shader_compile=%.2f table_parts: metadata=%.2f fold=%.2f resources=%.2f "
-                         "parallel: batches=%.2f draws=%.1f threads=%.1f wall=%.2f "
-                         "realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f\n",
+                         // #2215 trap 143: the WALL fields are printed together and they compose to
+                         // `total`; the thread-summed ones are fenced off behind an explicit label.
+                         // They used to be interleaved, and three of them are individually LARGER
+                         // than `total` (tables=918 against total=464 on one Blue Prince window),
+                         // because realization runs on `threads` workers and these are sums across
+                         // them. A reader who divided one by `total` got a share that is not a
+                         // share -- six of those shipped from one lane in a day, and the other
+                         // lane retracted one of the same shape.
+                         "avg_ms[wall, sums to total]: total=%.2f realize_draws=%.2f "
+                         "realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f "
+                         "| [SUMMED OVER %.1f THREADS -- divide by threads before comparing to "
+                         "total]: tables=%.2f shader_lookup=%.2f shader_compile=%.2f "
+                         "metadata=%.2f fold=%.2f resources=%.2f "
+                         "| parallel[wall]: batches=%.2f draws=%.1f wall=%.2f\n",
                          (unsigned long long)window.submits, window.draws / wn,
                          window.dispatches / wn, window.render_spans / wn,
                          window.shader_hits / wn, window.shader_misses / wn,
@@ -7224,18 +7234,23 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                          window.decode_misses / wn, window.decode_invalidations / wn,
                          window.readable_hits / wn, window.readable_calls / wn,
                          window.readable_os_probes / wn, window_total / wn,
-                         window.realize_draws / wn, window.table_build / wn,
+                         window.realize_draws / wn,
+                         window.realize_compute / wn, window.plan / wn, window.backend / wn,
+                         window.publish / wn,
+                         // 1.0, not 0.0, when no parallel batch ran: realization was then SERIAL,
+                         // so these sums already ARE wall and dividing by the printed figure is
+                         // still the right instruction. Printing 0.0 told the reader to divide by
+                         // zero, which is worse than the ambiguity this line was fixed to remove.
+                         window.parallel_batches
+                             ? static_cast<double>(window.parallel_threads) /
+                                   static_cast<double>(window.parallel_batches)
+                             : 1.0,
+                         window.table_build / wn,
                          window.shader_lookup / wn, window.shader_compile / wn,
                          window.table_metadata / wn, window.table_dynamic_fold / wn,
                          window.table_resources / wn,
                          window.parallel_batches / wn, window.parallel_draws / wn,
-                         window.parallel_batches
-                             ? static_cast<double>(window.parallel_threads) /
-                                   static_cast<double>(window.parallel_batches)
-                             : 0.0,
-                         window.parallel_wall / wn,
-                         window.realize_compute / wn, window.plan / wn, window.backend / wn,
-                         window.publish / wn);
+                         window.parallel_wall / wn);
             window = {};
         }
     }
