@@ -178,7 +178,7 @@ private:
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
 // shaders place descriptors in the extended user SGPRs s16..s31 (e.g. vertex buffers at s16/s18).
 static constexpr uint32_t kUserSgprs = 32;
-void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t base, uint32_t out[kUserSgprs]) {
+void read_user_sgprs(const RegisterFile& sh, uint32_t base, uint32_t out[kUserSgprs]) {
     for (uint32_t i = 0; i < kUserSgprs; i++) { auto it = sh.find(base + i); out[i] = it == sh.end() ? 0u : it->second; }
 }
 
@@ -4729,7 +4729,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
     if (failures) failures->clear();
     if (st.dispatches.empty()) return {};
     namespace P = prosper::agc::Pm4;
-    auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
+    auto rd = [](const RegisterFile& regs, uint32_t off) {
         auto it = regs.find(off);
         return it == regs.end() ? 0u : it->second;
     };
@@ -5400,7 +5400,7 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     }
 
     namespace P = prosper::agc::Pm4;
-    auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
+    auto rd = [](const RegisterFile& regs, uint32_t off) {
         auto it = regs.find(off); return it == regs.end() ? 0u : it->second;
     };
     size_t matched = 0;
