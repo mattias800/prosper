@@ -499,29 +499,32 @@ One line per falsified hypothesis, with the evidence that killed it.
   arms, so an address-keyed comparison across runs is void (this cost the first pass of this very
   A/B). #2353.
 
-- **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS.** The frontier was
-  recorded as "an instruction inventory"; one of the four is not an instruction problem at all.
-  Program `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56),
-  every one `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
-  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. **Three** gates
-  admit only single-layer non-array 2D: the lowering's own atomic gate at
-  `src/gpu/rdna2_to_spirv.cpp:10101` -- whose comment states the narrowing outright, *"the live Astro
-  Bot visibility image is an ordinary 2D R32_UINT surface ... fail-visible for every other image
-  shape"*, making CrossWorlds the second title to need it -- the coverage predicate at
-  `src/gpu/rdna2_to_spirv.cpp:15903` (`i.mimg_dim == 1u`), and the atomic-to-storage-buffer carve-out
-  at `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`). Buffer-flattening is the
-  **designed** path for `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483`
-  requires `kind == StorageBuffer` with `atomic_access` and `report.ok()`), so this is a working
-  lowering gated to one image shape rather than a broken one. **Half-open:** the `:10101` gate should have
-  made this a `skip unsupported program`, yet the capture records `recompiled=yes` with
-  `descriptors=20`. **The shader-cache explanation is ruled out** -- see the Ruled out entry below --
-  so what remains is that those MIMG instructions never reach that branch, which is local to this
-  lowering rather than a general recompile-vs-bind divergence. The dispatch is
-  full-screen -- `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **The same guest
-  image is what the `#590` line defers** (`layered image deferred to #657`), so both of this title's
-  remaining non-recompiler compute failures are one unsupported thing: multi-layer images. #2353,
-  Refs #657 / #590.
+- **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS, AND THE ATOMIC ONE
+  IS NOT A MISSING FEATURE -- IT IS THREE COPIES OF ONE PREDICATE THAT DISAGREE.** Program
+  `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56), every one
+  `image_atomic_add` (MIMG `op=0x11`) against a **two-layer** R32_UINT 2D-array image --
+  `[compute-resource] binding=37 class=4 fmt=2 comps=1 dims=3840x2160x2 pc=751`. The dispatch is
+  full-screen: `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. Three sites
+  independently encode which image-atomic image shapes are supported, and **#2272 generalised exactly
+  one of them** to 2D_ARRAY (line numbers as of `7a493df2`):
 
+  | site | where | 2D_ARRAY accepted? |
+  | --- | --- | --- |
+  | coverage predicate | `src/gpu/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
+  | lowering gate | `src/gpu/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
+  | validator carve-out | `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`) | no |
+
+  So the lowering emits the buffer-backed binding for a 2D_ARRAY atomic and the validator then
+  rejects that exact binding as `WrongType`. That is why the capture shows `recompiled=yes` with
+  `descriptors=20` **and** a descriptor-contract failure -- a pair that reads as contradictory until
+  the three sites are read together. Buffer-flattening is the **designed** path for
+  `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483` requires
+  `kind == StorageBuffer` with `atomic_access` and `report.ok()`); it exists as the RADV
+  image-atomic workaround. **This is #2293's defect one iteration later** -- that PR is titled *"the
+  image-atomic opcode list existed in THREE places and all three had to agree"*, and the same triple
+  now disagrees on the *dimension* predicate instead of the opcode list. Fix: make sites 1 and 3
+  admit what site 2 already emits, with the size check taking the layer count into account.
+  #2353, Refs #2272 / #2293 / #657 / #590.
 - **THE UNIFORM COMPOSITE IS NOT THE UNAUTHORED 16³ GRADING LUT.** The title binds a 16x16x16 2-byte
   storage image whose authoring dispatch was skipped (`3D tile mode has no volume address pattern` --
   `Sw4KbS`, tile mode 5), and the frozen composite is a single colour, so the LUT looked like the
