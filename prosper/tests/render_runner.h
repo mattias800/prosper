@@ -6123,6 +6123,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                               rpbi.renderArea.extent.width, rpbi.renderArea.extent.height,
                               color_target ? color_target->persistent_id : 0, dv.size(),
                               [&] {   // #2283: colour-writing draws, counted not inferred
+                                  // Gate-checked HERE, not only inside the callee. Arguments are
+                                  // evaluated before the call, so without this the loop ran on every
+                                  // pass of every DEFAULT run -- an O(draws) scan added to the hot
+                                  // path by a diagnostic that was switched off. Exactly the cost
+                                  // this instrument exists to find.
+                                  if (!backend_pass_timing_enabled()) return size_t{0};
                                   size_t n = 0;
                                   for (size_t i = 0; i < dv.size() && i < draws.size(); ++i)
                                       if (draws[i].ps && draws[i].ps->color_write_mask) ++n;
