@@ -131,8 +131,8 @@ int main() {
     {
         const uint64_t bad_out_ptr = 0x80;
         const uint64_t rc = ef_create(bad_out_ptr, 0, 0x20, 0, 0, 0);
-        CHECK(rc == prosper::hle::kSceKernelErrorEINVAL,
-              "CreateEventFlag refuses a non-null but unwritable out-pointer with EINVAL");
+        CHECK(rc == prosper::hle::kSceKernelErrorEFAULT,
+              "CreateEventFlag refuses a non-null but unwritable out-pointer with EFAULT");
         // A refusal must not have published anything: the handler returns before allocating, so
         // there is no object to leak and nothing was written anywhere.
     }
