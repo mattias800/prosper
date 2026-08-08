@@ -14,6 +14,9 @@ extern "C" {
 
 #include <algorithm>
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -859,5 +862,272 @@ void uninstall_vaapi_backend() {
     auto& vaapi = shared_vaapi_backend();
     if (backend() == &vaapi) set_backend(nullptr);
 }
+
+
+// ===== sceVideodec2 access-unit decoding (#2270) ==============================================
+//
+// Separate from the stream pipeline above because the guest's contract is different: it demuxes
+// itself and submits one compressed access unit at a time. That is send_packet/receive_frame, so
+// this is a second entry point onto libavcodec rather than a second decoder.
+//
+// Output is NV12 because that is what the platform delivers (VideoFrame's own comment) and what the
+// guest allocates for: measured on Tales of Graces f, max_width*max_height = 1920*1088 against a
+// max_frame_size of 3,133,440, i.e. exactly 1.5 bytes per pixel. 2.0 would be YUV422, 4.0 RGBA.
+namespace {
+
+struct AuDecoder {
+    AVCodecContext* ctx = nullptr;
+    bool checked_first_au = false;    // the codec->bitstream sanity check runs once, in decode_au
+    AVFrame* frame = nullptr;
+    AVFrame* sw_frame = nullptr;      // hardware path: av_hwframe_transfer_data destination
+    AVBufferRef* hw_device = nullptr;
+    AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
+    // get_format reads this through ctx->opaque, so it must outlive avcodec_open2 -- hence a
+    // shared_ptr rather than a stack local. Attaching hw_device_ctx ALONE is not enough: without
+    // this callback libavcodec silently negotiates a software format and the decoder reports
+    // hardware while decoding in software, which is exactly what the first version of this did.
+    std::shared_ptr<HardwareSelection> selection;
+    AVPacket* packet = nullptr;
+    std::vector<uint8_t> nv12;      // interleaved UV staging; owned so `out` stays valid to next call
+    uint32_t width = 0, height = 0;
+};
+
+std::mutex g_au_mutex;
+std::map<int, AuDecoder> g_au_decoders;
+int g_next_au_id = 1;
+
+// libavcodec's H.264 decoder yields planar YUV420P; the guest wants semi-planar NV12. Interleaving
+// is the whole conversion -- the Y plane is byte-identical, so only chroma is touched.
+void yuv420p_to_nv12(const AVFrame* src, std::vector<uint8_t>& dst,
+                     uint32_t w, uint32_t h) {
+    const size_t y_bytes = static_cast<size_t>(w) * h;
+    dst.resize(y_bytes + y_bytes / 2);
+    for (uint32_t row = 0; row < h; ++row)
+        std::memcpy(dst.data() + static_cast<size_t>(row) * w,
+                    src->data[0] + static_cast<size_t>(row) * src->linesize[0], w);
+    uint8_t* uv = dst.data() + y_bytes;
+    const uint32_t cw = w / 2, ch = h / 2;
+    for (uint32_t row = 0; row < ch; ++row) {
+        const uint8_t* u = src->data[1] + static_cast<size_t>(row) * src->linesize[1];
+        const uint8_t* v = src->data[2] + static_cast<size_t>(row) * src->linesize[2];
+        uint8_t* o = uv + static_cast<size_t>(row) * w;
+        for (uint32_t col = 0; col < cw; ++col) { o[col * 2] = u[col]; o[col * 2 + 1] = v[col]; }
+    }
+}
+
+}  // namespace
+
+int VaapiBackend::open_decoder(uint32_t codec) {
+    // codec==1 is AVC/H.264: measured on two titles as codec=1 profile=100, and profile_idc 100 is
+    // H.264 High Profile. 1920x1088 / 3840x2160 corroborate it -- 1088 is 1080 rounded up to an
+    // H.264 16-pixel macroblock row. Anything else is refused rather than guessed at.
+    // codec==2382845 is VP9, and that is NOT read off the enum -- the enum value is not a small
+    // ordinal and we have no published table for it. It is read off the BITSTREAM, which is primary
+    // evidence and cannot be argued with: Sonic Racing: CrossWorlds' first access unit begins
+    //
+    //     82 49 83 42 60 ef f0 86 ...
+    //
+    // 0x82 = 1000 0010: frame_marker=0b10 (VP9 requires exactly 2), profile_low=0, profile_high=0
+    // (profile 0), show_existing_frame=0, frame_type=0 (KEY frame), show_frame=1 -- and a VP9 key
+    // frame is followed by the frame sync code 0x49 0x83 0x42, which is exactly bytes 1..3. Later
+    // access units start 0x86, the same layout with frame_type=1 (inter). There are no Annex-B start
+    // codes anywhere in the stream, so it is neither H.264 nor HEVC.
+    //
+    // The decoder contract corroborates the geometry independently: max=3840x2160 with
+    // max_frame_size=12441600, and 12441600 / (3840*2160) = 1.5 bytes/pixel = NV12.
+    //
+    // CONFIDENCE: HIGH that this title's stream is VP9 (sync code, from the guest's own buffer).
+    // CONFIDENCE: MED that the value 2382845 *means* VP9 in general -- that mapping rests on one
+    // title. A second title reporting 2382845 with a non-VP9 stream would falsify it, which is what
+    // the sync-code check in decode_au() below is for: it makes a wrong mapping LOUD rather than
+    // letting libavcodec fail somewhere downstream with an unrelated-looking error.
+    AVCodecID want = AV_CODEC_ID_NONE;
+    const char* want_name = nullptr;
+    if (codec == 1)             { want = AV_CODEC_ID_H264; want_name = "H.264"; }
+    else if (codec == 2382845)  { want = AV_CODEC_ID_VP9;  want_name = "VP9";   }
+    else {
+        fprintf(stderr, "[vdec2] open_decoder: codec=%u is not a bitstream format we have identified "
+                        "(1=AVC/H.264, 2382845=VP9); refusing rather than guessing (#2270)\n", codec);
+        return -1;
+    }
+    const AVCodec* av = avcodec_find_decoder(want);
+    if (!av) { fprintf(stderr, "[vdec2] no %s decoder in this libavcodec build\n", want_name); return -1; }
+
+    AuDecoder d;
+    // VA-API FIRST, and not as an optimisation. A VA-API H.264 decoder produces NV12 surfaces
+    // NATIVELY, which is exactly what the guest allocates for (1.5 bytes/pixel, measured), so the
+    // hardware path has NO colour conversion at all -- the software path needs a per-frame
+    // YUV420P->NV12 chroma interleave, and at 3840x2160 that is 12.4 MB of CPU work every frame.
+    // Doing it on the CPU is the wrong answer; doing it on the GPU is a better wrong answer than
+    // that; not doing it is the right one. Same av_hwdevice_ctx_create the stream path above uses.
+    for (int i = 0;; ++i) {
+        const AVCodecHWConfig* cfg = avcodec_get_hw_config(av, i);
+        if (!cfg) break;
+        if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+            cfg->device_type == AV_HWDEVICE_TYPE_VAAPI) { d.hw_pix_fmt = cfg->pix_fmt; break; }
+    }
+    if (d.hw_pix_fmt != AV_PIX_FMT_NONE) {
+        const char* dev = std::getenv("PROSPER_AVP_VAAPI_DEVICE");
+        if (dev && !*dev) dev = nullptr;
+        if (av_hwdevice_ctx_create(&d.hw_device, AV_HWDEVICE_TYPE_VAAPI, dev, nullptr, 0) < 0) {
+            d.hw_pix_fmt = AV_PIX_FMT_NONE;
+            d.hw_device = nullptr;
+        }
+    }
+
+    d.ctx = avcodec_alloc_context3(av);
+    if (!d.ctx) { if (d.hw_device) av_buffer_unref(&d.hw_device); return -1; }
+    if (d.hw_device) {
+        d.ctx->hw_device_ctx = av_buffer_ref(d.hw_device);
+        d.selection = std::make_shared<HardwareSelection>();
+        d.selection->format = d.hw_pix_fmt;
+        d.selection->require_hardware = false;   // a software frame is still a picture
+        d.ctx->opaque = d.selection.get();
+        d.ctx->get_format = select_video_format;
+    }
+    if (avcodec_open2(d.ctx, av, nullptr) < 0) {
+        avcodec_free_context(&d.ctx);
+        if (d.hw_device) av_buffer_unref(&d.hw_device);
+        return -1;
+    }
+    d.frame = av_frame_alloc();
+    d.sw_frame = av_frame_alloc();
+    d.packet = av_packet_alloc();
+    if (!d.frame || !d.sw_frame || !d.packet) {
+        if (d.frame) av_frame_free(&d.frame);
+        if (d.sw_frame) av_frame_free(&d.sw_frame);
+        if (d.packet) av_packet_free(&d.packet);
+        avcodec_free_context(&d.ctx);
+        if (d.hw_device) av_buffer_unref(&d.hw_device);
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    const int id = g_next_au_id++;
+    g_au_decoders[id] = d;
+    // Deliberately says REQUESTED, not "using". Whether hardware is actually negotiated is only
+    // known when a frame comes back in the hardware pixel format, and the first version of this
+    // line claimed hardware while every frame decoded in software.
+    fprintf(stderr, "[vdec2] access-unit H.264 decoder opened (id=%d, VA-API %s)\n", id,
+            d.hw_device ? "requested" : "unavailable -- software");
+    return id;
+}
+
+bool VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame& out) {
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    auto it = g_au_decoders.find(id);
+    if (it == g_au_decoders.end() || !au || !bytes) return false;
+    AuDecoder& d = it->second;
+
+    // Make a WRONG codec mapping loud on the very first access unit, instead of letting libavcodec
+    // fail later with an error that reads as a corrupt stream. The VP9 mapping in open_decoder() is
+    // derived from one title's bitstream, so it is exactly the kind of inference that must announce
+    // its own falsification: a VP9 key frame carries frame_marker==0b10 in the top two bits and the
+    // sync code 0x49 0x83 0x42 immediately after the first byte. Checked once per decoder, and it
+    // only ever warns -- a stream that fails this may still decode, and refusing here would turn a
+    // diagnostic into a regression.
+    if (!d.checked_first_au) {
+        d.checked_first_au = true;
+        if (d.ctx && d.ctx->codec_id == AV_CODEC_ID_VP9 && bytes >= 4) {
+            const bool marker = (au[0] & 0xC0) == 0x80;
+            const bool sync   = au[1] == 0x49 && au[2] == 0x83 && au[3] == 0x42;
+            const bool keyfrm = (au[0] & 0x04) == 0;
+            if (!marker || (keyfrm && !sync))
+                fprintf(stderr,
+                        "[vdec2] WARNING: opened as VP9 but the first access unit does not look like "
+                        "VP9 (head=%02x %02x %02x %02x, frame_marker=%s, sync=%s). The codec->format "
+                        "mapping may be wrong for this title -- see open_decoder (#2270).\n",
+                        au[0], au[1], au[2], au[3], marker ? "ok" : "BAD", sync ? "ok" : "absent");
+        }
+    }
+
+    // av_packet_from_data would take ownership of a buffer we do not own; the guest's access unit
+    // lives in guest memory and must not be freed by libavcodec.
+    d.packet->data = const_cast<uint8_t*>(au);
+    d.packet->size = static_cast<int>(bytes);
+    const int sent = avcodec_send_packet(d.ctx, d.packet);
+    const int got = sent >= 0 ? avcodec_receive_frame(d.ctx, d.frame) : -1;
+    {
+        // Counted, not just logged: "no picture" is the correct answer while a decoder builds its
+        // reference state, so a run with zero pictures and a run with zero SENT packets are very
+        // different failures and must not look alike.
+        static std::atomic<unsigned> sends{0}, send_fail{0}, pics{0};
+        ++sends;
+        if (sent < 0) ++send_fail;
+        if (got == 0) ++pics;
+        const unsigned n = sends.load();
+        if (n <= 4 || n % 64 == 0) {
+            char err[AV_ERROR_MAX_STRING_SIZE] = {0};
+            if (sent < 0) av_strerror(sent, err, sizeof err);
+            fprintf(stderr, "[vdec2] au#%u bytes=%zu send=%d%s%s recv=%d | pictures=%u "
+                    "send_failures=%u\n", n, bytes, sent, sent < 0 ? " " : "", sent < 0 ? err : "",
+                    got, pics.load(), send_fail.load());
+        }
+    }
+    if (sent < 0 || got < 0) return false;   // needs more input: NOT an error
+
+    // HARDWARE: the decoded surface is already NV12. Transfer it to CPU-visible memory and hand
+    // the planes over as they are -- no colour conversion, no chroma interleave, nothing per-pixel
+    // on the CPU beyond the transfer the guest's own buffer requires anyway.
+    const AVFrame* pic = d.frame;
+    if (d.hw_pix_fmt != AV_PIX_FMT_NONE && d.frame->format == d.hw_pix_fmt) {
+        av_frame_unref(d.sw_frame);
+        d.sw_frame->format = AV_PIX_FMT_NV12;          // ask for NV12 directly from the surface
+        if (av_hwframe_transfer_data(d.sw_frame, d.frame, 0) < 0) return false;
+        pic = d.sw_frame;
+    }
+
+    d.width = static_cast<uint32_t>(pic->width);
+    d.height = static_cast<uint32_t>(pic->height);
+
+    if (pic->format == AV_PIX_FMT_NV12) {
+        // Already the guest's layout. Copy plane-wise only because the strides may exceed the
+        // width; when they do not this is two straight memcpys.
+        const size_t y_bytes = static_cast<size_t>(d.width) * d.height;
+        d.nv12.resize(y_bytes + y_bytes / 2);
+        for (uint32_t row = 0; row < d.height; ++row)
+            std::memcpy(d.nv12.data() + static_cast<size_t>(row) * d.width,
+                        pic->data[0] + static_cast<size_t>(row) * pic->linesize[0], d.width);
+        for (uint32_t row = 0; row < d.height / 2; ++row)
+            std::memcpy(d.nv12.data() + y_bytes + static_cast<size_t>(row) * d.width,
+                        pic->data[1] + static_cast<size_t>(row) * pic->linesize[1], d.width);
+    } else if (pic->format == AV_PIX_FMT_YUV420P) {
+        // SOFTWARE fallback only. This is the per-frame CPU chroma interleave the hardware path
+        // exists to avoid -- 12.4 MB per frame at 3840x2160 -- so it is a correctness net, not a
+        // design. If a host ever runs here permanently, that is a bug to chase, not a tradeoff.
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) == 0)
+            fprintf(stderr, "[vdec2] software decode path: paying a per-frame YUV420P->NV12 CPU "
+                            "interleave; VA-API was unavailable (#2270)\n");
+        yuv420p_to_nv12(pic, d.nv12, d.width, d.height);
+    } else {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            fprintf(stderr, "[vdec2] unexpected decoded pixel format %d; no picture\n",
+                    pic->format);
+        return false;
+    }
+
+    out.y = d.nv12.data();
+    out.uv = d.nv12.data() + static_cast<size_t>(d.width) * d.height;
+    out.width = d.width;
+    out.height = d.height;
+    out.y_stride = d.width;
+    out.uv_stride = d.width;
+    out.pts_us = 0;
+    return true;
+}
+
+void VaapiBackend::close_decoder(int id) {
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    auto it = g_au_decoders.find(id);
+    if (it == g_au_decoders.end()) return;
+    if (it->second.frame) av_frame_free(&it->second.frame);
+    if (it->second.sw_frame) av_frame_free(&it->second.sw_frame);
+    if (it->second.packet) av_packet_free(&it->second.packet);
+    if (it->second.ctx) avcodec_free_context(&it->second.ctx);
+    if (it->second.hw_device) av_buffer_unref(&it->second.hw_device);
+    g_au_decoders.erase(it);
+}
+
 
 } // namespace prosper::video

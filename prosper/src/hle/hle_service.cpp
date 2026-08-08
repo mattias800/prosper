@@ -298,6 +298,7 @@ static_assert(sizeof(VdecInput) == 48 && sizeof(VdecFrame) == 32 && sizeof(VdecO
 
 std::mutex g_vdec_mx;
 std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
+std::unordered_map<uint64_t, int> g_vdec_au_ids;   // #2270 access-unit decoders
 
 // A rejected decoder config is a hard stop for a title's movie playback, and the guest only prints the
 // bare SCE code — 0x811d0200 covers TWO different conditions here, so "err=0x811d0200" alone cannot tell
@@ -508,6 +509,19 @@ HLE(s_videodec2_create_decoder) {
     // Building a decoder DOES need a queue to build it on, and a caller that reaches here without one
     // must fail visibly rather than be handed a decoder handle backed by no queue (#1658).
     uint64_t valid = vdec_validate_config(config, /*require_queue=*/true); if (valid) return valid;
+    // The other half of the #2270 contract capture: what the title asked the decoder to BE.
+    // codec/profile name the bitstream a real decoder must accept; max_width/height and
+    // VdecMemory::max_frame_size together pin the output layout arithmetically -- max_frame_size
+    // divided by max_width*max_height is bytes-per-pixel, and 1.5 vs 4 is YUV420 vs packed 32-bit.
+    if (getenv("PROSPER_VDEC2_CONTRACT"))
+        fprintf(stderr,
+                "[vdec-contract] create codec=%u profile=%u max=%dx%d dpb=%d input_depth=%u | "
+                "mem cpu=%llu gpu=%llu shared=%llu max_frame=%llu align=%u\n",
+                config->codec, config->profile, config->max_width, config->max_height,
+                config->max_dpb, config->input_depth,
+                (unsigned long long)memory->cpu_size, (unsigned long long)memory->gpu_size,
+                (unsigned long long)memory->shared_size,
+                (unsigned long long)memory->max_frame_size, memory->frame_alignment);
     if (memory->cpu_size < VDEC_MIN_MEMORY || memory->gpu_size < VDEC_MIN_MEMORY ||
         memory->shared_size < VDEC_MIN_MEMORY || memory->max_frame_size < VDEC_MIN_MEMORY)
         return VDEC_ERR_MEMORY_SIZE;
@@ -520,8 +534,27 @@ HLE(s_videodec2_create_decoder) {
     return 0;
 }
 HLE(s_videodec2_delete_decoder) {
-    std::lock_guard<std::mutex> lk(g_vdec_mx);
-    return g_vdec_codecs.erase(a0) ? 0 : VDEC_ERR_DECODER;
+    // Tear the access-unit decoder down with the guest's decoder (#2270). Without this every
+    // deleted decoder strands an AVCodecContext, two AVFrames, an AVPacket and the NV12 staging
+    // vector for the life of the process.
+    //
+    // A LEAK, not a correctness bug, and the distinction is worth keeping straight: a stale
+    // g_vdec_au_ids entry could only decode against another movie's reference frames if a handle
+    // were ever REUSED, and it is not -- g_handle is fetch_add-only and never reset (:66, :529),
+    // so the recycled-handle path is unreachable.
+    //
+    // close_decoder runs OUTSIDE g_vdec_mx: it calls into the video backend, and holding an HLE
+    // lock across a backend call is how lock-order problems get built.
+    int au_id = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_vdec_mx);
+        if (!g_vdec_codecs.erase(a0)) return VDEC_ERR_DECODER;
+        auto it = g_vdec_au_ids.find(a0);
+        if (it != g_vdec_au_ids.end()) { au_id = it->second; g_vdec_au_ids.erase(it); }
+    }
+    if (au_id >= 0)
+        if (auto* vb = prosper::video::backend()) vb->close_decoder(au_id);
+    return 0;
 }
 HLE(s_videodec2_decode) {
     // This log is CAPPED at 8 access units, and it is the only Videodec2 entry point that caps.
@@ -549,6 +582,99 @@ HLE(s_videodec2_decode) {
     if (input->data_size && !input->data) return VDEC_ERR_ARG;
     if (!frame->data_size) return VDEC_ERR_FRAME_SIZE;
     if (!frame->data) return VDEC_ERR_FRAME_PTR;
+    // PROSPER_VDEC2_CONTRACT: what a title actually asks this decoder for (#2270). prosper has no
+    // Videodec2 decoder, and the two facts a fix needs -- the output pixel FORMAT enum and the
+    // LAYOUT to write into frame->data -- are the two that cannot be read off a struct definition.
+    //
+    // There is a catch-22 in the middle of it: what the guest does with a DECODED picture cannot be
+    // observed while every decode returns no-picture. What CAN be observed is what the guest asked
+    // for and what it allocated, and the allocation constrains the layout arithmetically -- a
+    // frame buffer of w*h*3/2 is a YUV420/NV12 request, w*h*4 is a packed 32-bit one. That is a
+    // derivation from bytes the guest wrote, not an inference from what seems likely.
+    if (getenv("PROSPER_VDEC2_CONTRACT")) {
+        static std::atomic<unsigned> seq{0};
+        const unsigned k = seq.fetch_add(1);
+        if (k < 12) {
+            const double px = 0.0;
+            (void)px;
+            // The first bytes of the access unit NAME the bitstream, which the codec field does not
+            // when its value is not one we have seen before. H.264 carries a 1-byte NAL header after
+            // the start code (SPS = 0x67); HEVC carries a 2-byte one (VPS = 0x40 0x01). Printing the
+            // head is what separates "implement HEVC" from "we are reading the wrong field".
+            char head[64] = {0};
+            if (input->data && input->data_size) {
+                const auto* au = (const uint8_t*)(uintptr_t)input->data;
+                const uint64_t n = input->data_size < 16 ? input->data_size : 16;
+                for (uint64_t i = 0; i < n; ++i)
+                    snprintf(head + i * 3, 4, "%02x ", au[i]);
+            }
+            fprintf(stderr,
+                    "[vdec-contract] decode#%u handle=0x%llx au_bytes=%llu frame_buf=%llu head=%s\n",
+                    k, (unsigned long long)a0, (unsigned long long)input->data_size,
+                    (unsigned long long)frame->data_size, head);
+        }
+    }
+    // Real decode when a backend offers the access-unit path (#2270). Opt-in while the output
+    // FORMAT enum is still unknown: the layout is established (NV12, from max_frame_size /
+    // max_width*max_height = 1.5 bytes per pixel exactly, corroborated by VideoFrame already being
+    // the NV12 the platform delivers), but which Sony constant names it in out->format is not, and
+    // a wrong constant yields a correctly-decoded picture the guest reads wrongly.
+    static const bool vdec2_decode = getenv("PROSPER_VDEC2_DECODE") != nullptr;
+    if (vdec2_decode) {
+        if (auto* vb = prosper::video::backend()) {
+            int au_id;
+            {
+                std::lock_guard<std::mutex> lk(g_vdec_mx);
+                auto found = g_vdec_au_ids.find(a0);
+                if (found == g_vdec_au_ids.end()) {
+                    au_id = vb->open_decoder(codec);
+                    g_vdec_au_ids[a0] = au_id;
+                } else {
+                    au_id = found->second;
+                }
+            }
+            prosper::video::VideoFrame pic;
+            if (au_id >= 0 &&
+                vb->decode_au(au_id, (const uint8_t*)PW(input->data), (size_t)input->data_size,
+                              pic)) {
+                const uint64_t need = (uint64_t)pic.width * pic.height * 3 / 2;
+                auto* dst = (uint8_t*)PW(frame->data);
+                // A decoded picture that does not fit is the shape a WRONG LAYOUT takes, so it must
+                // not be silent. `need` is the 1.5-bytes-per-pixel NV12 derivation the whole output
+                // rests on; if that derivation is wrong, what you observe is exactly this -- a
+                // buffer the guest sized correctly and we think is too small. Falling through to
+                // vdec_no_picture without a word makes it indistinguishable from a decoder that
+                // merely needs more input, which is the benign case it looks like. Rate-limited, and
+                // it names both numbers so the ratio is checkable on sight (#2270).
+                if (dst && frame->data_size < need) {
+                    static std::atomic<unsigned> warned{0};
+                    if (warned.fetch_add(1) < 8)
+                        fprintf(stderr,
+                                "[vdec2] frame buffer too small: need=%llu (%ux%u NV12) but "
+                                "frame->data_size=%llu -- reporting NO PICTURE. If this fires, "
+                                "suspect the bytes-per-pixel derivation before the decoder (#2270)\n",
+                                (unsigned long long)need, pic.width, pic.height,
+                                (unsigned long long)frame->data_size);
+                }
+                if (dst && frame->data_size >= need) {
+                    const size_t y_bytes = (size_t)pic.width * pic.height;
+                    std::memcpy(dst, pic.y, y_bytes);
+                    std::memcpy(dst + y_bytes, pic.uv, y_bytes / 2);
+                    frame->accepted = 1;
+                    out->valid = 1; out->error = 0; out->pictures = 1; out->discarded = 0;
+                    out->codec = codec;
+                    out->width = pic.width; out->height = pic.height;
+                    out->pitch = pic.y_stride; out->pitch_bytes = pic.y_stride;
+                    out->frame = frame->data; out->frame_size = frame->data_size;
+                    // The one field still unestablished. Left 0 deliberately rather than filled
+                    // with a plausible constant: a wrong value here is a correctly-decoded picture
+                    // the guest misreads, which is silent, and #2270 records it as the open item.
+                    out->format = 0;
+                    return 0;
+                }
+            }
+        }
+    }
     frame->accepted = 0; vdec_no_picture(frame, out, codec);
     return 0;
 }
