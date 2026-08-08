@@ -48,8 +48,25 @@ The image has program headers but **no section header table**, so `e_shoff`, `e_
 `il2cpp_prx_to_elf_header`). That is enough for binutils to *accept* the file — `objdump -f`,
 `objdump -p` and `objdump -T` all work, and `-T` is genuinely useful: it lists the module's Sony
 NID dynamic symbols. It is **not** enough for `objdump -d`, which disassembles sections and finds
-none; disassembly still needs `objdump -D -b binary -m i386:x86-64 --start-address=…`, or
-`tools/re/xref.py`. Synthesizing section headers from the PT_LOADs would fix that and is #2154.
+none.
+
+**`--sections` fixes that (#2154).** It synthesizes one section per `PT_LOAD` plus a `.shstrtab`,
+with `sh_addr == sh_offset == p_vaddr` — which follows directly from the flattening, so nothing is
+derived or guessed; each section is the segment restated in the form objdump reads. `objdump -d`
+then disassembles with real virtual addresses and resolves call targets, instead of the old
+`objdump -D -b binary -m i386:x86-64 --start-address=…` workaround that throws every
+program-header-derived address away.
+
+```
+python3 prx_to_elf.py <module>.prx out.elf --sections
+objdump -d --start-address=0x2140d0 --stop-address=0x214100 out.elf
+```
+
+It is **opt-in, and the default output is byte-identical** to what it was — verified on
+`Il2cppUserAssemblies.prx` with `cmp`, and asserted by `test_prx_to_elf.py`. Il2CppDumper reads
+program headers and the dynamic segment and does not need sections, but its ELF reader does consult
+them on some paths and that has not been re-run end to end, so the dump path is left untouched. Use
+`--sections` for disassembly; leave it off for a dump.
 
 ### Ruled out
 - **"binutils also needs `e_ident[EI_OSABI]`/`[EI_ABIVERSION]` cleared" (#2016's own note) — false.**

@@ -229,6 +229,67 @@ def main():
             print("objdump arm: RAN and DISCRIMINATED — accepts the fixed header, "
                   "rejects the #2016 header")
 
+    # ---- --sections (#2154): objdump -d disassembles SECTIONS, and there were none -------------
+    #
+    # Without a section header table objdump -f/-p/-T all work and objdump -d prints NOTHING, which
+    # is the single most confusing failure this tool can produce: every other binutils command
+    # behaves, so the file looks fine.
+    sec = os.path.join(tmp, "synthetic-sections.elf")
+    proc_s = subprocess.run([sys.executable, TOOL, src, sec, "--sections"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    check(proc_s.returncode == 0,
+          "prx_to_elf.py --sections failed: %s" % proc_s.stdout.decode("utf-8", "replace"),
+          "the flag being unrecognised or the synthesis throwing")
+    with open(sec, "rb") as fh:
+        sec_bytes = fh.read()
+
+    # THE SAFETY PROPERTY, and the reason --sections is opt-in: Il2CppDumper's input must be
+    # unchanged. A regression here is silent -- a dump that subtly differs is far worse than one
+    # that fails.
+    proc_d = subprocess.run([sys.executable, TOOL, src, dst],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    with open(dst, "rb") as fh:
+        default_again = fh.read()
+    check(default_again == out and proc_d.returncode == 0,
+          "the DEFAULT output changed when --sections was added to the tool",
+          "synthesising sections unconditionally, which would alter Il2CppDumper's input")
+
+    check(u64(sec_bytes, E_SHOFF) != 0 and u16(sec_bytes, E_SHNUM) >= 3,
+          "--sections wrote no usable section table (e_shoff=%#x e_shnum=%d)"
+          % (u64(sec_bytes, E_SHOFF), u16(sec_bytes, E_SHNUM)),
+          "emitting headers without pointing the ELF header at them")
+    check(u16(sec_bytes, E_SHSTRNDX) == u16(sec_bytes, E_SHNUM) - 1,
+          "e_shstrndx (%d) does not name the last section, where .shstrtab is written"
+          % u16(sec_bytes, E_SHSTRNDX),
+          "an index off by one, which makes every section name garbage")
+
+    # The arm that matters, and it carries its own control: the SAME objdump -d on the
+    # SAME address range must print nothing for the sectionless file and instructions for this one.
+    # Without the control this asserts that objdump works, not that the sections do.
+    def objdump_d(path):
+        try:
+            r = subprocess.run(["objdump", "-d", path],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except OSError:
+            return None
+        return r.stdout
+    d_sec, d_plain = objdump_d(sec), objdump_d(dst)
+    if d_sec is None:
+        print("objdump -d arm: VOID — binutils not on PATH; the byte checks above are the gate")
+    else:
+        has_insns = b"Disassembly of section" in d_sec
+        plain_has = b"Disassembly of section" in d_plain
+        check(has_insns,
+              "objdump -d still disassembles nothing WITH --sections",
+              "sections that binutils does not accept as containing code")
+        if plain_has:
+            print("objdump -d arm: VOID — this binutils disassembles the sectionless file too, "
+                  "so the fixed file doing so discriminates nothing")
+        else:
+            print("objdump -d arm: RAN and DISCRIMINATED — disassembles with sections, "
+                  "prints nothing without them")
+    os.unlink(sec)
+
     for f in (src, dst, ctl):
         os.unlink(f)
     os.rmdir(tmp)
