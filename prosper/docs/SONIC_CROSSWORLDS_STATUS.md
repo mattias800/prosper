@@ -481,6 +481,24 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **THE DESCRIPTOR-CONTRACT SKIP IS NOT A STALE CACHED SPIR-V.** The hypothesis was that the program
+  compiled once against a single-layer resolution, was cached by `recompile_compute_shader_cached`,
+  and is validated on later dispatches against the two-layer resource -- which would make it a
+  general recompile-time vs bind-time divergence rather than a title-local gap. A/B on one
+  `boot_trace` binary, 75 s per arm, `PROSPER_DBG=1 PROSPER_RENDER_TIMING=1`, arm B adding
+  `PROSPER_NO_SHADER_CACHE=1`:
+
+  | arm | shaders hit | miss | bypass | `skip invalid descriptor contract` | `skip unsupported program` |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | cache on | 21.1 | 1.1 | 0.0 | 1 | 3 |
+  | cache off | 0.0 | 0.0 | **22.2** | 1 | 3 |
+
+  The lever provably moved -- every compile in arm B is fresh against the live table -- and the
+  failure population is unchanged in both class and count. Note the counts are by **class**, not by
+  program address: guest code addresses are run-local and every one of them differs between the two
+  arms, so an address-keyed comparison across runs is void (this cost the first pass of this very
+  A/B). #2353.
+
 - **THE REMAINING SKIPPED COMPUTE PROGRAMS ARE NOT ALL RECOMPILER OPCODE GAPS.** The frontier was
   recorded as "an instruction inventory"; one of the four is not an instruction problem at all.
   Program `0x288012e000` recompiles, then fails descriptor validation on **20** bindings (37-56),
@@ -494,12 +512,11 @@ One line per falsified hypothesis, with the evidence that killed it.
   at `src/gpu/shader_resources.cpp:1026` (`r.img_dim == 1 && r.depth == 1`). Buffer-flattening is the
   **designed** path for `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483`
   requires `kind == StorageBuffer` with `atomic_access` and `report.ok()`), so this is a working
-  lowering gated to one image shape rather than a broken one. **Open, and settle it before widening
-  any gate:** the `:10101` gate should have made this a `skip unsupported program`, yet the capture
-  records `recompiled=yes` with `descriptors=20` -- so either the shader was compiled and cached
-  against a single-layer resolution and validated later against the two-layer one (a recompile-time
-  vs bind-time divergence, which would be general), or those MIMG instructions never reached that
-  branch. The dispatch is
+  lowering gated to one image shape rather than a broken one. **Half-open:** the `:10101` gate should have
+  made this a `skip unsupported program`, yet the capture records `recompiled=yes` with
+  `descriptors=20`. **The shader-cache explanation is ruled out** -- see the Ruled out entry below --
+  so what remains is that those MIMG instructions never reach that branch, which is local to this
+  lowering rather than a general recompile-vs-bind divergence. The dispatch is
   full-screen -- `240x135` groups of 64 threads is exactly 1920x1080 in 8x8 tiles. **The same guest
   image is what the `#590` line defers** (`layered image deferred to #657`), so both of this title's
   remaining non-recompiler compute failures are one unsupported thing: multi-layer images. #2353,
