@@ -984,7 +984,11 @@ HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, ca
         uint64_t ra = 0, ra2 = 0, ra3 = 0;
         for (int i = 1; i < 96; i++) {
             uint64_t v = stack_scan[i];
-            if (prosper::guest_va_in_module(v)) {   // #1659: was a stale literal base
+            // guest_va_in_module_code, not guest_va_in_module: the weak form accepts the BOOT_STUB
+            // aperture, so a stack slot holding an import trampoline's address is taken for a guest
+            // return address. Here that address is a CORRELATION KEY, so a stub address does not
+            // merely mislabel a log line -- it changes chain identity (#2045, same fix as #2000).
+            if (prosper::guest_va_in_module_code(v)) {   // #1659: was a stale literal base
                 if (!ra) ra = v; else if (!ra2) ra2 = v; else { ra3 = v; break; }
             }
         }
