@@ -57,7 +57,14 @@ namespace {
             char* end = nullptr;
             const double v = strtod(e, &end);
             if (end == e || *end != '\0' || !(v >= 0.0)) return 30.0;   // !(v>=0) also rejects NaN
-            return v;
+            // Clamp the upper end too (#2176). strtod accepts `inf` and `1e300`, and both
+            // overflow the duration_cast to steady_clock::duration below -- undefined
+            // behaviour, even though the direction observed happens to be the safe one
+            // (nothing is ever reclaimed). An hour is far past any window that could be
+            // deliberate: the default is 30 s, and the guard's whole premise is bounding the
+            // retained set by RATE, which a 3,600 s window stops doing usefully anyway.
+            constexpr double kMaxWindowSeconds = 3600.0;
+            return v > kMaxWindowSeconds ? kMaxWindowSeconds : v;
         }();
         return seconds;
     }

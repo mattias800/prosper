@@ -333,6 +333,24 @@ namespace {
     // Loud, because this is a BEHAVIOUR CHANGE: the operation used to succeed. A guest that
     // use-after-destroys is buggy, but it was buggy silently, and a title that somehow depended on
     // the old self-init must announce itself rather than fail somewhere else later.
+    // Take the slot ATOMICALLY and return whatever it held (#2176). Two threads racing destroy on
+    // the same slot both used to read the non-sentinel pointer before either cleared it, and both
+    // handed the SAME storage to retire_sync_object. Before #2042 that double-freed immediately;
+    // with the quarantine it double-frees ~30 s later from an unrelated call, which is strictly
+    // harder to diagnose -- it cuts against the very argument the quarantine was made for.
+    //
+    // The exchange installs the destroyed sentinel, so it also closes the second edge in the same
+    // move: every handler used to retire BEFORE clearing the slot, leaving a window where another
+    // thread could still resolve the object out of it after its quarantine clock had started. Now
+    // the object is unreachable the instant the clock starts, and exactly one racer gets a
+    // non-sentinel pointer back to retire.
+    inline void* pt_claim_slot(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void* prev = __atomic_exchange_n((void**)(uintptr_t)slot_addr,
+                                         (void*)kPtDestroyed, __ATOMIC_ACQ_REL);
+        return pt_static_sentinel(prev) ? nullptr : prev;
+    }
+
     inline void pt_report_destroyed(const char* what) {
         static std::atomic<unsigned> seen{0};
         if (seen.fetch_add(1) < 16)
@@ -639,8 +657,10 @@ namespace { inline uint64_t fbsd_errno(int host) {
 // CONFIDENCE: HIGH on the table above (read out of libthr and libc, the guest's own platform);
 // CONFIDENCE: MED that Sony's libkernel did not re-write these bodies, which no evidence in the
 // corpus can currently settle either way — a title observed testing a Destroy result would.
-HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { auto* m = (pthread_mutex_t*)*(void**)a0; guest_mutex_unregister(m); retire_sync_object(m, SyncObjectKind::Mutex,
-                                    [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } if (a0) *(void**)a0 = (void*)kPtDestroyed; return 0; }   // #2170: destroyed != uninitialised
+HLE(k_mutex_destroy) { auto* m = (pthread_mutex_t*)pt_claim_slot(a0);   // #2176: claim, then retire
+    if (m) { guest_mutex_unregister(m); retire_sync_object(m, SyncObjectKind::Mutex,
+                                    [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); }
+    return 0; }
 // PROSPER_MUTEX_FAILLOG: report any mutex op that returns a non-zero (EINVAL/EDEADLK/...) result,
 // with the guest slot address and the host object it resolved to. Diagnostic for the macOS
 // guest-side "std::mutex lock failed: Invalid argument" terminate — a host EINVAL(22) surfaces as
@@ -928,8 +948,7 @@ SCE_PTHREAD_ALIAS(k_sce_condattr_getclock,     k_condattr_getclock)
 SCE_PTHREAD_ALIAS(k_sce_condattr_setpshared,   k_condattr_setpshared)
 SCE_PTHREAD_ALIAS(k_sce_condattr_getpshared,   k_condattr_getpshared)
 HLE(k_cond_destroy) {
-    if (a0 && !pt_static_sentinel(*(void**)a0)) {
-        auto* cond = (pthread_cond_t*)*(void**)a0;
+    if (auto* cond = (pthread_cond_t*)pt_claim_slot(a0)) {   // #2176: claim, then retire
         // Quarantined, not freed, and the host `pthread_cond_destroy` runs at reclaim rather than
         // here — see the contract block above k_mutex_destroy and sync_retire.hpp (#2042). A thread
         // parked in interruptible_cond_wait is inside this very object.
@@ -938,7 +957,6 @@ HLE(k_cond_destroy) {
         retire_sync_object(cond, SyncObjectKind::Cond,
                            [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); });
     }
-    if (a0) *(void**)a0 = (void*)kPtDestroyed;   // #2170: destroyed != uninitialised
     return 0;
 }
 HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
@@ -998,9 +1016,9 @@ HLE(k_rwlock_init) {
 // EBUSY refusal would be a divergence rather than a fix. See the contract table above
 // k_mutex_destroy. The return value, and the cleared slot, are exactly what they were before.
 HLE(k_rwlock_destroy) {
-    if (a0 && !pt_static_sentinel(*(void**)a0)) retire_sync_object(*(void**)a0, SyncObjectKind::Rwlock,
-            [](void* p) { auto* g = (GuestRwlock*)p; pthread_rwlock_destroy(&g->rw); g->~GuestRwlock(); });
-    if (a0) *(void**)a0 = (void*)kPtDestroyed;   // #2170: destroyed != uninitialised
+    if (void* g = pt_claim_slot(a0))            // #2176: claim, then retire
+        retire_sync_object(g, SyncObjectKind::Rwlock,
+            [](void* p) { auto* r = (GuestRwlock*)p; pthread_rwlock_destroy(&r->rw); r->~GuestRwlock(); });
     return 0;
 }
 // An UNMATCHED unlock must never reach the host lock (#2012).
@@ -2468,7 +2486,7 @@ HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = s
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 // Quarantined, not freed, and `sem_destroy` deferred to reclaim — a thread parked in `sem_wait` is
 // inside this object. See the contract block above k_mutex_destroy and sync_retire.hpp (#2042).
-HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { retire_sync_object(*slot, SyncObjectKind::Sem, [](void* p) { sem_destroy((sem_t*)p); }); *slot = nullptr; } } return 0; }
+HLE(k_sem_destroy)   { if (void* s = pt_claim_slot(a0)) retire_sync_object(s, SyncObjectKind::Sem, [](void* p) { sem_destroy((sem_t*)p); }); return 0; }   // #2176
 // The Sony spellings of the fallible semaphore entry points (#2178). SemDestroy is absent because
 // it returns 0 unconditionally — #2042 made it quarantine its object rather than free it, which
 // changes what it does but not what it reports, so it still needs no alias. NOTE that the POSIX
@@ -2521,7 +2539,7 @@ HLE(k_barrier_init)    { if (!a0 || a2 == 0) return prosper::hle::kSceKernelErro
 HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return prosper::hle::kSceKernelErrorEINVAL; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : sce_pthread_rc(fbsd_errno(rc)); }
 // Quarantined, not freed (#2042) — `pthread_barrier_wait` parks every arriving thread inside the
 // object, the widest window in the family. See the contract block above k_mutex_destroy.
-HLE(k_barrier_destroy) { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { retire_sync_object(*slot, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); }); *slot = nullptr; } } return 0; }
+HLE(k_barrier_destroy) { if (void* b = pt_claim_slot(a0)) retire_sync_object(b, SyncObjectKind::Barrier, [](void* p) { pthread_barrier_destroy((pthread_barrier_t*)p); }); return 0; }   // #2176
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony

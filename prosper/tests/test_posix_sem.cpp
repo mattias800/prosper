@@ -36,8 +36,15 @@ int main() {
     CHECK(post((uint64_t)sem, 0, 0, 0, 0, 0) == 0, "sem_post wakes one waiter");
     consumer.join();
     CHECK(released.load(std::memory_order_acquire), "blocked waiter resumes successfully");
-    CHECK(destroy((uint64_t)sem, 0, 0, 0, 0, 0) == 0 && *(void**)sem == nullptr,
-          "semaphore destroys and clears its guest handle");
+    // The PROPERTY, not the literal: #2170 gave destroyed slots their own sentinel and #2176 routed
+    // every destroy through one atomic claim, so this now holds kPtDestroyed rather than NULL. The
+    // guest cannot tell the two apart -- ensure_sem refuses any sentinel with EINVAL, and sem_init
+    // overwrites the slot unconditionally either way -- but the old assertion pinned the value.
+    void* const sem_before = *(void**)sem;
+    CHECK(destroy((uint64_t)sem, 0, 0, 0, 0, 0) == 0,
+          "semaphore destroys without reporting failure");
+    CHECK(*(void**)sem != sem_before && (uintptr_t)*(void**)sem < 0x1000,
+          "semaphore destroy detaches the guest handle from the object (a sentinel, not a pointer)");
 
     std::printf(failures ? "== FAIL: %d ==\n" : "== PASS ==\n", failures);
     return failures ? 1 : 0;
