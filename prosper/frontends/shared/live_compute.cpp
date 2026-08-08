@@ -2305,6 +2305,8 @@ struct BoundBuffer {
     size_t guest_bytes = 0;             // physical guest backing (may exceed logical image bytes)
     bool writable = false;              // reflected OpStore/writing-atomic reachability
     bool atomic_image = false;           // R32_UINT StorageImage exposed as a linear atomic SSBO
+    uint32_t atomic_layers = 1;          // #2265: array layers staged for that view (1 when plain 2D)
+    size_t atomic_slice_bytes = 0;       // physical guest bytes PER LAYER (tiled slices are padded)
     bool persistent = false;
     bool upload_skipped = false;
     VkBuffer result_baseline = VK_NULL_HANDLE;
@@ -4298,22 +4300,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             "invalid storage-buffer materialization contract");
                 break;
             }
+            // #2265: one shared shape test with the lowering gate and the descriptor validator.
             buffers[i].atomic_image = descriptors[i].atomic_access &&
-                resource->cls == ResourceClass::StorageImage &&
-                resource->format == DataFormat::Uint32 && resource->num_components == 1 &&
-                resource->img_dim == 1 && resource->depth == 1 &&
-                !resource->depth_compare && !resource->in_mip_tail &&
-                !resource->compression_enabled && resource->width && resource->height;
+                shader_resource_supports_atomic_image_buffer(*resource);
+            buffers[i].atomic_layers = buffers[i].atomic_image
+                ? shader_resource_atomic_image_layers(*resource) : 1u;
+            // LOGICAL staging extent -- what the shader indexes, tightly packed across layers.
             const uint64_t linear_image_bytes = static_cast<uint64_t>(resource->width) *
-                resource->height * sizeof(uint32_t);
+                resource->height * buffers[i].atomic_layers * sizeof(uint32_t);
             if (buffers[i].atomic_image) {
                 const size_t tight_pitch = static_cast<size_t>(resource->width) * sizeof(uint32_t);
-                const size_t guest_image_bytes = resource->tile_mode
+                // PHYSICAL slice footprint. Deliberately NOT the logical w*h*4: a tiled slice is a
+                // padded, 64 KiB-aligned unit, so using the logical size here would under-bound the
+                // readability probe and the detile source would walk past the region proven
+                // readable. Measured for CrossWorlds' (3840, 2160, bpe 4, tile 27): physical
+                // 33,423,360 against logical 33,177,600, and tiled_mip_chain_bytes -- which is
+                // documented as the array slice stride -- returns the same 33,423,360, so the two
+                // candidate strides agree and the slice needs no further alignment.
+                buffers[i].atomic_slice_bytes = resource->tile_mode
                     ? tiled_surface_bytes(resource->width, resource->height,
                                           resource->tile_mode, 0, sizeof(uint32_t))
                     : (resource->linear_row_pitch_bytes
                            ? static_cast<size_t>(resource->linear_row_pitch_bytes)
                            : tight_pitch) * resource->height;
+                const size_t guest_image_bytes =
+                    buffers[i].atomic_slice_bytes * buffers[i].atomic_layers;
                 if (linear_image_bytes > UINT32_MAX ||
                     (!resource->tile_mode && resource->linear_row_pitch_bytes &&
                      resource->linear_row_pitch_bytes < tight_pitch) ||
@@ -4339,6 +4350,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!prior || prior->gpu_addr != resource->gpu_addr ||
                     prior->size != resource->size ||
                     buffers[j].atomic_image != buffers[i].atomic_image ||
+                    // #2265: two views of one allocation that differ only in layering must not
+                    // alias -- their linear staging has a different shape even when the byte
+                    // totals coincide.
+                    buffers[j].atomic_layers != buffers[i].atomic_layers ||
+                    buffers[j].atomic_slice_bytes != buffers[i].atomic_slice_bytes ||
                     buffers[j].bytes != buffers[i].bytes ||
                     buffers[j].guest_bytes != buffers[i].guest_bytes ||
                     prior->host_data != resource->host_data ||
@@ -4357,17 +4373,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     : resource_bytes(resource);
                 if (buffers[i].atomic_image) {
                     buffers[i].linear_seed.resize(buffers[i].bytes);
-                    if (resource->tile_mode) {
-                        detile_surface(buffers[i].linear_seed.data(), source,
-                                       resource->width, resource->height,
-                                       resource->tile_mode, 0, sizeof(uint32_t));
-                    } else {
-                        const size_t tight_pitch = static_cast<size_t>(resource->width) * 4u;
-                        const size_t source_pitch = resource->linear_row_pitch_bytes
-                            ? resource->linear_row_pitch_bytes : tight_pitch;
-                        for (uint32_t y = 0; y < resource->height; ++y)
-                            std::memcpy(buffers[i].linear_seed.data() + y * tight_pitch,
-                                        source + y * source_pitch, tight_pitch);
+                    // #2265: per-layer 2D detile at the physical slice stride, into a tightly
+                    // packed linear volume. Deliberately NOT detile_volume(): that is for a 3D
+                    // texture, where Z participates in the mode-27 pipe-XOR swizzle. A 2D_ARRAY's
+                    // slices are independently tiled 2D surfaces separated by a stride, so using
+                    // the volume path here would compile, run, and produce plausible garbage.
+                    const size_t layer_linear_bytes =
+                        static_cast<size_t>(resource->width) * resource->height * 4u;
+                    for (uint32_t layer = 0; layer < buffers[i].atomic_layers; ++layer) {
+                        uint8_t* dst = buffers[i].linear_seed.data() + layer * layer_linear_bytes;
+                        const uint8_t* src = source + layer * buffers[i].atomic_slice_bytes;
+                        if (resource->tile_mode) {
+                            detile_surface(dst, src, resource->width, resource->height,
+                                           resource->tile_mode, 0, sizeof(uint32_t));
+                        } else {
+                            const size_t tight_pitch = static_cast<size_t>(resource->width) * 4u;
+                            const size_t source_pitch = resource->linear_row_pitch_bytes
+                                ? resource->linear_row_pitch_bytes : tight_pitch;
+                            for (uint32_t y = 0; y < resource->height; ++y)
+                                std::memcpy(dst + y * tight_pitch,
+                                            src + y * source_pitch, tight_pitch);
+                        }
                     }
                     source = buffers[i].linear_seed.data();
                     if (trace)
@@ -7427,17 +7453,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (!buffer.resource->host_data && buffer.resource->gpu_addr)
                     prosper::host::guest_write_watch_notify_host_write(
                         buffer.resource->gpu_addr, buffer.guest_bytes);
-                if (buffer.resource->tile_mode) {
-                    tile_surface(destination, result,
-                                 buffer.resource->width, buffer.resource->height,
-                                 buffer.resource->tile_mode, 0, sizeof(uint32_t));
-                } else {
-                    const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
-                    const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
-                        ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
-                    for (uint32_t y = 0; y < buffer.resource->height; ++y)
-                        std::memcpy(destination + y * destination_pitch,
-                                    result + y * tight_pitch, tight_pitch);
+                // #2265: mirror of the upload -- per-layer 2D retile at the physical slice stride.
+                const size_t layer_linear_bytes =
+                    static_cast<size_t>(buffer.resource->width) * buffer.resource->height * 4u;
+                for (uint32_t layer = 0; layer < buffer.atomic_layers; ++layer) {
+                    uint8_t* dst = destination + layer * buffer.atomic_slice_bytes;
+                    const uint8_t* src = result + layer * layer_linear_bytes;
+                    if (buffer.resource->tile_mode) {
+                        tile_surface(dst, src, buffer.resource->width, buffer.resource->height,
+                                     buffer.resource->tile_mode, 0, sizeof(uint32_t));
+                    } else {
+                        const size_t tight_pitch = static_cast<size_t>(buffer.resource->width) * 4u;
+                        const size_t destination_pitch = buffer.resource->linear_row_pitch_bytes
+                            ? buffer.resource->linear_row_pitch_bytes : tight_pitch;
+                        for (uint32_t y = 0; y < buffer.resource->height; ++y)
+                            std::memcpy(dst + y * destination_pitch,
+                                        src + y * tight_pitch, tight_pitch);
+                    }
                 }
                 ctx.unmap_memory(buffer.memory);
                 if (buffer.resource->gpu_addr)
