@@ -172,7 +172,23 @@ int main() {
                     for (size_t i = kNew; i < usable; ++i)
                         if (small[i] == pattern(i)) { if (first_bad == SIZE_MAX) first_bad = i; ++bad_count; }
                     const size_t window = usable - kNew;
-                    const bool slack_clean = bad_count < window;
+                    // Fire on a RUN of consecutive positional matches starting at kNew, not on the
+                    // whole window. An over-copy writes a contiguous run from index 0, so it fills
+                    // dst[0 .. n) and the affected slack is exactly kNew .. n-1 -- small[kNew] is
+                    // always the first byte hit. Requiring the ENTIRE window to match would therefore
+                    // miss any over-copy with kNew < n < usable: with glibc's usable(64) = 72 that is
+                    // an overrun of 1-7 bytes, which is precisely the silent variant this guard exists
+                    // for. (Caught in review of #2337; the first version of this fix had that gap and
+                    // its PR text wrongly claimed sensitivity was unchanged.)
+                    //
+                    // K = 4 bounds a chance collision at 256^-4 = 2^-32, far below the old
+                    // single-byte test, while catching an overrun of 4 bytes or more. Overruns of
+                    // 1-3 bytes remain undetectable here; that is a deliberate trade against a guard
+                    // that reddens unrelated PRs, and it is recorded rather than left implicit.
+                    const size_t kRun = window < 4 ? window : 4;
+                    size_t run = 0;
+                    while (run < kRun && small[kNew + run] == pattern(kNew + run)) ++run;
+                    const bool slack_clean = run < kRun;
                     if (!slack_clean) {
                         // The "did NOT move" branch below reads as unreachable against the
                         // interpretation printed after it, and it IS -- deliberately. It is a
@@ -186,9 +202,11 @@ int main() {
                         printf("  [diag]   block %s (old=0x%llx new=0x%llx)\n",
                                moved ? "MOVED" : "did NOT move — shrunk in place",
                                (unsigned long long)old_addr, (unsigned long long)(uintptr_t)small);
-                        printf("  [diag]   usable=%zu kNew=%zu window=%zu bytes; ALL %zu match the source "
-                               "pattern positionally, first at +%zu\n",
-                               usable, kNew, window, bad_count, first_bad - kNew);
+                        printf("  [diag]   usable=%zu kNew=%zu window=%zu bytes; %zu of the first %zu slack "
+                               "bytes match the source pattern positionally (%zu matches in the whole "
+                               "window, first at +%zu)\n",
+                               usable, kNew, window, run, kRun, bad_count,
+                               first_bad == SIZE_MAX ? (size_t)0 : first_bad - kNew);
                         printf("  [diag]   slack:");
                         for (size_t i = kNew; i < usable && i < kNew + 32; ++i) printf(" %02x", small[i]);
                         printf("\n");
