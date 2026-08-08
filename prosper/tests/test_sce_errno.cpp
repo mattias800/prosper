@@ -375,6 +375,34 @@ int main() {
         }
     }
 
+    // ---- behavioral: the guest-visible errno slot carries FreeBSD numbers (#2296) -----------
+    //
+    // `select` with a descriptor set is unsupported (no socket backing), and the handler reports
+    // that the libScePosix way: return -1 and leave an errno for __error()/h_errno_location to
+    // hand back. The guest compares that against ITS OWN ENOSYS, which is 78 -- so publishing the
+    // host number (Linux 38, MinGW-w64 40) sends it down a generic-error path instead of the
+    // "unimplemented, use the fallback" branch its author wrote.
+    //
+    // Neither pointer is dereferenced on this path (`select_is_pure_sleep` only compares, and the
+    // refusal only logs the values), so passing a bare non-zero readfds is safe and is what makes
+    // the call miss the pure-sleep shape.
+    {
+        auto select_fn = Hle::lookup(nid_hash("select"));
+        if (select_fn) {
+            std::printf("  [note] host ENOSYS=%d, FreeBSD=%d -- this arm %s here\n",
+                        ENOSYS, (int)FreeBsdErrno::ENoSys,
+                        ENOSYS == (int)FreeBsdErrno::ENoSys ? "CANNOT distinguish" : "discriminates");
+            errno = 0;
+            const uint64_t rc = select_fn(1 /* nfds>0 */, 0x1000 /* readfds, never dereferenced */,
+                                          0, 0, 0, 0);
+            const int published = errno;
+            CHECK((int64_t)rc == -1 && published == (int)FreeBsdErrno::ENoSys,
+                  "select's unsupported-shape refusal publishes FreeBSD ENOSYS (78), not the host's");
+        } else {
+            std::printf("  [skip] select not registered on this platform\n");
+        }
+    }
+
     std::printf(failures ? "== FAIL: %d ==\n" : "== PASS ==\n", failures);
     return failures ? 1 : 0;
 }

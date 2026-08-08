@@ -603,6 +603,35 @@ inline uint64_t sce_error_from_host_errno(int host_errno,
     return sce_kernel_error(freebsd_errno_from_host(host_errno, fallback));
 }
 
+
+// Publish a prosper-CHOSEN error into the guest-visible errno slot.
+//
+// `__error()` / `__errno_location()` (hle_libc.cpp `h_errno_location`) hands the guest the address
+// of the HOST thread's `errno`, and the guest is a FreeBSD-ABI binary that compares what it reads
+// against FreeBSD constants. So a wrapper that returns -1 and picks its own errno must write the
+// FREEBSD number, not this host's: `errno = ENOSYS` publishes 38 on Linux and 40 on MinGW where
+// the guest is testing for 78, so its "unimplemented, use the fallback" branch never runs and it
+// takes a generic-error path instead. `ENOTSUP` is the same shape (host 95 / 129, FreeBSD 45).
+//
+// ############################################################################################
+// #  DO NOT apply this blanket to every `errno = ...` in the HLE. It is only correct where     #
+// #  prosper CHOOSES the value AND nothing downstream converts the slot again.                 #
+// ############################################################################################
+//
+// The trap is concrete, not hypothetical. In `hle_file.cpp` the libc and sceKernel spellings share
+// one worker: `HLE(k_stat)` (and twenty of its siblings) calls `f_stat`, then feeds the errno that
+// worker left into `file_sce_error()` -- which applies `freebsd_errno_from_host` itself. Converting
+// inside such a worker translates twice, and the second pass reads an already-FreeBSD number as a
+// host one: 78 is EBADFD on Linux, so ENOSYS would arrive at the guest as neither. Those workers
+// must keep leaving HOST numbers in the slot.
+//
+// The general remainder -- that a host libc failure inside any wrapper also leaves a host-numbered
+// errno for the guest to misread -- is not fixable at an assignment site at all, because there is
+// no assignment to fix. It needs the accessor to publish, and that is tracked separately in #2296.
+inline void set_guest_errno(int host_errno) {
+    errno = host_errno == 0 ? 0 : static_cast<int>(freebsd_errno_from_host(host_errno));
+}
+
 // Decode the errno out of an encoded SCE error. Returns false when `value` is not in the family.
 inline bool sce_kernel_error_errno(uint64_t value, FreeBsdErrno& out) {
     if ((value & ~0xffull) != 0x80020000ull) return false;
