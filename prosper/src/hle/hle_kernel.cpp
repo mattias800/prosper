@@ -408,6 +408,21 @@ namespace {
                found->second.type == PTHREAD_MUTEX_ERRORCHECK &&
                found->second.owner == (uint64_t)pthread_self();
     }
+    // #2327: FreeBSD returns EPERM from a condition wait whose mutex the caller does not own
+    // (libthr checks _mutex_owned before parking). winpthreads returns EINVAL instead, so the
+    // guest saw the wrong errno under the right encoding -- and a guest testing for EPERM, which
+    // is what Sony's own C11 _Cnd_timedwait does, could not match it.
+    //
+    // "Not owned" deliberately includes "not locked at all" (owner == 0): waiting on a mutex
+    // nobody holds is the same contract violation and FreeBSD answers it the same way. Returns
+    // false for a mutex this registry has never seen, so an unregistered object keeps whatever
+    // the host decides rather than being refused on missing evidence.
+    bool guest_mutex_not_owned_by_self(pthread_mutex_t* mutex) {
+        std::lock_guard<std::mutex> lock(g_guest_mutex_state_mutex);
+        auto found = g_guest_mutex_states.find(mutex);
+        return found != g_guest_mutex_states.end() &&
+               found->second.owner != (uint64_t)pthread_self();
+    }
     void guest_mutex_acquired(pthread_mutex_t* mutex) {
         std::lock_guard<std::mutex> lock(g_guest_mutex_state_mutex);
         auto found = g_guest_mutex_states.find(mutex);
@@ -437,6 +452,7 @@ namespace {
     inline void guest_mutex_register(pthread_mutex_t*, int) {}
     inline void guest_mutex_unregister(pthread_mutex_t*) {}
     inline bool guest_mutex_self_deadlock(pthread_mutex_t*) { return false; }
+    inline bool guest_mutex_not_owned_by_self(pthread_mutex_t*) { return false; }
     inline void guest_mutex_acquired(pthread_mutex_t*) {}
     inline bool guest_mutex_released(pthread_mutex_t*) { return false; }
 #endif
@@ -2460,6 +2476,12 @@ HLE(k_mutex_timedlock) {
 HLE(k_cond_timedwait_sce) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return prosper::hle::kSceKernelErrorEINVAL;
+    // FreeBSD refuses a wait on a mutex the caller does not own, with EPERM, BEFORE parking.
+    // Answer that here rather than forwarding the host's: winpthreads reports EINVAL for this
+    // case, so the guest got the right encoding carrying the wrong errno (#2327). Only fires
+    // where prosper actually tracks ownership -- the registry is Windows-only, and on POSIX the
+    // host already implements the FreeBSD contract itself.
+    if (guest_mutex_not_owned_by_self(m)) return prosper::hle::kSceKernelErrorEPERM;
     timespec dl = abs_deadline_us(a2);
     int rc = interruptible_cond_timedwait(c, m, &dl, GuestWaitKind::ConditionSequence, 0,
                                           nullptr, kGuestMutexCondWaitBookkeeping);
