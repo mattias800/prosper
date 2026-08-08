@@ -9,6 +9,25 @@ same stem means same capture, different stem means different capture — and the
 once that file exists. Replay it with `--bundle <file>`; see `tools/AGENTS.md` (interactive frame grab).
 A zero-byte `.prgbundle` is a grab that was interrupted, and `--bundle` rejects it saying exactly that.
 
+## Windows
+
+`gpu_replay` builds and runs on native Windows since #2331. It was Linux-only because MinGW's UCRT
+headers have no `setenv`/`unsetenv` — a two-line shim, not a porting problem — and because the target
+sat inside the CMake `if(UNIX)` block. The F9 / `PROSPER_GRAB_BUNDLE_*` capture half already worked
+there, so a Windows investigation could produce a several-hundred-MiB `.prgbundle` and then have no
+way to open it.
+
+**Pass Windows-style paths and set `MSYS2_ARG_CONV_EXCL='*'` under Git Bash / MSYS.** Otherwise the
+shell rewrites the arguments and the tool prints its usage block, which reads as a bad flag rather
+than a mangled path:
+
+```bash
+MSYS2_ARG_CONV_EXCL='*' ./build/gpu_replay.exe \
+  --bundle C:/path/to/frame_grab.prgbundle C:/path/to/out.bmp
+```
+
+The trailing output path is required even when you only want the inspection lines.
+
 `gpu_replay` inspects, validates, graphs, and renders a local `.prgcap` without booting the guest.
 Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA endpoints, optional rendered RTT
 pixels, and optional exact persistent Vulkan depth/stencil checkpoint planes.

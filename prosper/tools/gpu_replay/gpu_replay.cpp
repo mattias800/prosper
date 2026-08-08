@@ -1764,6 +1764,25 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
 
 } // namespace
 
+// MinGW's UCRT headers have no setenv/unsetenv, so gpu_replay did not COMPILE on Windows --
+// which is why it was Linux-only. Same shape tools/screenshot/screenshot.cpp already uses.
+// `_putenv_s(name, "")` is the documented Win32 way to remove a variable.
+static bool set_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 1) == 0;
+#endif
+}
+
+static bool clear_environment(const char* name) {
+#ifdef _WIN32
+    return _putenv_s(name, "") == 0;
+#else
+    return unsetenv(name) == 0;
+#endif
+}
+
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool recompile_raw = false;
@@ -2172,7 +2191,7 @@ int main(int argc, char** argv) {
         }
         const char* tap_env_raw = std::getenv("PROSPER_FS_TAP");
         const std::string tap_env = tap_env_raw ? tap_env_raw : "";
-        if (tap_env_raw) unsetenv("PROSPER_FS_TAP");
+        if (tap_env_raw) clear_environment("PROSPER_FS_TAP");
         size_t vs_swapped = 0, fs_swapped = 0, vs_kept = 0, fs_kept = 0;
         for (auto& it : replay.items) {
             const auto* pixel_inputs = it.has_pixel_inputs ? &it.pixel_inputs : nullptr;
@@ -2217,7 +2236,7 @@ int main(int argc, char** argv) {
                 if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) ++fs_kept;
             }
         }
-        if (tap_env_raw) setenv("PROSPER_FS_TAP", tap_env.c_str(), 1);
+        if (tap_env_raw) set_environment("PROSPER_FS_TAP", tap_env.c_str());
         std::fprintf(stderr, "[recompile-raw] substituted vs=%zu fs=%zu kept-stored vs=%zu fs=%zu of %zu draws\n",
                      vs_swapped, fs_swapped, vs_kept, fs_kept, replay.items.size());
     }
