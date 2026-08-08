@@ -1192,11 +1192,20 @@ int host_settable_status_mask() {
 // bits differ substantially on Linux. Translate the descriptor/status operations used by libc and
 // game runtimes; reject record-lock commands until their FreeBSD flock layout is translated too.
 // The ENOTSUP refusals below publish FreeBSD's 45 rather than the host's (Linux 95, MinGW 129):
-// f_fcntl is registered for BOTH `fcntl` and `sceKernelFcntl` (see the R() line near the bottom of
-// this file), and both spellings return -1 with the guest reading the slot directly -- no wrapper
-// re-converts it, so translating here is safe and is what the guest actually tests against (#2296).
-// The `errno = ...` sites in the f_stat/f_open/f_read family are deliberately NOT translated: their
-// sceKernel wrappers pass that slot through file_sce_error(), which translates it a second time.
+// f_fcntl is registered for BOTH `fcntl` and `sceKernelFcntl` -- one R() line, grep it rather than
+// trusting a line number -- and both spellings return -1 with the guest reading the slot directly;
+// no wrapper re-converts it, so translating here is safe and is what the guest tests against (#2296).
+//
+// Sorting the rest of this file needs THREE buckets, not two, and the third is the trap:
+//   1. converted downstream -- the f_stat/f_open/f_read family, whose sceKernel wrappers pass the
+//      slot through file_sce_error(). Translating there would convert TWICE. Leave alone.
+//   2. not converted, value diverges -- the ENOTSUP refusals below. Must translate.
+//   3. not converted, value HAPPENS to agree on every host -- the EBADF/EINVAL assignments in this
+//      same function. They are correct today only because 9 and 22 are identical on FreeBSD, Linux
+//      and MinGW. They are in bucket 2, not bucket 1: nothing downstream converts them.
+// So: ANY errno added to f_fcntl whose FreeBSD number differs from the host must go through
+// hle::set_guest_errno -- in practice anything above 34, where the two numberings part company.
+// Do not read the untranslated EBADF/EINVAL here as evidence that this function is bucket 1.
 HLE(f_fcntl) {
     if (a0 > INT_MAX) {
         errno = EBADF;
