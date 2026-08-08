@@ -1535,6 +1535,60 @@ void cache_guest_readable_range(uint64_t begin, uint64_t end,
         g_guest_readable_cache.persistent_ranges.insert(mapping.begin, mapping.end);
 }
 
+// #2387: the same treatment for guest_writable, which had none. Its Linux arm answers by
+// opening /proc/self/maps and running a fgets/sscanf loop over the process's whole mapping
+// table -- per call, uncached -- while Windows and macOS each pay a syscall per region. Stack
+// sampling of a Blue Prince frame loop put the main thread's stdio parsing (fgets,
+// __vfscanf_internal, _IO_default_uflow) well above anything else it was doing.
+//
+// A SEPARATE range set, deliberately. Writability is not implied by readability, so this cache
+// must never consult the readable registry (`guest_readable_mapping_containing`) or share its
+// sets: doing so would let a read-only mapping satisfy a write probe, which turns a would-be
+// refusal into a silent guest memory corruption. Every range in here was proven writable by an
+// actual probe on this platform's own path.
+//
+// Generation-guarded exactly like the readable cache: `sync_generation` drops everything when the
+// guest mapping generation moves, so an unmap/remap cannot leave a stale writable range behind.
+// That mechanism is not new here -- it is the one the readable cache has already been relying on.
+//
+// THE INVARIANT THIS CACHE DEPENDS ON, written down because it is now load-bearing and was not
+// stated anywhere: *every* change to guest page protection must advance
+// host::guest_mapping_generation(). If a page is made read-only without advancing it, this cache
+// keeps answering "writable" for it until something else moves the generation.
+//
+// The guest-facing path satisfies this: hle_kernel_mem.cpp implements protect as
+// notify_guest_mapping_removed + notify_guest_mapping_added(..., committed && (prot & 0x1)), and
+// both advance the generation.
+//
+// KNOWN EXCEPTION, deliberately not fixed here (#2393): the PROSPER_LWATCH fault handler in
+// exec_image_linux.cpp mprotects a live guest page down to PROT_READ and back without notifying,
+// so while that watch is armed this cache can answer true for a page that is momentarily
+// read-only. It is diagnostic-only and off by default, and the fix is NOT to call
+// notify_guest_mapping_* from a signal handler -- those take a mutex and are not
+// async-signal-safe. Recorded rather than papered over; see the issue for the options.
+// Found in review by Wren, who went looking for this after the two attacks I had asked for.
+struct GuestWritableCacheState {
+    bool enabled = getenv("PROSPER_NO_GUEST_WRITE_CACHE") == nullptr;   // bisection lever
+    host::GuestReadableRangeCache ranges;    // the range-set container, not the readable DATA
+    uint64_t calls = 0, hits = 0, os_probes = 0;
+};
+thread_local GuestWritableCacheState g_guest_writable_cache;
+
+static bool guest_writable_cache_hit(uint64_t begin, uint64_t end) {
+    if (!g_guest_writable_cache.enabled) return false;
+    ++g_guest_writable_cache.calls;
+    g_guest_writable_cache.ranges.sync_generation(host::guest_mapping_generation());
+    const bool hit = g_guest_writable_cache.ranges.contains(begin, end);
+    if (hit) ++g_guest_writable_cache.hits;
+    return hit;
+}
+
+// `begin`/`end` must bound a span this call PROVED writable end to end, never merely the query.
+static void cache_guest_writable_range(uint64_t begin, uint64_t end) {
+    if (!g_guest_writable_cache.enabled || begin >= end) return;
+    g_guest_writable_cache.ranges.insert(begin, end);
+}
+
 struct GuestReadableSubmitScope {
     GuestReadableSubmitScope() {
         g_guest_readable_cache.active = g_guest_readable_cache.enabled;
@@ -1640,10 +1694,17 @@ bool guest_readable(uint64_t a, uint32_t n) {
 bool guest_writable(uint64_t a, uint32_t n) {
     if (a < 0x1000 || n == 0 || a + n < a) return false;
     const uint64_t end = a + n;
+    if (guest_writable_cache_hit(a, end)) return true;   // #2387
+    // Widest span this call proves writable, so a later query anywhere inside the same
+    // contiguous run of writable regions hits. Each arm below walks contiguous regions and
+    // fails the moment one is missing or non-writable, so [span_lo, span_hi) is writable
+    // end to end whenever the arm returns true. Recorded only on that success path.
+    uint64_t span_lo = a, span_hi = a;
 #ifdef _WIN32
     uint64_t cursor = a;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION mbi{};
+        ++g_guest_writable_cache.os_probes;
         if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
         if (mbi.State != MEM_COMMIT) {
             if (!prosper_try_commit_dmem(cursor, end - cursor, 1) ||
@@ -1656,8 +1717,12 @@ bool guest_writable(uint64_t a, uint32_t n) {
             return false;
         const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         if (region_end <= cursor) return false;
+        const uint64_t region_lo = (uint64_t)(uintptr_t)mbi.BaseAddress;
+        if (cursor == a) span_lo = std::max(region_lo, (uint64_t)0x1000);
+        span_hi = region_end;
         cursor = std::min(end, region_end);
     }
+    cache_guest_writable_range(span_lo, span_hi);   // #2387
     return true;
 #elif defined(__APPLE__)
     uint64_t cursor = a;
@@ -1674,10 +1739,18 @@ bool guest_writable(uint64_t a, uint32_t n) {
         if (result != KERN_SUCCESS || cursor < region || !(info.protection & VM_PROT_WRITE))
             return false;
         if (region > UINT64_MAX - size || region + size <= cursor) return false;
+        if (cursor == a) span_lo = std::max((uint64_t)region, (uint64_t)0x1000);
+        span_hi = (uint64_t)(region + size);
         cursor = std::min(end, static_cast<uint64_t>(region + size));
     }
+    cache_guest_writable_range(span_lo, span_hi);   // #2387
     return true;
 #else
+    // #2387: this is the arm the cache above exists for. Windows and macOS answer with a syscall
+    // per region; only here is the answer a text parse of the process's entire mapping table --
+    // fopen, then fgets + sscanf per line, per call. Uncached, that made guest_writable the
+    // dominant stdio cost on the render thread.
+    ++g_guest_writable_cache.os_probes;
     FILE* maps = fopen("/proc/self/maps", "re");
     if (!maps) return false;
     uint64_t cursor = a;
@@ -1691,10 +1764,14 @@ bool guest_writable(uint64_t a, uint32_t n) {
             fclose(maps);
             return false;
         }
+        if (cursor == a) span_lo = std::max((uint64_t)begin, (uint64_t)0x1000);
+        span_hi = finish;
         cursor = std::min(end, static_cast<uint64_t>(finish));
     }
     fclose(maps);
-    return cursor == end;
+    if (cursor != end) return false;
+    cache_guest_writable_range(span_lo, span_hi);   // #2387
+    return true;
 #endif
 }
 

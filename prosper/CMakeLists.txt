@@ -998,6 +998,21 @@ if(TARGET prosper_core)
   add_executable(test_guest_read_cache_disabled tests/test_guest_read_cache_disabled.cpp)
   target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
   add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
+  # #2387: guest_writable's range cache. The first case is the one that matters -- a read-only
+  # mapping, deliberately warmed into the READABLE cache first, must still be refused for write.
+  # A shared cache (or a writable path that consulted the readable registry) passes every other
+  # assertion here and fails only that one, silently corrupting guest memory in production.
+  # POSIX-only: the test builds its own read-only / read-write / revoked mappings with mmap and
+  # mprotect, which is the whole point -- it needs to CREATE a page whose permissions it controls,
+  # not find one. The Windows equivalent is VirtualAlloc + VirtualProtect(PAGE_READONLY) and is
+  # deliberately left to the lane that can run it (docs/THREAD_WAIT_PROFILING.md records the same
+  # split for the profiling tools). The cache itself is built and exercised on all platforms; only
+  # this test's mapping setup is POSIX.
+  if(NOT WIN32)
+    add_executable(test_guest_writable_cache tests/test_guest_writable_cache.cpp)
+    target_link_libraries(test_guest_writable_cache PRIVATE prosper_core)
+    add_test(NAME guest_writable_cache COMMAND test_guest_writable_cache)
+  endif()
 
   if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_write_watch tests/test_guest_write_watch.cpp)
