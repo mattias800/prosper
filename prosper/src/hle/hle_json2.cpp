@@ -409,15 +409,30 @@ JHLE(value_ctor_cstr) {
     if (!value) return a0;
     *value = Value{};                      // a valid, empty Json::Value even if the text is rejected
     if (!a1) return a0;                    // Value(nullptr) is a null value, not a crash
+    // NOTE: on Linux gpu::guest_readable returns false when the fault-handler probe pipe is absent
+    // (gpu_executor.cpp). That pipe is created unconditionally since #2329; if it is ever re-gated,
+    // every string here silently becomes Null -- a valid pointer and valid text producing the wrong
+    // result with no diagnostic. Do not re-gate it without revisiting this.
+    // Readability of the FIRST byte is checked separately from the length scan, because the two
+    // zero-length cases are not the same answer and collapsing them is a silent wrong result:
+    //   unreadable pointer -> refuse, leaving Null   (there is no text to honour)
+    //   readable NUL        -> construct an empty String (the guest asked for one, and got one)
+    // The regression arm for the 0x80 pointer is what caught this: an earlier draft returned early
+    // on `length == 0` and so turned a REJECTED pointer into a valid empty string.
+    if (!prosper::gpu::guest_readable(a1, 1)) return a0;
     constexpr uint32_t kMaxJsonCString = 1u << 20;   // 1 MiB: a JSON scalar, not a document
     uint32_t length = 0;
     while (length < kMaxJsonCString &&
            prosper::gpu::guest_readable(a1 + length, 1) &&
            *reinterpret_cast<const char*>(static_cast<uintptr_t>(a1 + length)) != '\0')
         ++length;
-    // An unterminated or unreadable string yields the empty value rather than a partial one: the
+    // An UNTERMINATED or unreadable string yields the Null value rather than a partial one: the
     // guest asked for the text at that pointer, and prosper cannot honour half of it truthfully.
-    if (length == 0 || length == kMaxJsonCString) return a0;
+    if (length == kMaxJsonCString) return a0;
+    // A readable EMPTY string is not that case. `Value("")` is a String whose text is empty, and
+    // returning Null for it would be a silent wrong ANSWER rather than a refusal -- `getType()`
+    // would report 0 where the guest constructed a string, and every later `getString()` would
+    // disagree with the constructor. Length 0 falls through to the same construction as any other.
     value->type = ValueType::String;
     value->data.string = new String{new std::string(
         reinterpret_cast<const char*>(static_cast<uintptr_t>(a1)), length)};

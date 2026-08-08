@@ -219,6 +219,19 @@ int main() {
             call(dtor, &v);
         }
         if (ctor_cstr) {
+            // Value("") is a String whose text is empty, NOT Null. Returning Null here would be a
+            // silent wrong answer rather than a refusal: getType() would report 0 where the guest
+            // constructed a string, and every later getString() would disagree with the ctor.
+            JsonValue v;
+            std::memset(&v, 0xA5, sizeof v);
+            call(ctor_cstr, &v, const_cast<char*>(""));
+            CHECK(v.type == 5, "Value(\"\") constructs an empty String (type 5), not Null");
+            auto* js = reinterpret_cast<void*>(call(get_string, &v));
+            auto* cs = js ? reinterpret_cast<const char*>(call(string_cstr, js)) : nullptr;
+            CHECK(cs && cs[0] == 0, "Value(\"\") stores empty text");
+            call(dtor, &v);
+        }
+        if (ctor_cstr) {
             // A null argument is a null Value, not a crash -- and the storage must still be left
             // well-formed, because the guest will destroy it either way.
             JsonValue v;
