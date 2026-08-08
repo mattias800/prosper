@@ -97,9 +97,12 @@ vblank polling continues at the same rate, AGC register patching continues:
 | `k_rwlock_init` / `k_rwlock_destroy` | — | 143 / 143 |
 | `agc_patch_add_registers` | — | 128 |
 
-**No `libSceVideodec2` or `libSceAvPlayer` handler appears in either window**, so the "the next thing
-after the logo is a CRI Mana movie whose video never reaches the screen" hypothesis has no support
-from the call census. The title is compositing almost nothing while doing normal work.
+**No `libSceVideodec2` or `libSceAvPlayer` handler appears in either window** — but **do not read
+that as ruling the movie out; it was, and the ruling was wrong.** The census is a 400-tick sampling
+histogram and the Videodec2 traffic is nine one-shot calls, so their absence here is a limit of the
+instrument rather than a fact about the title. The "next thing after the logo is a movie whose video
+never reaches the screen" hypothesis turned out to be **correct** (#2281). See the corrected row in
+`## Ruled out` and instrument trap 137.
 
 Two measured leads, both recorded on [#2013](https://github.com/mattias800/prosper/issues/2013):
 
@@ -551,10 +554,22 @@ One line per falsified hypothesis, with the evidence that killed it.
   opcode over: **`0x305` is `v_mul_lo_u16`, and `v_lshlrev_b16` is `0x314`** — implementing 0x305 as
   a left shift compiles, validates, and silently computes the wrong value. Caught by a bit-exact
   execution test before it shipped. (This lane, PR for #2013.)
-- **The post-logo wall is not a stalled CRI Mana movie.** `hle_calls` over 400-tick windows in both
-  the logo and the uniform phase (positive control: `g_vo_flipstatus` present in both) shows no
-  `libSceVideodec2` and no `libSceAvPlayer` handler at all, and the same mutex/TLS/flip-poll shape in
-  both. The engine is doing ordinary work while compositing almost nothing. (This lane, 2026-08-06.)
+- **~~The post-logo wall is not a stalled CRI Mana movie.~~ THIS ROW WAS WRONG — the wall IS a movie.**
+  The original entry read: *"`hle_calls` over 400-tick windows in both the logo and the uniform phase
+  (positive control: `g_vo_flipstatus` present in both) shows no `libSceVideodec2` and no
+  `libSceAvPlayer` handler at all."* The measurement was real; the conclusion did not follow.
+  `PROSPER_SVCLOG=1` over the same phase shows `sceVideodec2CreateDecoder -> 0x10001 codec=2382845`
+  and eight `sceVideodec2Decode` calls, and the A/B settles it: implementing VP9 decode (#2281)
+  carries the title **through** the wall — intro video, Unreal Engine splash, auto-save notice, and
+  the garage scene at 64,461 colours.
+  **Why the census produced a false negative, which is the reusable part.** The control was
+  `g_vo_flipstatus` at **236 calls** in the window; the Videodec2 traffic is **nine** calls, fired
+  once when the movie starts. A 400-tick *sampling* histogram exists to show steady-state work, and
+  nine one-shot events are exactly what it does not retain. So the control proved the instrument
+  fires on a HIGH-RATE handler and could not, even in principle, establish that it would catch a
+  nine-call event — which is the quantity the null was about. **Match a control's rate to the rate
+  of the thing you are looking for**; a control at 236 validates nothing about detecting 9. See
+  instrument trap 137. (Corrected by this lane, 2026-08-08, #2281.)
 - **`pidof <name>` selects the WRONG lane's process, and the result looks completely valid.** An
   `hle_calls` arm here attached by `pidof screenshot` and produced a full 47-handler histogram — for
   another worktree's title, because three lanes were running `screenshot` concurrently. The only tell
