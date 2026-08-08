@@ -6345,9 +6345,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // Shader I/O tap mode (PROSPER_SHADER_TAP): the captured "positions" are actually the tapped
                 // intermediate VGPR (dst..dst+3) at that PC, so print the raw hex too (values are often
                 // integers/bitfields, not clip floats) and skip the meaningless clip classification.
+                // Gated on the REQUEST, not on whether the redirect happened -- and those differ
+                // (#2064). tap_vec is set only when the instruction at tap_pc is walked, so a
+                // tap_pc after this shader's EXP POS0 exports the REAL clip position while this
+                // header still says "the tapped VGPR". The recompiler now prints
+                // `[shader-tap] NOT APPLIED ...` naming the PC in that case, so the two lines
+                // must be read together: this header states what was ASKED FOR, and the ABSENCE
+                // of a NOT APPLIED line is what says it was delivered.
                 const bool is_tap = getenv("PROSPER_SHADER_TAP") != nullptr;
                 if (is_tap)
-                    fprintf(stderr, "[geom-probe] draw=%llu SHADER-TAP: values below are the tapped VGPR "
+                    fprintf(stderr, "[geom-probe] draw=%llu SHADER-TAP REQUESTED (see any [shader-tap] NOT APPLIED line for this shader, which means these are the REAL clip positions -- #2064): values below are the tapped VGPR "
                                     "(dst+3) at that PC, not clip positions (bbox/tags meaningless)\n",
                             geom_target_label);
                 else

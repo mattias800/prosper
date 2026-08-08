@@ -1,4 +1,5 @@
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
+#include <atomic>
 #include "rdna2_to_spirv.hpp"
 #include "diagnostic_selectors.hpp"
 #include "rdna2_decode.hpp"
@@ -2515,7 +2516,34 @@ struct SpirvCompute {
         // gl_Position instead of the real clip position, so the geometry-probe capture reads it back.
         uint32_t v;
         if (tap_vec) { v = tap_vec; }
-        else { v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)}); }
+        else {
+            // A tap was REQUESTED and is not available here, which is the silent-degradation case
+            // (#2064): tap_vec is set only when the instruction at tap_pc is walked, so a tap_pc
+            // AFTER this shader's EXP POS0 leaves it 0 and the real clip position is exported --
+            // while the readout still prints "values below are the tapped VGPR". A plausible,
+            // well-labelled, completely wrong answer.
+            //
+            // Warned rather than rejected, and the distinction matters: tap_pc is GLOBAL across
+            // stages, so a PC tapped in the pixel shader is legitimately absent from every vertex
+            // shader. Refusing here would drop every draw in the frame for a tap that is doing
+            // exactly what it was asked to do. The warning names both PCs so a reader can tell the
+            // two apart immediately -- "after the export" is the defect, "not in this shader" is not.
+            if (tap_pc != 0xFFFFFFFFu) {
+                // Atomic, not a plain counter: parallel_draw_worker_execute realizes draws on
+                // worker threads and realization recompiles, and I could not establish that
+                // the recompile itself runs under ShaderCache's mutex rather than only the
+                // lookup. An unverified serialization claim is not worth one relaxed add.
+                static std::atomic<unsigned> warned{0};
+                if (warned.fetch_add(1, std::memory_order_relaxed) < 8)
+                    fprintf(stderr,
+                            "[shader-tap] NOT APPLIED at the position export: PROSPER_SHADER_TAP "
+                            "pc=%u was not reached before EXP POS0 in this vertex shader, so the "
+                            "REAL clip position is exported. If pc=%u is after the export, move it "
+                            "earlier; if it belongs to another stage, this line is expected (#2064)\n",
+                            tap_pc, tap_pc);
+            }
+            v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)});
+        }
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_out_v4f, p, v_pos, uconst(0)});
         put(code, Op_Store, {p, v});
     }

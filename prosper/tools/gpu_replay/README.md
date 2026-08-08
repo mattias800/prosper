@@ -361,6 +361,25 @@ and byte-identical when the env var is unset. Tap a PC in the shader's **straigh
 vertex-fetch/transform prologue) — a PC inside a loop or if-body defines the value in a block that doesn't
 dominate the position export, so the shader fails to compile (fail-visible: the draw drops, no output line).
 
+**The tapped PC must also come BEFORE the shader's `EXP POS0`**, which for an NGG VS is often well short of
+the end of the program (#2064). The redirect is applied when the instruction at the tapped PC is walked, so a
+PC *after* the position export leaves it unapplied — and until #2064 that degraded **silently**: the real clip
+positions were exported while the probe header still announced "values below are the tapped VGPR". A
+plausible, well-labelled, completely wrong answer.
+
+It is now fail-visible. The recompiler prints, capped:
+
+```
+[shader-tap] NOT APPLIED at the position export: PROSPER_SHADER_TAP pc=439 was not reached before
+EXP POS0 in this vertex shader, so the REAL clip position is exported.
+```
+
+Read that line together with the probe's `SHADER-TAP REQUESTED` header: the header says what was *asked
+for*, and the **absence** of a NOT APPLIED line for the same shader is what says it was delivered. Note the
+line is expected and harmless when the tapped PC belongs to another stage — `PROSPER_SHADER_TAP` is global, so
+a PC tapped in the pixel shader is legitimately absent from every vertex shader. That is why this warns rather
+than rejecting: refusing would drop every draw in the frame for a tap doing exactly what it was asked.
+
 ## Fragment I/O value tap — `PROSPER_FS_TAP=DRAW:PC` (what did the fragment shader compute at PC?)
 
 ```bash
