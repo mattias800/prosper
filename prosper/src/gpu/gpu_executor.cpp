@@ -1550,6 +1550,23 @@ void cache_guest_readable_range(uint64_t begin, uint64_t end,
 // Generation-guarded exactly like the readable cache: `sync_generation` drops everything when the
 // guest mapping generation moves, so an unmap/remap cannot leave a stale writable range behind.
 // That mechanism is not new here -- it is the one the readable cache has already been relying on.
+//
+// THE INVARIANT THIS CACHE DEPENDS ON, written down because it is now load-bearing and was not
+// stated anywhere: *every* change to guest page protection must advance
+// host::guest_mapping_generation(). If a page is made read-only without advancing it, this cache
+// keeps answering "writable" for it until something else moves the generation.
+//
+// The guest-facing path satisfies this: hle_kernel_mem.cpp implements protect as
+// notify_guest_mapping_removed + notify_guest_mapping_added(..., committed && (prot & 0x1)), and
+// both advance the generation.
+//
+// KNOWN EXCEPTION, deliberately not fixed here (#2393): the PROSPER_LWATCH fault handler in
+// exec_image_linux.cpp mprotects a live guest page down to PROT_READ and back without notifying,
+// so while that watch is armed this cache can answer true for a page that is momentarily
+// read-only. It is diagnostic-only and off by default, and the fix is NOT to call
+// notify_guest_mapping_* from a signal handler -- those take a mutex and are not
+// async-signal-safe. Recorded rather than papered over; see the issue for the options.
+// Found in review by Wren, who went looking for this after the two attacks I had asked for.
 struct GuestWritableCacheState {
     bool enabled = getenv("PROSPER_NO_GUEST_WRITE_CACHE") == nullptr;   // bisection lever
     host::GuestReadableRangeCache ranges;    // the range-set container, not the readable DATA
