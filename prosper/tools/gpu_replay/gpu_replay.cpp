@@ -65,7 +65,7 @@ void usage(const char* argv0) {
                          "[--draw-steps PREFIX [--draw-steps-every N] [--draw-steps-target WxH]] "
                          "[--recompile-raw] "
                          "[--prepend producer.prgcap] "
-                         "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
+                         "[--list-resources DRAW:vs|ps] [--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--override-resource DRAW:vs|ps:BINDING PATH] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
@@ -1814,6 +1814,7 @@ int main(int argc, char** argv) {
     std::string post_compute_resource_spec, post_compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
     std::string retry_failed_chain_spec, retry_failed_stage_spec;
+    std::string list_resources_spec;   // #2373
     std::string realized_shader_spec, realized_shader_path;
     std::string rtt_seed_path;
     std::string graph_json_path, prepend_path;
@@ -1939,6 +1940,8 @@ int main(int argc, char** argv) {
             if (!end || *end || !value || value > 1024) { usage(argv[0]); return 2; }
             warmup_repeats = static_cast<uint32_t>(value);
         }
+        else if (std::string(argv[i]) == "--list-resources" && i + 1 < argc)
+            list_resources_spec = argv[++i];   // #2373
         else if (std::string(argv[i]) == "--dump-resource" && i + 2 < argc) {
             dump_spec = argv[++i]; dump_path = argv[++i];
         }
@@ -2511,6 +2514,47 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    // #2373: enumerate a draw's bindings instead of probing for them. `--inspect-only` has always
+    // printed this table for COMPUTE dispatches and never for draws, so answering "what does this
+    // draw sample, and what is in it" meant one process launch per candidate index — 65 of them to
+    // find nine textures on Sonic Origins (#1871), and a wrong guess reads identically to a capture
+    // gap. That question is the last step of most wrong-pixel investigations.
+    if (!list_resources_spec.empty()) {
+        const size_t colon = list_resources_spec.find(':');
+        char* draw_end = nullptr;
+        const unsigned long long draw_index =
+            std::strtoull(list_resources_spec.c_str(), &draw_end, 0);
+        const std::string stage = colon == std::string::npos
+            ? std::string() : list_resources_spec.substr(colon + 1);
+        const size_t di = colon != std::string::npos &&
+                          draw_end == list_resources_spec.c_str() + colon
+            ? prosper::tools::replay_item_index_for_draw(replay, draw_index) : SIZE_MAX;
+        if (di == SIZE_MAX || (stage != "vs" && stage != "ps")) {
+            std::fprintf(stderr, "gpu_replay: invalid selector %s (want DRAW:vs|ps)\n",
+                         list_resources_spec.c_str());
+            return 2;
+        }
+        const auto* table = stage == "vs" ? replay.items[di].vrt.get() : replay.items[di].prt.get();
+        if (!table) {
+            std::printf("draw %llu %s: no captured resource table\n", draw_index, stage.c_str());
+            return 0;
+        }
+        std::printf("draw %llu %s: %zu resource(s)\n", draw_index, stage.c_str(),
+                    table->resources.size());
+        for (const auto& r : table->resources) {
+            // `bytes` is what --dump-resource would write, and 0 marks exactly the case that used to
+            // be indistinguishable from a wrong binding number.
+            std::printf("  binding=%-3u cls=%u fmt=%u comps=%u %ux%ux%u stride=%u "
+                        "addr=0x%llx size=%llu bytes=%llu%s\n",
+                        r.binding, static_cast<unsigned>(r.cls), static_cast<unsigned>(r.format),
+                        r.num_components, r.width, r.height, r.depth, r.stride,
+                        static_cast<unsigned long long>(r.gpu_addr),
+                        static_cast<unsigned long long>(r.size),
+                        static_cast<unsigned long long>(r.host_data ? r.host_data_size : 0),
+                        r.host_data ? "" : "  <- no captured bytes");
+        }
+        if (positional.size() == 1 && !inspect && dump_spec.empty()) return 0;
+    }
     if (!dump_spec.empty()) {
         size_t c1 = dump_spec.find(':'), c2 = c1 == std::string::npos ? c1 : dump_spec.find(':', c1 + 1);
         if (c1 == std::string::npos || c2 == std::string::npos) { usage(argv[0]); return 2; }
@@ -2527,8 +2571,36 @@ int main(int argc, char** argv) {
         const prosper::gpu::ShaderResource* found = nullptr;
         if (table) for (const auto& resource : table->resources)
             if (static_cast<int>(resource.binding) == binding) { found = &resource; break; }
-        if (!found || !found->host_data) {
-            std::fprintf(stderr, "gpu_replay: resource %s not found or has no captured bytes\n", dump_spec.c_str()); return 2;
+        // #2373: one message used to cover three different failures — no table, no such binding, and
+        // a binding captured without bytes — and only the LAST is a capture defect. Reading it as
+        // that one is how a wrong guess at a binding number gets published as "the bundle did not
+        // retain the sampled bytes". Say which, and on a wrong guess name the bindings that DO
+        // exist, since the answer the caller wants is almost always one of them.
+        if (!table) {
+            std::fprintf(stderr,
+                         "gpu_replay: draw %llu stage %s has no captured resource table "
+                         "(so no binding can be dumped; this is not a per-binding capture gap)\n",
+                         draw_index, stage.c_str());
+            return 2;
+        }
+        if (!found) {
+            std::string present;
+            for (const auto& resource : table->resources) {
+                if (!present.empty()) present += ", ";
+                present += std::to_string(resource.binding);
+            }
+            std::fprintf(stderr,
+                         "gpu_replay: draw %llu stage %s has no binding %d. Present: %s\n",
+                         draw_index, stage.c_str(), binding,
+                         present.empty() ? "(none)" : present.c_str());
+            return 2;
+        }
+        if (!found->host_data) {
+            std::fprintf(stderr,
+                         "gpu_replay: draw %llu stage %s binding %d exists but was captured "
+                         "WITHOUT bytes (this one IS a capture gap)\n",
+                         draw_index, stage.c_str(), binding);
+            return 2;
         }
         FILE* f = std::fopen(dump_path.c_str(), "wb");
         if (!f || std::fwrite(found->host_data, 1, static_cast<size_t>(found->host_data_size), f) != found->host_data_size) {

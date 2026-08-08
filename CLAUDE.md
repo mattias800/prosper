@@ -276,6 +276,22 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
      `tools/snapshot`, so regressions are caught without a human.
   Only after step 6 is a title considered **"done"**, and work moves to the next game. Earlier rungs
   are milestones worth recording (issue/`COMPATIBILITY.md`), not stopping points.
+- **Reach for free vendor/open-source tooling BEFORE building a `PROSPER_*` switch.** prosper is an
+  ordinary Vulkan application, so AMD's and Khronos' own tools work on it directly and need no
+  per-title work. **Measured on Linux/AMD 2026-08-08 with no change to prosper's code**, stated as
+  what was actually observed rather than as what the tools promise:
+  - **An RGP capture succeeds** from one variable (`MESA_VK_TRACE=rgp`), and RADV reports
+    `instruction timing: enabled, cache counters: enabled, queue events: enabled` on it. **Reading a
+    `.rgp` needs AMD's GUI — nobody here has opened one**, so treat its per-draw timing and occupancy
+    as the tool's documented capability, not as a project measurement.
+  - **`radeontop` answers "is this GPU-bound?" in one run, no capture and no GUI.** *Blue Prince* at
+    ~3.2 fps leaves the GPU at **4.17%** against a `vkcube` control at **56.31%** — so with #2215's
+    30-45 ms/submit, its submits are long because they **wait**. That control is mandatory here: the
+    tool prints "Unknown Radeon card" and its `ta`/`ee` counters are dead on this chip.
+  **`docs/GPU_PROFILING_EXTERNAL.md` has the recipes and the way each tool lies** — RGP writes to
+  `/tmp`, a frame ordinal silently captures the wrong regime, and the Fedora RenderDoc package ships
+  no Python bindings. Build a `PROSPER_*` switch only for something the guest-facing layer knows and
+  the GPU vendor cannot see.
 - **Build tools — don't avoid them.** This project is a long reverse-engineering effort, and getting
   progressively more complicated games running will keep demanding new instrumentation. When you hit a
   question the existing tools can't answer — "who references this address in the unsymbolicated eboot?",
