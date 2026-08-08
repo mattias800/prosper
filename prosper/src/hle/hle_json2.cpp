@@ -428,7 +428,16 @@ JHLE(value_ctor_cstr) {
         ++length;
     // An UNTERMINATED or unreadable string yields the Null value rather than a partial one: the
     // guest asked for the text at that pointer, and prosper cannot honour half of it truthfully.
-    if (length == kMaxJsonCString) return a0;
+    // The loop exits on THREE conditions -- the cap, an unreadable byte, or the terminator --
+    // so testing only the cap let a string that runs into an unmapped page before any NUL fall
+    // through and construct a String from the readable PREFIX. That is a wrong answer wearing
+    // the shape of a success, which is the exact thing the rest of this function refuses to do,
+    // and it contradicted the comment above it. Require the terminator positively instead.
+    const bool terminated =
+        length < kMaxJsonCString &&
+        prosper::gpu::guest_readable(a1 + length, 1) &&
+        *reinterpret_cast<const char*>(static_cast<uintptr_t>(a1 + length)) == 0;
+    if (!terminated) return a0;
     // A readable EMPTY string is not that case. `Value("")` is a String whose text is empty, and
     // returning Null for it would be a silent wrong ANSWER rather than a refusal -- `getType()`
     // would report 0 where the guest constructed a string, and every later `getString()` would
