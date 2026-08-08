@@ -141,6 +141,13 @@ int main() {
                         if (small[i] == 0xC3) { if (first_bad == SIZE_MAX) first_bad = i; ++bad_count; }
                     const bool slack_clean = bad_count == 0;
                     if (!slack_clean) {
+                        // The "did NOT move" branch below reads as unreachable against the
+                        // interpretation printed after it, and it IS -- deliberately. It is a
+                        // CONTRADICTION DETECTOR, not dead code: allocate-before-free is what makes
+                        // the block always move, so if that string ever prints, the invariant has
+                        // stopped holding and every elimination below it is void. Deleting it as
+                        // unreachable would remove the only thing that could tell a reader the
+                        // diagnosis no longer applies.
                         const bool moved = (uintptr_t)small != old_addr;
                         printf("  [diag] over-copy guard FAILED — the facts, before you conclude anything:\n");
                         printf("  [diag]   block %s (old=0x%llx new=0x%llx)\n",
@@ -156,7 +163,7 @@ int main() {
                         // reaches for first are all excluded by two lines of the implementation.
                         // guest_reallocalign_portable allocates the replacement BEFORE freeing the
                         // source on both branches (hle_libc.cpp:234 then :245; :226 then :229 on
-                        // Windows), and h_reallocalign at :330 is the only route in. So:
+                        // Windows), and h_reallocalign at :362 is the only route in. So:
                         //   - the block ALWAYS moves; an in-place shrink leaving the source's own
                         //     bytes past kNew cannot occur
                         //   - the destination cannot occupy recycled source memory, because the
