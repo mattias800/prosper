@@ -151,12 +151,25 @@ int main() {
                         printf("  [diag]   slack:");
                         for (size_t i = kNew; i < usable && i < kNew + 32; ++i) printf(" %02x", small[i]);
                         printf("\n");
-                        // The interpretation, stated here rather than left to whoever is on call.
-                        printf("  [diag]   If the block did NOT move, its bytes past kNew are the SOURCE's own\n"
-                               "  [diag]   leftovers and no copy overran anything — this guard cannot tell that\n"
-                               "  [diag]   case apart from a real over-copy. If it DID move, the destination is a\n"
-                               "  [diag]   fresh block, so 0xC3 in its slack is either a genuine over-copy or\n"
-                               "  [diag]   recycled heap that still held the freed source. See #2297.\n");
+                        // The interpretation, stated here rather than left to whoever is on call —
+                        // and stated as the ELIMINATIONS, because the three explanations a reader
+                        // reaches for first are all excluded by two lines of the implementation.
+                        // guest_reallocalign_portable allocates the replacement BEFORE freeing the
+                        // source on both branches (hle_libc.cpp:234 then :245; :226 then :229 on
+                        // Windows), and h_reallocalign at :330 is the only route in. So:
+                        //   - the block ALWAYS moves; an in-place shrink leaving the source's own
+                        //     bytes past kNew cannot occur
+                        //   - the destination cannot occupy recycled source memory, because the
+                        //     source is still live when the destination is allocated
+                        //   - a genuine over-copy cannot occur either: the copy is capped at the new
+                        //     size (`old_readable < size ? old_readable : size`)
+                        printf("  [diag]   Do NOT read this as an over-copy. Allocate-before-free\n"
+                               "  [diag]   (hle_libc.cpp:234 then :245) excludes all three of the usual\n"
+                               "  [diag]   explanations: the block always moves, the destination cannot reuse\n"
+                               "  [diag]   the still-live source, and the copy is already capped at the new size.\n"
+                               "  [diag]   What is left: 0xC3 from heap freed ELSEWHERE in this process, or\n"
+                               "  [diag]   USABLE() overreporting so this scan walks past the real allocation.\n"
+                               "  [diag]   Check `usable` against the allocation first. See #2297.\n");
                     }
                     CHECK(slack_clean,
                           "the copy is capped by the NEW size — no source bytes past it (over-copy guard)");
