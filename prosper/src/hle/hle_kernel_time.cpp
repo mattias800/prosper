@@ -563,11 +563,12 @@ HLE(k_ok)              { return 0; }                       // generic success no
 // would share an entry. The tripwire is therefore an observed id >= 0x10000; the corpus's widest is
 // 0x130, so nothing is close, and if one ever appears this mask is the first thing to revisit.
 //
-// NOT fixed here, and it is the same defect on a parallel path: the eight *Internal entry points
-// (sceSysmoduleIsLoadedInternal ynFKQ5bfGks, LoadModule{,ByName,WithArg}Internal,
-// UnloadModule{,ByName,WithArg}Internal, GetModuleHandleInternal) are unregistered, so they fall to
-// prosper_on_unimpl, which also returns 0. No dump in the local corpus imports any of them —
-// measured, which is why this stays focused — but a title that uses them reproduces #2002 exactly.
+// The eight *Internal entry points were the same defect on a parallel path, and are fixed in #2128:
+// unregistered, they fell to prosper_on_unimpl, which returns 0 — SUCCESS — without recording
+// anything, so a title that loaded through one of them and later called IsLoaded was told UNLOADED
+// about a load prosper itself had just reported as succeeding. Still no dump in the local corpus
+// imports any of them (re-measured on five, with the plain LoadModule NID as a positive control),
+// so this closes a class rather than fixing an observed symptom.
 constexpr uint64_t k_sysmodule_error_unloaded = 0x805A1001;   // SCE_SYSMODULE_ERROR_UNLOADED
 
 namespace {
@@ -605,6 +606,38 @@ HLE(k_sysmodule_unload) {
     std::lock_guard lk(g_sysmodule_mx);
     g_sysmodule_state[id] = false;
     return 0;
+}
+
+// sceSysmoduleLoadModuleByNameInternal (CU8m+Qs+HN4) / ...UnloadModuleByNameInternal (vpTHmA6Knvg).
+//
+// These take a NAME, not an id, so they cannot write the id-keyed map above — and prosper has no
+// name→id table to build one from. Registered anyway, to a handler that REFUSES, because leaving
+// them unregistered is not neutral: prosper_on_unimpl returns 0, which for this contract is success,
+// and the caller then believes a module is loaded that nothing recorded (#2128).
+//
+// An error is the honest answer of the two available. A refused load is a path the guest already
+// has; a success it cannot see the consequences of is not.
+HLE(k_sysmodule_by_name_unsupported) {
+    static std::atomic<unsigned> seen{0};
+    if (seen.fetch_add(1) < 8)
+        fprintf(stderr, "[sysmodule] LoadModuleByName/UnloadModuleByName refused: prosper's load "
+                        "state is keyed by module ID and there is no name->id table, so this call "
+                        "cannot be recorded. Reporting failure rather than an unrecorded "
+                        "success (#2128)\n");
+    return k_sysmodule_error_unloaded;
+}
+
+// sceSysmoduleGetModuleHandleInternal (D8cuU4d72xM). Never 0: for THIS contract 0 is a valid handle
+// shape and the caller will dereference it, which is strictly worse than the missing implementation
+// it stands in for. prosper has no per-sysmodule-id handles to hand out at all, so the answer is the
+// same whether or not the id was loaded — and saying so is the point.
+HLE(k_sysmodule_get_handle_internal) {
+    static std::atomic<unsigned> seen{0};
+    if (seen.fetch_add(1) < 8)
+        fprintf(stderr, "[sysmodule] GetModuleHandleInternal(0x%x) refused: prosper keeps loaded "
+                        "STATE per id but no module handle, and returning 0 here would hand the "
+                        "guest a dereferenceable handle it never got (#2128)\n", (unsigned)a0);
+    return k_sysmodule_error_unloaded;
 }
 
 // sceSysmoduleIsLoaded(uint16_t id) -> SCE_OK when this process loaded it, else UNLOADED.
@@ -1574,6 +1607,18 @@ void register_kernel_time_hle() {
     R("sceSysmoduleLoadModule", k_sysmodule_load);
     R("sceSysmoduleUnloadModule", k_sysmodule_unload);
     R("sceSysmoduleIsLoaded", k_sysmodule_is_loaded);
+    // The *Internal variants, onto the SAME recording handlers (#2128). The id-taking forms share
+    // them directly: LoadModuleInternalWithArg's extra (args, argp, pRes) follow the id in a0, so
+    // the recording path is identical and only the ignored tail differs.
+    R("sceSysmoduleLoadModuleInternal", k_sysmodule_load);
+    R("sceSysmoduleLoadModuleInternalWithArg", k_sysmodule_load);
+    R("sceSysmoduleUnloadModuleInternal", k_sysmodule_unload);
+    R("sceSysmoduleUnloadModuleInternalWithArg", k_sysmodule_unload);
+    R("sceSysmoduleIsLoadedInternal", k_sysmodule_is_loaded);
+    // The two the id-keyed map cannot represent, and the one that must never answer 0.
+    R("sceSysmoduleLoadModuleByNameInternal", k_sysmodule_by_name_unsupported);
+    R("sceSysmoduleUnloadModuleByNameInternal", k_sysmodule_by_name_unsupported);
+    R("sceSysmoduleGetModuleHandleInternal", k_sysmodule_get_handle_internal);
 #ifndef _WIN32
     R("sceKernelLoadStartModule", k_load_start_mod_entry);   // entry-rsp trampoline (#639)
 #else
