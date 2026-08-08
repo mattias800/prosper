@@ -16,6 +16,7 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/sce_errno.hpp"
+#include "../src/hle/sync_retire.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -258,6 +259,46 @@ int main() {
             snprintf(msg, sizeof msg, "the re-initialised %s works again", o.what);
             CHECK(use(h, 0, 0, 0, 0, 0) == 0, msg);
             destroy(h, 0, 0, 0, 0, 0);
+        }
+    }
+
+    // ===== destroy CLAIMS the slot, so a double destroy retires once (#2176) ==================
+    // Two threads racing destroy on one slot both used to read the non-sentinel pointer before
+    // either cleared it, and both handed the SAME storage to retire_sync_object. Before the #2042
+    // quarantine that double-freed immediately; with it, the second free lands ~30 s later from an
+    // unrelated call -- strictly harder to diagnose, which cuts against the quarantine's own
+    // argument. The fix claims the slot with an atomic exchange, so exactly one caller gets a
+    // pointer back.
+    {
+        auto init = Hle::lookup(nid_hash("scePthreadMutexInit"));
+        auto destroy = Hle::lookup(nid_hash("scePthreadMutexDestroy"));
+        CHECK(init && destroy, "mutex init/destroy are registered");
+        if (init && destroy) {
+            // Sequential arm. Deterministic, and it is the case #2176 notes is reachable with no
+            // race at all on the C11 spellings.
+            alignas(16) uint8_t slot[32]{};
+            const uint64_t h = (uint64_t)(uintptr_t)slot;
+            init(h, 0, 0, 0, 0, 0);
+            const uint64_t before = prosper::retired_sync_object_count();
+            destroy(h, 0, 0, 0, 0, 0);
+            const uint64_t after_one = prosper::retired_sync_object_count();
+            CHECK(after_one == before + 1, "the first destroy retires the object exactly once");
+            destroy(h, 0, 0, 0, 0, 0);
+            CHECK(prosper::retired_sync_object_count() == after_one,
+                  "a second destroy of the same slot retires NOTHING (the slot was claimed)");
+
+            // There is deliberately NO concurrent arm here, and that is worth stating rather
+            // than leaving as an omission. I wrote one -- two threads racing destroy on one slot,
+            // asserting exactly one retire, which holds for every interleaving -- and could not make
+            // it DISCRIMINATE: against a deliberately non-atomic read-then-write claim (with a yield
+            // opened in the window) it fired once in 40 runs, then not once in 246 more across 200
+            // rounds per run. An arm that cannot show its lever moved is not evidence, and a 200-
+            // round thread-pair loop that proves nothing is worse than none: it reads as coverage.
+            //
+            // The concurrent case is guarded BY CONSTRUCTION instead: __atomic_exchange_n returns
+            // the previous value to exactly one caller, so at most one racer can ever receive a
+            // non-sentinel pointer to retire. The arm above tests the same claim through the path a
+            // test can observe deterministically.
         }
     }
 
