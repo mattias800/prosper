@@ -481,6 +481,21 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **NO UNIMPLEMENTED NID IS BEING POLLED -- THIS IS NOT SONIC FRONTIERS' WALL.** That title's
+  four-session black screen was one unregistered NID answering `SCE_OK` and being called **1,319
+  times** (#2023), so the same census was the obvious first move here. It comes back clean:
+  `PROSPER_PROGRESS=5 PROSPER_PROGRESS_UNIMPL=1`, `boot_trace`, 120 s, **12 distinct unimplemented
+  functions** and the only one with any volume at all is `libScePosix::Xs9hdiD7sAA` at **127** calls
+  -- `pthread_setschedparam` per `../PS5-3.20_Libs`, i.e. the title setting thread priorities and
+  getting a benign success. Everything else is called once or twice, `libScePlayGo` included (2 and
+  1), so a content-availability wait is not what is happening either.
+  **And the frame loop is healthy, not stalled:** over the same run, presents climb steadily to
+  1,287 in 119 s (~10.8/s), flips to 403, `draws_cum` to 11,749 and dispatches to 17,500. *Read
+  `draws_last` carefully* -- it is the draws in the **last submit**, not in the heartbeat interval,
+  so its frequent `0` is not "the title stopped drawing": `draws_cum` rises by ~425 every 5 s
+  throughout. The title runs, draws ~85 times a second, dispatches ~140 times a second, presents,
+  and shows black. #2013.
+
 - **RESTORING THE LAYERED ATOMIC DISPATCH DOES NOT MOVE THE COMPOSITE.** #2265's full-screen
   `IMAGE_ATOMIC_ADD` dispatch was the strongest remaining candidate -- it writes the image the
   presented frame is composed from, and unlike the four programs restored before it, it covers the
