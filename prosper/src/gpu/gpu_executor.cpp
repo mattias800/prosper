@@ -2811,9 +2811,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 for (uint32_t k = 0; k < n; k++)
                     if (valid_reg(sdst + (int)k)) reloaded.set((size_t)(sdst + (int)k));
                 uint64_t base = 0; bool base_ok;
-                if (is_buffer) { uint32_t b0, b1; base_ok = known(sbase, b0) && known(sbase + 1, b1);
+                // `known()` leaves its out-param UNTOUCHED when it returns false, and both halves are
+                // composed into `base` regardless of `base_ok` — so an unknown SBASE used to read
+                // uninitialized stack and print it. That is undefined behaviour, and it produced a
+                // diagnostic that actively lied: a half-unknown pointer rendered as a plausible guest
+                // VA, because stale stack here is full of real addresses whose high dword is 0x20.
+                // It cost a session's worth of chasing a table pointer that was never known (#2412).
+                // Zero-initialise so an unknown half reads as an obvious 0 rather than as evidence.
+                if (is_buffer) { uint32_t b0 = 0, b1 = 0; base_ok = known(sbase, b0) && known(sbase + 1, b1);
                                  base = ((uint64_t)b0 | ((uint64_t)b1 << 32)) & 0xFFFFFFFFFFFFull; }   // V#.Base48
-                else { uint32_t p0, p1; base_ok = known(sbase, p0) && known(sbase + 1, p1);
+                else { uint32_t p0 = 0, p1 = 0; base_ok = known(sbase, p0) && known(sbase + 1, p1);
                        base = (uint64_t)p0 | ((uint64_t)p1 << 32); }        // raw pointer
                 if (trc) fprintf(stderr, "[dyntrace] SMEM op=0x%x %s sdst=s%d sbase=s%d base=0x%llx base_ok=%d "
                                  "soff_field=%u soff_val=0x%x soff_ok=%d imm=0x%x n=%u\n", in.opcode,
