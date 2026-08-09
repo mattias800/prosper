@@ -451,6 +451,15 @@ struct BackendHashStatsTotals {
     uint64_t skipped_unique = 0;
     uint64_t skipped_large = 0;
     uint64_t unique_buffers = 0;
+    // #2400 discriminator: bytes memcpy'd, accumulated at the SAME statement as the census records
+    // and as resource_reuse_stats.buffer_upload_bytes, but NEVER reset. Three counters on one event:
+    //   census_bytes   -- my per-submit accumulation, flushed by the frontend
+    //   totals_bytes   -- this one, immune to every reset and to the frontend entirely
+    //   COPIED         -- the frontend's per-call accumulation of buffer_upload_bytes
+    // census == totals != COPIED  ->  the frontend accumulation is losing data.
+    // census != totals            ->  the census is losing or duplicating.
+    // Nothing here depends on a print cadence, which is what invalidated every earlier comparison.
+    uint64_t copied_bytes = 0;
 };
 inline BackendHashStatsTotals& backend_hash_stats_totals() {
     static thread_local BackendHashStatsTotals totals;
@@ -576,12 +585,14 @@ inline void backend_submit_buffer_census_flush() {
                 "[buffer-census] window submits=%llu copies/submit=%.1f distinct/submit=%.1f "
                 "DUPLICATE=%.1f%% of copies, %.1f%% of bytes  (%.1f MiB/submit copied, "
                 "%.1f MiB/submit if deduped per submit)  [cumulative over %llu submits: "
-                "dup %.1f%% of bytes]\n",
+                "dup %.1f%% of bytes]  DISCRIMINATOR census_bytes=%.1f MiB totals_bytes=%.1f MiB\n",
                 (unsigned long long)c.w_submits, double(c.w_copies) / wn, double(c.w_distinct) / wn,
                 share(c.w_copies, c.w_distinct), share(c.w_bytes, c.w_distinct_bytes),
                 double(c.w_bytes) / (wn * 1024.0 * 1024.0),
                 double(c.w_distinct_bytes) / (wn * 1024.0 * 1024.0),
-                (unsigned long long)c.submits, share(c.bytes, c.distinct_bytes));
+                (unsigned long long)c.submits, share(c.bytes, c.distinct_bytes),
+                double(c.bytes) / (1024.0 * 1024.0),
+                double(backend_hash_stats_totals().copied_bytes) / (1024.0 * 1024.0));
         c.w_submits = c.w_copies = c.w_distinct = c.w_bytes = c.w_distinct_bytes = 0;
     }
 }
@@ -5478,6 +5489,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             // #2400: recorded HERE, at the memcpy, so the census counts exactly the
                             // copies it claims to -- the transient-upload branch above does not copy
                             // through a mapped pointer and must not be counted.
+                            backend_hash_stats_totals().copied_bytes += static_cast<uint64_t>(bytes);
                             backend_submit_buffer_census_record(words, word_count, r.buffer_identity,
                                                                 static_cast<uint64_t>(bytes));
                             std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,

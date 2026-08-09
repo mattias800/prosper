@@ -1520,7 +1520,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 "[render-timing] buffer_reuse (cumulative over %llu backend calls) "
                                 "refs=%llu unique=%llu memo_hits=%llu hashed=%llu (%.1f MiB) "
                                 "skipped_large=%llu (%.1f MiB) skipped_unique=%llu "
-                                "COPIED=%.1f MiB upload_fallbacks=%llu\n",
+                                "COPIED=%.1f MiB upload_fallbacks=%llu  SAMELINE totals_bytes=%.1f MiB\n",
                                 (unsigned long long)calls, (unsigned long long)refs,
                                 (unsigned long long)uniq, (unsigned long long)memo,
                                 (unsigned long long)hashed, (double)dwords * 4.0 / (1024.0 * 1024.0),
@@ -1528,7 +1528,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 (double)large_dwords * 4.0 / (1024.0 * 1024.0),
                                 (unsigned long long)skipped_unique,
                                 (double)upload_bytes / (1024.0 * 1024.0),
-                                (unsigned long long)fallbacks);
+                                (unsigned long long)fallbacks,
+                                // #2400: the never-reset backend total, printed on THIS line so it
+                                // shares COPIED's instant. Every earlier comparison of these two
+                                // paired different print cadences and was void for that reason.
+                                (double)prosper::test::backend_hash_stats_totals().copied_bytes /
+                                    (1024.0 * 1024.0));
                 }
             };
             auto append_rtt_timing = [](std::string& output, const RttTimingRecord& record) {
