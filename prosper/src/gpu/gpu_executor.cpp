@@ -2019,18 +2019,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // ends up not knowing is invisible in them by construction -- which is #2412's remaining question
     // ("what makes the fold lose the descriptor-table pointer") and nothing in the log could answer it.
     //
-    // DELIBERATELY PRINTS NO pc. set_value/forget are reached from THREE separate instruction loops in
-    // this function, so a "current pc" captured in one of them is stale in the others: an early version
-    // of this line carried a pc and attributed s60's loss to VOP2 instructions writing VGPRs, which
-    // cannot forget a scalar register at all. The transitions and values below are exact; attributing
-    // them to an instruction needs a pc threaded through every caller, not one loop's variable.
+    // The pc is trustworthy, and that was checked rather than assumed. Every set_value/forget call that
+    // can fire during the walk is inside the ONE instruction loop below; the only calls outside it are
+    // the pre-loop seeding of system/user SGPRs, which report the sentinel 0xffffffff and so cannot be
+    // mistaken for an instruction. (The two earlier scanning loops in this function build branch edges
+    // and mutate no fold state.)
+    uint32_t watch_pc = 0xffffffffu;   // 0xffffffff = pre-loop seeding, not an instruction
     const int watch_sgpr = [] {
         const char* w = std::getenv("PROSPER_DYNTRACE_SGPR");
         return w ? (int)strtol(w, nullptr, 0) : -1;
     }();
     auto set_value = [&](int r, uint32_t v) {
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] s%d <- KNOWN 0x%08x\n", r, v);
+            fprintf(stderr, "[sgprwatch] pc=%u s%d <- KNOWN 0x%08x\n", watch_pc, r, v);
         if (valid_reg(r)) {
             val[(size_t)r] = v;
             val_known.set((size_t)r);
@@ -2042,7 +2043,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
     auto forget = [&](int r) {
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] s%d <- FORGOTTEN\n", r);
+            fprintf(stderr, "[sgprwatch] pc=%u s%d <- FORGOTTEN\n", watch_pc, r);
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
@@ -2328,6 +2329,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
 
     for (const auto& in : ins) {
+        watch_pc = in.pc;
         if (in.is_end) break;
         // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
         // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
