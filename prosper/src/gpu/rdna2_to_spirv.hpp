@@ -300,6 +300,20 @@ inline constexpr uint32_t kFragmentWaveReasonDppRow16   = 1u << 2;  // DPP row, 
 inline constexpr uint32_t kFragmentWaveReasonPermLane32 = 1u << 3;  // PERMLANEX16, needs >= 32
 inline constexpr uint32_t kFragmentWaveReasonReadLane64 = 1u << 4;  // V_READLANE_B32 across a wave64
 inline constexpr uint32_t kFragmentWaveReasonShuffle    = 1u << 5;  // lane-addressed shuffle
+// #2402: OpGroupNonUniformAny serves two ROLES and only one of them is width-agnostic.
+//
+//   GUARD  - the vote's result becomes a branch condition. "Did any lane take this branch" selects
+//            the same executed-pixel set whether it is computed over one 64-wide subgroup or two
+//            32-wide ones, so such a shader can run at wave32.
+//   REDUCE - the vote's result becomes a guest SCALAR VALUE (SCC, a 64-bit mask compare) and is
+//            consumed as data. Splitting the wave changes the answer: s_cmp_eq_u64 mask,0 on a
+//            wave whose set bits live only in lanes 32..63 votes true over the full wave and false
+//            over the lower half. No lowering exists.
+//
+// kFragmentWaveReasonWaveAny is set for BOTH (its meaning is unchanged, so existing readers keep
+// working). This bit is set only for REDUCE, so `reasons == kFragmentWaveReasonWaveAny` means
+// guard-only and is the sole safe case to lower.
+inline constexpr uint32_t kFragmentWaveReasonWaveAnyReduce = 1u << 6;
 
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.

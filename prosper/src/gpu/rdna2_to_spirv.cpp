@@ -575,7 +575,10 @@ struct SpirvCompute {
     // invocation's bool would instead create 64 independent pixel branches. Mark the module with the
     // same arithmetic capability used by fragment MBCNT so the backend enforces subgroup size 64,
     // and declare Vote for OpGroupNonUniformAny itself.
-    uint32_t fragment_wave_any(uint32_t active_bit) {
+    // `as_guard` says the caller feeds this vote straight into a branch condition. Defaults to
+    // FALSE (reduce) because that is the conservative role: a reduce marked guard would be
+    // wrongly lowered to wave32 and silently produce wrong scalars (#2402).
+    uint32_t fragment_wave_any(uint32_t active_bit, bool as_guard = false) {
         if (!is_fragment) return 0;
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
@@ -587,6 +590,7 @@ struct SpirvCompute {
         }
         fragment_required_subgroup_size = wave_size;
         fragment_wave_reasons |= kFragmentWaveReasonWaveAny;
+        if (!as_guard) fragment_wave_reasons |= kFragmentWaveReasonWaveAnyReduce;
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
@@ -14922,7 +14926,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (F.on_vcc && !rs.vcc) return false;
             uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
             if (b.is_fragment && (F.on_exec || F.on_vcc))
-                condition = b.fragment_wave_any(condition);
+                condition = b.fragment_wave_any(condition, /*as_guard=*/true);
             condition = F.on_scc0 ? condition : b.logical_not(condition);
             const RegState before = rs;
             std::set<int> written_v, written_s;
@@ -15376,7 +15380,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
             if (b.is_fragment && L.condition != DivLoop::Condition::Scc)
-                loop_cond = b.fragment_wave_any(loop_cond);
+                loop_cond = b.fragment_wave_any(loop_cond, /*as_guard=*/true);
             const uint32_t chk_end = b.cur_block;
             b.emit_condbranch(loop_cond, body, merge);         // canonical exit: branch on continue predicate
             while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;
@@ -15510,7 +15514,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         ? b.native_wave_any(cond_reg)
                         : b.guest_wave_any(cond_reg);
                 else if (b.is_fragment && (F.on_exec || F.on_vcc))
-                    cond_reg = b.fragment_wave_any(cond_reg);
+                    cond_reg = b.fragment_wave_any(cond_reg, /*as_guard=*/true);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 if (active_direct_wave_loop && active_direct_wave_continue &&
                     active_direct_wave_loop->direct_wave_breaks && F.on_vcc &&
