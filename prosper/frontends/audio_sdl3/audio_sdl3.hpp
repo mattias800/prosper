@@ -17,6 +17,15 @@ bool install_sdl3_audio_sink();
 // No-op when the SDL3 sink is not installed.
 void set_sdl3_audio_paused(bool paused);
 
+// Set the playback gain applied to every stream, as a linear multiplier (1.0 = unchanged).
+// Applied via SDL_SetAudioStreamGain, so no sample data is copied or clipped by prosper.
+// Takes effect immediately on open streams and is remembered for streams opened later.
+//
+// prosper-app defaults this to 0.25. Guest audio that is mixed or decoded incorrectly tends to
+// arrive at or near full scale, and full-scale wrong audio is genuinely painful to listen to
+// while iterating -- a lower default costs nothing and can be raised with --volume.
+void set_sdl3_audio_gain(float gain);
+
 // Uninstall the SDL3 sink (restores the default), closing any open streams and SDL audio.
 void shutdown_sdl3_audio_sink();
 

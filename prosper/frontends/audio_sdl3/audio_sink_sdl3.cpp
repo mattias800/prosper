@@ -58,6 +58,7 @@ public:
         s.freq = info.freq;
         s.put_failed = false;
         s.next = {};   // (re)start the per-grain pacing clock on the first output()
+        SDL_SetAudioStreamGain(s.stream, gain_);
         const bool stream_ready = paused_ ? SDL_PauseAudioStreamDevice(s.stream)
                                           : SDL_ResumeAudioStreamDevice(s.stream);
         if (!stream_ready) {
@@ -131,6 +132,20 @@ public:
         s.frame_bytes = s.grain_bytes = 0;
     }
 
+    // Applies to open streams immediately AND is remembered for later opens, so it works
+
+    // whether it is set before or after the guest creates its ports.
+
+    void set_gain(float g) {
+
+        std::lock_guard<std::mutex> lk(mx_);
+
+        gain_ = g;
+
+        for (auto& s : slots_) if (s.stream) SDL_SetAudioStreamGain(s.stream, gain_);
+
+    }
+
     void set_paused(bool paused) {
         std::lock_guard<std::mutex> lk(mx_);
         if (paused_ == paused) return;
@@ -158,6 +173,7 @@ private:
     std::mutex mx_;
     std::array<Slot, kMaxPorts> slots_{};
     bool paused_ = false;
+    float gain_ = 1.0f;   // linear playback gain, applied via SDL_SetAudioStreamGain
 };
 
 Sdl3AudioSink g_sink;
@@ -172,6 +188,11 @@ bool install_sdl3_audio_sink() {
     g_installed = true;
     SDL_Log("prosper-audio: SDL3 audio backend installed");
     return true;
+}
+
+void set_sdl3_audio_gain(float gain) {
+    if (gain < 0.0f) gain = 0.0f;
+    g_sink.set_gain(gain);   // safe before install: the value is remembered and applied on open
 }
 
 void set_sdl3_audio_paused(bool paused) {
