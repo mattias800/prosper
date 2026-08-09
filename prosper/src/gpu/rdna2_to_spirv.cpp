@@ -9608,8 +9608,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (getenv("PROSPER_DBG")) {
                         const ShaderResource* pp = rt->by_fetch_pc(in.pc);
                         fprintf(stderr,
-                                "[mubuf-raw-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x "
+                                "[mubuf-raw-unresolved] rt=%p pc=%u srsrc=s%d srt_tag=%s0x%x "
                                 "key_res=%s pc_res=%s rewritten=%d (%zu res)\n",
+                                (const void*)rt,
                                 in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ", srt_tag,
                                 has_srt_tag && rt->by_srt_offset(srt_tag) ? "yes" : "null",
                                 pp ? "yes" : "null",

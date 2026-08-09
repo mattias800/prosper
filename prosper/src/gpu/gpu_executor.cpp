@@ -5416,8 +5416,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                                 r.fetch_pc == 0xffffffffu;
                             keyless += no_key ? 1 : 0;
                             std::fprintf(stderr,
-                                         "[compute-table] program 0x%llx binding=%u class=%u "
+                                         "[compute-table] rt=%p program 0x%llx binding=%u class=%u "
                                          "addr=0x%llx size=%llu stride=%u srt=0x%x sgpr=%u pc=%u%s\n",
+                                         (const void*)item.resources.get(),
                                          (unsigned long long)code_addr, r.binding,
                                          static_cast<unsigned>(r.cls),
                                          (unsigned long long)r.gpu_addr,
