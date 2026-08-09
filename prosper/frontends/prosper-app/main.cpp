@@ -957,6 +957,10 @@ static void install_host_backends() {
         fprintf(stderr, "[app] native video backend disabled.\n");
     }
 #endif
+    // Loud by design. Built without SDL3 audio support this whole block vanishes, prosper-app has
+    // NO playback device, and nothing says so. The PCM is still decoded, mixed and delivered -- to
+    // an internal sink that reports "open" while nothing plays, which is indistinguishable from a
+    // title simply being silent. That cost a full investigation on GTA V (#2402).
 #ifdef PROSPER_AUDIO_SDL3
     if (!getenv("PROSPER_APP_DISABLE_AUDIO")) {
         prosper::install_sdl3_audio_sink();
@@ -966,6 +970,9 @@ static void install_host_backends() {
     } else {
         fprintf(stderr, "[app] SDL audio backend disabled; using the realtime silent sink.\n");
     }
+#else
+    fprintf(stderr, "[app] BUILT WITHOUT SDL3 AUDIO SUPPORT -- there will be no sound. "
+                    "Reconfigure with -DPROSPER_AUDIO_SDL3=ON.\n");
 #endif
 #ifdef PROSPER_PAD_SDL3
     if (!getenv("PROSPER_APP_DISABLE_PAD")) {

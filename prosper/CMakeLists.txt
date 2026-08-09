@@ -1738,9 +1738,17 @@ endif()
 # backend would silently have no device. So acquire SDL3 ONCE here, with the UNION of the subsystems
 # the enabled frontends need (JOYSTICK/HIDAPI only when the pad frontend is on). Both consumer blocks
 # below just use the resulting SDL3::SDL3 target.
-option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend"   OFF)
-option(PROSPER_PAD_SDL3   "Build the optional SDL3 gamepad frontend" OFF)
 option(PROSPER_APP        "Build the prosper-app frontend (SDL3 window + Vulkan present)" OFF)
+# The app frontend defaults to having audio, because it is the frontend a USER runs and a silent
+# one is indistinguishable from broken audio. With PROSPER_AUDIO_SDL3 off, install_sdl3_audio_sink()
+# is compiled out of prosper-app entirely and NOTHING is logged about it -- GTA V appeared to have
+# no audio for exactly this reason, while the guest was publishing 99.9%-non-zero PCM that prosper
+# mixed correctly into a sink with no device behind it (#2402).
+#
+# option() honours an existing cache entry, so an explicit -DPROSPER_AUDIO_SDL3=OFF still wins;
+# this only changes the DEFAULT, and only when the app is being built.
+option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend"   ${PROSPER_APP})
+option(PROSPER_PAD_SDL3   "Build the optional SDL3 gamepad frontend" OFF)
 if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3 OR PROSPER_APP) AND TARGET prosper_core AND NOT TARGET SDL3::SDL3)
   # On macOS the build is x86_64 (Rosetta), but a system SDL3 (e.g. Homebrew) is arm64-only and won't
   # link — so skip discovery there and always FetchContent+build SDL3 for the requested architecture.
