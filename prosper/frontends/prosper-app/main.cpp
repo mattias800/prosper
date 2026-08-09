@@ -51,10 +51,15 @@
 #include "audio_sdl3.hpp"              // install_sdl3_audio_sink (route sceAudioOut to the host)
 #endif
 
-// Default playback volume for prosper-app, as a percent. Deliberately low: guest audio that is
-// mixed or decoded incorrectly arrives at or near full scale, and full-scale wrong audio is
-// genuinely painful while iterating on a title. Raise it with --volume.
-static constexpr int kDefaultVolumePercent = 25;
+// Default playback volume for prosper-app, as a percent.
+//
+// UNITY, deliberately. prosper is a compatibility layer, so the title's own mix is the correct
+// output and anything else is us editing it. This shipped as 25 in #2411 -- a bring-up default that
+// made distorted audio bearable while iterating -- and that reasoning does not survive contact with
+// a release: the AppImage and the tarball carry this value, and a user who finds prosper quieter
+// than their console has no way to know we chose that for them. Attenuation during bring-up belongs
+// on the command line (`--volume 25`), not in the default every user inherits.
+static constexpr int kDefaultVolumePercent = 100;
 static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before backends install
 #ifdef PROSPER_AUDIO_FFMPEG
 #include "ajm_ffmpeg.hpp"              // install AJM MP3 decoder before guest instance creation
@@ -1155,9 +1160,7 @@ int main(int argc, char** argv) {
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
     pick.bare_launch = (argc <= 1);
-        // Playback volume as a percent, applied to the SDL3 audio sink. 25 by default -- see
-    // --volume below and audio_sdl3.hpp for why a low default is deliberate.
-for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
@@ -1166,9 +1169,7 @@ for (int i = 1; i < argc; i++) {
         // arguments and needs the appended one to override whatever selected the current game.
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
         else if (a == "--volume" && i + 1 < argc) {
-            // Percent, 0-100. Defaults to 25 (see kDefaultVolumePercent): guest audio that is
-            // mixed or decoded wrongly arrives near full scale, and full-scale wrong audio is
-            // painful while iterating. Clamped rather than rejected so a typo cannot deafen.
+            // Percent, 0-100. Clamped rather than rejected so a typo cannot deafen.
             g_volume_percent = atoi(argv[++i]);
             if (g_volume_percent < 0) g_volume_percent = 0;
             if (g_volume_percent > 100) g_volume_percent = 100;
