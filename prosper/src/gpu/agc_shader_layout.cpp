@@ -1131,6 +1131,15 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 }
                 continue;
             }
+            // #2412: the INLINE direct reading succeeding. Counting these across titles answers
+            // whether the inline interpretation is load-bearing anywhere, which is the gate on any
+            // change to this path: if type 8/10 never resolve inline on any title, the inline reading
+            // for those types is dead and can be replaced; if they do, it cannot.
+            if (getenv("PROSPER_SHARPLOG"))
+                fprintf(stderr,
+                        "[direct-accept] type=%u sgpr=%u base=0x%llx size=%llu stride=%u fmt=%u\n",
+                        type, reg, (unsigned long long)d.base, (unsigned long long)d.size_bytes,
+                        d.stride, static_cast<unsigned>(d.format));
             ShaderResource r;
             r.cls            = compute_buffer ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
             r.format         = d.format;
