@@ -1027,6 +1027,46 @@ namespace {
         if (code == EXCEPTION_ACCESS_VIOLATION && addr_readable(c->Rip) &&
             insn_is_fs_relative((const uint8_t*)(uintptr_t)c->Rip) && guest_fs_reapply())
             return EXCEPTION_CONTINUE_EXECUTION;
+        // Guest `int $0x41` (opcode CD 41) is RAGE's software breakpoint / assert trap (GTA V,
+        // PPSA04263). This mirrors the Linux path at exec_image_linux.cpp:2257 and #1138, which
+        // Windows never received -- the platforms disagreed, and only the fatal one shipped here.
+        //
+        // On PS5 an int with a userspace-illegal vector raises #GP; with no debugger attached the
+        // kernel's trap handler returns past it, so the title continues into its OWN error-reporting
+        // and recovery code. Windows instead raises an ACCESS_VIOLATION whose faulting address is
+        // -1 (there is no such address; it is how a software interrupt with no mapping surfaces),
+        // and with nothing skipping it the guest thread dies.
+        //
+        // Measured on PPSA04263 before this change: the Story-Mode route reached ~2880 frames and
+        // then took `code=0xc0000005 rip=<guest> addr=0xffffffffffffffff` with `cd 41` at rip.
+        //
+        // Runs BEFORE the t_armed gate, like the %fs re-apply above, because the trap fires on guest
+        // worker threads that were never armed. Only fires for a rip inside the guest image whose
+        // bytes really are CD 41, so no other title is affected (none emit int 0x41). Disable with
+        // PROSPER_NO_INT41_SKIP to get the fatal path back for debugging, matching Linux.
+        if (code == EXCEPTION_ACCESS_VIOLATION && g_base && c->Rip >= g_base &&
+            // BOTH bytes are validated, not just the first. This test runs on EVERY access
+            // violation whose rip is in the guest image -- not only on int41 faults -- so it
+            // speculatively reads ins[1] at arbitrary guest rips. addr_readable is a single
+            // VirtualQuery on the page containing its argument (:343), so a rip on the last byte of
+            // a committed page would leave ins[1] on an uncommitted successor and fault INSIDE the
+            // VEH: a nested exception rather than a clean diagnostic. Linux avoids this differently
+            // -- it bounds by an explicit g_base + 4 GiB band and argues the 2-byte read is safe
+            // within it -- so the Windows version needs its own second check rather than inheriting
+            // that argument. (Review finding on #2423.)
+            (!g_image_end || c->Rip < g_image_end) &&
+            addr_readable(c->Rip) && addr_readable(c->Rip + 1)) {
+            const auto* ins = (const uint8_t*)(uintptr_t)c->Rip;
+            static const bool int41_skip = getenv("PROSPER_NO_INT41_SKIP") == nullptr;
+            if (int41_skip && ins[0] == 0xCDu && ins[1] == 0x41u) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 8)
+                    fprintf(stderr, "[int41] guest int $0x41 (debugbreak) at eboot+0x%llx -> skipped\n",
+                            (unsigned long long)(c->Rip - g_base));
+                c->Rip += 2;   // advance past the 2-byte int instruction
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
             code != EXCEPTION_IN_PAGE_ERROR && code != EXCEPTION_PRIV_INSTRUCTION &&
             code != EXCEPTION_DATATYPE_MISALIGNMENT)
