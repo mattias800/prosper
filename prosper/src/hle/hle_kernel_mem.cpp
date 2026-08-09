@@ -1638,12 +1638,83 @@ HLE(k_get_direct_memory_type) {
 // without VirtualQuery's larger result structure. Every output is optional; an untracked address
 // fails before touching any of them. Copying the Mapping under g_mx avoids retaining a vector
 // element pointer while another thread splits or replaces the tracker.
+// #2391: the tracker is not the whole truth about guest memory, and this query is where it shows.
+//
+// `g_maps` records what the kernel-memory HLE mapped. It does NOT record the LOADER's module images:
+// map_image reserves the whole module at its guest base and registers it with nothing. So a guest
+// asking about an address in its OWN module -- code, data, or bss -- got EACCES, as if the memory did
+// not exist. GTA V (PPSA04263) asserts on exactly that: it queries an address in its own zero-fill
+// bss (ph[7], past filesz) and traps at eboot+0x2b2be48 on the non-zero return.
+//
+// The tracker stays AUTHORITATIVE when it has an entry, because it carries the guest's REQUESTED
+// protection, which legitimately differs from the host's -- prosper maps images RWX regardless of
+// segment flags, so consulting the host first would tell a guest its read-only segment is writable.
+// The host is consulted only where prosper's own bookkeeping has nothing to say.
+//
+// Deliberately NOT done: registering module images in `g_maps`. That is the more complete fix, but
+// `g_maps` also feeds `range_is_free_reservation` and the MAP_FIXED safety checks -- whose own
+// comment says a gap means "an untracked host mapping / loaded image, so MAP_FIXED must fail". Adding
+// entries there changes MAPPING behavior; this changes only the answer to a question. See #2391.
+//
+// THE TRAP, and the reason the protection VALUE matters as much as the success code: the guest reads
+// `prot & 0x80` immediately after this call. Returning a placeholder 0 would satisfy its assertion
+// and then send it down a branch chosen by a value we invented -- a QUIETER failure than the loud one
+// being fixed, and far harder to attribute later. So the fallback reports real host protection mapped
+// onto the Sony CPU bits, never a placeholder, and fails closed when the host has nothing either.
+// Host-side fallback for k_query_memory_protection (#2391). Reports the containing host mapping and
+// its REAL protection, translated to the Sony CPU bits (READ 0x1 / WRITE 0x2 / EXEC 0x4). Returns
+// false when the address is not mapped at all, so an unmapped query still fails closed with EACCES.
+static bool query_host_mapping(uint64_t addr, uint64_t& out_base, uint64_t& out_end, uint32_t& out_prot) {
+#if defined(__APPLE__)
+    mach_vm_address_t region = (mach_vm_address_t)addr;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+        return false;
+    if (addr < (uint64_t)region || addr >= (uint64_t)region + (uint64_t)size) return false;
+    out_base = (uint64_t)region; out_end = (uint64_t)region + (uint64_t)size;
+    out_prot = ((info.protection & VM_PROT_READ)    ? 0x1u : 0u) |
+               ((info.protection & VM_PROT_WRITE)   ? 0x2u : 0u) |
+               ((info.protection & VM_PROT_EXECUTE) ? 0x4u : 0u);
+    return true;
+#else
+    // Linux: /proc/self/maps is the only source that reports protection per range. One pass, stopping
+    // at the containing line -- this is a cold path (the tracker answers every mapped-by-HLE query).
+    FILE* maps = fopen("/proc/self/maps", "re");
+    if (!maps) return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long long lo = 0, hi = 0; char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+        if (addr < lo || addr >= hi) continue;
+        out_base = (uint64_t)lo; out_end = (uint64_t)hi;
+        out_prot = (perms[0] == 'r' ? 0x1u : 0u) | (perms[1] == 'w' ? 0x2u : 0u) |
+                   (perms[2] == 'x' ? 0x4u : 0u);
+        found = true;
+        break;
+    }
+    fclose(maps);
+    return found;
+#endif
+}
+
 HLE(k_query_memory_protection) {
     Mapping mapping{};
-    if (!snapshot_mapping(a0, mapping)) return 0x8002000dull;  // SCE_KERNEL_ERROR_EACCES
-    if (a1) *(uint64_t*)(uintptr_t)a1 = mapping.base;
-    if (a2) *(uint64_t*)(uintptr_t)a2 = mapping.base + mapping.size;
-    if (a3) *(uint32_t*)(uintptr_t)a3 = mapping.guest_prot;
+    if (snapshot_mapping(a0, mapping)) {
+        if (a1) *(uint64_t*)(uintptr_t)a1 = mapping.base;
+        if (a2) *(uint64_t*)(uintptr_t)a2 = mapping.base + mapping.size;
+        if (a3) *(uint32_t*)(uintptr_t)a3 = mapping.guest_prot;
+        return 0;
+    }
+    uint64_t hb = 0, he = 0; uint32_t hp = 0;
+    if (!query_host_mapping(a0, hb, he, hp)) return 0x8002000dull;  // SCE_KERNEL_ERROR_EACCES
+    if (a1) *(uint64_t*)(uintptr_t)a1 = hb;
+    if (a2) *(uint64_t*)(uintptr_t)a2 = he;
+    if (a3) *(uint32_t*)(uintptr_t)a3 = hp;
     return 0;
 }
 
@@ -5362,12 +5433,66 @@ HLE(k_get_direct_memory_type) {
     return 0;
 }
 
+// #2391: the tracker is not the whole truth about guest memory, and this query is where it shows.
+//
+// `g_maps` records what the kernel-memory HLE mapped. It does NOT record the LOADER's module images:
+// map_image reserves the whole module at its guest base and registers it with nothing. So a guest
+// asking about an address in its OWN module -- code, data, or bss -- got EACCES, as if the memory did
+// not exist. GTA V (PPSA04263) asserts on exactly that: it queries an address in its own zero-fill
+// bss (ph[7], past filesz) and traps at eboot+0x2b2be48 on the non-zero return.
+//
+// The tracker stays AUTHORITATIVE when it has an entry, because it carries the guest's REQUESTED
+// protection, which legitimately differs from the host's -- prosper maps images RWX regardless of
+// segment flags, so consulting the host first would tell a guest its read-only segment is writable.
+// The host is consulted only where prosper's own bookkeeping has nothing to say.
+//
+// Deliberately NOT done: registering module images in `g_maps`. That is the more complete fix, but
+// `g_maps` also feeds `range_is_free_reservation` and the MAP_FIXED safety checks -- whose own
+// comment says a gap means "an untracked host mapping / loaded image, so MAP_FIXED must fail". Adding
+// entries there changes MAPPING behavior; this changes only the answer to a question. See #2391.
+//
+// THE TRAP, and the reason the protection VALUE matters as much as the success code: the guest reads
+// `prot & 0x80` immediately after this call. Returning a placeholder 0 would satisfy its assertion
+// and then send it down a branch chosen by a value we invented -- a QUIETER failure than the loud one
+// being fixed, and far harder to attribute later. So the fallback reports real host protection mapped
+// onto the Sony CPU bits, never a placeholder, and fails closed when the host has nothing either.
+// Host-side fallback for k_query_memory_protection (#2391). See the contract block above the POSIX
+// arm's copy. Reserved-but-uncommitted memory reports as NOT mapped: the guest asked what protection
+// applies, and a reservation has none.
+static bool query_host_mapping(uint64_t addr, uint64_t& out_base, uint64_t& out_end, uint32_t& out_prot) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((const void*)(uintptr_t)addr, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD prot = mbi.Protect & 0xffu;   // strip PAGE_GUARD / NOCACHE / WRITECOMBINE modifiers
+    if (prot == 0 || prot == PAGE_NOACCESS) return false;
+    uint32_t sony = 0;
+    if (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        sony |= 0x1u;
+    if (prot & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        sony |= 0x2u;
+    if (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        sony |= 0x4u;
+    if (prot & PAGE_EXECUTE) sony |= 0x4u;
+    out_base = (uint64_t)(uintptr_t)mbi.BaseAddress;
+    out_end  = out_base + (uint64_t)mbi.RegionSize;
+    out_prot = sony;
+    return true;
+}
+
 HLE(k_query_memory_protection) {
     Mapping mapping{};
-    if (!snapshot_mapping(a0, mapping)) return 0x8002000dull;
-    if (a1) *(uint64_t*)(uintptr_t)a1 = mapping.base;
-    if (a2) *(uint64_t*)(uintptr_t)a2 = mapping.base + mapping.size;
-    if (a3) *(uint32_t*)(uintptr_t)a3 = mapping.guest_prot;
+    if (snapshot_mapping(a0, mapping)) {
+        if (a1) *(uint64_t*)(uintptr_t)a1 = mapping.base;
+        if (a2) *(uint64_t*)(uintptr_t)a2 = mapping.base + mapping.size;
+        if (a3) *(uint32_t*)(uintptr_t)a3 = mapping.guest_prot;
+        return 0;
+    }
+    uint64_t hb = 0, he = 0; uint32_t hp = 0;
+    if (!query_host_mapping(a0, hb, he, hp)) return 0x8002000dull;  // SCE_KERNEL_ERROR_EACCES
+    if (a1) *(uint64_t*)(uintptr_t)a1 = hb;
+    if (a2) *(uint64_t*)(uintptr_t)a2 = he;
+    if (a3) *(uint32_t*)(uintptr_t)a3 = hp;
     return 0;
 }
 

@@ -1,0 +1,81 @@
+# Grand Theft Auto V (PPSA04263, RAGE) — Windows lane. Reach Story Mode gameplay.
+#
+# Route, established by capture rather than assumed:
+#   boot -> "Continue" title card -> main menu, which opens on the ONLINE tab.
+# The menu's own tab bar reads  [L1]  ONLINE  GTA+  STORY  [R1]  — so STORY is TWO tabs right of
+# where the menu lands, reached with R1 twice, then Cross to enter.
+#
+# FLIP TIMING, measured from PROSPER_PAD_SCRIPT_LOG on this title rather than estimated:
+#     f600 = t 59.2s | f800 = 77.8s | f1000 = 87.6s | f1200 = 95.0s | f1400 = 102.5s | f1600 = 109.9s
+# The rate is NOT constant — the first 600 flips take 59 s (boot and the IoStore-bound load) and the
+# next 1000 take 51 s. An early anchor is therefore much "later" in wall-clock terms than a linear
+# reading suggests, which is why the leading sweep starts at f600 rather than being packed at the
+# front: before that the title is still loading and a press is swallowed.
+#
+# The leading Cross sweep dismisses the title card and any dialog between it and the menu. It is a
+# SWEEP, deliberately: the flip at which the card appears has not been pinned to a single value, and
+# an extra Cross on a settled menu re-enters the currently selected tab rather than doing damage.
+#
+# The tab navigation is spaced 100 flips apart so each input lands on a settled screen. Pressing R1
+# twice in quick succession risks the second being eaten by the tab-change animation.
+
+f600-620:cross
+f800-820:cross
+f1000-1020:cross
+f1200-1220:cross
+f1400-1420:cross
+f1600-1620:cross
+f1800-1820:cross
+f2000-2020:cross
+f2200-2220:cross
+f2400-2420:cross
+
+# --- ONLINE -> GTA+ -> STORY, then enter -------------------------------------------------------
+# FOUR R1 presses, not two, and the reason is measured: in one run only ONE of two registered, the
+# menu stayed on GTA+, and the following Cross entered GTA+ (an online feature) instead of STORY.
+# STORY is the RIGHTMOST tab -- the bar reads [L1] ONLINE GTA+ STORY [R1] -- so a press that lands
+# when already on STORY clamps rather than overshooting. Extra presses are therefore free in the
+# right-hand direction and are the cheap fix for an eaten input; two were not enough.
+f2600-2620:r1
+f2700-2720:r1
+f2800-2820:r1
+f2880-2900:r1
+f3000-3020:cross
+
+# A second Cross well after, in case the first landed during a transition. If STORY was already
+# entered, this lands on whatever the story flow presents (a save-slot or difficulty prompt), which
+# is progress rather than a wrong turn.
+f3300-3320:cross
+f3600-3620:cross
+
+# Past the Story Mode entry: the flow presents a save-slot / "Resume Story" confirmation before the
+# world loads. Spaced pulses rather than a burst, same reason as above.
+f4000-4020:cross
+f4400-4420:cross
+f4800-4820:cross
+f5200-5220:cross
+f5600-5620:cross
+f6000-6020:cross
+
+# --- WHAT THIS ROUTE REACHES TODAY, and where it stops ------------------------------------------
+#
+# Verified on Windows with #2390 + #2394: this drives the title through
+#     "Continue" title card -> main menu (opens on ONLINE) -> R1, R1 -> STORY tab
+# all rendering at 4K. Capture 12 of the run (frame 2831, t=156.1 s) shows the STORY tab selected
+# with the Franklin key art, the "GRAND THEFT AUTO V STORY MODE" blurb, and the "Resume Story"
+# prompt.
+#
+# The process then SEGFAULTS shortly after the f2900 Cross that enters Story Mode, at t~158-190 s.
+# The fault produces NO [veh] record and no fault address, which is itself informative: the Windows
+# VEH logger sees nothing, so this is not a guest-code access violation of the kind that stopped the
+# three earlier walls. It is a host-side crash, and it needs a different instrument than the ones
+# that found those.
+#
+# So: this file is a working route to the STORY tab and NOT yet a route to gameplay. Do not read the
+# trailing Cross pulses as evidence they land on anything.
+#
+# Two smaller observations from the same captures, recorded because they are cheap to lose:
+#   * The bottom-right prompt renders as "Re u e Sto y" — glyph dropouts in "Resume Story". The
+#     surrounding UI text is intact, so this is a per-glyph gap, not a font failure.
+#   * The main menu's ONLINE tab correctly reports NO CONNECTION rather than hanging on a network
+#     probe, which is the right behaviour for an offline compatibility layer.
