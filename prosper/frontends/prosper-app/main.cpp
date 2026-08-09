@@ -50,6 +50,12 @@
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"              // install_sdl3_audio_sink (route sceAudioOut to the host)
 #endif
+
+// Default playback volume for prosper-app, as a percent. Deliberately low: guest audio that is
+// mixed or decoded incorrectly arrives at or near full scale, and full-scale wrong audio is
+// genuinely painful while iterating on a title. Raise it with --volume.
+static constexpr int kDefaultVolumePercent = 25;
+static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before backends install
 #ifdef PROSPER_AUDIO_FFMPEG
 #include "ajm_ffmpeg.hpp"              // install AJM MP3 decoder before guest instance creation
 #endif
@@ -921,6 +927,9 @@ static void install_host_backends() {
 #ifdef PROSPER_AUDIO_SDL3
     if (!getenv("PROSPER_APP_DISABLE_AUDIO")) {
         prosper::install_sdl3_audio_sink();
+        prosper::set_sdl3_audio_gain(g_volume_percent / 100.0f);
+        fprintf(stderr, "[app] audio volume %d%%%s\n", g_volume_percent,
+                g_volume_percent == kDefaultVolumePercent ? " (default; --volume N to change)" : "");
     } else {
         fprintf(stderr, "[app] SDL audio backend disabled; using the realtime silent sink.\n");
     }
@@ -1106,7 +1115,9 @@ int main(int argc, char** argv) {
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
     pick.bare_launch = (argc <= 1);
-    for (int i = 1; i < argc; i++) {
+        // Playback volume as a percent, applied to the SDL3 audio sink. 25 by default -- see
+    // --volume below and audio_sdl3.hpp for why a low default is deliberate.
+for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
@@ -1114,6 +1125,14 @@ int main(int argc, char** argv) {
         // relaunch_with_dump() depends on that: it appends "--dump <new title>" to this run's own
         // arguments and needs the appended one to override whatever selected the current game.
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
+        else if (a == "--volume" && i + 1 < argc) {
+            // Percent, 0-100. Defaults to 25 (see kDefaultVolumePercent): guest audio that is
+            // mixed or decoded wrongly arrives near full scale, and full-scale wrong audio is
+            // painful while iterating. Clamped rather than rejected so a typo cannot deafen.
+            g_volume_percent = atoi(argv[++i]);
+            if (g_volume_percent < 0) g_volume_percent = 0;
+            if (g_volume_percent > 100) g_volume_percent = 100;
+        }
         else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
         else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
         else if (a == "--games-dir") {                       // where the titles are, this run only
