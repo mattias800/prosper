@@ -1,7 +1,8 @@
 # Thread wait profiling — what blocks, how much, and where
 
 **Status:** Linux implementation complete and merged (`tools/perf/wait_profile.py` #2377,
-`tools/perf/stack_profile.py` #2380 + #2383). **Windows and macOS have nothing.** This document exists so
+`tools/perf/stack_profile.py` #2380 + #2383, `tools/perf/lock_holder.py`). **Windows and macOS have
+nothing.** This document exists so
 the Windows lane can build the equivalent without re-deriving the design, and — more importantly — without
 re-discovering the seven traps that made the Linux versions wrong on the way here.
 
@@ -22,8 +23,11 @@ subsumes the other**:
 | --- | --- | --- | --- |
 | *How much* is each thread blocked, and on what object? | `wait_profile.py` | read `/proc` | negligible; sample at 10–50 Hz |
 | *Where* in the code is it blocked? | `stack_profile.py` | attach gdb, walk stacks | stops the process; sample every 5–10 s |
+| *Who HOLDS* the lock it is waiting on? | `lock_holder.py` | `process_vm_readv` of the mutex owner word | negligible; does **not** stop the target |
 
 Run the cheap one first to find *which* thread is stuck, then the expensive one to find *where*.
+"Thread A waits on lock X" is a symptom; "thread B holds X inside `foo()` every frame" is a fix — and
+without the third question an investigation stops at a futex address, which names nothing.
 
 ### The limit that forces the pair, demonstrated
 
