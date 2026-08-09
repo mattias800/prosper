@@ -7396,6 +7396,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     timing.build_reflect_memo_mismatch += pending_timing.build_reflect_memo_mismatch;
                     timing.buffer_ms += pending_timing.buffer_ms;
                 };
+                // #2400: the real per-submit boundary. `accumulate` runs twice (totals and window),
+                // so the census flush goes here, once, rather than inside the lambda.
+                prosper::test::backend_submit_buffer_census_flush();
                 accumulate(totals);
                 accumulate(window);
                 if (totals.submits % 25 == 0) {

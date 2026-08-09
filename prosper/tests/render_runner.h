@@ -456,6 +456,135 @@ inline BackendHashStatsTotals& backend_hash_stats_totals() {
     static thread_local BackendHashStatsTotals totals;
     return totals;
 }
+
+// Per-SUBMIT duplicate-copy census (#2400). PROSPER_BUFFER_CENSUS=1; off by default and free when off.
+//
+// The three dedup structures in render_draw_pass_rgba -- shared_buffers, shared_buffer_indices and
+// buffer_ref_memo -- are function locals, so they reset on EVERY backend call, while a Blue Prince
+// gameplay submit makes ~27.5 of them. A large buffer referenced by two passes of one submit is
+// therefore over the 4 KiB cutoff, takes a unique tag, matches nothing, and is memcpy'd AGAIN --
+// even though the guest is not running and cannot have changed it in between.
+//
+// #2400 measured the copy at 25.6 ms/submit (27% of the submit) with 99.86% of the bytes coming from
+// those large dedup-bypassed buffers. What nobody has measured is how much of that is the SAME buffer
+// copied twice inside one submit. This answers exactly that and nothing else: it changes no behavior,
+// so it cannot cause a wrong render, and its only job is to decide whether hoisting the dedup to
+// submit scope is worth the GPU-write-invalidation work that a real fix would need.
+//
+// Deliberately NOT hashing contents: the question is whether the same {pointer, size, identity}
+// triple is copied more than once per submit, which is answerable by identity alone. #2400 records
+// why hashing cannot pay for itself here (~150 ms to save ~25 ms).
+struct BackendSubmitBufferCensus {
+    // Reset every submit.
+    std::vector<std::pair<const void*, uint64_t>> keys;   // {words, count<<32 ^ identity-ish}
+    std::vector<uint64_t> key_bytes;
+    // Cumulative across submits.
+    uint64_t submits = 0;
+    uint64_t copies = 0;            // memcpy'd buffers, summed over the submit's backend calls
+    uint64_t distinct = 0;          // of those, distinct {pointer,size,identity} triples
+    uint64_t bytes = 0;             // bytes actually memcpy'd
+    uint64_t distinct_bytes = 0;    // bytes if each distinct triple were copied once
+    // Last reporting window only, reset at every print.
+    //
+    // Cumulative alone is not enough, and the reason is a mistake this instrument caused within an
+    // hour of existing: a cumulative MiB/submit was divided by the WINDOWED copy ms/submit from
+    // `[render-window] backend-submit resources` and reported as an agreeing ~12 GiB/s bandwidth
+    // cross-check. The denominators are different windows. Blue Prince's cumulative MiB/submit is
+    // still climbing steeply through a run (63 -> 329 -> 491 -> 607) because gameplay submits are
+    // an order of magnitude heavier than the menu submits averaged in with them, so it never equals
+    // the current window; redone at the end of the same run the "agreement" gave 18.7 GiB/s, above
+    // memcpy speed, which is what exposed it.
+    //
+    // The DUPLICATE SHARE was unaffected (53.2 / 53.1 / 53.0% across three widely separated
+    // cumulative windows -- a ratio of two co-accumulated sums is robust to the window). The
+    // absolute per-submit volume was not. So: publish the windowed volume, and never pair a
+    // cumulative figure here with a windowed one from a neighbouring report.
+    uint64_t w_submits = 0, w_copies = 0, w_distinct = 0, w_bytes = 0, w_distinct_bytes = 0;
+};
+inline BackendSubmitBufferCensus& backend_submit_buffer_census() {
+    static thread_local BackendSubmitBufferCensus census;
+    return census;
+}
+inline bool backend_submit_buffer_census_enabled() {
+    // The flush lives in the frontend's timing block, so PROSPER_RENDER_TIMING is REQUIRED. Without
+    // it the census records forever and never reports -- it produces no output at all, which reads
+    // exactly like "the census ran and found nothing". Setting only PROSPER_BUFFER_CENSUS did that
+    // silently once already, so say so loudly instead of failing quiet.
+    static const bool on = [] {
+        const bool want = getenv("PROSPER_BUFFER_CENSUS") != nullptr;
+        if (want && getenv("PROSPER_RENDER_TIMING") == nullptr) {
+            fprintf(stderr, "[buffer-census] DISABLED: PROSPER_BUFFER_CENSUS needs "
+                            "PROSPER_RENDER_TIMING=1 (the per-submit flush lives in the timing "
+                            "path). Set both, or you get no output rather than a zero.\n");
+            return false;
+        }
+        return want;
+    }();
+    return on;
+}
+inline void backend_submit_buffer_census_record(const void* words, uint32_t word_count,
+                                                uint64_t identity, uint64_t bytes) {
+    if (!backend_submit_buffer_census_enabled()) return;
+    BackendSubmitBufferCensus& c = backend_submit_buffer_census();
+    c.keys.emplace_back(words, (static_cast<uint64_t>(word_count) << 32) ^ (identity * 0x9e3779b9u));
+    c.key_bytes.push_back(bytes);
+}
+// Called by the FRONTEND at the real per-submit boundary (live_renderer.cpp, where `accumulate` runs
+// and `timing.submits++`). It must not be driven from inside render_draw_pass_rgba.
+//
+// The first version of this did exactly that, keyed on `flush_submission_batch` — which reads like a
+// submit boundary and is not one: it defaults to TRUE, so it fires on essentially every backend call.
+// A 100 s menu run then reported **submits=75392**, against a known ~8.6 submits/s, and DUPLICATE=1.8%
+// of copies / 0.1% of bytes. That near-zero is exactly what a per-CALL window must report, because
+// within one call `buffer_ref_memo` has already removed repeat references — the instrument was
+// measuring the one window in which the answer is guaranteed uninteresting.
+//
+// It was caught by the absurd submit COUNT, not by the duplicate share looking wrong; the share was
+// perfectly plausible. Had the count been merely 2x off instead of 88x, this would have published
+// "within-submit duplication is negligible" and killed a live hypothesis with a broken window.
+// **A census is only as meaningful as the boundary it resets on — check the boundary against a
+// known rate before believing anything it reports.**
+inline void backend_submit_buffer_census_flush() {
+    if (!backend_submit_buffer_census_enabled()) return;
+    BackendSubmitBufferCensus& c = backend_submit_buffer_census();
+    if (!c.keys.empty()) {
+        std::vector<size_t> idx(c.keys.size());
+        for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return c.keys[a] < c.keys[b]; });
+        uint64_t distinct = 0, distinct_bytes = 0, bytes = 0;
+        for (size_t i = 0; i < idx.size(); ++i) {
+            bytes += c.key_bytes[idx[i]];
+            if (i == 0 || c.keys[idx[i]] != c.keys[idx[i - 1]]) {
+                ++distinct;
+                distinct_bytes += c.key_bytes[idx[i]];
+            }
+        }
+        c.copies += c.keys.size();      c.w_copies += c.keys.size();
+        c.distinct += distinct;         c.w_distinct += distinct;
+        c.bytes += bytes;               c.w_bytes += bytes;
+        c.distinct_bytes += distinct_bytes; c.w_distinct_bytes += distinct_bytes;
+        ++c.submits;                    ++c.w_submits;
+        c.keys.clear();
+        c.key_bytes.clear();
+    }
+    if (c.submits && (c.submits % 64) == 0 && c.w_submits) {
+        const auto share = [](uint64_t total, uint64_t uniq) {
+            return total ? 100.0 * double(total - uniq) / double(total) : 0.0;
+        };
+        const double wn = double(c.w_submits);
+        fprintf(stderr,
+                "[buffer-census] window submits=%llu copies/submit=%.1f distinct/submit=%.1f "
+                "DUPLICATE=%.1f%% of copies, %.1f%% of bytes  (%.1f MiB/submit copied, "
+                "%.1f MiB/submit if deduped per submit)  [cumulative over %llu submits: "
+                "dup %.1f%% of bytes]\n",
+                (unsigned long long)c.w_submits, double(c.w_copies) / wn, double(c.w_distinct) / wn,
+                share(c.w_copies, c.w_distinct), share(c.w_bytes, c.w_distinct_bytes),
+                double(c.w_bytes) / (wn * 1024.0 * 1024.0),
+                double(c.w_distinct_bytes) / (wn * 1024.0 * 1024.0),
+                (unsigned long long)c.submits, share(c.bytes, c.distinct_bytes));
+        c.w_submits = c.w_copies = c.w_distinct = c.w_bytes = c.w_distinct_bytes = 0;
+    }
+}
 inline void maybe_report_hash_stats() {
     static const bool on = getenv("PROSPER_HASH_STATS") != nullptr;
     if (!on) return;
@@ -5346,6 +5475,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             const ResourcePhaseTimer phase_copy(timing_enabled,
                                                                 &res_buffer_copy_ms);
                             resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
+                            // #2400: recorded HERE, at the memcpy, so the census counts exactly the
+                            // copies it claims to -- the transient-upload branch above does not copy
+                            // through a mapped pointer and must not be counted.
+                            backend_submit_buffer_census_record(words, word_count, r.buffer_identity,
+                                                                static_cast<uint64_t>(bytes));
                             std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
                                         words, static_cast<size_t>(bytes));
                             upload.range = bytes;
