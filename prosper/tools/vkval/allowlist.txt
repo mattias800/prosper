@@ -57,8 +57,10 @@ VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exe
 # ---- #1712: Int64 capability declared, shaderInt64 never enabled on any device ------------------
 VUID-VkShaderModuleCreateInfo-pCode-08740 | required | rdna2_to_spirv_exec, texture_sample_render | Recompiled 64-bit integer ops force OpCapability Int64, which no device-creation path in the tree requests (#1712)
 
-# ---- #1714: MRT blend state differs per attachment without independentBlend ---------------------
-VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605 | required | shadow_compare_render | Per-target blend state is built from each target's own registers while independentBlend is never enabled (#1714)
+# ---- #1714: FIXED. independentBlend is now requested when the device advertises it, so the
+# per-attachment blend state we build is legal and this id no longer fires. The scan's `required`
+# check caught the stale entry on the same change that fixed the defect, which is exactly what it
+# is for -- entry deleted rather than downgraded.
 
 # ---- #1715: generated geometry stage declares no invocation count -------------------------------
 VUID-VkPipelineShaderStageCreateInfo-stage-00715 | required | interp_render | The synthesised geometry entry point has no OpExecutionMode Invocations, so the declared count is 0 (#1715)
