@@ -4337,6 +4337,14 @@ namespace {
                         break;
                     }
                     // Adjacent and same-ownership, so this coalesces with the existing free span.
+                    //
+                    // One place the repair is slightly WIDER than the request, stated because the
+                    // rest of this comment stresses how narrow it is: tail_size is rounded up to
+                    // kWinAllocationGranularity, so up to 64 KiB - 1 beyond the request can be
+                    // reserved into the free pool. Benign — take_placeholder_locked carves the exact
+                    // subrange later and the remainder stays ours as a free placeholder — but it is
+                    // better stated here than discovered from a span list that is larger than the
+                    // requests explain. (Review finding on #2426.)
                     remember_free_placeholder_locked(tail_base, tail_size);
                     // Log the SPAN's own base, not the request's: when the request starts inside the
                     // span those differ, and printing `hint` there would misreport which placeholder
@@ -4352,8 +4360,14 @@ namespace {
             }
             if (retry) {
                 if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
-                MLOG("map_dmem FIXED repair: view still failed after extend (error=%lu)\n",
-                     (unsigned long)GetLastError());
+                // `align` is carried because the repair does NOT honour it: tail_base is the free
+                // span's end, which need not satisfy the caller's alignment, so with
+                // align > kWinAllocationGranularity the extend can succeed and the view still fail.
+                // That is the likeliest reason to land here and it was invisible without the value.
+                // (Review finding on #2426.)
+                MLOG("map_dmem FIXED repair: view still failed after extend "
+                     "(error=%lu align=0x%llx)\n",
+                     (unsigned long)GetLastError(), (unsigned long long)align);
             }
         }
     no_repair:
