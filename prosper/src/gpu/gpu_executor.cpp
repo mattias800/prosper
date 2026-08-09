@@ -5323,6 +5323,41 @@ std::vector<ComputeItem> realize_compute_dispatches(
             if (logged.insert(code_addr).second) {
                 std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
                              (unsigned long long)code_addr);
+                // #2412: print the table this program was offered, next to the keys the shader looks
+                // up by. Every one of GTA V's 951 recompiler rejects is `mode=unresolved-operand`
+                // (#2416) — the lowering exists and the descriptor does not resolve — so the useful
+                // question is no longer "which instruction" but "which KEY missed". The recompiler
+                // matches a resource three ways: by fetch pc, by SRT offset, and by SGPR base; a
+                // resource carrying `srt=0xffffffff sgpr=0xffffffff` can be matched by none of them
+                // and is invisible to every lookup, however correct its address and size are.
+                if (std::getenv("PROSPER_DBG")) {
+                    if (!item.resources || item.resources->resources.empty()) {
+                        std::fprintf(stderr,
+                                     "[compute-table] program 0x%llx has NO resources at all\n",
+                                     (unsigned long long)code_addr);
+                    } else {
+                        size_t keyless = 0;
+                        for (const auto& r : item.resources->resources) {
+                            const bool no_key = r.srt_offset == 0xffffffffu &&
+                                                r.sgpr_base == 0xffffffffu &&
+                                                r.fetch_pc == 0xffffffffu;
+                            keyless += no_key ? 1 : 0;
+                            std::fprintf(stderr,
+                                         "[compute-table] program 0x%llx binding=%u class=%u "
+                                         "addr=0x%llx size=%llu stride=%u srt=0x%x sgpr=%u pc=%u%s\n",
+                                         (unsigned long long)code_addr, r.binding,
+                                         static_cast<unsigned>(r.cls),
+                                         (unsigned long long)r.gpu_addr,
+                                         (unsigned long long)r.size, r.stride, r.srt_offset,
+                                         r.sgpr_base, r.fetch_pc, no_key ? "  <-- UNMATCHABLE" : "");
+                        }
+                        std::fprintf(stderr,
+                                     "[compute-table] program 0x%llx: %zu resource(s), %zu with no "
+                                     "lookup key\n",
+                                     (unsigned long long)code_addr,
+                                     item.resources->resources.size(), keyless);
+                    }
+                }
                 // PROSPER_SHADER_DUMP=<dir>: write the failed COMPUTE program's raw bytes for offline
                 // shader_inspect, mirroring the graphics VS/PS dump (gpu_execute.hpp). The graphics
                 // path was the only dumper, so a failing dispatch's CFG could not be mapped offline.

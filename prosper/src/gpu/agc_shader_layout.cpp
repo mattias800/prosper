@@ -1079,7 +1079,27 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // pointer/data dwords decode with FORMAT=0. Dynamic descriptors whose format is patched by
             // shader ALU are recovered by resolve_dynamic_fetch instead of this metadata-only path.
             if (d.base == 0 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
-                d.format == DataFormat::Unknown || !d.num_components) continue;
+                d.format == DataFormat::Unknown || !d.num_components) {
+                // #2412: name WHICH clause rejected, and show the raw dwords. A direct slot that is
+                // really a 64-bit POINTER to an in-memory descriptor table decodes as a nonsense V#
+                // here, and the guard correctly drops it — but the log then looks identical to a
+                // genuinely absent resource. Printing the words separates "not a descriptor" from
+                // "a descriptor we mis-decoded", which need opposite fixes.
+                if (getenv("PROSPER_SHARPLOG"))
+                    fprintf(stderr,
+                            "[direct-reject] type=%u sgpr=%u words=%08x:%08x:%08x:%08x "
+                            "base=0x%llx size=%llu stride=%u fmt=%u comps=%u why=%s%s%s%s%s\n",
+                            type, reg, user_sgprs[reg], user_sgprs[reg + 1], user_sgprs[reg + 2],
+                            user_sgprs[reg + 3], (unsigned long long)d.base,
+                            (unsigned long long)d.size_bytes, d.stride,
+                            static_cast<unsigned>(d.format), d.num_components,
+                            d.base == 0 ? "base0 " : "",
+                            d.size_bytes == 0 ? "size0 " : "",
+                            d.size_bytes > 0x10000000u ? "size>256M " : "",
+                            d.format == DataFormat::Unknown ? "fmt-unknown " : "",
+                            !d.num_components ? "comps0" : "");
+                continue;
+            }
             ShaderResource r;
             r.cls            = compute_buffer ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
             r.format         = d.format;
