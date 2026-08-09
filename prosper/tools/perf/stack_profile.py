@@ -69,6 +69,55 @@ import subprocess
 import sys
 import time
 
+# An UNRESOLVED frame. `set auto-solib-add off` (which this tool passes, to avoid paying for
+# shared-library symbols on every attach) makes gdb print `??` for any frame in a library it
+# did not load. `??` is not an answer and must never be reported as the blocking site -- but it
+# is also not plumbing to be silently swallowed, because a stack that is ENTIRELY `??` means the
+# tool has told you nothing and should say so. Both cases are handled in blocking_site().
+#
+# Found by review, not by the control: the control ran where gdb resolved libc, so its frames
+# came back named (`pthread_cond_wait@@GLIBC_2.3.2`) and `??` never appeared. The first live
+# prosper run printed `?? <- ??` as a blocking site for four threads and I read past it.
+UNRESOLVED = re.compile(r"^\?+$")
+
+# Sentinel: distinguishes "nothing in this stack resolved" from "this stack is all plumbing".
+# They look the same in a report and mean opposite things -- the first is a tool failure for
+# that thread, the second is a real finding about the program.
+UNRESOLVED_ONLY = "(no symbolized frame -- gdb resolved nothing in this stack)"
+
+# A thread whose stack produced NO frames at all. Distinct again: `UNRESOLVED_ONLY` means gdb
+# walked the stack and could not name the frames; this means nothing was parsed for the thread.
+# Both are tool failures for that thread and neither is a finding about the program -- which is
+# the whole reason they are not allowed to share the "pure library wait" label.
+NO_FRAMES = "(no frames parsed for this thread -- tool failure, not a finding)"
+
+# C++ wait wrappers. These are plumbing exactly like the C ones, but they are TEMPLATED --
+# `std::condition_variable::__wait_until_impl<std::chrono::duration<long, std::ratio<1l, ...> > >`
+# -- so an anchored `$` pattern over the whole symbol cannot match them. Matched by prefix.
+#
+# Also from review. The first live run reported
+#   GfxFlipThread  100.0%  std::__condvar::wait_until <- std::condition_variable::__wait_until_impl
+# as a finding, when it is the wait machinery itself: the tool named the thing it exists to skip.
+CXX_PLUMBING_PREFIXES = (
+    "std::__condvar::",
+    "std::condition_variable::",
+    "std::condition_variable_any::",
+    "std::mutex::lock",
+    "std::mutex::try_lock",
+    "std::recursive_mutex::lock",
+    "std::timed_mutex::",
+    "std::shared_mutex::",
+    "std::unique_lock",
+    "std::lock_guard",
+    "std::this_thread::sleep_for",
+    "std::this_thread::sleep_until",
+    "std::this_thread::yield",
+    "std::thread::join",
+    "std::__atomic_futex_unaligned",
+    "__gthread_cond_",
+    "__gthread_mutex_",
+)
+
 # gdb frames that are plumbing rather than an answer. A stack whose top frame is
 # `futex_wait` tells you nothing you did not already know from /proc; the first frame
 # BELOW this set is the one that names the lock.
@@ -160,17 +209,51 @@ def gdb_stacks(pid: int, gdb: str, timeout: float):
     return threads, stopped, None
 
 
-def blocking_site(frames, depth: int):
-    """The first non-plumbing frame, plus `depth-1` callers beneath it.
+def is_plumbing(fn: str) -> bool:
+    """True for wait machinery, in C or C++ spelling."""
+    return bool(PLUMBING.match(fn)) or fn.startswith(CXX_PLUMBING_PREFIXES)
 
-    Returns None when a thread's whole stack is plumbing -- that is a real outcome
-    (a pure library wait with no symbolized caller), reported as such rather than
-    silently bucketed with something else.
+
+def blocking_site(frames, depth: int):
+    """The first frame that is neither plumbing nor unresolved, plus `depth-1` callers.
+
+    Three distinct outcomes, kept distinct because they call for different actions:
+      * a named site            -> the answer
+      * None                    -> the whole stack is plumbing (a pure library wait)
+      * UNRESOLVED_ONLY         -> every frame is `??`; the tool measured nothing here and
+                                   the caller must say so rather than print `?? <- ??`
+
+    `??` frames are skipped when they sit ABOVE a named frame, because with
+    `auto-solib-add off` they are precisely the library plumbing we mean to skip. They are
+    only fatal to the answer when nothing below them resolved.
     """
     for i, fn in enumerate(frames):
-        if not PLUMBING.match(fn):
-            return " <- ".join(frames[i:i + depth])
-    return None
+        if is_plumbing(fn) or UNRESOLVED.match(fn):
+            continue
+        # `<-` reads as "called by", so the displayed chain must stay CONTIGUOUS. An earlier
+        # version filtered `??` out of the middle, turning ["answer", "??", "caller2"] into
+        # "answer <- caller2" -- which asserts an adjacency that does not exist. Truncate at
+        # the first unresolved caller instead and mark the cut, so the gap is visible.
+        chain, truncated = [], False
+        for f in frames[i:]:
+            if UNRESOLVED.match(f):
+                truncated = True
+                break
+            chain.append(f)
+            if len(chain) == depth:
+                break
+        site = " <- ".join(chain)
+        if truncated and len(chain) < depth:
+            site += " <- ..."      # callers below exist but did not resolve
+        return site
+    # No named site. Three different reasons, and only one of them is a statement about the
+    # PROGRAM -- so they must not share a label. An earlier version collapsed all three into
+    # "pure library wait", which claims a finding in the two cases that support none.
+    if not frames:
+        return NO_FRAMES
+    if any(UNRESOLVED.match(f) for f in frames):
+        return UNRESOLVED_ONLY
+    return None            # genuinely all plumbing: a real finding about the program
 
 
 def main() -> int:
@@ -225,8 +308,15 @@ def main() -> int:
     # Perturbation is printed before any finding, because it bounds how much of the
     # finding the tool itself caused.
     share = (stopped_total / wall * 100.0) if wall > 0 else 0.0
-    print(f"  process stopped by this tool: {stopped_total:.2f}s of {wall:.2f}s wall "
-          f"({share:.1f}% -- this is perturbation, not a measurement of the program)")
+    # UPPER BOUND, not a measurement: this is gdb's whole wall time -- process spawn, attach,
+    # symbol work, unwind, detach -- and the target is only actually stopped for part of it.
+    # Labelled as a bound because a tool that argues perturbation numbers must be trustworthy
+    # cannot then quote one that overstates itself without saying which way it errs. Erring
+    # high is the safe direction: it can cause an unnecessary --interval increase, never a
+    # falsely-clean run.
+    print(f"  perturbation UPPER BOUND: gdb held {stopped_total:.2f}s of {wall:.2f}s wall "
+          f"({share:.1f}%) -- includes gdb startup/symbol/detach, so the true stopped time is "
+          f"lower. Not a measurement of the program.")
     if share > 10.0:
         print("    WARNING: over 10% of wall clock was spent stopped. Raise --interval "
               "before trusting any timing conclusion drawn alongside this run.")
