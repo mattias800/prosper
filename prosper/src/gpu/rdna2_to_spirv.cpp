@@ -13535,8 +13535,15 @@ bool emit_cfg_state_machine(
                         // Its sibling at the ALU reject site already prints these; this one did not,
                         // so half the rejects from a run were unidentifiable and the two diagnostics
                         // could not be compared (#2309).
+                        // `mode` as at the ALU reject site (#2412): `unknown-encoding` means no
+                        // lowering exists and one must be written; `unresolved-operand` means the
+                        // lowering ran and could not resolve an operand or a resource-table
+                        // descriptor. Without it a census cannot tell "implement this" from
+                        // "this instruction is fine, its descriptor is not".
                         std::fprintf(stderr,
-                                     "[cfg-recompile-reject] pc=%u words=%s len=%u fmt=%d op=0x%x\n",
+                                     "[cfg-recompile-reject] mode=%s pc=%u words=%s len=%u "
+                                     "fmt=%d op=0x%x\n",
+                                     handled ? "unresolved-operand" : "unknown-encoding",
                                      in.pc, reject_words_text(in).c_str(), in.len_dwords,
                                      static_cast<int>(in.fmt), in.opcode);
                     return false;
@@ -14743,10 +14750,20 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG")) {
-                    fprintf(stderr, "[recompile-reject] pc=%u words=%s fmt=%d op=0x%x "
+                    // `mode` separates the two rejections that used to print identically and want
+                    // OPPOSITE work (#2412). `unknown-encoding` (handled=false) means no lowering
+                    // exists — write the emitter. `unresolved-operand` (handled=true, ok=false)
+                    // means the lowering exists and could not resolve an operand or a V#/T#/S#
+                    // through the resource table — the emitter is fine and the descriptor is the
+                    // defect. GTA V's black 3D world is the worked example: its top three rejected
+                    // instructions are buffer_store_dword / buffer_load_dwordx2 / buffer_load_dword,
+                    // all lowered at :9343-9362, so a census without this field reads as "implement
+                    // MUBUF" when nothing about MUBUF is missing.
+                    fprintf(stderr, "[recompile-reject] mode=%s pc=%u words=%s fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
                                     "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
                                     "sext=%d/%d\n",
+                        handled ? "unresolved-operand" : "unknown-encoding",
                         in.pc, reject_words_text(in).c_str(), (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
                         in.src[0].value, (int)in.src[0].kind,
