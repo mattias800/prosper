@@ -2759,6 +2759,55 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         have_pending_srt_use = true;
                     }
                 }
+                // RAW-POINTER scalar load (#2412). `s_load_dword`/`x2` (op < 8) take SBASE as a plain
+                // 64-bit pointer rather than a V#, and no use was recorded for them at all — the
+                // branch above is gated on `is_buffer`. GTA V's compute shaders read their constants
+                // exactly this way: `user_sgprs=6` holding three pointers and no descriptor anywhere,
+                // so `by_sgpr_base_cls(..., ConstantBuffer)` has nothing to find, the load rejects as
+                // `unresolved-cbuf`, and the whole program is skipped.
+                //
+                // The fold already proves what is needed: both SBASE dwords are const-folded, so the
+                // pointer is exact and wave-uniform, and the commit below measures the exact accessed
+                // span into `required_size`. Publish a key-less ConstantBuffer use keyed by the
+                // consuming pc — the same per-instruction provenance direct MIMG/MUBUF discovery uses,
+                // and the key the recompiler's SMEM path already tries FIRST (`by_fetch_pc(in.pc)`).
+                //
+                // `v4` carries only the pointer; words 2/3 stay zero so `decode_buffer_descriptor`
+                // yields size 0 and the consumer takes its documented `required_size` path, which is
+                // gated on exactly this key-less shape (`u.key != 0xFFFFFFFFu -> continue`).
+                //
+                // Deliberately USE-DRIVEN: it fires only for a scalar load the shader actually
+                // performs, never for a slot that merely parses. A declaration-driven version of this
+                // idea was tried in build_shader_resources and regressed the frame (#2412) precisely
+                // because it lacked that condition.
+                // SINGLE-DWORD loads only. `s_load_dword` reads one scalar of DATA; every wider form
+                // is a pointer or descriptor fetch whose result the fold already tracks as V#/T#/BVH
+                // provenance, and publishing a ConstantBuffer for those shadows the uses those paths
+                // exist to produce. `dynfetch_fold` establishes the bound empirically: at `n <= 2` its
+                // three BVH-root cases fail (a BVH root is a two-dword pointer load), and at `n <= 16`
+                // six cases fail including the x16 T#/S# publications. This is the widest form that
+                // is unambiguously data.
+                if (srt_uses && !is_buffer && n == 1 &&
+                    valid_reg(sbase) && valid_reg(sbase + 1) &&
+                    val_known.test((size_t)sbase) && val_known.test((size_t)(sbase + 1))) {
+                    const uint64_t ptr = (uint64_t)val[(size_t)sbase] |
+                                         ((uint64_t)val[(size_t)(sbase + 1)] << 32);
+                    if (ptr > 0x10000) {   // matches the consumer's own null/low-pointer guard
+                        pending_srt_use = SrtUse{};
+                        pending_srt_use.kind = 1;
+                        pending_srt_use.key = 0xFFFFFFFFu;         // no SRT tag: resolved by use_pc
+                        pending_srt_use.v4[0] = (uint32_t)(ptr & 0xFFFFFFFFu);
+                        pending_srt_use.v4[1] = (uint32_t)(ptr >> 32);
+                        pending_srt_use.v4[2] = 0;                 // size comes from required_size
+                        pending_srt_use.v4[3] = 0;
+                        pending_srt_use.use_pc = in.pc;
+                        have_pending_srt_use = true;
+                        if (trc)
+                            fprintf(stderr,
+                                    "[dyntrace] rawptr-use pc=%u sbase=s%d ptr=0x%llx imm=0x%x\n",
+                                    in.pc, sbase, (unsigned long long)ptr, in.literal);
+                    }
+                }
                 for (uint32_t k = 0; k < n; k++)
                     if (valid_reg(sdst + (int)k)) reloaded.set((size_t)(sdst + (int)k));
                 uint64_t base = 0; bool base_ok;
@@ -3651,12 +3700,29 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 if (r0.srt_offset == u.key) { clash = true; break; }
 
         const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
-        if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+        if (d.base <= 0x10000 || d.size_bytes > 0x10000000u) continue;
+        // A scalar consumer whose base is a RAW POINTER has no bounded V# size to report, so
+        // `size_bytes == 0` here means "unbounded", not "empty" (#2412). The graphics builder already
+        // makes exactly this distinction and documents it — *"Scalar SMEM only needs V#.Base plus the
+        // consuming load's exact byte span"* — and caps the pc-keyed upload to the measured access.
+        // Compute dropped the use instead, which is why GTA V's compute programs, whose entire user
+        // data is pointers, resolved nothing. Mirror the graphics rule rather than inventing a second
+        // one: key-less only, a real measured span, and the same 1 MiB ceiling.
+        uint32_t scalar_size = d.size_bytes;
+        uint32_t scalar_stride = d.stride;
+        if (scalar_size == 0) {
+            if (u.key != 0xFFFFFFFFu || u.required_size == 0 || u.required_size > (1u << 20))
+                continue;
+            scalar_size = u.required_size;
+            scalar_stride = 0;
+        } else if (scalar_size < u.required_size) {
+            scalar_size = u.required_size;
+        }
         if (clash && !exact_mtbuf) {
             bool piggybacked = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
-                    r0.size != d.size_bytes)
+                    r0.size != scalar_size)
                     continue;
                 if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
                 piggybacked = r0.fetch_pc == u.use_pc;
@@ -3669,13 +3735,20 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         if (u.instruction_format != UINT32_MAX) {
             rdna2_buffer_format(u.instruction_format, &r.format, &r.num_components);
             if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
-        } else {
+        } else if (d.format != DataFormat::Unknown) {
             r.format = d.format;
             r.num_components = d.num_components ? d.num_components : 1;
+        } else {
+            // A raw-pointer scalar consumer carries no format bits — its V# words 2 and 3 are zero
+            // because there is no descriptor, only an address. The access is a run of dwords, which
+            // is exactly what the scalar path reads, so describe it as such rather than propagating
+            // Unknown into a resource the renderer would then have to guess about (#2412).
+            r.format = DataFormat::Uint32;
+            r.num_components = 1;
         }
         r.gpu_addr = d.base;
-        r.size = d.size_bytes;
-        r.stride = d.stride;
+        r.size = scalar_size;
+        r.stride = scalar_stride;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
         r.fetch_pc = u.use_pc;
         table.resources.push_back(r);
