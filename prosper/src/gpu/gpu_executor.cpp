@@ -3251,6 +3251,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         current_known &= known(srsrc + k, current[(size_t)k]);
                     const bool loaded_provenance = valid_reg(srsrc) &&
                                                    descr_known.test((size_t)srsrc);
+                    // #2412: WHY a MUBUF publishes no descriptor use. A use is created only when the
+                    // fold knows all four SRSRC words; ~1.8% of sites fail that, and those are exactly
+                    // the instructions whose shaders then reject. This names which word was unknown, so
+                    // the causes can be enumerated per shader instead of guessed one at a time -- one
+                    // cause (VCC consumed as scalar data) was traced and fixed for 27 draws, so there
+                    // are demonstrably others.
+                    if (!current_known && std::getenv("PROSPER_MUBUF_UNKNOWN_LOG")) {
+                        int unknown_word = -1;
+                        for (int k = 0; k < 4 && unknown_word < 0; ++k) {
+                            uint32_t probe = 0;
+                            if (!known(srsrc + k, probe)) unknown_word = k;
+                        }
+                        fprintf(stderr,
+                                "[mubuf-unknown] pc=%u op=0x%x srsrc=s%d unknown_word=%d "
+                                "loaded_provenance=%d\n",
+                                in.pc, in.opcode, srsrc, unknown_word, (int)loaded_provenance);
+                    }
                     if (current_known) {
                         // MUBUF/MTBUF itself is definitive that its four SRSRC words are a V#. Publish
                         // the values LIVE at the consumer whenever the scalar fold knows all of them.
