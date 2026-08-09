@@ -90,7 +90,7 @@ enum : uint32_t {
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_EmitVertex=218, Op_EndPrimitive=219,
     Op_Kill=252, Op_Return=253, Op_ModuleProcessed=330, Op_GroupNonUniformAny=335,
-    Op_GroupNonUniformShuffle=345,
+    Op_GroupNonUniformBallot=339, Op_GroupNonUniformShuffle=345,
     Op_GroupNonUniformIAdd=349,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -102,7 +102,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
-    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
+    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformBallot=64, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
     Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
@@ -645,6 +645,29 @@ struct SpirvCompute {
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), value});
+        return result;
+    }
+    // One 32-bit HALF of the guest wave mask, materialised from this lane's bool (#2420).
+    // OpGroupNonUniformBallot returns a uvec4 whose .x/.y are lanes 0..31 / 32..63 OF THIS SUBGROUP,
+    // so it equals the guest mask only when the subgroup is exactly the guest wave. The caller must
+    // establish that; a narrower subgroup would report half a mask as though it were whole, which is
+    // silent wrong data rather than a visible reject.
+    bool declared_subgroup_ballot = false;
+    uint32_t native_wave_ballot_half(uint32_t mask_bit, uint32_t half) {
+        if (!native_subgroup_size || !mask_bit) return 0;
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_ballot) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
+            declared_subgroup_ballot = true;
+        }
+        const uint32_t ballot = id();
+        put(code, Op_GroupNonUniformBallot,
+            {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});
+        const uint32_t result = id();
+        putv(code, Op_CompositeExtract, {t_u32, result, ballot, half});
         return result;
     }
     uint32_t native_wave_first_active(uint32_t mask_bit) {
@@ -5356,6 +5379,26 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             // is zero. Compute/fragment keep their real multi-lane masks and must not take this path.
             if (!b.is_compute && !b.is_fragment && (o.value == 106 || o.value == 107))
                 return o.value == 106 ? b.sel(rs.vcc, b.uconst(1), b.uconst(0)) : b.uconst(0);
+            // VCC read as scalar DATA, materialised exactly (#2420). GTA V computes a descriptor-table
+            // pointer from the compare mask -- `s_add_u32 s60, s36, vcc_lo` -- and a per-invocation
+            // bool has no 32-bit value to add, so s60 became unknown, its s_load's base was unknown,
+            // the MUBUF reading that SRSRC could not fold, and the shader rejected. 23,166 draws of
+            // that title die this way (#2412).
+            //
+            // `subgroupBallot` supplies those bits EXACTLY, and only under one condition: its .x/.y
+            // are lanes 0..31 / 32..63 of THIS SUBGROUP, so it equals the guest wave mask only when
+            // the subgroup IS the guest wave. Narrower and it would report half a mask as though it
+            // were whole -- a wrong descriptor address, i.e. silent wrong rendering. So the exact-size
+            // contract is required, and anything else keeps rejecting exactly as before.
+            //
+            // Reached only on the path that already sets ok=false, so this can only turn a reject into
+            // working code; no shader that compiles today changes.
+            if ((o.value == 106 || o.value == 107) && rs.vcc &&
+                b.native_subgroup_size && b.native_subgroup_size == b.wave_size) {
+                const uint32_t half =
+                    b.native_wave_ballot_half(rs.vcc, o.value == 106 ? 0u : 1u);
+                if (half) return half;
+            }
             if (ok) *ok = false;
             if (getenv("PROSPER_DBG"))
                 std::fprintf(stderr,
