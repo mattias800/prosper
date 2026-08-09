@@ -154,7 +154,13 @@ struct Vk {
 
     VkCommandPool   cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd     = VK_NULL_HANDLE;
-    VkSemaphore     acquireSem = VK_NULL_HANDLE, presentSem = VK_NULL_HANDLE;
+    VkSemaphore     acquireSem = VK_NULL_HANDLE;
+    // #2403: ONE present semaphore PER SWAPCHAIN IMAGE, indexed by the acquired image index.
+    // A single shared semaphore is signalled by vkQueueSubmit while the presentation engine may still
+    // hold it from the previous image's present -- VUID-vkQueueSubmit-pSignalSemaphores-00067, 6x per
+    // GTA V run. The layer's own remedy (a); needs no extension.
+    std::vector<VkSemaphore> presentSems;
+    VkSemaphore     presentSem = VK_NULL_HANDLE;   // retained: fallback before the vector is sized
     VkFence         inFlight   = VK_NULL_HANDLE;
 
     // Present unification (#1270): set when the app adopted the renderer's shared device and presents by
@@ -352,6 +358,21 @@ void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout t
 // handles are deliberately retained until process teardown: the acquire signal operation may still
 // be pending, so destroying them here would itself violate Vulkan lifetime rules. This path is rare
 // and bounded by a fatal device/driver error.
+// #2403: the present semaphore for one acquired swapchain image, created on first use of that index.
+// Lazy rather than sized up-front because the acquired-index domain is whatever the driver hands back;
+// growing on demand needs no image-count plumbing and cannot under-size. Falls back to the single
+// shared semaphore only if creation fails, which is exactly the old (incorrect but working) behaviour.
+VkSemaphore present_sem_for(Vk& vk, uint32_t image_index) {
+    if (image_index >= vk.presentSems.size()) vk.presentSems.resize(image_index + 1, VK_NULL_HANDLE);
+    if (vk.presentSems[image_index] == VK_NULL_HANDLE) {
+        VkSemaphoreCreateInfo semi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkSemaphore s = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(vk.device, &semi, nullptr, &s) == VK_SUCCESS) vk.presentSems[image_index] = s;
+        else return vk.presentSem;
+    }
+    return vk.presentSems[image_index];
+}
+
 bool replace_present_sync(Vk& vk) {
     VkSemaphore acquire = VK_NULL_HANDLE;
     VkSemaphore present = VK_NULL_HANDLE;
@@ -369,6 +390,10 @@ bool replace_present_sync(Vk& vk) {
     }
     vk.acquireSem = acquire;
     vk.presentSem = present;
+    // #2403: drop the per-image set; present_sem_for() re-creates lazily per acquired index.
+    for (VkSemaphore s : vk.presentSems)
+        if (s) vkDestroySemaphore(vk.device, s, nullptr);
+    vk.presentSems.clear();
     vk.inFlight = fence;
     return true;
 }
@@ -476,6 +501,10 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
     VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     su.waitSemaphoreCount = 1; su.pWaitSemaphores = &vk.acquireSem; su.pWaitDstStageMask = &waitStage;
     su.commandBufferCount = 1; su.pCommandBuffers = &vk.cmd;
+    // #2403: bind the per-image present semaphore for THIS acquired index before use.
+    // Signalled by the submit below and waited by the present; sharing one across images
+    // is VUID-vkQueueSubmit-pSignalSemaphores-00067 (6x/run on GTA V).
+    vk.presentSem = present_sem_for(vk, imgIndex);
     su.signalSemaphoreCount = 1; su.pSignalSemaphores = &vk.presentSem;
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -619,6 +648,10 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     su.waitSemaphoreCount = 1; su.pWaitSemaphores = &vk.acquireSem; su.pWaitDstStageMask = &waitStage;
     su.commandBufferCount = 1; su.pCommandBuffers = &vk.cmd;
+    // #2403: bind the per-image present semaphore for THIS acquired index before use.
+    // Signalled by the submit below and waited by the present; sharing one across images
+    // is VUID-vkQueueSubmit-pSignalSemaphores-00067 (6x/run on GTA V).
+    vk.presentSem = present_sem_for(vk, imgIndex);
     su.signalSemaphoreCount = 1; su.pSignalSemaphores = &vk.presentSem;
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;

@@ -878,6 +878,14 @@ inline const RenderVkCtx& render_vk_ctx() {
         VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
         // samplerAnisotropy (#275): enable only if advertised; maxSamplerAnisotropy is the clamp ceiling.
         VkPhysicalDeviceFeatures supported{}; vkGetPhysicalDeviceFeatures(r.phys, &supported);
+        // #2396: the recompiler emits SPIR-V declaring the Int64 capability (24 modules per GTA V run)
+        // and we build PER-ATTACHMENT blend states for MRT -- both REQUIRE a device feature we never
+        // requested. VUID-...pCode-08740 (24) and VUID-...pAttachments-00605 (20), both -> 0 when
+        // enabled. Running against an unrequested capability is undefined behaviour, not a warning.
+        // Enabled only when advertised, matching samplerAnisotropy (#275): on a device without them the
+        // honest outcome is the layer error, not a silently miscompiled shader.
+        if (supported.shaderInt64)      feats.shaderInt64 = VK_TRUE;
+        if (supported.independentBlend) feats.independentBlend = VK_TRUE;
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
         r.max_compute_workgroup_size_x = phys_props.limits.maxComputeWorkGroupSize[0];
         r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;
