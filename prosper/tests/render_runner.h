@@ -4320,7 +4320,30 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
         const bool uses_internal_gds =
             fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
-        if (required_fragment_subgroup_size &&
+        // #2402: a fragment shader whose ONLY reason for wanting wave64 is a branch-guard VOTE
+        // (`wave-any`) does not depend on the wave WIDTH for its meaning -- "did any lane take this
+        // branch" is answered the same way over two 32-wide subgroups as over one 64-wide one. That
+        // is the opposite of a lane-IDENTITY dependence, where SubgroupLocalInvocationId *is* the
+        // guest lane id and no lowering exists; #2147 added the reason bits precisely so the two
+        // could be told apart, and its comment below says which has prospects.
+        //
+        // Skipping these draws is not a safe default -- it dropped GTA V's entire opening animation
+        // on NVIDIA (subgroup range 32..32) while AMD, whose wave64 is native, rendered it. The
+        // charter is explicit that an unsupported GPU operation is a fatal gap rather than an
+        // acceptable skip, and a silent skip reads as "handled" when real content is being lost.
+        //
+        // Narrow by construction: only when wave-any is the SOLE reason. Any lane-id, DPP,
+        // permlane, readlane64 or shuffle bit still gates, because those genuinely encode a
+        // 64-lane data layout. CONFIDENCE: MED -- the semantics argument is sound and the failure
+        // mode if wrong is a wrongly-taken branch in one shader, not memory unsafety.
+        const uint32_t fragment_wave_reasons =
+            required_fragment_subgroup_size == 64
+                ? prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs)
+                : 0u;
+        const bool wave_any_is_sole_reason =
+            fragment_wave_reasons != UINT32_MAX &&
+            fragment_wave_reasons == prosper::gpu::kFragmentWaveReasonWaveAny;
+        if (required_fragment_subgroup_size && !wave_any_is_sole_reason &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
              required_fragment_subgroup_size > ctx.max_subgroup_size ||
