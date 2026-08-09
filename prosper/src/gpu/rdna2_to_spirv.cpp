@@ -15301,6 +15301,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // control flow therefore needs no workgroup vote: the dispatcher selects the next block from
         // this pixel/vertex's SCC, VCC, or EXEC bit. Keep ordinary structured shaders on their compact
         // SSA path and use the Function-variable fallback only after the narrow structurizer rejects.
+        // Only one of these two blocks can run: complex_compute_cfg requires b.is_compute and
+        // complex_graphics_cfg requires graphics_cfg (b.is_fragment || b.is_vertex), and a module is
+        // one or the other. That exclusivity is what makes a clean reject (0) from the compute block
+        // safe to fall through — it reaches this block only in a stage that cannot enter it. If the
+        // stage predicates above ever stop being disjoint, this second attempt would run against
+        // builder state the first had already touched, and the checkpoint would no longer describe an
+        // untouched buffer.
         if (allow_cfg_dispatcher && complex_graphics_cfg && cf_rejected) {
             const int emitted = try_cfg_dispatcher();
             if (emitted > 0) return true;
