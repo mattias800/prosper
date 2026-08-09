@@ -14863,10 +14863,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // instructions are buffer_store_dword / buffer_load_dwordx2 / buffer_load_dword,
                     // all lowered at :9343-9362, so a census without this field reads as "implement
                     // MUBUF" when nothing about MUBUF is missing.
-                    fprintf(stderr, "[recompile-reject] mode=%s pc=%u words=%s fmt=%d op=0x%x "
+                    // Shader identity (#2412): the reject lines carry a program-local pc and nothing
+                    // else, so a census cannot group them by SHADER -- which is the unit that matters,
+                    // since 24,485 skipped GTA V draws turned out to be 43 distinct shaders. The first
+                    // code dword plus the span identifies one cheaply and stably.
+                    fprintf(stderr, "[recompile-reject] sh=%08x/%zu mode=%s pc=%u words=%s fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
                                     "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
                                     "sext=%d/%d\n",
+                        dwords ? code[0] : 0u, dwords,
                         handled ? "unresolved-operand" : "unknown-encoding",
                         in.pc, reject_words_text(in).c_str(), (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
