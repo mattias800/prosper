@@ -1062,10 +1062,30 @@ int main() {
     wave64_compute_config.wave_size = 64;
     wave64_compute_config.native_subgroup_size = 64;
     wave64_compute_config.local_x = 64;
-    if (!recompile_compute(wave32_compute_vopc_preserves_vcc_hi_data,
-                           std::size(wave32_compute_vopc_preserves_vcc_hi_data), nullptr,
-                           wave64_compute_config).empty()) {
-        printf("  [FAIL] implicit Wave64 VOPC preserved overwritten VCC_HI scalar data\n");
+    // In Wave64 the VOPC overwrites the WHOLE of VCC, so the 0.75f placed in VCC_HI is gone and the
+    // later read must NOT return it. That requirement is unchanged. What changed is the outcome: this
+    // used to be expressed as "the shader must reject", because a per-invocation bool could not
+    // express what VCC_HI now holds. It can — after a Wave64 v_cmp, VCC_HI is exactly lanes 32..63 of
+    // the compare mask, and `subgroupBallot(vcc).y` is exactly those bits when the subgroup IS the
+    // guest wave, which this config establishes (native_subgroup_size = 64). See #2420.
+    //
+    // Asserting the BALLOT OPCODE rather than mere non-emptiness is what pins the distinction: a
+    // module that compiled by some other route — in particular by resurrecting the stale scalar, the
+    // exact defect this case exists to catch — would not contain it.
+    const std::vector<uint32_t> wave64_vcc_hi = recompile_compute(
+        wave32_compute_vopc_preserves_vcc_hi_data,
+        std::size(wave32_compute_vopc_preserves_vcc_hi_data), nullptr, wave64_compute_config);
+    auto has_opcode = [](const std::vector<uint32_t>& m, uint32_t op) {
+        for (size_t i = 5; i < m.size();) {
+            const uint32_t len = m[i] >> 16;
+            if (len == 0 || i + len > m.size()) break;
+            if ((m[i] & 0xffffu) == op) return true;
+            i += len;
+        }
+        return false;
+    };
+    if (wave64_vcc_hi.empty() || !has_opcode(wave64_vcc_hi, 339)) {   // OpGroupNonUniformBallot
+        printf("  [FAIL] Wave64 VCC_HI read did not materialise the mask half via subgroupBallot\n");
         return 1;
     }
     printf("  [ok]   implicit VOPC preserves VCC_HI scalar data only in Wave32\n");
