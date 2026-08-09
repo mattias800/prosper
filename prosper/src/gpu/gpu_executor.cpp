@@ -2025,6 +2025,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // mistaken for an instruction. (The two earlier scanning loops in this function build branch edges
     // and mutate no fold state.)
     uint32_t watch_pc = 0xffffffffu;   // 0xffffffff = pre-loop seeding, not an instruction
+    // Raw words of the instruction being folded, so a FORGOTTEN line can be decoded directly with
+    // `llvm-mc -disassemble` instead of matched back to a dumped shader by pc -- pcs are
+    // program-local and several of this title's shaders share a prologue, which makes that match
+    // unreliable (#2412).
+    uint32_t watch_w0 = 0, watch_w1 = 0; uint32_t watch_len = 0;
     const int watch_sgpr = [] {
         const char* w = std::getenv("PROSPER_DYNTRACE_SGPR");
         return w ? (int)strtol(w, nullptr, 0) : -1;
@@ -2043,7 +2048,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
     auto forget = [&](int r) {
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] pc=%u s%d <- FORGOTTEN\n", watch_pc, r);
+            fprintf(stderr, "[sgprwatch] pc=%u s%d <- FORGOTTEN words=%08x:%08x len=%u\n",
+                    watch_pc, r, watch_w0, watch_w1, watch_len);
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
@@ -2330,6 +2336,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
 
     for (const auto& in : ins) {
         watch_pc = in.pc;
+        watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
+        watch_len = in.len_dwords;
         if (in.is_end) break;
         // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
         // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
