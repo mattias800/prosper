@@ -2014,7 +2014,29 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
     auto valid_reg = [](int r) { return r >= 0 && r < (int)kFoldSgprs; };
+    // PROSPER_DYNTRACE_SGPR=<n>: report every fold-visible transition of one scalar register. The
+    // existing traces cover SMEM/MIMG/MUBUF/BVH and deliberately not scalar ALU, so a register the fold
+    // ends up not knowing is invisible in them by construction -- which is #2412's remaining question
+    // ("what makes the fold lose the descriptor-table pointer") and nothing in the log could answer it.
+    //
+    // The pc is trustworthy, and that was checked rather than assumed. Every set_value/forget call that
+    // can fire during the walk is inside the ONE instruction loop below; the only calls outside it are
+    // the pre-loop seeding of system/user SGPRs, which report the sentinel 0xffffffff and so cannot be
+    // mistaken for an instruction. (The two earlier scanning loops in this function build branch edges
+    // and mutate no fold state.)
+    uint32_t watch_pc = 0xffffffffu;   // 0xffffffff = pre-loop seeding, not an instruction
+    // Raw words of the instruction being folded, so a FORGOTTEN line can be decoded directly with
+    // `llvm-mc -disassemble` instead of matched back to a dumped shader by pc -- pcs are
+    // program-local and several of this title's shaders share a prologue, which makes that match
+    // unreliable (#2412).
+    uint32_t watch_w0 = 0, watch_w1 = 0; uint32_t watch_len = 0;
+    const int watch_sgpr = [] {
+        const char* w = std::getenv("PROSPER_DYNTRACE_SGPR");
+        return w ? (int)strtol(w, nullptr, 0) : -1;
+    }();
     auto set_value = [&](int r, uint32_t v) {
+        if (r == watch_sgpr)
+            fprintf(stderr, "[sgprwatch] pc=%u s%d <- KNOWN 0x%08x\n", watch_pc, r, v);
         if (valid_reg(r)) {
             val[(size_t)r] = v;
             val_known.set((size_t)r);
@@ -2025,6 +2047,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
     };
     auto forget = [&](int r) {
+        if (r == watch_sgpr)
+            fprintf(stderr, "[sgprwatch] pc=%u s%d <- FORGOTTEN words=%08x:%08x len=%u\n",
+                    watch_pc, r, watch_w0, watch_w1, watch_len);
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
@@ -2310,6 +2335,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
 
     for (const auto& in : ins) {
+        watch_pc = in.pc;
+        watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
+        watch_len = in.len_dwords;
         if (in.is_end) break;
         // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
         // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
@@ -2759,12 +2787,68 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         have_pending_srt_use = true;
                     }
                 }
+                // RAW-POINTER scalar load (#2412). `s_load_dword`/`x2` (op < 8) take SBASE as a plain
+                // 64-bit pointer rather than a V#, and no use was recorded for them at all — the
+                // branch above is gated on `is_buffer`. GTA V's compute shaders read their constants
+                // exactly this way: `user_sgprs=6` holding three pointers and no descriptor anywhere,
+                // so `by_sgpr_base_cls(..., ConstantBuffer)` has nothing to find, the load rejects as
+                // `unresolved-cbuf`, and the whole program is skipped.
+                //
+                // The fold already proves what is needed: both SBASE dwords are const-folded, so the
+                // pointer is exact and wave-uniform, and the commit below measures the exact accessed
+                // span into `required_size`. Publish a key-less ConstantBuffer use keyed by the
+                // consuming pc — the same per-instruction provenance direct MIMG/MUBUF discovery uses,
+                // and the key the recompiler's SMEM path already tries FIRST (`by_fetch_pc(in.pc)`).
+                //
+                // `v4` carries only the pointer; words 2/3 stay zero so `decode_buffer_descriptor`
+                // yields size 0 and the consumer takes its documented `required_size` path, which is
+                // gated on exactly this key-less shape (`u.key != 0xFFFFFFFFu -> continue`).
+                //
+                // Deliberately USE-DRIVEN: it fires only for a scalar load the shader actually
+                // performs, never for a slot that merely parses. A declaration-driven version of this
+                // idea was tried in build_shader_resources and regressed the frame (#2412) precisely
+                // because it lacked that condition.
+                // SINGLE-DWORD loads only. `s_load_dword` reads one scalar of DATA; every wider form
+                // is a pointer or descriptor fetch whose result the fold already tracks as V#/T#/BVH
+                // provenance, and publishing a ConstantBuffer for those shadows the uses those paths
+                // exist to produce. `dynfetch_fold` establishes the bound empirically: at `n <= 2` its
+                // three BVH-root cases fail (a BVH root is a two-dword pointer load), and at `n <= 16`
+                // six cases fail including the x16 T#/S# publications. This is the widest form that
+                // is unambiguously data.
+                if (srt_uses && !is_buffer && n == 1 &&
+                    valid_reg(sbase) && valid_reg(sbase + 1) &&
+                    val_known.test((size_t)sbase) && val_known.test((size_t)(sbase + 1))) {
+                    const uint64_t ptr = (uint64_t)val[(size_t)sbase] |
+                                         ((uint64_t)val[(size_t)(sbase + 1)] << 32);
+                    if (ptr > 0x10000) {   // matches the consumer's own null/low-pointer guard
+                        pending_srt_use = SrtUse{};
+                        pending_srt_use.kind = 1;
+                        pending_srt_use.key = 0xFFFFFFFFu;         // no SRT tag: resolved by use_pc
+                        pending_srt_use.v4[0] = (uint32_t)(ptr & 0xFFFFFFFFu);
+                        pending_srt_use.v4[1] = (uint32_t)(ptr >> 32);
+                        pending_srt_use.v4[2] = 0;                 // size comes from required_size
+                        pending_srt_use.v4[3] = 0;
+                        pending_srt_use.use_pc = in.pc;
+                        have_pending_srt_use = true;
+                        if (trc)
+                            fprintf(stderr,
+                                    "[dyntrace] rawptr-use pc=%u sbase=s%d ptr=0x%llx imm=0x%x\n",
+                                    in.pc, sbase, (unsigned long long)ptr, in.literal);
+                    }
+                }
                 for (uint32_t k = 0; k < n; k++)
                     if (valid_reg(sdst + (int)k)) reloaded.set((size_t)(sdst + (int)k));
                 uint64_t base = 0; bool base_ok;
-                if (is_buffer) { uint32_t b0, b1; base_ok = known(sbase, b0) && known(sbase + 1, b1);
+                // `known()` leaves its out-param UNTOUCHED when it returns false, and both halves are
+                // composed into `base` regardless of `base_ok` — so an unknown SBASE used to read
+                // uninitialized stack and print it. That is undefined behaviour, and it produced a
+                // diagnostic that actively lied: a half-unknown pointer rendered as a plausible guest
+                // VA, because stale stack here is full of real addresses whose high dword is 0x20.
+                // It cost a session's worth of chasing a table pointer that was never known (#2412).
+                // Zero-initialise so an unknown half reads as an obvious 0 rather than as evidence.
+                if (is_buffer) { uint32_t b0 = 0, b1 = 0; base_ok = known(sbase, b0) && known(sbase + 1, b1);
                                  base = ((uint64_t)b0 | ((uint64_t)b1 << 32)) & 0xFFFFFFFFFFFFull; }   // V#.Base48
-                else { uint32_t p0, p1; base_ok = known(sbase, p0) && known(sbase + 1, p1);
+                else { uint32_t p0 = 0, p1 = 0; base_ok = known(sbase, p0) && known(sbase + 1, p1);
                        base = (uint64_t)p0 | ((uint64_t)p1 << 32); }        // raw pointer
                 if (trc) fprintf(stderr, "[dyntrace] SMEM op=0x%x %s sdst=s%d sbase=s%d base=0x%llx base_ok=%d "
                                  "soff_field=%u soff_val=0x%x soff_ok=%d imm=0x%x n=%u\n", in.opcode,
@@ -3175,6 +3259,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         current_known &= known(srsrc + k, current[(size_t)k]);
                     const bool loaded_provenance = valid_reg(srsrc) &&
                                                    descr_known.test((size_t)srsrc);
+                    // #2412: WHY a MUBUF publishes no descriptor use. A use is created only when the
+                    // fold knows all four SRSRC words; ~1.8% of sites fail that, and those are exactly
+                    // the instructions whose shaders then reject. This names which word was unknown, so
+                    // the causes can be enumerated per shader instead of guessed one at a time -- one
+                    // cause (VCC consumed as scalar data) was traced and fixed for 27 draws, so there
+                    // are demonstrably others.
+                    if (!current_known && std::getenv("PROSPER_MUBUF_UNKNOWN_LOG")) {
+                        int unknown_word = -1;
+                        for (int k = 0; k < 4 && unknown_word < 0; ++k) {
+                            uint32_t probe = 0;
+                            if (!known(srsrc + k, probe)) unknown_word = k;
+                        }
+                        fprintf(stderr,
+                                "[mubuf-unknown] pc=%u op=0x%x srsrc=s%d unknown_word=%d "
+                                "loaded_provenance=%d\n",
+                                in.pc, in.opcode, srsrc, unknown_word, (int)loaded_provenance);
+                    }
                     if (current_known) {
                         // MUBUF/MTBUF itself is definitive that its four SRSRC words are a V#. Publish
                         // the values LIVE at the consumer whenever the scalar fold knows all of them.
@@ -3651,12 +3752,29 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 if (r0.srt_offset == u.key) { clash = true; break; }
 
         const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
-        if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+        if (d.base <= 0x10000 || d.size_bytes > 0x10000000u) continue;
+        // A scalar consumer whose base is a RAW POINTER has no bounded V# size to report, so
+        // `size_bytes == 0` here means "unbounded", not "empty" (#2412). The graphics builder already
+        // makes exactly this distinction and documents it — *"Scalar SMEM only needs V#.Base plus the
+        // consuming load's exact byte span"* — and caps the pc-keyed upload to the measured access.
+        // Compute dropped the use instead, which is why GTA V's compute programs, whose entire user
+        // data is pointers, resolved nothing. Mirror the graphics rule rather than inventing a second
+        // one: key-less only, a real measured span, and the same 1 MiB ceiling.
+        uint32_t scalar_size = d.size_bytes;
+        uint32_t scalar_stride = d.stride;
+        if (scalar_size == 0) {
+            if (u.key != 0xFFFFFFFFu || u.required_size == 0 || u.required_size > (1u << 20))
+                continue;
+            scalar_size = u.required_size;
+            scalar_stride = 0;
+        } else if (scalar_size < u.required_size) {
+            scalar_size = u.required_size;
+        }
         if (clash && !exact_mtbuf) {
             bool piggybacked = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
-                    r0.size != d.size_bytes)
+                    r0.size != scalar_size)
                     continue;
                 if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
                 piggybacked = r0.fetch_pc == u.use_pc;
@@ -3669,13 +3787,20 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         if (u.instruction_format != UINT32_MAX) {
             rdna2_buffer_format(u.instruction_format, &r.format, &r.num_components);
             if (r.format == DataFormat::Unknown || r.num_components == 0) continue;
-        } else {
+        } else if (d.format != DataFormat::Unknown) {
             r.format = d.format;
             r.num_components = d.num_components ? d.num_components : 1;
+        } else {
+            // A raw-pointer scalar consumer carries no format bits — its V# words 2 and 3 are zero
+            // because there is no descriptor, only an address. The access is a run of dwords, which
+            // is exactly what the scalar path reads, so describe it as such rather than propagating
+            // Unknown into a resource the renderer would then have to guess about (#2412).
+            r.format = DataFormat::Uint32;
+            r.num_components = 1;
         }
         r.gpu_addr = d.base;
-        r.size = d.size_bytes;
-        r.stride = d.stride;
+        r.size = scalar_size;
+        r.stride = scalar_stride;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
         r.fetch_pc = u.use_pc;
         table.resources.push_back(r);
@@ -5323,6 +5448,42 @@ std::vector<ComputeItem> realize_compute_dispatches(
             if (logged.insert(code_addr).second) {
                 std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
                              (unsigned long long)code_addr);
+                // #2412: print the table this program was offered, next to the keys the shader looks
+                // up by. Every one of GTA V's 951 recompiler rejects is `mode=unresolved-operand`
+                // (#2416) — the lowering exists and the descriptor does not resolve — so the useful
+                // question is no longer "which instruction" but "which KEY missed". The recompiler
+                // matches a resource three ways: by fetch pc, by SRT offset, and by SGPR base; a
+                // resource carrying `srt=0xffffffff sgpr=0xffffffff` can be matched by none of them
+                // and is invisible to every lookup, however correct its address and size are.
+                if (std::getenv("PROSPER_DBG")) {
+                    if (!item.resources || item.resources->resources.empty()) {
+                        std::fprintf(stderr,
+                                     "[compute-table] program 0x%llx has NO resources at all\n",
+                                     (unsigned long long)code_addr);
+                    } else {
+                        size_t keyless = 0;
+                        for (const auto& r : item.resources->resources) {
+                            const bool no_key = r.srt_offset == 0xffffffffu &&
+                                                r.sgpr_base == 0xffffffffu &&
+                                                r.fetch_pc == 0xffffffffu;
+                            keyless += no_key ? 1 : 0;
+                            std::fprintf(stderr,
+                                         "[compute-table] rt=%p program 0x%llx binding=%u class=%u "
+                                         "addr=0x%llx size=%llu stride=%u srt=0x%x sgpr=%u pc=%u%s\n",
+                                         (const void*)item.resources.get(),
+                                         (unsigned long long)code_addr, r.binding,
+                                         static_cast<unsigned>(r.cls),
+                                         (unsigned long long)r.gpu_addr,
+                                         (unsigned long long)r.size, r.stride, r.srt_offset,
+                                         r.sgpr_base, r.fetch_pc, no_key ? "  <-- UNMATCHABLE" : "");
+                        }
+                        std::fprintf(stderr,
+                                     "[compute-table] program 0x%llx: %zu resource(s), %zu with no "
+                                     "lookup key\n",
+                                     (unsigned long long)code_addr,
+                                     item.resources->resources.size(), keyless);
+                    }
+                }
                 // PROSPER_SHADER_DUMP=<dir>: write the failed COMPUTE program's raw bytes for offline
                 // shader_inspect, mirroring the graphics VS/PS dump (gpu_execute.hpp). The graphics
                 // path was the only dumper, so a failing dispatch's CFG could not be mapped offline.

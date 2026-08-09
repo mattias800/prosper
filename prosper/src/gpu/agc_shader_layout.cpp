@@ -1079,7 +1079,67 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // pointer/data dwords decode with FORMAT=0. Dynamic descriptors whose format is patched by
             // shader ALU are recovered by resolve_dynamic_fetch instead of this metadata-only path.
             if (d.base == 0 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
-                d.format == DataFormat::Unknown || !d.num_components) continue;
+                d.format == DataFormat::Unknown || !d.num_components) {
+                // #2412: name WHICH clause rejected, and show the raw dwords. A direct slot that is
+                // really a 64-bit POINTER to an in-memory descriptor table decodes as a nonsense V#
+                // here, and the guard correctly drops it — but the log then looks identical to a
+                // genuinely absent resource. Printing the words separates "not a descriptor" from
+                // "a descriptor we mis-decoded", which need opposite fixes.
+                if (getenv("PROSPER_SHARPLOG")) {
+                    // Which of the two candidate BASE readings is actually mapped guest memory. A V#
+                    // stores base at bit 0 (Base48); the Gen5 256-byte-unit form used by
+                    // decode_bvh_descriptor just below stores it shifted, `base_256 << 8`. If the
+                    // shifted reading is mapped and the direct one is not, this slot is not a V# and
+                    // no adjustment to the plausibility guard can make it one.
+                    const uint64_t shifted =
+                        (((uint64_t)user_sgprs[reg] |
+                          ((uint64_t)(user_sgprs[reg + 1] & 0xFFu) << 32)) << 8);
+                    // THE decisive test for "this slot is a POINTER, not an inline descriptor".
+                    // If d.base is mapped and the 16 bytes AT d.base decode as a sane V#, then the
+                    // four SGPR dwords are a pointer pair and reading them as a descriptor is the
+                    // defect. Printing the dereferenced decode makes that a measurement rather than
+                    // an inference (#2412).
+                    if (d.base && guest_readable(d.base, 16)) {
+                        const uint32_t* at = reinterpret_cast<const uint32_t*>(
+                            static_cast<uintptr_t>(d.base));
+                        const DecodedBufferDescriptor deref = decode_buffer_descriptor(at);
+                        fprintf(stderr,
+                                "[direct-deref] type=%u sgpr=%u at=0x%llx words=%08x:%08x:%08x:%08x "
+                                "-> base=0x%llx rd=%d size=%llu stride=%u fmt=%u comps=%u\n",
+                                type, reg, (unsigned long long)d.base, at[0], at[1], at[2], at[3],
+                                (unsigned long long)deref.base,
+                                deref.base ? (int)guest_readable(deref.base, 16) : -1,
+                                (unsigned long long)deref.size_bytes, deref.stride,
+                                static_cast<unsigned>(deref.format), deref.num_components);
+                    }
+                    fprintf(stderr,
+                            "[direct-reject] type=%u sgpr=%u words=%08x:%08x:%08x:%08x "
+                            "base=0x%llx rd=%d | shifted=0x%llx rd=%d | "
+                            "size=%llu stride=%u fmt=%u comps=%u why=%s%s%s%s%s\n",
+                            type, reg, user_sgprs[reg], user_sgprs[reg + 1], user_sgprs[reg + 2],
+                            user_sgprs[reg + 3], (unsigned long long)d.base,
+                            d.base ? (int)guest_readable(d.base, 16) : -1,
+                            (unsigned long long)shifted,
+                            shifted ? (int)guest_readable(shifted, 16) : -1,
+                            (unsigned long long)d.size_bytes, d.stride,
+                            static_cast<unsigned>(d.format), d.num_components,
+                            d.base == 0 ? "base0 " : "",
+                            d.size_bytes == 0 ? "size0 " : "",
+                            d.size_bytes > 0x10000000u ? "size>256M " : "",
+                            d.format == DataFormat::Unknown ? "fmt-unknown " : "",
+                            !d.num_components ? "comps0" : "");
+                }
+                continue;
+            }
+            // #2412: the INLINE direct reading succeeding. Counting these across titles answers
+            // whether the inline interpretation is load-bearing anywhere, which is the gate on any
+            // change to this path: if type 8/10 never resolve inline on any title, the inline reading
+            // for those types is dead and can be replaced; if they do, it cannot.
+            if (getenv("PROSPER_SHARPLOG"))
+                fprintf(stderr,
+                        "[direct-accept] type=%u sgpr=%u base=0x%llx size=%llu stride=%u fmt=%u\n",
+                        type, reg, (unsigned long long)d.base, (unsigned long long)d.size_bytes,
+                        d.stride, static_cast<unsigned>(d.format));
             ShaderResource r;
             r.cls            = compute_buffer ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
             r.format         = d.format;

@@ -137,13 +137,9 @@ public:
     // whether it is set before or after the guest creates its ports.
 
     void set_gain(float g) {
-
         std::lock_guard<std::mutex> lk(mx_);
-
         gain_ = g;
-
         for (auto& s : slots_) if (s.stream) SDL_SetAudioStreamGain(s.stream, gain_);
-
     }
 
     void set_paused(bool paused) {

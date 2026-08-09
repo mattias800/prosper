@@ -1045,7 +1045,17 @@ namespace {
         // bytes really are CD 41, so no other title is affected (none emit int 0x41). Disable with
         // PROSPER_NO_INT41_SKIP to get the fatal path back for debugging, matching Linux.
         if (code == EXCEPTION_ACCESS_VIOLATION && g_base && c->Rip >= g_base &&
-            (!g_image_end || c->Rip < g_image_end) && addr_readable(c->Rip)) {
+            // BOTH bytes are validated, not just the first. This test runs on EVERY access
+            // violation whose rip is in the guest image -- not only on int41 faults -- so it
+            // speculatively reads ins[1] at arbitrary guest rips. addr_readable is a single
+            // VirtualQuery on the page containing its argument (:343), so a rip on the last byte of
+            // a committed page would leave ins[1] on an uncommitted successor and fault INSIDE the
+            // VEH: a nested exception rather than a clean diagnostic. Linux avoids this differently
+            // -- it bounds by an explicit g_base + 4 GiB band and argues the 2-byte read is safe
+            // within it -- so the Windows version needs its own second check rather than inheriting
+            // that argument. (Review finding on #2423.)
+            (!g_image_end || c->Rip < g_image_end) &&
+            addr_readable(c->Rip) && addr_readable(c->Rip + 1)) {
             const auto* ins = (const uint8_t*)(uintptr_t)c->Rip;
             static const bool int41_skip = getenv("PROSPER_NO_INT41_SKIP") == nullptr;
             if (int41_skip && ins[0] == 0xCDu && ins[1] == 0x41u) {

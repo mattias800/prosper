@@ -90,7 +90,7 @@ enum : uint32_t {
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_EmitVertex=218, Op_EndPrimitive=219,
     Op_Kill=252, Op_Return=253, Op_ModuleProcessed=330, Op_GroupNonUniformAny=335,
-    Op_GroupNonUniformShuffle=345,
+    Op_GroupNonUniformBallot=339, Op_GroupNonUniformShuffle=345,
     Op_GroupNonUniformIAdd=349,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -102,7 +102,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
-    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
+    Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformBallot=64, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
     Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
@@ -592,6 +592,34 @@ struct SpirvCompute {
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
         return result;
     }
+    // Fragment-side ballot (#2412). Same exactness argument as native_wave_ballot_half, but the
+    // fragment stage establishes its exact-wave contract differently: it does not carry
+    // native_subgroup_size, it DECLARES the width it needs via fragment_required_subgroup_size, which
+    // the backend then enforces (or skips the draw). Mirrors fragment_wave_any, which exists for the
+    // reduction form of the same problem.
+    //
+    // This is a REDUCE in #2410's taxonomy -- the bits become guest scalar DATA -- so the wave64
+    // requirement it records must NOT be relaxed to a narrower subgroup: half a mask reported as whole
+    // is silent wrong data.
+    uint32_t fragment_wave_ballot_half(uint32_t mask_bit, uint32_t half) {
+        if (!is_fragment || !mask_bit) return 0;
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_ballot) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
+            declared_subgroup_ballot = true;
+        }
+        fragment_required_subgroup_size = wave_size;
+        fragment_wave_reasons |= kFragmentWaveReasonWaveAny;
+        const uint32_t ballot = id();
+        put(code, Op_GroupNonUniformBallot,
+            {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});
+        const uint32_t result = id();
+        putv(code, Op_CompositeExtract, {t_u32, result, ballot, half});
+        return result;
+    }
     uint32_t subgroup_id() {
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
@@ -645,6 +673,29 @@ struct SpirvCompute {
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny,
             {t_bool, result, uconst(Scope_Subgroup), value});
+        return result;
+    }
+    // One 32-bit HALF of the guest wave mask, materialised from this lane's bool (#2420).
+    // OpGroupNonUniformBallot returns a uvec4 whose .x/.y are lanes 0..31 / 32..63 OF THIS SUBGROUP,
+    // so it equals the guest mask only when the subgroup is exactly the guest wave. The caller must
+    // establish that; a narrower subgroup would report half a mask as though it were whole, which is
+    // silent wrong data rather than a visible reject.
+    bool declared_subgroup_ballot = false;
+    uint32_t native_wave_ballot_half(uint32_t mask_bit, uint32_t half) {
+        if (!native_subgroup_size || !mask_bit) return 0;
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_ballot) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
+            declared_subgroup_ballot = true;
+        }
+        const uint32_t ballot = id();
+        put(code, Op_GroupNonUniformBallot,
+            {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});
+        const uint32_t result = id();
+        putv(code, Op_CompositeExtract, {t_u32, result, ballot, half});
         return result;
     }
     uint32_t native_wave_first_active(uint32_t mask_bit) {
@@ -3093,6 +3144,13 @@ struct RegState {
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
     uint32_t vcc = 0;
     uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
+    // #2418: does this shader read SCC anywhere? A STATIC property of the decoded stream, computed
+    // once before emission, never mutated during it — so it carries none of the lifetime hazards a
+    // stateful "pending reduction" marker would. It exists so the fragment stage can re-arm SCC after
+    // a mask op (which needs an exact wave vote, and so forces wave64) ONLY for shaders that actually
+    // consume it. Re-arming unconditionally is correct but makes every shader that merely saves EXEC
+    // pay a subgroup-size requirement it does not need, which gates the draw on a 32-wide device.
+    bool reads_scc = false;
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
     // PC-relative EMBEDDED TABLES (#273): load pc -> the table's dwords, resolved by
@@ -3389,6 +3447,50 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
         if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
     return true;   // every reachable path hit a redefinition/end without a read
+}
+
+// #2418: does this shader read SCC anywhere? Used to decide whether the fragment stage should pay for
+// an exact wave vote when a mask op writes SCC. Deliberately CONSERVATIVE and whole-shader: it answers
+// "could SCC ever be consumed", not "is this particular write live". A false positive costs one shader a
+// subgroup-size requirement it might not have needed; a false NEGATIVE would silently drop the vote a
+// consumer depends on, so every reader is listed even where the recompiler handles it elsewhere.
+//
+// SCC readers on RDNA2 (doc 70648): SOP2 s_cselect_b32/b64 (0x0a/0x0b) and the carry-in forms
+// s_addc_u32/s_subb_u32 (0x04/0x05); SOPP s_cbranch_scc0/scc1 (0x04/0x05); SOP1 s_cmov_b32/b64
+// (0x02/0x03); SOPK s_cmovk_i32 (0x02). SOPC and s_cmp_*/s_cmpk_* WRITE SCC and are not readers.
+//
+// SOPK was omitted in the first version of this scan and that was a genuine false negative -- the
+// direction this function's own contract calls the dangerous one, since a missed reader silently
+// drops the vote its consumer depends on. Caught in review of #2416. The file already documents the
+// hazard at the `sopk_writes_scalar_data` exclusion note: "several SOPK ops (s_addk/s_mulk/s_cmovk/
+// s_cmpk) READ or read-modify-write their dst via the implicit SIMM16".
+//
+// Only s_cmovk_i32 READS SCC in this space, verified rather than taken from a table --
+// `llvm-mc -mcpu=gfx1030 -disassemble` over the SOPK opcode range gives 0x00 s_movk_i32,
+// 0x02 s_cmovk_i32, 0x03.. s_cmpk_* (which WRITE SCC), 0x0f s_addk_i32, 0x10 s_mulk_i32,
+// 0x12/0x13 s_getreg/s_setreg. Including the whole SOPK format would be conservative in the safe
+// direction but costs every shader containing an s_movk -- which is nearly all of them -- a
+// subgroup-size requirement it does not need.
+inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
+    for (const auto& in : ins) {
+        switch (in.fmt) {
+            case Rdna2Format::SOP2:
+                if (in.opcode == 0x04 || in.opcode == 0x05 ||
+                    in.opcode == 0x0a || in.opcode == 0x0b) return true;
+                break;
+            case Rdna2Format::SOPP:
+                if (in.opcode == 0x04 || in.opcode == 0x05) return true;
+                break;
+            case Rdna2Format::SOP1:
+                if (in.opcode == 0x02 || in.opcode == 0x03) return true;
+                break;
+            case Rdna2Format::SOPK:
+                if (in.opcode == 0x02) return true;   // s_cmovk_i32: conditional move ON SCC
+                break;
+            default: break;
+        }
+    }
+    return false;
 }
 
 std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
@@ -5321,6 +5423,26 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             // is zero. Compute/fragment keep their real multi-lane masks and must not take this path.
             if (!b.is_compute && !b.is_fragment && (o.value == 106 || o.value == 107))
                 return o.value == 106 ? b.sel(rs.vcc, b.uconst(1), b.uconst(0)) : b.uconst(0);
+            // VCC read as scalar DATA, materialised exactly (#2420). GTA V computes a descriptor-table
+            // pointer from the compare mask -- `s_add_u32 s60, s36, vcc_lo` -- and a per-invocation
+            // bool has no 32-bit value to add, so s60 became unknown, its s_load's base was unknown,
+            // the MUBUF reading that SRSRC could not fold, and the shader rejected. 23,166 draws of
+            // that title die this way (#2412).
+            //
+            // `subgroupBallot` supplies those bits EXACTLY, and only under one condition: its .x/.y
+            // are lanes 0..31 / 32..63 of THIS SUBGROUP, so it equals the guest wave mask only when
+            // the subgroup IS the guest wave. Narrower and it would report half a mask as though it
+            // were whole -- a wrong descriptor address, i.e. silent wrong rendering. So the exact-size
+            // contract is required, and anything else keeps rejecting exactly as before.
+            //
+            // Reached only on the path that already sets ok=false, so this can only turn a reject into
+            // working code; no shader that compiles today changes.
+            if ((o.value == 106 || o.value == 107) && rs.vcc &&
+                b.native_subgroup_size && b.native_subgroup_size == b.wave_size) {
+                const uint32_t half =
+                    b.native_wave_ballot_half(rs.vcc, o.value == 106 ? 0u : 1u);
+                if (half) return half;
+            }
             if (ok) *ok = false;
             if (getenv("PROSPER_DBG"))
                 std::fprintf(stderr,
@@ -5399,6 +5521,66 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            // s_quadmask_b64 D, S (#2412): D[i] = S[4i]|S[4i+1]|S[4i+2]|S[4i+3] for i in 0..15, upper
+            // bits zero. Each output bit ORs a QUAD of lanes, so a per-invocation bool cannot form it.
+            // `s_quadmask_b64 vcc, vcc` (0xbeea2d6a, confirmed with llvm-mc) is the first reject in 20
+            // of GTA V's 59 failing shaders.
+            //
+            // A ballot gives the source mask exactly; the quadmask is then integer arithmetic over it.
+            // BOTH representations prosper keeps for a mask register are produced -- the scalar DATA
+            // value in sreg and the per-lane bool -- so it cannot matter which a later instruction
+            // consumes; writing one and leaving the other stale would be silent wrong rendering.
+            //
+            // Wave64 only, and each stage supplies its exact-wave contract its own way: compute carries
+            // native_subgroup_size, the fragment stage DECLARES fragment_required_subgroup_size. An
+            // earlier revision gated on native_subgroup_size alone and therefore never fired for the
+            // graphics shaders that need it -- dead code that ctest could not see, caught only by
+            // measuring the failing-shader count. Vertex has neither mechanism and still rejects.
+            if (in.opcode == 0x2d && b.wave_size == 64 &&
+                (b.is_fragment || (b.native_subgroup_size == b.wave_size))) {
+                uint32_t src_mask = 0;
+                if (in.src[0].value == 106 || in.src[0].value == 107) src_mask = rs.vcc;
+                else if (in.src[0].value == 126 || in.src[0].value == 127) src_mask = rs.exec;
+                else if (in.src[0].kind == OperandKind::SGPR) {
+                    auto it = rs.sreg_bool.find(in.src[0].value);
+                    if (it != rs.sreg_bool.end()) src_mask = it->second;
+                }
+                const uint32_t lo = src_mask ? (b.is_fragment
+                        ? b.fragment_wave_ballot_half(src_mask, 0)
+                        : b.native_wave_ballot_half(src_mask, 0)) : 0;
+                const uint32_t hi = src_mask ? (b.is_fragment
+                        ? b.fragment_wave_ballot_half(src_mask, 1)
+                        : b.native_wave_ballot_half(src_mask, 1)) : 0;
+                if (lo && hi) {
+                    uint32_t value = b.uconst(0);
+                    for (uint32_t i = 0; i < 16; ++i) {
+                        const uint32_t word = i < 8 ? lo : hi;
+                        const uint32_t shift = (i < 8 ? i : i - 8) * 4u;
+                        const uint32_t nibble = b.ibin(
+                            Op_BitwiseAnd,
+                            b.ibin(Op_ShiftRightLogical, word, b.uconst(shift)), b.uconst(0xFu));
+                        value = b.ibin(Op_BitwiseOr, value,
+                                       b.sel(b.ucmp(Op_INotEqual, nibble, b.uconst(0)),
+                                             b.uconst(1u << i), b.uconst(0)));
+                    }
+                    const int dst = in.dst.value;
+                    rs.sreg[dst] = value;
+                    rs.sreg[dst + 1] = b.uconst(0);
+                    rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);
+                    const uint32_t lane = b.ibin(Op_BitwiseAnd, b.subgroup_local_id(),
+                                                 b.uconst(b.wave_size - 1));
+                    const uint32_t my_bit = b.ibin(
+                        Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, value, lane), b.uconst(1u));
+                    const uint32_t as_bool = b.land(
+                        b.ucmp(Op_ULessThan, lane, b.uconst(16u)),
+                        b.ucmp(Op_INotEqual, my_bit, b.uconst(0)));
+                    if (dst == 126 || dst == 127) { rs.exec = as_bool; rs.exec_narrowed = true; }
+                    else if (dst == 106 || dst == 107) rs.vcc = as_bool;
+                    else rs.sreg_bool[dst] = as_bool;
+                    rs.scc = b.ucmp(Op_INotEqual, value, b.uconst(0));
+                    return true;
+                }
+            }
             if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.opcode == 0x13) { // s_ff1_i32_b32
                 // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty
@@ -5927,6 +6109,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // EXECZ guard is conservatively (and incorrectly) rejected.
                     const bool source_is_exec = in.src[0].value == 126 || in.src[0].value == 127;
                     rs.exec_narrowed = !((in.opcode == 0x28 || in.opcode == 0x2b) && source_is_exec);
+                    // RE-ARM SCC for the FRAGMENT stage (#2418). The poison above is the right default
+                    // — SCC here is `(result != 0)` over the whole 64-lane mask, which one lane's bool
+                    // cannot express — but the fragment stage has an exact instrument for precisely
+                    // this reduction, and this file already uses it for the same purpose after v_cmpx
+                    // narrows EXEC (`rs.scc = b.is_fragment ? b.fragment_wave_any(rs.exec) : 0;`).
+                    // `fragment_wave_any`'s contract is "exact scalar wave vote for fragment control
+                    // flow AND MASK REDUCTIONS".
+                    //
+                    // Without it, the poisoned SCC makes every later consumer reject — `s_cselect_b32`
+                    // at the SOP2 switch (`if (!rs.scc) { ok = false; }`), `s_addc`, and SCC branch
+                    // emission — which is a large share of GTA V's 23,386 skipped draws, since
+                    // saveexec-then-`s_cbranch_scc0` is an ordinary shape in its pixel shaders.
+                    //
+                    // GATED ON `reads_scc`, and that gate is the whole point. `fragment_wave_any` sets
+                    // `fragment_required_subgroup_size`, so an unconditional re-arm would give every
+                    // shader that merely saves EXEC a wave64 requirement it does not need — and that
+                    // shader is then GATED on a 32-wide device where it works today. On a native-wave64
+                    // host that regression is invisible, which is exactly why it is guarded here rather
+                    // than discovered later on other hardware.
+                    //
+                    // This is a REDUCE in #2410's taxonomy: the value becomes a guest scalar consumed
+                    // as data, so forcing wave64 where it IS used is correct and must not be relaxed.
+                    // Compute and vertex keep the poison — compute has its own synchronized guest-wave
+                    // reduction paths, and the vertex stage has no equivalent exact vote at all.
+                    if (b.is_fragment && rs.reads_scc) rs.scc = b.fragment_wave_any(rs.exec);
                 }
                 return true;
             }
@@ -9548,8 +9755,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (getenv("PROSPER_DBG")) {
                         const ShaderResource* pp = rt->by_fetch_pc(in.pc);
                         fprintf(stderr,
-                                "[mubuf-raw-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x "
+                                "[mubuf-raw-unresolved] rt=%p pc=%u srsrc=s%d srt_tag=%s0x%x "
                                 "key_res=%s pc_res=%s rewritten=%d (%zu res)\n",
+                                (const void*)rt,
                                 in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ", srt_tag,
                                 has_srt_tag && rt->by_srt_offset(srt_tag) ? "yes" : "null",
                                 pp ? "yes" : "null",
@@ -13535,8 +13743,15 @@ bool emit_cfg_state_machine(
                         // Its sibling at the ALU reject site already prints these; this one did not,
                         // so half the rejects from a run were unidentifiable and the two diagnostics
                         // could not be compared (#2309).
+                        // `mode` as at the ALU reject site (#2412): `unknown-encoding` means no
+                        // lowering exists and one must be written; `unresolved-operand` means the
+                        // lowering ran and could not resolve an operand or a resource-table
+                        // descriptor. Without it a census cannot tell "implement this" from
+                        // "this instruction is fine, its descriptor is not".
                         std::fprintf(stderr,
-                                     "[cfg-recompile-reject] pc=%u words=%s len=%u fmt=%d op=0x%x\n",
+                                     "[cfg-recompile-reject] mode=%s pc=%u words=%s len=%u "
+                                     "fmt=%d op=0x%x\n",
+                                     handled ? "unresolved-operand" : "unknown-encoding",
                                      in.pc, reject_words_text(in).c_str(), in.len_dwords,
                                      static_cast<int>(in.fmt), in.opcode);
                     return false;
@@ -14743,10 +14958,25 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG")) {
-                    fprintf(stderr, "[recompile-reject] pc=%u words=%s fmt=%d op=0x%x "
+                    // `mode` separates the two rejections that used to print identically and want
+                    // OPPOSITE work (#2412). `unknown-encoding` (handled=false) means no lowering
+                    // exists — write the emitter. `unresolved-operand` (handled=true, ok=false)
+                    // means the lowering exists and could not resolve an operand or a V#/T#/S#
+                    // through the resource table — the emitter is fine and the descriptor is the
+                    // defect. GTA V's black 3D world is the worked example: its top three rejected
+                    // instructions are buffer_store_dword / buffer_load_dwordx2 / buffer_load_dword,
+                    // all lowered at :9343-9362, so a census without this field reads as "implement
+                    // MUBUF" when nothing about MUBUF is missing.
+                    // Shader identity (#2412): the reject lines carry a program-local pc and nothing
+                    // else, so a census cannot group them by SHADER -- which is the unit that matters,
+                    // since 24,485 skipped GTA V draws turned out to be 43 distinct shaders. The first
+                    // code dword plus the span identifies one cheaply and stably.
+                    fprintf(stderr, "[recompile-reject] sh=%08x/%zu mode=%s pc=%u words=%s fmt=%d op=0x%x "
                                     "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
                                     "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
                                     "sext=%d/%d\n",
+                        dwords ? code[0] : 0u, dwords,
+                        handled ? "unresolved-operand" : "unknown-encoding",
                         in.pc, reject_words_text(in).c_str(), (int)in.fmt, in.opcode,
                         in.dst.value, (int)in.dst.kind,
                         in.src[0].value, (int)in.src[0].kind,
@@ -16304,6 +16534,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
         }
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    // #2418: a static property of the decoded stream, set once and never mutated during emission.
+    // Gates the fragment SCC re-arm after mask ops so only shaders that actually consume SCC pay the
+    // exact-wave-vote's subgroup-size requirement.
+    rs.reads_scc = shader_reads_scc(ins);
     if (system_inputs) {
         // RDNA2 PS system values are packed in field order. ADDR reserves each field's documented
         // width even when ENA is clear, allowing a driver to keep later VGPR numbers stable. Vulkan
