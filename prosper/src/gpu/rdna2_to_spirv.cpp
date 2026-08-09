@@ -15380,7 +15380,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // until the complete guest wave becomes empty makes scalar state and nested wave votes
             // exact; vector writes remain predicated by the per-lane EXEC bool.
             if (b.is_fragment && L.condition != DivLoop::Condition::Scc)
-                loop_cond = b.fragment_wave_any(loop_cond, /*as_guard=*/true);
+                // NOT a guard. The comment above states the invariant this site exists to hold:
+                // every invocation stays in the loop until the COMPLETE GUEST WAVE becomes empty.
+                // `OpGroupNonUniformAny` answers over the hardware subgroup, so on a 32-wide device
+                // it reports "any of my 32", and each half of a 64-lane guest wave would leave the
+                // loop when its own half emptied -- which is precisely the invariant being claimed.
+                // The trip count is a wave-wide decision, so this is a REDUCE and must keep forcing
+                // wave64. Marked as_guard=true in an earlier revision of #2410; `ctest` caught it
+                // via recompiled_fragment_render's backedge-break fail-visible arm.
+                loop_cond = b.fragment_wave_any(loop_cond);
             const uint32_t chk_end = b.cur_block;
             b.emit_condbranch(loop_cond, body, merge);         // canonical exit: branch on continue predicate
             while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;
