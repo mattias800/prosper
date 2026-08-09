@@ -4279,7 +4279,39 @@ namespace {
         }
         // A private fixed mapping would report success while severing the physical alias contract.
         // Older Windows versions without placeholder replacement fail visibly instead.
-        if (fixed) return nullptr;
+        //
+        // This return is the one that KILLS A TITLE, and until #2424 it was the only failure path in
+        // this function that said nothing. The private fallback immediately below logs; this did not,
+        // so a fixed MAP_DIRECT that failed was indistinguishable in a log from one that never ran.
+        // Reconstructing GTA V's (PPSA04263) wall took a VEH dump, a guest disassembly and a batchmap
+        // return code, all to learn that this line had been taken.
+        //
+        // The placeholder spans are dumped with it because the suspected mechanism is which LIST a
+        // span sits in: coalescing is deliberately confined to spans of the same guest ownership
+        // (remember_placeholder_locked), so two adjacent halves in g_free_placeholders and
+        // g_guest_placeholders can never merge, and MapViewOfFile3 cannot span two placeholders.
+        // Printing both lists is what distinguishes that from a same-list coalesce that simply
+        // failed -- a different bug with a different fix.
+        if (fixed) {
+            if (memlog()) {   // guard the lock too: MLOG alone would still take g_dview_mx
+                const DWORD err = GetLastError();
+                MLOG("map_dmem FIXED FAILED hint=0x%llx len=0x%llx phys=0x%llx align=0x%llx error=%lu"
+                     " -- guest gets ENOMEM\n",
+                     (unsigned long long)hint, (unsigned long long)len,
+                     (unsigned long long)phys, (unsigned long long)align, (unsigned long)err);
+                std::lock_guard<std::mutex> lk(g_dview_mx);
+                const uint64_t lo = hint, hi = hint + len;
+                for (const PlaceholderSpan& s : g_free_placeholders)
+                    if (s.base < hi && lo < s.base + s.size)
+                        MLOG("  overlapping FREE placeholder base=0x%llx size=0x%llx\n",
+                             (unsigned long long)s.base, (unsigned long long)s.size);
+                for (const PlaceholderSpan& s : g_guest_placeholders)
+                    if (s.base < hi && lo < s.base + s.size)
+                        MLOG("  overlapping GUEST placeholder base=0x%llx size=0x%llx\n",
+                             (unsigned long long)s.base, (unsigned long long)s.size);
+            }
+            return nullptr;
+        }
         MLOG("map_dmem private fallback hint=0x%llx len=0x%llx phys=0x%llx align=0x%llx error=%lu\n",
              (unsigned long long)hint, (unsigned long long)len,
              (unsigned long long)phys, (unsigned long long)align, GetLastError());
