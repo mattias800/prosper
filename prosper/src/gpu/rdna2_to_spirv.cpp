@@ -3457,7 +3457,20 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
 //
 // SCC readers on RDNA2 (doc 70648): SOP2 s_cselect_b32/b64 (0x0a/0x0b) and the carry-in forms
 // s_addc_u32/s_subb_u32 (0x04/0x05); SOPP s_cbranch_scc0/scc1 (0x04/0x05); SOP1 s_cmov_b32/b64
-// (0x02/0x03). SOPC and s_cmp_* WRITE SCC and are not readers.
+// (0x02/0x03); SOPK s_cmovk_i32 (0x02). SOPC and s_cmp_*/s_cmpk_* WRITE SCC and are not readers.
+//
+// SOPK was omitted in the first version of this scan and that was a genuine false negative -- the
+// direction this function's own contract calls the dangerous one, since a missed reader silently
+// drops the vote its consumer depends on. Caught in review of #2416. The file already documents the
+// hazard at the `sopk_writes_scalar_data` exclusion note: "several SOPK ops (s_addk/s_mulk/s_cmovk/
+// s_cmpk) READ or read-modify-write their dst via the implicit SIMM16".
+//
+// Only s_cmovk_i32 READS SCC in this space, verified rather than taken from a table --
+// `llvm-mc -mcpu=gfx1030 -disassemble` over the SOPK opcode range gives 0x00 s_movk_i32,
+// 0x02 s_cmovk_i32, 0x03.. s_cmpk_* (which WRITE SCC), 0x0f s_addk_i32, 0x10 s_mulk_i32,
+// 0x12/0x13 s_getreg/s_setreg. Including the whole SOPK format would be conservative in the safe
+// direction but costs every shader containing an s_movk -- which is nearly all of them -- a
+// subgroup-size requirement it does not need.
 inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
     for (const auto& in : ins) {
         switch (in.fmt) {
@@ -3470,6 +3483,9 @@ inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
                 break;
             case Rdna2Format::SOP1:
                 if (in.opcode == 0x02 || in.opcode == 0x03) return true;
+                break;
+            case Rdna2Format::SOPK:
+                if (in.opcode == 0x02) return true;   // s_cmovk_i32: conditional move ON SCC
                 break;
             default: break;
         }
