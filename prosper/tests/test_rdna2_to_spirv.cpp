@@ -15,6 +15,7 @@
 #include "compute_runner.h"
 #include <algorithm>
 #include <bit>
+#include <set>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -7230,6 +7231,86 @@ int main() {
         };
         CHECK(recompile_valu(overlap_cs, std::size(overlap_cs), 1, 2).empty(),
               "#590: partially-overlapping loops remain REJECTED (unstructured region)");
+    }
+
+    // #2396: a CFG-dispatcher attempt that fails PART WAY THROUGH must not leave its half-written
+    // dispatcher in the module. emit_cfg_state_machine writes the dispatcher loop's OpLoopMerge,
+    // its OpSelectionMerge and the OpSwitch before it emits the per-case bodies, so a reject inside
+    // a case body used to fall through to the structurizer with those instructions still in the
+    // buffer — referencing case/default/continue/merge labels that were never emitted. The result
+    // was structurally invalid SPIR-V that nothing downstream caught: RADV's spirv_to_nir returns
+    // NULL on it and radv_shader.c:542 dereferences that NULL, which is how GTA V (PPSA04263)
+    // segfaulted the render thread on Linux/AMD.
+    //
+    // The stream forces the dispatcher (varying VCC branch + back-edge loop, as kernel 17d does) and
+    // then puts an instruction the dispatcher CANNOT lower into a later block. The MUBUF is the exact
+    // pair of guest dwords GTA V's rejected compute program contains; with no ShaderResourceTable it
+    // cannot resolve, so the reject lands after the switch header is already written.
+    {
+        const uint32_t partial_dispatcher_cs[] = {
+            0xBE800380u,               //  0: s_mov_b32 s0, 0
+            0x7E020284u,               //  1: v_mov_b32 v1, 4
+            0x7DA20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF880008u,               //  3: s_cbranch_execz +8 -> 12
+            0x7DA20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
+            0xBF880008u,               //  5: s_cbranch_execz +8 -> 14
+            0xf4000480u, 0xfa000078u,  //  6: SMEM s_load_dword — with no ShaderResourceTable the
+                                       //     base pointer cannot resolve, so this rejects inside
+                                       //     emit_alu DURING case emission, after the loop/switch
+                                       //     header is already written
+            0x81008100u,               //  8: s0++
+            0xBF82FFF8u,               //  9: s_branch -8 -> 2 (A back-edge; A=[2,9])
+            0x81008100u,               // 10: s0++
+            0xBF82FFF8u,               // 11: s_branch -8 -> 4 (B back-edge; overlaps A, not nested)
+            0x7E040280u,               // 12: v_mov_b32 v2, 0
+            0x7E040280u,               // 13: v_mov_b32 v2, 0
+            0xBF810000u,               // 14: s_endpgm
+        };
+        const std::vector<uint32_t> spv =
+            recompile_valu(partial_dispatcher_cs, std::size(partial_dispatcher_cs), 1, 2);
+
+        // NOTE ON WHAT THIS TEST DOES AND DOES NOT PROVE. It asserts the INVARIANT — no emitted
+        // module may reference a label it never defines — and it is not a counter-arm for the fix
+        // that motivated it. Reproducing the defect in a unit needs the dispatcher to partial-fail
+        // AND the structurizer fallback to then SUCCEED, and in every synthetic stream tried here
+        // the fallback rejects too, so the partial output is discarded and nothing ships either way.
+        // Streams that merely reach the partial path (kernel 17d1s at line ~686 is one; verified
+        // with a temporary probe) end up empty with and without the fix, so asserting emptiness on
+        // them would pass for the wrong reason. The regression evidence for the fix itself is the
+        // live GTA V (PPSA04263) run recorded on #2396: before, the run segfaults and Mesa's
+        // MESA_SPIRV_DUMP_PATH module fails `spirv-val` with six undefined forward references;
+        // after, the route reaches gameplay and 199 of 200 dumped modules validate.
+        auto every_referenced_label_is_defined = [](const std::vector<uint32_t>& m) {
+            if (m.size() < 5) return true;
+            std::set<uint32_t> defined, referenced;
+            for (size_t i = 5; i < m.size();) {
+                const uint32_t op = m[i] & 0xffffu, len = m[i] >> 16;
+                if (len == 0 || i + len > m.size()) break;
+                switch (op) {
+                    case 248: defined.insert(m[i+1]); break;                    // OpLabel
+                    case 249: referenced.insert(m[i+1]); break;                 // OpBranch
+                    case 250: referenced.insert(m[i+2]);                        // OpBranchConditional
+                              referenced.insert(m[i+3]); break;
+                    case 246: referenced.insert(m[i+1]);                        // OpLoopMerge
+                              referenced.insert(m[i+2]); break;
+                    case 247: referenced.insert(m[i+1]); break;                 // OpSelectionMerge
+                    // OpSwitch %selector %default (<literal> <label>)* — words are
+                    // [1]=selector [2]=default [3]=literal0 [4]=label0 [5]=literal1 [6]=label1 ...
+                    // so the case LABELS are the even offsets from 4, not the odd ones.
+                    case 251: referenced.insert(m[i+2]);
+                              for (uint32_t w = 4; w < len; w += 2)
+                                  referenced.insert(m[i+w]);
+                              break;
+                    default: break;
+                }
+                i += len;
+            }
+            for (uint32_t label : referenced)
+                if (!defined.count(label)) return false;
+            return true;
+        };
+        CHECK(every_referenced_label_is_defined(spv),
+              "#2396: no emitted module references a label it never defines");
     }
 
     // Astro Bot's exact RTIP 1.1 IMAGE_BVH_INTERSECT_RAY lowering, executed on real Vulkan. The

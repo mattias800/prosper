@@ -15268,18 +15268,51 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return false;
             return true;
         }
-        if (allow_cfg_dispatcher && complex_compute_cfg && (cf_rejected || Ls.empty()) &&
-            emit_cfg_state_machine(b, rs, ins, safe, rt,
-                                   allow_exec_update, allow_smem, exp_fn, code, dwords))
-            return true;
+        // Attempting the dispatcher is only recoverable while it has emitted NOTHING.
+        // emit_cfg_state_machine writes the dispatcher loop's OpLoopMerge, its OpSelectionMerge and
+        // the OpSwitch into b.code *before* it emits the per-case block bodies, and it can still
+        // reject inside a case body (an unlowerable instruction, an unresolvable successor). Falling
+        // through to the structurizer after that leaves the half-written construct in the module: the
+        // switch and both merges survive, referencing case / default / continue / merge labels that
+        // are never emitted. That is structurally invalid SPIR-V, and nothing downstream catches it —
+        // `spirv-val` is a CI gate over representative modules, not over game shaders, so the module
+        // reaches the driver, `spirv_to_nir` returns NULL, and RADV dereferences that NULL (#2396).
+        // So the attempt is transactional: fall back only when the buffer is untouched, and reject
+        // loudly once anything has been written.
+        auto try_cfg_dispatcher = [&]() -> int {           // 1 = emitted, 0 = clean reject, -1 = partial
+            const size_t checkpoint = b.code.size();
+            if (emit_cfg_state_machine(b, rs, ins, safe, rt,
+                                       allow_exec_update, allow_smem, exp_fn, code, dwords))
+                return 1;
+            if (b.code.size() == checkpoint) return 0;
+            if (getenv("PROSPER_DBG"))
+                std::fprintf(stderr,
+                             "[cfg-dispatcher-partial] rejected after emitting %zu words; failing the "
+                             "shader instead of shipping a half-written dispatcher\n",
+                             b.code.size() - checkpoint);
+            return -1;
+        };
+        if (allow_cfg_dispatcher && complex_compute_cfg && (cf_rejected || Ls.empty())) {
+            const int emitted = try_cfg_dispatcher();
+            if (emitted > 0) return true;
+            if (emitted < 0) return false;
+        }
         // In graphics, the SPIR-V invocation already represents one guest lane. Complex reducible
         // control flow therefore needs no workgroup vote: the dispatcher selects the next block from
         // this pixel/vertex's SCC, VCC, or EXEC bit. Keep ordinary structured shaders on their compact
         // SSA path and use the Function-variable fallback only after the narrow structurizer rejects.
-        if (allow_cfg_dispatcher && complex_graphics_cfg && cf_rejected &&
-            emit_cfg_state_machine(b, rs, ins, safe, rt,
-                                   allow_exec_update, allow_smem, exp_fn, code, dwords))
-            return true;
+        // Only one of these two blocks can run: complex_compute_cfg requires b.is_compute and
+        // complex_graphics_cfg requires graphics_cfg (b.is_fragment || b.is_vertex), and a module is
+        // one or the other. That exclusivity is what makes a clean reject (0) from the compute block
+        // safe to fall through — it reaches this block only in a stage that cannot enter it. If the
+        // stage predicates above ever stop being disjoint, this second attempt would run against
+        // builder state the first had already touched, and the checkpoint would no longer describe an
+        // untouched buffer.
+        if (allow_cfg_dispatcher && complex_graphics_cfg && cf_rejected) {
+            const int emitted = try_cfg_dispatcher();
+            if (emitted > 0) return true;
+            if (emitted < 0) return false;
+        }
         if (cf_rejected) Ls.clear();   // unmodeled CF somewhere: fall through to straight-line (loud reject)
         if (Fs.empty() && Ls.empty()) {
             wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
