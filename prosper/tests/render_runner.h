@@ -4520,7 +4520,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         st[fragment_stage_index].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         st[fragment_stage_index].module = v.fs;
         st[fragment_stage_index].pName = "main";
-        if (required_fragment_subgroup_size) {
+        // A guard-only shader must be created with NO required-size request and run at the device's
+        // native width -- that is the entire point of not skipping it. Requesting 64 here would be
+        // out of range on exactly the device this path targets (NVIDIA reports 32..32), and on a
+        // device without subgroup_size_control it would attach the pNext at all. The variable itself
+        // is deliberately left at 64: it feeds the pipeline key below, where the distinction between
+        // a wave64 shader run natively and one run relaxed still matters. (Found in review of #2410.)
+        if (required_fragment_subgroup_size && !wave_any_guard_only) {
             required_fragment_subgroup.requiredSubgroupSize = required_fragment_subgroup_size;
             st[fragment_stage_index].pNext = &required_fragment_subgroup;
         }
