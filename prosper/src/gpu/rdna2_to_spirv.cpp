@@ -3093,6 +3093,13 @@ struct RegState {
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
     uint32_t vcc = 0;
     uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
+    // #2418: does this shader read SCC anywhere? A STATIC property of the decoded stream, computed
+    // once before emission, never mutated during it — so it carries none of the lifetime hazards a
+    // stateful "pending reduction" marker would. It exists so the fragment stage can re-arm SCC after
+    // a mask op (which needs an exact wave vote, and so forces wave64) ONLY for shaders that actually
+    // consume it. Re-arming unconditionally is correct but makes every shader that merely saves EXEC
+    // pay a subgroup-size requirement it does not need, which gates the draw on a 32-wide device.
+    bool reads_scc = false;
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
     // PC-relative EMBEDDED TABLES (#273): load pc -> the table's dwords, resolved by
@@ -3389,6 +3396,34 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
         if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
     return true;   // every reachable path hit a redefinition/end without a read
+}
+
+// #2418: does this shader read SCC anywhere? Used to decide whether the fragment stage should pay for
+// an exact wave vote when a mask op writes SCC. Deliberately CONSERVATIVE and whole-shader: it answers
+// "could SCC ever be consumed", not "is this particular write live". A false positive costs one shader a
+// subgroup-size requirement it might not have needed; a false NEGATIVE would silently drop the vote a
+// consumer depends on, so every reader is listed even where the recompiler handles it elsewhere.
+//
+// SCC readers on RDNA2 (doc 70648): SOP2 s_cselect_b32/b64 (0x0a/0x0b) and the carry-in forms
+// s_addc_u32/s_subb_u32 (0x04/0x05); SOPP s_cbranch_scc0/scc1 (0x04/0x05); SOP1 s_cmov_b32/b64
+// (0x02/0x03). SOPC and s_cmp_* WRITE SCC and are not readers.
+inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
+    for (const auto& in : ins) {
+        switch (in.fmt) {
+            case Rdna2Format::SOP2:
+                if (in.opcode == 0x04 || in.opcode == 0x05 ||
+                    in.opcode == 0x0a || in.opcode == 0x0b) return true;
+                break;
+            case Rdna2Format::SOPP:
+                if (in.opcode == 0x04 || in.opcode == 0x05) return true;
+                break;
+            case Rdna2Format::SOP1:
+                if (in.opcode == 0x02 || in.opcode == 0x03) return true;
+                break;
+            default: break;
+        }
+    }
+    return false;
 }
 
 std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
@@ -5927,6 +5962,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // EXECZ guard is conservatively (and incorrectly) rejected.
                     const bool source_is_exec = in.src[0].value == 126 || in.src[0].value == 127;
                     rs.exec_narrowed = !((in.opcode == 0x28 || in.opcode == 0x2b) && source_is_exec);
+                    // RE-ARM SCC for the FRAGMENT stage (#2418). The poison above is the right default
+                    // — SCC here is `(result != 0)` over the whole 64-lane mask, which one lane's bool
+                    // cannot express — but the fragment stage has an exact instrument for precisely
+                    // this reduction, and this file already uses it for the same purpose after v_cmpx
+                    // narrows EXEC (`rs.scc = b.is_fragment ? b.fragment_wave_any(rs.exec) : 0;`).
+                    // `fragment_wave_any`'s contract is "exact scalar wave vote for fragment control
+                    // flow AND MASK REDUCTIONS".
+                    //
+                    // Without it, the poisoned SCC makes every later consumer reject — `s_cselect_b32`
+                    // at the SOP2 switch (`if (!rs.scc) { ok = false; }`), `s_addc`, and SCC branch
+                    // emission — which is a large share of GTA V's 23,386 skipped draws, since
+                    // saveexec-then-`s_cbranch_scc0` is an ordinary shape in its pixel shaders.
+                    //
+                    // GATED ON `reads_scc`, and that gate is the whole point. `fragment_wave_any` sets
+                    // `fragment_required_subgroup_size`, so an unconditional re-arm would give every
+                    // shader that merely saves EXEC a wave64 requirement it does not need — and that
+                    // shader is then GATED on a 32-wide device where it works today. On a native-wave64
+                    // host that regression is invisible, which is exactly why it is guarded here rather
+                    // than discovered later on other hardware.
+                    //
+                    // This is a REDUCE in #2410's taxonomy: the value becomes a guest scalar consumed
+                    // as data, so forcing wave64 where it IS used is correct and must not be relaxed.
+                    // Compute and vertex keep the poison — compute has its own synchronized guest-wave
+                    // reduction paths, and the vertex stage has no equivalent exact vote at all.
+                    if (b.is_fragment && rs.reads_scc) rs.scc = b.fragment_wave_any(rs.exec);
                 }
                 return true;
             }
@@ -16321,6 +16381,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
         }
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    // #2418: a static property of the decoded stream, set once and never mutated during emission.
+    // Gates the fragment SCC re-arm after mask ops so only shaders that actually consume SCC pay the
+    // exact-wave-vote's subgroup-size requirement.
+    rs.reads_scc = shader_reads_scc(ins);
     if (system_inputs) {
         // RDNA2 PS system values are packed in field order. ADDR reserves each field's documented
         // width even when ENA is clear, allowing a driver to keep later VGPR numbers stable. Vulkan
