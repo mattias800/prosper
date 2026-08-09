@@ -820,6 +820,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_registry PRIVATE prosper_core)
   add_test(NAME apr_registry_resolution COMMAND test_apr_registry)
 
+  # #2384: the AMPR tracks-offset predicate. Its NEW case is provable by a boot; what needs a unit
+  # test is that the widening is strictly ADDITIVE, because the predicate is shared by every title
+  # that constructs a command buffer and none of their dumps are available to CI. Pure function of a
+  # 64-bit argument, so it needs no dump and cannot skip silently.
+  add_executable(test_ampr_tracks_offset tests/test_ampr_tracks_offset.cpp)
+  target_link_libraries(test_ampr_tracks_offset PRIVATE prosper_core)
+  add_test(NAME ampr_tracks_offset COMMAND test_ampr_tracks_offset)
+
   # GTA V (#1139/#1142) net-new HLE regression guards: sceKernelAprGetFileStat fills the real stat
   # (#1133) and sceAudioOut2GetSpeakerArrayMemorySize returns a non-zero allocation size (#1134). The
   # AGC GetSize third piece is covered separately by test_agc_getsize (#1208).

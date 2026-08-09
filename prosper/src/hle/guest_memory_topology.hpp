@@ -30,4 +30,10 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
 // for one pair of physically aliased but VA-disjoint views.
 uint64_t guest_memory_gpu_write_successes_for_test();
 
+// #2384: does an AMPR constructor's `a2` say the command buffer keeps a byte cursor? Exposed for
+// test because the answer is a PREDICATE over guest-supplied bit patterns, and the only way to show
+// the widening is strictly additive is to assert it over the shapes the working titles pass -- which
+// a boot test cannot do without those titles' dumps. The implementation lives in hle_kernel_mem.cpp.
+bool ampr_cb_tracks_offset_arg_for_test(uint64_t a2);
+
 } // namespace prosper

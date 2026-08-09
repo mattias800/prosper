@@ -56,6 +56,63 @@ struct AmprCbState { uint64_t capacity = 0, offset = 0; bool tracks_offset = fal
 std::mutex g_ampr_cb_state_mx;
 std::unordered_map<uint64_t, AmprCbState> g_ampr_cb_state;
 
+// Does the constructor's `a2` say this command buffer keeps a byte cursor?
+//
+// Two shapes answer yes, and the second is #2384.
+//
+//  PLAIN   a2 IS the capacity -- Pathless's PS5 3.20 IoStore batch passes 0x560. Unchanged.
+//  PACKED  a2 is (count << 32) | capacity -- Grand Theft Auto V (PPSA04263). Its ten constructor
+//          calls in one boot carry a2 = 0x6400001370, 0x5f00001610, 0x5e00001680, 0x5d000016f0,
+//          0x5c00001760, 0x9c000022b0, 0xe7000008a0, 0x7500000c70, 0x6700001290, 0x5700001990.
+//
+// The four consecutive calls at 0x5f/0x5e/0x5d/0x5c are why this is a decomposition and not a curve
+// fit: as the high field falls 95, 94, 93, 92 the low field rises by exactly 0x70 each step -- a
+// pool carved 112 bytes at a time, with the remaining-entry count in the high half. Monotone in both
+// fields at a fixed stride is not something an arbitrary 64-bit value does.
+//
+// This predicate is STRICTLY ADDITIVE, which is the property that matters for the titles already
+// working -- but the reason is the ORDER, not the `count != 0` guard, and I had that backwards until
+// mutation testing corrected it. The plain arm runs first and returns true for every a2 it accepts,
+// so no currently-accepted value ever reaches the packed arm at all. DOLL's a2 = 0 and a2 = 1 are
+// rejected by both arms. tests/test_ampr_tracks_offset.cpp asserts this over a SWEEP rather than
+// over examples, because examples cannot establish a disjointness claim.
+//
+// `count != 0` is therefore REDUNDANT and deliberately kept: when count is zero, a2 IS cap, so the
+// plain arm has already decided. Deleting it is an equivalent mutation and no test can kill it --
+// which is exactly why there is no arm claiming to. It stays as a cheap statement of intent, on the
+// same footing as the `bc.eq` term in apr_submit_common. The `count <= 0xffff` bound is NOT
+// redundant and does have a discriminating arm.
+//
+// KNOWN FALSE-POSITIVE CLASS, raised by Marlow in review and recorded because it cannot be fixed by
+// range-checking: a GUEST POINTER can satisfy the packed arm. The guest VA range is
+// 0x2000000000-0x9fc0000000, so any pointer whose LOW 32 BITS land in [0x20, 0x100000] -- the first
+// MiB of every 4 GiB-aligned window -- decomposes into a plausible count and capacity. That defeats
+// the "pointer-valued arguments are outside this conservative bound" guard in ampr_cb_capacity_arg
+// directly above, because taking the low 32 bits discards exactly the high bits that made a pointer
+// recognisable.
+//
+// It is not separable by value, and that is the part worth knowing before anyone tries: GTA V's own
+// packed a2 values (0x6400001370, 0x5f00001610, 0x9c000022b0) are themselves numerically inside the
+// guest VA range, so a "reject anything that looks like a pointer" test would reject the very calls
+// this exists to accept. Distinguishing them needs a signal other than the 64-bit value -- the
+// calling NID, or a constructor shape captured from a title that passes a pointer here.
+//
+// Accepted deliberately: no title has been observed to pass that shape, the change is additive for
+// every title that works today, and the consequence of a false positive is a cursor tracked for a
+// buffer that does not want one -- not a wrong answer to the guest. Revisit if a title regresses in
+// AMPR submit timing.
+//
+// CONFIDENCE: MED -- the shape is inferred from one title's live capture, with no disassembly of the
+// guest-side constructor yet. What would raise it: a second title with the same packing, or the
+// constructor's own code showing the two fields written separately.
+bool ampr_a2_is_capacity(uint64_t a2) { return a2 >= 0x20 && a2 <= 0x100000; }
+
+bool ampr_cb_tracks_offset_arg(uint64_t a2) {
+    if (ampr_a2_is_capacity(a2)) return true;                  // PLAIN
+    const uint64_t count = a2 >> 32, cap = a2 & 0xffffffffull; // PACKED
+    return count != 0 && count <= 0xffff && ampr_a2_is_capacity(cap);
+}
+
 uint64_t ampr_cb_capacity_arg(uint64_t a1, uint64_t a2, uint64_t a5) {
     // Observed constructor shapes place capacity in a1 (APR request), a2 (Pathless IoStore batch),
     // or a5 (DOLL IoStore batch). Pointer-valued arguments are outside this conservative bound.
@@ -66,6 +123,10 @@ uint64_t ampr_cb_capacity_arg(uint64_t a1, uint64_t a2, uint64_t a5) {
     if (a5 && a5 <= 0x100000) return a5;
     return 0;
 }
+
+}  // namespace  -- the AMPR arg predicates above are internal; this is their test seam
+bool ampr_cb_tracks_offset_arg_for_test(uint64_t a2) { return ampr_cb_tracks_offset_arg(a2); }
+namespace {
 
 void ampr_cb_construct(uint64_t cb, uint64_t capacity, bool tracks_offset) {
     if (!cb) return;
@@ -1777,7 +1838,7 @@ HLE(k_ampr_init) {
     if (a3 > 0xffff && a1 && a1 <= 0x10000) { g_apr_last_cb = a3; g_apr_last_cb_size = a1; }
     if (a0 > 0xffff)
         ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
-                          a2 >= 0x20 && a2 <= 0x100000); // Pathless 3.20 uses a2=0x560; DOLL uses 0/1
+                          ampr_cb_tracks_offset_arg(a2));   // #2384
     if (amprlog()) {
         fprintf(stderr, "[amprlog] init  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
@@ -2437,6 +2498,12 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
     return complete;
 }
 
+// POSIX ARM. There are TWO definitions of this function in this file, ~3,200 lines apart,
+// and the only thing distinguishing them is the `#if defined(__linux__) || defined(__APPLE__)`
+// that opens far above. Nothing local tells you which arm you are in, which is the mechanism
+// behind three separate one-arm-read-as-the-whole-file errors in a single session (#2376,
+// #2384). Naming the arm here costs a comment and removes the trap. Raised by Marlow in review
+// of #2388.
 void register_kernel_mem_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelReserveVirtualRange", k_reserve_vrange);
@@ -5320,7 +5387,7 @@ HLE(k_ampr_init) {
     // two different contents (#1970).
     if (a0 > 0xffff)
         ampr_cb_construct(a0, ampr_cb_capacity_arg(a1, a2, a5),
-                          a2 >= 0x20 && a2 <= 0x100000); // match the POSIX 3.20 discriminator
+                          ampr_cb_tracks_offset_arg(a2));   // #2384
     // The POSIX arm logs this call; this arm did not, so a Windows run could not answer
     // "was the command buffer ever CONSTRUCTED?" at all -- and that is the question a zero
     // GetCurrentOffset raises (#2384). Same tag as POSIX so one grep works on both.
@@ -5692,6 +5759,12 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
     return written;
 }
 
+// WINDOWS ARM. There are TWO definitions of this function in this file, ~3,200 lines apart,
+// and the only thing distinguishing them is the `#if defined(__linux__) || defined(__APPLE__)`
+// that opens far above. Nothing local tells you which arm you are in, which is the mechanism
+// behind three separate one-arm-read-as-the-whole-file errors in a single session (#2376,
+// #2384). Naming the arm here costs a comment and removes the trap. Raised by Marlow in review
+// of #2388.
 void register_kernel_mem_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelReserveVirtualRange", k_reserve_vrange);
