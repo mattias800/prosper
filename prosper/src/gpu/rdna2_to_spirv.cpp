@@ -592,6 +592,34 @@ struct SpirvCompute {
             {t_bool, result, uconst(Scope_Subgroup), active_bit});
         return result;
     }
+    // Fragment-side ballot (#2412). Same exactness argument as native_wave_ballot_half, but the
+    // fragment stage establishes its exact-wave contract differently: it does not carry
+    // native_subgroup_size, it DECLARES the width it needs via fragment_required_subgroup_size, which
+    // the backend then enforces (or skips the draw). Mirrors fragment_wave_any, which exists for the
+    // reduction form of the same problem.
+    //
+    // This is a REDUCE in #2410's taxonomy -- the bits become guest scalar DATA -- so the wave64
+    // requirement it records must NOT be relaxed to a narrower subgroup: half a mask reported as whole
+    // is silent wrong data.
+    uint32_t fragment_wave_ballot_half(uint32_t mask_bit, uint32_t half) {
+        if (!is_fragment || !mask_bit) return 0;
+        if (!declared_subgroup) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            declared_subgroup = true;
+        }
+        if (!declared_subgroup_ballot) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformBallot});
+            declared_subgroup_ballot = true;
+        }
+        fragment_required_subgroup_size = wave_size;
+        fragment_wave_reasons |= kFragmentWaveReasonWaveAny;
+        const uint32_t ballot = id();
+        put(code, Op_GroupNonUniformBallot,
+            {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});
+        const uint32_t result = id();
+        putv(code, Op_CompositeExtract, {t_u32, result, ballot, half});
+        return result;
+    }
     uint32_t subgroup_id() {
         if (!declared_subgroup) {
             put(caps, Op_Capability, {Cap_GroupNonUniform});
@@ -5477,6 +5505,66 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            // s_quadmask_b64 D, S (#2412): D[i] = S[4i]|S[4i+1]|S[4i+2]|S[4i+3] for i in 0..15, upper
+            // bits zero. Each output bit ORs a QUAD of lanes, so a per-invocation bool cannot form it.
+            // `s_quadmask_b64 vcc, vcc` (0xbeea2d6a, confirmed with llvm-mc) is the first reject in 20
+            // of GTA V's 59 failing shaders.
+            //
+            // A ballot gives the source mask exactly; the quadmask is then integer arithmetic over it.
+            // BOTH representations prosper keeps for a mask register are produced -- the scalar DATA
+            // value in sreg and the per-lane bool -- so it cannot matter which a later instruction
+            // consumes; writing one and leaving the other stale would be silent wrong rendering.
+            //
+            // Wave64 only, and each stage supplies its exact-wave contract its own way: compute carries
+            // native_subgroup_size, the fragment stage DECLARES fragment_required_subgroup_size. An
+            // earlier revision gated on native_subgroup_size alone and therefore never fired for the
+            // graphics shaders that need it -- dead code that ctest could not see, caught only by
+            // measuring the failing-shader count. Vertex has neither mechanism and still rejects.
+            if (in.opcode == 0x2d && b.wave_size == 64 &&
+                (b.is_fragment || (b.native_subgroup_size == b.wave_size))) {
+                uint32_t src_mask = 0;
+                if (in.src[0].value == 106 || in.src[0].value == 107) src_mask = rs.vcc;
+                else if (in.src[0].value == 126 || in.src[0].value == 127) src_mask = rs.exec;
+                else if (in.src[0].kind == OperandKind::SGPR) {
+                    auto it = rs.sreg_bool.find(in.src[0].value);
+                    if (it != rs.sreg_bool.end()) src_mask = it->second;
+                }
+                const uint32_t lo = src_mask ? (b.is_fragment
+                        ? b.fragment_wave_ballot_half(src_mask, 0)
+                        : b.native_wave_ballot_half(src_mask, 0)) : 0;
+                const uint32_t hi = src_mask ? (b.is_fragment
+                        ? b.fragment_wave_ballot_half(src_mask, 1)
+                        : b.native_wave_ballot_half(src_mask, 1)) : 0;
+                if (lo && hi) {
+                    uint32_t value = b.uconst(0);
+                    for (uint32_t i = 0; i < 16; ++i) {
+                        const uint32_t word = i < 8 ? lo : hi;
+                        const uint32_t shift = (i < 8 ? i : i - 8) * 4u;
+                        const uint32_t nibble = b.ibin(
+                            Op_BitwiseAnd,
+                            b.ibin(Op_ShiftRightLogical, word, b.uconst(shift)), b.uconst(0xFu));
+                        value = b.ibin(Op_BitwiseOr, value,
+                                       b.sel(b.ucmp(Op_INotEqual, nibble, b.uconst(0)),
+                                             b.uconst(1u << i), b.uconst(0)));
+                    }
+                    const int dst = in.dst.value;
+                    rs.sreg[dst] = value;
+                    rs.sreg[dst + 1] = b.uconst(0);
+                    rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);
+                    const uint32_t lane = b.ibin(Op_BitwiseAnd, b.subgroup_local_id(),
+                                                 b.uconst(b.wave_size - 1));
+                    const uint32_t my_bit = b.ibin(
+                        Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, value, lane), b.uconst(1u));
+                    const uint32_t as_bool = b.land(
+                        b.ucmp(Op_ULessThan, lane, b.uconst(16u)),
+                        b.ucmp(Op_INotEqual, my_bit, b.uconst(0)));
+                    if (dst == 126 || dst == 127) { rs.exec = as_bool; rs.exec_narrowed = true; }
+                    else if (dst == 106 || dst == 107) rs.vcc = as_bool;
+                    else rs.sreg_bool[dst] = as_bool;
+                    rs.scc = b.ucmp(Op_INotEqual, value, b.uconst(0));
+                    return true;
+                }
+            }
             if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.opcode == 0x13) { // s_ff1_i32_b32
                 // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty
