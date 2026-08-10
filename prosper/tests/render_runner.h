@@ -204,6 +204,21 @@ struct FrameResource {
         return tex_rgba != nullptr || has_uniform_color || persistent_render_target_id != 0 ||
                persistent_depth_target_id != 0 || borrowed_compute_image != nullptr;
     }
+    // Per-entry payloads for a RUNTIME-SELECTED descriptor array (#2412 stage 5). Empty -- the only
+    // state any producer creates today -- means an ordinary single descriptor and every path below
+    // behaves exactly as before.
+    //
+    // Arity is DERIVED from this vector rather than carried in a separate count field, deliberately:
+    // two sources of truth for "how many descriptors" is precisely the disagreement that makes a
+    // layout declare N while a write supplies M, which is a validation error at bind time and a wrong
+    // shader read if validation is off. One vector, one length, no way to disagree.
+    std::vector<std::vector<uint32_t>> table_entries;
+    // The number of descriptors this binding occupies: 1 ordinary, N for a table-indexed array.
+    // Used by the descriptor POOL accounting, the layout binding, and the write -- all three must
+    // agree, so all three call this.
+    uint32_t descriptor_arity() const {
+        return table_entries.empty() ? 1u : static_cast<uint32_t>(table_entries.size());
+    }
 };
 
 // Optional color-target contract for the live backend. A non-zero ID gives the target a stable
@@ -4296,7 +4311,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         for (const FrameResource& resource : resources) {
             set_count = std::max(set_count, resource.set + 1);
             if (!resource.is_texture()) {
-                ++storage_buffers;
+                // N per array, not 1 per resource: the pool is sized from these counters, and an
+                // N-entry array that reserved 1 fails inside vkAllocateDescriptorSets with
+                // VK_ERROR_OUT_OF_POOL_MEMORY -- an error with no visible connection to arrays.
+                storage_buffers += resource.descriptor_arity();
             } else if (resource.is_storage_image) {
                 ++storage_images;
             } else {
@@ -4868,7 +4886,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         std::vector<std::vector<uint64_t>> descriptor_layout_keys(v.n_sets);
         if (v.use_desc) {
             std::vector<VkDescriptorSetLayoutBinding> lb(R.size());
-            std::vector<VkDescriptorBufferInfo> dbi(R.size());
+            // One contiguous run of VkDescriptorBufferInfo per resource, arity entries long. Sized
+            // ONCE, before anything takes an address into it: `wr[].pBufferInfo` points in here and
+            // must stay valid until vkUpdateDescriptorSets, so growing this vector while
+            // materialising entries would silently invalidate pointers already stored in `wr` --
+            // which Vulkan reads as garbage descriptors rather than reporting as an error.
+            std::vector<uint32_t> dbi_offset(R.size(), 0);
+            {
+                uint32_t running = 0;
+                for (size_t i = 0; i < R.size(); i++) {
+                    dbi_offset[i] = running;
+                    running += R[i].descriptor_arity();
+                }
+                (void)running;
+            }
+            const size_t dbi_total = R.empty()
+                ? 0 : static_cast<size_t>(dbi_offset.back()) + R.back().descriptor_arity();
+            std::vector<VkDescriptorBufferInfo> dbi(dbi_total);
                 // Resolve one storage-buffer payload to an index in `shared_buffers` -- the memo lookup,
                 // the size-gated content dedup, and the arena/pool/create upload. Extracted verbatim
                 // from the per-resource site below so it can be called MORE THAN ONCE per resource: an
@@ -5051,7 +5085,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             bool buffer_resources_ready = true;
             for (size_t i = 0; i < R.size(); i++) {
                 const FrameResource& r = R[i];
-                lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
+                lb[i] = {}; lb[i].binding = r.binding;
+                lb[i].descriptorCount = r.descriptor_arity();
                 if (r.is_texture()) {
                     const ResourcePhaseTimer phase_texture(timing_enabled, &res_texture_ms);
                     lb[i].descriptorType = r.is_storage_image
@@ -5552,21 +5587,51 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         wr[i].pBufferInfo = &dbi[i];
                         continue;
                     }
-                    const uint32_t* words = r.buffer_words_data();
-                    size_t word_count = r.buffer_word_count();
-                    size_t buffer_index = SIZE_MAX;
-                    // False is the fatal upload path: the zero-word fallback itself failed, so this
-                    // draw cannot be bound. Same effect as the `break` this replaced.
-                    if (!resolve_buffer_upload(words, word_count, r.buffer_identity, r.set, r.binding,
-                                               buffer_index)) {
-                        buffer_resources_ready = false;
-                        break;
+                    // One upload per descriptor this binding occupies. Uniform over entries on
+                    // purpose: an earlier revision took entry 0 from `dwords` and entries 1..N-1 from
+                    // `table_entries`, which leaves `table_entries[0]` counted-but-unused and is the
+                    // same two-sources-of-truth defect the comment on `table_entries` warns about.
+                    //
+                    // With `table_entries` empty -- every producer today -- arity is 1 and this makes
+                    // exactly one call with exactly the arguments the single-descriptor path always
+                    // used, `r.buffer_identity` included, so the memo and dedup behaviour is unchanged.
+                    const uint32_t arity = r.descriptor_arity();
+                    bool entries_ready = true;
+                    for (uint32_t e = 0; e < arity; e++) {
+                        const uint32_t* entry_words = nullptr;
+                        size_t entry_count = 0;
+                        uint64_t entry_identity = 0;
+                        if (r.table_entries.empty()) {
+                            entry_words = r.buffer_words_data();
+                            entry_count = r.buffer_word_count();
+                            entry_identity = r.buffer_identity;
+                        } else {
+                            const std::vector<uint32_t>& entry = r.table_entries[e];
+                            entry_words = entry.empty() ? nullptr : entry.data();
+                            entry_count = entry.size();
+                            // Identity 0 keeps each table entry conservatively distinct. Entries of one
+                            // array are different guest buffers; sharing one identity across them would
+                            // let the per-call memo collapse them into a single descriptor, so the
+                            // shader would read entry 0 for every index.
+                            entry_identity = 0;
+                        }
+                        size_t entry_index = SIZE_MAX;
+                        // False is the fatal upload path: the zero-word fallback itself failed, so this
+                        // draw cannot be bound. Same effect as the `break` this replaced.
+                        if (!resolve_buffer_upload(entry_words, entry_count, entry_identity, r.set,
+                                                  r.binding, entry_index)) {
+                            entries_ready = false;
+                            break;
+                        }
+                        dbi[dbi_offset[i] + e] = {shared_buffers[entry_index].buffer,
+                                                  shared_buffers[entry_index].offset,
+                                                  shared_buffers[entry_index].range};
                     }
-                    dbi[i] = {shared_buffers[buffer_index].buffer,
-                              shared_buffers[buffer_index].offset,
-                              shared_buffers[buffer_index].range};
-                    wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
-                    wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
+                    if (!entries_ready) { buffer_resources_ready = false; break; }
+                    wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding;
+                    wr[i].descriptorCount = arity;
+                    wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    wr[i].pBufferInfo = &dbi[dbi_offset[i]];
                 }
             }
             if (!buffer_resources_ready) continue;
@@ -5698,7 +5763,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(9); // key schema version (complete MRT attachment formats, #1390)
+            append(10); // key schema version (descriptor arity, #2471; MRT formats, #1390)
             append(W); append(H); append(color_count);
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 append(static_cast<uint32_t>(color_formats[slot]));
@@ -5724,12 +5789,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             append(static_cast<uint32_t>(bd_gs.size()));
             for (uint32_t word : bd_gs) append(word);
             append(v.use_desc); append(v.n_sets);
-            // A pair of shader-cache identities names the exact compile keys, including every
-            // descriptor's class and binding. External/replay shaders have identity zero and keep
-            // the full layout contract in the fallback key.
+            // Descriptor ARITY is keyed on BOTH branches, and it has to be (#2471). A cached
+            // VkPipeline was created under one VkPipelineLayout and is replayed under whatever
+            // `v.layout` resolves to now; the two are keyed independently (`pipeline_layout_key`,
+            // :5698), so any axis that reaches the layout and not this key silently pairs a
+            // pipeline with an incompatible layout — VUID-vkCmdDraw*-None-08600, "descriptorCount
+            // N doesn't match M", raised at the draw rather than at either cache.
+            //
+            // Arity is exactly such an axis, on both branches and for different reasons:
+            //   * a pair of shader-cache identities names the exact compile keys, including every
+            //     descriptor's class and binding, but NOT its count — a fixed vertex-fetch VS
+            //     reading one binding is a byte-identical module at arity 1 or arity 3;
+            //   * the fallback branch below used to hardcode `append(1)` as the descriptorCount,
+            //     correct only while every binding held one descriptor.
+            // So it is appended here, once, ahead of the split: two copies of the arity rule is the
+            // same drift risk that put a hardcoded 1 in the fallback in the first place. `R.size()`
+            // comes along because the arity list is meaningless without its length.
+            append(static_cast<uint32_t>(R.size()));
+            for (size_t i = 0; i < R.size(); ++i) append(R[i].descriptor_arity());
             append(!exact_shader_identities);
             if (!exact_shader_identities) {
-                append(static_cast<uint32_t>(R.size()));
                 for (size_t i = 0; i < R.size(); ++i) {
                     const bool texture = R[i].is_texture();
                     const VkDescriptorType descriptor_type = !texture
@@ -5740,7 +5819,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     append(R[i].set); append(R[i].binding); append(descriptor_type);
-                    append(1); append(stage_flags);
+                    append(stage_flags);   // count already keyed above, for both branches
                 }
             }
             append(ia.topology); append(ia.primitiveRestartEnable);
@@ -5778,6 +5857,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 ++pipeline_stats.hits;
             } else {
                 ++pipeline_stats.misses;
+            }
+            // PROSPER_PIPEKEY_LOG (#2471): pair the graphics-pipeline cache decision with the
+            // pipeline LAYOUT it will run under. The two are keyed independently — `pipeline_key`
+            // here, `pipeline_layout_key` at :5698 — and nothing checks that a cache hit's stored
+            // pipeline was created under a layout equivalent to `v.layout`. When they diverge the
+            // symptom is VUID-vkCmdDraw*-None-08600 ("descriptorCount N doesn't match M") at draw
+            // time, thousands of lines away from either cache, so the two decisions have to be
+            // readable side by side. Prints the per-resource arity because arity is the axis that
+            // reaches the layout without reaching this key.
+            static const bool pipekey_log = getenv("PROSPER_PIPEKEY_LOG") != nullptr;
+            if (pipekey_log) {
+                // Unbounded on purpose: a fixed char buffer would truncate the arity list on a
+                // draw with many resources, and a truncated list is exactly the case this
+                // diagnostic exists to read. It allocates only when the variable is set.
+                std::string arity_text = "[";
+                for (size_t i = 0; i < R.size(); ++i) {
+                    if (i) arity_text += ' ';
+                    arity_text += std::to_string(R[i].binding);
+                    arity_text += ':';
+                    arity_text += std::to_string(R[i].descriptor_arity());
+                }
+                arity_text += ']';
+                std::fprintf(stderr,
+                             "[pipekey] draw=%zu key=%016llx words=%u %s exact_ids=%d "
+                             "use_desc=%d n_sets=%u arity=%s layout=%p pipe=%p\n",
+                             di, (unsigned long long)pipeline_key.hash, pipeline_key.word_count,
+                             create_pipeline ? "MISS" : "HIT ",
+                             (int)exact_shader_identities, (int)v.use_desc, v.n_sets,
+                             arity_text.c_str(), (void*)v.layout, (void*)v.pipe);
+                std::fflush(stderr);
             }
         } else {
             ++pipeline_stats.bypasses;

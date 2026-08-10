@@ -1555,6 +1555,10 @@ if(TARGET prosper_core)
       target_link_libraries(test_indexed_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME indexed_render COMMAND test_indexed_render)
 
+      add_executable(test_descriptor_array_render tests/test_descriptor_array_render.cpp)
+      target_link_libraries(test_descriptor_array_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME descriptor_array_render COMMAND test_descriptor_array_render)
+
       # Storage images: a recompiled compute kernel does MIMG image_load->image_store (no sampler) to
       # copy a 1D storage image bit-exact (the game's blit/copy compute-shader class).
       add_executable(test_storage_image_copy tests/test_storage_image_copy.cpp)

@@ -585,7 +585,34 @@ The Vulkan backend retains graphics pipelines across render-target calls. Live d
 process-unique, never-recycled identity from the exact shader cache, so a hot lookup does not copy or
 hash complete SPIR-V modules. Capture, replay, and test draws without those identities fall back to an
 exact full-module key. The rest of the key contains the descriptor-layout contract and every baked
-fixed-function value; equality still compares the complete key after hashing. The cache is bounded to
+fixed-function value; equality still compares the complete key after hashing.
+
+**A shader-cache identity does not imply descriptor ARITY, and the key must carry it separately (#2471).**
+An identity names the exact compile key, including every descriptor's class and binding — but a module is
+byte-identical whether its binding was declared with one descriptor or with N, so arity reaches the
+pipeline *layout* without reaching this key. When the two disagree, a cached `VkPipeline` created under an
+arity-1 layout is replayed with an arity-N layout bound, which is `VUID-vkCmdDraw*-None-08600`
+(*"Set 0 binding 0 descriptorCount 3 doesn't match 1"*) raised at the draw, thousands of lines from either
+cache. Both key branches were affected and for different reasons — the identity branch appended no count at
+all, and the full-module fallback hardcoded `1` — so the arity vector is now appended once, ahead of the
+branch, and `descriptor_arity()` is the single source of truth for the pool, the layout, the write and the
+key. **This class is invisible to a pixel assertion**: the stale pipeline still draws correct output, so the
+test that guards it asserts the cache *decision* (an arity-3 draw must miss against an arity-1 baseline,
+and a second arity-3 draw must still hit) rather than the frame. Only a validation layer sees the rest, so
+run `tools/vkval/vk_validation_scan.py` on any change that touches descriptor counts or layouts.
+
+`PROSPER_PIPEKEY_LOG=1` prints one line per draw pairing the two independent decisions — the pipeline-cache
+key and hit/miss, against the resolved `VkPipelineLayout` handle and the per-binding arity — which is what
+makes a divergence between them readable:
+
+```
+[pipekey] draw=0 key=be1fbdc545dac514 words=423 MISS exact_ids=0 use_desc=1 n_sets=1 arity=[3:1] layout=0x…5a0 pipe=(nil)
+[pipekey] draw=0 key=d8ac419006f6961a words=423 MISS exact_ids=0 use_desc=1 n_sets=1 arity=[3:3] layout=0x…3b0 pipe=(nil)
+[pipekey] draw=0 key=d8ac419006f6961a words=423 HIT  exact_ids=0 use_desc=1 n_sets=1 arity=[3:3] layout=0x…3b0 pipe=0x…240
+```
+
+Two draws sharing a `key=` while differing in `arity=` or `layout=` is the defect; the same `key=` with the
+same `arity=` and `layout=` is a correct reuse. The cache is bounded to
 4096 entries by default. Set `PROSPER_PIPELINE_CACHE_ENTRIES=<N>` to change the entry limit or
 `PROSPER_NO_BACKEND_PIPELINE_CACHE=1` for a transient-pipeline A/B. With `PROSPER_RENDER_TIMING=1`,
 the backend and submit-aligned windows report references, hits, misses, bypasses, current entries, and
