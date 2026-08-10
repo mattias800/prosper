@@ -56,7 +56,7 @@ FragmentInterpolationLayout::FragmentInterpolationLayout() {
 namespace {
 
 enum : uint32_t {
-    Op_ExtInstImport=11, Op_ExtInst=12, Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16,
+    Op_Extension=10, Op_ExtInstImport=11, Op_ExtInst=12, Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16,
     Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
@@ -104,6 +104,16 @@ enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
     Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformBallot=64, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
     Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
+    // Descriptor indexing (#2412 stage 4b). These are CORE only from SPIR-V 1.5; this emitter writes
+    // 1.3, so they additionally require OpExtension "SPV_EXT_descriptor_indexing" -- emitted together
+    // by declare_descriptor_indexing() and only when an indexed binding actually exists.
+    //
+    // Cap_ShaderNonUniform is NOT one of the Cap_GroupNonUniform* values above. Those are wave/subgroup
+    // operations that merely share the word; `grep -c NonUniform` on this file returns 45 hits and every
+    // one of them is a GroupNonUniform op, which reads exactly like descriptor indexing is already
+    // supported. It was not.
+    Cap_ShaderNonUniform=5301, Cap_RuntimeDescriptorArray=5302,
+    Cap_StorageBufferArrayNonUniformIndexing=5306,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
@@ -127,6 +137,8 @@ enum : uint32_t {
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
     Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
+    // Decoration 5300 -- descriptor indexing's NonUniform, unrelated to the GroupNonUniform ops.
+    Dec_NonUniform=5300,
     BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_SubgroupId=40, BI_SubgroupLocalInvocationId=41,
@@ -271,7 +283,24 @@ bool inline_16bit_operand_dword(const Operand& o, uint32_t& out) {
 // A compute-shader SPIR-V builder specialized for "load N floats -> compute over SSA floats ->
 // store 1 float", with helpers the VALU translator drives.
 struct SpirvCompute {
-    std::vector<uint32_t> caps, extimp, mem, entry, exec, debug, deco, types, code;
+    // `exts` holds OpExtension. SPIR-V requires it AFTER every OpCapability and BEFORE
+    // OpExtInstImport, which is why it is a separate section rather than appended to `caps` or
+    // prepended to `extimp` -- see the module assembly order below. Getting that order wrong fails
+    // spirv-val with a LAYOUT complaint that says nothing about descriptors.
+    std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
+    bool descriptor_indexing_declared = false;
+    // Declare the capability set and extension for an indexed descriptor array, once per module and
+    // only when one is actually declared, so every module that does not use one is byte-identical to
+    // what this emitter produced before stage 4b.
+    void declare_descriptor_indexing() {
+        if (descriptor_indexing_declared) return;
+        descriptor_indexing_declared = true;
+        put(caps, Op_Capability, {Cap_ShaderNonUniform});
+        put(caps, Op_Capability, {Cap_RuntimeDescriptorArray});
+        put(caps, Op_Capability, {Cap_StorageBufferArrayNonUniformIndexing});
+        std::vector<uint32_t> o; pstr(o, "SPV_EXT_descriptor_indexing");
+        putv(exts, Op_Extension, o);
+    }
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;
@@ -289,6 +318,10 @@ struct SpirvCompute {
     int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
     uint32_t guest_scratch_dwords=0;
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
+    // binding -> declared array length for a TABLE-INDEXED binding (#2412). Absent means an ordinary
+    // single descriptor, so an access chain for it takes no leading index. Kept beside `cbuf_var`
+    // because every consumer of the variable also needs to know whether it is an array.
+    std::map<uint32_t, uint32_t> cbuf_table_arity;
     // A two-byte guest V# can only back our u32 SSBO ABI when every use of that binding is the exact
     // one-record Uint16/Float16 path. Ordinary load/store/atomic helpers blacklist their bindings;
     // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
@@ -2306,6 +2339,35 @@ struct SpirvCompute {
                 if (!seen.insert(r.binding).second) continue;
                 uint32_t v = id();
                 put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set}); put(deco, Op_Decorate, {v, Dec_Binding, r.binding});
+                if (r.table_index_count != 0) {
+                    // TABLE-INDEXED binding (#2412 stage 4b): the descriptor is one OF an array,
+                    // selected by an index only the GPU knows. The pointee becomes an array of the same
+                    // Block type rather than the Block itself, so this binding occupies
+                    // `table_index_count` descriptors and an access chain needs a leading index.
+                    //
+                    // A count of 0 never reaches here -- it means "not table-indexed".
+                    //
+                    // An IMPLAUSIBLE length emits a runtime array rather than a fixed array of that
+                    // length. This is the defensive path for a length that reflection could not read:
+                    // #2463 gives such a length its own sentinel (UINT32_MAX), and emitting
+                    // `OpTypeArray %Block 4294967295` would ask the driver for a 4-billion-descriptor
+                    // binding. The numeric guard catches that sentinel without this branch having to
+                    // depend on #2463 being merged first, and catches any other absurd count on the way.
+                    constexpr uint32_t kMaxPlausibleArity = 1u << 16;
+                    declare_descriptor_indexing();
+                    const uint32_t arr = id();
+                    if (r.table_index_count > kMaxPlausibleArity) {
+                        put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
+                    } else {
+                        put(types, Op_TypeArray, {arr, t_struct_u, uconst(r.table_index_count)});
+                    }
+                    const uint32_t arr_ptr = id();
+                    put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
+                    put(types, Op_Variable, {arr_ptr, v, SC_StorageBuffer});
+                    cbuf_var[r.binding] = v;
+                    cbuf_table_arity[r.binding] = r.table_index_count;
+                    continue;
+                }
                 put(types, Op_Variable, {t_ptr_sb_struct_u, v, SC_StorageBuffer});
                 cbuf_var[r.binding] = v;
             }
@@ -2989,7 +3051,7 @@ struct SpirvCompute {
             putv(debug, Op_ModuleProcessed, words);
         }
         std::vector<uint32_t> m{0x07230203u, 0x00010300u, 0u, next_id, 0u};
-        for (auto* s : {&caps, &extimp, &mem, &entry, &exec, &debug, &deco, &types, &code})
+        for (auto* s : {&caps, &exts, &extimp, &mem, &entry, &exec, &debug, &deco, &types, &code})
             m.insert(m.end(), s->begin(), s->end());
         return m;
     }
