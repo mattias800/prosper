@@ -449,7 +449,7 @@ wall-clock window, and a 60 s window lands in different phases on different runs
 
 **Every figure in this table is Windows/NVIDIA (RTX 4090), and the wave64 column is a device property, not
 a title property.** Whether a wave64 fragment shader is skipped is decided by a **seven-way disjunction over
-adapter properties** (`render_runner.h:4469`–`:4478`) — subgroup-size control, min and max subgroup size,
+adapter properties** (`render_runner.h:4487`–`:4496`) — subgroup-size control, min and max subgroup size,
 `requiredSubgroupSizeStages`, `subgroupSupportedStages`, the subgroup feature set, and internal-GDS use
 without fragment stores/atomics. On this project's Linux lane — AMD Radeon 8060S (RADV STRIX_HALO) — **all
 seven terms are false**, so that adapter is expected to report **0** skips for the same title:
@@ -478,8 +478,8 @@ committed while assembling a baseline whose purpose is to avoid exactly that.
 ### The wave64 column counts SHADERS, not skipped draws — do not divide it by the draw count
 
 `[render] skip draw: fragment shader requires subgroup size 64` is emitted inside a dedupe guard keyed on
-fragment-shader identity (`render_runner.h:4484`, `logged.insert(shader_key).second`), while the `continue`
-that actually drops the draw sits **outside** it at `:4558`. So the line fires **once per distinct shader**
+fragment-shader identity (`render_runner.h:4502`, `logged.insert(shader_key).second`), while the `continue`
+that actually drops the draw sits **outside** it at `:4576`. So the line fires **once per distinct shader**
 and the skip happens **per draw**: `grep -c` over that message counts shaders, and the number of draws lost
 to wave64 is **not measured by any current diagnostic**.
 
