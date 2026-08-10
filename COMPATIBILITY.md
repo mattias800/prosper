@@ -8,7 +8,7 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
-Last updated: 2026-08-06
+Last updated: 2026-08-10
 
 ## Summary
 

@@ -6,10 +6,11 @@ Not a CPU emulator: the PS5 is x86-64, so guest code runs **natively**. `prosper
 operating system (FreeBSD-derived), the library ABI (Sony NID-linked modules), and the GPU
 (AGC → Vulkan) underneath the unmodified game binary.
 
-**Primary title:** `PPSA24651` — *The Messenger* (Unity 2022 / IL2CPP). Also exercised:
-`PPSA02664` (Unity/IL2CPP), `PPSA17942` (Unreal Engine), `PPSA13579` (*Blasphemous 2*), and
-`PPSA15552` (*Dead Cells*). Their SELF segments are unencrypted, which is what makes the project
-possible without console keys. Dumps are user-supplied and gitignored.
+**Primary title:** `PPSA24651` — *The Messenger* (Unity 2022 / IL2CPP). The compatibility corpus now
+tracks 39 titles across Unity/IL2CPP, Unreal Engine, RAGE, Hedgehog Engine and custom engines; see
+[`../COMPATIBILITY.md`](../COMPATIBILITY.md) for the current user-visible milestones. Their SELF
+segments are unencrypted, which is what makes the project possible without console keys. Dumps are
+user-supplied and gitignored.
 
 ## Status
 - ✅ **M0–M1 — Recon, tooling & loader.** Format cracked; SELF/ELF → relocatable image → multi-module
@@ -75,22 +76,14 @@ possible without console keys. Dumps are user-supplied and gitignored.
   over an otherwise valid world (#654). A 420-frame sampled-render native capture confirms the complete first
   playable room, and screenshot manifests distinguish new publications from actual pixel progress (#648).
   The route and capture recipe are in `scripts/blasphemous2/README.md`.
-- 🚧 **Active frontiers:** bundle v2 makes long Dead Cells history practical with exact shared-resource
-  chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state
-  run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal
-  642×362 edges without bounded leaves, but the first 80-draw semantic endpoint is the opening vignette rather
-  than playable gameplay. The preserved #608 bundle selected the Jump tutorial with exactly 90 draws and the
-  738x420 pass at draw 79..81. Current routes are selected without submit ordinals by combining 91..94 semantic
-  draws, exactly 8 dispatches, and the 636x420 pass at draw 77..85. Timeline v6 records compact target spans so the
-  predicate can be discovered and validated offline before an expensive detailed capture (#594).
-  The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
-  failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
-  HTILE metadata instead; #611 implements that missing cache boundary. Capture v8 now snapshots exact valid
-  depth/stencil planes with their complete cache identity and embeds the source bundle output oracle. Both the
-  normal production path and an invalidation-disabled stale-depth A/B replay byte-identically from one final
-  capsule in about 3.3 seconds (#569). The Dead Cells splash guard checks the richest frame in its startup window against
-  a measured content threshold, avoiding its nondeterministic animation frame. UE4's measured GPU boundary remains
-  under its area issues.
+- 🚧 **Active frontiers (2026-08-10):** GTA V reaches its title/menu and routed gameplay entry, where
+  the HUD renders over an absent 3D world. The six-stage runtime-selected descriptor-array lift is
+  complete; post-lift Linux and Windows evidence moves the current blocker to about 57 distinct compute
+  control-flow structurization sites (#2412/#2481), with subgroup-contract limits tracked separately
+  in #2429. Dragon Quest VII now boots and submits continuously on Windows (#2447), but routed
+  progression can hit a fixed `sceKernelBatchMap` ENOMEM whose high-volume memory logger suppresses the
+  repro (#2448/#2450). Sonic Racing: CrossWorlds has advanced to rung 2: pulsed input reaches its full
+  4K title screen, while the later profile panel and terminal white state remain open (#2358/#2360).
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in
 [`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current work is tracked in GitHub
@@ -122,7 +115,7 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # the self-checking suite (count varies by platform)
+ctest --test-dir build --no-tests=error  # report the discovered count; it varies by platform
 ```
 `ctest` needs `spirv-val` on `PATH` — `spirv-tools` on Fedora/Ubuntu,
 `mingw-w64-ucrt-x86_64-spirv-tools` in MSYS2, `brew install spirv-tools` on macOS. The

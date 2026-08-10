@@ -166,7 +166,7 @@ sudo apt install ninja-build pkg-config libvulkan-dev libavformat-dev libavcodec
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # unit + boot + Vulkan-execution tests
+ctest --test-dir build-linux --no-tests=error  # unit + boot + Vulkan-execution tests
 ```
 
 Add `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON` to build the windowed frontend
@@ -186,7 +186,7 @@ pacman -S --needed git mingw-w64-ucrt-x86_64-gcc \
 cmake -S prosper -B prosper/build-windows-core -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
 cmake --build prosper/build-windows-core
-ctest --test-dir prosper/build-windows-core --output-on-failure
+ctest --test-dir prosper/build-windows-core --output-on-failure --no-tests=error
 ```
 
 This builds and tests the headless core without SDL or Vulkan. GitHub Actions runs the same UCRT64

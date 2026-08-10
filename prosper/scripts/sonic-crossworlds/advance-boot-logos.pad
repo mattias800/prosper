@@ -1,4 +1,4 @@
-# Sonic Racing: CrossWorlds (PPSA08804): carry the boot sequence past the SEGA logo.
+# Sonic Racing: CrossWorlds (PPSA08804): carry the boot sequence to the title screen.
 #
 # Before this route the title was recorded at rung 1 -- "the SEGA logo renders, the composite then goes
 # uniform" -- and every diagnostic said the renderer was healthy: 0 dropped pipelines, 0 unresolved
@@ -6,10 +6,11 @@
 # for a button.
 #
 # With this route the title renders, in order and correctly at 3840x2160: the SEGA logo, the **Unreal
-# Engine** logo (crc 42763e4a), the **CRIWARE** logo (5170ed80) and the **legal / licensor text screen**
-# (b3b61854). None of those three had ever been observed on this title; four independent no-pad
-# observations -- two arms of mine and the two master arms recorded in SONIC_CROSSWORLDS_STATUS.md --
-# show only black / SEGA logo / black.
+# Engine** logo (crc 42763e4a), the **CRIWARE** logo (5170ed80), the **legal / licensor text screen**
+# (b3b61854), the auto-save notice, the complete title screen, and the player-profile menu. The profile
+# menu's UI renders over a black central panel and the sequence later holds on white; gameplay is not
+# reached. Four independent no-pad observations show only black / SEGA logo / black because the guest
+# waits for an input edge after the logo.
 #
 # THE EDGE IS THE POINT, and it is the whole finding. An earlier arm held Cross continuously from frame 0
 # (`f0-20000:cross`), with delivery confirmed from the guest's own read (`[pad] pad_read_state call#512
@@ -20,11 +21,12 @@
 # Frame anchors rather than seconds: this title runs at roughly 3.7 host frames/s during the logo
 # sequence, so wall-clock anchors drift badly between runs while frame anchors do not.
 #
-# Verified on Linux/RADV through tools/screenshot, default launch, --seconds 30 --count 9 (270 s), on
-# master at ad5f5132 + c477d938. Two runs, identical CRC set, sampling counts differing by one.
+# Verified on Linux/RADV through tools/screenshot in two independent routed 560 s runs. The title-screen
+# CRC differs because its scene is animated, while the two runs agree in content signature at about 99.6%
+# non-black coverage and 113k sampled colours (#2360).
 #
-# This does NOT reach a title screen. It reaches the auto-save notice, which on SEGA titles sits just
-# before one, so extending it is worth another pass -- watch where it stalls next and add pulses there.
+# This reaches rung 2 (title screen), not rung 3 (gameplay). Continue extending with bounded pulses and
+# inspect the next stable state; do not replace the pulses with a trailing hold.
 #
 # One observation, flagged rather than claimed: the auto-save notice renders LETTERBOXED into a
 # horizontal band, with the top and bottom thirds black, rather than filling the 3840x2160 target. That
