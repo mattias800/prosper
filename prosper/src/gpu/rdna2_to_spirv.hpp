@@ -295,11 +295,18 @@ uint32_t fragment_spirv_required_subgroup_size(const std::vector<uint32_t>& spir
 //
 // These name the emitter path that raised the contract. A module may set several.
 inline constexpr uint32_t kFragmentWaveReasonLaneId     = 1u << 0;  // lane id from SubgroupLocalInvocationId
-inline constexpr uint32_t kFragmentWaveReasonWaveAny    = 1u << 1;  // OpGroupNonUniformAny (guard AND reduce)
+inline constexpr uint32_t kFragmentWaveReasonWaveAny    = 1u << 1;  // OpGroupNonUniformAny (vote)
 inline constexpr uint32_t kFragmentWaveReasonDppRow16   = 1u << 2;  // DPP row, needs >= 16
 inline constexpr uint32_t kFragmentWaveReasonPermLane32 = 1u << 3;  // PERMLANEX16, needs >= 32
 inline constexpr uint32_t kFragmentWaveReasonReadLane64 = 1u << 4;  // V_READLANE_B32 across a wave64
 inline constexpr uint32_t kFragmentWaveReasonShuffle    = 1u << 5;  // lane-addressed shuffle
+// OpGroupNonUniformBallot. Separate from WaveAny because the two have OPPOSITE prospects under a
+// wave32 lowering, which is the same distinction #2147 drew between lane-id and vote and the same
+// reason it drew it (#2441). A ballot's bits become guest scalar DATA -- half a mask reported as
+// whole is silently wrong -- so its width requirement can never be relaxed, whereas a vote's may
+// be. Reporting both as "wave-any" made the recoverable and unrecoverable cases one number: on
+// PPSA04263 that number was 68 of 112 skipped fragment shaders, with no way to ask how it divides.
+inline constexpr uint32_t kFragmentWaveReasonWaveBallot = 1u << 6;  // OpGroupNonUniformBallot (reduce)
 
 // Reasons recorded by the emitter, or UINT32_MAX when the module carries no reason marker at
 // all (built, cached or captured before #2147). Absent must not read as none.

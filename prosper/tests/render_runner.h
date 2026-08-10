@@ -4370,6 +4370,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         {prosper::gpu::kFragmentWaveReasonPermLane32, " permlane32"},
                         {prosper::gpu::kFragmentWaveReasonReadLane64, " readlane64"},
                         {prosper::gpu::kFragmentWaveReasonShuffle,    " shuffle"},
+                        {prosper::gpu::kFragmentWaveReasonWaveBallot, " wave-ballot"},
                     };
                     for (const auto& entry : kReasonNames)
                         if ((why & entry.bit) && n > 0 && n < static_cast<int>(sizeof why_text))

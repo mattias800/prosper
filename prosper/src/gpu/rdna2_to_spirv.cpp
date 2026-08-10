@@ -612,7 +612,11 @@ struct SpirvCompute {
             declared_subgroup_ballot = true;
         }
         fragment_required_subgroup_size = wave_size;
-        fragment_wave_reasons |= kFragmentWaveReasonWaveAny;
+        // Ballot, not vote: the reason bit must say which, because only one of the two can ever be
+        // relaxed to a narrower subgroup and the skip diagnostic is where that question gets asked
+        // (#2441). This records the same width as before -- the gate keys on
+        // fragment_required_subgroup_size, not on the reason -- so behaviour is unchanged.
+        fragment_wave_reasons |= kFragmentWaveReasonWaveBallot;
         const uint32_t ballot = id();
         put(code, Op_GroupNonUniformBallot,
             {t_v4u(), ballot, uconst(Scope_Subgroup), mask_bit});

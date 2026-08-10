@@ -937,6 +937,71 @@ int main() {
     }
     printf("  [ok]   fragment private spill/fill emits structurally valid Function storage\n");
 
+    // #2441: the fragment skip diagnostic must say WHICH cross-lane form raised the wave64 contract,
+    // because the two have opposite prospects under a wave32 lowering. A vote MAY be width-agnostic
+    // (two 32-lane votes union to the same executed-pixel set); a ballot never is, since its bits
+    // become guest scalar DATA and half a mask reported as whole is silently wrong -- which
+    // rdna2_to_spirv.cpp's own comment on fragment_wave_ballot_half already says. Both used to set
+    // kFragmentWaveReasonWaveAny, so the recoverable and unrecoverable cases were a single number:
+    // on PPSA04263, 68 of 112 skipped fragment shaders, with no way to ask how it divides.
+    //
+    // s_quadmask_b64 vcc, vcc (0xbeea2d6a) is the ballot path. It reads VCC as a mask, so the v_cmp
+    // ahead of it is load-bearing: without a real per-lane bool in VCC the lowering takes no ballot.
+    const uint32_t quadmask_fragment[] = {
+        0x7e020280u,              // v_mov_b32 v1, 0
+        0x7c2200f0u,              // v_cmp_* -> VCC (per-lane bool)
+        0xbeea2d6au,              // s_quadmask_b64 vcc, vcc
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u, // exp mrt0 v0,v1,v2,v3
+        0xbf810000u,
+    };
+    const auto quadmask_spv = recompile_fragment(quadmask_fragment, std::size(quadmask_fragment));
+    if (quadmask_spv.empty()) {
+        printf("  [FAIL] fragment s_quadmask_b64 did not recompile\n");
+        return 1;
+    }
+    const uint32_t quadmask_reasons = fragment_spirv_required_subgroup_reasons(quadmask_spv);
+    if (quadmask_reasons == UINT32_MAX) {
+        printf("  [FAIL] fragment s_quadmask_b64 module carries no wave-reason marker\n");
+        return 1;
+    }
+    // The arm that fails without the split: before it, nothing ever set WaveBallot.
+    if (!(quadmask_reasons & prosper::gpu::kFragmentWaveReasonWaveBallot)) {
+        printf("  [FAIL] s_quadmask_b64 reported its wave64 contract as a vote, not a ballot "
+               "(reasons=0x%x)\n", quadmask_reasons);
+        return 1;
+    }
+    // The width itself must be unchanged: this split is diagnostic, not a behavioural relaxation.
+    if (fragment_spirv_required_subgroup_size(quadmask_spv) != 64) {
+        printf("  [FAIL] ballot module stopped advertising its exact wave64 requirement\n");
+        return 1;
+    }
+    printf("  [ok]   s_quadmask_b64 records a BALLOT reason, distinct from a vote, still wave64\n");
+
+    // The other direction, so that moving the wrong call site cannot pass: a module whose only
+    // cross-lane form is a branch-guard vote must NOT claim a ballot raised its contract.
+    const uint32_t execz_vote_fragment[] = {
+        0x7e020280u,              // v_mov_b32 v1, 0
+        0x7c2200f0u,              // v_cmp_* -> VCC
+        0xbf880002u,              // s_cbranch_execz +2  (routes through the fragment wave vote)
+        0xbe8503f2u, 0x7e020205u,
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,
+        0xbf810000u,
+    };
+    const auto execz_vote_spv =
+        recompile_fragment(execz_vote_fragment, std::size(execz_vote_fragment));
+    if (!execz_vote_spv.empty()) {
+        const uint32_t vote_reasons = fragment_spirv_required_subgroup_reasons(execz_vote_spv);
+        if (vote_reasons != UINT32_MAX &&
+            (vote_reasons & prosper::gpu::kFragmentWaveReasonWaveBallot)) {
+            printf("  [FAIL] a vote-only fragment module claimed a ballot (reasons=0x%x)\n",
+                   vote_reasons);
+            return 1;
+        }
+        printf("  [ok]   a vote-only fragment module does not claim a ballot\n");
+    }
+
     // Astro Bot's Wave32 graphics shaders save/copy/restore active-lane masks through the low
     // halves of EXEC and VCC.  These are the B32 equivalents of the B64 mask moves already modeled
     // below, not scalar-data transfers: treating EXEC_LO as ordinary data rejected the entire draw.
