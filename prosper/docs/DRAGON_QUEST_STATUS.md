@@ -409,6 +409,67 @@ current build.
   1.78 M non-zero samples at peak 0.38976. Every port and context line now carries a never-reset
   total for exactly this reason. See instrument-trap 39.
 
+## Windows pre-lift baseline (2026-08-10, master `a6043524`)
+
+Recorded **before** the runtime-selected-descriptor lift (#2412) begins landing its layers, so that a
+cross-title regression on this title is detectable afterwards. The lift changes device creation, reflection,
+SPIR-V emission and the executor, so every title is in its blast radius even though DQ is not the title it
+targets.
+
+Six runs, `screenshot --seconds 60 --count 1`, `PROSPER_NULL_PAGE=1 PROSPER_GUEST_ARGS= `
+`PROSPER_NO_RTT_SNAPSHOT_BORROW=1 PROSPER_GFXLOG=1 PROSPER_DBG=1`, no input route.
+Windows 11, RTX 4090 driver 32.0.16.1047, MinGW-w64 UCRT gcc 16.1.0, Vulkan SDK 1.4.350.0.
+
+| run | frames | `[render] item` draws | wave64 skips | `recompile-reject` | composite crc |
+| --- | --- | --- | --- | --- | --- |
+| base1 | 862 | 3497 | 4 | 0 | `666f7b3f` |
+| base2 | 769 | 3114 | 4 | 0 | `666f7b3f` |
+| base5 | 189 | 1926 | 21 | 0 | `666f7b3f` |
+| base3 | 0 | 0 | 0 | 0 | `08ed2210` |
+| base4 | 0 | 0 | 0 | 0 | `08ed2210` |
+| base6 | 0 | 0 | 0 | 0 | `08ed2210` |
+
+### Assert these — they held on every run
+
+- **`recompile-reject` count is 0.** Every run, rendered or stalled. This title has no recompiler rejects at
+  all, which is what distinguishes it from GTA V's 951 (all `unresolved-operand`) and is why the descriptor
+  lift is **not** expected to change DQ's composite. A non-zero count after the lift is a real regression.
+- **`crc=666f7b3f` on every run that rendered at least one frame**, and `crc=08ed2210` on every run that
+  rendered none — 3/3 each way, no overlap. So the crc **also diagnoses which mode a run was in**, which is
+  useful because the two are otherwise easy to confuse.
+- Boot reaches guest execution (`File root is /app0/`) on 6 of 6.
+
+### Do NOT assert these — they are phase-dependent and will cry wolf
+
+**Frames (189–862), draws (1926–3497), and wave64 skips (4–21) all vary by more than 2x between runs of the
+same binary.** They are not noise around a value; they depend on how far the boot got inside a fixed
+wall-clock window, and a 60 s window lands in different phases on different runs.
+
+**Draws-per-frame is not an invariant either, and this was nearly recorded as one.** base1 and base2 agreed to
+two decimal places (4.06, 4.05), which looked like a stable normalisation that would survive the ±12% spread
+in the raw counts. base5 gives **10.19**. The agreement was coincidence — both runs happened to sample the
+same phase. This is instrument trap 146 (a ratio over a moving sequence measures *when the window landed*),
+committed while assembling a baseline whose purpose is to avoid exactly that.
+
+### The acceptance rule, which is load-bearing
+
+**A run counts only if it reached guest execution AND rendered at least one frame.** `File root is /app0/`
+alone is insufficient: base3/4/6 all satisfy it, render nothing, and return a *different crc*. Scored
+naively, the baseline would read "crc may be either value" and a stalled run after the lift would present as a
+composite change.
+
+### Stall rate here is 50%, and that is an apparatus figure
+
+3 of 6 runs rendered nothing. That is far worse than the **1 stall in 11** measured on 120 s runs **without**
+`GFXLOG`/`DBG` (#2448) — those diagnostics are high-volume and slow the boot, so a 60 s window is much more
+likely to close before rendering starts. **Do not quote 50% as a property of the title**; it is the rate for
+*this* configuration. The comparable no-diagnostic figure is on #2448.
+
+### How to use this after a lift stage lands
+
+Re-run the same command, discard any run that fails the acceptance rule, and compare only the asserted
+invariants. A change in frames, draws or wave64 skips is **not** evidence of anything on its own.
+
 ## Ruled out — eliminated, do not re-run these
 
 - **"The failing draws run with the previous pipeline's *user data*."** This title's own
