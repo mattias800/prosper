@@ -1,5 +1,6 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/tile.hpp"
 #include "../src/host/guest_write_watch.hpp"
@@ -640,6 +641,79 @@ int main() {
     item.command_order = 70;
     item.recompile_config = config;
     item.recompile_config_available = true;
+
+    // GTA V reaches two compute programs whose only external operations use fully-known RAW V#s
+    // with NUM_RECORDS=0. Production discovery materializes an exact-PC marker and recompilation
+    // removes the buffer access entirely, so reflection correctly reports no descriptor. The live
+    // backend must recognize only that complete proof as successful without submitting empty work.
+    const uint32_t zero_record_code[] = {
+        0xE0300000u, 0x80000000u, // buffer_load_dword v0, off, s[0:3]
+        0xBF810000u,
+    };
+    const uint32_t zero_record_seed[4] = {
+        0x00000000u, 0x00100000u, 0x00000000u, 0x00016204u,
+    };
+    ShaderResourceTable zero_record_rt;
+    const std::vector<SrtUse> zero_record_uses = add_compute_buffer_resources(
+        zero_record_rt, zero_record_code, std::size(zero_record_code), zero_record_seed,
+        std::size(zero_record_seed));
+    assign_convention_bindings(zero_record_rt, 2);
+    ComputeShaderConfig zero_record_config;
+    zero_record_config.user_sgprs.assign(zero_record_seed,
+                                         zero_record_seed + std::size(zero_record_seed));
+    zero_record_config.local_x = zero_record_config.local_y = zero_record_config.local_z = 1;
+    const std::vector<uint32_t> zero_record_spirv = recompile_compute(
+        zero_record_code, std::size(zero_record_code), &zero_record_rt,
+        zero_record_config);
+    const DescriptorValidationReport zero_record_report = validate_spirv_descriptor_interface(
+        zero_record_spirv, &zero_record_rt, 0, SpirvShaderStage::Compute, false);
+    CHECK(zero_record_uses.size() == 1 && zero_record_rt.resources.size() == 1 &&
+              is_zero_record_raw_buffer(zero_record_rt.resources[0]) &&
+              !zero_record_spirv.empty() && zero_record_report.ok() &&
+              zero_record_report.descriptors.empty(),
+          "production zero-record RAW program recompiles with an exact marker and no descriptors");
+
+    ComputeItem zero_record_item;
+    zero_record_item.spirv = zero_record_spirv;
+    zero_record_item.user_sgprs = zero_record_config.user_sgprs;
+    zero_record_item.resources = std::make_shared<ShaderResourceTable>(zero_record_rt);
+    zero_record_item.launch.threads_x = zero_record_item.launch.threads_y =
+        zero_record_item.launch.threads_z = 1;
+    zero_record_item.launch.local_x = zero_record_item.launch.local_y =
+        zero_record_item.launch.local_z = 1;
+    zero_record_item.launch.groups_x = zero_record_item.launch.groups_y =
+        zero_record_item.launch.groups_z = 1;
+    zero_record_item.code_addr = 0x413cf4900ull;
+    zero_record_item.dispatch_index = 6;
+    zero_record_item.submit_no = 11;
+    zero_record_item.command_order = 69;
+    zero_record_item.recompile_config = zero_record_config;
+    zero_record_item.recompile_config_available = true;
+
+    const uint64_t zero_record_submits_before =
+        prosper::frontend::live_compute_queue_submit_attempts();
+    CHECK(prosper::frontend::execute_live_compute_items({zero_record_item}),
+          "all-marker descriptorless compute completes as a proven live-backend no-op");
+    ComputeItem empty_zero_record_item = zero_record_item;
+    empty_zero_record_item.resources = std::make_shared<ShaderResourceTable>();
+    CHECK(!prosper::frontend::execute_live_compute_items({empty_zero_record_item}),
+          "descriptorless compute with an empty runtime table remains fail-visible");
+    ComputeItem ordinary_zero_record_item = zero_record_item;
+    ordinary_zero_record_item.resources = std::make_shared<ShaderResourceTable>();
+    ShaderResource unused_ordinary_resource;
+    unused_ordinary_resource.cls = ResourceClass::ConstantBuffer;
+    unused_ordinary_resource.format = DataFormat::Uint32;
+    unused_ordinary_resource.num_components = 1;
+    unused_ordinary_resource.binding = 2;
+    unused_ordinary_resource.gpu_addr = reinterpret_cast<uint64_t>(result.data());
+    unused_ordinary_resource.size = sizeof(uint32_t);
+    ordinary_zero_record_item.resources->resources.push_back(unused_ordinary_resource);
+    CHECK(!prosper::frontend::execute_live_compute_items({ordinary_zero_record_item}),
+          "descriptorless compute with an unused ordinary resource remains fail-visible");
+    CHECK(prosper::frontend::live_compute_queue_submit_attempts() ==
+              zero_record_submits_before,
+          "proven and rejected descriptorless programs never attempt a Vulkan queue submit");
+
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend executes the game kernel");
     CHECK(result.size() == launched_records * 4, "compute resource retains its padded declared size");

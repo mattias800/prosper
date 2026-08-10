@@ -4886,6 +4886,97 @@ int main() {
       printf("  kernel68 mismatches=%u (buf[6]=%g expect=12)\n", bad68, f6); }
     CHECK(stored68_out.size() == N && bad68 == 0, "recompiled kernel 68 (raw store routes to binding 3 via SRSRC) correct");
 
+    // GTA V gameplay-entry compute programs consume fully-known RAW V#s with NUM_RECORDS=0. The
+    // production front half represents each use with this exact-PC marker. Loads must produce zero
+    // only for active EXEC lanes; stores must emit no memory write at all (a shared dummy would let
+    // one null store leak into a later null load).
+    auto zero_record_resource = [](uint32_t fetch_pc) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Unknown;
+        resource.num_components = 0;
+        resource.binding = 3;
+        resource.gpu_addr = 0;
+        resource.size = 0;
+        resource.stride = 0;
+        resource.srt_offset = 0xFFFFFFFFu;
+        resource.sgpr_base = 0xFFFFFFFFu;
+        resource.fetch_pc = fetch_pc;
+        return resource;
+    };
+
+    // v2=7; narrow EXEC to u0>u1; zero-record raw load into v2; restore EXEC; convert/output v2.
+    // Active lanes observe zero, while masked lanes retain the old 7 through predicate_write.
+    const uint32_t code68_zero_load[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040287u, 0x7DA80300u,
+        0xE0300000u, 0x80000200u,
+        0xBEFE04C1u, 0x7E040D02u, 0xBF810000u,
+    };
+    ShaderResourceTable rt68_zero_load;
+    rt68_zero_load.resources.push_back(zero_record_resource(4));
+    CHECK(is_zero_record_raw_buffer(rt68_zero_load.resources[0]),
+          "zero-record RAW test uses the explicit production marker shape");
+    const std::vector<uint32_t> spv68_zero_load = recompile_valu(
+        code68_zero_load, std::size(code68_zero_load), 2, 2, &rt68_zero_load);
+    const uint32_t code68_zero_load_control[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040287u, 0x7DA80300u,
+        0x7E040280u,
+        0xBEFE04C1u, 0x7E040D02u, 0xBF810000u,
+    };
+    const std::vector<uint32_t> spv68_zero_load_control = recompile_valu(
+        code68_zero_load_control, std::size(code68_zero_load_control), 2, 2,
+        &rt68_zero_load);
+    CHECK(!spv68_zero_load.empty() && !spv68_zero_load_control.empty() &&
+              count_spirv_opcode(spv68_zero_load, 61) ==
+                  count_spirv_opcode(spv68_zero_load_control, 61) &&
+              count_spirv_opcode(spv68_zero_load, 62) ==
+                  count_spirv_opcode(spv68_zero_load_control, 62) &&
+              count_spirv_opcode(spv68_zero_load, 65) ==
+                  count_spirv_opcode(spv68_zero_load_control, 65),
+          "zero-record raw load adds no storage-buffer access/load/store instructions");
+    std::vector<float> in68_zero_load(N * 2), expected68_zero_load(N);
+    uint32_t active68_zero_load = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t u0 = i % 17u, u1 = i % 13u;
+        in68_zero_load[i * 2] = static_cast<float>(u0);
+        in68_zero_load[i * 2 + 1] = static_cast<float>(u1);
+        expected68_zero_load[i] = u0 > u1 ? 0.0f : 7.0f;
+        active68_zero_load += u0 > u1;
+    }
+    const std::vector<float> got68_zero_load = prosper::test::run_compute(
+        spv68_zero_load, in68_zero_load, N, N, {}, std::vector<uint32_t>(1, 0xDEADBEEFu));
+    uint32_t bad68_zero_load = 0;
+    for (uint32_t i = 0; i < N && got68_zero_load.size() == N; ++i)
+        if (got68_zero_load[i] != expected68_zero_load[i]) ++bad68_zero_load;
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_load.size() == N && bad68_zero_load == 0,
+          "zero-record raw load returns zero under EXEC and preserves masked VGPR lanes");
+
+    ShaderResourceTable rt68_zero_store;
+    rt68_zero_store.resources.push_back(zero_record_resource(2));
+    const std::vector<uint32_t> spv68_zero_store = recompile_valu(
+        code68, std::size(code68), 1, 0, &rt68_zero_store);
+    const uint32_t code68_zero_store_control[] = {
+        0x7E040F00u, 0x06060100u, 0x7E000000u, 0x7E000000u, 0xBF810000u,
+    };
+    const std::vector<uint32_t> spv68_zero_store_control = recompile_valu(
+        code68_zero_store_control, std::size(code68_zero_store_control), 1, 0,
+        &rt68_zero_store);
+    CHECK(!spv68_zero_store.empty() && !spv68_zero_store_control.empty() &&
+              count_spirv_opcode(spv68_zero_store, 61) ==
+                  count_spirv_opcode(spv68_zero_store_control, 61) &&
+              count_spirv_opcode(spv68_zero_store, 62) ==
+                  count_spirv_opcode(spv68_zero_store_control, 62) &&
+              count_spirv_opcode(spv68_zero_store, 65) ==
+                  count_spirv_opcode(spv68_zero_store_control, 65),
+          "zero-record raw store adds no storage-buffer access/load/store instructions");
+    const std::vector<uint32_t> zero_store_sentinel = {0xDEADBEEFu};
+    std::vector<uint32_t> zero_store_after;
+    prosper::test::run_compute(spv68_zero_store, std::vector<float>{3.0f}, 1, 1, {},
+                               zero_store_sentinel, &zero_store_after);
+    CHECK(zero_store_after == zero_store_sentinel,
+          "zero-record raw store is a no-op and cannot mutate a shared dummy backing");
+
     // Kernel N: v_nop (VOP1 op 0x00) between real ALU ops must be a transparent no-op. This was the
     // #121 blocker — PPSA02664's vertex shaders contain v_nop (a common scheduling/hazard filler), and
     // the recompiler rejected it, failing the whole shader and skipping ~182 draws/frame (black screen).

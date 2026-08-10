@@ -9948,6 +9948,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
                 }
+                if (is_zero_record_raw_buffer(*res)) {
+                    // The front half proved all four live V# words at this exact instruction and
+                    // decoded NUM_RECORDS=0. RDNA2's OOB contract returns zero for every raw load
+                    // component and drops raw stores. Keep inactive lanes' destination values just
+                    // like a normal EXEC-predicated load, and never touch a shared dummy buffer on
+                    // the store side. Atomics are outside the producer's admitted subset and remain
+                    // fail-closed if a hand-built table tries to apply the marker to one.
+                    if (is_atomic) { ok = false; return true; }
+                    if (is_store) return true;
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const int d = in.dst.value + static_cast<int>(k);
+                        const uint32_t old = vreg_old(b, rs, d);
+                        rs.vreg[d] = b.uconst(0);
+                        predicate_write(b, rs, d, old);
+                    }
+                    return true;
+                }
                 resolved_buffer = res;
                 binding = res->binding;
                 stride  = res->stride;

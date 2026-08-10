@@ -293,6 +293,7 @@ struct ShaderResourceCompileKey {
     uint32_t flat_base_sgpr = 0;
     uint32_t bvh_box_grow = 0;
     bool null_bvh = false;
+    bool zero_record_raw = false;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -475,6 +476,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.flat_base_sgpr);
             hash = hash_mix(hash, resource.bvh_box_grow);
             hash = hash_mix(hash, resource.null_bvh);
+            hash = hash_mix(hash, resource.zero_record_raw);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1172,6 +1174,10 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
             compiled.bvh_box_grow = resource.bvh_box_grow;
             compiled.null_bvh = is_proven_null_bvh(resource);
+            // gpu_addr/size intentionally stay out of the module key, but this semantic is compiled
+            // into zero-producing/no-op instructions. Partition exactly this proven marker so a
+            // later nonzero descriptor at the same pc cannot reuse the specialized module.
+            compiled.zero_record_raw = is_zero_record_raw_buffer(resource);
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -3481,13 +3487,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
                         // Typed format stores retain the strided record requirement.
                         const bool stride_supported = !format_store_use || d.stride != 0;
-                        if (d.base > 0x10000 && d.size_bytes != 0 &&
-                            d.size_bytes <= 0x10000000u && stride_supported && format_supported) {
+                        // A fully-known RAW MUBUF with NUM_RECORDS=0 is not a missing descriptor:
+                        // hardware returns zero for loads and drops stores. Preserve that proof at
+                        // this exact consumer pc, but do not generalize it to MTBUF, format stores,
+                        // atomics, or an addr0 descriptor with nonzero records.
+                        const bool zero_record_raw = raw_buffer_use && d.num_records == 0u &&
+                                                     d.size_bytes == 0u;
+                        if (zero_record_raw ||
+                            (d.base > 0x10000 && d.size_bytes != 0 &&
+                             d.size_bytes <= 0x10000000u && stride_supported && format_supported)) {
+                            u.zero_record_raw = zero_record_raw;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
-                                             "stride=%u size=%u\n",
+                                             "stride=%u size=%u zero-record=%d\n",
                                              in.pc, srsrc, (unsigned long long)d.base,
-                                             d.stride, d.size_bytes);
+                                             d.stride, d.size_bytes, (int)zero_record_raw);
                             srt_uses->push_back(u);
                         }
                     }
@@ -3931,6 +3945,26 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 if (r0.srt_offset == u.key) { clash = true; break; }
 
         const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+        if (u.zero_record_raw) {
+            // Re-check the producer's proof at materialization so a malformed/manually-constructed
+            // SrtUse cannot manufacture zero semantics. The resource deliberately carries only
+            // exact-PC identity; the emitter never accesses its assigned dummy binding.
+            if (u.instruction_format != UINT32_MAX || d.num_records != 0u ||
+                d.size_bytes != 0u || u.required_size != 0u)
+                continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Unknown;
+            r.num_components = 0;
+            r.gpu_addr = 0;
+            r.size = 0;
+            r.stride = 0;
+            r.srt_offset = 0xFFFFFFFFu;
+            r.sgpr_base = 0xFFFFFFFFu;
+            r.fetch_pc = u.use_pc;
+            table.resources.push_back(r);
+            continue;
+        }
         if (d.base <= 0x10000 || d.size_bytes > 0x10000000u) continue;
         // A scalar consumer whose base is a RAW POINTER has no bounded V# size to report, so
         // `size_bytes == 0` here means "unbounded", not "empty" (#2412). The graphics builder already

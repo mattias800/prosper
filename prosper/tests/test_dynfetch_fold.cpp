@@ -1739,6 +1739,71 @@ int main() {
           direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
           "direct raw-MUBUF V# preserves base/stride/record dwords");
 
+    // GTA V publishes fully-known RAW V#s whose NUM_RECORDS is zero at gameplay entry. These are
+    // architectural zero-read/drop-write resources, not scalar raw pointers: retain one explicit
+    // exact-PC marker for each consumer so the recompiler can lower both sides without a backing
+    // buffer. The captured descriptor shape retains stride/format metadata despite its empty range.
+    const uint32_t zero_record_raw[] = {
+        0xE0300000u, 0x80000000u, // buffer_load_dword v0, off, s[0:3]
+        0xE0700000u, 0x80000100u, // buffer_store_dword v1, off, s[0:3]
+        0xBF810000u,
+    };
+    const uint32_t zero_record_seed[4] = {
+        0x00000000u, 0x00100000u, 0x00000000u, 0x00016204u,
+    };
+    std::vector<SrtUse> zero_record_uses;
+    resolve_dynamic_fetch(zero_record_raw, std::size(zero_record_raw), zero_record_seed,
+                          std::size(zero_record_seed), 0, &zero_record_uses);
+    CHECK(zero_record_uses.size() == 2 && zero_record_uses[0].zero_record_raw &&
+              zero_record_uses[1].zero_record_raw && zero_record_uses[0].use_pc == 0 &&
+              zero_record_uses[1].use_pc == 2 &&
+              decode_buffer_descriptor(zero_record_uses[0].v4.data()).num_records == 0,
+          "fully-known zero-record RAW loads/stores retain exact-PC zero semantics");
+    ShaderResourceTable zero_record_table;
+    const std::vector<SrtUse> materialized_zero_uses = add_compute_buffer_resources(
+        zero_record_table, zero_record_raw, std::size(zero_record_raw), zero_record_seed,
+        std::size(zero_record_seed));
+    assign_convention_bindings(zero_record_table, 2);
+    CHECK(materialized_zero_uses.size() == 2 && zero_record_table.resources.size() == 2 &&
+              is_zero_record_raw_buffer(zero_record_table.resources[0]) &&
+              is_zero_record_raw_buffer(zero_record_table.resources[1]) &&
+              zero_record_table.by_fetch_pc(0) && zero_record_table.by_fetch_pc(2) &&
+              zero_record_table.resources[0].binding == 2 &&
+              zero_record_table.resources[1].binding == 3,
+          "production compute materialization creates distinct zero-record RAW markers");
+    ComputeShaderConfig zero_record_config;
+    zero_record_config.user_sgprs.assign(zero_record_seed,
+                                         zero_record_seed + std::size(zero_record_seed));
+    zero_record_config.local_x = zero_record_config.local_y = zero_record_config.local_z = 1;
+    CHECK(!recompile_compute(zero_record_raw, std::size(zero_record_raw), &zero_record_table,
+                             zero_record_config).empty(),
+          "production zero-record resource table reaches compute translation");
+
+    const uint32_t all_zero_raw_seed[4] = {};
+    std::vector<SrtUse> all_zero_raw_uses;
+    resolve_dynamic_fetch(zero_record_raw, std::size(zero_record_raw), all_zero_raw_seed,
+                          std::size(all_zero_raw_seed), 0, &all_zero_raw_uses);
+    CHECK(all_zero_raw_uses.size() == 2 && all_zero_raw_uses[0].zero_record_raw &&
+              all_zero_raw_uses[1].zero_record_raw,
+          "all-zero unbound RAW V# uses the same exact zero-record contract");
+
+    // The admitted boundary is NUM_RECORDS=0, not merely Base=0. A descriptor with the same zero
+    // address but one 16-byte record remains malformed and must not inherit zero semantics.
+    uint32_t addr0_nonzero_record_seed[4];
+    std::copy(std::begin(zero_record_seed), std::end(zero_record_seed),
+              addr0_nonzero_record_seed);
+    addr0_nonzero_record_seed[2] = 1u;
+    std::vector<SrtUse> addr0_nonzero_record_uses;
+    resolve_dynamic_fetch(zero_record_raw, std::size(zero_record_raw),
+                          addr0_nonzero_record_seed, std::size(addr0_nonzero_record_seed), 0,
+                          &addr0_nonzero_record_uses);
+    ShaderResourceTable addr0_nonzero_record_table;
+    add_compute_buffer_resources(addr0_nonzero_record_table, zero_record_raw,
+                                 std::size(zero_record_raw), addr0_nonzero_record_seed,
+                                 std::size(addr0_nonzero_record_seed));
+    CHECK(addr0_nonzero_record_uses.empty() && addr0_nonzero_record_table.resources.empty(),
+          "addr0 plus nonzero NUM_RECORDS stays rejected at the zero-record boundary");
+
     // Astro Bot's 7f5f world-map NGG shader patches only NUM_RECORDS in its direct s[16:19] V#
     // (`s_mov_b32 s18, 1`) before a raw buffer_load_dwordx4 at pc2761. The consumer is itself the
     // architectural descriptor proof; requiring the four words to retain pristine entry-seed

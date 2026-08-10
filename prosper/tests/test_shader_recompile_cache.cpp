@@ -574,6 +574,51 @@ int main() {
               repeated_u16_tail == cached_u16_tail && stats.misses == 3 && stats.hits == 1,
           "compute cache partitions ordinary/u16/f16 one-record tail semantics exactly");
 
+    // A zero-record RAW V# is compiled into constants/no-ops, while a later nonzero descriptor at
+    // the same instruction emits a real buffer access. Addresses and ordinary sizes intentionally
+    // stay out of the module key, so partition only this exact semantic marker.
+    clear_shader_recompile_cache();
+    static const uint32_t kZeroRecordRawCompute[] = {
+        0xe0300000u, 0x80000000u, // buffer_load_dword v0, off, s[0:3]
+        0xbf810000u,
+    };
+    ShaderResource zero_record_raw;
+    zero_record_raw.cls = ResourceClass::ConstantBuffer;
+    zero_record_raw.format = DataFormat::Unknown;
+    zero_record_raw.num_components = 0;
+    zero_record_raw.binding = 3;
+    zero_record_raw.gpu_addr = 0;
+    zero_record_raw.size = 0;
+    zero_record_raw.stride = 0;
+    zero_record_raw.srt_offset = 0xFFFFFFFFu;
+    zero_record_raw.sgpr_base = 0xFFFFFFFFu;
+    zero_record_raw.fetch_pc = 0;
+    ShaderResourceTable zero_record_raw_table;
+    zero_record_raw_table.resources.push_back(zero_record_raw);
+    ComputeShaderConfig zero_record_raw_config;
+    zero_record_raw_config.user_sgprs.resize(4);
+    zero_record_raw_config.local_x = 64;
+    const auto cached_zero_record_raw = recompile_compute_shader_cached(
+        kZeroRecordRawCompute, std::size(kZeroRecordRawCompute), &zero_record_raw_table,
+        zero_record_raw_config);
+    zero_record_raw_table.resources[0].gpu_addr = 0x20000u;
+    zero_record_raw_table.resources[0].size = 4;
+    const auto cached_nonzero_raw = recompile_compute_shader_cached(
+        kZeroRecordRawCompute, std::size(kZeroRecordRawCompute), &zero_record_raw_table,
+        zero_record_raw_config);
+    zero_record_raw_table.resources[0].gpu_addr = 0;
+    zero_record_raw_table.resources[0].size = 0;
+    const auto repeated_zero_record_raw = recompile_compute_shader_cached(
+        kZeroRecordRawCompute, std::size(kZeroRecordRawCompute), &zero_record_raw_table,
+        zero_record_raw_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(is_zero_record_raw_buffer(zero_record_raw_table.resources[0]) &&
+              !cached_zero_record_raw.empty() && !cached_nonzero_raw.empty() &&
+              cached_zero_record_raw != cached_nonzero_raw &&
+              repeated_zero_record_raw == cached_zero_record_raw && stats.misses == 2 &&
+              stats.hits == 1 && stats.entries == 2,
+          "compute cache separates exact zero-record RAW lowering from nonzero buffers");
+
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw
     // uint-channel fallback, even when the guest code and every binding/provenance field are equal.

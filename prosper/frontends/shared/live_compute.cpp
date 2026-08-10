@@ -4189,7 +4189,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 return false;
         }
     }
-    if (descriptors.empty() && image_descriptors.empty()) return false;
+    // A compute program whose every external RAW access was proven NUM_RECORDS=0 contains no
+    // storage/image operation after recompilation. Treat that exact runtime contract as a successful
+    // no-op: reporting failure here would publish an unknown authority boundary and poison later
+    // producer ordering even though the guest operation completed architecturally. Keep the proof
+    // deliberately stronger than merely "descriptorless SPIR-V": the table must be nonempty and every
+    // entry must be the exact-PC marker produced by add_compute_buffer_resources.
+    const bool all_zero_record_raw_noop = descriptors.empty() && image_descriptors.empty() &&
+        item.resources && !item.resources->resources.empty() &&
+        std::all_of(item.resources->resources.begin(), item.resources->resources.end(),
+                    is_zero_record_raw_buffer);
+    if (descriptors.empty() && image_descriptors.empty() && !all_zero_record_raw_noop)
+        return false;
     const bool has_storage_images = std::any_of(
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
             return descriptor.kind == SpirvDescriptorKind::StorageImage;
@@ -4234,6 +4245,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const bool phase_timing =
         phase_timing_requested && timing_item_selected &&
         (!timing_trace_only || trace);
+    // Keep timing selection and the transfer/authority censuses above this return so investigations
+    // still observe the proven no-op program. No Vulkan objects or queue submission are needed.
+    if (all_zero_record_raw_noop) {
+        if (trace)
+            std::fprintf(stderr,
+                         "[compute] program 0x%llx has only zero-record RAW resources -> no-op\n",
+                         static_cast<unsigned long long>(item.code_addr));
+        return true;
+    }
     if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
         if (!warned) { warned = true;
