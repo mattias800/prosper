@@ -2645,7 +2645,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x1F: case 0x21: {  // s_lshl_b64 / s_lshr_b64
                         uint32_t ahi = 0;
                         bool khi = false;
-                        if (in.src[0].kind == OperandKind::SGPR)
+                        // VCC as a 64-bit SOURCE reaches here as Special(106), not SGPR — the same
+                        // asymmetry `srcval` documents above (":2314"): vcc_lo/hi are WRITTEN as SGPR
+                        // 106/107 and READ BACK as Specials with the same field value. `srcval`
+                        // already maps the LOW half onto val[106]; this high-half read did not, so
+                        // `s_lshl_b64 vcc, vcc, N` resolved its low dword and then bailed on the
+                        // high one — two halves of one handler disagreeing about whether VCC is
+                        // addressable.
+                        //
+                        // Only base 106 is accepted. A 64-bit operand names its LOW register, so
+                        // VCC is 106:107; a base of 107 would index 108, which is not the pair's
+                        // high half and is not a valid scalar key.
+                        //
+                        // This does not widen what may be folded: `known()` still has to have a
+                        // value for 107, and returns false if the high dword was never tracked, in
+                        // which case the handler bails exactly as before. It only stops the lookup
+                        // failing for a register the fold demonstrably tracks. (#2412)
+                        if (in.src[0].kind == OperandKind::SGPR ||
+                            (in.src[0].kind == OperandKind::Special && in.src[0].value == 106))
                             khi = known(in.src[0].value + 1, ahi);
                         else if (in.src[0].kind == OperandKind::InlineInt) {
                             ahi = in.src[0].value < 0 ? UINT32_MAX : 0u;
@@ -2677,7 +2694,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // an SGPR number. And an UNTRACKED high dword must not silently fold as 0: if the
                         // field reaches bits >= 32 the result is unknown.
                         bool khi;
-                        if (in.src[0].kind == OperandKind::SGPR)           khi = known(in.src[0].value + 1, ahi);
+                        // Special(106) = VCC read back as a 64-bit source; see the note on the
+                        // s_lshl_b64/s_lshr_b64 handler above for why this is not an SGPR here.
+                        if (in.src[0].kind == OperandKind::SGPR ||
+                            (in.src[0].kind == OperandKind::Special && in.src[0].value == 106))
+                                                                          khi = known(in.src[0].value + 1, ahi);
                         else if (in.src[0].kind == OperandKind::InlineInt) { ahi = in.src[0].value < 0 ? 0xFFFFFFFFu : 0u; khi = true; }
                         else                                               { ahi = 0; khi = true; }   // 32-bit literal
                         if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
