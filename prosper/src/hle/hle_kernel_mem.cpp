@@ -2799,7 +2799,33 @@ static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]) {
                                        uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 
 namespace {
-    bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
+    // Preserves the caller's last-error across its ONE-TIME initialisation (#2431). `getenv` is a CRT
+    // call and may set the thread's last-error value, and this gate is evaluated BEFORE the argument
+    // list of the MLOG it guards -- so without this, the very first
+    //
+    //     MLOG("... error=%lu\n", ..., GetLastError());
+    //
+    // in a process would report the error belonging to `getenv` rather than the Win32 call that just
+    // failed. The window is narrow (the static initialises once; later calls are a guard load and a
+    // return, which touch nothing) but it is exactly the first such line anyone reads, and the value
+    // is accurate while the diagnostic is OFF and able to lie while it is ON -- the only time it is
+    // read at all. Fixing it here rather than at each call site keeps the eleven inline
+    // `MLOG(..., GetLastError())` sites correct without depending on every future one remembering.
+    //
+    // WINDOWS COPY ONLY. The POSIX branch near the top of this file has a byte-identical gate and
+    // must NOT get this treatment -- SetLastError/GetLastError do not exist there.
+    bool memlog() {
+        static int v = [] {
+            const DWORD saved = GetLastError();
+            const int on = getenv("PROSPER_MEMLOG") ? 1 : 0;
+            SetLastError(saved);
+            return on;
+        }();
+        return v;
+    }
+    // Passing `GetLastError()` directly as an MLOG argument is SAFE because `memlog()` above restores
+    // it. If that ever stops being true, every such site silently starts reporting the wrong Win32
+    // error, so capture into a local before the MLOG instead of relaxing the gate.
     #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
 
     // PROSPER_DMEM_CALLER=1: attribute each direct-memory allocation to the guest code that asked
@@ -4420,8 +4446,12 @@ namespace {
         // Printing both lists is what distinguishes that from a same-list coalesce that simply
         // failed -- a different bug with a different fix.
         if (fixed) {
+            // Captured BEFORE the `memlog()` gate, not inside it (#2431). The gate now restores
+            // last-error across its own initialisation, but this block also takes a lock and walks
+            // two lists, so keeping the capture adjacent to the failure it describes is the form
+            // that stays correct if anything is ever inserted above it.
+            const DWORD err = GetLastError();
             if (memlog()) {   // guard the lock too: MLOG alone would still take g_dview_mx
-                const DWORD err = GetLastError();
                 MLOG("map_dmem FIXED FAILED hint=0x%llx len=0x%llx phys=0x%llx align=0x%llx error=%lu"
                      " -- guest gets ENOMEM\n",
                      (unsigned long long)hint, (unsigned long long)len,
