@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -16186,6 +16187,46 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+    // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
+    //
+    // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
+    // VCC-as-scalar-data path at :5604 most consequentially, since when it is 0 the guest's
+    // `s_add_u32 sN, sM, vcc_lo` never resolves, the descriptor never lands, and the draw is
+    // skipped. Nothing printed any of this, under any variable, so "was that path active on this
+    // device?" could only be inferred from the adapter's advertised width.
+    //
+    // That inference is WRONG, and reporting only the effective value would preserve the error:
+    // the expression above is zero for THREE independent reasons -- the device width not matching
+    // `wave_size`, an implausible `local_count`, or a workgroup that is not a whole number of waves
+    // (`local_count % wave_size`). A dispatch with a partial final wave disables the path on an
+    // adapter whose width matches perfectly. #2429 attributes it entirely to the first cause, and
+    // that is checkable only if all three inputs are printed.
+    //
+    // Deduplicated on the full tuple rather than rate-limited, because the interesting event is a
+    // DISTINCT combination appearing, not the hundredth repeat of one -- and a kernel that disables
+    // the path for a different reason than its predecessors is exactly what a rate limit would drop.
+    if (getenv("PROSPER_DBG")) {
+        static std::mutex mx;
+        static std::set<uint64_t> seen;
+        const uint64_t key = (uint64_t)config.native_subgroup_size << 40 |
+                             (uint64_t)wave_size << 32 |
+                             (uint64_t)(local_count % (wave_size ? wave_size : 1u)) << 8 |
+                             (uint64_t)(b.native_subgroup_size ? 1u : 0u);
+        std::lock_guard<std::mutex> lk(mx);
+        if (seen.insert(key).second)
+            std::fprintf(stderr,
+                         "[subgroup-width] device=%u wave=%u local=%llu local%%wave=%llu -> "
+                         "native_subgroup_size=%u (%s)\n",
+                         config.native_subgroup_size, wave_size,
+                         (unsigned long long)local_count,
+                         (unsigned long long)(local_count % (wave_size ? wave_size : 1u)),
+                         b.native_subgroup_size,
+                         b.native_subgroup_size
+                             ? "width-dependent lowerings ENABLED"
+                             : (config.native_subgroup_size != wave_size
+                                    ? "DISABLED: device width != wave_size"
+                                    : "DISABLED: workgroup is not a whole number of waves"));
+    }
     b.native_storage_format_support = config.native_storage_format_support;
     b.packed_r11_storage = config.packed_r11_storage;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
