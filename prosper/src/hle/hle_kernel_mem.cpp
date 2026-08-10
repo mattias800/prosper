@@ -5507,10 +5507,17 @@ HLE(k_batch_map) {
             break;
         }
         bool ok = true;
+        // The Win32 reason for a failed op, captured AT the failing call and carried to the
+        // [batchmap-fail] line below (#2450). It cannot be read at that line: `track()`,
+        // `untrack()` and the switch's own bookkeeping run in between and are free to set it.
+        // Same hazard as #2431, one level up -- there the gate ran before the capture, here
+        // the capture would run long after the failure.
+        DWORD win_err = 0;
         switch (op) {
             case 0: {                               // MAP_DIRECT: shared physical backing
                 void* p = win_map_phys(start, len, host_prot(prot), phys, 0, start != 0);
                 ok = (p != nullptr);
+                if (!ok) win_err = GetLastError();
                 if (ok) {
                     const bool sparse = sparse_dmem_view_contains(
                         (uint64_t)p, (uint64_t)p + len);
@@ -5524,12 +5531,14 @@ HLE(k_batch_map) {
             case 3: {                               // MAP_FLEXIBLE: anonymous/private
                 void* p = win_commit(start, len, host_prot(prot));
                 ok = (p != nullptr);
+                if (!ok) win_err = GetLastError();
                 if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
                               "batch-flex", kVirtualQueryFlexible);
                 break;
             }
             case 1: {                               // UNMAP
                 ok = !start || win_unmap(start, len);
+                if (!ok) win_err = GetLastError();
                 if (ok && start) untrack(start, len);
                 break;
             }
@@ -5545,6 +5554,7 @@ HLE(k_batch_map) {
                     if (!protect_len) break;
                     DWORD error = ERROR_SUCCESS;
                     ok = win_protect(protect_start, protect_len, host_prot(prot), &error);
+                    if (!ok) win_err = error;   // out-param, already captured at the call
                     if (ok) {
                         retrack_prot(protect_start, protect_len, host_prot(prot), prot,
                                      "batch-prot");
@@ -5579,9 +5589,10 @@ HLE(k_batch_map) {
                 const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
                 if (seen < 8)
                     fprintf(stderr,
-                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx "
+                            "prot=0x%x error=%lu\n",
                             i, n, op, (unsigned long long)start, (unsigned long long)phys,
-                            (unsigned long long)len, prot);
+                            (unsigned long long)len, prot, (unsigned long)win_err);
                 else if (seen == 8)
                     fprintf(stderr, "[batchmap-fail] further BatchMap failures suppressed after 8\n");
             }
