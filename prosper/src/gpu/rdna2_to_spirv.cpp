@@ -16195,6 +16195,12 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // skipped. Nothing printed any of this, under any variable, so "was that path active on this
     // device?" could only be inferred from the adapter's advertised width.
     //
+    // `config.native_subgroup_size` is NOT the adapter's advertised width -- it is the OUTPUT of
+    // select_native_compute_subgroup_size() (gpu_executor.cpp:7359), a ~14-condition adoption
+    // decision over device features, queue support and the dispatch's own dimensions, which yields
+    // 0 when it declines. Zero therefore means "no native width was adopted", NOT "the device is
+    // narrower than wave_size", and the three cases below are distinguished for that reason.
+    //
     // That inference is WRONG, and reporting only the effective value would preserve the error:
     // the expression above is zero for THREE independent reasons -- the device width not matching
     // `wave_size`, an implausible `local_count`, or a workgroup that is not a whole number of waves
@@ -16223,9 +16229,12 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                          b.native_subgroup_size,
                          b.native_subgroup_size
                              ? "width-dependent lowerings ENABLED"
-                             : (config.native_subgroup_size != wave_size
-                                    ? "DISABLED: device width != wave_size"
-                                    : "DISABLED: workgroup is not a whole number of waves"));
+                             : (config.native_subgroup_size == 0
+                                    ? "DISABLED: no native width adopted -- "
+                                      "select_native_compute_subgroup_size() declined"
+                                    : (config.native_subgroup_size != wave_size
+                                           ? "DISABLED: adopted width != wave_size"
+                                           : "DISABLED: workgroup is not a whole number of waves")));
     }
     b.native_storage_format_support = config.native_storage_format_support;
     b.packed_r11_storage = config.packed_r11_storage;
