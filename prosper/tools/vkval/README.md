@@ -62,8 +62,20 @@ Bazzite box that means the `ps5ys` distrobox, not the host.
 ## When to run this deliberately
 
 CI runs the gate, so most changes need nothing. **Run it yourself, before opening the PR, for any
-change touching descriptor counts, descriptor-set layouts, or pipeline keys.** That trigger list is
-not a guess — it is the shape of the one defect this guard has caught that nothing else could:
+change touching descriptor counts, descriptor-set layouts, or pipeline keys.**
+
+That trigger list is the shape of the one defect this guard has caught **during review, with every
+other check on the PR already green** — which is a narrower claim than "the one defect it has caught",
+and the narrowness is the point. The six entries in `allowlist.txt` (#1710, #1712, #1713, #1714,
+#1715, #1716, #1717, #1726) are also findings this guard surfaced, but they are pre-existing
+conditions catalogued when it was switched on (#1704). #2471 is different in kind: it arrived *inside*
+a change under active review. That is what justifies running it yourself rather than trusting CI.
+
+**So treat the list as a floor, not a ceiling.** It is derived from a single case, and those six
+allow-listed IDs are evidence nobody has mined for what else belongs on it. Start here; do not read it
+as complete.
+
+The case, and why nothing else could see it:
 
 #2471 bound a 3-entry descriptor array whose `VkPipeline` had been created under an **arity-1**
 `VkPipelineLayout` and was replayed with the **arity-3** layout bound
@@ -80,9 +92,10 @@ independent blind spots hid it, and between them they cover every check a normal
   never configured there. `UNIX` is the operative gate: Vulkan **is** found in Windows build caches, so
   installing the SDK changes nothing.
 
-And the reflex that does not help: a second **driver** cannot discriminate this class either, because
-`08600` is a **usage** error raised by the validation layer rather than driver behaviour, so it is
-driver-independent close to by construction.
+And the reflex that does not help: a second **driver** cannot discriminate this class. `08600` is a
+**usage** error — the layer compares the pipeline's own layout against the layout the descriptor sets
+were bound with and reports a mismatch, without consulting the driver at all. So there is no driver
+behaviour to differ, and "try it on another GPU" is wasted effort here.
 
 **So `ctest` green is not evidence about spec validity, on any platform.** This scan is the only check
 in the repo that sees this class. Instrument-trap 151 in `docs/GAME_COMPAT_ORCHESTRATION.md` records
