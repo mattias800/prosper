@@ -1221,7 +1221,7 @@ if(TARGET prosper_core)
   # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
   # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
   if(WIN32)
-    add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
+    add_executable(boot_trace tools/boot_trace/boot_trace.cpp tools/boot_trace/first_frame_capture.cpp)
     target_link_libraries(boot_trace PRIVATE prosper_core)
 
     # Live Vulkan renderer on Windows (PROSPER_RENDER=1): with the Vulkan SDK present, wire the same
@@ -1281,7 +1281,7 @@ if(TARGET prosper_core)
 
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux + macOS/Rosetta).
   if(UNIX)
-    add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
+    add_executable(boot_trace tools/boot_trace/boot_trace.cpp tools/boot_trace/first_frame_capture.cpp)
     target_link_libraries(boot_trace PRIVATE prosper_core)
 
     if(NOT APPLE)

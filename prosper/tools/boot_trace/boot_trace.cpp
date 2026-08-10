@@ -1,14 +1,16 @@
 // boot_trace — link the game's modules, boot the guest, and report how far it got:
-// the unimplemented-call trace (via stderr from dispatch) plus, on a fault, the register
-// state and an rbp-chain backtrace classified by module. The primary bring-up debugging
-// tool. Linux only. Usage: boot_trace <dump-root>
+// the unimplemented-call trace (via stderr from dispatch), first-frame capture (--capture-first-frame),
+// plus, on a fault, the register state and an rbp-chain backtrace classified by module. The primary bring-up debugging
+// tool. Linux only. Usage: boot_trace <dump-root> [--capture-first-frame [output.bmp]]
 #include "loader/linker.hpp"
 #include "host/exec_image.hpp"
 #include "host/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
+#include "first_frame_capture.hpp"         // --capture-first-frame observer (isolated)
 #include "hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
 #include <cstdint>
+#include <thread>  // Required for std::thread in capture mode
 #include <exception>          // std::set_terminate / std::current_exception (PROSPER_TERM_BT)
 #ifndef _WIN32
 #include <execinfo.h>         // backtrace / backtrace_symbols (host crash backtrace)
@@ -88,6 +90,22 @@ static const char* cls(uint64_t a) { return prosper::guest_module_name(a); }
 static uint64_t    bof(uint64_t a) { return prosper::guest_module_offset(a); }
 
 int main(int argc, char** argv) {
+    // --- Parse --capture-first-frame option BEFORE boot ---
+    std::string capture_first_frame_path;  // Non-empty = capture mode enabled
+    double capture_timeout = 30.0;         // Default timeout for frame capture
+    std::string dump_root_arg;
+    
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--capture-first-frame") == 0 && i + 1 < argc && argv[i + 1][0] != '-') {
+            capture_first_frame_path = argv[++i];
+        } else if (strcmp(argv[i], "--capture-first-frame") == 0) {
+            capture_first_frame_path = "first_frame.bmp";  // Default filename
+        } else if (dump_root_arg.empty()) {
+            dump_root_arg = argv[i];
+        }
+    }
+    if (dump_root_arg.empty()) dump_root_arg = "../../PPSA24651-app0";
+    
     // PROSPER_TERM_BT: install a std::terminate handler that dumps the HOST backtrace + exception
     // message. Diagnostic for the macOS std::mutex EINVAL crash — the guest rbp-walker only shows
     // guest frames, but an uncaught host C++ exception (e.g. a mutex lock throwing) terminates on
@@ -113,7 +131,7 @@ int main(int argc, char** argv) {
             _Exit(42);
         });
     }
-    std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
+    std::string d = dump_root_arg;  // Use parsed argument (supports --capture-first-frame before path)
     Program p; std::string e;
     // Boot the title via the shared path (also used by prosper-app): link the fixed module set,
     // map, TLS/unwind/procparam, stubs, trap handler, plugin ranges, and the dependent-module
@@ -233,6 +251,47 @@ int main(int argc, char** argv) {
 #endif  // !_WIN32 (PROSPER_NULLGUARD)
 
 #ifdef PROSPER_HAVE_VULKAN
+    // === FIRST FRAME CAPTURE MODE ===
+    // When --capture-first-frame is specified, we enable the renderer, wait for the first
+    // real frame from the existing present path, capture it as BMP, then exit.
+    // This is an OBSERVER ONLY - it does not modify or replace any rendering.
+    if (!capture_first_frame_path.empty()) {
+        fprintf(stderr, "[first-frame] CAPTURE MODE ENABLED\n");
+        fprintf(stderr, "[first-frame] output: %s\n", capture_first_frame_path.c_str());
+        
+        // Enable rendering (required for present_write_frame to produce frames)
+        setenv("PROSPER_RENDER", "1", 1);
+        
+        // Register the live renderer (same as screenshot tool / prosper-app)
+        prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
+        
+        // Boot already completed above; run guest on separate thread
+        std::thread guest_thread([&p]() {
+            BootResult r = run_entry(p.imgs[0]);
+            fprintf(stderr, "[first-frame] guest ended: kind=%d %s\n", r.kind, r.detail.c_str());
+        });
+        guest_thread.detach();
+        
+        // Wait for and capture the first real frame
+        prosper::first_frame::CaptureResult result;
+        bool captured = prosper::first_frame::capture_first_frame(
+            capture_first_frame_path, capture_timeout, result);
+        
+        // Generate EXP-CLI-FRAME-REAL-001 compliant report
+        std::string report = prosper::first_frame::generate_report(
+            result, d, "c1d6cd86e689ddb62b97420bebc413ba3371f038");
+        fprintf(stderr, "\n%s\n", report.c_str());
+        
+        // Write report to file alongside BMP
+        if (!capture_first_frame_path.empty()) {
+            std::string report_path = capture_first_frame_path + ".report.txt";
+            FILE* rf = fopen(report_path.c_str(), "w");
+            if (rf) { fputs(report.c_str(), rf); fclose(rf); }
+        }
+        
+        return captured ? 0 : 2;  // Exit code: 0=success, 2=no frame captured
+    }
+
     // Compute is part of command submission even when frame rendering/dumping is disabled.
     // Compute translation-only diagnostics still realize shaders/resources but submit no Vulkan work.
     if (getenv("PROSPER_COMPUTE_TRANSLATE_ONLY")) {
