@@ -1063,14 +1063,16 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         const bool runtime_is_array = runtime_count != 0;
         if (shader_is_array != runtime_is_array ||
             (shader_is_array && shader_count != 0 && shader_count != runtime_count)) {
-            // `DescriptorValidationIssue` has no count fields, so the two COUNTS ride in the
-            // `required_bytes` / `available_bytes` slots (this initializer is positional). Nothing
-            // currently renders those two fields for any issue, so no message is wrong today -- but a
-            // future formatter that prints "required N bytes" would report "8 bytes" for an eight-element
-            // array. Read them as counts for this code only, or give the struct explicit count fields
-            // before writing such a formatter.
-            report.issues.push_back({DescriptorIssueCode::ArrayBindingArityMismatch, true, d.set,
-                                     d.binding, d.kind, actual, shader_count, runtime_count});
+            // The counts go in their own fields and the byte slots stay zero. An earlier revision rode
+            // them in `required_bytes`/`available_bytes` on the belief that nothing rendered those --
+            // false: `gpu_executor.cpp` prints both for every issue in the `[descriptor]` and
+            // `[compute-descriptor]` dumps, and mixes them into the dedupe hash for error issues, so a
+            // fired check printed `required=8 available=0` about descriptors rather than bytes.
+            DescriptorValidationIssue arity{DescriptorIssueCode::ArrayBindingArityMismatch, true, d.set,
+                                            d.binding, d.kind, actual};
+            arity.shader_count = shader_count;
+            arity.runtime_count = runtime_count;
+            report.issues.push_back(arity);
             continue;
         }
         // Explicit null descriptors are valid guest state: resource reads return zero and the backend

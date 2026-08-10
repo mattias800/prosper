@@ -4973,7 +4973,13 @@ bool validate_runtime_descriptor_contract(const char* stage_name,
             // Contract errors with different proven ranges are distinct. Warning-only unused
             // resources are not: their guest address/size can change every draw and must not flood
             // a long diagnostic run with the same module/binding warning.
-            if (issue.error) { mix(issue.required_bytes); mix(issue.available_bytes); }
+            // Counts are mixed alongside the byte ranges so the property survives codes that report
+            // counts instead of ranges: two arity mismatches at one binding differing only in how many
+            // descriptors each side declared stay distinct rather than deduping into one line.
+            if (issue.error) {
+                mix(issue.required_bytes); mix(issue.available_bytes);
+                mix(issue.shader_count); mix(issue.runtime_count);
+            }
         }
         if (logged.insert(key).second) {
             fprintf(stderr, "[descriptor] %s module=%016llx used=%zu runtime=%zu result=%s mode=%s\n",
@@ -4991,6 +4997,11 @@ bool validate_runtime_descriptor_contract(const char* stage_name,
                         spirv_descriptor_kind_name(issue.actual),
                         (unsigned long long)issue.required_bytes,
                         (unsigned long long)issue.available_bytes);
+            for (const auto& issue : report.issues)
+                if (issue.code == DescriptorIssueCode::ArrayBindingArityMismatch)
+                    fprintf(stderr, "[descriptor]     arity set=%u binding=%u shader_declares=%u "
+                                    "runtime_supplies=%u\n",
+                            issue.set, issue.binding, issue.shader_count, issue.runtime_count);
             if (runtime) for (const auto& r : runtime->resources)
                 fprintf(stderr, "[descriptor]   runtime binding=%u cls=%u addr=0x%llx size=%u "
                                 "stride=%u fmt=%u comps=%u srt=0x%x sgpr=%u pc=%u\n",
@@ -5739,6 +5750,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  spirv_descriptor_kind_name(issue.actual),
                                  (unsigned long long)issue.required_bytes,
                                  (unsigned long long)issue.available_bytes, issue.error ? 1 : 0);
+                    if (issue.code == DescriptorIssueCode::ArrayBindingArityMismatch)
+                        std::fprintf(stderr,
+                                     "[compute-descriptor]   arity binding=%u shader_declares=%u "
+                                     "runtime_supplies=%u\n",
+                                     issue.binding, issue.shader_count, issue.runtime_count);
                     if (item.resources) for (const auto& resource : item.resources->resources)
                         if (resource.binding == issue.binding)
                             std::fprintf(stderr,

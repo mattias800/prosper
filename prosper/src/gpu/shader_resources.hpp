@@ -633,6 +633,19 @@ struct DescriptorValidationIssue {
     SpirvDescriptorKind actual = SpirvDescriptorKind::Unknown;
     uint64_t required_bytes = 0;
     uint64_t available_bytes = 0;
+
+    // Descriptor counts for `ArrayBindingArityMismatch`, and zero for every other code (#2412).
+    //
+    // These exist rather than reusing the byte slots above, which was the first attempt: those two are
+    // rendered for EVERY issue by `gpu_executor.cpp` (the `[descriptor]` and `[compute-descriptor]`
+    // dumps) and are mixed into the diagnostic dedupe hash for error issues, so an eight-element array
+    // against a scalar printed `required=8 available=0` -- a byte count that was really a descriptor
+    // count, in a line a human reads while debugging the very stages this check exists to guard.
+    //
+    // APPEND-ONLY, like `SpirvDescriptorBinding`: this struct is brace-initialised positionally at every
+    // `report.issues.push_back({...})` site, so a field inserted above silently shifts them all. #2462.
+    uint32_t shader_count = 0;
+    uint32_t runtime_count = 0;
 };
 
 struct DescriptorValidationReport {
