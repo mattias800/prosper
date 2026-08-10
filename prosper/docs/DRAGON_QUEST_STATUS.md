@@ -432,7 +432,9 @@ Windows 11, RTX 4090 driver 32.0.16.1047, MinGW-w64 UCRT gcc 16.1.0, Vulkan SDK 
 ### Assert these — they held on every run
 
 - **`recompile-reject` count is 0.** Every run, rendered or stalled. This title has no recompiler rejects at
-  all, which is what distinguishes it from GTA V's 951 (all `unresolved-operand`) and is why the descriptor
+  all, which is what distinguishes it from GTA V's 951 (all `unresolved-operand`; run-local like every
+  other count here — the same class measured 920–933 across the Linux lane's runs, so do not quote 951
+  as a constant) and is why the descriptor
   lift is **not** expected to change DQ's composite. A non-zero count after the lift is a real regression.
 - **`crc=666f7b3f` on every run that rendered at least one frame**, and `crc=08ed2210` on every run that
   rendered none — 3/3 each way, no overlap. So the crc **also diagnoses which mode a run was in**, which is
@@ -444,6 +446,16 @@ Windows 11, RTX 4090 driver 32.0.16.1047, MinGW-w64 UCRT gcc 16.1.0, Vulkan SDK 
 **Frames (189–862), draws (1926–3497), and wave64 shader lines (4–21) all vary by more than 2x between runs
 of the same binary.** They are not noise around a value; they depend on how far the boot got inside a fixed
 wall-clock window, and a 60 s window lands in different phases on different runs.
+
+**Every figure in this table is Windows/NVIDIA (RTX 4090), and one of them is 0 on Linux by construction.**
+The wave64 column is a **device property, not a title property**: on Linux/RADV the same title over the same
+route gives **0** skips, because that adapter reports `maxSubgroupSize = 64`, so the `required > max` disjunct
+that accounts for every skip measured here **cannot fire at all**. A Linux reader comparing against this
+baseline would otherwise see 4–21 → 0 and have every reason to file a regression. Frames and draws are
+host-speed-dependent for the same reason the spread above exists — a fixed wall-clock window reaches a
+different point on a different machine — so compare against this table only from a Windows/NVIDIA run, and
+re-derive it locally otherwise. Cross-platform, only the two assertions above (`recompile-reject = 0` and the
+crc dichotomy) carry.
 
 **Draws-per-frame is not an invariant either, and this was nearly recorded as one.** base1 and base2 agreed to
 two decimal places (4.06, 4.05), which looked like a stable normalisation that would survive the ±12% spread
