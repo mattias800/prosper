@@ -83,6 +83,31 @@ static std::vector<uint32_t> descriptor_test_spirv() {
     return s;
 }
 
+// An ARRAY of eight storage-buffer descriptors at one binding (#2412 stage 4). Same shape as
+// descriptor_test_spirv, with the variable's pointee wrapped in `OpTypeArray %Block %8` so the binding
+// declares eight descriptors rather than one, and the access chain carrying the extra leading index that
+// selects among them.
+static std::vector<uint32_t> descriptor_array_test_spirv() {
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 32, 0};
+    emit(s, 15, {0, 20, 0x6e69616d, 0});                    // OpEntryPoint Vertex %20 "main"
+    emit(s, 21, {1, 32, 0});                                // %1 = u32
+    emit(s, 29, {2, 1});                                    // %2 = runtime array u32 (the block's data)
+    emit(s, 30, {3, 2});                                    // %3 = struct {%2}  -- the Block
+    emit(s, 43, {1, 14, 8});                                // %14 = 8
+    emit(s, 28, {15, 3, 14});                               // %15 = array of 8 x %3  <- descriptor array
+    emit(s, 32, {4, 12, 15});                               // %4 = StorageBuffer pointer to the ARRAY
+    emit(s, 32, {5, 12, 1});                                // %5 = StorageBuffer pointer to u32
+    emit(s, 43, {1, 6, 0});                                 // %6 = 0
+    emit(s, 43, {1, 7, 4});                                 // %7 = 4
+    emit(s, 59, {4, 8, 12});                                // %8 = the array-of-descriptors variable
+    emit(s, 71, {2, 6, 4});                                 // ArrayStride 4 on the block's data
+    emit(s, 72, {3, 0, 35, 0});                             // member 0 Offset 0
+    emit(s, 71, {8, 34, 0}); emit(s, 71, {8, 33, 9});       // set 0 binding 9
+    emit(s, 65, {5, 9, 8, 6, 6, 7});                        // %9 = &buffer[0][0][4] -- extra leading index
+    emit(s, 61, {1, 10, 9});                                // %10 = load %9
+    return s;
+}
+
 static std::vector<uint32_t> atomic_descriptor_test_spirv() {
     std::vector<uint32_t> s = descriptor_test_spirv();
     // %12 points at binding 10. AtomicAnd is result-producing, so its pointer is operand 2 after
@@ -556,6 +581,42 @@ int main() {
     auto sok = validate_spirv_descriptor_interface(spv, &scalar_ok, 0, SpirvShaderStage::Vertex);
     CHECK(!has_issue(sok, DescriptorIssueCode::ArrayBindingArityMismatch),
           "an ordinary scalar resource is not reported as an arity mismatch");
+
+    // Stage 4: reflection reports the DECLARED arity. Before this, an array of eight descriptors
+    // reflected as one binding and the count was invisible, which is what made the mismatch above
+    // undetectable from the shader side.
+    const std::vector<uint32_t> array_spv = descriptor_array_test_spirv();
+    ShaderResourceTable array_runtime; array_runtime.resources.push_back(table_indexed);
+    auto avr = validate_spirv_descriptor_interface(array_spv, &array_runtime, 0,
+                                                   SpirvShaderStage::Vertex);
+    const SpirvDescriptorBinding* abind = find_spirv_descriptor_binding(avr, 0, 9);
+    CHECK(abind && abind->descriptor_count == 8,
+          "reflection reports eight descriptors for an OpTypeArray of eight blocks at one binding");
+
+    // The DIRECTION stage 3 could not construct, now constructible and asserted: SPIR-V declaring an
+    // array against a runtime table supplying a single descriptor must be rejected. This is the arm
+    // stage 3's PR promised would land with stage 4.
+    ShaderResourceTable array_vs_scalar; array_vs_scalar.resources.push_back(good);
+    auto asr = validate_spirv_descriptor_interface(array_spv, &array_vs_scalar, 0,
+                                                   SpirvShaderStage::Vertex);
+    CHECK(!asr.ok() && has_issue(asr, DescriptorIssueCode::ArrayBindingArityMismatch),
+          "a shader-declared descriptor array bound against a single resource is rejected");
+
+    // Discriminator for the arity REPORT, not merely for the issue: the ordinary fixture must still
+    // report exactly one descriptor. Without this, `descriptor_count = 8` everywhere would satisfy the
+    // two arms above.
+    ShaderResourceTable one; one.resources.push_back(good);
+    auto onr = validate_spirv_descriptor_interface(spv, &one, 0, SpirvShaderStage::Vertex);
+    const SpirvDescriptorBinding* obind = find_spirv_descriptor_binding(onr, 0, 9);
+    CHECK(obind && obind->descriptor_count == 1,
+          "an ordinary non-array binding still reflects exactly one descriptor");
+
+    // And the matched pair validates: eight declared against eight supplied raises no arity issue.
+    ShaderResource eight = good; eight.table_index_count = 8; eight.table_entry_stride = 16;
+    ShaderResourceTable matched; matched.resources.push_back(eight);
+    auto mar = validate_spirv_descriptor_interface(array_spv, &matched, 0, SpirvShaderStage::Vertex);
+    CHECK(!has_issue(mar, DescriptorIssueCode::ArrayBindingArityMismatch),
+          "eight declared descriptors against eight supplied table entries is not an arity mismatch");
 
     // --- validate_runtime_descriptor_contract: the mode-carrying overload (#2239 candidate 3) ---
     //
