@@ -2369,18 +2369,24 @@ struct SpirvCompute {
         // permits a shader declaring one descriptor against a layout declaring N, that produced no
         // error: the shader read element 0 for every index. Titles put their constant buffers on
         // exactly these two bindings, so it was the common case that failed quietly.
+        // Both helpers below must select the SAME resource, so the predicate lives in one place. Two
+        // resources may share a binding (`declare_cbufs` does not prevent it), so a class filter on one
+        // helper and not the other can take the arity from one and the index SGPR from the other —
+        // wrong descriptor index, and quiet, because both values are individually plausible.
+        auto table_indexed_here = [](const ShaderResource& r, uint32_t binding) {
+            return r.binding == binding && r.table_index_count != 0 &&
+                   (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer);
+        };
         auto table_arity_for = [&](uint32_t binding) -> uint32_t {
             if (!rt) return 0;
             for (const auto& r : rt->resources)
-                if (r.binding == binding && r.table_index_count != 0 &&
-                    (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer))
-                    return r.table_index_count;
+                if (table_indexed_here(r, binding)) return r.table_index_count;
             return 0;
         };
         auto index_sgpr_for = [&](uint32_t binding) -> uint32_t {
             if (!rt) return 0xFFFFFFFFu;
             for (const auto& r : rt->resources)
-                if (r.binding == binding && r.table_index_count != 0) return r.table_index_sgpr;
+                if (table_indexed_here(r, binding)) return r.table_index_sgpr;
             return 0xFFFFFFFFu;
         };
         // Declare `binding`'s variable as an array of the Block type, reusing the id already decorated
@@ -2400,9 +2406,18 @@ struct SpirvCompute {
         };
         const uint32_t arity2 = table_arity_for(2), arity3 = table_arity_for(3);
         // NOTE on the fallback: `buf_for_binding` returns `v_cbuf` for a binding it does not know. If
-        // binding 2 is an array, that fallback yields an array-typed variable and an access chain built
-        // for a scalar pointee against it is a TYPE error at emission -- loud, and caught by spirv-val,
-        // which is the acceptable direction. It is not silently wrong.
+        // binding 2 is an array, that fallback yields an array-typed variable, and an access chain built
+        // for a scalar pointee against it is malformed SPIR-V. It is NOT caught at emission: `put`/`putv`
+        // (:383, :386) are a word assembler — they push a length word and the raw ids and type-check
+        // nothing — so the module is emitted happily. Nor is it caught by `spirv-val`, which gates one
+        // representative module per emitter path and has none for this case, since the case has never
+        // been constructed. What actually happens is that pipeline creation rejects the module and the
+        // draw is dropped. Both branches are hard errors rather than wrong pixels -- index 0 selects a
+        // Block, so index 1 indexes into a structure, and SPIR-V requires a struct member index to be an
+        // OpConstant, which a computed index is not; in the only constant case it yields a
+        // pointer-to-runtime-array against a declared `t_ptr_sb_u32`, a type mismatch. So the direction
+        // is still fail-visible, not silently wrong -- but "loud" here means a dropped draw, not a
+        // validator, and nothing reports it as a type error at the point the mistake was made.
         if (arity2) declare_as_array(2, v_cbuf, arity2);
         else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
         if (arity3) declare_as_array(3, v_cbuf1, arity3);

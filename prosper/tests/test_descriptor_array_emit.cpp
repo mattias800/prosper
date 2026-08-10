@@ -178,6 +178,54 @@ int main() {
         CHECK(!has_nonuniform(m_plain), "control: an ordinary module carries no NonUniform decoration");
     }
 
+    // --- Arm 5: two resources share one binding, of DIFFERENT classes ------------------------------
+    // `table_arity_for` filters by class (ConstantBuffer/VertexBuffer, the only classes whose array
+    // path exists); `index_sgpr_for` did not. Nothing prevents two resources sharing a binding, so the
+    // arity came from the vertex buffer while the index SGPR came from whichever resource sat at that
+    // binding FIRST. Both values are individually plausible — an arity that is right and an SGPR that
+    // is wrong — so the shader loads its descriptor index from the wrong register and no check fires.
+    //
+    // Asserted by byte-equality rather than by decoding the push-constant offset: two tables that
+    // differ ONLY in the decoy's `table_index_sgpr` must emit identical modules, because the decoy is
+    // not a table-indexable class and must be ignored entirely.
+    {
+        auto table_with_decoy = [](uint32_t decoy_sgpr) {
+            ShaderResourceTable rt;
+            ShaderResource decoy{};
+            decoy.cls = ResourceClass::Sampler;   // NOT table-indexable — must be skipped
+            decoy.binding = 3;
+            decoy.table_index_count = 2; decoy.table_entry_stride = 16;
+            decoy.table_index_sgpr = decoy_sgpr;
+            rt.resources.push_back(decoy);        // FIRST, so a missing class filter reaches it first
+            ShaderResource vb{};
+            vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+            vb.num_components = 2;
+            vb.binding = 3; vb.stride = 8; vb.sgpr_base = 8;
+            vb.table_index_count = 3; vb.table_entry_stride = 16; vb.table_index_sgpr = 6;
+            rt.resources.push_back(vb);
+            return rt;
+        };
+        ShaderResourceTable decoy_lo = table_with_decoy(9);
+        ShaderResourceTable decoy_hi = table_with_decoy(11);
+        std::vector<uint32_t> m_lo = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &decoy_lo);
+        std::vector<uint32_t> m_hi = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &decoy_hi);
+        CHECK(!m_lo.empty() && !m_hi.empty(),
+              "a binding shared by two resource classes still recompiles");
+        CHECK(m_lo == m_hi,
+              "the index SGPR ignores a resource whose class cannot be table-indexed");
+
+        // Positive control, and it is load-bearing. The equality above would also hold if NO index
+        // SGPR reached the module at all — a table-indexed resource that silently stopped emitting a
+        // selector would satisfy it just as well as the fix does. So prove the axis is live: moving
+        // the VERTEX BUFFER's own index SGPR must change the module.
+        ShaderResourceTable moved = table_with_decoy(9);
+        moved.resources[1].table_index_sgpr = 7;
+        std::vector<uint32_t> m_moved = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &moved);
+        CHECK(!m_moved.empty() && m_moved != m_lo,
+              "positive control: moving the VERTEX BUFFER's index SGPR does change the module, so the "
+              "equality above is the decoy being ignored rather than the SGPR being unused");
+    }
+
     printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
     return fails ? 1 : 0;
 }
