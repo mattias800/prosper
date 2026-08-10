@@ -14,6 +14,19 @@
 // Everything else — 8-bit (0x8A) and 16-bit (0x66-prefixed) partial-register writes, RIP-relative-only
 // oddities aside, any other opcode, and register-source (ModRM.mod==3) forms — returns false so the
 // caller falls through to the normal fault path and never silently mishandles an instruction.
+//
+// %fs/%gs-overridden accesses are declined for a reason that is about MEANING, not encoding (#2112). For
+// every other prefix the faulting linear address IS the address the guest computed, so "it faulted below
+// 64 KiB" really does mean "the guest read a null field" and zeroing the destination reproduces the Linux
+// zero page. With an FS/GS override the linear address is segbase + offset, so a fault below 64 KiB means
+// OUR segment base is wrong — on Windows the kernel zeroes the user FS base at every kernel transition —
+// and the guest's own offset was small, not null. Emulating that read as zero manufactures a value the
+// guest never asked for AND consumes the fault that exec_image_win.cpp's guest_fs_reapply() needs to
+// restore the base and retry. Measured on Dragon Quest VII (PPSA17942) before this change: the guest's
+// `mov rax, %fs:0x0` TCB-self-pointer load was emulated to rax=0 (one `[nullpage] addr=0x0` line), and
+// the next instruction, `cmp BYTE PTR [rax-0x10]`, took a fatal access violation at 0xfffffffffffffff0.
+// CS/DS/ES/SS overrides (0x2E/0x36/0x3E/0x26) stay ignorable: x86-64 forces those bases to zero, so they
+// are genuinely equivalent to no prefix. CONFIDENCE: HIGH.
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -33,8 +46,9 @@ inline bool decode_low_read_dest(const uint8_t* p, size_t avail, int* dest_reg, 
         if (!need(1)) return false;
         uint8_t b = p[i];
         if (b == 0x66) { opsize16 = true; i++; continue; }
+        if (b == 0x64 || b == 0x65) return false;   // %fs/%gs: a low fault means a wrong base, not a null read
         if (b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65) { i++; continue; }
+            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) { i++; continue; }
         break;
     }
     if (!need(1)) return false;

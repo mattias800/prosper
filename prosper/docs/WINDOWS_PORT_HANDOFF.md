@@ -259,6 +259,25 @@ that thread waits on becomes the focus, so matching signals from other threads a
 - Windows resets the user `%fs` base to 0 on every kernel transition; guest TLS survives only via the
   VEH `wrfsbase` re-apply (`hle_kernel_mem.cpp`/`guest_tls.cpp`). Native FSGSBASE (`rd/wrfsbase`,
   `WaitOnAddress`, `WakeByAddress*`) works and needs `-lsynchronization` (linked into `prosper_core`).
+  - **That re-apply is fault-driven, so anything that SWALLOWS the fault silently breaks guest TLS.**
+    `PROSPER_NULL_PAGE` did exactly that until #2112: Windows cannot map the reserved bottom 64 KiB, so
+    the VEH emulates a faulting low-address read by zeroing the destination register and stepping over
+    the instruction — and `decode_low_read_dest` treated the `0x64`/`0x65` segment prefixes as ignorable,
+    so a drifted-base `%fs` read looked like a read of a guest null field. The distinction is about
+    meaning, not encoding: with no override the faulting linear address IS what the guest computed, so a
+    sub-64-KiB fault really is a null-field read; with an FS/GS override it is `segbase + offset`, so a
+    low fault means *our* base is wrong and the guest's offset was small. Fixed by declining FS/GS in the
+    decoder; CS/DS/ES/SS stay ignorable because x86-64 forces those bases to zero.
+  - **Do not restate #2112's original diagnosis: it said page 0 is "mapped and readable" on Windows so
+    the `%fs` read *succeeds* and returns zeros.** That is the Linux mechanism. On Windows the read does
+    fault; the null-page *emulator* then answered it. The conclusion ("`PROSPER_NULL_PAGE` and the
+    fault-driven re-apply are mutually incompatible") was right, but the route to it was not — and the
+    route is what tells you where the fix goes. `PROSPER_NULL_PAGE_LOG=1` settles it in one run: a
+    `[nullpage]` line whose rip is the instruction *after* the faulting `%fs` access is the signature.
+  - The symptom does not look like a TLS bug, which is why it cost a title's whole boot: the emulated
+    read succeeds, and the crash lands on the *next* instruction at a nonsense address
+    (`0xfffffffffffffff0` = `[rax-0x10]` with `rax` fabricated to 0), pointing at the guest rather than
+    at us.
 - MinGW `longjmp` does an SEH unwind that can't cross guest/asm frames → use `__builtin_setjmp/longjmp`.
 - `boot_trace` on Windows is nondeterministic-crash-prone ONLY if a diagnostic reads raw stack words —
   the sync-caller scanner is `VirtualQuery`-guarded now; keep any new stack-walk guarded.
