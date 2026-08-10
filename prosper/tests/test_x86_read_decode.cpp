@@ -74,6 +74,35 @@ int main() {
     // --- Rejected: truncated instruction (fewer bytes than the encoding needs). ---
     expect_reject("truncated disp8",        {0x48,0x8b,0x42});         // needs a disp8 byte
 
+    // --- Rejected: %fs/%gs-overridden reads (#2112). ---
+    // A low-address fault on a segment-overridden access means OUR segment base is wrong (Windows zeroes
+    // the user FS base at every kernel transition), NOT that the guest read a null field. Emulating it as
+    // zero both fabricates a value and consumes the fault guest_fs_reapply() needs.
+    //
+    // These are the VERBATIM bytes at eboot+0x24d3c30 in Dragon Quest VII Reimagined (PPSA17942) — the
+    // guest's TCB self-pointer load, `mov rax,QWORD PTR fs:0x0`, padded to 12 bytes with three redundant
+    // 0x66 prefixes. On master this decoded to reg=rax/len=12, so the emulator set rax=0 and advanced Rip
+    // to 0x24d3c3c, where `cmp BYTE PTR [rax-0x10],0x0` took a fatal access violation at 0xfffffffffffffff0.
+    expect_reject("DQ7 mov rax,fs:0x0 [66x3]", {0x66,0x66,0x66,0x64,0x48,0x8b,0x04,0x25,0,0,0,0});
+    expect_reject("mov rax,fs:0x0 [canonical]",{0x64,0x48,0x8b,0x04,0x25,0,0,0,0});
+    expect_reject("mov rax,fs:0x28 [canary]",  {0x64,0x48,0x8b,0x04,0x25,0x28,0,0,0});
+    expect_reject("mov rax,gs:0x0",            {0x65,0x48,0x8b,0x04,0x25,0,0,0,0});
+    expect_reject("movzx eax,BYTE fs:(%rsi)",  {0x64,0x0f,0xb6,0x06});
+    expect_reject("mov eax,fs:(%rax) [32-bit]",{0x64,0x8b,0x00});
+
+    // DISCRIMINATOR for the four rejections above: the SAME instruction with the 0x64 removed must still
+    // be ACCEPTED, with the triple-0x66 padding intact and REX.W still overriding it. Without this arm the
+    // rejections could equally be caused by the padding, by the SIB/disp32 form, or by a decoder that had
+    // simply stopped accepting anything — and the test would pass just as loudly while proving nothing.
+    // It fails if the new reject is wider than "has an FS/GS override".
+    expect_ok("same insn, no fs prefix",    {0x66,0x66,0x66,0x48,0x8b,0x04,0x25,0,0,0,0}, 0, 11);
+    // CS/DS/ES/SS overrides must STAY accepted: x86-64 forces those segment bases to zero, so the faulting
+    // linear address really is the address the guest computed and zeroing the destination is still correct.
+    expect_ok("mov rax,ds:(%rdx) [0x3e]",   {0x3e,0x48,0x8b,0x02},                        0, 4);
+    expect_ok("mov rax,cs:(%rdx) [0x2e]",   {0x2e,0x48,0x8b,0x02},                        0, 4);
+    expect_ok("mov rax,ss:(%rdx) [0x36]",   {0x36,0x48,0x8b,0x02},                        0, 4);
+    expect_ok("mov rax,es:(%rdx) [0x26]",   {0x26,0x48,0x8b,0x02},                        0, 4);
+
     if (g_fail) { fprintf(stderr, "test_x86_read_decode: %d failure(s)\n", g_fail); return 1; }
     printf("test_x86_read_decode: all cases passed\n");
     return 0;
