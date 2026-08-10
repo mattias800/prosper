@@ -762,6 +762,18 @@ struct RenderVkCtx {
     // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback for final clip-space positions.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
+    // Runtime-selected descriptors (#2412, stage 1 of the descriptor lift). True only when EVERY feature
+    // the design needs is present, because a partially-available set is not a usable capability: a shader
+    // emitted against an unsized array is invalid without `runtimeDescriptorArray`, and an index that
+    // varies between waves of one workgroup is undefined without the matching non-uniform feature. So
+    // this is deliberately all-or-nothing rather than a bag of independent flags — a caller can treat it
+    // as "may I emit an indexed descriptor array" and be right.
+    //
+    // Measured available on both lanes' hardware: RADV STRIX_HALO and RTX 4090 report all of them true.
+    // The AMD device additionally reports `…NonUniformIndexingNative = false`, which is a performance
+    // note and not a correctness one here: our index is computed in scalar registers so it is
+    // wave-uniform, and a driver waterfall over the distinct values present converges in one iteration.
+    bool descriptor_indexing = false;
     bool compute_full_subgroups = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     uint32_t max_compute_workgroup_subgroups = 0;
@@ -929,6 +941,8 @@ inline const RenderVkCtx& render_vk_ctx() {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         VkPhysicalDeviceTransformFeedbackFeaturesEXT tf_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+        VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
@@ -940,6 +954,60 @@ inline const RenderVkCtx& render_vk_ctx() {
                       irf.pNext = const_cast<void*>(dci.pNext);
                       dci.pNext = &irf;
                       dev_exts.push_back("VK_EXT_image_robustness");
+                  }
+              }
+              if (!strcmp(de[i].extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+                  // Stage 1 of the runtime-selected-descriptor lift (#2412). Enabled ONLY when every
+                  // feature the design needs is present -- see `descriptor_indexing` for why this is
+                  // all-or-nothing. Nothing consumes the capability yet; this stage exists so the
+                  // later stages have a device that can express an indexed descriptor array, and so
+                  // that a device which cannot is discovered here rather than at pipeline creation.
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &di_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  const bool have_all =
+                      di_features.runtimeDescriptorArray &&
+                      di_features.descriptorBindingPartiallyBound &&
+                      di_features.shaderStorageBufferArrayNonUniformIndexing &&
+                      di_features.shaderSampledImageArrayNonUniformIndexing &&
+                      di_features.shaderStorageImageArrayNonUniformIndexing;
+                  if (have_all) {
+                      // Request exactly the five, not the whole struct as queried. Enabling a feature
+                      // the design does not use widens the driver contract for no benefit, and a
+                      // later reader cannot tell which ones are load-bearing.
+                      VkPhysicalDeviceDescriptorIndexingFeaturesEXT want{
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+                      want.runtimeDescriptorArray = VK_TRUE;
+                      want.descriptorBindingPartiallyBound = VK_TRUE;
+                      want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+                      want.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+                      want.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
+                      di_features = want;
+                      di_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &di_features;
+                      dev_exts.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+                      r.descriptor_indexing = true;
+                      // Log the SUCCESS too, not only the shortfall. A diagnostic that fires only on
+                      // failure makes the working case silent and therefore indistinguishable from code
+                      // that never ran -- which is the ambiguity that has cost this project several false
+                      // zeros today alone. This line is the lever check for stage 1: it is the only way
+                      // to confirm the capability was actually acquired rather than merely compiled.
+                      if (getenv("PROSPER_GFXLOG"))
+                          fprintf(stderr, "[vk] descriptor indexing ENABLED "
+                                          "(runtimeArray+partiallyBound+nonUniform ssbo/sampled/image)\n");
+                  } else if (getenv("PROSPER_GFXLOG")) {
+                      // Report the SHORTFALL, not merely "unavailable": which feature is missing decides
+                      // whether a fallback is possible at all, and a bare "not supported" would send the
+                      // next reader to the extension list when the extension is present.
+                      fprintf(stderr,
+                              "[vk] VK_EXT_descriptor_indexing present but incomplete: "
+                              "runtimeArray=%d partiallyBound=%d ssboNonUniform=%d "
+                              "sampledNonUniform=%d storageImgNonUniform=%d\n",
+                              (int)di_features.runtimeDescriptorArray,
+                              (int)di_features.descriptorBindingPartiallyBound,
+                              (int)di_features.shaderStorageBufferArrayNonUniformIndexing,
+                              (int)di_features.shaderSampledImageArrayNonUniformIndexing,
+                              (int)di_features.shaderStorageImageArrayNonUniformIndexing);
                   }
               }
               if (!strcmp(de[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
@@ -1039,6 +1107,10 @@ inline const RenderVkCtx& render_vk_ctx() {
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
             shared.compute_subgroup_arithmetic =
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+            // Publish the descriptor-indexing capability enabled on this device, under the contract stated
+            // above: `r.descriptor_indexing` is set only where the five features were actually requested at
+            // device creation, never from `supported`.
+            shared.descriptor_indexing = r.descriptor_indexing;
             shared.min_compute_subgroup_size = r.min_subgroup_size;
             shared.max_compute_subgroup_size = r.max_subgroup_size;
             shared.max_compute_workgroup_subgroups = r.max_compute_workgroup_subgroups;
