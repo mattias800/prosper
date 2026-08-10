@@ -5030,10 +5030,29 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // recompiler resolves. Compute-specific delta: an image_store use becomes a STORAGE image
         // (the recompiler's storage path requires ResourceClass::StorageImage), a sampled use a
         // Texture. Never shadow an existing resource at the same srt_offset (first-match-wins).
+        // Seed the fold with the registers the dispatch ACTUALLY initializes, not all 32 (#590).
+        // COMPUTE_PGM_RSRC2.USER_SGPR declares how many user SGPRs the hardware loads; s[user_count..31]
+        // are undefined. Passing kUserSgprs made the fold mark every one of those as a KNOWN value of
+        // zero, because `sgprs` is a zero-filled kUserSgprs array. "Known zero" and "never established"
+        // are not the same thing to a const-fold: a descriptor chain rooted in an undefined register
+        // then folds to base=0, the address becomes a bare immediate offset (0x38, 0xb0, 0x128 ...),
+        // `readable()` fails, and the use is dropped — or worse, four zero dwords are published as a V#
+        // that shadows a real descriptor under first-match-wins.
+        //
+        // Measured on PPSA04263 (GTA V) at gameplay: ALL 52 failing compute programs declare fewer than
+        // 32 (range 2..15), so 17-30 phantom registers were marked known in every one of them; the same
+        // run reports 1,988 SMEM loads with `base=0x0 base_ok=1` and 475 unreadable bare-offset
+        // addresses.
+        //
+        // This function already encodes the same bound ~180 lines below, where the push-constant path
+        // computes `fw_user_count = min(user_count, kUserSgprs)` and skips a fold result whose
+        // `base_sgpr` lands in [user_count, 31] — because indexing past the block would be wrong. The
+        // fold call had not been given that bound, so the two disagreed about which registers exist.
+        const uint32_t fold_user_count = std::min<uint32_t>(user_count, kUserSgprs);
         {
             const std::vector<SrtUse> srt_uses = add_compute_buffer_resources(
                 *table, (const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                sgprs, kUserSgprs,
+                sgprs, fold_user_count,
                 linear_store_proof_context ? launch.local_x : 0,
                 linear_store_proof_context ? launch.threads_x : 0,
                 linear_store_proof_context ? user_count : UINT32_MAX);
@@ -5377,13 +5396,22 @@ std::vector<ComputeItem> realize_compute_dispatches(
                            &config);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
             // const-fold walk trace + user-data dump forced on (once per distinct program) — the
-            // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp). Compute dispatches
-            // only run build_shader_resources (the DIRECT front-half table) and NEVER the const-fold
-            // resolve_dynamic_fetch that graphics stages use, so a bindless storage-image U# / T#
-            // (image_store SRSRC, image_sample) can't be recovered by pc-provenance for a dispatch.
-            // This trace reveals whether the failing dispatch's descriptors ARE const-fold-resolvable
-            // (i.e. loaded via a foldable s_load chain) — the ground truth for #590 before extending
-            // the compute resource build. Read-only: it does not change what the executor binds.
+            // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp).
+            //
+            // STALE TEXT REMOVED, and what it cost is why this note replaces it rather than deleting
+            // it silently. This comment used to assert that compute dispatches "only run
+            // build_shader_resources (the DIRECT front-half table) and NEVER the const-fold
+            // resolve_dynamic_fetch that graphics stages use". That stopped being true when
+            // add_compute_buffer_resources landed: the compute table build calls it (see the #590
+            // block above), and it calls resolve_dynamic_fetch directly. An agent investigating GTA V's
+            // black world read this comment, cited it with a file:line as the mechanism, and published
+            // "the fold is never run for compute, so run it" as the fix — for a fold that had been
+            // running the whole time. A stale comment is read as verified fact precisely because it
+            // sits next to the code it describes.
+            //
+            // What the trace is actually for: it reveals whether a failing dispatch's descriptors are
+            // const-fold-resolvable (i.e. loaded via a foldable s_load chain), which is the ground
+            // truth for #590. Read-only: it does not change what the executor binds.
             if (dyntrace_failed_shader_enabled(code_addr)) {
                 static std::set<uint64_t> traced_cs;
                 if (traced_cs.insert(code_addr).second) {
@@ -5405,8 +5433,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                      sgprs[i], sgprs[i + 1], sgprs[i + 2], sgprs[i + 3]);
                     std::vector<SrtUse> cs_uses;
                     g_dyntrace_force = true;
+                    // Same bound as the production call above. A diagnostic seeded differently from
+                    // the path it exists to explain reports a resolution the executor never had —
+                    // which is how this fold's phantom-register seeding stayed invisible: the trace
+                    // and production agreed with each other while both over-claimed.
                     resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                          sgprs, kUserSgprs, 0, &cs_uses);
+                                          sgprs, std::min<uint32_t>(user_count, kUserSgprs), 0,
+                                          &cs_uses);
                     g_dyntrace_force = false;
                     std::fprintf(stderr,
                                  "[dynfail]   pre-specialization raw const-fold recovered %zu "
