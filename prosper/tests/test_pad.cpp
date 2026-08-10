@@ -359,6 +359,43 @@ int main() {
               (SCE_PAD_BUTTON_LEFT | SCE_PAD_BUTTON_SQUARE | SCE_PAD_BUTTON_R1),
               "names: recorded text round-trips through parser");
 
+        // #2439: a route that parses to ZERO entries is configured-but-inert, and used to print
+        // exactly what a working route prints before its first press window opens. First the
+        // MECHANISM, because it is the part that makes the warning necessary: a bare path is parsed
+        // as an INLINE route, and yields nothing while reporting no error at all.
+        std::string route_err = "unset";
+        const auto path_as_inline =
+            load_pad_script("prosper/scripts/gta5/reach-story-mode.pad", &route_err);
+        CHECK(path_as_inline.empty() && route_err.empty(),
+              "route: a path without '@' parses as an inline route -> 0 entries, NO error");
+        // The Windows spelling has a ':' and still yields nothing, so a colon check would not catch it.
+        CHECK(load_pad_script("C:/routes/reach-story-mode.pad").empty(),
+              "route: a drive-lettered path without '@' also yields 0 entries");
+
+        // Then the warning itself. Without it, each of these is silent.
+        CHECK(pad_script_empty_route_warning("prosper/scripts/gta5/reach-story-mode.pad", true)
+                  .find("prefix it with '@'") != std::string::npos,
+              "route: an empty path-shaped route says it should have been '@'-prefixed");
+        CHECK(pad_script_empty_route_warning("C:\\routes\\x.pad", true)
+                  .find("prefix it with '@'") != std::string::npos,
+              "route: the backslash spelling gets the same hint");
+        CHECK(pad_script_empty_route_warning("route.pad", true)
+                  .find("prefix it with '@'") != std::string::npos,
+              "route: a bare .pad filename gets the hint even with no separator");
+        // An '@' source that is empty is a real (if odd) request, not a spelling mistake: warn that
+        // nothing will be delivered, but do not tell the author to add an '@' they already wrote.
+        const std::string at_warning = pad_script_empty_route_warning("@empty.pad", true);
+        CHECK(!at_warning.empty() && at_warning.find("prefix it with '@'") == std::string::npos,
+              "route: an empty @file route warns without suggesting the '@' it already has");
+        CHECK(pad_script_empty_route_warning("f600-620:cross", true).find("0 entries") !=
+                  std::string::npos,
+              "route: an empty inline route still warns that no input will be delivered");
+        // The case that must stay silent: a route with entries.
+        CHECK(pad_script_empty_route_warning("f600-620:cross", false).empty(),
+              "route: a route that parsed entries says nothing");
+        CHECK(pad_script_empty_route_warning("", true).empty(),
+              "route: an unset PROSPER_PAD_SCRIPT says nothing");
+
         PadRecordState flip_record;
         CHECK(flip_record.observe(9, 0).empty(), "record: initial neutral flip emits nothing");
         CHECK(flip_record.observe(10, SCE_PAD_BUTTON_CROSS).empty(),

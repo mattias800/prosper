@@ -165,6 +165,17 @@ public:
             if (!error.empty()) log_error(error);
             fprintf(stderr, "[pad] live route reload enabled for %s\n", path_.string().c_str());
         }
+        // A route that loaded without error and still parsed to zero entries is configured-but-inert,
+        // and it used to be indistinguishable from a working one (#2439). The symptom is a title that
+        // sits on its first screen, which reads as a title or emulator defect and sends the reader
+        // after the guest. One measured instance: a 300 s GTA V run reached 13,320 frames at a
+        // sustained 62 fps with no phase change, because the route was passed without its leading '@'
+        // and was therefore parsed as an INLINE route that yields nothing.
+        if (initial_load_succeeded) {
+            const std::string warning =
+                pad_script_empty_route_warning(source_, script_.empty());
+            if (!warning.empty()) fprintf(stderr, "%s\n", warning.c_str());
+        }
     }
 
     bool configured() const { return !source_.empty(); }
