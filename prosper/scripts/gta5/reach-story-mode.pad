@@ -65,14 +65,50 @@ f6000-6020:cross
 # with the Franklin key art, the "GRAND THEFT AUTO V STORY MODE" blurb, and the "Resume Story"
 # prompt.
 #
-# The process then SEGFAULTS shortly after the f2900 Cross that enters Story Mode, at t~158-190 s.
+# 2026-08-10 -- the segfault below DID NOT REPRODUCE in 1 of 1 runs on master a6043524 (Windows,
+# RTX 4090): this route ran 200 s to frame 3805, exit 0, with presses delivered at t=142.1 s (f3000),
+# 161.7 s (f3300) and 186.0 s (f3600) -- straight through the t~158-190 s window named below -- and no
+# crash of any kind.
+#
+# That is ONE observation, and the crash's frequency beforehand was never characterised, so treat this
+# route as UNVERIFIED rather than fixed. A single clean pass cannot distinguish "fixed" from
+# "intermittent and did not fire this time", and run-to-run variation here is large enough to matter:
+# DQ reaches pad polling roughly 1 boot in 11, and frame and draw counts vary more than 2x between runs
+# of one binary (#2459). Do NOT read this as evidence that a merged change fixed it -- nothing here
+# identifies a fix, and no run below establishes the crash was deterministic to begin with.
+#
+# The historical note is kept because the conclusion it draws ("a working route to the STORY tab and
+# NOT yet a route to gameplay") is what a reader would otherwise act on, and one clean pass through the
+# window is reason to RETRY the route rather than to abandon it.
+#
+# What is NOT established by that run, and the FIRST item is the one that weakens it most:
+#
+#   * It does not establish that the run ever ENTERED Story Mode. The presses cover t~158-190 s in
+#     TIME, which is not the same as reaching the state that crashed. The four-R1 note above records
+#     exactly how this fails: in one run only one of two R1 presses registered, the menu stayed on
+#     GTA+, and the following Cross entered GTA+ instead of STORY. A run parked on the wrong tab
+#     completes 200 s cleanly for reasons that have nothing to do with the segfault. No frame from
+#     this run was inspected to confirm the tab or the transition, so the honest reading is weaker
+#     than "1 of 1": it is ONE run, with no crash, whose entry into the crashing state is unverified.
+#     A re-run must confirm the tab it landed on -- not merely that it covered the window.
+#   * It does not establish that the WORLD renders. The run ends before the route's trailing pulses
+#     (f4000-f6000) and no frame was inspected for scene content, so "does not crash" is the claim,
+#     not "reaches gameplay". Draws per frame did rise from 7.6 (no route, 90 s) to 30.0 on this run,
+#     which is consistent with heavier content but proves nothing on its own.
+#
+# --- historical, kept for the record ---------------------------------------------------------------
+# The process then SEGFAULTS shortly after the f3000 Cross that enters Story Mode, at t~158-190 s.
 # The fault produces NO [veh] record and no fault address, which is itself informative: the Windows
 # VEH logger sees nothing, so this is not a guest-code access violation of the kind that stopped the
 # three earlier walls. It is a host-side crash, and it needs a different instrument than the ones
 # that found those.
 #
-# So: this file is a working route to the STORY tab and NOT yet a route to gameplay. Do not read the
-# trailing Cross pulses as evidence they land on anything.
+# So (HISTORICAL): this file is a working route to the STORY tab and NOT yet a route to gameplay. Do not
+# read the trailing Cross pulses as evidence they land on anything.
+#
+# CURRENT: the crash did not reproduce in one run (see the note at the top of this block) -- unverified,
+# not fixed. The trailing pulses still have no verified effect -- that part stands until someone
+# inspects a frame.
 #
 # Two smaller observations from the same captures, recorded because they are cheap to lose:
 #   * The bottom-right prompt renders as "Re u e Sto y" — glyph dropouts in "Resume Story". The
