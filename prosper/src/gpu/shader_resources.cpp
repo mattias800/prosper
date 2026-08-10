@@ -409,6 +409,49 @@ SpirvDescriptorKind descriptor_kind(const VariableInfo& var,
     return SpirvDescriptorKind::Unknown;
 }
 
+// How many descriptors this ONE binding declares (#2412 stage 4). 1 for an ordinary binding, N for
+// `OpTypeArray` of descriptors with a resolved length, 0 for `OpTypeRuntimeArray` (length supplied at
+// bind time).
+//
+// Deliberately conservative, because every existing shader must keep reporting 1 and a wrong answer
+// here now REJECTS a draw (stage 3 turned an arity mismatch into an error). Two guards:
+//
+//   - Only the OUTERMOST wrapper counts. `descriptor_kind` walks *through* arrays to find the
+//     underlying image or block, so it cannot distinguish "an array of eight buffers" from "one buffer
+//     whose block contains an array" -- and those are entirely different bindings. A storage buffer's
+//     block almost always contains a runtime array (that is the buffer's data), so anything deeper than
+//     one level is the buffer's own contents and not a descriptor count.
+//   - The wrapper's element must itself be descriptor-shaped (Struct, Image, SampledImage). A pointer
+//     to a bare array of scalars is not a descriptor array, and reading it as one would report an
+//     arity that rejects a binding that has always worked.
+//
+// An `OpTypeArray` whose length did not resolve reports `kDescriptorArityUnknown`, NOT 0 and not 1.
+// All three were considered and the first two are wrong in opposite directions: 1 would silently bind
+// element 0 of an array whose size we could not read, and 0 means `OpTypeRuntimeArray` -- which
+// validation treats as compatible with any table size, so a decode failure would become the most
+// permissive answer available. Unknown must be the least permissive, because it is the case we know
+// least about; validation rejects it regardless of what the table supplies.
+uint32_t descriptor_array_arity(const VariableInfo& var,
+                                const std::unordered_map<uint32_t, TypeInfo>& types) {
+    auto pi = types.find(var.pointer_type);
+    if (pi == types.end() || pi->second.kind != TypeKind::Pointer) return 1;
+    auto outer = types.find(pi->second.element);
+    if (outer == types.end()) return 1;
+    if (outer->second.kind != TypeKind::Array && outer->second.kind != TypeKind::RuntimeArray)
+        return 1;
+    auto elem = types.find(outer->second.element);
+    if (elem == types.end()) return 1;
+    if (elem->second.kind != TypeKind::Struct && elem->second.kind != TypeKind::Image &&
+        elem->second.kind != TypeKind::SampledImage)
+        return 1;
+    if (outer->second.kind == TypeKind::RuntimeArray) return 0;
+    // No `count ? count : 0` no-op here: an unresolved length is its own answer. `count` stays 0 when
+    // the length id resolved to no `OpConstant` in this pass -- an `OpSpecConstant`, or a constant this
+    // pass does not decode.
+    if (outer->second.count == 0) return kDescriptorArityUnknown;
+    return outer->second.count;
+}
+
 const TypeInfo* descriptor_image_type(const VariableInfo& var,
                                       const std::unordered_map<uint32_t, TypeInfo>& types) {
     auto pi = types.find(var.pointer_type);
@@ -739,6 +782,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     }
 
     std::unordered_map<uint32_t, SpirvDescriptorKind> descriptor_vars;
+    std::unordered_map<uint32_t, uint32_t> descriptor_arities;
     std::set<uint32_t> sampled_float_vars;
     std::set<uint32_t> storage_float_vars;
     std::unordered_map<uint32_t, SpirvImageNumericClass> image_numeric_classes;
@@ -746,6 +790,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         SpirvDescriptorKind kind = descriptor_kind(var, types);
         if (kind != SpirvDescriptorKind::Unknown) {
             descriptor_vars[id] = kind;
+            descriptor_arities[id] = descriptor_array_arity(var, types);
             const SpirvImageNumericClass numeric_class =
                 descriptor_image_numeric_class(var, types);
             image_numeric_classes[id] = numeric_class;
@@ -940,6 +985,10 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             image_arrayed, image_multisampled, image_depth,
             atomic_vars.count(var) != 0};
         descriptor.image_numeric_class = image_numeric_classes[var];
+        // Assigned here rather than added to the initializer above: that initializer is positional and
+        // names no field, so extending it is how #2462 happens. See the note on the member.
+        if (auto ai = descriptor_arities.find(var); ai != descriptor_arities.end())
+            descriptor.descriptor_count = ai->second;
         const uint64_t marker_key = (static_cast<uint64_t>(descriptor.set) << 32u) |
                                     descriptor.binding;
         if (auto marker = zero_pad_markers.find(marker_key); marker != zero_pad_markers.end()) {
@@ -1061,7 +1110,13 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         const uint32_t runtime_count = r.table_index_count;
         const bool shader_is_array  = shader_count != 1;
         const bool runtime_is_array = runtime_count != 0;
-        if (shader_is_array != runtime_is_array ||
+        // An unread array length is a mismatch whatever the table supplies -- tested FIRST and named,
+        // rather than left to fall out of the comparison below. The arithmetic would reject it today
+        // (kDescriptorArityUnknown equals neither 1 nor any plausible table size), but only by accident:
+        // the sentinel would stop rejecting the moment someone changed the comparison, and nothing in
+        // the expression would show that a decode failure was ever meant to be caught here.
+        const bool shader_arity_unknown = shader_count == kDescriptorArityUnknown;
+        if (shader_arity_unknown || shader_is_array != runtime_is_array ||
             (shader_is_array && shader_count != 0 && shader_count != runtime_count)) {
             // The counts go in their own fields and the byte slots stay zero. An earlier revision rode
             // them in `required_bytes`/`available_bytes` on the belief that nothing rendered those --
