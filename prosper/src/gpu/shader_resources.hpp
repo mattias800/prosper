@@ -556,6 +556,23 @@ struct SpirvDescriptorBinding {
     uint64_t zero_pad_logical_bytes = 0;
     uint64_t zero_pad_binding_bytes = 0;
     StorageBufferTailSemantic zero_pad_semantic = StorageBufferTailSemantic::None;
+
+    // Number of descriptors the binding declares: 1 for an ordinary binding, N for a fixed-size array,
+    // and 0 for an `OpTypeRuntimeArray` of descriptors whose length is supplied at bind time (#2412).
+    //
+    // Distinct from `required_bytes` on purpose. Reflection folds an array index into the same offset
+    // arithmetic it uses for byte offsets inside a buffer, because it treats `TypeKind::Array`
+    // uniformly -- so an array of descriptors reports one binding with a nonsense byte requirement.
+    // This field is what lets validation tell "eight descriptors" from "one descriptor, 128 bytes in".
+    //
+    // DELIBERATELY LAST, and anything added later must also go last. Reflection builds this struct with
+    // a POSITIONAL aggregate initializer (`shader_resources.cpp`, `SpirvDescriptorBinding descriptor{
+    // var, si->second, ... }`) that names no field, so a field inserted anywhere above silently shifts
+    // every initializer after it by one -- `readable` receives `descriptor_count`'s slot and so on down.
+    // It compiles without a warning. Measured: inserting this field after `dynamic_access` turned 0 test
+    // failures into 15. Appending leaves the initializer's positions untouched and this member falls to
+    // its default initializer, which is what an ordinary single-descriptor binding must report anyway.
+    uint32_t descriptor_count = 1;
 };
 
 struct StorageBufferMaterializationPlan {
@@ -595,6 +612,16 @@ enum class DescriptorIssueCode : uint32_t {
     InvalidImageMetadata,
     UndersizedBuffer,
     UnusedRuntimeBinding,
+    // The SPIR-V declares an ARRAY of descriptors at this binding while the resource table supplies a
+    // single one, or the reverse (#2412).
+    //
+    // Added BEFORE arrays are made to work, deliberately. Today an array binding reflects as one binding
+    // with a `required_bytes` computed as though the array index were a byte offset, and is then compared
+    // against a scalar `ShaderResource` -- and no existing code covers that, so the mismatch validates
+    // SILENTLY. Introducing the code first turns the rest of this work into "make this stop firing",
+    // which is a lever that can be watched, instead of "change reflection and hope validation still means
+    // something". A layer whose job is catching mis-binding must not be the layer that fails quietly.
+    ArrayBindingArityMismatch,
 };
 
 struct DescriptorValidationIssue {
@@ -606,6 +633,19 @@ struct DescriptorValidationIssue {
     SpirvDescriptorKind actual = SpirvDescriptorKind::Unknown;
     uint64_t required_bytes = 0;
     uint64_t available_bytes = 0;
+
+    // Descriptor counts for `ArrayBindingArityMismatch`, and zero for every other code (#2412).
+    //
+    // These exist rather than reusing the byte slots above, which was the first attempt: those two are
+    // rendered for EVERY issue by `gpu_executor.cpp` (the `[descriptor]` and `[compute-descriptor]`
+    // dumps) and are mixed into the diagnostic dedupe hash for error issues, so an eight-element array
+    // against a scalar printed `required=8 available=0` -- a byte count that was really a descriptor
+    // count, in a line a human reads while debugging the very stages this check exists to guard.
+    //
+    // APPEND-ONLY, like `SpirvDescriptorBinding`: this struct is brace-initialised positionally at every
+    // `report.issues.push_back({...})` site, so a field inserted above silently shifts them all. #2462.
+    uint32_t shader_count = 0;
+    uint32_t runtime_count = 0;
 };
 
 struct DescriptorValidationReport {

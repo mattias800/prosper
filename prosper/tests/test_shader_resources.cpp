@@ -528,6 +528,35 @@ int main() {
     CHECK(!dr.ok() && has_issue(dr, DescriptorIssueCode::DuplicateBinding),
           "duplicate runtime binding is rejected as ambiguous");
 
+    // Descriptor-array arity (#2412). A resource that declares a table of descriptors selected by a
+    // runtime index, bound against SPIR-V that reflects ONE descriptor at that binding, must be
+    // rejected. Before this code existed the pair validated SILENTLY: the array count was invisible to
+    // validation, so a half-finished lift -- a count carried but no reflection or emission behind it --
+    // would have bound as though it were an ordinary single descriptor and produced wrong pixels rather
+    // than a diagnostic.
+    //
+    // Only this DIRECTION is constructible today, and that is the point rather than a shortcut: the
+    // reverse (SPIR-V declaring an array against a scalar resource) needs reflection to report
+    // `descriptor_count != 1`, which is exactly the defect the next stage fixes -- reflection folds an
+    // array index into byte-offset arithmetic and reports one binding. So the arm for the reverse
+    // direction cannot exist until that lands, and it must land WITH one; asserting it now would be a
+    // test whose inputs cannot express the case it claims to cover.
+    ShaderResource table_indexed = good;
+    table_indexed.table_index_count = 8;
+    table_indexed.table_entry_stride = 16;
+    ShaderResourceTable arity; arity.resources.push_back(table_indexed);
+    auto arr = validate_spirv_descriptor_interface(spv, &arity, 0, SpirvShaderStage::Vertex);
+    CHECK(!arr.ok() && has_issue(arr, DescriptorIssueCode::ArrayBindingArityMismatch),
+          "a table-indexed resource at a binding the shader declares as a single descriptor is rejected");
+
+    // Discriminator: the arity check must not reject the ordinary case. `good` is byte-for-byte the
+    // resource above minus the count, so a failure here would mean the new code rejects every scalar
+    // binding -- which the arm above could not distinguish from working correctly.
+    ShaderResourceTable scalar_ok; scalar_ok.resources.push_back(good);
+    auto sok = validate_spirv_descriptor_interface(spv, &scalar_ok, 0, SpirvShaderStage::Vertex);
+    CHECK(!has_issue(sok, DescriptorIssueCode::ArrayBindingArityMismatch),
+          "an ordinary scalar resource is not reported as an arity mismatch");
+
     // --- validate_runtime_descriptor_contract: the mode-carrying overload (#2239 candidate 3) ---
     //
     // The per-draw form takes its mode from the caller so a hot loop can hoist the getenv to submit

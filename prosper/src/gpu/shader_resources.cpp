@@ -587,6 +587,8 @@ const char* descriptor_issue_name(DescriptorIssueCode code) {
         case DescriptorIssueCode::InvalidImageMetadata:return "invalid image metadata";
         case DescriptorIssueCode::UndersizedBuffer:    return "undersized buffer";
         case DescriptorIssueCode::UnusedRuntimeBinding:return "unused runtime binding";
+        case DescriptorIssueCode::ArrayBindingArityMismatch:
+                                                        return "descriptor array arity mismatch";
         default:                                        return "unknown descriptor issue";
     }
 }
@@ -1038,6 +1040,39 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         if (actual != d.kind && !atomic_image_buffer) {
             report.issues.push_back({DescriptorIssueCode::WrongType, true, d.set, d.binding,
                                      d.kind, actual, d.required_bytes, r.size});
+            continue;
+        }
+        // ARITY (#2412, stage 3). Checked before any byte-range reasoning, because for an array binding
+        // `required_bytes` is not a byte range at all: reflection folds the array index into the same
+        // offset arithmetic it uses inside a buffer, so an eight-element array reports one binding with
+        // a nonsense requirement. Comparing that against `r.size` produces a confident verdict about a
+        // quantity neither side is talking about.
+        //
+        // Both directions are errors and for different reasons. Array SPIR-V against a scalar resource
+        // means the shader can index past the one descriptor the backend will bind — reading whatever
+        // the next binding holds. A scalar shader against a table-indexed resource means the executor
+        // built an array the module cannot address, so entries beyond the first are unreachable and the
+        // dispatch silently uses one slot of a table it was given.
+        //
+        // This is deliberately introduced BEFORE arrays work. Until stage 4 emits them and stage 5
+        // materialises them, the correct behaviour for a mismatch is to REJECT, and rejecting loudly is
+        // the whole point: the pre-stage-3 code compared an array against a scalar and said nothing.
+        const uint32_t shader_count  = d.descriptor_count;
+        const uint32_t runtime_count = r.table_index_count;
+        const bool shader_is_array  = shader_count != 1;
+        const bool runtime_is_array = runtime_count != 0;
+        if (shader_is_array != runtime_is_array ||
+            (shader_is_array && shader_count != 0 && shader_count != runtime_count)) {
+            // The counts go in their own fields and the byte slots stay zero. An earlier revision rode
+            // them in `required_bytes`/`available_bytes` on the belief that nothing rendered those --
+            // false: `gpu_executor.cpp` prints both for every issue in the `[descriptor]` and
+            // `[compute-descriptor]` dumps, and mixes them into the dedupe hash for error issues, so a
+            // fired check printed `required=8 available=0` about descriptors rather than bytes.
+            DescriptorValidationIssue arity{DescriptorIssueCode::ArrayBindingArityMismatch, true, d.set,
+                                            d.binding, d.kind, actual};
+            arity.shader_count = shader_count;
+            arity.runtime_count = runtime_count;
+            report.issues.push_back(arity);
             continue;
         }
         // Explicit null descriptors are valid guest state: resource reads return zero and the backend
