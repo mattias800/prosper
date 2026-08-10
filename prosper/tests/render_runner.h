@@ -4254,7 +4254,52 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
     const bool backend_trace = getenv("PROSPER_BACKEND_TRACE") != nullptr;
+    // PROSPER_WAVE64_SKIP_CENSUS=1 -- which DRAWS are lost to the wave64 fragment gate, and to which
+    // render target (#2429, #2448). The existing "requires subgroup size 64" line sits inside a dedupe
+    // guard keyed on shader identity while the `continue` that drops the draw is outside it, so that
+    // message counts DISTINCT SHADERS and the skipped-DRAW count is measured nowhere. A census on #2448
+    // divided the one by the other and reported "1.5% of draws"; the units did not match and it was
+    // withdrawn.
+    //
+    // Attribution is by pass extent W x H, which is what separates a world pass from a UI pass, and it is
+    // exact rather than heuristic: one shader serves many targets, but each DRAW belongs to exactly one
+    // pass, so the extent is a property of the draw.
+    //
+    // `seen` is incremented for EVERY draw and `skipped` only for dropped ones, so the denominator is a
+    // real total rather than a copy of the numerator. A skipped count alone cannot separate "this target
+    // lost everything" from "this target had two draws". Emitted periodically, never at exit: a summary
+    // that depends on reaching a particular exit path does not survive the SIGTERM that ends every routed
+    // run here.
+    static const bool wave64_census = getenv("PROSPER_WAVE64_SKIP_CENSUS") != nullptr;
+    struct Wave64Census {
+        std::mutex mx;
+        // Keyed by a packed extent rather than a pair: std::map is not included here and a pair needs
+        // a hash specialisation. unordered_map is already used in this file.
+        std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> per_extent;   // (W<<32|H) -> {seen, skipped}
+        uint64_t observations = 0;
+        static uint64_t key(uint32_t w, uint32_t h) { return (uint64_t(w) << 32) | h; }
+        void note(uint32_t w, uint32_t h, bool skipped) {
+            std::lock_guard<std::mutex> lk(mx);
+            auto& e = per_extent[key(w, h)];
+            ++e.first;
+            if (skipped) ++e.second;
+            if ((++observations % 5000) != 0) return;
+            std::vector<uint64_t> keys;
+            keys.reserve(per_extent.size());
+            for (const auto& kv : per_extent) keys.push_back(kv.first);
+            std::sort(keys.begin(), keys.end());   // stable order: unordered_map iteration is not
+            for (uint64_t k : keys) {
+                const auto& c = per_extent[k];
+                std::fprintf(stderr, "[wave64-census] %ux%u draws=%llu skipped=%llu\n",
+                             (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
+                             (unsigned long long)c.first, (unsigned long long)c.second);
+            }
+        }
+    };
+    static Wave64Census wave64_stats;
     for (size_t di = 0; di < draws.size(); di++) {
+        // Denominator: every draw this pass considers, recorded before any skip path can divert it.
+        if (wave64_census) wave64_stats.note(W, H, /*skipped=*/false);
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
@@ -4391,6 +4436,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              static_cast<int>(uses_internal_gds),
                              static_cast<int>(ctx.fragment_stores_atomics), why_text);
             }
+            // Numerator, counted OUTSIDE the dedupe guard above: once per dropped DRAW rather than
+            // once per distinct shader. `note` already counted this draw in the denominator at the
+            // top of the loop, so this call passes skipped=true and the pair stays consistent.
+            if (wave64_census) { std::lock_guard<std::mutex> lk(wave64_stats.mx);
+                                 ++wave64_stats.per_extent[Wave64Census::key(W, H)].second; }
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
