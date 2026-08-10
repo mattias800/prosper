@@ -5548,10 +5548,44 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // preserving one native subgroup per guest wave. Keep the environment switch as an explicit
         // experiment for every other multi-wave shape; this automatic path is shader-address/title
         // independent and remains subject to all device and workgroup bounds below.
+        const bool native_multiwave_requested =
+            native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr;
+        const bool native_subgroup_disabled =
+            getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr;
         config.native_subgroup_size = select_native_compute_subgroup_size(
-            shared_vulkan, config,
-            native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr,
-            getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr);
+            shared_vulkan, config, native_multiwave_requested, native_subgroup_disabled);
+        // PROSPER_SUBGROUP_LOG (#2429): the resolved native-subgroup contract is a GUARD CONDITION in
+        // several recompiler paths and was printable NOWHERE -- so any claim that turned on it could
+        // only be inferred from the device's reported subgroup size, which is a different value with a
+        // different derivation. Conflating the two is what this line exists to stop.
+        //
+        // Prints the INPUTS beside the answer, deliberately. `select_native_compute_subgroup_size`
+        // returns 0 -- meaning "no native contract, use the portable shell" -- from **three `return 0`
+        // sites spanning 22 clauses** (25 if `adoptable`'s four ANDed checks are counted individually
+        // rather than as the one `!adoptable` clause). **Exactly two of those clauses concern the
+        // device's subgroup range** (`wave_size` below `min_compute_subgroup_size` or above
+        // `max_compute_subgroup_size`); the rest are capability bits, workgroup bounds, and the
+        // kernel's own local size. Measured on GTA V, the causes were entirely the last of those:
+        // `invocations % wave_size != 0` and the one-wave rule, never the adapter. So a bare
+        // `native=0` would send a reader hunting the GPU when the answer is the dispatch's local size,
+        // which is why local/invocations and the device bounds are all on the line.
+        if (getenv("PROSPER_SUBGROUP_LOG")) {
+            const uint64_t local_invocations = static_cast<uint64_t>(config.local_x) *
+                config.local_y * config.local_z;
+            std::fprintf(stderr,
+                         "[subgroup] cs=0x%llx guest-wave=%u native=%u local=%ux%ux%u "
+                         "invocations=%llu device-range=%u..%u max-wg-subgroups=%u "
+                         "size-control=%d full-subgroups=%d multiwave=%d disabled=%d\n",
+                         (unsigned long long)code_addr, config.wave_size,
+                         config.native_subgroup_size, config.local_x, config.local_y, config.local_z,
+                         (unsigned long long)local_invocations,
+                         shared_vulkan.min_compute_subgroup_size,
+                         shared_vulkan.max_compute_subgroup_size,
+                         shared_vulkan.max_compute_workgroup_subgroups,
+                         (int)shared_vulkan.compute_subgroup_size_control,
+                         (int)shared_vulkan.compute_full_subgroups,
+                         (int)native_multiwave_requested, (int)native_subgroup_disabled);
+        }
         config.tgid_x_en = tgid_x_en;
         config.tgid_y_en = tgid_y_en;
         config.tgid_z_en = tgid_z_en;
