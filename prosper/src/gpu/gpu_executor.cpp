@@ -2030,6 +2030,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // program-local and several of this title's shaders share a prologue, which makes that match
     // unreliable (#2412).
     uint32_t watch_w0 = 0, watch_w1 = 0; uint32_t watch_len = 0;
+    // Per-register record of the instruction that most recently made it UNKNOWN. Sized like the other
+    // per-register fold state; `0xffffffff` means "never forgotten in this walk", which is a distinct
+    // and useful answer from "forgotten by <instruction>" — a V# word that was never written at all
+    // fails for a different reason than one a modeled instruction gave up on.
+    std::array<uint32_t, kFoldSgprs> forget_pc{}; forget_pc.fill(0xffffffffu);
+    std::array<uint32_t, kFoldSgprs> forget_w0{}, forget_w1{};
     const int watch_sgpr = [] {
         const char* w = std::getenv("PROSPER_DYNTRACE_SGPR");
         return w ? (int)strtol(w, nullptr, 0) : -1;
@@ -2064,6 +2070,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             mask_state[(size_t)r] = FoldMask::Unknown;
+            // Remember WHICH instruction made this register unknown (#2412). `[mubuf-unknown]` names
+            // the V# word that is not provable; it could not name the instruction responsible, so the
+            // cause had to be recovered by hand-tracing one shader at a time. Three such traces
+            // produced three different mechanisms — a pointer-assembled V#, a VCC-as-soffset load, and
+            // a mask-recycled register — which is exactly the point at which per-site archaeology stops
+            // converging and the aggregate has to be asked instead.
+            //
+            // Cost is two stores on a path that already writes five bitsets, and it is read only by the
+            // opt-in diagnostics below.
+            forget_pc[(size_t)r] = watch_pc;
+            forget_w0[(size_t)r] = watch_w0;
+            forget_w1[(size_t)r] = watch_w1;
         }
     };
     for (uint32_t i = 0; system_sgprs && i < nsystem_sgprs && i < kFoldSgprs; ++i)
@@ -3300,10 +3318,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             uint32_t probe = 0;
                             if (!known(srsrc + k, probe)) unknown_word = k;
                         }
+                        // Name the instruction that made the unknown word unknown, and identify the
+                        // program so lines can be joined to `[recompile-reject]`'s `sh=` (#2436's
+                        // scheme: first code dword + span). `writer_pc=4294967295` means the register
+                        // was NEVER forgotten in this walk — i.e. never written at all — which is a
+                        // different defect from a modeled instruction giving up on it, and the two
+                        // were previously indistinguishable in this output.
+                        const int unk_reg = unknown_word >= 0 ? srsrc + unknown_word : -1;
+                        const bool unk_valid = unk_reg >= 0 && valid_reg(unk_reg);
                         fprintf(stderr,
-                                "[mubuf-unknown] pc=%u op=0x%x srsrc=s%d unknown_word=%d "
-                                "loaded_provenance=%d\n",
-                                in.pc, in.opcode, srsrc, unknown_word, (int)loaded_provenance);
+                                "[mubuf-unknown] sh=%08x/%zu pc=%u op=0x%x srsrc=s%d unknown_word=%d "
+                                "loaded_provenance=%d writer_pc=%u writer_words=%08x:%08x\n",
+                                dwords ? code[0] : 0u, dwords,
+                                in.pc, in.opcode, srsrc, unknown_word, (int)loaded_provenance,
+                                unk_valid ? forget_pc[(size_t)unk_reg] : 0xffffffffu,
+                                unk_valid ? forget_w0[(size_t)unk_reg] : 0u,
+                                unk_valid ? forget_w1[(size_t)unk_reg] : 0u);
                     }
                     if (current_known) {
                         // MUBUF/MTBUF itself is definitive that its four SRSRC words are a V#. Publish
