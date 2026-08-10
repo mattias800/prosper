@@ -209,6 +209,53 @@ int main() {
             prosper::test::render_draws_rgba({ draw_with({}, { quad, decoy, decoy }) }, W, H);
         CHECK(px_guard.size() == (size_t)W*H*4 && greenAt9(px_guard),
               "the storage-buffer array still renders GREEN with the per-class guard in place");
+
+        // The assertions above cover the ACCESSOR. They do not cover the LAYOUT SITE that consumes
+        // it, and that distinction is the whole defect: reverting only
+        // `lb[i].descriptorCount = r.written_descriptor_count()` to `descriptor_arity()` -- i.e.
+        // reverting the fix while leaving the accessor intact -- leaves every assertion above green.
+        // Measured, not assumed.
+        //
+        // So drive the site. This draw carries the texture-with-`table_entries` alongside the buffer
+        // the shader reads, which is the FIRST time the layout loop sees a class whose declared arity
+        // and written count disagree. With the fix it declares 1 against a write of 1; without it, 3
+        // against 1, and elements 1..2 are never written.
+        //
+        // And this arm IS ctest-visible, which is worth stating precisely because the obvious
+        // expectation -- "no pixel assertion can see it, so only the validation layer can" -- is
+        // wrong here, and I had written that before measuring it.
+        //
+        // Reverting the call site alone makes the POOL and the LAYOUT disagree: the pool reserves
+        // `written_descriptor_count()` (1 sampler) while the layout declares `descriptor_arity()` (3),
+        // so `vkAllocateDescriptorSets` requests 3 COMBINED_IMAGE_SAMPLER from a pool holding 1. On
+        // this adapter that returns no set, the following `vkUpdateDescriptorSets` gets
+        // `dstSet == VK_NULL_HANDLE`, and the test dies with **exit 139**. Measured both ways.
+        //
+        // Note this is the mirror image of #2471, where the pool arm was unverifiable because RADV
+        // over-allocates rather than returning OUT_OF_POOL_MEMORY. A pool can be over-allocated
+        // into; it cannot invent capacity for a descriptor TYPE it was never sized for.
+        //
+        // The validation layer adds the reason rather than the symptom -- `pool only has a total of 1`
+        // and `dstSet is VK_NULL_HANDLE` -- so `vk_validation_scan.py` is still the instrument that
+        // explains a failure here, and it is clean with the fix in place.
+        {
+            prosper::test::BackendDraw d = draw_with(quad, {});
+            prosper::test::FrameResource tex_bound{};
+            tex_bound.binding = 4; tex_bound.set = 0;
+            tex_bound.has_uniform_color = true;
+            tex_bound.uniform_color = {0.25f, 0.5f, 0.75f, 1.0f};
+            tex_bound.tw = 64; tex_bound.th = 32;
+            tex_bound.table_entries = { quad, decoy, decoy };   // arity 3 on a class that writes 1
+            d.R.push_back(std::move(tex_bound));
+            std::vector<uint8_t> px_mixed = prosper::test::render_draws_rgba({ std::move(d) }, W, H);
+            CHECK(px_mixed.size() == (size_t)W*H*4,
+                  "a draw binding a texture whose declared arity exceeds its written count produced "
+                  "a frame (the layout site saw the disagreement)");
+            if (px_mixed.size() == (size_t)W*H*4)
+                CHECK(greenAt9(px_mixed),
+                      "and it still renders GREEN -- the guard keeps layout and write consistent "
+                      "instead of declaring descriptors nothing writes");
+        }
     }
 
     printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
