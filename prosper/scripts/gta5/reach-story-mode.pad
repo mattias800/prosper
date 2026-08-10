@@ -65,12 +65,21 @@ f6000-6020:cross
 # with the Franklin key art, the "GRAND THEFT AUTO V STORY MODE" blurb, and the "Resume Story"
 # prompt.
 #
-# SUPERSEDED 2026-08-10 -- the segfault below NO LONGER REPRODUCES. Re-verified on master a6043524
-# (Windows, RTX 4090): this route ran 200 s to frame 3805, exit 0, with presses delivered at t=142.1 s
-# (f3000), 161.7 s (f3300) and 186.0 s (f3600) -- straight through the t~158-190 s window named below --
-# and ZERO crashes of any kind. Something merged since fixed it; the note below is kept because the
-# conclusion it draws ("a working route to the STORY tab and NOT yet a route to gameplay") is what a
-# reader would otherwise act on, and it is now wrong in the direction that stops work.
+# 2026-08-10 -- the segfault below DID NOT REPRODUCE in 1 of 1 runs on master a6043524 (Windows,
+# RTX 4090): this route ran 200 s to frame 3805, exit 0, with presses delivered at t=142.1 s (f3000),
+# 161.7 s (f3300) and 186.0 s (f3600) -- straight through the t~158-190 s window named below -- and no
+# crash of any kind.
+#
+# That is ONE observation, and the crash's frequency beforehand was never characterised, so treat this
+# route as UNVERIFIED rather than fixed. A single clean pass cannot distinguish "fixed" from
+# "intermittent and did not fire this time", and run-to-run variation here is large enough to matter:
+# DQ reaches pad polling roughly 1 boot in 11, and frame and draw counts vary more than 2x between runs
+# of one binary (#2459). Do NOT read this as evidence that a merged change fixed it -- nothing here
+# identifies a fix, and no run below establishes the crash was deterministic to begin with.
+#
+# The historical note is kept because the conclusion it draws ("a working route to the STORY tab and
+# NOT yet a route to gameplay") is what a reader would otherwise act on, and one clean pass through the
+# window is reason to RETRY the route rather than to abandon it.
 #
 # What is NOT established by that run: whether the WORLD renders. The run ends before the route's
 # trailing pulses (f4000-f6000) and no frame was inspected for scene content, so "does not crash" is
@@ -87,8 +96,9 @@ f6000-6020:cross
 # So (HISTORICAL): this file is a working route to the STORY tab and NOT yet a route to gameplay. Do not
 # read the trailing Cross pulses as evidence they land on anything.
 #
-# CURRENT: the crash is gone (see the superseding note at the top of this block). The trailing pulses
-# still have no verified effect -- that part stands until someone inspects a frame.
+# CURRENT: the crash did not reproduce in one run (see the note at the top of this block) -- unverified,
+# not fixed. The trailing pulses still have no verified effect -- that part stands until someone
+# inspects a frame.
 #
 # Two smaller observations from the same captures, recorded because they are cheap to lose:
 #   * The bottom-right prompt renders as "Re u e Sto y" — glyph dropouts in "Resume Story". The
