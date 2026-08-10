@@ -5560,12 +5560,15 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // different derivation. Conflating the two is what this line exists to stop.
         //
         // Prints the INPUTS beside the answer, deliberately. `select_native_compute_subgroup_size`
-        // returns 0 -- meaning "no native contract, use the portable shell" -- on any of roughly eight
-        // disqualifiers, and only one of them is about the device's subgroup range. The likeliest cause
-        // of a 0 on a capable adapter is the workgroup-shape rule: unless multiwave is opted into, the
-        // workgroup must be EXACTLY one wave. So a bare `native=0` would send a reader hunting the GPU
-        // when the answer is the kernel's local size, which is why local/invocations and the device
-        // bounds are all on the line.
+        // returns 0 -- meaning "no native contract, use the portable shell" -- from **three `return 0`
+        // sites spanning 22 clauses** (25 if `adoptable`'s four ANDed checks are counted individually
+        // rather than as the one `!adoptable` clause). **Exactly two of those clauses concern the
+        // device's subgroup range** (`wave_size` below `min_compute_subgroup_size` or above
+        // `max_compute_subgroup_size`); the rest are capability bits, workgroup bounds, and the
+        // kernel's own local size. Measured on GTA V, the causes were entirely the last of those:
+        // `invocations % wave_size != 0` and the one-wave rule, never the adapter. So a bare
+        // `native=0` would send a reader hunting the GPU when the answer is the dispatch's local size,
+        // which is why local/invocations and the device bounds are all on the line.
         if (getenv("PROSPER_SUBGROUP_LOG")) {
             const uint64_t local_invocations = static_cast<uint64_t>(config.local_x) *
                 config.local_y * config.local_z;
