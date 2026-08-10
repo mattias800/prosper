@@ -1913,29 +1913,44 @@ struct SpirvCompute {
     }
     // Load one dword (raw bits) from the constant/vertex buffer at descriptor `binding` at dword index
     // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
-    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding) {
-        uint32_t buf = buf_for_binding(binding);
-        // A TABLE-INDEXED binding needs a LEADING index selecting which descriptor of the array to
-        // read; an ordinary binding's chain starts at the Block's member 0 as before (#2412 stage 4c).
+    // THE only place a storage-buffer element pointer is built. There were FOUR identical
+    // OpAccessChain sites -- cbuf_load_impl, cbuf_store's unpredicated and predicated branches, and
+    // cbuf_atomic_rtn -- and a table-indexed binding needs the leading selector in every one of them.
+    //
+    // #2474 claimed cbuf_load_impl was "the single place a buffer access chain is built" and used that
+    // as its correctness argument. It was false, and the review that caught it found three sites; the
+    // fourth turned up while fixing it. For a table-indexed binding the pointee is `OpTypeArray %Block N`,
+    // so an unfixed site does not merely read the wrong slot: `uconst(0)` consumes the ARRAY index and
+    // `idx` is then a member index into the Block, which has one member. So idx==0 yields a pointer to
+    // the runtime array against a declared `t_ptr_sb_u32` (result-type mismatch) and idx!=0 is
+    // out-of-range -- an invalid module either way. Loud rather than silent, but only where something
+    // validates; on this path nothing does yet, so it surfaces as a failed pipeline and a dropped draw.
+    //
+    // Hence one function: the sites cannot drift apart again, and a fifth caller inherits the selector
+    // rather than a stale comment promising there is only one.
+    uint32_t cbuf_element_ptr(uint32_t buf, uint32_t binding, uint32_t idx) {
         auto arity = cbuf_table_arity.find(binding);
         auto index_sgpr = cbuf_table_index_sgpr.find(binding);
+        uint32_t ptr = id();
         if (arity != cbuf_table_arity.end() && index_sgpr != cbuf_table_index_sgpr.end()) {
             const uint32_t sel = load_push_constant(index_sgpr->second);
-            // NonUniform on BOTH the index and the resulting pointer, unconditionally.
-            //
-            // Measured justification rather than caution: of PPSA04263's 51 compute launches, 5 are
-            // local=256x1x1 -- four waves per workgroup, so four EXECs and four distinct scalar
-            // indices. The value is wave-uniform but NOT dynamically uniform across the invocation
-            // group, so for those programs the decoration is load-bearing. 43 of 51 launches are one
-            // wave per group, which is exactly why the "index is obviously uniform" reading looks safe
-            // and is wrong -- and why this is emitted per access rather than reasoned about per site.
+            // NonUniform on both the selector and the pointer, unconditionally. Measured: of
+            // PPSA04263's 51 compute launches, 5 are local=256x1x1 -- four waves per workgroup, so four
+            // EXECs and four distinct scalar indices, wave-uniform but NOT dynamically uniform across
+            // the invocation group. 43 of 51 are one wave per group, which is why the "obviously
+            // uniform" reading looks safe and is wrong. `load_push_constant` mints a fresh id per call
+            // and does not cache, so these decorations never duplicate onto one id.
             put(deco, Op_Decorate, {sel, Dec_NonUniform});
-            uint32_t p = id();
-            putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, sel, uconst(0), idx});
-            put(deco, Op_Decorate, {p, Dec_NonUniform});
-            uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+            putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, sel, uconst(0), idx});
+            put(deco, Op_Decorate, {ptr, Dec_NonUniform});
+            return ptr;
         }
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+        putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, uconst(0), idx});
+        return ptr;
+    }
+    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding) {
+        uint32_t buf = buf_for_binding(binding);
+        uint32_t p = cbuf_element_ptr(buf, binding, idx);
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
     uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2) {
@@ -1956,14 +1971,14 @@ struct SpirvCompute {
         cbuf_ordinary_accesses.insert(binding);
         uint32_t buf = buf_for_binding(binding);
         if (!predicated) {
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+            uint32_t p = cbuf_element_ptr(buf, binding, idx);
             put(code, Op_Store, {p, value}); return;
         }
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
         put(code, Op_Label, {then}); cur_block = then;
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+        uint32_t p = cbuf_element_ptr(buf, binding, idx);
         put(code, Op_Store, {p, value});
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
@@ -1976,7 +1991,7 @@ struct SpirvCompute {
         cbuf_ordinary_accesses.insert(binding);
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+            uint32_t p = cbuf_element_ptr(buf, binding, idx);
             uint32_t result = id();
             put(code, op, {t_u32, result, p, uconst(Scope_Device),
                            uconst(MemSem_UniformAcqRel), value});
