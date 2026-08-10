@@ -214,6 +214,18 @@ struct ShaderResource {
     // re-packed.
     uint32_t      table_entry_stride = 0;
 
+    // Which USER SGPR carries the descriptor index for a table-indexed binding, or 0xFFFFFFFF when the
+    // index is not available as a user SGPR (#2412 stage 4c). Same shape as the flat-load path's
+    // `flat_base_sgpr`, and resolved the same way: the emitter reads it through a push constant.
+    //
+    // This covers the case where the guest passes the index in user data. It deliberately does NOT
+    // cover GTA V's own case, where the index is derived from EXEC on the GPU
+    // (`s_mov_b64 vcc, exec` -> `s_buffer_load_dwordx4 ..., vcc_lo`) and therefore has no user-SGPR
+    // home -- that needs the const-fold to name the register holding the computed value, which is the
+    // remaining step. Keeping the two apart matters: a wrong index reads a valid descriptor from the
+    // wrong slot, which renders confidently wrong content rather than failing.
+    uint32_t      table_index_sgpr = 0xFFFFFFFFu;
+
     // Exact input-side origin for a DIRECT four-dword V# in the PM4 SH register file. This is
     // runtime realization provenance only; it does not affect descriptor binding or shader-cache
     // identity. The front half sets an absolute SPI_SHADER_USER_DATA_* register when it can prove
