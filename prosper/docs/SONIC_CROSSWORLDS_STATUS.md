@@ -5,26 +5,24 @@ Engine: **Unreal Engine 5** (IoStore/APR), with **CRIWARE** (CRI Mana / Sofdec2 
 CRI FS) and the **EOS SDK** (`prx/eossdk-ps5-shipping.prx`) alongside it. 64 guest threads at the
 frame loop.
 
-## Current rung: 1 — the SEGA logo renders
+## Current rung: 2 — the complete 4K title screen renders through a pulsed pad route
 
-**Requires the #2012 fix** (PR #2015, a shared libkernel change reviewed separately). On master
-without it the title still produces no frame at all — see *What unblocked it* below, which is the
-measured before/after.
+**Requires the #2012 fix** (PR #2015, a shared libkernel change reviewed separately) and controller
+edges from `scripts/sonic-crossworlds/advance-boot-logos.pad`. A default launch reaches the SEGA logo
+and then waits for input; the old uniform post-logo observation was a static guest state, not evidence
+of a renderer failure. A held Cross does not advance it — the route must alternate neutral and pressed
+states (#2358).
 
-![Sonic Racing: CrossWorlds — SEGA logo](../../assets/screenshots/sonic-crossworlds-sega-logo.png)
+![Sonic Racing: CrossWorlds — title screen](../../assets/screenshots/sonic-crossworlds-title.png)
 
-Direct, unmodified `tools/screenshot` capture, Linux/RADV (`AMD Radeon 8060S (RADV STRIX_HALO)`),
-native 3840x2160, default switches, no route:
+Two independent direct, unmodified `tools/screenshot` runs on Linux/RADV reached the native 3840x2160
+title screen: the full 3D scene, every character, the track, logo and UI. The animated frames differ in
+CRC but agree in content signature at about 99.6% non-black coverage and 113k sampled colours (#2360).
+The route continues into the player-profile menu, whose UI renders over a black central panel, and
+eventually reaches a uniform white state. Gameplay is not reached.
 
-```bash
-PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
-  ./build-linux/screenshot <DUMP_ROOT>/PPSA08804-app0 --seconds 20 --count 20 --out ~/shots
-```
-
-The logo appears at t≈60 s and holds to t≈80 s (1,373 distinct colours, 430,916 non-black pixels,
-decoded from the PNG rather than scored). A second arm with no diagnostics at all reproduced it at
-t=45 s with the **identical** `pixel_crc32` (`0d70a70a`). From t≈100 s the composite becomes a
-**uniform `RGBA(1,0,1,255)`** while the engine keeps producing frames — see *The frontier* below.
+The sections below retain the default-launch investigation because it records the falsifications that
+prevented the input wait from being found earlier. Read `## Ruled out` before reviving any of them.
 
 ## What unblocked it: #2012
 
@@ -66,7 +64,7 @@ the missing registrations added as well (step 1), the same instrument reports **
 `XhWHn6P5R7U` disappears from the unimplemented-NID list. So the fake "you acquired it" was the
 *source* of the unmatched unlocks, and the guard is the backstop for any other source.
 
-## The frontier: the composite after the logo
+## Historical frontier: the default-launch composite after the logo
 
 From t≈80 s the presented frame is a single colour, `RGBA(1,0,1,255)`, while `frame_seq` and
 `present_count` keep climbing. **This is not a hang, and `frame_seq` climbing is not evidence that

@@ -8,20 +8,25 @@ Read the repository-root `CLAUDE.md` before this document. `CLAUDE.md` remains a
 verification, evidence, review, privacy, and release policy. This document explains how to apply those rules when
 several game agents work at once.
 
-The current-state sections below are dated **2026-07-31**. Update them whenever an investigation materially moves,
-a PR merges, or ownership changes. Do not let this document replace issue comments: issues are the durable evidence
-log, while this document is the map that helps the next orchestrator find and interpret that evidence.
+The checkpoint below was refreshed **2026-08-10**. The named Lane A–F allocation and Wave 1/2 sections remain
+dated historical records; they retain valuable falsifications and apparatus lessons, but their ownership and
+"next assignment" text is not live. Update the checkpoint whenever an investigation materially moves, a PR merges,
+or ownership changes. Do not let this document replace issue comments: issues are the durable evidence log, while
+this document is the map that helps the next orchestrator find and interpret that evidence.
 
 ## Current checkpoint
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
 - Remote branch: `master`.
-- Exact master at this update: `9dcb6c4b` (2026-08-04; ~210 commits after `6414f402`).
+- Documentation refresh base: `9e101c70` (2026-08-10).
 - **Game dumps now live in `<REPO_ROOT>/testdata/<TITLE_ID>-app0`** (gitignored). Briefs and commands
   that still say `<DUMP_ROOT>/…` mean this path. All 39 tracked titles have a dump present, and every
   dump has a tracker — the sets match exactly, so there is no unexplored title.
-- Active title lanes (2026-08-04 wave 1): **The Oregon Trail, Sonic Origins, R-Type Delta, Asterix &
-  Obelix Babylon Mission, ArcRunner** — every title currently at rung 0.
+- The 2026-08-04 rung-0 wave below is complete: every listed title produced either a visible milestone
+  or a relocated, evidence-backed blocker. Current activity is centered on GTA V's post-lift compute CFG
+  frontier (#2412/#2481/#2429) and Dragon Quest VII's Windows progression/mapping frontier (#2448/#2450).
+  This sentence is a handoff, not a lock: live `in-progress` labels, claim comments and remote fix branches
+  are authoritative for ownership.
 - GPU state: sharing is the default; see the scheduling rules below.
 
 ### The standing objective, in the user's words

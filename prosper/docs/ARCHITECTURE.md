@@ -73,22 +73,31 @@ Maps FreeBSD/libkernel semantics onto the host:
   intermediate). Recompile to **SPIR-V**. This is a self-contained sub-project
   (decoder → SSA IR → SPIR-V emitter), the biggest single effort in the whole layer.
 
-**Implementation status (built, all execution/pixel-verified):** the pipeline is
-`pm4_decode` → `command_processor` (fold a Dcb into a `GpuState`) → `render_state` /
-`resolve_pipeline_state` → `vk_translate` → a real `VkGraphicsPipeline`, plus a resource-layer
-contract (`gpu_resources`). The **RDNA2→SPIR-V recompiler** (`rdna2_decode` + `rdna2_to_spirv`)
-handles ~52 ALU ops + convert/compare/select/bitfield/pack and **divergent control flow** (EXEC
-per-lane predication, `saveexec`/restore, forward `s_cbranch_execz`), at ~67% instruction coverage
-over the game's real shaders (measured by `recompile_coverage`/`shader_histo`). Remaining: `SMEM`/
-`MUBUF`/`MIMG` memory ops (need the resource-binding model) and loops (backward branches). The live
-boot blocker is upstream — Unity's completion-event-driven residency pass never fires under our
-headless equeue (see `docs/GRAPHICS.md`).
+**Implementation status (built and verified in layers):** the pipeline is `pm4_decode` →
+`command_processor` (fold a Dcb into a `GpuState`) → `render_state` / `resolve_pipeline_state` →
+`vk_translate` → real `VkGraphicsPipeline`s, plus the shared live resource layer. The
+**RDNA2→SPIR-V recompiler** (`rdna2_decode` + `rdna2_to_spirv`) handles scalar/vector ALU,
+convert/compare/select/bitfield/pack, `SCC`, EXEC-mask predication and structured branches/loops;
+`SMEM`, `MUBUF`, `MIMG`, LDS/barriers, exports and interpolation; and reflected runtime descriptor
+validation. Runtime-selected descriptor arrays now span device capability acquisition, reflection,
+SPIR-V declaration/indexing, pool/layout/write arity and pipeline-cache identity (#2458–#2475).
 
-### 5. Peripherals (`src/io`, future — not yet a module)
-- `libScePad` → SDL_GameController (DualSense passthrough where possible).
-- `libSceAudioOut(2)` → SDL audio / miniaudio; `libSceAjm` → decode ATRAC9/AAC via
-  ffmpeg or a dedicated ATRAC9 decoder.
-- `libSceAvPlayer` → ffmpeg-backed video → texture.
+The remaining work is data-driven rather than one old percentage: unsupported instructions and
+unprovable resource/operand paths fail visibly, and `recompile_coverage`, live reject diagnostics and
+`shader_inspect` identify the next exact program counter. The current GTA V workload, for example,
+is dominated by compute CFG structurization sites after the descriptor-array lift, not by missing
+`SMEM`/`MUBUF` support (#2481). See `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md` and
+`docs/RECOMPILER_REMAINING.md`, including each document's `## Ruled out` section, before extending
+the translator.
+
+### 5. Peripherals and frontends
+- `frontends/prosper-app` provides an SDL3 window, Vulkan presentation, controller/keyboard input,
+  audio and native dialogs; the headless tools share the same boot/render core.
+- `libScePad` input is backed by evdev/SDL3 and can be driven by deterministic `.pad` routes for
+  title progression.
+- `libSceAudioOut(2)` has a host audio sink; AJM/ATRAC9 and AvPlayer/Videodec paths feed decoded
+  audio/video into the guest-visible contracts. Per-title codec/layout gaps remain tracked issues,
+  not a future-module placeholder.
 
 ## The ABI question (why host choice matters)
 

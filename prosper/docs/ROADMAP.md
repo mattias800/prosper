@@ -24,27 +24,30 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
-## Current status (2026-07-13) - at a glance
+## Current status (2026-08-10) — at a glance
 
-- **Messenger reaches and renders the first level:** intro, title, menus, save list, dialogue, player,
-  background, foreground tree/terrain, water, and structures render at native 1920×1080. The causal fixes
-  are the grading-LUT producer/target extent (#528), Vulkan front-face translation (#534), and independent
-  depth/stencil aspect validity in the persistent guest-surface cache (#541). The full-resolution route was
-  user-confirmed against the hardware reference; #299, #300, #522, #530, and #540 are closed.
-- **The investigation tools are operational:** #514 provides versioned live GPU capture/replay with exact
-  live/replay hashes and per-draw/resource isolation; #515 provides reflected SPIR-V/runtime descriptor
-  validation in live and offline replay paths. Producer provenance, normal screenshot capture, and the local
-  content-metric snapshot guard complete the current first-bad-contract workflow.
-- **Dead Cells cross-title milestone:** deterministic routing now reaches the controllable Prisoners' Quarters
-  scene with full-color geometry, lighting, player, effects, and HUD. Retained PM4 graphics/compute order (#584),
-  guest-write depth-cache invalidation (#611), and narrowly proved uniform VCCZ lighting loops (#615) restore the
-  producer and depth layers. #626 fixes the last grayscale composition error: multi-target world shaders export
-  MRT3..MRT0, so the single-attachment recompiler must select MRT0 rather than the first emitted G-buffer plane.
-  It also realizes the eighth scene dispatch by resolving its directly placed destination V#. #566 is closed.
-- **Immediate milestone:** extend the capture-first workflow to later Dead Cells rooms and additional 3D titles.
-  Capture v8 preserves complete persistent color/depth state and embeds a source-output oracle (#569), while
-  Timeline v6 supplies offline target-span discovery and a semantic scene selector (#594). Keep reducing new
-  failures through standalone checkpoints and synthetic contracts rather than long unstructured live traces.
+- **Compatibility breadth:** 39 title trackers cover Unity/IL2CPP, Unreal Engine, RAGE, Hedgehog Engine and
+  custom engines. `COMPATIBILITY.md` is the user-facing milestone index; tracker issues and their comments are
+  the live source for rungs, routes and blockers. Messenger, Dead Cells and Blasphemous 2 remain the foundational
+  end-to-end gameplay proofs, and the same shared stack now reaches visible milestones across the wider corpus.
+- **Recent visible progress:** Sonic Racing: CrossWorlds now reaches a complete 4K title screen through a pulsed
+  controller route (#2358/#2360); a held button was not an input edge, so the previous post-logo "renderer wall"
+  was the guest waiting for input. GTA V reaches its title/menu on both primary development platforms, and a
+  routed run reaches gameplay entry with the HUD visible over an absent 3D world. Dragon Quest VII boots and
+  submits continuously on Windows after the `%fs`/`%gs` null-read fix (#2447).
+- **Current graphics frontier:** GTA V's six-stage runtime-selected descriptor-array lift is complete. Live
+  post-lift evidence on Linux/RADV and Windows/NVIDIA shows that the missing 3D world is not waiting on that lift;
+  the dominant measured gap is about 57 distinct compute CFG structurization sites (#2412/#2481). Native subgroup
+  adoption is a per-dispatch contract, not merely a device width: a quarter of routed wave64 compute dispatches on
+  a 64-wide RADV device decline it because of workgroup shape (#2429).
+- **Current Windows frontier:** routed Dragon Quest VII progression can fail a fixed `sceKernelBatchMap` with
+  ENOMEM. UE4 then deliberately enters `LowLevelFatalError`; the resulting exit 139 is not a wild-pointer crash.
+  The high-volume memory logger suppresses the timing-sensitive failure, so diagnosis is being carried on the
+  capped failure line that survives the repro (#2448/#2450).
+- **Verification/tooling direction:** use scheduled F8 performance captures and F9 replay bundles before adding
+  another renderer diagnostic, and require every measurement to expose whether its trigger, window and positive
+  control were valid. The suite grows continuously, so quote the discovered `ctest --no-tests=error` count rather
+  than copying a fixed expected total into documentation.
 
 ## Historical status (2026-07-05) - retained for the milestone log
 
