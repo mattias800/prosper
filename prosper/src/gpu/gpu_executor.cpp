@@ -191,6 +191,74 @@ void read_user_sgprs(const RegisterFile& sh, uint32_t base, uint32_t out[kUserSg
 // by the HLE submit mutex, so a plain global is safe there.
 bool g_dyntrace_force = false;
 
+// PROSPER_DESCR_COHERENCE=1 — stage 0 of the runtime-selected-descriptor lift (#2412). Records the
+// bytes seen at each descriptor address and counts how often the same address later yields DIFFERENT
+// bytes, i.e. whether the guest rewrites descriptor-table slots under us. See the call site for why
+// this gates the whole design rather than being a checkpoint inside it.
+//
+// Reports `checked` alongside `changed` because a bare zero cannot distinguish "the table is stable"
+// from "the probe never ran"; `checked` is the control line. Also reports distinct addresses, so a
+// large `checked` with tiny `distinct` (the same slot re-read every dispatch) is not mistaken for
+// broad coverage.
+bool descr_coherence_enabled() {
+    static const bool on = std::getenv("PROSPER_DESCR_COHERENCE") != nullptr;
+    return on;
+}
+
+namespace {
+struct DescriptorCoherenceState {
+    std::mutex mx;
+    // Grows with DISTINCT addresses and is never pruned — ~125k entries on a 210 s GTA V route. Fine for
+    // an opt-in diagnostic at that scale; a much longer route would want a cap or an eviction policy.
+    std::unordered_map<uint64_t, uint64_t> seen;   // descriptor address -> last observed hash
+    uint64_t checked = 0, changed = 0;
+    // Summary is emitted PERIODICALLY, not at exit. The first version of this probe reported from a
+    // destructor with a comment explaining that a summary must not depend on reaching a particular exit
+    // path — and a destructor is exactly such a path: every routed run here is terminated by `timeout`,
+    // whose SIGTERM runs no static destructors, so the run that produced the finding printed the
+    // per-slot lines and no totals at all. Cost: one wasted 220 s run and a result with no denominator.
+    //
+    // Periodic emission has no such dependency: whatever the run does, the last line printed is a valid
+    // running total. `checked` is the control (a bare `changed` cannot separate "stable" from "never
+    // ran") and `distinct_addrs` guards against reading one slot re-read many times as broad coverage.
+    static constexpr uint64_t kReportEvery = 20000;
+};
+DescriptorCoherenceState& descr_coherence_state() {
+    static DescriptorCoherenceState s;
+    return s;
+}
+}  // namespace
+
+void record_descriptor_observation(uint64_t addr, uint64_t hash) {
+    DescriptorCoherenceState& s = descr_coherence_state();
+    std::lock_guard<std::mutex> lk(s.mx);
+    ++s.checked;
+    // Reported BEFORE the first-sight early return below, so emission depends only on `checked`.
+    // Placed after it, this line could fire only on a REPEAT observation — and in a run whose slots are
+    // rarely re-read inside the window that means `checked` in the hundreds of thousands, zero RUNNING
+    // lines, and zero CHANGED lines (a first sight can never mismatch), which is indistinguishable from
+    // the probe never having run. That is exactly the ambiguity the control exists to remove, and the
+    // mechanism is trap 147: the report was not unarmed, it was STARVED by an early return consuming the
+    // path before the trigger. Found in review; the published 8.5% figure was unaffected because both
+    // measured runs reached repeat observations, but the next run need not have.
+    if ((s.checked % DescriptorCoherenceState::kReportEvery) == 0)
+        std::fprintf(stderr,
+                     "[descr-coherence] RUNNING checked=%llu distinct_addrs=%zu changed=%llu\n",
+                     (unsigned long long)s.checked, s.seen.size(), (unsigned long long)s.changed);
+    auto it = s.seen.find(addr);
+    if (it == s.seen.end()) { s.seen.emplace(addr, hash); return; }
+    if (it->second != hash) {
+        // Report the first few individually — an aggregate alone cannot say WHICH slot moves, and a
+        // table whose entries all churn is a different problem from one slot being rewritten.
+        if (s.changed < 8)
+            std::fprintf(stderr, "[descr-coherence] CHANGED addr=0x%llx %016llx -> %016llx\n",
+                         (unsigned long long)addr, (unsigned long long)it->second,
+                         (unsigned long long)hash);
+        ++s.changed;
+        it->second = hash;
+    }
+}
+
 bool dyntrace_failed_shader_enabled(uint64_t code_addr) {
     if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;
     const char* filter = std::getenv("PROSPER_DYNTRACE_FAIL_ADDR");
@@ -3072,6 +3140,37 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // A 4-dword load is a V# candidate — snapshot it now (before any later stride patch) so a
                 // vertex fetch using these SGPRs resolves to the descriptor as loaded. An 8-dword load is
                 // a T# candidate (image_sample SRSRC), snapshotted the same way (#294).
+                // PROSPER_DESCR_COHERENCE=1 — stage 0 of the runtime-selected-descriptor lift (#2412).
+                //
+                // The planned design pre-materialises a descriptor TABLE on the CPU and lets the shader
+                // select an entry by runtime index. That is only sound if the table's contents at the
+                // moment we read them are the contents the dispatch expects. A bindless renderer
+                // rewriting table slots per frame is not exotic — it is the ordinary reason to be
+                // bindless — and if it happens here the failure is SILENT: the index is in range, the
+                // descriptor is valid, and the bytes are a previous frame's. Nothing else in the plan
+                // detects that, which is why it is measured before any of the five layers are touched.
+                //
+                // The probe: remember the bytes seen at each descriptor ADDRESS and report when the same
+                // address later yields different bytes. That answers "does the guest rewrite descriptor
+                // slots" directly, without plumbing a hash through to submit.
+                //
+                // BOTH counters are reported, deliberately. A bare "0 mismatches" is indistinguishable
+                // from "the probe never ran" — the ambiguity that has cost this project several false
+                // zeros — so `checked` is the control line and is printed alongside.
+                // Gated on `is_buffer` (s_buffer_load, op >= 8) — a V#-RELATIVE load, which is what
+                // reading a descriptor table looks like. The first version hooked every 4-dword scalar
+                // load and so measured ordinary constant data too: 2.22M observations over 404,343
+                // addresses, 21% of which changed at least once. That number is real but its population
+                // is far broader than "descriptor tables", and the design question is specifically about
+                // table slots. Narrowing costs one run and makes the answer actionable instead of
+                // suggestive.
+                if (descr_coherence_enabled() && n == 4 && is_buffer) {
+                    uint64_t h = 1469598103934665603ull;              // FNV-1a over the four dwords
+                    for (int k = 0; k < 4; ++k) {
+                        h ^= mem[k]; h *= 1099511628211ull;
+                    }
+                    record_descriptor_observation(addr, h);
+                }
                 if (n == 4 && valid_reg(sdst)) {
                               descr[(size_t)sdst] = { mem[0], mem[1], mem[2], mem[3] };
                               descr_known.set((size_t)sdst);
