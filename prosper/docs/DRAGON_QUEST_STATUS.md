@@ -420,7 +420,7 @@ Six runs, `screenshot --seconds 60 --count 1`, `PROSPER_NULL_PAGE=1 PROSPER_GUES
 `PROSPER_NO_RTT_SNAPSHOT_BORROW=1 PROSPER_GFXLOG=1 PROSPER_DBG=1`, no input route.
 Windows 11, RTX 4090 driver 32.0.16.1047, MinGW-w64 UCRT gcc 16.1.0, Vulkan SDK 1.4.350.0.
 
-| run | frames | `[render] item` draws | wave64 skips | `recompile-reject` | composite crc |
+| run | frames | `[render] item` draws | wave64 shader lines | `recompile-reject` | composite crc |
 | --- | --- | --- | --- | --- | --- |
 | base1 | 862 | 3497 | 4 | 0 | `666f7b3f` |
 | base2 | 769 | 3114 | 4 | 0 | `666f7b3f` |
@@ -441,8 +441,8 @@ Windows 11, RTX 4090 driver 32.0.16.1047, MinGW-w64 UCRT gcc 16.1.0, Vulkan SDK 
 
 ### Do NOT assert these — they are phase-dependent and will cry wolf
 
-**Frames (189–862), draws (1926–3497), and wave64 skips (4–21) all vary by more than 2x between runs of the
-same binary.** They are not noise around a value; they depend on how far the boot got inside a fixed
+**Frames (189–862), draws (1926–3497), and wave64 shader lines (4–21) all vary by more than 2x between runs
+of the same binary.** They are not noise around a value; they depend on how far the boot got inside a fixed
 wall-clock window, and a 60 s window lands in different phases on different runs.
 
 **Draws-per-frame is not an invariant either, and this was nearly recorded as one.** base1 and base2 agreed to
@@ -450,6 +450,22 @@ two decimal places (4.06, 4.05), which looked like a stable normalisation that w
 in the raw counts. base5 gives **10.19**. The agreement was coincidence — both runs happened to sample the
 same phase. This is instrument trap 146 (a ratio over a moving sequence measures *when the window landed*),
 committed while assembling a baseline whose purpose is to avoid exactly that.
+
+### The wave64 column counts SHADERS, not skipped draws — do not divide it by the draw count
+
+`[render] skip draw: fragment shader requires subgroup size 64` is emitted inside a dedupe guard keyed on
+fragment-shader identity (`render_runner.h:4346`, `logged.insert(shader_key).second`), while the `continue`
+that actually drops the draw sits **outside** it at `:4394`. So the line fires **once per distinct shader**
+and the skip happens **per draw**: `grep -c` over that message counts shaders, and the number of draws lost
+to wave64 is **not measured by any current diagnostic**.
+
+This is recorded because the mistake is easy and was made here: a census on #2448 compared this count against
+the `[render] item` draw total and reported *"22 skipped draws of 1,467, i.e. 1.5%"*, concluding that wave64
+could not explain a black composite. **Numerator and denominator were different units.** The conclusion may
+still be right, but that measurement does not support it, and the honest statement is that the skipped-draw
+count is unknown.
+
+Counting skipped draws needs a counter at the `continue`, not at the log line.
 
 ### The acceptance rule, which is load-bearing
 
