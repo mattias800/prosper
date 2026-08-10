@@ -322,6 +322,8 @@ struct SpirvCompute {
     // single descriptor, so an access chain for it takes no leading index. Kept beside `cbuf_var`
     // because every consumer of the variable also needs to know whether it is an array.
     std::map<uint32_t, uint32_t> cbuf_table_arity;
+    // binding -> user SGPR holding the descriptor index, when one is available.
+    std::map<uint32_t, uint32_t> cbuf_table_index_sgpr;
     // A two-byte guest V# can only back our u32 SSBO ABI when every use of that binding is the exact
     // one-record Uint16/Float16 path. Ordinary load/store/atomic helpers blacklist their bindings;
     // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
@@ -1913,6 +1915,26 @@ struct SpirvCompute {
     // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
     uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding) {
         uint32_t buf = buf_for_binding(binding);
+        // A TABLE-INDEXED binding needs a LEADING index selecting which descriptor of the array to
+        // read; an ordinary binding's chain starts at the Block's member 0 as before (#2412 stage 4c).
+        auto arity = cbuf_table_arity.find(binding);
+        auto index_sgpr = cbuf_table_index_sgpr.find(binding);
+        if (arity != cbuf_table_arity.end() && index_sgpr != cbuf_table_index_sgpr.end()) {
+            const uint32_t sel = load_push_constant(index_sgpr->second);
+            // NonUniform on BOTH the index and the resulting pointer, unconditionally.
+            //
+            // Measured justification rather than caution: of PPSA04263's 51 compute launches, 5 are
+            // local=256x1x1 -- four waves per workgroup, so four EXECs and four distinct scalar
+            // indices. The value is wave-uniform but NOT dynamically uniform across the invocation
+            // group, so for those programs the decoration is load-bearing. 43 of 51 launches are one
+            // wave per group, which is exactly why the "index is obviously uniform" reading looks safe
+            // and is wrong -- and why this is emitted per access rather than reasoned about per site.
+            put(deco, Op_Decorate, {sel, Dec_NonUniform});
+            uint32_t p = id();
+            putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, sel, uconst(0), idx});
+            put(deco, Op_Decorate, {p, Dec_NonUniform});
+            uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+        }
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
@@ -2366,6 +2388,8 @@ struct SpirvCompute {
                     put(types, Op_Variable, {arr_ptr, v, SC_StorageBuffer});
                     cbuf_var[r.binding] = v;
                     cbuf_table_arity[r.binding] = r.table_index_count;
+                    if (r.table_index_sgpr != 0xFFFFFFFFu)
+                        cbuf_table_index_sgpr[r.binding] = r.table_index_sgpr;
                     continue;
                 }
                 put(types, Op_Variable, {t_ptr_sb_struct_u, v, SC_StorageBuffer});
