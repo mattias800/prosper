@@ -4254,52 +4254,73 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     }
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
     const bool backend_trace = getenv("PROSPER_BACKEND_TRACE") != nullptr;
-    // PROSPER_WAVE64_SKIP_CENSUS=1 -- which DRAWS are lost to the wave64 fragment gate, and to which
-    // render target (#2429, #2448). The existing "requires subgroup size 64" line sits inside a dedupe
-    // guard keyed on shader identity while the `continue` that drops the draw is outside it, so that
-    // message counts DISTINCT SHADERS and the skipped-DRAW count is measured nowhere. A census on #2448
-    // divided the one by the other and reported "1.5% of draws"; the units did not match and it was
-    // withdrawn.
+    // PROSPER_WAVE64_SKIP_CENSUS=1 -- which DRAWS the required-subgroup-size gate drops, at which
+    // render target, and WHY (#2429, #2448). The existing "requires subgroup size 64" line sits inside
+    // a dedupe guard keyed on shader identity while the `continue` that drops the draw is outside it,
+    // so that message counts DISTINCT SHADERS and the skipped-DRAW count is measured nowhere. A census
+    // on #2448 divided one by the other and reported "1.5% of draws"; the units did not match and the
+    // figure was withdrawn.
     //
-    // Attribution is by pass extent W x H, which is what separates a world pass from a UI pass, and it is
-    // exact rather than heuristic: one shader serves many targets, but each DRAW belongs to exactly one
-    // pass, so the extent is a property of the draw.
+    // The gate is SEVEN disjuncts, not one, so naming it "wave64" over-attributes: two of them are not
+    // width problems at all (a subgroup FEATURE shortfall, and internal-GDS use without fragment
+    // stores/atomics). That distinction decides whether a wave32 lowering would recover the draw, which
+    // is the judgement this number exists to inform, so the reason mask is recorded per skip rather
+    // than summed away.
     //
-    // `seen` is incremented for EVERY draw and `skipped` only for dropped ones, so the denominator is a
-    // real total rather than a copy of the numerator. A skipped count alone cannot separate "this target
-    // lost everything" from "this target had two draws". Emitted periodically, never at exit: a summary
-    // that depends on reaching a particular exit path does not survive the SIGTERM that ends every routed
-    // run here.
+    // Attribution by pass extent W x H is exact rather than heuristic: one shader serves many targets,
+    // but each DRAW belongs to exactly one pass. `seen` counts EVERY draw, so the denominator is a real
+    // total and not a copy of the numerator.
+    //
+    // Each report is a CUMULATIVE SNAPSHOT of the counters, not a delta, so only the LAST block in a
+    // log is a total for the run. Summing the blocks double-counts -- an awk over every line of a
+    // 15,000-draw run reports 30,100. Read the final block.
+    //
+    // Emitted at observation 100 and every 5000 after, never at exit. The FIRST report matters as much
+    // as the cadence: with a threshold alone, a run smaller than the interval prints NOTHING, and that
+    // silence is indistinguishable from the variable being unset, from a typo, and from this code never
+    // running. That is the defect this instrument was rejected for in review, and the shape of #2456.
     static const bool wave64_census = getenv("PROSPER_WAVE64_SKIP_CENSUS") != nullptr;
     struct Wave64Census {
         std::mutex mx;
-        // Keyed by a packed extent rather than a pair: std::map is not included here and a pair needs
-        // a hash specialisation. unordered_map is already used in this file.
-        std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> per_extent;   // (W<<32|H) -> {seen, skipped}
+        std::unordered_map<uint64_t, uint64_t> seen;
+        std::unordered_map<uint64_t, std::unordered_map<uint32_t, uint64_t>> skipped;
         uint64_t observations = 0;
         static uint64_t key(uint32_t w, uint32_t h) { return (uint64_t(w) << 32) | h; }
-        void note(uint32_t w, uint32_t h, bool skipped) {
-            std::lock_guard<std::mutex> lk(mx);
-            auto& e = per_extent[key(w, h)];
-            ++e.first;
-            if (skipped) ++e.second;
-            if ((++observations % 5000) != 0) return;
+        void report_locked() {
             std::vector<uint64_t> keys;
-            keys.reserve(per_extent.size());
-            for (const auto& kv : per_extent) keys.push_back(kv.first);
-            std::sort(keys.begin(), keys.end());   // stable order: unordered_map iteration is not
+            keys.reserve(seen.size());
+            for (const auto& kv : seen) keys.push_back(kv.first);
+            std::sort(keys.begin(), keys.end());
             for (uint64_t k : keys) {
-                const auto& c = per_extent[k];
+                uint64_t dropped = 0;
+                auto it = skipped.find(k);
+                if (it != skipped.end())
+                    for (const auto& rm : it->second) dropped += rm.second;
                 std::fprintf(stderr, "[wave64-census] %ux%u draws=%llu skipped=%llu\n",
                              (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
-                             (unsigned long long)c.first, (unsigned long long)c.second);
+                             (unsigned long long)seen[k], (unsigned long long)dropped);
+                if (it != skipped.end())
+                    for (const auto& rm : it->second)
+                        std::fprintf(stderr, "[wave64-census]   %ux%u reason=0x%02x n=%llu\n",
+                                     (uint32_t)(k >> 32), (uint32_t)(k & 0xffffffffu),
+                                     rm.first, (unsigned long long)rm.second);
             }
+        }
+        void note_draw(uint32_t w, uint32_t h) {
+            std::lock_guard<std::mutex> lk(mx);
+            ++seen[key(w, h)];
+            ++observations;
+            if (observations == 100 || (observations % 5000) == 0) report_locked();
+        }
+        void note_skip(uint32_t w, uint32_t h, uint32_t reason_mask) {
+            std::lock_guard<std::mutex> lk(mx);
+            ++skipped[key(w, h)][reason_mask];
         }
     };
     static Wave64Census wave64_stats;
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
-        if (wave64_census) wave64_stats.note(W, H, /*skipped=*/false);
+        if (wave64_census) wave64_stats.note_draw(W, H);
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
@@ -4436,11 +4457,32 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              static_cast<int>(uses_internal_gds),
                              static_cast<int>(ctx.fragment_stores_atomics), why_text);
             }
-            // Numerator, counted OUTSIDE the dedupe guard above: once per dropped DRAW rather than
-            // once per distinct shader. `note` already counted this draw in the denominator at the
-            // top of the loop, so this call passes skipped=true and the pair stays consistent.
-            if (wave64_census) { std::lock_guard<std::mutex> lk(wave64_stats.mx);
-                                 ++wave64_stats.per_extent[Wave64Census::key(W, H)].second; }
+            // Numerator, counted OUTSIDE the dedupe guard above: once per dropped DRAW rather than once
+            // per distinct shader. The draw was already counted in the denominator at the top of the
+            // loop, so this records only the skip.
+            //
+            // The mask names WHICH of the seven disjuncts fired. Bits 0x40 (internal GDS without
+            // fragment stores/atomics) and 0x20 (subgroup FEATURE shortfall) are NOT width problems, so
+            // a wave32 lowering would not recover those draws; summing them into one "wave64" total
+            // would answer a different question than the one asked.
+            //
+            // Lock nesting is deliberate and one-directional: `log_mutex` above is still held here (its
+            // guard is scoped to the enclosing block), so the order is always log_mutex ->
+            // wave64_stats.mx, and nothing takes them the other way. Preserve that if you add a lock
+            // inside the census.
+            if (wave64_census) {
+                uint32_t reason_mask = 0;
+                if (!ctx.subgroup_size_control)                                          reason_mask |= 0x01;
+                if (required_fragment_subgroup_size < ctx.min_subgroup_size)             reason_mask |= 0x02;
+                if (required_fragment_subgroup_size > ctx.max_subgroup_size)             reason_mask |= 0x04;
+                if (!(ctx.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT)) reason_mask |= 0x08;
+                if (!(ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT))               reason_mask |= 0x10;
+                if (!prosper::gpu::fragment_subgroup_features_supported(
+                        required_fragment_subgroup_features,
+                        available_fragment_subgroup_features))                           reason_mask |= 0x20;
+                if (uses_internal_gds && !ctx.fragment_stores_atomics)                   reason_mask |= 0x40;
+                wave64_stats.note_skip(W, H, reason_mask);
+            }
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
