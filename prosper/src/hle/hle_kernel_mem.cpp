@@ -4277,6 +4277,100 @@ namespace {
         if (hint && !fixed) {
             if (void* p = map_section_view(0, len, hp, phys, align)) return p;
         }
+        // FIXED MAP_DIRECT over a placeholder too small for it (#2424). The guest maps a range,
+        // unmaps it, then remaps the SAME base with a LARGER length -- GTA V (PPSA04263) does exactly
+        // this at 0x1550880000: 0x40000, unmap, then 0x80000. The unmap leaves a free placeholder of
+        // the original size, and `MapViewOfFile3` with MEM_REPLACE_PLACEHOLDER requires the view to
+        // match a SINGLE placeholder exactly, so the larger view is rejected with
+        // ERROR_INVALID_ADDRESS (487) and the guest gets ENOMEM from sceKernelBatchMap.
+        //
+        // Linux never reaches this: mmap(MAP_FIXED) replaces whatever occupies the range, so
+        // map-small / unmap / map-larger at one VA costs nothing there. This is the Windows half.
+        //
+        // The repair is to make the placeholder cover the whole request and retry the view ONCE.
+        // What makes it safe is that VirtualAlloc2 at a FIXED base fails if the range is not free --
+        // the reservation IS the ownership test, performed atomically by the kernel. There is no
+        // query-then-claim race to lose, and no way to steal a range another owner holds: a
+        // committed page, a live view, or a guest placeholder all make the reservation fail and we
+        // fall through to the original nullptr.
+        //
+        // Deliberately narrow: only the tail beyond an existing FREE placeholder at exactly `hint`
+        // is claimed. A request that does not begin on a free placeholder, or that overlaps anything
+        // in g_guest_placeholders, is not repaired -- those are ownership questions rather than a
+        // size mismatch, and #2424 records that they have a different (unimplemented) answer.
+        if (fixed && hint && len && !(len & 0xfff)) {
+            bool retry = false;
+            {
+                std::lock_guard<std::mutex> lk(g_dview_mx);
+                const uint64_t end = hint + len;
+                for (const PlaceholderSpan& s : g_guest_placeholders)
+                    if (s.base < end && hint < s.base + s.size) goto no_repair;   // owned: not ours
+                for (const PlaceholderSpan& s : g_free_placeholders) {
+                    // The free span must CONTAIN the requested base and end before the request does.
+                    // Both observed shapes reach here: a span starting exactly at `hint` (GTA V's
+                    // 0x1550880000, unmapped at 0x40000 then remapped at 0x80000), and a span
+                    // starting BELOW it (0x14d2c30000 +0x30000 against a request at 0x14d2c40000
+                    // +0x40000, where the request begins 0x10000 inside the span). The second is why
+                    // an exact-base test was too narrow -- it left the title failing at the next map.
+                    const uint64_t span_end = s.base + s.size;
+                    const uint64_t req_end = hint + len;
+                    if (s.base > hint || hint >= span_end || req_end <= span_end) continue;
+                    const uint64_t tail_base = span_end;
+                    const uint64_t tail_size =
+                        align_up(req_end - span_end, kWinAllocationGranularity);
+                    if (tail_base > UINT64_MAX - tail_size) break;
+                    for (const PlaceholderSpan& g : g_guest_placeholders)
+                        if (g.base < tail_base + tail_size && tail_base < g.base + g.size)
+                            goto no_repair;
+                    const PlaceholderApis& apis = placeholder_apis();
+                    if (!apis.virtual_alloc2) break;
+                    // Fixed-base placeholder reservation: succeeds only if the tail is genuinely free.
+                    void* got = apis.virtual_alloc2(
+                        GetCurrentProcess(),
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(tail_base)),
+                        static_cast<SIZE_T>(tail_size),
+                        MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+                    if (!got) {
+                        MLOG("map_dmem FIXED repair: tail 0x%llx +0x%llx not free (error=%lu)\n",
+                             (unsigned long long)tail_base, (unsigned long long)tail_size,
+                             (unsigned long)GetLastError());
+                        break;
+                    }
+                    // Adjacent and same-ownership, so this coalesces with the existing free span.
+                    //
+                    // One place the repair is slightly WIDER than the request, stated because the
+                    // rest of this comment stresses how narrow it is: tail_size is rounded up to
+                    // kWinAllocationGranularity, so up to 64 KiB - 1 beyond the request can be
+                    // reserved into the free pool. Benign — take_placeholder_locked carves the exact
+                    // subrange later and the remainder stays ours as a free placeholder — but it is
+                    // better stated here than discovered from a span list that is larger than the
+                    // requests explain. (Review finding on #2426.)
+                    remember_free_placeholder_locked(tail_base, tail_size);
+                    // Log the SPAN's own base, not the request's: when the request starts inside the
+                    // span those differ, and printing `hint` there would misreport which placeholder
+                    // grew.
+                    MLOG("map_dmem FIXED repair: free placeholder 0x%llx grew 0x%llx -> 0x%llx to "
+                         "cover request 0x%llx +0x%llx -- retrying view\n",
+                         (unsigned long long)s.base, (unsigned long long)s.size,
+                         (unsigned long long)(s.size + tail_size),
+                         (unsigned long long)hint, (unsigned long long)len);
+                    retry = true;
+                    break;
+                }
+            }
+            if (retry) {
+                if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
+                // `align` is carried because the repair does NOT honour it: tail_base is the free
+                // span's end, which need not satisfy the caller's alignment, so with
+                // align > kWinAllocationGranularity the extend can succeed and the view still fail.
+                // That is the likeliest reason to land here and it was invisible without the value.
+                // (Review finding on #2426.)
+                MLOG("map_dmem FIXED repair: view still failed after extend "
+                     "(error=%lu align=0x%llx)\n",
+                     (unsigned long)GetLastError(), (unsigned long long)align);
+            }
+        }
+    no_repair:
         // A private fixed mapping would report success while severing the physical alias contract.
         // Older Windows versions without placeholder replacement fail visibly instead.
         //
