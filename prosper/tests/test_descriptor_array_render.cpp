@@ -166,6 +166,113 @@ int main() {
                   "binding 3 at run-table offset 2 still receives its own buffer (offsets are applied)");
     }
 
+    // --- Arm 5: the layout must declare what the WRITE supplies, per class (#2477) ----------------
+    // Arrays are implemented for storage buffers only. The texture / storage-image write and the
+    // internal-GDS write each supply exactly ONE descriptor, so a layout that took `descriptor_arity()`
+    // for those classes declared N against a write of 1 -- elements 1..N-1 never written, undefined
+    // descriptors bound.
+    //
+    // Asserted on `written_descriptor_count()` rather than on a frame, and that is not a shortcut:
+    // NO pixel assertion can see this class. The shader reads element 0, element 0 IS written, so the
+    // quad is green whether the layout declared 1 or 3 -- exactly the blind spot that let #2471's
+    // spec-invalid binding pass every arm it had. The only thing a rendered frame proves here is that
+    // the guard did not break the working path, which the render below does check.
+    {
+        prosper::test::FrameResource buf{};
+        buf.binding = 3; buf.set = 0;
+        buf.table_entries = { quad, decoy, decoy };
+        CHECK(buf.descriptor_arity() == 3 && buf.written_descriptor_count() == 3,
+              "storage buffer: the array path writes N, so the layout declares N");
+
+        // A texture carrying table_entries -- unreachable from any current producer, constructed BY
+        // HAND here precisely because nothing else can construct it (charter: build one positive
+        // instance of the class outside whatever produced the null).
+        prosper::test::FrameResource tex{};
+        tex.binding = 4; tex.set = 0;
+        tex.has_uniform_color = true;          // makes is_texture() true without a pixel upload
+        tex.table_entries = { quad, decoy, decoy };
+        CHECK(tex.is_texture(), "control: the hand-built resource really is a texture class");
+        CHECK(tex.descriptor_arity() == 3,
+              "control: it really declares 3 entries, so the two counts CAN disagree here");
+        CHECK(tex.written_descriptor_count() == 1,
+              "texture: its write supplies one, so the layout must declare one -- not its arity");
+
+        prosper::test::FrameResource gds{};
+        gds.binding = 5; gds.set = 0;
+        gds.is_internal_gds = true;
+        gds.table_entries = { quad, decoy };
+        CHECK(gds.written_descriptor_count() == 1,
+              "internal GDS: its write supplies one, so the layout must declare one");
+
+        // And the guard must not have disturbed the path that does work.
+        std::vector<uint8_t> px_guard =
+            prosper::test::render_draws_rgba({ draw_with({}, { quad, decoy, decoy }) }, W, H);
+        CHECK(px_guard.size() == (size_t)W*H*4 && greenAt9(px_guard),
+              "the storage-buffer array still renders GREEN with the per-class guard in place");
+
+        // The assertions above cover the ACCESSOR. They do not cover the LAYOUT SITE that consumes
+        // it, and that distinction is the whole defect: reverting only
+        // `lb[i].descriptorCount = r.written_descriptor_count()` to `descriptor_arity()` -- i.e.
+        // reverting the fix while leaving the accessor intact -- leaves every assertion above green.
+        // Measured, not assumed.
+        //
+        // So drive the site. This draw carries the texture-with-`table_entries` alongside the buffer
+        // the shader reads, which is the FIRST time the layout loop sees a class whose declared arity
+        // and written count disagree. With the fix it declares 1 against a write of 1; without it, 3
+        // against 1, and elements 1..2 are never written.
+        //
+        // And this arm IS ctest-visible, which is worth stating precisely because the obvious
+        // expectation -- "no pixel assertion can see it, so only the validation layer can" -- is
+        // wrong here, and I had written that before measuring it.
+        //
+        // Reverting the call site alone makes the POOL and the LAYOUT disagree: the pool reserves
+        // `written_descriptor_count()` (1 sampler) while the layout declares `descriptor_arity()` (3),
+        // so `vkAllocateDescriptorSets` requests 3 COMBINED_IMAGE_SAMPLER from a pool holding 1. On
+        // this adapter that returns no set, the following `vkUpdateDescriptorSets` gets
+        // `dstSet == VK_NULL_HANDLE`, and the test dies with **exit 139**. Measured both ways.
+        //
+        // Note this is the mirror image of #2471, where the pool arm was unverifiable because RADV
+        // over-allocates rather than returning OUT_OF_POOL_MEMORY. A pool can be over-allocated
+        // into; it cannot invent capacity for a descriptor TYPE it was never sized for.
+        //
+        // The validation layer adds the reason rather than the symptom -- `pool only has a total of 1`
+        // and `dstSet is VK_NULL_HANDLE` -- so `vk_validation_scan.py` is still the instrument that
+        // explains a failure here, and it is clean with the fix in place.
+        //
+        // WHAT THIS ARM'S DISCRIMINATION RESTS ON, because it is not self-contained (raised in review):
+        // it discriminates via POOL EXHAUSTION, not via the frame. Trace the mutated path if the
+        // allocation ever succeeds -- a more generously sized pool, a different adapter, or a driver
+        // that over-allocates samplers the way RADV over-allocates buffers:
+        //
+        //     layout declares 3, write supplies 1  -> set allocates
+        //     elements 1..2 undefined              -> shader reads element 0
+        //     element 0 is written                 -> quad is GREEN -> this arm PASSES
+        //
+        // That is not hypothetical hand-waving: over-allocation is measured behaviour on this very
+        // adapter for buffers (#2471), which is why the pool arm there was unverifiable. So if pool
+        // sizing for COMBINED_IMAGE_SAMPLER ever becomes generous, this arm stops discriminating and
+        // goes quiet rather than failing. If that happens, assert the emitted `descriptorCount`
+        // directly instead of relying on the allocator to refuse.
+        {
+            prosper::test::BackendDraw d = draw_with(quad, {});
+            prosper::test::FrameResource tex_bound{};
+            tex_bound.binding = 4; tex_bound.set = 0;
+            tex_bound.has_uniform_color = true;
+            tex_bound.uniform_color = {0.25f, 0.5f, 0.75f, 1.0f};
+            tex_bound.tw = 64; tex_bound.th = 32;
+            tex_bound.table_entries = { quad, decoy, decoy };   // arity 3 on a class that writes 1
+            d.R.push_back(std::move(tex_bound));
+            std::vector<uint8_t> px_mixed = prosper::test::render_draws_rgba({ std::move(d) }, W, H);
+            CHECK(px_mixed.size() == (size_t)W*H*4,
+                  "a draw binding a texture whose declared arity exceeds its written count produced "
+                  "a frame (the layout site saw the disagreement)");
+            if (px_mixed.size() == (size_t)W*H*4)
+                CHECK(greenAt9(px_mixed),
+                      "and it still renders GREEN -- the guard keeps layout and write consistent "
+                      "instead of declaring descriptors nothing writes");
+        }
+    }
+
     printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
     return fails ? 1 : 0;
 }

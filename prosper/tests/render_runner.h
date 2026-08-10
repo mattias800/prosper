@@ -213,11 +213,38 @@ struct FrameResource {
     // layout declare N while a write supplies M, which is a validation error at bind time and a wrong
     // shader read if validation is off. One vector, one length, no way to disagree.
     std::vector<std::vector<uint32_t>> table_entries;
-    // The number of descriptors this binding occupies: 1 ordinary, N for a table-indexed array.
-    // Used by the descriptor POOL accounting, the layout binding, and the write -- all three must
-    // agree, so all three call this.
+    // The number of descriptors this binding DECLARES: 1 ordinary, N for a table-indexed array.
+    // This is the guest's intent, not what any Vulkan object ends up carrying -- for that, use
+    // `written_descriptor_count()` below.
+    //
+    // This comment used to say the pool, the layout and the write "all three must agree, so all
+    // three call this". They must agree; they did not all call this. The pool counts a texture as
+    // ONE (`is_texture()` branches to `++storage_images` / `++sampled_images` regardless of arity)
+    // and the texture and internal-GDS writes each supply ONE, while the layout took this value for
+    // every class -- so the invariant the comment asserted was the one thing not being maintained.
+    // #2477.
     uint32_t descriptor_arity() const {
         return table_entries.empty() ? 1u : static_cast<uint32_t>(table_entries.size());
+    }
+    // The number of descriptors the WRITE path actually supplies, and therefore what the POOL and the
+    // LAYOUT must both declare (#2477). Only the storage-buffer path loops over `table_entries`; the
+    // texture / storage-image write and the internal-GDS write each supply exactly one descriptor.
+    //
+    // Taking `descriptor_arity()` in the layout while the write supplied one produced precisely the
+    // layout-declares-N / write-supplies-M disagreement the `table_entries` comment above exists to
+    // prevent: the layout would declare N, elements 1..N-1 would never be written, and binding the
+    // set would read undefined descriptors. The two sites are ~500 lines apart, so nothing local
+    // showed it.
+    //
+    // This is a fail-visible GUARD, not array support for those classes: it keeps the three sites in
+    // agreement and says so loudly if a producer ever populates `table_entries` on a class whose
+    // write cannot honour it. Unreachable today -- nothing sets `table_entries` on a texture or the
+    // internal GDS buffer -- which is why it is a guard rather than a fix, and why it needs no
+    // producer to be worth having. `CONFIDENCE: HIGH` that silent truncation is the wrong direction
+    // here: a layout that quietly declares fewer descriptors than the guest asked for is the
+    // under-reporting failure, and it is the one nobody files.
+    uint32_t written_descriptor_count() const {
+        return is_texture() || is_internal_gds ? 1u : descriptor_arity();
     }
 };
 
@@ -4314,7 +4341,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 // N per array, not 1 per resource: the pool is sized from these counters, and an
                 // N-entry array that reserved 1 fails inside vkAllocateDescriptorSets with
                 // VK_ERROR_OUT_OF_POOL_MEMORY -- an error with no visible connection to arrays.
-                storage_buffers += resource.descriptor_arity();
+                storage_buffers += resource.written_descriptor_count();
             } else if (resource.is_storage_image) {
                 ++storage_images;
             } else {
@@ -5086,7 +5113,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             for (size_t i = 0; i < R.size(); i++) {
                 const FrameResource& r = R[i];
                 lb[i] = {}; lb[i].binding = r.binding;
-                lb[i].descriptorCount = r.descriptor_arity();
+                // What the WRITE will supply, not what the resource declares (#2477). See
+                // `written_descriptor_count()`. Loud once if a producer ever asks for an array on a
+                // class whose write path cannot build one -- silently declaring 1 would drop the
+                // extra entries and read as handled.
+                lb[i].descriptorCount = r.written_descriptor_count();
+                if (r.descriptor_arity() != r.written_descriptor_count()) {
+                    static std::once_flag warned;
+                    std::call_once(warned, [&] {
+                        std::fprintf(stderr,
+                                     "[render] UNSUPPORTED descriptor array: binding %u declares %u "
+                                     "entries but its class writes one (texture=%d storage-image=%d "
+                                     "internal-gds=%d). Declaring 1 so the layout and the write agree; "
+                                     "entries 1..%u are IGNORED. Arrays are implemented for storage "
+                                     "buffers only -- see #2477.\n",
+                                     r.binding, r.descriptor_arity(),
+                                     (int)r.is_texture(), (int)r.is_storage_image,
+                                     (int)r.is_internal_gds, r.descriptor_arity() - 1u);
+                    });
+                }
                 if (r.is_texture()) {
                     const ResourcePhaseTimer phase_texture(timing_enabled, &res_texture_ms);
                     lb[i].descriptorType = r.is_storage_image
