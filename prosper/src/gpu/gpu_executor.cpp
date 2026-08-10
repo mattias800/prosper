@@ -208,6 +208,8 @@ bool descr_coherence_enabled() {
 namespace {
 struct DescriptorCoherenceState {
     std::mutex mx;
+    // Grows with DISTINCT addresses and is never pruned — ~125k entries on a 210 s GTA V route. Fine for
+    // an opt-in diagnostic at that scale; a much longer route would want a cap or an eviction policy.
     std::unordered_map<uint64_t, uint64_t> seen;   // descriptor address -> last observed hash
     uint64_t checked = 0, changed = 0;
     // Summary is emitted PERIODICALLY, not at exit. The first version of this probe reported from a
@@ -231,12 +233,20 @@ void record_descriptor_observation(uint64_t addr, uint64_t hash) {
     DescriptorCoherenceState& s = descr_coherence_state();
     std::lock_guard<std::mutex> lk(s.mx);
     ++s.checked;
-    auto it = s.seen.find(addr);
-    if (it == s.seen.end()) { s.seen.emplace(addr, hash); return; }
+    // Reported BEFORE the first-sight early return below, so emission depends only on `checked`.
+    // Placed after it, this line could fire only on a REPEAT observation — and in a run whose slots are
+    // rarely re-read inside the window that means `checked` in the hundreds of thousands, zero RUNNING
+    // lines, and zero CHANGED lines (a first sight can never mismatch), which is indistinguishable from
+    // the probe never having run. That is exactly the ambiguity the control exists to remove, and the
+    // mechanism is trap 147: the report was not unarmed, it was STARVED by an early return consuming the
+    // path before the trigger. Found in review; the published 8.5% figure was unaffected because both
+    // measured runs reached repeat observations, but the next run need not have.
     if ((s.checked % DescriptorCoherenceState::kReportEvery) == 0)
         std::fprintf(stderr,
                      "[descr-coherence] RUNNING checked=%llu distinct_addrs=%zu changed=%llu\n",
                      (unsigned long long)s.checked, s.seen.size(), (unsigned long long)s.changed);
+    auto it = s.seen.find(addr);
+    if (it == s.seen.end()) { s.seen.emplace(addr, hash); return; }
     if (it->second != hash) {
         // Report the first few individually — an aggregate alone cannot say WHICH slot moves, and a
         // table whose entries all churn is a different problem from one slot being rewritten.
