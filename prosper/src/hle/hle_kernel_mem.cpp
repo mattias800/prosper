@@ -2360,10 +2360,22 @@ HLE(k_batch_map) {
             // SEPARATE function (see the `#else` half of this file) where UNMAP and PROTECT can
             // also fail, so do not carry that two-op conclusion across platforms -- #2450 did, and
             // it excluded the two ops most likely to be responsible there.
-            fprintf(stderr,
-                    "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
-                    i, n, op, (unsigned long long)start, (unsigned long long)phys,
-                    (unsigned long long)len, prot);
+            // Bounded, but the cap ANNOUNCES itself. Uncapped, a guest allocator that retries on
+            // failure could emit one line per attempt; silently capped, the case where the
+            // interesting instance is the 200th attempt rather than the first is hidden. Saying
+            // "further ... suppressed" costs one line and tells the reader a tail exists, so
+            // raising the cap later is an informed decision rather than a guess.
+            {
+                static std::atomic<unsigned> logged{0};
+                const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
+                if (seen < 8)
+                    fprintf(stderr,
+                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+                            i, n, op, (unsigned long long)start, (unsigned long long)phys,
+                            (unsigned long long)len, prot);
+                else if (seen == 8)
+                    fprintf(stderr, "[batchmap-fail] further BatchMap failures suppressed after 8\n");
+            }
             if (!ret) ret = 0x8002000Cull;   // ENOMEM on a failed map
             break;
         }
@@ -5527,10 +5539,22 @@ HLE(k_batch_map) {
             // still zero on Windows: MAP_DIRECT and MAP_FLEXIBLE via a null view, UNMAP via
             // win_unmap, and PROTECT/TYPE_PROTECT via win_protect. `op` is therefore load-bearing
             // rather than decorative.
-            fprintf(stderr,
-                    "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
-                    i, n, op, (unsigned long long)start, (unsigned long long)phys,
-                    (unsigned long long)len, prot);
+            // Bounded, but the cap ANNOUNCES itself. Uncapped, a guest allocator that retries on
+            // failure could emit one line per attempt; silently capped, the case where the
+            // interesting instance is the 200th attempt rather than the first is hidden. Saying
+            // "further ... suppressed" costs one line and tells the reader a tail exists, so
+            // raising the cap later is an informed decision rather than a guess.
+            {
+                static std::atomic<unsigned> logged{0};
+                const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
+                if (seen < 8)
+                    fprintf(stderr,
+                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+                            i, n, op, (unsigned long long)start, (unsigned long long)phys,
+                            (unsigned long long)len, prot);
+                else if (seen == 8)
+                    fprintf(stderr, "[batchmap-fail] further BatchMap failures suppressed after 8\n");
+            }
             if (!ret) ret = 0x8002000Cull;
             break;
         }
