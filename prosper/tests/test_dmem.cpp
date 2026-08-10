@@ -201,6 +201,22 @@ int main() {
                 (uint64_t)(uintptr_t)&batch_done, 0, 0, 0) != 0 && batch_done == 0,
           "BatchMap reports an invalid host unmap instead of counting it as complete");
 
+    // A MAP_FLEXIBLE entry that cannot possibly be satisfied must report ENOMEM and count zero
+    // entries done -- and, since #2450, must NAME the failing entry on stderr. This is the only
+    // arm that reaches the `if (!ok)` branch in k_batch_map: UNMAP above never sets ok=false and
+    // both PROTECT forms assign `ret` themselves, so without this the failure diagnostic added for
+    // #2450 is compiled but never executed by any test.
+    alignas(8) uint8_t impossible_map[0x20]{};
+    *(uint64_t*)(impossible_map + 0x00) = 0;                       // no fixed VA
+    *(uint64_t*)(impossible_map + 0x10) = 0x4000000000000ull;      // 1 PiB -- cannot be mapped
+    impossible_map[0x18] = 0x03;                                   // read|write
+    *(int32_t*)(impossible_map + 0x1c) = 3;                        // MAP_FLEXIBLE
+    int32_t impossible_done = -1;
+    CHECK((uint32_t)batch((uint64_t)(uintptr_t)impossible_map, 1,
+                          (uint64_t)(uintptr_t)&impossible_done, 0, 0, 0) == 0x8002000Cu &&
+              impossible_done == 0,
+          "BatchMap returns ENOMEM and counts zero entries for an unsatisfiable MAP_FLEXIBLE");
+
     // Direct memory is one physical pool, not private memory per virtual mapping. Dead Cells
     // releases and reuses small physical ranges aggressively; independent Windows allocations
     // let its allocator observe different metadata through two aliases and corrupt adjacent VA.

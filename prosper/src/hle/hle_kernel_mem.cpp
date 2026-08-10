@@ -2345,7 +2345,40 @@ HLE(k_batch_map) {
             }
             default: ok = false; ret = 0x80020016ull; break;
         }
-        if (!ok) { if (!ret) ret = 0x8002000Cull; break; }   // ENOMEM on a failed map
+        if (!ok) {
+            // A failed entry is FATAL to the caller -- UE4 titles turn the resulting ENOMEM into
+            // `LowLevelFatalError ... sceKernelBatchMap failed with error code: 0x8002000c` and kill
+            // the process (#2450, Dragon Quest VII PPSA17942). Report it unconditionally: this fires
+            // only on an actual failure, so it costs nothing on a healthy run, and without it the
+            // only way to learn WHICH entry failed is PROSPER_MEMLOG, which logs every map in the
+            // title -- thousands of lines, and enough added overhead that it perturbs the timing of
+            // the very allocation failure being diagnosed.
+            //
+            // `op` is the discriminator that matters. On THIS (POSIX) path only 0 = MAP_DIRECT and
+            // 3 = MAP_FLEXIBLE can reach here with `ret` still zero: UNMAP cannot fail and both
+            // PROTECT forms assign `ret` themselves. The Windows implementation of this call is a
+            // SEPARATE function (see the `#else` half of this file) where UNMAP and PROTECT can
+            // also fail, so do not carry that two-op conclusion across platforms -- #2450 did, and
+            // it excluded the two ops most likely to be responsible there.
+            // Bounded, but the cap ANNOUNCES itself. Uncapped, a guest allocator that retries on
+            // failure could emit one line per attempt; silently capped, the case where the
+            // interesting instance is the 200th attempt rather than the first is hidden. Saying
+            // "further ... suppressed" costs one line and tells the reader a tail exists, so
+            // raising the cap later is an informed decision rather than a guess.
+            {
+                static std::atomic<unsigned> logged{0};
+                const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
+                if (seen < 8)
+                    fprintf(stderr,
+                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+                            i, n, op, (unsigned long long)start, (unsigned long long)phys,
+                            (unsigned long long)len, prot);
+                else if (seen == 8)
+                    fprintf(stderr, "[batchmap-fail] further BatchMap failures suppressed after 8\n");
+            }
+            if (!ret) ret = 0x8002000Cull;   // ENOMEM on a failed map
+            break;
+        }
         done++;
     }
     MLOG("batchmap n=%d done=%d first{op=%d start=0x%llx len=0x%llx prot=0x%x} -> 0x%llx\n",
@@ -5494,7 +5527,37 @@ HLE(k_batch_map) {
             }
             default: ok = false; ret = 0x80020016ull; break;
         }
-        if (!ok) { if (!ret) ret = 0x8002000Cull; break; }
+        if (!ok) {
+            // Name the failing entry (#2450). A failed entry is fatal to the caller: UE4 titles
+            // turn the resulting ENOMEM into `LowLevelFatalError ... sceKernelBatchMap failed with
+            // error code: 0x8002000c` and kill the process (Dragon Quest VII, PPSA17942). Fires
+            // only on an actual failure, so it is free on a healthy run -- and the alternative,
+            // PROSPER_MEMLOG, logs every map in the title and perturbs the timing of the very
+            // allocation failure being diagnosed.
+            //
+            // Unlike the POSIX implementation, ALL FOUR mapping ops can reach here with `ret`
+            // still zero on Windows: MAP_DIRECT and MAP_FLEXIBLE via a null view, UNMAP via
+            // win_unmap, and PROTECT/TYPE_PROTECT via win_protect. `op` is therefore load-bearing
+            // rather than decorative.
+            // Bounded, but the cap ANNOUNCES itself. Uncapped, a guest allocator that retries on
+            // failure could emit one line per attempt; silently capped, the case where the
+            // interesting instance is the 200th attempt rather than the first is hidden. Saying
+            // "further ... suppressed" costs one line and tells the reader a tail exists, so
+            // raising the cap later is an informed decision rather than a guess.
+            {
+                static std::atomic<unsigned> logged{0};
+                const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
+                if (seen < 8)
+                    fprintf(stderr,
+                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+                            i, n, op, (unsigned long long)start, (unsigned long long)phys,
+                            (unsigned long long)len, prot);
+                else if (seen == 8)
+                    fprintf(stderr, "[batchmap-fail] further BatchMap failures suppressed after 8\n");
+            }
+            if (!ret) ret = 0x8002000Cull;
+            break;
+        }
         done++;
     }
     if (a2) *(int32_t*)(uintptr_t)a2 = done;
