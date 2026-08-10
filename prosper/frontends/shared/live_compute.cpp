@@ -992,6 +992,9 @@ struct VulkanComputeContext {
     // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
     bool image_support = false;
+    // Stage 1 of the descriptor lift (#2412): true when this compute device can express an indexed
+    // descriptor array. Set either here (own device) or inherited when adopting the renderer's.
+    bool descriptor_indexing_support = false;
     uint32_t subgroup_size = 0;
     VkShaderStageFlags subgroup_stages = 0;
     VkSubgroupFeatureFlags subgroup_operations = 0;
@@ -2249,6 +2252,56 @@ struct VulkanComputeContext {
         dci.pQueueCreateInfos = &qci;
         dci.pEnabledFeatures = &enabled;
         std::vector<const char*> dev_exts;
+        // Runtime-selected descriptors (#2412, stage 1). This path only runs when there is NO renderer
+        // to adopt a device from (the shared case logs "adopted the renderer's device"), but it must
+        // acquire the same capability: otherwise a compute-only run would gate on a flag the graphics
+        // device set and emit indexed-array SPIR-V against a device that cannot execute it — silent
+        // undefined behaviour rather than a clean failure. All-or-nothing for the same reason as the
+        // graphics side, and the SUCCESS is logged as well as the shortfall so the working case is not
+        // indistinguishable from code that never ran.
+        VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+        { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+          std::vector<VkExtensionProperties> de(ne);
+          vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
+          for (auto& e : de) {
+              if (std::strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) continue;
+              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+              f2.pNext = &di_features;
+              vkGetPhysicalDeviceFeatures2(physical, &f2);
+              const bool have_all =
+                  di_features.runtimeDescriptorArray &&
+                  di_features.descriptorBindingPartiallyBound &&
+                  di_features.shaderStorageBufferArrayNonUniformIndexing &&
+                  di_features.shaderSampledImageArrayNonUniformIndexing &&
+                  di_features.shaderStorageImageArrayNonUniformIndexing;
+              if (have_all) {
+                  VkPhysicalDeviceDescriptorIndexingFeaturesEXT want{
+                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+                  want.runtimeDescriptorArray = VK_TRUE;
+                  want.descriptorBindingPartiallyBound = VK_TRUE;
+                  want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+                  want.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+                  want.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
+                  di_features = want;
+                  di_features.pNext = const_cast<void*>(dci.pNext);
+                  dci.pNext = &di_features;
+                  dev_exts.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+                  descriptor_indexing_support = true;
+                  std::fprintf(stderr, "[compute] descriptor indexing ENABLED (own device)\n");
+              } else {
+                  std::fprintf(stderr,
+                               "[compute] VK_EXT_descriptor_indexing present but incomplete: "
+                               "runtimeArray=%d partiallyBound=%d ssboNonUniform=%d "
+                               "sampledNonUniform=%d storageImgNonUniform=%d\n",
+                               (int)di_features.runtimeDescriptorArray,
+                               (int)di_features.descriptorBindingPartiallyBound,
+                               (int)di_features.shaderStorageBufferArrayNonUniformIndexing,
+                               (int)di_features.shaderSampledImageArrayNonUniformIndexing,
+                               (int)di_features.shaderStorageImageArrayNonUniformIndexing);
+              }
+              break;
+          } }
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
@@ -2256,9 +2309,15 @@ struct VulkanComputeContext {
           vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
           for (auto& e : de) if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset")) {
               dev_exts.push_back("VK_KHR_portability_subset"); break; } }
+#endif
+        // Assigned OUTSIDE the Apple guard. Before stage 1 the only extension this path ever requested
+        // was VK_KHR_portability_subset, so the assignment lived inside `#ifdef __APPLE__` and every
+        // other platform passed a zero-length list. Leaving it there would have silently dropped the
+        // descriptor-indexing extension on Linux and Windows -- the pNext feature struct would be sent
+        // without its extension enabled, which is exactly the shape that produces a validation error
+        // far from its cause.
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
-#endif
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
