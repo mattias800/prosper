@@ -173,3 +173,71 @@ why the uniform reading looks safe and is wrong; the decoration is per-access, s
 **Sequencing note.** This work sits on top of #2463, whose reflection contract is unreviewed. Stage 1
 changed shape under review (a two-leg fix became three), so the emitter is deliberately not built on
 an unreviewed contract.
+
+## Stage 5 groundwork — the five backend sites an indexed descriptor array touches (#2412)
+
+Surveyed 2026-08-10 against `08d42aea`, independently of stage 4b: this half needs only stage 2's
+representation (`table_index_count`, merged as 48d978ab) and stage 1's enabled features (merged as
+056edd10), not the SPIR-V emitter. Every line number below was read, not recalled.
+
+**1. The descriptor POOL is sized one entry per resource, and this is the site that fails furthest from
+its cause.** `tests/render_runner.h` counts demand with `++storage_buffers` / `++storage_images` /
+`++sampled_images` — once per `FrameResource`, whatever its arity — and passes those counts as the
+`VkDescriptorPoolSize` values. An array of N descriptors consumes **N** pool entries while 1 was
+reserved, so allocation fails with `VK_ERROR_OUT_OF_POOL_MEMORY` at a `vkAllocateDescriptorSets` that
+has nothing visibly to do with arrays. The counting loop must add `max(1, table_index_count)` per
+resource. Recorded first because it is the one a reader will not predict from "declare an array".
+
+**2. The layout binding hardcodes `descriptorCount = 1`.** One site, in the layout-building loop, and it
+becomes the array length.
+
+**3. Three write sites hardcode `descriptorCount = 1`** and each supplies a single
+`VkDescriptorBufferInfo`. An indexed binding needs N infos, one per table entry, materialised from the
+guest table at `base + i * table_entry_stride`. All three are in the same file; missing one yields a
+binding whose layout declares N and whose write supplies 1, which is a validation error rather than a
+silent wrong result — the good failure direction.
+
+**4. The layout cache key ALREADY includes `descriptorCount`**, alongside binding, type and stage flags.
+So arity participates in layout identity and an array layout cannot be wrongly reused for a scalar
+binding of the same number. This is a pre-existing correct property, recorded so nobody "fixes" it and
+so a reviewer does not have to suspect stale-layout reuse.
+
+**5. `descriptorBindingPartiallyBound` is already enabled** — stage 1 requires all five descriptor
+indexing features together, so the backend may leave a junk table slot **unwritten** rather than
+inventing a dummy descriptor for every unreadable entry. That is what makes per-entry validation
+practical: run each entry through the existing `image_descriptor_reject_reason` equivalent, write the
+ones that pass, leave the rest unbound, and let the shader's own bounds discipline handle the gap.
+
+**Materialisation must be lazy or generation-invalidated, and that is measured rather than assumed.**
+Stage 0 (`PROSPER_DESCR_COHERENCE`, #2456) found **8.5% of distinct V#-relative descriptor addresses
+rewritten during a single routed `PPSA04263` run** — 720,000 observations, 125,563 distinct addresses,
+10,630 changed. Eager whole-table pre-materialisation is therefore dead: the table would be stale before
+it was used. The same measurement collapses two design holes into one — the per-resource copy is ~67% of
+a collapsed frame, so a cache is mandatory rather than optional, **and it needs the same generation
+signal invalidation needs**. One mechanism serves both.
+
+A second figure from the same probe bounds the working set: **1,170 distinct descriptor addresses in a
+55 s pre-gameplay run against 125,563 in 210 s of gameplay** — a ~100x explosion at the transition, in
+the same place the 53 skipped dispatches live. Whatever the cache is, it must survive that step change.
+
+**6. The crux of the implementation is the `VkDescriptorBufferInfo` array's SIZING, and it carries a
+pointer-stability constraint that is easy to miss.** Today the backend allocates
+`std::vector<VkDescriptorBufferInfo> dbi(R.size())` — exactly one info per resource, sized once — and
+each write takes `wr[i].pBufferInfo = &dbi[i]`. Those addresses are handed to Vulkan and must stay valid
+until `vkUpdateDescriptorSets`, which they do *only because the vector is never grown after it is sized*.
+
+An indexed binding needs a **contiguous run of N infos**, so the vector must become
+`sum over resources of max(1, table_index_count)` entries with a per-resource offset, and
+`wr[i].pBufferInfo = &dbi[offset_i]` with `descriptorCount = count_i`. The trap: any implementation that
+appends per entry as it materialises (`push_back` in the loop) will **reallocate and silently invalidate
+every pointer already stored in `wr`**, producing use-after-free that Vulkan reads as garbage descriptors
+rather than as a crash. Size the run table before the loop, or store offsets and resolve the pointers in
+a second pass after the vector is final. Same constraint applies to `dii` for image arrays.
+
+**Sequencing consequence.** This makes the backend half a change to the *shared* renderer's descriptor
+sizing and indexing semantics, which the charter lists as requiring independent review, and it cannot be
+verified end-to-end until a producer sets `table_index_count` — so it should land with a synthetic
+multi-entry test plus an explicit statement that the N>0 path has no live producer yet. Landing
+pool-sizing or layout arity *without* the matching write arity is worse than landing neither: a layout
+declaring N against a write supplying 1 is a validation error the moment a producer appears, so these
+four sites (pool, layout, write, and this run table) must change together.
