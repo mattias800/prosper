@@ -2035,8 +2035,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         return w ? (int)strtol(w, nullptr, 0) : -1;
     }();
     auto set_value = [&](int r, uint32_t v) {
+        // `sh=` identifies WHICH PROGRAM this transition belongs to, derived exactly as the reject
+        // lines derive it (first code dword + span; rdna2_to_spirv.cpp:14974). Without it the watch
+        // is a bare register number across every program folded in the run, and register numbers are
+        // program-local — so two lanes tracing "s16" can legitimately observe different registers and
+        // reach contradictory conclusions about the same chain. That happened: a Windows trace of s16
+        // showed ZERO forget sites while the Linux fold attributed the loss of the descriptor-table
+        // pointer to a v_cmp writing s16, and neither observation was wrong. (#2412)
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] pc=%u s%d <- KNOWN 0x%08x\n", watch_pc, r, v);
+            fprintf(stderr, "[sgprwatch] sh=%08x/%zu pc=%u s%d <- KNOWN 0x%08x\n",
+                    dwords ? code[0] : 0u, dwords, watch_pc, r, v);
         if (valid_reg(r)) {
             val[(size_t)r] = v;
             val_known.set((size_t)r);
@@ -2048,8 +2056,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
     auto forget = [&](int r) {
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] pc=%u s%d <- FORGOTTEN words=%08x:%08x len=%u\n",
-                    watch_pc, r, watch_w0, watch_w1, watch_len);
+            fprintf(stderr, "[sgprwatch] sh=%08x/%zu pc=%u s%d <- FORGOTTEN words=%08x:%08x len=%u\n",
+                    dwords ? code[0] : 0u, dwords, watch_pc, r, watch_w0, watch_w1, watch_len);
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
