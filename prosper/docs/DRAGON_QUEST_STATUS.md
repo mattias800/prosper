@@ -512,6 +512,32 @@ blocker.
    timestamp — `…-210000-123.bmp` and `…-210000-123-2.prgbundle` are two different grabs despite an
    identical title and millisecond. The `stat` habit still applies to artifacts captured before that
    landed (`captures/frame_grab_001.*` is exactly that shape) and to anything else named by ordinal.
+7. **`PROSPER_GFXLOG=1` PERTURBS this title's routed capture — the diagnostic changes what it observes.**
+   Measured 2026-08-10 on current master (`08d42aea`), Linux, native 3840x2160, the documented
+   `reach-title-screen.pad` route with fresh save roots. Identical command except for the variable:
+
+   | run | frames 33-44 | verdict a naive reader takes |
+   | --- | --- | --- |
+   | documented recipe (no `GFXLOG`) | title held, mean luminance 173-220, 38 of 45 frames with content | correct |
+   | `PROSPER_GFXLOG=1` added | **pure black**, mean 0.00, from frame 33 to 39 | "the title regressed on master" |
+
+   `PROSPER_GFXLOG` emits roughly **160,000 lines** over this route (counted: 159,619 `[render] item`
+   lines in one run) and slows it enough to shift a **time-dependent pad script** out of alignment with
+   the sampled frames. The presses themselves are delivered on schedule — `[pad-script] elapsed=30.049
+   frame=479 buttons=cross` — so `PROSPER_PAD_SCRIPT_LOG` *confirms the route ran* while the game is in a
+   different state by the time each screenshot fires. Both halves look healthy; only the composite is
+   wrong. **Every routed capture in this project is timing-dependent, so add no logging variable to a
+   scripted route without re-establishing the baseline under the same variable.** This nearly produced a
+   phantom title-screen regression report on a clean master.
+8. **A no-input black frame here is the authored Slate state, and it will invert a cross-platform
+   conclusion if taken as data.** Also 2026-08-10: a default 90 s launch is black with
+   `pixel-distinct=1`, and it was one step away from being published as "Linux composites black with zero
+   wave64 skips, therefore wave64 cannot explain the Windows black composite" — a *falsification* of the
+   leading hypothesis (#2448) drawn entirely from a state this document and
+   `scripts/dragon-quest-vii/README.md` both already describe as authored. The routed run says the
+   opposite: the title renders correctly. **Read the route README before the run, not after it** — the
+   warning is in the first paragraph, and the black frame is convincing enough that nothing downstream
+   would have questioned it.
 
 ## What has been fixed
 
