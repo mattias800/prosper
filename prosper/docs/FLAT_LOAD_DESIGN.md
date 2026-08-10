@@ -219,3 +219,25 @@ signal invalidation needs**. One mechanism serves both.
 A second figure from the same probe bounds the working set: **1,170 distinct descriptor addresses in a
 55 s pre-gameplay run against 125,563 in 210 s of gameplay** — a ~100x explosion at the transition, in
 the same place the 53 skipped dispatches live. Whatever the cache is, it must survive that step change.
+
+**6. The crux of the implementation is the `VkDescriptorBufferInfo` array's SIZING, and it carries a
+pointer-stability constraint that is easy to miss.** Today the backend allocates
+`std::vector<VkDescriptorBufferInfo> dbi(R.size())` — exactly one info per resource, sized once — and
+each write takes `wr[i].pBufferInfo = &dbi[i]`. Those addresses are handed to Vulkan and must stay valid
+until `vkUpdateDescriptorSets`, which they do *only because the vector is never grown after it is sized*.
+
+An indexed binding needs a **contiguous run of N infos**, so the vector must become
+`sum over resources of max(1, table_index_count)` entries with a per-resource offset, and
+`wr[i].pBufferInfo = &dbi[offset_i]` with `descriptorCount = count_i`. The trap: any implementation that
+appends per entry as it materialises (`push_back` in the loop) will **reallocate and silently invalidate
+every pointer already stored in `wr`**, producing use-after-free that Vulkan reads as garbage descriptors
+rather than as a crash. Size the run table before the loop, or store offsets and resolve the pointers in
+a second pass after the vector is final. Same constraint applies to `dii` for image arrays.
+
+**Sequencing consequence.** This makes the backend half a change to the *shared* renderer's descriptor
+sizing and indexing semantics, which the charter lists as requiring independent review, and it cannot be
+verified end-to-end until a producer sets `table_index_count` — so it should land with a synthetic
+multi-entry test plus an explicit statement that the N>0 path has no live producer yet. Landing
+pool-sizing or layout arity *without* the matching write arity is worse than landing neither: a layout
+declaring N against a write supplying 1 is a validation error the moment a producer appears, so these
+four sites (pool, layout, write, and this run table) must change together.
