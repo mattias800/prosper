@@ -5763,7 +5763,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(9); // key schema version (complete MRT attachment formats, #1390)
+            append(10); // key schema version (descriptor arity, #2471; MRT formats, #1390)
             append(W); append(H); append(color_count);
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 append(static_cast<uint32_t>(color_formats[slot]));
@@ -5789,12 +5789,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             append(static_cast<uint32_t>(bd_gs.size()));
             for (uint32_t word : bd_gs) append(word);
             append(v.use_desc); append(v.n_sets);
-            // A pair of shader-cache identities names the exact compile keys, including every
-            // descriptor's class and binding. External/replay shaders have identity zero and keep
-            // the full layout contract in the fallback key.
+            // Descriptor ARITY is keyed on BOTH branches, and it has to be (#2471). A cached
+            // VkPipeline was created under one VkPipelineLayout and is replayed under whatever
+            // `v.layout` resolves to now; the two are keyed independently (`pipeline_layout_key`,
+            // :5698), so any axis that reaches the layout and not this key silently pairs a
+            // pipeline with an incompatible layout — VUID-vkCmdDraw*-None-08600, "descriptorCount
+            // N doesn't match M", raised at the draw rather than at either cache.
+            //
+            // Arity is exactly such an axis, on both branches and for different reasons:
+            //   * a pair of shader-cache identities names the exact compile keys, including every
+            //     descriptor's class and binding, but NOT its count — a fixed vertex-fetch VS
+            //     reading one binding is a byte-identical module at arity 1 or arity 3;
+            //   * the fallback branch below used to hardcode `append(1)` as the descriptorCount,
+            //     correct only while every binding held one descriptor.
+            // So it is appended here, once, ahead of the split: two copies of the arity rule is the
+            // same drift risk that put a hardcoded 1 in the fallback in the first place. `R.size()`
+            // comes along because the arity list is meaningless without its length.
+            append(static_cast<uint32_t>(R.size()));
+            for (size_t i = 0; i < R.size(); ++i) append(R[i].descriptor_arity());
             append(!exact_shader_identities);
             if (!exact_shader_identities) {
-                append(static_cast<uint32_t>(R.size()));
                 for (size_t i = 0; i < R.size(); ++i) {
                     const bool texture = R[i].is_texture();
                     const VkDescriptorType descriptor_type = !texture
@@ -5805,7 +5819,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     append(R[i].set); append(R[i].binding); append(descriptor_type);
-                    append(1); append(stage_flags);
+                    append(stage_flags);   // count already keyed above, for both branches
                 }
             }
             append(ia.topology); append(ia.primitiveRestartEnable);
@@ -5843,6 +5857,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 ++pipeline_stats.hits;
             } else {
                 ++pipeline_stats.misses;
+            }
+            // PROSPER_PIPEKEY_LOG (#2471): pair the graphics-pipeline cache decision with the
+            // pipeline LAYOUT it will run under. The two are keyed independently — `pipeline_key`
+            // here, `pipeline_layout_key` at :5698 — and nothing checks that a cache hit's stored
+            // pipeline was created under a layout equivalent to `v.layout`. When they diverge the
+            // symptom is VUID-vkCmdDraw*-None-08600 ("descriptorCount N doesn't match M") at draw
+            // time, thousands of lines away from either cache, so the two decisions have to be
+            // readable side by side. Prints the per-resource arity because arity is the axis that
+            // reaches the layout without reaching this key.
+            static const bool pipekey_log = getenv("PROSPER_PIPEKEY_LOG") != nullptr;
+            if (pipekey_log) {
+                // Unbounded on purpose: a fixed char buffer would truncate the arity list on a
+                // draw with many resources, and a truncated list is exactly the case this
+                // diagnostic exists to read. It allocates only when the variable is set.
+                std::string arity_text = "[";
+                for (size_t i = 0; i < R.size(); ++i) {
+                    if (i) arity_text += ' ';
+                    arity_text += std::to_string(R[i].binding);
+                    arity_text += ':';
+                    arity_text += std::to_string(R[i].descriptor_arity());
+                }
+                arity_text += ']';
+                std::fprintf(stderr,
+                             "[pipekey] draw=%zu key=%016llx words=%u %s exact_ids=%d "
+                             "use_desc=%d n_sets=%u arity=%s layout=%p pipe=%p\n",
+                             di, (unsigned long long)pipeline_key.hash, pipeline_key.word_count,
+                             create_pipeline ? "MISS" : "HIT ",
+                             (int)exact_shader_identities, (int)v.use_desc, v.n_sets,
+                             arity_text.c_str(), (void*)v.layout, (void*)v.pipe);
+                std::fflush(stderr);
             }
         } else {
             ++pipeline_stats.bypasses;

@@ -113,6 +113,18 @@ int main() {
     CHECK(greenAt9(px_arr), "a 3-entry descriptor array binds, and element 0 draws the GREEN quad");
     CHECK(px_arr == px_single,
           "routing element 0 through the array path is byte-identical to the single-descriptor path");
+    // The graphics-pipeline cache must NOT hand Case A the pipeline Case C created (#2471). The two
+    // draws share every byte of shader and every item of fixed state, so a key that omits descriptor
+    // arity collides them — and the collision is invisible to every assertion above, because the
+    // stale pipeline still draws a correct green quad. What it is not is spec-valid: the pipeline was
+    // created under an arity-1 VkPipelineLayout and the sets are bound under an arity-3 one, which is
+    // VUID-vkCmdDrawIndexed-None-08600, "Set 0 binding 0 descriptorCount 3 doesn't match 1". A
+    // validation layer sees it; pixels never will. So the arity axis is asserted through the cache
+    // decision instead.
+    const prosper::test::BackendPipelineCacheStats after_a =
+        prosper::test::backend_pipeline_cache_stats();
+    CHECK(after_a.hits == 0 && after_a.misses == 1,
+          "an arity-3 draw does not reuse the arity-1 baseline's pipeline (hits=0, misses=1)");
 
     // --- Case B: the discriminator — element 0 really is entries[0] -------------------------------
     std::vector<uint8_t> px_swapped =
@@ -123,6 +135,15 @@ int main() {
           "a decoy at element 0 is NOT green — element 0 really is entries[0]");
     CHECK(px_swapped != px_arr,
           "which entry sits at element 0 changes the picture (entries are not collapsed into one)");
+    // The other half of the arity assertion, and the one that makes it mean something. Case B has
+    // Case A's shaders AND Case A's arity, so it MUST hit — keying arity is meant to separate
+    // arity-1 from arity-3, not to defeat the cache. Without this arm the check above is satisfied
+    // by any change that makes every draw miss (disabling the cache, keying a pointer, keying a
+    // counter), none of which fixes the layout pairing.
+    const prosper::test::BackendPipelineCacheStats after_b =
+        prosper::test::backend_pipeline_cache_stats();
+    CHECK(after_b.hits == 1 && after_b.misses == 0,
+          "a second arity-3 draw with the same shaders DOES reuse Case A's pipeline (hits=1)");
 
     // --- Case D: a non-zero run-table offset -------------------------------------------------------
     // Binding 2 comes FIRST and occupies two descriptors, so binding 3's run starts at offset 2. The
