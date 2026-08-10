@@ -410,6 +410,41 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
 // descriptor decode of BASE_ARRAY/LAST_ARRAY is pinned by test_build_shader_resources).
 const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
     if (d.base == 0) return "base-zero";
+    // A base BELOW the PS5 guest-VA floor is as unusable as zero, and used to pass this screen (#2446).
+    // Observed on PPSA04263 (GTA V) at gameplay with the compute materialization verdict logged:
+    //
+    //   pc=18 key=0xffffffff base=0x100        512x512 type=13 fmt=11 tile=24 -> materialize
+    //   pc=18 key=0xffffffff base=0x20972c0000 512x512 type=13 fmt=11 tile=24 -> materialize
+    //
+    // `0x100` is 256 bytes. It is the signature of a fold that resolved `base + imm` with the base
+    // unknown-or-zero — the same mechanism behind the bare-offset addresses recorded on #2412 (0x38,
+    // 0xb0, 0x128, 0x1a0, 0x218). Those reach `readable()` and fail loudly; this one never got that far,
+    // because only exact zero was screened, so it became a table entry.
+    //
+    // A materialized bogus resource is worse than a rejected one: lookups are first-match, so it can
+    // occupy the provenance a real descriptor needed, and unlike a rejection it produces no diagnostic.
+    //
+    // The threshold ALIGNS WITH the raw-pointer guard in `resolve_dynamic_fetch` (`gpu_executor.cpp`,
+    // the #2412 raw-pointer block: `if (ptr > 0x10000)`), whose comment says it "matches the consumer's
+    // own null/low-pointer guard", so one address is not plausible to a pointer screen and implausible
+    // to a descriptor screen.
+    //
+    // "Aligns with" rather than "matches", because the boundary value itself differs: the five existing
+    // sites accept `> 0x10000` and this one accepts `>= 0x10000`, so exactly 0x10000 is rejected there
+    // and accepted here. Deliberate under the discovery/validation split below — a screen that only
+    // validates should not reject the one address its sibling happens to exclude — but the off-by-one is
+    // real and stating it is cheaper than the next reader re-deriving whether it was intentional.
+    //
+    // NOT the `0x1000000000` PS5 guest-VA floor used by the two direct V# paths below, and the
+    // difference is the two predicates' jobs rather than an inconsistency. Those paths are SPECULATIVE
+    // DISCOVERY — they scan writable slots deciding whether arbitrary dwords even are a descriptor, so a
+    // high floor buys them precision against false positives, alongside a stride requirement and a
+    // 256 MiB extent ceiling. This predicate VALIDATES a descriptor already believed to be a T# by the
+    // instruction that consumed it, so it must reject only what is genuinely unusable. Applying the
+    // discovery floor here rejected 19 existing assertions whose synthetic bases (0x12000000,
+    // 0x123456780, …) are incidental scaffolding for mip/DCC/format behaviour — an over-strict
+    // validation screen throwing away descriptors that decode perfectly well.
+    if (d.base < 0x10000ull) return "base-below-low-pointer-guard";
     if (d.width == 0 || d.height == 0) return "zero-extent";
     // depth = LAST_ARRAY - BASE_ARRAY + 1, and the decoder emits 0 for LAST_ARRAY < BASE_ARRAY —
     // a malformed inverted range, not a single layer. It must keep failing visibly (#2005).

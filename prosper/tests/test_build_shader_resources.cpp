@@ -379,6 +379,26 @@ int main() {
                          "base-zero") == 0,
               "a zero-base T# is rejected as base-zero");
 
+        // #2446: a base BELOW the PS5 guest-VA floor used to pass, because only exact zero was
+        // screened. 0x100 is the shape a fold produces when it resolves `base + imm` with the base
+        // unknown-or-zero, and it was observed materializing as a valid 512x512 image on PPSA04263.
+        // Fails without the fix: the predicate returns nullptr and this CHECK reports "accepted".
+        uint32_t low_base[8]; memcpy(low_base, good, sizeof good);
+        make_tsharp(low_base, 0x100ull, 512, 512, /*RGBA16F*/71, /*tile*/27, /*2D*/9);
+        {
+            const char* why = image_descriptor_reject_reason(decode_image_descriptor(low_base));
+            CHECK(why != nullptr && strcmp(why, "base-below-low-pointer-guard") == 0,
+                  "a T# whose base is below the low-pointer guard is rejected, not materialized");
+        }
+        // The discriminator: the SAME descriptor shape with a base ABOVE the floor must still pass, so
+        // the rejection is attributable to the base and not to the 512x512 extent or the tile mode.
+        {
+            uint32_t at_guard[8];
+            make_tsharp(at_guard, 0x10000ull, 512, 512, /*RGBA16F*/71, /*tile*/27, /*2D*/9);
+            CHECK(image_descriptor_reject_reason(decode_image_descriptor(at_guard)) == nullptr,
+                  "the same shape at the low-pointer guard is accepted (the base is what was rejected)");
+        }
+
         uint32_t bad_type[8]; memcpy(bad_type, good, sizeof good);
         bad_type[3] = (bad_type[3] & ~(0xfu << 28)) | (0u << 28);   // TYPE 0 = buffer, not an image
         CHECK(image_descriptor_reject_reason(decode_image_descriptor(bad_type)) != nullptr &&
