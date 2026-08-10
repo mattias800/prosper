@@ -108,6 +108,30 @@ static std::vector<uint32_t> descriptor_array_test_spirv() {
     return s;
 }
 
+// The same eight-descriptor array with its length as an `OpSpecConstant` instead of `OpConstant`, so the
+// length id resolves to nothing in this pass and the arity is genuinely UNREADABLE (#2412). Valid SPIR-V;
+// `OpSpecConstant` (50) is not among the opcodes reflection decodes into `constants`.
+static std::vector<uint32_t> descriptor_array_specconst_test_spirv() {
+    std::vector<uint32_t> s = {0x07230203u, 0x00010000u, 0, 32, 0};
+    emit(s, 15, {0, 20, 0x6e69616d, 0});                    // OpEntryPoint Vertex %20 "main"
+    emit(s, 21, {1, 32, 0});                                // %1 = u32
+    emit(s, 29, {2, 1});                                    // %2 = runtime array u32 (the block's data)
+    emit(s, 30, {3, 2});                                    // %3 = struct {%2}  -- the Block
+    emit(s, 50, {1, 14, 8});                                // %14 = OpSpecConstant 8  <- NOT resolved
+    emit(s, 28, {15, 3, 14});                               // %15 = array of %14 x %3
+    emit(s, 32, {4, 12, 15});                               // %4 = StorageBuffer pointer to the ARRAY
+    emit(s, 32, {5, 12, 1});                                // %5 = StorageBuffer pointer to u32
+    emit(s, 43, {1, 6, 0});                                 // %6 = 0
+    emit(s, 43, {1, 7, 4});                                 // %7 = 4
+    emit(s, 59, {4, 8, 12});                                // %8 = the array-of-descriptors variable
+    emit(s, 71, {2, 6, 4});                                 // ArrayStride 4 on the block's data
+    emit(s, 72, {3, 0, 35, 0});                             // member 0 Offset 0
+    emit(s, 71, {8, 34, 0}); emit(s, 71, {8, 33, 9});       // set 0 binding 9
+    emit(s, 65, {5, 9, 8, 6, 6, 7});                        // %9 = &buffer[0][0][4]
+    emit(s, 61, {1, 10, 9});                                // %10 = load %9
+    return s;
+}
+
 static std::vector<uint32_t> atomic_descriptor_test_spirv() {
     std::vector<uint32_t> s = descriptor_test_spirv();
     // %12 points at binding 10. AtomicAnd is result-producing, so its pointer is operand 2 after
@@ -617,6 +641,34 @@ int main() {
     auto mar = validate_spirv_descriptor_interface(array_spv, &matched, 0, SpirvShaderStage::Vertex);
     CHECK(!has_issue(mar, DescriptorIssueCode::ArrayBindingArityMismatch),
           "eight declared descriptors against eight supplied table entries is not an arity mismatch");
+
+    // An UNREADABLE array length is its own value, not folded onto 0 (which means OpTypeRuntimeArray and
+    // is treated as compatible with any table size). Reported as a review finding on #2463: collapsing
+    // the two made a decode failure the most permissive answer in the space.
+    const std::vector<uint32_t> spec_spv = descriptor_array_specconst_test_spirv();
+    ShaderResourceTable spec_eight; spec_eight.resources.push_back(eight);
+    auto spr = validate_spirv_descriptor_interface(spec_spv, &spec_eight, 0, SpirvShaderStage::Vertex);
+    const SpirvDescriptorBinding* sbind = find_spirv_descriptor_binding(spr, 0, 9);
+    CHECK(sbind && sbind->descriptor_count == kDescriptorArityUnknown,
+          "an OpSpecConstant array length reflects as unknown arity, not as zero or one");
+
+    // The property that matters, and the one the previous revision got wrong: rejected REGARDLESS of what
+    // the table supplies. Eight entries is the size that would have been ACCEPTED when unknown collapsed
+    // onto 0, so this arm fails on the exact defect rather than merely near it.
+    CHECK(!spr.ok() && has_issue(spr, DescriptorIssueCode::ArrayBindingArityMismatch),
+          "an unreadable array length is rejected even against a table that supplies eight entries");
+
+    ShaderResourceTable spec_scalar; spec_scalar.resources.push_back(good);
+    auto ssr = validate_spirv_descriptor_interface(spec_spv, &spec_scalar, 0, SpirvShaderStage::Vertex);
+    CHECK(!ssr.ok() && has_issue(ssr, DescriptorIssueCode::ArrayBindingArityMismatch),
+          "an unreadable array length is rejected against a scalar resource too");
+
+    // Discriminator: a genuine OpTypeRuntimeArray must still mean "any length", so the fix above must not
+    // have made every unresolved-looking array reject. Zero and unknown are different answers.
+    SpirvDescriptorBinding probe{};
+    probe.descriptor_count = 0;
+    CHECK(probe.descriptor_count != kDescriptorArityUnknown,
+          "zero (OpTypeRuntimeArray) and unknown arity are distinct values");
 
     // --- validate_runtime_descriptor_contract: the mode-carrying overload (#2239 candidate 3) ---
     //

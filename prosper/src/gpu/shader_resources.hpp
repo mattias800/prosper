@@ -500,6 +500,17 @@ enum class StorageBufferTailSemantic : uint32_t {
 // recompiler, reflection, live backend, and their contract tests cannot drift through magic values.
 constexpr uint32_t kSpirvImageFormatR32ui = 33;
 
+// A declared descriptor-array length that reflection could not read (#2412). Distinct from 0, which
+// means exactly `OpTypeRuntimeArray` -- a length deliberately supplied at bind time and therefore
+// compatible with any table size.
+//
+// The distinction is load-bearing rather than tidy. Validation treats 0 as permissive, so folding
+// "unresolved" into it made a DECODE FAILURE the most permissive value in the space, inside the check
+// whose entire purpose is to stop silent acceptance: a shader declaring 16 entries whose length did not
+// resolve was accepted against a table of 8, and then indexes past the set. An `OpSpecConstant` length
+// reaches this -- valid SPIR-V, and `OpSpecConstant` is not among the opcodes this pass resolves.
+inline constexpr uint32_t kDescriptorArityUnknown = 0xFFFFFFFFu;
+
 struct SpirvDescriptorBinding {
     uint32_t variable_id = 0;
     uint32_t set = 0;

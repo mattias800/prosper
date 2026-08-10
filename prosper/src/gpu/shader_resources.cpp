@@ -425,10 +425,12 @@ SpirvDescriptorKind descriptor_kind(const VariableInfo& var,
 //     to a bare array of scalars is not a descriptor array, and reading it as one would report an
 //     arity that rejects a binding that has always worked.
 //
-// A resolved length of zero from `OpTypeArray` is reported as a runtime array rather than as "no
-// descriptors": the count is resolved from `OpConstant` earlier in this pass, and a length that failed
-// to resolve leaves `count` at 0. Reporting 1 there would silently bind element 0 of an array whose
-// size we could not read.
+// An `OpTypeArray` whose length did not resolve reports `kDescriptorArityUnknown`, NOT 0 and not 1.
+// All three were considered and the first two are wrong in opposite directions: 1 would silently bind
+// element 0 of an array whose size we could not read, and 0 means `OpTypeRuntimeArray` -- which
+// validation treats as compatible with any table size, so a decode failure would become the most
+// permissive answer available. Unknown must be the least permissive, because it is the case we know
+// least about; validation rejects it regardless of what the table supplies.
 uint32_t descriptor_array_arity(const VariableInfo& var,
                                 const std::unordered_map<uint32_t, TypeInfo>& types) {
     auto pi = types.find(var.pointer_type);
@@ -443,7 +445,11 @@ uint32_t descriptor_array_arity(const VariableInfo& var,
         elem->second.kind != TypeKind::SampledImage)
         return 1;
     if (outer->second.kind == TypeKind::RuntimeArray) return 0;
-    return outer->second.count ? outer->second.count : 0;
+    // No `count ? count : 0` no-op here: an unresolved length is its own answer. `count` stays 0 when
+    // the length id resolved to no `OpConstant` in this pass -- an `OpSpecConstant`, or a constant this
+    // pass does not decode.
+    if (outer->second.count == 0) return kDescriptorArityUnknown;
+    return outer->second.count;
 }
 
 const TypeInfo* descriptor_image_type(const VariableInfo& var,
@@ -1104,7 +1110,13 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
         const uint32_t runtime_count = r.table_index_count;
         const bool shader_is_array  = shader_count != 1;
         const bool runtime_is_array = runtime_count != 0;
-        if (shader_is_array != runtime_is_array ||
+        // An unread array length is a mismatch whatever the table supplies -- tested FIRST and named,
+        // rather than left to fall out of the comparison below. The arithmetic would reject it today
+        // (kDescriptorArityUnknown equals neither 1 nor any plausible table size), but only by accident:
+        // the sentinel would stop rejecting the moment someone changed the comparison, and nothing in
+        // the expression would show that a decode failure was ever meant to be caught here.
+        const bool shader_arity_unknown = shader_count == kDescriptorArityUnknown;
+        if (shader_arity_unknown || shader_is_array != runtime_is_array ||
             (shader_is_array && shader_count != 0 && shader_count != runtime_count)) {
             // The counts go in their own fields and the byte slots stay zero. An earlier revision rode
             // them in `required_bytes`/`available_bytes` on the belief that nothing rendered those --
