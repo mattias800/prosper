@@ -4869,6 +4869,183 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (v.use_desc) {
             std::vector<VkDescriptorSetLayoutBinding> lb(R.size());
             std::vector<VkDescriptorBufferInfo> dbi(R.size());
+                // Resolve one storage-buffer payload to an index in `shared_buffers` -- the memo lookup,
+                // the size-gated content dedup, and the arena/pool/create upload. Extracted verbatim
+                // from the per-resource site below so it can be called MORE THAN ONCE per resource: an
+                // indexed descriptor array (#2412 stage 5) needs one upload per table entry, and each
+                // of them wants exactly this dedup and arena behaviour.
+                //
+                // Pure refactor, no behavioural change. Two mechanical transformations: the fatal
+                // upload path used to `break` the caller's resource loop and now returns false for the
+                // caller to do the same, and `r.set`/`r.binding`/`r.buffer_identity` became parameters
+                // so the body no longer reaches for the enclosing resource.
+                auto resolve_buffer_upload =
+                    [&](const uint32_t* words, size_t word_count, uint64_t identity,
+                        uint32_t set, uint32_t binding, size_t& buffer_index_out) -> bool {
+                if (!words || !word_count) {
+                    words = &zero_buffer_word;
+                    word_count = 1;
+                }
+                // PROSPER_BUFLOG=1: per-binding upload provenance — set/binding, word count,
+                // and the first dwords as floats. Ground truth for "which bytes did the shader
+                // see" when a fetch-offset defect is suspected (the #1287 palette-UV audit).
+                static const bool buflog_enabled = getenv("PROSPER_BUFLOG") != nullptr;
+                if (buflog_enabled) {
+                    static int buflog_count = 0;
+                    if (buflog_count++ < 400) {
+                        const float* fp = reinterpret_cast<const float*>(words);
+                        fprintf(stderr,
+                                "[buflog] set=%u binding=%u words=%zu id=%llx f0=%g f1=%g f2=%g\n",
+                                set, binding, word_count,
+                                (unsigned long long)identity,
+                                word_count > 0 ? fp[0] : 0.f, word_count > 1 ? fp[1] : 0.f,
+                                word_count > 2 ? fp[2] : 0.f);
+                    }
+                }
+                ++resource_reuse_stats.buffer_references;
+                ++backend_hash_stats_totals().references;
+                const bool shareable = share_backend_resources && identity != 0;
+                size_t buffer_index = SIZE_MAX;
+                const BufferRefMemoKey memo_key{words, word_count, identity};
+                if (shareable) {
+                    auto memo_found = buffer_ref_memo.find(memo_key);
+                    if (memo_found != buffer_ref_memo.end()) {
+                        buffer_index = memo_found->second;
+                        ++resource_reuse_stats.buffer_ref_memo_hits;
+                        ++backend_hash_stats_totals().memo_hits;
+                    }
+                }
+                if (buffer_index != SIZE_MAX) {
+                    // repeat reference within this call — resolved without hashing (#1268)
+                } else {
+                // A unique-tag key can never match an existing entry (the tag differs from every
+                // other key and operator== checks all scalars before the memcmp), so its content
+                // hash contributes nothing to the lookup — skip it (#1268).
+                //
+                // Large buffers also take a unique tag: cross-pointer content dedup is kept for
+                // SMALL buffers only (<= kSharedBufferHashDedupMaxDwords). Measured live on Blue
+                // Prince's loading submits, the content-hash lookup had ZERO dedup hits across
+                // 556K hashed references while costing ~1.8 GiB/s of FNV over ~97 KiB average
+                // payloads — pure waste at exactly the draw volume where it hurts. Repeat
+                // references to a large range still resolve through the per-call memo above;
+                // what a large buffer loses is only the merge of two DIFFERENT-pointer,
+                // identical-content references within one call, which the live data shows never
+                // happens. Small buffers (per-draw UBO-sized, the tests' contract) keep the full
+                // hash + memcmp dedup exactly as before.
+                constexpr size_t kSharedBufferHashDedupMaxDwords = 1024;   // 4 KiB
+                const bool hash_dedup =
+                    shareable && word_count <= kSharedBufferHashDedupMaxDwords;
+                uint64_t content_hash = 0;
+                if (hash_dedup) {
+                    const ResourcePhaseTimer phase_hash(timing_enabled, &res_buffer_hash_ms);
+                    content_hash = hash_buffer_words(words, word_count);
+                    ++resource_reuse_stats.buffer_hash_calls;
+                    resource_reuse_stats.buffer_hash_dwords += word_count;
+                    ++backend_hash_stats_totals().hash_calls;
+                    backend_hash_stats_totals().hash_dwords += word_count;
+                } else if (shareable) {
+                    ++resource_reuse_stats.buffer_hash_skipped_large;
+                    resource_reuse_stats.buffer_skipped_large_dwords += word_count;
+                    ++backend_hash_stats_totals().skipped_large;
+                } else {
+                    ++resource_reuse_stats.buffer_hash_skipped_unique;
+                    ++backend_hash_stats_totals().skipped_unique;
+                }
+                SharedBufferKey buffer_key{
+                    words, word_count, identity, content_hash,
+                    hash_dedup ? 0 : ++resource_unique_tag};
+                auto buffer_found = shared_buffer_indices.end();
+                {
+                    const ResourcePhaseTimer phase_index(timing_enabled,
+                                                         &res_buffer_index_find_ms);
+                    buffer_found = shared_buffer_indices.find(buffer_key);
+                }
+                if (buffer_found != shared_buffer_indices.end()) {
+                    buffer_index = buffer_found->second;
+                } else {
+                    buffer_index = shared_buffers.size();
+                    SharedBufferUpload upload;
+                    const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
+                    if (use_buffer_arena) {
+                        const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                                               &res_buffer_acquire_ms);
+                        acquire_buffer_arena_slice(bytes, upload);
+                    }
+                    if (!upload.arena && reuse_host_buffers) {
+                        const ResourcePhaseTimer phase_acquire(timing_enabled,
+                                                               &res_buffer_acquire_ms);
+                        RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
+                        upload.buffer = pooled.buffer;
+                        upload.memory = pooled.memory;
+                        upload.mapped = pooled.mapped;
+                        upload.bytes = pooled.bytes;
+                        upload.allocation_bytes = pooled.allocation_bytes;
+                        upload.pooled = upload.buffer && upload.memory && upload.mapped;
+                    }
+                    if (!upload.arena && !upload.pooled) {
+                        // create+allocate+map+copy, all of it. Neither `acquire` nor `copy` saw
+                        // this branch, so a payload that misses both the arena and the pool cost
+                        // a full Vulkan allocation that read as free.
+                        const ResourcePhaseTimer phase_create(timing_enabled,
+                                                              &res_buffer_create_ms);
+                        RenderBufferUploadFailureStep failure =
+                            create_transient_storage_buffer_upload(
+                                ctx, words, bytes, upload.buffer, upload.memory);
+                        if (failure != RenderBufferUploadFailureStep::None) {
+                            static std::atomic<uint32_t> failure_logs{0};
+                            if (failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                                std::fprintf(
+                                    stderr,
+                                    "[buffer-upload-failed] set=%u binding=%u requested=%llu "
+                                    "step=%s — substituting one zero word\n",
+                                    set, binding, (unsigned long long)bytes,
+                                    render_buffer_upload_failure_name(failure));
+                            upload = {};
+                            failure = create_transient_storage_buffer_upload(
+                                ctx, &zero_buffer_word, sizeof(zero_buffer_word),
+                                upload.buffer, upload.memory);
+                            if (failure != RenderBufferUploadFailureStep::None) {
+                                if (failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                                    std::fprintf(
+                                        stderr,
+                                        "[buffer-upload-failed] set=%u binding=%u zero-word "
+                                        "fallback step=%s — skipping draw\n",
+                                        set, binding,
+                                        render_buffer_upload_failure_name(failure));
+                                return false;   // caller breaks its loop; see the call site
+                            }
+                            upload.range = sizeof(zero_buffer_word);
+                            ++resource_reuse_stats.buffer_upload_fallbacks;
+                        } else {
+                            upload.range = bytes;
+                        }
+                    } else {
+                        const ResourcePhaseTimer phase_copy(timing_enabled,
+                                                            &res_buffer_copy_ms);
+                        resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
+                        std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
+                                    words, static_cast<size_t>(bytes));
+                        upload.range = bytes;
+                    }
+                    {
+                        const ResourcePhaseTimer phase_index(timing_enabled,
+                                                             &res_buffer_index_insert_ms);
+                        shared_buffers.push_back(upload);
+                        shared_buffer_indices.emplace(buffer_key, buffer_index);
+                    }
+                    ++resource_reuse_stats.unique_buffers;
+                    ++backend_hash_stats_totals().unique_buffers;
+                }
+                if (shareable) {
+                    const ResourcePhaseTimer phase_index(timing_enabled,
+                                                         &res_buffer_index_find_ms);
+                    buffer_ref_memo.emplace(memo_key, buffer_index);
+                }
+                }
+                buffer_index_out = buffer_index;
+                return true;
+                };
+
             std::vector<VkDescriptorImageInfo> dii(R.size());
             std::vector<VkWriteDescriptorSet> wr(R.size());
             bool buffer_resources_ready = true;
@@ -5377,166 +5554,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     }
                     const uint32_t* words = r.buffer_words_data();
                     size_t word_count = r.buffer_word_count();
-                    if (!words || !word_count) {
-                        words = &zero_buffer_word;
-                        word_count = 1;
-                    }
-                    // PROSPER_BUFLOG=1: per-binding upload provenance — set/binding, word count,
-                    // and the first dwords as floats. Ground truth for "which bytes did the shader
-                    // see" when a fetch-offset defect is suspected (the #1287 palette-UV audit).
-                    static const bool buflog_enabled = getenv("PROSPER_BUFLOG") != nullptr;
-                    if (buflog_enabled) {
-                        static int buflog_count = 0;
-                        if (buflog_count++ < 400) {
-                            const float* fp = reinterpret_cast<const float*>(words);
-                            fprintf(stderr,
-                                    "[buflog] set=%u binding=%u words=%zu id=%llx f0=%g f1=%g f2=%g\n",
-                                    r.set, r.binding, word_count,
-                                    (unsigned long long)r.buffer_identity,
-                                    word_count > 0 ? fp[0] : 0.f, word_count > 1 ? fp[1] : 0.f,
-                                    word_count > 2 ? fp[2] : 0.f);
-                        }
-                    }
-                    ++resource_reuse_stats.buffer_references;
-                    ++backend_hash_stats_totals().references;
-                    const bool shareable = share_backend_resources && r.buffer_identity != 0;
                     size_t buffer_index = SIZE_MAX;
-                    const BufferRefMemoKey memo_key{words, word_count, r.buffer_identity};
-                    if (shareable) {
-                        auto memo_found = buffer_ref_memo.find(memo_key);
-                        if (memo_found != buffer_ref_memo.end()) {
-                            buffer_index = memo_found->second;
-                            ++resource_reuse_stats.buffer_ref_memo_hits;
-                            ++backend_hash_stats_totals().memo_hits;
-                        }
-                    }
-                    if (buffer_index != SIZE_MAX) {
-                        // repeat reference within this call — resolved without hashing (#1268)
-                    } else {
-                    // A unique-tag key can never match an existing entry (the tag differs from every
-                    // other key and operator== checks all scalars before the memcmp), so its content
-                    // hash contributes nothing to the lookup — skip it (#1268).
-                    //
-                    // Large buffers also take a unique tag: cross-pointer content dedup is kept for
-                    // SMALL buffers only (<= kSharedBufferHashDedupMaxDwords). Measured live on Blue
-                    // Prince's loading submits, the content-hash lookup had ZERO dedup hits across
-                    // 556K hashed references while costing ~1.8 GiB/s of FNV over ~97 KiB average
-                    // payloads — pure waste at exactly the draw volume where it hurts. Repeat
-                    // references to a large range still resolve through the per-call memo above;
-                    // what a large buffer loses is only the merge of two DIFFERENT-pointer,
-                    // identical-content references within one call, which the live data shows never
-                    // happens. Small buffers (per-draw UBO-sized, the tests' contract) keep the full
-                    // hash + memcmp dedup exactly as before.
-                    constexpr size_t kSharedBufferHashDedupMaxDwords = 1024;   // 4 KiB
-                    const bool hash_dedup =
-                        shareable && word_count <= kSharedBufferHashDedupMaxDwords;
-                    uint64_t content_hash = 0;
-                    if (hash_dedup) {
-                        const ResourcePhaseTimer phase_hash(timing_enabled, &res_buffer_hash_ms);
-                        content_hash = hash_buffer_words(words, word_count);
-                        ++resource_reuse_stats.buffer_hash_calls;
-                        resource_reuse_stats.buffer_hash_dwords += word_count;
-                        ++backend_hash_stats_totals().hash_calls;
-                        backend_hash_stats_totals().hash_dwords += word_count;
-                    } else if (shareable) {
-                        ++resource_reuse_stats.buffer_hash_skipped_large;
-                        resource_reuse_stats.buffer_skipped_large_dwords += word_count;
-                        ++backend_hash_stats_totals().skipped_large;
-                    } else {
-                        ++resource_reuse_stats.buffer_hash_skipped_unique;
-                        ++backend_hash_stats_totals().skipped_unique;
-                    }
-                    SharedBufferKey buffer_key{
-                        words, word_count, r.buffer_identity, content_hash,
-                        hash_dedup ? 0 : ++resource_unique_tag};
-                    auto buffer_found = shared_buffer_indices.end();
-                    {
-                        const ResourcePhaseTimer phase_index(timing_enabled,
-                                                             &res_buffer_index_find_ms);
-                        buffer_found = shared_buffer_indices.find(buffer_key);
-                    }
-                    if (buffer_found != shared_buffer_indices.end()) {
-                        buffer_index = buffer_found->second;
-                    } else {
-                        buffer_index = shared_buffers.size();
-                        SharedBufferUpload upload;
-                        const VkDeviceSize bytes = static_cast<VkDeviceSize>(word_count) * 4;
-                        if (use_buffer_arena) {
-                            const ResourcePhaseTimer phase_acquire(timing_enabled,
-                                                                   &res_buffer_acquire_ms);
-                            acquire_buffer_arena_slice(bytes, upload);
-                        }
-                        if (!upload.arena && reuse_host_buffers) {
-                            const ResourcePhaseTimer phase_acquire(timing_enabled,
-                                                                   &res_buffer_acquire_ms);
-                            RenderHostBuffer pooled = acquire_render_host_buffer(ctx, bytes);
-                            upload.buffer = pooled.buffer;
-                            upload.memory = pooled.memory;
-                            upload.mapped = pooled.mapped;
-                            upload.bytes = pooled.bytes;
-                            upload.allocation_bytes = pooled.allocation_bytes;
-                            upload.pooled = upload.buffer && upload.memory && upload.mapped;
-                        }
-                        if (!upload.arena && !upload.pooled) {
-                            // create+allocate+map+copy, all of it. Neither `acquire` nor `copy` saw
-                            // this branch, so a payload that misses both the arena and the pool cost
-                            // a full Vulkan allocation that read as free.
-                            const ResourcePhaseTimer phase_create(timing_enabled,
-                                                                  &res_buffer_create_ms);
-                            RenderBufferUploadFailureStep failure =
-                                create_transient_storage_buffer_upload(
-                                    ctx, words, bytes, upload.buffer, upload.memory);
-                            if (failure != RenderBufferUploadFailureStep::None) {
-                                static std::atomic<uint32_t> failure_logs{0};
-                                if (failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
-                                    std::fprintf(
-                                        stderr,
-                                        "[buffer-upload-failed] set=%u binding=%u requested=%llu "
-                                        "step=%s — substituting one zero word\n",
-                                        r.set, r.binding, (unsigned long long)bytes,
-                                        render_buffer_upload_failure_name(failure));
-                                upload = {};
-                                failure = create_transient_storage_buffer_upload(
-                                    ctx, &zero_buffer_word, sizeof(zero_buffer_word),
-                                    upload.buffer, upload.memory);
-                                if (failure != RenderBufferUploadFailureStep::None) {
-                                    if (failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
-                                        std::fprintf(
-                                            stderr,
-                                            "[buffer-upload-failed] set=%u binding=%u zero-word "
-                                            "fallback step=%s — skipping draw\n",
-                                            r.set, r.binding,
-                                            render_buffer_upload_failure_name(failure));
-                                    buffer_resources_ready = false;
-                                    break;
-                                }
-                                upload.range = sizeof(zero_buffer_word);
-                                ++resource_reuse_stats.buffer_upload_fallbacks;
-                            } else {
-                                upload.range = bytes;
-                            }
-                        } else {
-                            const ResourcePhaseTimer phase_copy(timing_enabled,
-                                                                &res_buffer_copy_ms);
-                            resource_reuse_stats.buffer_upload_bytes += static_cast<uint64_t>(bytes);
-                            std::memcpy(static_cast<uint8_t*>(upload.mapped) + upload.offset,
-                                        words, static_cast<size_t>(bytes));
-                            upload.range = bytes;
-                        }
-                        {
-                            const ResourcePhaseTimer phase_index(timing_enabled,
-                                                                 &res_buffer_index_insert_ms);
-                            shared_buffers.push_back(upload);
-                            shared_buffer_indices.emplace(buffer_key, buffer_index);
-                        }
-                        ++resource_reuse_stats.unique_buffers;
-                        ++backend_hash_stats_totals().unique_buffers;
-                    }
-                    if (shareable) {
-                        const ResourcePhaseTimer phase_index(timing_enabled,
-                                                             &res_buffer_index_find_ms);
-                        buffer_ref_memo.emplace(memo_key, buffer_index);
-                    }
+                    // False is the fatal upload path: the zero-word fallback itself failed, so this
+                    // draw cannot be bound. Same effect as the `break` this replaced.
+                    if (!resolve_buffer_upload(words, word_count, r.buffer_identity, r.set, r.binding,
+                                               buffer_index)) {
+                        buffer_resources_ready = false;
+                        break;
                     }
                     dbi[i] = {shared_buffers[buffer_index].buffer,
                               shared_buffers[buffer_index].offset,
