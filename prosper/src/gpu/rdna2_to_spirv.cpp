@@ -3658,6 +3658,15 @@ inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
     return false;
 }
 
+// VOP3B add/subtract without carry-in produces a fresh carry/borrow mask in SDST. Unlike the
+// 0x128-0x12a family, this mask does not depend on a tracked src2 mask. Keep this exact predicate
+// shared by every Wave32 scalar-width/provenance site so the emitter and CFG dispatcher cannot
+// disagree about whether the physical destination is one word or an SGPR pair.
+inline bool vop3b_fresh_carry_output(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR &&
+           (in.opcode == 0x30f || in.opcode == 0x310 || in.opcode == 0x319);
+}
+
 std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
     std::unordered_set<uint32_t> safe;
     // pc of the terminating s_endpgm — a forward execz whose target is here skips straight to the end.
@@ -3706,11 +3715,13 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
             // effects (emit_alu writes rs.sreg/rs.vcc/rs.sreg_bool for them, and predicate_write only
             // covers VGPRs) — on hardware the skipped block would have preserved VCC/the SGPR:
             //   VOP1 0x02 v_readfirstlane_b32 (writes an SGPR), VOP2 0x28-0x2A carry ops (write VCC),
-            //   VOP3B 0x128-0x12A (write the carry-out SGPR pair/VCC), and VOP3B v_mad_u64_u32
-            //   0x176 (its 65th-bit carry mask also lands in VCC/an SGPR pair unpredicated).
+            //   VOP3B 0x128-0x12A and 0x30F/0x310/0x319 (write the carry-out SGPR pair/VCC), and
+            //   VOP3B v_mad_u64_u32 0x176 (its 65th-bit carry mask also lands in VCC/an SGPR pair
+            //   unpredicated).
             const bool scalar_side_effect =
                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02) ||
                 (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2A) ||
+                vop3b_fresh_carry_output(in) ||
                 (in.fmt == Rdna2Format::VOP3 &&
                  ((in.opcode >= 0x128 && in.opcode <= 0x12A) || in.opcode == 0x176));
             if (!scalar_side_effect &&
@@ -3843,6 +3854,9 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
                    in.sdst.kind == OperandKind::SGPR) {
             writes_b32_mask = tracked_mask_source(in.src[2]);
             mask_dst = in.sdst.value;
+        } else if (vop3b_fresh_carry_output(in)) {
+            writes_b32_mask = true;
+            mask_dst = in.sdst.value;
         }
 
         auto erase_written_words = [&](int base, uint32_t width) {
@@ -3856,7 +3870,8 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
             erase_written_words(in.dst.value, 1);
         if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
             erase_written_words(in.sdst.value,
-                in.opcode >= 0x128 && in.opcode <= 0x12a ? 1u : 2u);
+                ((in.opcode >= 0x128 && in.opcode <= 0x12a) ||
+                 vop3b_fresh_carry_output(in)) ? 1u : 2u);
         if (writes_b32_mask && mask_dst >= 0 && mask_dst != 126)
             masks.insert(mask_dst);
         if (mask_writer) *mask_writer = writes_b32_mask && mask_dst >= 0 && mask_dst != 126;
@@ -5012,7 +5027,8 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
         visit(in.dst.value, wave32_one_word_masks ? 1u : 2u);
     if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
         visit(in.sdst.value, wave32_one_word_masks &&
-                              in.opcode >= 0x128 && in.opcode <= 0x12a ? 1u : 2u);
+                              ((in.opcode >= 0x128 && in.opcode <= 0x12a) ||
+                               vop3b_fresh_carry_output(in)) ? 1u : 2u);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5681,6 +5697,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
               const ShaderResourceTable* rt = nullptr, bool allow_wave = false) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o, &ok); };
+    auto write_vop3b_carry_output = [&](uint32_t carry_mask) {
+        if (in.sdst.kind == OperandKind::SGPR && b.allow_b32_masks &&
+            (b.is_fragment || (b.is_compute && b.wave_size == 32))) {
+            // A Wave32 carry destination is one physical word. Preserve an independently-live
+            // adjacent SGPR and register the new lifetime in the B32 mask domain used by CFG joins.
+            rs.sreg_bool[in.sdst.value] = carry_mask;
+            rs.sreg_bool_narrowed[in.sdst.value] = true;
+            rs.sreg_bool_b32.insert(in.sdst.value);
+            rs.sreg.erase(in.sdst.value);
+            rs.sreg_srt.erase(in.sdst.value);
+            if (in.sdst.value == 106) rs.vcc = carry_mask;
+        } else if (in.sdst.value == 106 || in.sdst.value == 107) {
+            rs.vcc = carry_mask;
+        } else if (in.sdst.kind == OperandKind::SGPR) {
+            rs.sreg_bool[in.sdst.value] = carry_mask;
+        } else {
+            ok = false;
+        }
+    };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     if (in.has_modifier) { ok = false; return true; }
@@ -9020,9 +9055,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = d;
                 // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, not its raw carry.
                 const uint32_t carry_masked = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
-                if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_masked;
-                else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
-                else ok = false;
+                write_vop3b_carry_output(carry_masked);
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
@@ -9217,22 +9250,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // carry-out -> sdst mask (VCC or a saved SGPR-pair bool). ISA 3.9: an
                     // EXEC-inactive lane's mask bit is written 0, never its raw carry.
                     const uint32_t cout_masked = rs.exec_narrowed ? b.land(rs.exec, cout) : cout;
-                    if (in.sdst.kind == OperandKind::SGPR && b.allow_b32_masks &&
-                        (b.is_fragment || (b.is_compute && b.wave_size == 32))) {
-                        // In Wave32 every VOP3B carry destination is one physical word. In
-                        // particular, a VCC_LO carry write must not clobber an independently-live
-                        // VCC_HI compare mask (Astro world-map PC1879 -> PC1881).
-                        rs.sreg_bool[in.sdst.value] = cout_masked;
-                        rs.sreg_bool_narrowed[in.sdst.value] = true;
-                        rs.sreg_bool_b32.insert(in.sdst.value);
-                        rs.sreg.erase(in.sdst.value);
-                        rs.sreg_srt.erase(in.sdst.value);
-                        if (in.sdst.value == 106) rs.vcc = cout_masked;
-                    } else if (in.sdst.value == 106 || in.sdst.value == 107) {
-                        rs.vcc = cout_masked;
-                    } else if (in.sdst.kind == OperandKind::SGPR) {
-                        rs.sreg_bool[in.sdst.value] = cout_masked;
-                    }
+                    write_vop3b_carry_output(cout_masked);
                 }
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && b.ngg_logical_lane &&
                        in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
@@ -12430,7 +12448,8 @@ bool emit_cfg_state_machine(
             const bool wave32_one_word_mask = proven_wave32_masks &&
                 ((in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
                  (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 &&
-                  in.opcode <= 0x12a && base == in.sdst.value));
+                  in.opcode <= 0x12a && base == in.sdst.value) ||
+                 (vop3b_fresh_carry_output(in) && base == in.sdst.value));
             if (wave32_one_word_mask)
                 static_mask_keys.insert(base);
             else if (base <= 105 && scalar_write_is_b64_mask(in, base))
@@ -12825,8 +12844,9 @@ bool emit_cfg_state_machine(
                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43);
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 const bool wave32_vop3b = proven_wave32_masks &&
-                    in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 &&
-                    in.opcode <= 0x12a && base == in.sdst.value;
+                    ((in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 &&
+                      in.opcode <= 0x12a) || vop3b_fresh_carry_output(in)) &&
+                    base == in.sdst.value;
                 const uint32_t effective_width = wave32_vop3b ? 1u : width;
                 for (uint32_t word = 0; word < effective_width; ++word)
                     scalar_writes[block].insert(base + static_cast<int>(word));
@@ -13021,6 +13041,8 @@ bool emit_cfg_state_machine(
                     in.opcode <= 0x12a && in.sdst.kind == OperandKind::SGPR) {
                     const Operand& carry_in = in.src[2];
                     if (register_mask(carry_in)) b32_write_reg = in.sdst.value;
+                } else if (vop3b_fresh_carry_output(in)) {
+                    b32_write_reg = in.sdst.value;
                 }
 
                 // B64 mask-shaped instructions are not sufficient to prove a live mask lifetime:
@@ -13044,7 +13066,8 @@ bool emit_cfg_state_machine(
                         writes_b64_mask = source_mask(in.src[0]) && source_mask(in.src[1]);
                 }
                 const bool vop3_b32_carry = in.fmt == Rdna2Format::VOP3 &&
-                    in.opcode >= 0x128 && in.opcode <= 0x12a;
+                    ((in.opcode >= 0x128 && in.opcode <= 0x12a) ||
+                     vop3b_fresh_carry_output(in));
                 // rdna2_decode populates `sdst` only for its explicit ten-opcode VOP3B whitelist:
                 // add/sub carry, div-scale flag, and 64-bit multiply-add carry outputs. Each SDST
                 // is a per-lane scalar mask/flag; ordinary VOP3A scalar data never appears here

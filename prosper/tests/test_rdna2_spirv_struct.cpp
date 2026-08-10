@@ -1200,6 +1200,71 @@ int main() {
     }
     printf("  [ok]   explicit Wave32 VCC_HI cndmask requires its own unambiguous mask\n");
 
+    // GTA V's rejected Wave32 compute siblings produce a fresh VCC_LO carry at PC79 with the
+    // no-carry-in VOP3B family, then consume it at PC83 through implicit VCC. A later crossing CFG
+    // forces the portable arbitrary-CFG dispatcher, which must carry that one-word mask lifetime
+    // through its production dataflow instead of classifying the VOP3B SDST as a two-word mask.
+    // A second fresh carry targets ordinary s4 and narrows/restores EXEC through the explicit B32
+    // saveexec domain before another implicit consumer. That operation pins the emitter's runtime
+    // `sreg_bool_b32` state: merely updating static dispatcher provenance or the legacy `rs.vcc`
+    // shortcut cannot pass it.
+    const uint32_t wave32_compute_fresh_carry_cfg[] = {
+        0x7d840000u,                         // pc0: one incoming VCC mask lifetime
+        0xbf060000u,                         // pc1: scalar branch condition
+        0xbf840001u,                         // pc2: one edge skips the scalar-data lifetime
+        0xbeea0385u,                         // pc3: other edge recycles vcc_lo as scalar data
+        0x7e0202c1u,                         // pc4: v_mov_b32_e32 v1, -1
+        0xd70f6a02u, 0x00020300u,            // pc5: v_add_co_u32 v2,vcc_lo,v0,v1
+        0x50060080u,                         // pc7: v_add_co_ci_u32 v3,vcc_lo,0,v0,vcc_lo
+        0xd70f0402u, 0x00020300u,            // pc8: fresh carry -> ordinary s4 B32 mask
+        0xbe863c04u,                         // pc10: s_and_saveexec_b32 s6, s4
+        0xbefe0306u,                         // pc11: s_mov_b32 exec_lo, s6 (restore)
+        0xbeea0304u,                         // pc12: s_mov_b32 vcc_lo, s4 (explicit mask copy)
+        0x50060080u,                         // pc13: consume the copied mask through implicit VCC
+        0x7e040280u,                         // pc14: v_mov_b32_e32 v2, 0
+        0x7c020300u,                         // pc15: v_cmp_lt_u32_e32 vcc, v0, v1
+        0xbf860001u,                         // pc16: s_cbranch_vccz -> pc18
+        0x7e040281u,                         // pc17: v_mov_b32_e32 v2, 1
+        0x7d840100u,                         // pc18: v_cmp_eq_u32_e32 vcc, v0, v0
+        0xbf870001u,                         // pc19: s_cbranch_vccnz -> pc21
+        0xbf82fffdu,                         // pc20: s_branch -> pc18
+        0x7e040d02u,                         // pc21: v_mov_b32_e32 v2, v2
+        0xbf810000u,
+    };
+    ComputeShaderConfig wave32_carry_cfg_config;
+    wave32_carry_cfg_config.wave_size = 32;
+    wave32_carry_cfg_config.local_x = 64;
+    wave32_carry_cfg_config.native_subgroup_size = 0;
+    const auto fresh_carry_cfg_spv = recompile_compute(
+        wave32_compute_fresh_carry_cfg, std::size(wave32_compute_fresh_carry_cfg), nullptr,
+        wave32_carry_cfg_config);
+    if (fresh_carry_cfg_spv.empty() || !has_opcode(fresh_carry_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(fresh_carry_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(fresh_carry_cfg_spv)) {
+        printf("  [FAIL] Wave32 CFG lost a fresh VOP3B carry before its implicit VCC consumer\n");
+        return 1;
+    }
+    std::vector<uint32_t> fresh_carry_wrong_sdst(
+        std::begin(wave32_compute_fresh_carry_cfg),
+        std::end(wave32_compute_fresh_carry_cfg));
+    fresh_carry_wrong_sdst[5] = 0xd70f0402u; // same producer writes s4, not consumed VCC_LO
+    if (!recompile_compute(fresh_carry_wrong_sdst.data(), fresh_carry_wrong_sdst.size(), nullptr,
+                           wave32_carry_cfg_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted an implicit VCC consumer without its carry producer\n");
+        return 1;
+    }
+    std::vector<uint32_t> fresh_carry_tracked_wrong_sdst(
+        std::begin(wave32_compute_fresh_carry_cfg),
+        std::end(wave32_compute_fresh_carry_cfg));
+    fresh_carry_tracked_wrong_sdst[8] = 0xd70f0602u; // producer writes s6; copy still reads s4
+    if (!recompile_compute(fresh_carry_tracked_wrong_sdst.data(),
+                           fresh_carry_tracked_wrong_sdst.size(), nullptr,
+                           wave32_carry_cfg_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted an explicit B32 copy from the wrong carry SDST\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG tracks fresh VOP3B carry output at its exact SDST\n");
+
     // Exact control/data lifetime from Astro Bot's world-map phase, reduced only to its register-
     // independent instructions: a scalar-data VCC_LO lifetime feeds CMPX (which changes EXEC but
     // preserves VCC), one crossing arm defines and immediately consumes a fresh VCC mask, and the
