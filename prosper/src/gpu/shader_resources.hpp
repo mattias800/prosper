@@ -186,6 +186,34 @@ struct ShaderResource {
     uint32_t      srt_offset    = 0xFFFFFFFFu;
     uint32_t      sgpr_base     = 0xFFFFFFFFu;
 
+    // TABLE-INDEXED provenance (#2412, stage 2 of the runtime-selected-descriptor lift). A fifth,
+    // deliberately SEPARATE shape rather than a variation on the four above.
+    //
+    // The others all answer "where did this descriptor come from" -- an SRT offset, an SGPR index, a
+    // fetch pc. This one cannot: the shader loads a descriptor from a table at an index that is only
+    // known on the GPU (GTA V derives it from EXEC after `s_and_saveexec_b64`), so the descriptor is
+    // identified by *a table plus a runtime index*, not by an origin. Folding it into `srt_offset`
+    // would be the tempting shortcut and would erase exactly the distinction later validation has to
+    // see: `srt_offset` promises "the descriptor is AT this offset", while this promises "the
+    // descriptor is one OF these, selected later".
+    //
+    // `table_index_count` is the number of array elements the binding declares -- 0 means this resource
+    // is not table-indexed and the stride below is inert, so existing resources are unaffected by
+    // construction. When non-zero, `binding` names the ARRAY and the shader supplies the element.
+    //
+    // Nothing produces these yet. This stage is representation only; the following stages teach
+    // reflection and validation to see an array, emit the indexed access, and materialise the entries.
+    // The count is carried here first so those stages have something to agree about, and so a
+    // half-finished lift cannot be mistaken for a working one: a resource with a count but no
+    // reflection support must be REJECTED, not bound.
+    uint32_t      table_index_count = 0;
+
+    // Byte stride between consecutive descriptors in the guest table. 16 for a V#, 32 for a T#; kept
+    // explicit rather than derived from `cls` because the guest chooses the packing and a table of
+    // V#s addressed with a 32-byte stride is a real shape (padded slots) that must not be silently
+    // re-packed.
+    uint32_t      table_entry_stride = 0;
+
     // Exact input-side origin for a DIRECT four-dword V# in the PM4 SH register file. This is
     // runtime realization provenance only; it does not affect descriptor binding or shader-cache
     // identity. The front half sets an absolute SPI_SHADER_USER_DATA_* register when it can prove

@@ -107,6 +107,43 @@ int main() {
               "an empty vertex chain retains the absent resource-table contract");
     }
 
+    // Stage 2 of the runtime-selected-descriptor lift (#2412): TABLE-INDEXED provenance is a fifth,
+    // separate shape and must be INERT until the later stages exist. These arms pin that, because the
+    // failure mode of a half-finished lift is a resource carrying an array count that some layer then
+    // treats as a scalar binding — which today validates SILENTLY (no DescriptorIssueCode covers an
+    // array-vs-scalar mismatch), so nothing would report it.
+    {
+        ShaderResource r;
+        CHECK(r.table_index_count == 0 && r.table_entry_stride == 0,
+              "table-indexed fields default to inert, so existing resources are unaffected by construction");
+
+        // A count is NOT a provenance key: it must not disturb the four mutually-exclusive ones, and a
+        // table-indexed resource still resolves by whichever of them it carries.
+        ShaderResource t;
+        t.cls = ResourceClass::ConstantBuffer;
+        t.srt_offset = 0x40;
+        t.table_index_count = 8;
+        t.table_entry_stride = 16;
+        CHECK(t.srt_offset == 0x40 && t.sgpr_base == 0xFFFFFFFFu &&
+                  t.fetch_pc == 0xFFFFFFFFu,
+              "a table-indexed resource leaves the four origin keys exactly as set");
+
+        // Binding assignment must be untouched by the count: `binding` names the ARRAY, and stage 2
+        // changes no layout. If this ever differs, a later stage has silently repurposed the binding
+        // scalar and every existing table's layout moves with it.
+        auto tbl = std::make_shared<ShaderResourceTable>();
+        ShaderResource a; a.cls = ResourceClass::ConstantBuffer; a.srt_offset = 0x00;
+        ShaderResource b; b.cls = ResourceClass::ConstantBuffer; b.srt_offset = 0x10;
+        b.table_index_count = 4; b.table_entry_stride = 16;
+        tbl->resources = {a, b};
+        assign_convention_bindings(*tbl, 2);
+        CHECK(tbl->resources[0].binding == 2 && tbl->resources[1].binding == 3,
+              "an array count does not change how bindings are assigned (stage 2 is representation only)");
+        CHECK(tbl->resources[1].table_index_count == 4 &&
+                  tbl->resources[1].table_entry_stride == 16,
+              "binding assignment preserves the array count and stride it did not set");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
