@@ -424,10 +424,16 @@ const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
     // A materialized bogus resource is worse than a rejected one: lookups are first-match, so it can
     // occupy the provenance a real descriptor needed, and unlike a rejection it produces no diagnostic.
     //
-    // The threshold matches the raw-pointer guard in `resolve_dynamic_fetch` (`gpu_executor.cpp`, the
-    // #2412 raw-pointer block: `if (ptr > 0x10000)`), whose comment says it "matches the consumer's own
-    // null/low-pointer guard". Aligning the two means one address is not plausible to a pointer screen
-    // and implausible to a descriptor screen.
+    // The threshold ALIGNS WITH the raw-pointer guard in `resolve_dynamic_fetch` (`gpu_executor.cpp`,
+    // the #2412 raw-pointer block: `if (ptr > 0x10000)`), whose comment says it "matches the consumer's
+    // own null/low-pointer guard", so one address is not plausible to a pointer screen and implausible
+    // to a descriptor screen.
+    //
+    // "Aligns with" rather than "matches", because the boundary value itself differs: the five existing
+    // sites accept `> 0x10000` and this one accepts `>= 0x10000`, so exactly 0x10000 is rejected there
+    // and accepted here. Deliberate under the discovery/validation split below — a screen that only
+    // validates should not reject the one address its sibling happens to exclude — but the off-by-one is
+    // real and stating it is cheaper than the next reader re-deriving whether it was intentional.
     //
     // NOT the `0x1000000000` PS5 guest-VA floor used by the two direct V# paths below, and the
     // difference is the two predicates' jobs rather than an inconsistency. Those paths are SPECULATIVE
