@@ -16196,10 +16196,21 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // device?" could only be inferred from the adapter's advertised width.
     //
     // `config.native_subgroup_size` is NOT the adapter's advertised width -- it is the OUTPUT of
-    // select_native_compute_subgroup_size() (gpu_executor.cpp:7359), a ~14-condition adoption
-    // decision over device features, queue support and the dispatch's own dimensions, which yields
-    // 0 when it declines. Zero therefore means "no native width was adopted", NOT "the device is
-    // narrower than wave_size", and the three cases below are distinguished for that reason.
+    // select_native_compute_subgroup_size() (gpu_executor.cpp), an adoption decision with THREE
+    // `return 0` sites comprising 22 clauses -- 25 if `adoptable`'s four ANDed device checks are
+    // counted individually, which is defensible since each is independently sufficient. It spans
+    // device features, queue support, workgroup limits and the dispatch's own dimensions, and
+    // yields 0 when it declines. Zero therefore means "no native width was adopted", NOT "the
+    // device is narrower than wave_size", and the three cases below are distinguished for that
+    // reason.
+    //
+    // Counted rather than estimated, because two lanes published two different guesses at it on the
+    // same day (#2483 "~14", #2484 "roughly eight") and neither had derived the number.
+    //
+    // This line dedupes on the full input tuple, so it answers "which combinations exist" cheaply --
+    // 2 lines for a whole boot. For a per-dispatch CENSUS (how many dispatches fall in each
+    // category, which this instrument's dedupe destroys) use PROSPER_SUBGROUP_LOG in
+    // gpu_executor.cpp instead.
     //
     // That inference is WRONG, and reporting only the effective value would preserve the error:
     // the expression above is zero for THREE independent reasons -- the device width not matching
