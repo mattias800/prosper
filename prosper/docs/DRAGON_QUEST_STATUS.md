@@ -447,15 +447,27 @@ Windows 11, RTX 4090 driver 32.0.16.1047, MinGW-w64 UCRT gcc 16.1.0, Vulkan SDK 
 of the same binary.** They are not noise around a value; they depend on how far the boot got inside a fixed
 wall-clock window, and a 60 s window lands in different phases on different runs.
 
-**Every figure in this table is Windows/NVIDIA (RTX 4090), and one of them is 0 on Linux by construction.**
-The wave64 column is a **device property, not a title property**: on Linux/RADV the same title over the same
-route gives **0** skips, because that adapter reports `maxSubgroupSize = 64`, so the `required > max` disjunct
-that accounts for every skip measured here **cannot fire at all**. A Linux reader comparing against this
-baseline would otherwise see 4–21 → 0 and have every reason to file a regression. Frames and draws are
-host-speed-dependent for the same reason the spread above exists — a fixed wall-clock window reaches a
-different point on a different machine — so compare against this table only from a Windows/NVIDIA run, and
-re-derive it locally otherwise. Cross-platform, only the two assertions above (`recompile-reject = 0` and the
-crc dichotomy) carry.
+**Every figure in this table is Windows/NVIDIA (RTX 4090), and the wave64 column is a device property, not
+a title property.** Whether a wave64 fragment shader is skipped is decided by a **seven-way disjunction over
+adapter properties** (`render_runner.h:4469`–`:4478`) — subgroup-size control, min and max subgroup size,
+`requiredSubgroupSizeStages`, `subgroupSupportedStages`, the subgroup feature set, and internal-GDS use
+without fragment stores/atomics. On this project's Linux lane — AMD Radeon 8060S (RADV STRIX_HALO) — **all
+seven terms are false**, so that adapter is expected to report **0** skips for the same title:
+`subgroupSizeControl=true`, `minSubgroupSize=32`, `maxSubgroupSize=64`, `requiredSubgroupSizeStages` and
+`subgroupSupportedStages` both include `FRAGMENT`, `subgroupSupportedOperations` includes
+VOTE/ARITHMETIC/SHUFFLE, `fragmentStoresAndAtomics=true`. **That 0 is derived from device properties, not
+measured over this route** — no Linux run of this title over this configuration has been taken.
+
+**Surprise is possible in BOTH directions, so re-derive rather than compare.** An adapter that omits
+`FRAGMENT` from `requiredSubgroupSizeStages` fires disjunct 4 for *every* wave64 fragment shader and will read
+far **above** 4–21; an adapter like the Linux lane's reads 0. Neither is a regression. Run `vulkaninfo`
+against the seven properties before concluding anything from this column — citing `maxSubgroupSize` alone is
+not enough, because it licenses only "disjunct 3 cannot fire" and says nothing about the other six.
+
+Frames and draws are host-speed-dependent for the same reason the spread above exists — a fixed wall-clock
+window reaches a different point on a different machine — so compare against this table only from a
+Windows/NVIDIA run, and re-derive it locally otherwise. Cross-platform, only the two assertions above
+(`recompile-reject = 0` and the crc dichotomy) carry.
 
 **Draws-per-frame is not an invariant either, and this was nearly recorded as one.** base1 and base2 agreed to
 two decimal places (4.06, 4.05), which looked like a stable normalisation that would survive the ±12% spread
@@ -466,8 +478,8 @@ committed while assembling a baseline whose purpose is to avoid exactly that.
 ### The wave64 column counts SHADERS, not skipped draws — do not divide it by the draw count
 
 `[render] skip draw: fragment shader requires subgroup size 64` is emitted inside a dedupe guard keyed on
-fragment-shader identity (`render_runner.h:4346`, `logged.insert(shader_key).second`), while the `continue`
-that actually drops the draw sits **outside** it at `:4394`. So the line fires **once per distinct shader**
+fragment-shader identity (`render_runner.h:4484`, `logged.insert(shader_key).second`), while the `continue`
+that actually drops the draw sits **outside** it at `:4558`. So the line fires **once per distinct shader**
 and the skip happens **per draw**: `grep -c` over that message counts shaders, and the number of draws lost
 to wave64 is **not measured by any current diagnostic**.
 
