@@ -3550,9 +3550,30 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 break;
             case Rdna2Format::SOPK:
+                // s_movk_i32 (op 0x00) is `SDST = signext(SIMM16)` — a compile-time constant, and the one
+                // SOPK this fold has direct evidence it must not discard. Measured on PPSA04263 (GTA V) at
+                // gameplay, a single register watch (`PROSPER_DYNTRACE_SGPR=16`) reports **66,507** forgets
+                // of s16 to this encoding — `b0100092` = `s_movk_i32 s16, 0x92`, round-trip-decoded with
+                // llvm-mc gfx1030 against a positive control, not read off a table. Forgetting a literal
+                // assignment is pure loss: the value is in the instruction.
+                //
+                // It also does NOT write SCC. The comment below already said so and the code invalidated
+                // SCC anyway, which is safe but costs every later s_cselect that depended on a live SCC.
+                //
+                // Deliberately ONE opcode. The rest of the format stays exactly as before — conservative
+                // and correct — because s_addk_i32/s_cmpk_* genuinely do write SCC, and a stale SCC
+                // consumed by a later s_cselect fabricates a confidently-wrong V# patch. Widening this
+                // needs its own evidence per opcode; the sibling ops are not free just because they are
+                // adjacent in the encoding.
+                if (in.opcode == 0x00) {                         // s_movk_i32: constant, no SCC write
+                    if (in.dst.kind == OperandKind::SGPR)
+                        set_value(in.dst.value, (uint32_t)(int32_t)in.simm16);
+                    break;
+                }
                 // s_cmpk_* / s_addk_i32 write SCC (only s_movk/s_version/s_cmovk/s_mulk don't); this
-                // interpreter doesn't model SOPK, so ANY SOPK conservatively invalidates the tracked SCC —
-                // a stale SCC consumed by a later s_cselect would fabricate a confidently-wrong V# patch.
+                // interpreter doesn't model the rest of SOPK, so they conservatively invalidate the
+                // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
+                // confidently-wrong V# patch.
                 scc = -1;
                 if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
                 break;
