@@ -65,14 +65,30 @@ f6000-6020:cross
 # with the Franklin key art, the "GRAND THEFT AUTO V STORY MODE" blurb, and the "Resume Story"
 # prompt.
 #
+# SUPERSEDED 2026-08-10 -- the segfault below NO LONGER REPRODUCES. Re-verified on master a6043524
+# (Windows, RTX 4090): this route ran 200 s to frame 3805, exit 0, with presses delivered at t=142.1 s
+# (f3000), 161.7 s (f3300) and 186.0 s (f3600) -- straight through the t~158-190 s window named below --
+# and ZERO crashes of any kind. Something merged since fixed it; the note below is kept because the
+# conclusion it draws ("a working route to the STORY tab and NOT yet a route to gameplay") is what a
+# reader would otherwise act on, and it is now wrong in the direction that stops work.
+#
+# What is NOT established by that run: whether the WORLD renders. The run ends before the route's
+# trailing pulses (f4000-f6000) and no frame was inspected for scene content, so "does not crash" is
+# the claim, not "reaches gameplay". Draws per frame did rise from 7.6 (no route, 90 s) to 30.0 on this
+# run, which is consistent with heavier content but proves nothing on its own.
+#
+# --- historical, kept for the record ---------------------------------------------------------------
 # The process then SEGFAULTS shortly after the f2900 Cross that enters Story Mode, at t~158-190 s.
 # The fault produces NO [veh] record and no fault address, which is itself informative: the Windows
 # VEH logger sees nothing, so this is not a guest-code access violation of the kind that stopped the
 # three earlier walls. It is a host-side crash, and it needs a different instrument than the ones
 # that found those.
 #
-# So: this file is a working route to the STORY tab and NOT yet a route to gameplay. Do not read the
-# trailing Cross pulses as evidence they land on anything.
+# So (HISTORICAL): this file is a working route to the STORY tab and NOT yet a route to gameplay. Do not
+# read the trailing Cross pulses as evidence they land on anything.
+#
+# CURRENT: the crash is gone (see the superseding note at the top of this block). The trailing pulses
+# still have no verified effect -- that part stands until someone inspects a frame.
 #
 # Two smaller observations from the same captures, recorded because they are cheap to lose:
 #   * The bottom-right prompt renders as "Re u e Sto y" — glyph dropouts in "Resume Story". The
