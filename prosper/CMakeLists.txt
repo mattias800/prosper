@@ -1507,6 +1507,10 @@ if(TARGET prosper_core)
       add_executable(test_rdna2_to_spirv tests/test_rdna2_to_spirv.cpp)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
+      add_executable(test_descriptor_array_emit tests/test_descriptor_array_emit.cpp)
+      target_link_libraries(test_descriptor_array_emit PRIVATE PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME descriptor_array_emit COMMAND test_descriptor_array_emit)
+
 
       # The per-draw internal-GDS scan memo (#2334). Two registrations of ONE binary: the second
       # sets the opt-out, so the pair proves the memo both fires and can be turned off, on a single
