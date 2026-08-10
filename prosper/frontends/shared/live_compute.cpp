@@ -993,7 +993,9 @@ struct VulkanComputeContext {
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
     bool image_support = false;
     // Stage 1 of the descriptor lift (#2412): true when this compute device can express an indexed
-    // descriptor array. Set either here (own device) or inherited when adopting the renderer's.
+    // descriptor array. Assigned on the own-device path below, and inherited from SharedVulkanContext on
+    // the adopt path -- both are real assignments. An earlier revision of this comment claimed the
+    // inheritance while no code and no struct field implemented it; see the note at the adopt site.
     bool descriptor_indexing_support = false;
     uint32_t subgroup_size = 0;
     VkShaderStageFlags subgroup_stages = 0;
@@ -2184,6 +2186,15 @@ struct VulkanComputeContext {
             queue_family = shared.queue_family;
             borrowed = true;
             image_support = true;
+            // Inherit the descriptor-indexing capability from the device being adopted. Its absence was
+            // the blocking review finding on #2458: the flag stayed false on the shared path -- which is
+            // the normal path whenever a renderer exists -- even though the adopted device had the
+            // extension enabled and the features on. That direction fails safe on its own (a false
+            // reading skips the indexed path rather than executing an undeclared one), but the member
+            // comment asserted the inheritance, so a later stage would have gated on the flag, read the
+            // comment, and searched for "indexed arrays never engage in the live renderer" anywhere
+            // except in a struct field that did not exist.
+            descriptor_indexing_support = shared.descriptor_indexing;
             native_subgroup_contract = shared.compute_subgroup_size_control &&
                 shared.compute_full_subgroups && shared.compute_subgroup_vote &&
                 shared.compute_subgroup_arithmetic;
@@ -2195,6 +2206,14 @@ struct VulkanComputeContext {
                 query_subgroup_support();
                 std::fprintf(stderr, "[compute] Vulkan device: adopted the renderer's device "
                                      "(shared, queue family %u)\n", queue_family);
+                // Report the inherited capability in BOTH directions. A log that fires only when the
+                // feature is present makes its absence silent, which is how #2458 shipped a comment
+                // claiming an inheritance that no code performed: there was nothing a run could print
+                // that would have contradicted it. Printing "unavailable" is what makes the adopt path
+                // falsifiable from a log rather than from reading the source.
+                std::fprintf(stderr, "[compute] descriptor indexing %s (inherited from the adopted "
+                                     "device)\n",
+                             descriptor_indexing_support ? "ENABLED" : "unavailable");
                 return true;
             }
             // Anything failing here must fall through to a private device rather than killing the
@@ -2261,11 +2280,13 @@ struct VulkanComputeContext {
         // indistinguishable from code that never ran.
         VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+        bool di_ext_advertised = false;
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
           for (auto& e : de) {
               if (std::strcmp(e.extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) continue;
+              di_ext_advertised = true;
               VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
               f2.pNext = &di_features;
               vkGetPhysicalDeviceFeatures2(physical, &f2);
@@ -2302,6 +2323,16 @@ struct VulkanComputeContext {
               }
               break;
           } }
+        // The third case, and the only one that was silent: the extension is not advertised at all, so
+        // the loop above never enters its body and nothing above prints. "Absent" and "the scan never
+        // ran" would then look identical in a log -- the same ambiguity that let the adopt path claim an
+        // inheritance nobody could contradict. Report it so every outcome of this decision is visible.
+        // Guarded on `di_ext_advertised`, NOT on `descriptor_indexing_support`: the feature flag is also
+        // false in the present-but-incomplete case, which already printed its own itemised line, and this
+        // message would then contradict it with "not advertised" about a device that advertised it.
+        if (!di_ext_advertised)
+            std::fprintf(stderr, "[compute] descriptor indexing unavailable: "
+                                 "VK_EXT_descriptor_indexing not advertised by this device\n");
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);

@@ -1107,6 +1107,10 @@ inline const RenderVkCtx& render_vk_ctx() {
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
             shared.compute_subgroup_arithmetic =
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+            // Publish the descriptor-indexing capability enabled on this device, under the contract stated
+            // above: `r.descriptor_indexing` is set only where the five features were actually requested at
+            // device creation, never from `supported`.
+            shared.descriptor_indexing = r.descriptor_indexing;
             shared.min_compute_subgroup_size = r.min_subgroup_size;
             shared.max_compute_subgroup_size = r.max_subgroup_size;
             shared.max_compute_workgroup_subgroups = r.max_compute_workgroup_subgroups;

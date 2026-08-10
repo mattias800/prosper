@@ -732,6 +732,12 @@ struct SharedVulkanContext {
     bool compute_subgroup_arithmetic = false;
     uint32_t min_compute_subgroup_size = 0;
     uint32_t max_compute_subgroup_size = 0;
+    // Runtime-selected descriptors (#2412). Same contract as the wave fields above: this is a capability
+    // ENABLED on the borrowed device, not merely one the physical device supports. The compute backend
+    // must not re-query the physical device for it, because whether the features were requested at device
+    // creation is the renderer's decision -- a physically capable device whose owner declined them cannot
+    // execute an indexed descriptor array, and asking the driver would answer the wrong question.
+    bool descriptor_indexing = false;
     uint32_t max_compute_workgroup_subgroups = 0;
     uint32_t max_compute_workgroup_size_x = 0;
     uint32_t max_compute_workgroup_invocations = 0;
