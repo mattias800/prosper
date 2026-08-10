@@ -230,6 +230,17 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
 // paths use the process working directory. Returns an empty vector and describes file I/O errors.
 std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::string* error = nullptr);
 
+// Diagnostic for a route that loaded WITHOUT error and still parsed to zero entries (#2439). Such a
+// route is configured-but-inert, and it used to announce itself exactly as a working route does:
+// parse_pad_script drops every unparseable token silently, so the only output is the frame-0 neutral
+// line that a correctly-loaded route ALSO emits before its first press window opens. "Route loaded,
+// first press is still 500 flips away" and "route never existed" printed identically.
+//
+// Returns the text to log, or "" when the route has entries and nothing needs saying. The '@' hint is
+// added only when `source` looks like a file path, so an intentionally empty inline route is reported
+// without being told it meant something else.
+std::string pad_script_empty_route_warning(const std::string& source, bool parsed_empty);
+
 // Full scripted controller state now. Active entries combine buttons and full-deflection stick
 // directions; opposing directions on one axis cancel to an explicitly centered axis.
 PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,

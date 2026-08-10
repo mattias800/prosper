@@ -289,6 +289,22 @@ std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::stri
     return parse_pad_script(contents.str());
 }
 
+std::string pad_script_empty_route_warning(const std::string& source, bool parsed_empty) {
+    if (!parsed_empty || source.empty()) return {};
+    // Windows spellings fail the same way and are the reason this tests for separators rather than
+    // for a missing ':' -- "C:/route.pad" DOES contain a colon, so it parses as a seconds anchor of
+    // "C", fails the numeric check, and is dropped just as silently as a path with no colon at all.
+    const bool looks_like_path =
+        source[0] != '@' &&
+        (source.find('/') != std::string::npos || source.find('\\') != std::string::npos ||
+         (source.size() >= 4 && source.compare(source.size() - 4, 4, ".pad") == 0));
+    std::string out =
+        "[pad] PROSPER_PAD_SCRIPT parsed 0 entries; no input will ever be delivered";
+    if (looks_like_path)
+        out += " -- this looks like a file path, so prefix it with '@' to load it as a file";
+    return out;
+}
+
 PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
                                    double hold_secs, int64_t frame_count, int64_t frame_hold,
                                    int64_t read_count, int64_t read_hold) {
