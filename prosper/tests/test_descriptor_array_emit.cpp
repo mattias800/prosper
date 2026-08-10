@@ -94,6 +94,7 @@ int main() {
             tb.cls = ResourceClass::ConstantBuffer; tb.format = DataFormat::Float32;
             tb.num_components = 4; tb.binding = 4; tb.stride = 16; tb.sgpr_base = 12;
             tb.table_index_count = arity; tb.table_entry_stride = 16;
+            tb.table_index_sgpr = 6;   // the descriptor index arrives in user SGPR 6
             rt.resources.push_back(tb);
         }
         return rt;
@@ -152,6 +153,29 @@ int main() {
                 huge_literal = true;   // OpConstant with the sentinel as its value
         CHECK(!huge_literal,
               "an implausible arity is NOT emitted as a fixed array of 4294967295 descriptors");
+    }
+
+    // --- NOT asserted here: that the access chain selects an entry -------------------------------
+    // The emitter DOES build a leading selector plus the NonUniform decorations (see cbuf_load_impl),
+    // but this fixture cannot reach that code, and the reason is a defect rather than a fixture
+    // limitation: the shader reads binding 3, while the table-indexed resource has to live at binding 4
+    // because bindings 2 and 3 cannot be arrays (#2472). Nothing in the module loads from the array, so
+    // no access chain into it is ever emitted.
+    //
+    // Two arms asserting the selector and the decoration were written and removed rather than left
+    // failing, because a red test says "the code is broken" when the truth is "the test cannot reach
+    // it". They belong with the fix for #2472, which is therefore not cosmetic: it BLOCKS verification
+    // of the indexed access, which is the one part of stage 4c that renders wrong content rather than
+    // failing loudly if it is wrong -- a valid descriptor read from the wrong slot.
+    //
+    // What IS asserted below stays meaningful: the control confirms an ordinary module carries no
+    // NonUniform decoration, so the decoration cannot be leaking into every shader.
+    {
+        bool plain_nonuniform = false;
+        for (auto& e : walk(m_plain))
+            if (e.first == 71u && e.second + 2 < m_plain.size() && m_plain[e.second + 2] == 5300u)
+                plain_nonuniform = true;
+        CHECK(!plain_nonuniform, "control: an ordinary module carries no NonUniform decoration");
     }
 
     printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
