@@ -33,12 +33,60 @@ python3 tools/vkval/vk_validation_scan.py --build-dir prosper/build-linux --repo
 
 # re-parse a log you already have
 python3 tools/vkval/vk_validation_scan.py --log prosper/build-linux/Testing/Temporary/LastTest.log
+
+# one test only, while iterating on a fix (~40 s instead of the full suite)
+python3 tools/vkval/vk_validation_scan.py --build-dir prosper/build-linux \
+    --report-only --ctest-arg=-R --ctest-arg=descriptor_array_render
 ```
+
+`--ctest-arg=-R`, not `--ctest-arg -R` — argparse consumes the bare flag as its own and exits 2.
+
+**A focused run ends in a `FAIL` that is an artifact of the filter, not a regression.** Restricting the
+test set means the tests that produce the other allow-listed messages never execute, so the scan
+reports them missing:
+
+```
+[vkval] FAIL: 4 allow-listed id(s) marked `required` produced no messages, while the layer
+        demonstrably loaded.
+```
+
+That is expected under `-R` and appears on a completely healthy tree. The full scan has no such line.
+Read it as "you filtered the suite", and take only the `NEW — not on the allow-list` section as a
+finding from a focused run.
 
 The layer package is `vulkan-validationlayers` on Debian/Ubuntu and `vulkan-validation-layers` on
 Fedora. **Build in an environment that actually has Vulkan** — a configure that quietly loses it
 drops every Vulkan execution test and the scan then observes nothing (#1675). On this project's
 Bazzite box that means the `ps5ys` distrobox, not the host.
+
+## When to run this deliberately
+
+CI runs the gate, so most changes need nothing. **Run it yourself, before opening the PR, for any
+change touching descriptor counts, descriptor-set layouts, or pipeline keys.** That trigger list is
+not a guess — it is the shape of the one defect this guard has caught that nothing else could:
+
+#2471 bound a 3-entry descriptor array whose `VkPipeline` had been created under an **arity-1**
+`VkPipelineLayout` and was replayed with the **arity-3** layout bound
+(`VUID-vkCmdDrawIndexed-None-08600`, *"Set 0 binding 0 descriptorCount 3 doesn't match 1"*). Two
+independent blind spots hid it, and between them they cover every check a normal PR gets:
+
+- **A pixel assertion cannot see it.** The stale pipeline still draws a correct green quad, so every
+  pixel arm passed. Confirmed by mutation: reverting the fix returns the VUID byte-identically **while
+  the test still passes**. Author verification, author re-reading, and independent review all went
+  green on a spec-invalid draw.
+- **On Windows the job does not exist.** `test_descriptor_array_render` is triple-gated in
+  `CMakeLists.txt` — `if(TARGET prosper_core)` → `if(UNIX)` → `if(Vulkan_FOUND)` — so the whole
+  Vulkan-execution render suite (`multidraw_render`, `indexed_render`, `texture_sample_render` too) is
+  never configured there. `UNIX` is the operative gate: Vulkan **is** found in Windows build caches, so
+  installing the SDK changes nothing.
+
+And the reflex that does not help: a second **driver** cannot discriminate this class either, because
+`08600` is a **usage** error raised by the validation layer rather than driver behaviour, so it is
+driver-independent close to by construction.
+
+**So `ctest` green is not evidence about spec validity, on any platform.** This scan is the only check
+in the repo that sees this class. Instrument-trap 151 in `docs/GAME_COMPAT_ORCHESTRATION.md` records
+the whole case.
 
 ## The instrument trap this tool is built around
 
