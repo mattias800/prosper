@@ -238,6 +238,21 @@ int main() {
         // The validation layer adds the reason rather than the symptom -- `pool only has a total of 1`
         // and `dstSet is VK_NULL_HANDLE` -- so `vk_validation_scan.py` is still the instrument that
         // explains a failure here, and it is clean with the fix in place.
+        //
+        // WHAT THIS ARM'S DISCRIMINATION RESTS ON, because it is not self-contained (raised in review):
+        // it discriminates via POOL EXHAUSTION, not via the frame. Trace the mutated path if the
+        // allocation ever succeeds -- a more generously sized pool, a different adapter, or a driver
+        // that over-allocates samplers the way RADV over-allocates buffers:
+        //
+        //     layout declares 3, write supplies 1  -> set allocates
+        //     elements 1..2 undefined              -> shader reads element 0
+        //     element 0 is written                 -> quad is GREEN -> this arm PASSES
+        //
+        // That is not hypothetical hand-waving: over-allocation is measured behaviour on this very
+        // adapter for buffers (#2471), which is why the pool arm there was unverifiable. So if pool
+        // sizing for COMBINED_IMAGE_SAMPLER ever becomes generous, this arm stops discriminating and
+        // goes quiet rather than failing. If that happens, assert the emitted `descriptorCount`
+        // directly instead of relying on the allocator to refuse.
         {
             prosper::test::BackendDraw d = draw_with(quad, {});
             prosper::test::FrameResource tex_bound{};
