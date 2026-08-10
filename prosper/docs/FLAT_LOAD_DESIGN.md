@@ -120,3 +120,56 @@ pointer value *is* a host pointer, and the containing allocation's extent is alr
 - Capture the live dispatch's user SGPRs for `exec_cs_2042d47600` to confirm `s[12:13]` is a valid mapped
   guest pointer in the GPU-memory range (`0x1000000000+`) and see the source allocation's extent.
 - Confirm the per-lane offset range stays within the chosen window.
+
+## Stage 4b groundwork — what the SPIR-V emitter needs for an indexed descriptor array (#2412)
+
+Surveyed 2026-08-10 before writing any emitter code, and recorded here because three of the five
+findings are things a reader would otherwise conclude the opposite of. Stages 1 and 2 are merged
+(#2458, #2460); stage 3 is #2464 and stage 4a is #2463.
+
+**1. `NonUniform` already appears 45 times in `rdna2_to_spirv.cpp`, and NONE of them is the
+decoration this needs.** Every hit is `GroupNonUniform*` — `Op_GroupNonUniformAny`,
+`Op_GroupNonUniformBallot`, `Cap_GroupNonUniformArithmetic` and friends, i.e. **wave/subgroup
+operations**. The descriptor-indexing `NonUniform` is *decoration 5300*, an unrelated concept that
+happens to share the word. A `grep -c NonUniform` returning 45 reads exactly like "already
+supported" and is the first thing anyone will do. It is not supported: `Dec_NonUniform` does not
+exist in the file.
+
+**2. The emitter targets SPIR-V 1.3** (`0x00010300`, the header at the module-assembly site), and the
+descriptor-indexing capabilities became core only in **1.5**. So they require
+`OpExtension "SPV_EXT_descriptor_indexing"` — either that, or raising the module version, which is a
+much larger decision because every consumer and every `spirv-val` target moves with it.
+
+**3. The emitter emits no `OpExtension` at all, and its section list has no slot for one.** Assembly
+order is `caps, extimp, mem, entry, exec, debug, deco, types, code`. SPIR-V requires `OpExtension`
+**after** `OpCapability` and **before** `OpExtInstImport`, so an `exts` section has to be added
+*between the first two* — not appended. Getting that order wrong produces a module that fails
+`spirv-val` with a message about layout rather than about descriptors.
+
+**4. The declaration site is `declare_cbufs`'s N-buffer loop.** That loop already walks
+`rt->resources` and declares one `OpVariable` per distinct constant/vertex-buffer binding, all sharing
+one Block type (`OpTypeRuntimeArray` of u32 inside `OpTypeStruct`). A resource carrying
+`table_index_count != 0` (stage 2's field) is the trigger: declare `OpTypeArray %Block %N` (or
+`OpTypeRuntimeArray %Block` when the count is 0), a pointer to *that*, and the variable of it.
+
+**5. Every buffer load funnels through ONE accessor**, which is what makes this tractable: eight
+`cbuf_var` references in the file, and the read path is a single `binding -> variable` lookup that
+falls back to `v_cbuf`. The access chains themselves are built at the call sites as
+`{ptr, result, var, uconst(0), elem}`; an indexed binding needs one extra **leading** index —
+`{ptr, result, var, desc_index, uconst(0), elem}` — with the index and the resulting pointer
+decorated `NonUniform`.
+
+Capability set required, emitted only when such a binding exists so that every module that does not
+use one stays byte-identical: `ShaderNonUniform` (5301), `RuntimeDescriptorArray` (5302) for the
+runtime-array form, and `StorageBufferArrayNonUniformIndexing` (5306).
+
+**Why `NonUniform` is unconditional rather than reasoned about per site**, measured on `PPSA04263`:
+of 51 compute launches, 29 are `local=64x1x1`, 7 are `8x8x1`, 7 are `32x1x1`, and **5 are
+`local=256x1x1` — four waves per workgroup, therefore four EXECs and four distinct scalar indices**.
+So the index is wave-uniform but *not* dynamically uniform across the invocation group, and for those
+five programs the decoration is load-bearing. 43 of 51 launches being one wave per group is exactly
+why the uniform reading looks safe and is wrong; the decoration is per-access, so emit it always.
+
+**Sequencing note.** This work sits on top of #2463, whose reflection contract is unreviewed. Stage 1
+changed shape under review (a two-leg fix became three), so the emitter is deliberately not built on
+an unreviewed contract.
