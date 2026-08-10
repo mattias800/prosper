@@ -5507,10 +5507,26 @@ HLE(k_batch_map) {
             break;
         }
         bool ok = true;
+        // The Win32 reason for a failed op, captured AT the failing call and carried to the
+        // [batchmap-fail] line below (#2450). It cannot be read at that line: `track()`,
+        // `untrack()` and the switch's own bookkeeping run in between and are free to set it.
+        // Same hazard as #2431, one level up -- there the gate ran before the capture, here
+        // the capture would run long after the failure.
+        DWORD win_err = 0;
+        // Whether `win_err` was actually captured. Not all failures come from Win32: a
+        // TYPE_PROTECT whose range will not normalise, and an unknown `op`, both set `ret`
+        // themselves without any API call failing. Printing the uninitialised `win_err` for
+        // those would print 0 -- and 0 is ERROR_SUCCESS, so the line would claim the OS
+        // reported success on a path that never asked it anything. A diagnostic that is silent
+        // about a cause is worse than one that names it; a diagnostic that names the WRONG
+        // cause is worse than both, and it is read exactly when someone is attributing a
+        // failure. Raised in review on #2486.
+        bool win_err_valid = false;
         switch (op) {
             case 0: {                               // MAP_DIRECT: shared physical backing
                 void* p = win_map_phys(start, len, host_prot(prot), phys, 0, start != 0);
                 ok = (p != nullptr);
+                if (!ok) { win_err = GetLastError(); win_err_valid = true; }
                 if (ok) {
                     const bool sparse = sparse_dmem_view_contains(
                         (uint64_t)p, (uint64_t)p + len);
@@ -5524,12 +5540,14 @@ HLE(k_batch_map) {
             case 3: {                               // MAP_FLEXIBLE: anonymous/private
                 void* p = win_commit(start, len, host_prot(prot));
                 ok = (p != nullptr);
+                if (!ok) { win_err = GetLastError(); win_err_valid = true; }
                 if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
                               "batch-flex", kVirtualQueryFlexible);
                 break;
             }
             case 1: {                               // UNMAP
                 ok = !start || win_unmap(start, len);
+                if (!ok) { win_err = GetLastError(); win_err_valid = true; }
                 if (ok && start) untrack(start, len);
                 break;
             }
@@ -5545,6 +5563,7 @@ HLE(k_batch_map) {
                     if (!protect_len) break;
                     DWORD error = ERROR_SUCCESS;
                     ok = win_protect(protect_start, protect_len, host_prot(prot), &error);
+                    if (!ok) { win_err = error; win_err_valid = true; }   // out-param
                     if (ok) {
                         retrack_prot(protect_start, protect_len, host_prot(prot), prot,
                                      "batch-prot");
@@ -5575,13 +5594,25 @@ HLE(k_batch_map) {
             // "further ... suppressed" costs one line and tells the reader a tail exists, so
             // raising the cap later is an informed decision rather than a guess.
             {
+                // `ret` is printed because it is the value the guest surfaces: the title's own
+                // `sceKernelBatchMap failed with error code: 0x8002000c` is this number, so the
+                // line now joins our diagnosis to the string a user reports. When `ret` is still
+                // zero here the shared tail below sets ENOMEM, so that is what is shown.
+                char win_err_text[64];
+                if (win_err_valid)
+                    std::snprintf(win_err_text, sizeof win_err_text, "%lu",
+                                  (unsigned long)win_err);
+                else
+                    std::snprintf(win_err_text, sizeof win_err_text, "n/a (guest-rejected)");
                 static std::atomic<unsigned> logged{0};
                 const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
                 if (seen < 8)
                     fprintf(stderr,
-                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+                            "[batchmap-fail] entry=%d/%d op=%d va=0x%llx phys=0x%llx len=0x%llx "
+                            "prot=0x%x error=%s ret=0x%llx\n",
                             i, n, op, (unsigned long long)start, (unsigned long long)phys,
-                            (unsigned long long)len, prot);
+                            (unsigned long long)len, prot, win_err_text,
+                            (unsigned long long)(ret ? ret : 0x8002000Cull));
                 else if (seen == 8)
                     fprintf(stderr, "[batchmap-fail] further BatchMap failures suppressed after 8\n");
             }
