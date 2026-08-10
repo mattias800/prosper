@@ -2347,8 +2347,51 @@ struct SpirvCompute {
         put(types, Op_TypeRuntimeArray, {t_rta_u, t_u32});
         put(types, Op_TypeStruct, {t_struct_u, t_rta_u});
         put(types, Op_TypePointer, {t_ptr_sb_struct_u, SC_StorageBuffer, t_struct_u});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
+        // Bindings 2 and 3 are declared here rather than in the loop below, so a TABLE-INDEXED resource
+        // on either of them has to be handled here too (#2472). Before this, both were declared
+        // unconditionally as scalar buffers and then seeded into the loop's `seen` set, so an array at
+        // binding 2 or 3 was skipped and silently emitted as a single descriptor -- and since Vulkan
+        // permits a shader declaring one descriptor against a layout declaring N, that produced no
+        // error: the shader read element 0 for every index. Titles put their constant buffers on
+        // exactly these two bindings, so it was the common case that failed quietly.
+        auto table_arity_for = [&](uint32_t binding) -> uint32_t {
+            if (!rt) return 0;
+            for (const auto& r : rt->resources)
+                if (r.binding == binding && r.table_index_count != 0 &&
+                    (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer))
+                    return r.table_index_count;
+            return 0;
+        };
+        auto index_sgpr_for = [&](uint32_t binding) -> uint32_t {
+            if (!rt) return 0xFFFFFFFFu;
+            for (const auto& r : rt->resources)
+                if (r.binding == binding && r.table_index_count != 0) return r.table_index_sgpr;
+            return 0xFFFFFFFFu;
+        };
+        // Declare `binding`'s variable as an array of the Block type, reusing the id already decorated
+        // for it, so its set/binding decorations above stay correct.
+        auto declare_as_array = [&](uint32_t binding, uint32_t var, uint32_t arity) {
+            constexpr uint32_t kMaxPlausibleArity = 1u << 16;
+            declare_descriptor_indexing();
+            const uint32_t arr = id();
+            if (arity > kMaxPlausibleArity) put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
+            else                            put(types, Op_TypeArray, {arr, t_struct_u, uconst(arity)});
+            const uint32_t arr_ptr = id();
+            put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
+            put(types, Op_Variable, {arr_ptr, var, SC_StorageBuffer});
+            cbuf_table_arity[binding] = arity;
+            const uint32_t sgpr = index_sgpr_for(binding);
+            if (sgpr != 0xFFFFFFFFu) cbuf_table_index_sgpr[binding] = sgpr;
+        };
+        const uint32_t arity2 = table_arity_for(2), arity3 = table_arity_for(3);
+        // NOTE on the fallback: `buf_for_binding` returns `v_cbuf` for a binding it does not know. If
+        // binding 2 is an array, that fallback yields an array-typed variable and an access chain built
+        // for a scalar pointee against it is a TYPE error at emission -- loud, and caught by spirv-val,
+        // which is the acceptable direction. It is not silently wrong.
+        if (arity2) declare_as_array(2, v_cbuf, arity2);
+        else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
+        if (arity3) declare_as_array(3, v_cbuf1, arity3);
+        else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
         put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
         cbuf_var[2] = v_cbuf; cbuf_var[3] = v_cbuf1;
         // N-buffer model: declare an additional storage buffer for each distinct constant/vertex buffer

@@ -82,21 +82,15 @@ int main() {
         ShaderResource vb{};
         vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32; vb.num_components = 2;
         vb.binding = 3; vb.stride = 8; vb.sgpr_base = 8;
-        rt.resources.push_back(vb);
         if (arity) {
-            // Binding 4, NOT 3. Bindings 2 and 3 are pre-declared as scalar storage buffers before
-            // declare_cbufs' N-buffer loop and are seeded into its `seen` set, so a table-indexed
-            // resource at either is skipped and silently emitted as an ordinary descriptor. That is a
-            // real limitation of this stage rather than a quirk of the test -- filed separately -- and
-            // it matters because a title's constant buffers commonly land on exactly those two
-            // bindings. This arm therefore proves the mechanism on a binding that can reach it.
-            ShaderResource tb{};
-            tb.cls = ResourceClass::ConstantBuffer; tb.format = DataFormat::Float32;
-            tb.num_components = 4; tb.binding = 4; tb.stride = 16; tb.sgpr_base = 12;
-            tb.table_index_count = arity; tb.table_entry_stride = 16;
-            tb.table_index_sgpr = 6;   // the descriptor index arrives in user SGPR 6
-            rt.resources.push_back(tb);
+            // Binding 3 -- the binding this shader actually READS. Before #2472 bindings 2 and 3 could
+            // not be arrays, so this had to sit on binding 4 where nothing loaded from it and the access
+            // chain was unreachable. Now the arity goes on the read binding and the selector is testable.
+            vb.table_index_count = arity;
+            vb.table_entry_stride = 16;
+            vb.table_index_sgpr = 6;   // the descriptor index arrives in user SGPR 6
         }
+        rt.resources.push_back(vb);
         return rt;
     };
 
@@ -155,27 +149,33 @@ int main() {
               "an implausible arity is NOT emitted as a fixed array of 4294967295 descriptors");
     }
 
-    // --- NOT asserted here: that the access chain selects an entry -------------------------------
-    // The emitter DOES build a leading selector plus the NonUniform decorations (see cbuf_load_impl),
-    // but this fixture cannot reach that code, and the reason is a defect rather than a fixture
-    // limitation: the shader reads binding 3, while the table-indexed resource has to live at binding 4
-    // because bindings 2 and 3 cannot be arrays (#2472). Nothing in the module loads from the array, so
-    // no access chain into it is ever emitted.
-    //
-    // Two arms asserting the selector and the decoration were written and removed rather than left
-    // failing, because a red test says "the code is broken" when the truth is "the test cannot reach
-    // it". They belong with the fix for #2472, which is therefore not cosmetic: it BLOCKS verification
-    // of the indexed access, which is the one part of stage 4c that renders wrong content rather than
-    // failing loudly if it is wrong -- a valid descriptor read from the wrong slot.
-    //
-    // What IS asserted below stays meaningful: the control confirms an ordinary module carries no
-    // NonUniform decoration, so the decoration cannot be leaking into every shader.
+    // --- The access chain SELECTS an entry, and the selection is decorated NonUniform ---------------
+    // These two arms could not exist before #2472: the table-indexed resource had to live on a binding
+    // the shader never read, so no access chain into the array was emitted and both arms failed. They
+    // matter more than the declaration arms above, because this is the part that fails QUIETLY -- a
+    // mis-emitted selector reads a valid descriptor from the wrong slot, so the shader renders
+    // confidently wrong content instead of erroring.
     {
-        bool plain_nonuniform = false;
+        // An ordinary chain into a storage buffer is {result_type, result, base, 0, idx} -> 5 operands,
+        // word length 6. A table-indexed one carries a leading selector -> 6 operands, length 7.
+        bool indexed_chain = false;
+        for (auto& e : walk(m_arr))
+            if (e.first == 65u && (m_arr[e.second] >> 16) == 7u) indexed_chain = true;
+        CHECK(indexed_chain, "an access chain carries a LEADING selector (the array is really indexed)");
+
+        // The control that makes it mean something: the ordinary module's chains are all the short form.
+        bool plain_has_indexed = false;
         for (auto& e : walk(m_plain))
-            if (e.first == 71u && e.second + 2 < m_plain.size() && m_plain[e.second + 2] == 5300u)
-                plain_nonuniform = true;
-        CHECK(!plain_nonuniform, "control: an ordinary module carries no NonUniform decoration");
+            if (e.first == 65u && (m_plain[e.second] >> 16) == 7u) plain_has_indexed = true;
+        CHECK(!plain_has_indexed, "control: an ordinary module emits no leading-selector chain");
+
+        auto has_nonuniform = [](const std::vector<uint32_t>& m) {
+            for (auto& e : walk(m))
+                if (e.first == 71u && e.second + 2 < m.size() && m[e.second + 2] == 5300u) return true;
+            return false;
+        };
+        CHECK(has_nonuniform(m_arr), "the selection is decorated NonUniform (5300)");
+        CHECK(!has_nonuniform(m_plain), "control: an ordinary module carries no NonUniform decoration");
     }
 
     printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
