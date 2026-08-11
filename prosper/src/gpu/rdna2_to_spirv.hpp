@@ -23,6 +23,22 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 
+// Per-invocation provenance for fail-visible shader diagnostics. This is observation-only metadata:
+// it must travel beside the translation inputs rather than participate in compiled-module identity,
+// because the same program bytes and semantic configuration produce the same SPIR-V at every guest
+// address. A zero address is the neutral standalone/tool/test identity.
+enum class RecompileDiagnosticStage : uint8_t {
+    Standalone,
+    Compute,
+    Vertex,
+    Fragment,
+};
+
+struct RecompileDiagnosticContext {
+    RecompileDiagnosticStage stage = RecompileDiagnosticStage::Standalone;
+    uint64_t program_address = 0;
+};
+
 // A narrowly-proven compiler-generated scalar jump table. The shader loads a uniform selector from a
 // direct constant buffer, bounds it, scales it by the 64-bit table-entry size, loads a PC-relative
 // target, and reaches it with s_setpc_b64. Arbitrary indirect control flow remains unsupported: this
@@ -244,16 +260,22 @@ struct ComputeShaderConfig {
 // recompile_valu. Memory effects come only from the program's actual resource operations.
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
-                                        const ComputeShaderConfig& config);
+                                        const ComputeShaderConfig& config,
+                                        RecompileDiagnosticContext diagnostic = {
+                                            RecompileDiagnosticStage::Compute, 0});
 
 // True when the program contains enough proven wave work to justify an exact multi-wave subgroup
 // shell: either the canonical low/high MBCNT pair, or at least four VCC/EXEC branches accepted by the
 // structured compute emitter in a shader containing only top-level guest workgroup barriers. Portable
 // compute lowers those operations through synchronized workgroup scratch; native compute uses subgroup
 // scans/votes. This deliberately conservative structural signal is independent of title and address.
-bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords);
+bool compute_shader_prefers_native_multiwave(
+    const uint32_t* code, size_t dwords,
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Compute, 0});
 bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& instructions,
-                                             const uint32_t* code, size_t dwords);
+                                             const uint32_t* code, size_t dwords,
+                                             RecompileDiagnosticContext diagnostic = {
+                                                 RecompileDiagnosticStage::Compute, 0});
 
 // DPP/permlane operations are native subgroup shuffles: quad permutations need four contiguous
 // lanes, row operations need 16, and PERMLANEX16 needs a paired 32-lane row. The backend rejects

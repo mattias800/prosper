@@ -6,6 +6,7 @@
 #include "shader_resources.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstdarg>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,58 @@
 #include <vector>
 
 namespace prosper::gpu {
+
+namespace {
+
+const char* recompile_diagnostic_stage_name(RecompileDiagnosticStage stage) {
+    switch (stage) {
+        case RecompileDiagnosticStage::Compute: return "compute";
+        case RecompileDiagnosticStage::Vertex: return "vertex";
+        case RecompileDiagnosticStage::Fragment: return "fragment";
+        case RecompileDiagnosticStage::Standalone: return "standalone";
+    }
+    return "standalone";
+}
+
+// Recompiles can run concurrently. Build the complete diagnostic on the stack and submit it through
+// one stdio call so one program's identity cannot be spliced onto another program's reject payload.
+// The context is an explicit per-call value; no global or thread-local attribution state is involved.
+void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
+                              const char* tag, const char* role, const char* format, ...) {
+    if (!std::getenv("PROSPER_DBG")) return;
+
+    char payload[1536];
+    va_list args;
+    va_start(args, format);
+    const int body = std::vsnprintf(payload, sizeof payload, format, args);
+    va_end(args);
+    if (body < 0) return;
+    payload[sizeof(payload) - 1] = '\0';
+    size_t payload_size = std::strlen(payload);
+    while (payload_size && (payload[payload_size - 1] == '\n' ||
+                            payload[payload_size - 1] == '\r'))
+        payload[--payload_size] = '\0';
+
+    // Preserve the established `[tag] payload` prefix consumed by issue-census scripts. Provenance
+    // is an appended field group, not an insertion between the tag and its historical first field.
+    char line[2048];
+    const int written = diagnostic.program_address
+        ? std::snprintf(line, sizeof line,
+                        "[%s] %s stage=%s program=0x%llx role=%s\n",
+                        tag, payload, recompile_diagnostic_stage_name(diagnostic.stage),
+                        static_cast<unsigned long long>(diagnostic.program_address), role)
+        : std::snprintf(line, sizeof line,
+                        "[%s] %s stage=%s program=none role=%s\n",
+                        tag, payload, recompile_diagnostic_stage_name(diagnostic.stage), role);
+    if (written < 0) return;
+    const size_t used = std::min(static_cast<size_t>(written), sizeof(line) - 1);
+    if (used == sizeof(line) - 1) {
+        line[sizeof(line) - 2] = '\n';
+    }
+    std::fwrite(line, 1, used, stderr);
+}
+
+} // namespace
 
 // #2319: render exactly the dwords the instruction HAS, not a fixed two.
 //
@@ -293,6 +346,7 @@ struct SpirvCompute {
     // prepended to `extimp` -- see the module assembly order below. Getting that order wrong fails
     // spirv-val with a LAYOUT complaint that says nothing about descriptors.
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
+    RecompileDiagnosticContext diagnostic{};
     bool descriptor_indexing_declared = false;
     // Declare the capability set and extension for an indexed descriptor array, once per module and
     // only when one is actually declared, so every module that does not use one is byte-identical to
@@ -4829,7 +4883,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                                           const std::unordered_set<uint32_t>* skip = nullptr,
                                           const std::vector<DivLoop>* loops = nullptr,
                                           bool* rejected = nullptr,
-                                          bool compute_wave_branches = false) {
+                                          bool compute_wave_branches = false,
+                                          RecompileDiagnosticContext diagnostic = {}) {
     std::vector<ForwardIf> out;
     if (rejected) *rejected = false;
     auto reject = [&]() -> std::vector<ForwardIf> { if (rejected) *rejected = true; return {}; };
@@ -4856,15 +4911,15 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
             case 0x02: continue;                                     // s_branch: validated in pass 2
             case 0x09:                                               // execnz: only as a loop back-edge
                 if (loop_backedge(in.pc)) continue;
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr, "[compute-struct-reject] unclaimed execnz pc=%u\n", in.pc);
+                log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                         "unclaimed execnz pc=%u", in.pc);
                 return reject();
             case 0x08:                                               // execz: safe-linearized predication
                 if (skip && skip->count(in.pc)) continue;            // branch -> emit_alu no-ops it; else a
                 if (loop_exit(in.pc)) continue;                      // loop exit test: the loop emitter's
                 if (!allow_vcc && !compute_wave_branches) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr, "[compute-struct-reject] unsupported execz pc=%u\n", in.pc);
+                    log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                             "unsupported execz pc=%u", in.pc);
                     return reject();
                 }
                 break;                                               // compute lowers the wave-empty test with
@@ -4876,8 +4931,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                     // the architectural whole-wave VCCZ/VCCNZ flag. Accept it for the exact guest-wave
                     // CFG dispatcher; emit_body must never lower it through a native subgroup vote.
                     if (!compute_wave_branches) {
-                        if (getenv("PROSPER_DBG"))
-                            std::fprintf(stderr, "[compute-struct-reject] unsupported vcc branch pc=%u\n", in.pc);
+                        log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                                 "unsupported vcc branch pc=%u", in.pc);
                         return reject();
                     }
                     compute_uniform_vcc = true;
@@ -4894,8 +4949,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
         // A compute-uniform-accepted vcc branch can never be a break (compute loops require the
         // s_branch back-edge Vcc shape, which has no breaks) — reject the combination defensively.
         if (compute_uniform_vcc && loop_break(in.pc)) {
-            if (getenv("PROSPER_DBG"))
-                std::fprintf(stderr, "[compute-struct-reject] uniform vcc loop break pc=%u\n", in.pc);
+            log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                     "uniform vcc loop break pc=%u", in.pc);
             return reject();
         }
         if (const DivLoop* L = loop_break(in.pc)) {
@@ -4911,8 +4966,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
         bool early = false;
         if (tgt > end_pc && tgt != UINT32_MAX) {                     // possible early-out past s_endpgm:
             if (!code || tgt >= dwords) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr, "[compute-struct-reject] target out of range pc=%u target=%u\n", in.pc, tgt);
+                log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                         "target out of range pc=%u target=%u", in.pc, tgt);
                 return reject();                                     // verify the target terminates (see
             }
             std::vector<Rdna2Inst> tail;                             // detect_forward_if for the rationale)
@@ -4924,15 +4979,15 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 break;
             }
             if (!ends_immediately) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr, "[compute-struct-reject] nonterminal early target pc=%u target=%u\n", in.pc, tgt);
+                log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                         "nonterminal early target pc=%u target=%u", in.pc, tgt);
                 return reject();
             }
             tgt = end_pc; early = true;
         }
         if (tgt <= in.pc || tgt > end_pc) {
-            if (getenv("PROSPER_DBG"))
-                std::fprintf(stderr, "[compute-struct-reject] nonforward target pc=%u target=%u\n", in.pc, tgt);
+            log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                     "nonforward target pc=%u target=%u", in.pc, tgt);
             return reject();                                         // must be forward, within the stream
         }
         ForwardIf F;
@@ -4950,19 +5005,16 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (sb.pc + sb.len_dwords != tgt) continue;          // must be the arm's LAST instruction
                 if (loop_backedge(sb.pc)) continue;                  // a loop's back-edge, not an else-jump
                 if (sb.simm16 <= 0) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] backward else pc=%u branch=%u target=%u\n",
-                                     in.pc, sb.pc, tgt);
+                    log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                             "backward else pc=%u branch=%u target=%u",
+                                             in.pc, sb.pc, tgt);
                     return reject();                                 // backward else-jump: a loop, not an if
                 }
                 uint32_t lm = branch_target(sb);
                 if (lm <= tgt || lm > end_pc) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] invalid else merge pc=%u branch=%u "
-                                     "target=%u merge=%u\n",
-                                     in.pc, sb.pc, tgt, lm);
+                    log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                             "invalid else merge pc=%u branch=%u target=%u merge=%u",
+                                             in.pc, sb.pc, tgt, lm);
                     return reject();                                 // merge must be forward, in-stream
                 }
                 F.has_else = true; F.sb_pc = sb.pc; F.merge_pc = lm;
@@ -4982,10 +5034,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (r.is_end || r.pc >= region_end) break;
                 if (r.pc <= in.pc) continue;
                 if (r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] execz pc=%u contains barrier pc=%u\n",
-                                     in.pc, r.pc);
+                    log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                             "execz pc=%u contains barrier pc=%u", in.pc, r.pc);
                     return reject();
                 }
 
@@ -5008,11 +5058,10 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 for (int vcc_half = 106; vcc_half <= 107; ++vcc_half) {
                     if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width) continue;
                     if (!sgpr_dead_at_merge(ins, region_end, vcc_half)) {
-                        if (getenv("PROSPER_DBG"))
-                            std::fprintf(stderr,
-                                         "[compute-struct-reject] execz pc=%u scalar write pc=%u "
-                                         "leaves vcc-half s%d live at merge pc=%u\n",
-                                         in.pc, r.pc, vcc_half, region_end);
+                        log_recompile_diagnostic(
+                            diagnostic, "compute-struct-reject", "route-decline",
+                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge pc=%u",
+                            in.pc, r.pc, vcc_half, region_end);
                         return reject();
                     }
                 }
@@ -5044,11 +5093,10 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                     ds_wave_collective ||
                     (r.fmt == Rdna2Format::VOP3 &&
                      (r.opcode == 0x365 || r.opcode == 0x366))) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] vcc branch pc=%u contains "
-                                     "synchronized op pc=%u fmt=%d op=0x%x\n",
-                                     in.pc, r.pc, static_cast<int>(r.fmt), r.opcode);
+                    log_recompile_diagnostic(
+                        diagnostic, "compute-struct-reject", "route-decline",
+                        "vcc branch pc=%u contains synchronized op pc=%u fmt=%d op=0x%x",
+                        in.pc, r.pc, static_cast<int>(r.fmt), r.opcode);
                     return reject();
                 }
             }
@@ -5064,10 +5112,9 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
         bool claimed = false;
         for (const auto& F : out) if (F.has_else && F.sb_pc == in.pc) { claimed = true; break; }
         if (!claimed) {
-            if (getenv("PROSPER_DBG"))
-                std::fprintf(stderr,
-                             "[compute-struct-reject] unclaimed s_branch pc=%u target=%u\n",
-                             in.pc, branch_target(in));
+            log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                     "unclaimed s_branch pc=%u target=%u",
+                                     in.pc, branch_target(in));
             return reject();
         }
     }
@@ -5092,11 +5139,10 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
             while (!open.empty() && open.back() <= start) open.pop_back();
             if (!open.empty() && span_end > open.back()) {
                 if (!clampable) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] overlapping region start=%u end=%u "
-                                     "parent-end=%u\n",
-                                     start, span_end, open.back());
+                    log_recompile_diagnostic(
+                        diagnostic, "compute-struct-reject", "route-decline",
+                        "overlapping region start=%u end=%u parent-end=%u",
+                        start, span_end, open.back());
                     return reject();                     // plain if / loop escaping its region: not a tree
                 }
                 span_end = open.back();                  // cascade if/else: clamped to the enclosing
@@ -12986,9 +13032,9 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords) {
     const bool graphics = b.is_fragment || b.is_vertex;
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
-        if (getenv("PROSPER_DBG"))
-            std::fprintf(stderr, "[%s-cfg-reject] pc=%u reason=%s\n",
-                         b.is_compute ? "compute" : "graphics", pc, reason);
+        log_recompile_diagnostic(b.diagnostic,
+                                 b.is_compute ? "compute-cfg-reject" : "graphics-cfg-reject",
+                                 "terminal", "pc=%u reason=%s", pc, reason);
         return false;
     };
     if ((!b.is_compute && !graphics) || ins.empty()) return false;
@@ -13619,11 +13665,10 @@ bool emit_cfg_state_machine(
                 const int implicit_vcc = implicit_vcc_mask_source(in);
                 if (implicit_vcc >= 0 &&
                     (!masks.contains(implicit_vcc) || ambiguous.contains(implicit_vcc))) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[%s-cfg-reject] pc=%u "
-                                     "reason=missing-wave32-vcc-mask\n",
-                                     b.is_compute ? "compute" : "graphics", in.pc);
+                    log_recompile_diagnostic(
+                        b.diagnostic,
+                        b.is_compute ? "compute-cfg-reject" : "graphics-cfg-reject",
+                        "terminal", "pc=%u reason=missing-wave32-vcc-mask", in.pc);
                     return false;
                 }
 
@@ -13642,11 +13687,10 @@ bool emit_cfg_state_machine(
                     ambiguous.contains(106))
                     reads_ambiguous = true;
                 if (reads_ambiguous) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[%s-cfg-reject] pc=%u "
-                                     "reason=wave32-ambiguous-mask-read\n",
-                                     b.is_compute ? "compute" : "graphics", in.pc);
+                    log_recompile_diagnostic(
+                        b.diagnostic,
+                        b.is_compute ? "compute-cfg-reject" : "graphics-cfg-reject",
+                        "terminal", "pc=%u reason=wave32-ambiguous-mask-read", in.pc);
                     return false;
                 }
 
@@ -14475,15 +14519,21 @@ bool emit_cfg_state_machine(
             b.store_function(active_var, no);
         }
         else if (found == block_for_pc.end()) {
-            if (getenv("PROSPER_DBG"))
-                std::fprintf(stderr,
-                             "[compute-cfg-successor-reject] pc=%u end=%u blocks=%zu\n",
-                             pc, end_pc, block_for_pc.size());
             if (getenv("PROSPER_DBG")) {
-                std::fprintf(stderr, "[compute-cfg-successors]");
-                for (const auto& entry : block_for_pc)
-                    std::fprintf(stderr, " %u", entry.first);
-                std::fprintf(stderr, "\n");
+                log_recompile_diagnostic(
+                    b.diagnostic, "compute-cfg-successor-reject", "terminal",
+                    "pc=%u end=%u blocks=%zu", pc, end_pc, block_for_pc.size());
+                std::string successors;
+                char successor[32];
+                for (const auto& entry : block_for_pc) {
+                    const int written = std::snprintf(successor, sizeof successor, " %u",
+                                                      entry.first);
+                    if (written > 0)
+                        successors.append(successor, std::min<size_t>(
+                            static_cast<size_t>(written), sizeof(successor) - 1));
+                }
+                log_recompile_diagnostic(b.diagnostic, "compute-cfg-successors", "terminal",
+                                         "%s", successors.c_str());
             }
             return false;
         }
@@ -14663,12 +14713,12 @@ bool emit_cfg_state_machine(
                         // lowering ran and could not resolve an operand or a resource-table
                         // descriptor. Without it a census cannot tell "implement this" from
                         // "this instruction is fine, its descriptor is not".
-                        std::fprintf(stderr,
-                                     "[cfg-recompile-reject] mode=%s pc=%u words=%s len=%u "
-                                     "fmt=%d op=0x%x\n",
-                                     handled ? "unresolved-operand" : "unknown-encoding",
-                                     in.pc, reject_words_text(in).c_str(), in.len_dwords,
-                                     static_cast<int>(in.fmt), in.opcode);
+                        log_recompile_diagnostic(
+                            b.diagnostic, "cfg-recompile-reject", "terminal",
+                            "mode=%s pc=%u words=%s len=%u fmt=%d op=0x%x",
+                            handled ? "unresolved-operand" : "unknown-encoding",
+                            in.pc, reject_words_text(in).c_str(), in.len_dwords,
+                            static_cast<int>(in.fmt), in.opcode);
                     return false;
                 }
                 // Ordinary scalar B64 logicals already produced an exact nonzero SCC id above.
@@ -14714,10 +14764,8 @@ bool emit_cfg_state_machine(
         }
         if (mbcnt) {
             if (graphics) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr,
-                                 "[graphics-cfg-reject] pc=%u reason=mbcnt-cross-lane\n",
-                                 mbcnt->pc);
+                log_recompile_diagnostic(b.diagnostic, "graphics-cfg-reject", "terminal",
+                                         "pc=%u reason=mbcnt-cross-lane", mbcnt->pc);
                 return false;
             }
             bool operand_ok = true;
@@ -14755,10 +14803,8 @@ bool emit_cfg_state_machine(
         }
         if (append) {
             if (graphics) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr,
-                                 "[graphics-cfg-reject] pc=%u reason=gds-cross-lane\n",
-                                 append->pc);
+                log_recompile_diagnostic(b.diagnostic, "graphics-cfg-reject", "terminal",
+                                         "pc=%u reason=gds-cross-lane", append->pc);
                 return false;
             }
             const auto m0 = state.sreg.find(124);
@@ -14887,10 +14933,8 @@ bool emit_cfg_state_machine(
         }
         if (mask_compare) {
             if (b.is_vertex) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr,
-                                 "[graphics-cfg-reject] pc=%u reason=wave-mask-compare\n",
-                                 mask_compare->pc);
+                log_recompile_diagnostic(b.diagnostic, "graphics-cfg-reject", "terminal",
+                                         "pc=%u reason=wave-mask-compare", mask_compare->pc);
                 return false;
             }
             const int source = mask_zero_compare_candidate_source(*mask_compare);
@@ -14973,10 +15017,9 @@ bool emit_cfg_state_machine(
         }
         if (vopc_mask_compare) {
             if (b.is_vertex) {
-                if (getenv("PROSPER_DBG"))
-                    std::fprintf(stderr,
-                                 "[graphics-cfg-reject] pc=%u reason=vopc-wave-mask-compare\n",
-                                 vopc_mask_compare->pc);
+                log_recompile_diagnostic(b.diagnostic, "graphics-cfg-reject", "terminal",
+                                         "pc=%u reason=vopc-wave-mask-compare",
+                                         vopc_mask_compare->pc);
                 return false;
             }
             const int source = vopc_mask_zero_compare_source(*vopc_mask_compare);
@@ -15981,9 +16024,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                      ins[barrier_index].pc);
                     if (!emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
                                    exp_fn, code, dwords, &dead_masks)) {
-                        if (getenv("PROSPER_DBG"))
-                            std::fprintf(stderr, "[compute-phase-reject] begin=%u end=%u\n",
-                                         phase.front().pc, phase[phase.size() - 2].pc);
+                        log_recompile_diagnostic(
+                            b.diagnostic, "compute-phase-reject", "consequent",
+                            "begin=%u end=%u", phase.front().pc, phase[phase.size() - 2].pc);
                         return false;
                     }
                 }
@@ -15997,9 +16040,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                  tail.front().pc, tail.back().pc);
                 if (!emit_body(b, rs, tail, safe, rt, allow_exec_update, allow_smem,
                                exp_fn, code, dwords, &dead_masks)) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr, "[compute-phase-reject] begin=%u end=%u tail=1\n",
-                                     tail.front().pc, tail.back().pc);
+                    log_recompile_diagnostic(b.diagnostic, "compute-phase-reject", "consequent",
+                                             "begin=%u end=%u tail=1",
+                                             tail.front().pc, tail.back().pc);
                     return false;
                 }
             }
@@ -16050,10 +16093,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // else, so a census cannot group them by SHADER -- which is the unit that matters,
                     // since 24,485 skipped GTA V draws turned out to be 43 distinct shaders. The first
                     // code dword plus the span identifies one cheaply and stably.
-                    fprintf(stderr, "[recompile-reject] sh=%08x/%zu mode=%s pc=%u words=%s fmt=%d op=0x%x "
-                                    "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
-                                    "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
-                                    "sext=%d/%d\n",
+                    log_recompile_diagnostic(
+                        b.diagnostic, "recompile-reject", "terminal",
+                        "sh=%08x/%zu mode=%s pc=%u words=%s fmt=%d op=0x%x "
+                        "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
+                        "dim=%u glc=%d len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u "
+                        "sext=%d/%d",
                         dwords ? code[0] : 0u, dwords,
                         handled ? "unresolved-operand" : "unknown-encoding",
                         in.pc, reject_words_text(in).c_str(), (int)in.fmt, in.opcode,
@@ -16072,10 +16117,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // consecutive-vaddr form. Keep a separate MIMG-only line so an address-shape
                     // diagnosis sees every decoded extra dword without adding zeros to unrelated ops.
                     if (in.fmt == Rdna2Format::MIMG && in.len_dwords > 2u)
-                        fprintf(stderr,
-                                "[recompile-reject-mimg-address] pc=%u extra=%u words=%08x,%08x,%08x\n",
-                                in.pc, in.len_dwords - 2u,
-                                in.words[2], in.words[3], in.words[4]);
+                        log_recompile_diagnostic(
+                            b.diagnostic, "recompile-reject-mimg-address", "terminal",
+                            "pc=%u extra=%u words=%08x,%08x,%08x",
+                            in.pc, in.len_dwords - 2u,
+                            in.words[2], in.words[3], in.words[4]);
                 }
                 return false;
             }
@@ -16181,7 +16227,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         bool preloop_rejected = false;
         const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
             preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
-            &preloop_rejected, /*compute_wave_branches*/b.is_compute);
+            &preloop_rejected, /*compute_wave_branches*/b.is_compute, b.diagnostic);
         // detect_forward_ifs clamps a branch to an immediate s_endpgm at its artificial end marker
         // and records it as early_out. In this truncated prelude that can be a real branch over the
         // entire counted loop, so it cannot be structured as an ordinary one-arm conditional.
@@ -16191,10 +16237,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     (branch.has_else ? branch.merge_pc : branch.target_pc) > L.header_pc;
             });
         if (preloop_rejected || preloop_if_unsupported) {
-            if (getenv("PROSPER_DBG"))
-                fprintf(stderr,
-                        "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
-                        preloop_rejected, preloop_ifs.size(), L.header_pc);
+            log_recompile_diagnostic(
+                b.diagnostic, "recompile-reject", "terminal",
+                "counted-loop prelude cfg rejected=%u ifs=%zu header=%u",
+                preloop_rejected, preloop_ifs.size(), L.header_pc);
             return false;
         }
         if (preloop_ifs.empty()) {
@@ -16294,8 +16340,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             rs.sreg_written.insert(then_written.begin(), then_written.end());
             for (int reg : then_written) rs.sreg_input.erase(reg);
             if (then_bool != rs.sreg_bool || then_bool_b32 != rs.sreg_bool_b32) {
-                if (getenv("PROSPER_DBG"))
-                    fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
+                log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                         "counted-loop prelude changes mask domain");
                 return false; // no mask-domain PHIs in this narrow composition
             }
             if (!emit_range(merge_pc, L.header_pc)) return false;
@@ -16306,8 +16352,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // fixed-trip culling loop merely because some guest lanes were masked before its header.
         const bool carry_vertex_exec = b.ngg_one_lane && rs.exec_narrowed;
         if (rs.exec_narrowed && !guarded_narrow_entry && !carry_vertex_exec) {
-            if (getenv("PROSPER_DBG"))
-                fprintf(stderr, "[recompile-reject] counted-loop enters with narrowed EXEC\n");
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop enters with narrowed EXEC");
             return false;
         }
         // 2. Loop-carried registers -> a header OpPhi each. `cond_written` = regs written in the CONDITION
@@ -16365,8 +16411,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // 4. Body [after exit_branch, back-edge). Must restore EXEC before looping (bail if left narrowed).
         if (!emit_range(L.exit_branch_pc + 1, L.backedge_pc)) return false;
         if (rs.exec_narrowed && !guarded_narrow_entry && !carry_vertex_exec) {
-            if (getenv("PROSPER_DBG"))
-                fprintf(stderr, "[recompile-reject] counted-loop body leaves EXEC narrowed\n");
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "counted-loop body leaves EXEC narrowed");
             return false;
         }
         if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;        // skip the back-edge branch
@@ -16481,7 +16527,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         bool cf_rejected = false;
         const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe,
                                                              Ls.empty() ? nullptr : &Ls, &cf_rejected,
-                                                             /*compute_wave_branches*/b.is_compute);
+                                                             /*compute_wave_branches*/b.is_compute,
+                                                             b.diagnostic);
 
         // UE4's volume-lighting kernels combine nested EXEC loops with a backward VCC vote loop.
         // That shape is intentionally outside the narrow pattern structurizer above. Use the
@@ -16823,27 +16870,21 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // A poisoned SCC (0: last written by a 64-bit mask op) cannot condition a real
                 // structured if — reject (the ISA-audit #879 stale-SCC consumer).
                 if (!F.on_exec && !F.on_vcc && !rs.scc) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] poisoned SCC at branch pc=%u\n",
-                                     F.branch_pc);
+                    log_recompile_diagnostic(b.diagnostic, "compute-struct-reject", "terminal",
+                                             "poisoned SCC at branch pc=%u", F.branch_pc);
                     return false;
                 }
                 if (F.on_vcc && !rs.vcc) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] missing VCC at branch pc=%u\n",
-                                     F.branch_pc);
+                    log_recompile_diagnostic(b.diagnostic, "compute-struct-reject", "terminal",
+                                             "missing VCC at branch pc=%u", F.branch_pc);
                     return false;
                 }
                 // Compute VCC/EXEC branches normally return through the exact guest-wave dispatcher.
                 // The narrow structured-wave path above accepts only top-level vote sites, where all
                 // workgroup invocations may participate in the scratch barriers uniformly.
                 if (b.is_compute && (F.on_exec || F.on_vcc) && !structured_compute_wave_cfg) {
-                    if (getenv("PROSPER_DBG"))
-                        std::fprintf(stderr,
-                                     "[compute-struct-reject] unavailable wave vote at branch pc=%u\n",
-                                     F.branch_pc);
+                    log_recompile_diagnostic(b.diagnostic, "compute-struct-reject", "terminal",
+                                             "unavailable wave vote at branch pc=%u", F.branch_pc);
                     return false;
                 }
                 uint32_t cond_reg = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
@@ -16897,11 +16938,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                         return sgpr_dead_at_merge(ins, F.target_pc, reg);
                                     });
                     if (!dead_domain_difference) {
-                        if (getenv("PROSPER_DBG"))
-                            std::fprintf(stderr,
-                                         "[compute-struct-reject] live b32 mask domain differs "
-                                         "across branch pc=%u merge=%u\n",
-                                         F.branch_pc, F.target_pc);
+                        log_recompile_diagnostic(
+                            b.diagnostic, "compute-struct-reject", "terminal",
+                            "live b32 mask domain differs across branch pc=%u merge=%u",
+                            F.branch_pc, F.target_pc);
                         return false;
                     }
                     b.emit_branch(mergeL); b.emit_label(mergeL);
@@ -16946,11 +16986,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     uint32_t else_hi = F.merge_pc;
                     if (F.merge_pc >= hi) {
                         if (F.merge_pc != cont && F.merge_pc != hi) {
-                            if (getenv("PROSPER_DBG"))
-                                std::fprintf(stderr,
-                                             "[compute-struct-reject] escaping merge pc=%u merge=%u "
-                                             "region=%u continuation=%u\n",
-                                             F.branch_pc, F.merge_pc, hi, cont);
+                            log_recompile_diagnostic(
+                                b.diagnostic, "compute-struct-reject", "terminal",
+                                "escaping merge pc=%u merge=%u region=%u continuation=%u",
+                                F.branch_pc, F.merge_pc, hi, cont);
                             return false;
                         }
                         else_hi = hi;
@@ -16994,11 +17033,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.sreg_written.insert(then_written.begin(), then_written.end());
                     for (int reg : then_written) rs.sreg_input.erase(reg);
                     if (then_bool_b32 != rs.sreg_bool_b32) {
-                        if (getenv("PROSPER_DBG"))
-                            std::fprintf(stderr,
-                                         "[compute-struct-reject] b32 mask domain differs across "
-                                         "if/else pc=%u merge=%u\n",
-                                         F.branch_pc, F.merge_pc);
+                        log_recompile_diagnostic(
+                            b.diagnostic, "compute-struct-reject", "terminal",
+                            "b32 mask domain differs across if/else pc=%u merge=%u",
+                            F.branch_pc, F.merge_pc);
                         return false;
                     }
                     // Merge the UNION of mask keys. A mask created in only one arm is false in the
@@ -17028,10 +17066,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 const uint32_t next_pc = idx < ins.size() ? ins[idx].pc : UINT32_MAX;
                 const uint32_t next_if = bi < Fs.size() ? Fs[bi].branch_pc : UINT32_MAX;
                 const uint32_t next_loop = li < Ls.size() ? Ls[li].header_pc : UINT32_MAX;
-                std::fprintf(stderr,
-                             "[compute-struct-reject] structured emission stopped next-pc=%u "
-                             "next-if=%u next-loop=%u\n",
-                             next_pc, next_if, next_loop);
+                log_recompile_diagnostic(
+                    b.diagnostic, "compute-struct-reject", "consequent",
+                    "structured emission stopped next-pc=%u next-if=%u next-loop=%u",
+                    next_pc, next_if, next_loop);
             }
             return false;
         }
@@ -17077,7 +17115,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
-                                        const ComputeShaderConfig& config) {
+                                        const ComputeShaderConfig& config,
+                                        RecompileDiagnosticContext diagnostic) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
@@ -17091,6 +17130,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     (void)extend_terminating_if_else(code, dwords, ins);
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
+    b.diagnostic = diagnostic;
     if (config.lds_bytes) {
         uint32_t dw = (config.lds_bytes + 3) / 4;
         b.lds_dwords = std::min(16384u, std::max(1u, dw));
@@ -17233,7 +17273,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 }
 
 bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
-                                             const uint32_t* code, size_t dwords) {
+                                             const uint32_t* code, size_t dwords,
+                                             RecompileDiagnosticContext diagnostic) {
     bool low = false;
     bool high = false;
     bool guest_barrier = false;
@@ -17267,7 +17308,7 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
     bool rejected = false;
     const std::vector<ForwardIf> branches = detect_forward_ifs(
         ins, /*allow_vcc*/false, code, dwords, &safe, nullptr, &rejected,
-        /*compute_wave_branches*/true);
+        /*compute_wave_branches*/true, diagnostic);
     if (rejected) return false;
 
     auto top_level_pc = [&](uint32_t pc) {
@@ -17292,10 +17333,11 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
     return structured_wave_votes >= 4;
 }
 
-bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords) {
+bool compute_shader_prefers_native_multiwave(const uint32_t* code, size_t dwords,
+                                             RecompileDiagnosticContext diagnostic) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    return compute_shader_prefers_native_multiwave(ins, code, dwords);
+    return compute_shader_prefers_native_multiwave(ins, code, dwords, diagnostic);
 }
 
 // See FlatLoadInfo / analyze_flat_loads in the header (#1171). A `base + offset` flat address VGPR pair
@@ -17618,14 +17660,15 @@ static std::vector<uint32_t> recompile_fragment_impl(
         const FragmentInterpolationLayout* interpolation,
         uint32_t wave_size) {
     if (wave_size != 32 && wave_size != 64) return {};
+    const RecompileDiagnosticContext diagnostic{RecompileDiagnosticStage::Fragment, 0};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
         const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
-            if (getenv("PROSPER_DBG"))
-                fprintf(stderr, "[recompile-reject] pcrel dispatch specialization target=%u\n",
-                        pcrel_dispatch_target);
+            log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                     "pcrel dispatch specialization target=%u",
+                                     pcrel_dispatch_target);
             return {};
         }
     }
@@ -17648,29 +17691,33 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // narrowing EXEC to the surviving samples, so the module intentionally has no color outputs.
     // Keep other unsupported MRT-only programs fail-visible instead of accepting every no-color PS.
     if (!color_mask && !has_null_export && !has_depth_export) {
-        if (getenv("PROSPER_DBG")) {
-            fprintf(stderr,
-                    "[recompile-reject] fragment has no supported export dwords=%zu ins=%zu "
-                    "first=%08x last=%08x",
-                    dwords, ins.size(), dwords ? code[0] : 0u,
-                    dwords ? code[dwords - 1] : 0u);
-            if (pcrel_dispatch_target != UINT32_MAX)
-                fprintf(stderr, " pcrel-target=%u", pcrel_dispatch_target);
-            fputc('\n', stderr);
-        }
+        if (pcrel_dispatch_target != UINT32_MAX)
+            log_recompile_diagnostic(
+                diagnostic, "recompile-reject", "terminal",
+                "fragment has no supported export dwords=%zu ins=%zu first=%08x last=%08x "
+                "pcrel-target=%u",
+                dwords, ins.size(), dwords ? code[0] : 0u,
+                dwords ? code[dwords - 1] : 0u, pcrel_dispatch_target);
+        else
+            log_recompile_diagnostic(
+                diagnostic, "recompile-reject", "terminal",
+                "fragment has no supported export dwords=%zu ins=%zu first=%08x last=%08x",
+                dwords, ins.size(), dwords ? code[0] : 0u,
+                dwords ? code[dwords - 1] : 0u);
         return {};
     }
 
     const FragmentInterpolationLayout derived_interpolation = interpolation
         ? *interpolation : fragment_interpolation_layout(code, dwords, system_inputs);
     if (!derived_interpolation.valid) {
-        if (getenv("PROSPER_DBG"))
-            fprintf(stderr, "[recompile-reject] invalid fragment interpolation layout\n");
+        log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                 "invalid fragment interpolation layout");
         return {};
     }
     const uint32_t effective_wave_size = effective_fragment_wave_size(
         wave_size, program_dwords, shader_program_hash(code, program_dwords));
     SpirvCompute b;
+    b.diagnostic = diagnostic;
     b.wave_size = effective_wave_size;
     b.begin_fragment(rt, color_mask);
     // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
@@ -17716,11 +17763,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
                     for (uint32_t component = 0; component < widths[field]; ++component) {
                         const uint32_t value = b.system_interpolation_component(field, component);
                         if (!value) {
-                            if (getenv("PROSPER_DBG"))
-                                fprintf(stderr,
-                                        "[recompile-reject] missing fragment system interpolation "
-                                        "field=%u component=%u\n",
-                                        field, component);
+                            log_recompile_diagnostic(
+                                diagnostic, "recompile-reject", "terminal",
+                                "missing fragment system interpolation field=%u component=%u",
+                                field, component);
                             return {};
                         }
                         rs.vreg[(int)(vgpr + component)] = value;
@@ -17798,14 +17844,18 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // resource table. Loops (if any) are reconstructed by emit_body.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
         if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
-            fprintf(stderr, "[recompile-reject] pcrel target=%u body failed\n", pcrel_dispatch_target);
+            log_recompile_diagnostic(diagnostic, "recompile-reject", "consequent",
+                                     "pcrel target=%u body failed", pcrel_dispatch_target);
         return {};
     }
     if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export) {
-        if (getenv("PROSPER_DBG"))
-            fprintf(stderr, "[recompile-reject] emitted no fragment color%s%u\n",
-                    pcrel_dispatch_target != UINT32_MAX ? " pcrel-target=" : "",
-                    pcrel_dispatch_target != UINT32_MAX ? pcrel_dispatch_target : 0u);
+        if (pcrel_dispatch_target != UINT32_MAX)
+            log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                     "emitted no fragment color pcrel-target=%u",
+                                     pcrel_dispatch_target);
+        else
+            log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                     "emitted no fragment color");
         return {};
     }
     return b.finish();
@@ -18294,6 +18344,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
 
     SpirvCompute b;
+    b.diagnostic = {RecompileDiagnosticStage::Vertex, 0};
     b.capture_position = capture_position;   // geometry-probe: mark gl_Position for xfb capture (gated)
     b.vertex_lds_dwords = std::min(virtual_lds_dwords, 16384u);
     b.vertices_per_instance = rt ? rt->vertices_per_instance : 0u;
@@ -18588,9 +18639,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
         // z/w. Never observed in a vertex stage (compilers export positions/params at 32 bits);
         // reject fail-visibly until a live title exercises one.
         if (in.exp_compr) {
-            if (getenv("PROSPER_DBG"))
-                fprintf(stderr, "[recompile-reject] vertex compressed export pc=%u target=%u\n",
-                        in.pc, in.exp_target);
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "vertex compressed export pc=%u target=%u",
+                                     in.pc, in.exp_target);
             return false;
         }
         // v_cmpx is now allowed in the vertex shell (allow_exec_update=true below): a divergent block
@@ -18602,10 +18653,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             in.pc > ngg_output_gate_begin && in.pc < ngg_output_gate_end;
         if (state.exec_narrowed && !terminal_ngg_output && (in.exp_target >= 32 ||
             (in.exp_target >= 12 && in.exp_target <= 16))) {
-            if (getenv("PROSPER_DBG"))
-                fprintf(stderr,
-                        "[recompile-reject] vertex export under narrowed exec pc=%u target=%u\n",
-                        in.pc, in.exp_target);
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "vertex export under narrowed exec pc=%u target=%u",
+                                     in.pc, in.exp_target);
             return false;
         }
         if (in.exp_target == 12) {
@@ -18617,10 +18667,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
             // A position export must supply all four components (EN=0xF); a partial POS0 is not
             // meaningfully completable in the current model, so reject rather than invent components.
             if (in.exp_en != 0xFu) {
-                if (getenv("PROSPER_DBG"))
-                    fprintf(stderr,
-                            "[recompile-reject] partial vertex position export pc=%u en=0x%x\n",
-                            in.pc, in.exp_en);
+                log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                         "partial vertex position export pc=%u en=0x%x",
+                                         in.pc, in.exp_en);
                 return false;
             }
             uint32_t x = operand_bits(b, state, in, in.src[0], &eok);

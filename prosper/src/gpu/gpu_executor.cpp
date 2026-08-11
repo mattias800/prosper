@@ -1467,7 +1467,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
 
 std::vector<uint32_t> recompile_compute_shader_cached(
         const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
-        const ComputeShaderConfig& config, uint64_t* cache_identity) {
+        const ComputeShaderConfig& config, uint64_t* cache_identity,
+        RecompileDiagnosticContext diagnostic) {
     if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
@@ -1475,7 +1476,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     auto compile = [&] {
         const uint32_t* owned_code = !key.code || key.code->empty() ? nullptr : key.code->data();
         const size_t owned_dwords = key.code ? key.code->size() : 0u;
-        return recompile_compute(owned_code, owned_dwords, resources, config);
+        return recompile_compute(owned_code, owned_dwords, resources, config, diagnostic);
     };
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
@@ -5482,6 +5483,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
         }
         bool native_multiwave_wave_work = false;
+        const RecompileDiagnosticContext recompile_diagnostic{
+            RecompileDiagnosticStage::Compute, code_addr};
         {
             std::vector<Rdna2Inst> decoded;
             rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
@@ -5511,7 +5514,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
             assign_convention_bindings(*table, 2);
             native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
                 decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                shader_dwords);
+                shader_dwords, recompile_diagnostic);
             const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
                 return in.fmt == Rdna2Format::DS && in.ds_gds &&
                        (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
@@ -5632,7 +5635,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
 
         ComputeItem item;
         item.spirv = recompile_compute_shader_cached(
-            (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config);
+            (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config, nullptr,
+            recompile_diagnostic);
         item.user_sgprs = config.user_sgprs;
         item.required_subgroup_size = config.native_subgroup_size;
         item.cpu_fast_path = classify_compute_cpu_fast_path(

@@ -47,6 +47,8 @@ inline bool recompile_captured_compute(
 
     const auto& raw = raw_shader_versions[compute.raw_shader_index];
     gpu::ComputeShaderConfig config = compute.recompile_config;
+    const gpu::RecompileDiagnosticContext diagnostic{
+        gpu::RecompileDiagnosticStage::Compute, compute.code_addr};
     if (replay_device && replay_device->valid()) {
         const bool adoptable = replay_device->compute_queue_supported &&
             replay_device->storage_image_read_without_format &&
@@ -54,13 +56,14 @@ inline bool recompile_captured_compute(
         config.native_storage_format_support = adoptable
             ? replay_device->native_storage_format_support : 0;
         const bool native_multiwave = force_native_multiwave ||
-            gpu::compute_shader_prefers_native_multiwave(raw.words.data(), raw.words.size());
+            gpu::compute_shader_prefers_native_multiwave(
+                raw.words.data(), raw.words.size(), diagnostic);
         config.native_subgroup_size = gpu::select_native_compute_subgroup_size(
             *replay_device, config, native_multiwave, disable_native_subgroup);
     }
     config.packed_r11_storage = packed_r11_storage;
     std::vector<uint32_t> spirv = gpu::recompile_compute_shader_cached(
-        raw.words.data(), raw.words.size(), compute.resources.get(), config);
+        raw.words.data(), raw.words.size(), compute.resources.get(), config, nullptr, diagnostic);
     if (spirv.empty()) return false;
 
     compute.spirv = std::move(spirv);
@@ -105,8 +108,11 @@ inline bool recompile_failed_compute_stage(
         table.resources.push_back(captured.resource);
     const gpu::ShaderResourceTable* resources = stage.resource_table.present ? &table : nullptr;
     const auto& raw = raw_shader_versions[stage.raw_shader_index];
+    const gpu::RecompileDiagnosticContext diagnostic{
+        gpu::RecompileDiagnosticStage::Compute, stage.program_addr};
     spirv = gpu::recompile_compute_shader_cached(
-        raw.words.data(), raw.words.size(), resources, stage.recompile_config);
+        raw.words.data(), raw.words.size(), resources, stage.recompile_config, nullptr,
+        diagnostic);
     return true;
 }
 

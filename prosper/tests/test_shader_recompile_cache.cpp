@@ -1,10 +1,18 @@
 #include "../src/gpu/gpu_execute.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <iterator>
+#include <string>
+#include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include "test_scratch.h"
 
 using namespace prosper::gpu;
@@ -31,6 +39,84 @@ static size_t count_extension(const std::filesystem::path& directory, const char
         if (it->is_regular_file(ec) && it->path().extension() == extension) ++count;
     }
     return ec ? 0 : count;
+}
+
+struct CapturedStderr {
+    std::filesystem::path path;
+    std::string output;
+};
+
+struct ScratchCaptureFile {
+    std::filesystem::path path;
+    FILE* stream = nullptr;
+
+    explicit ScratchCaptureFile(std::filesystem::path capture_path)
+        : path(std::move(capture_path)) {
+#ifdef _WIN32
+        stream = _wfopen(path.c_str(), L"w+b");
+#else
+        stream = std::fopen(path.c_str(), "w+b");
+#endif
+    }
+
+    ~ScratchCaptureFile() {
+        if (stream) std::fclose(stream);
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+
+    ScratchCaptureFile(const ScratchCaptureFile&) = delete;
+    ScratchCaptureFile& operator=(const ScratchCaptureFile&) = delete;
+};
+
+static std::filesystem::path next_stderr_capture_path() {
+    static std::atomic<uint64_t> capture_sequence{0};
+    return prosper_test::test_scratch_dir() /
+        ("shader-recompile-stderr-" +
+         std::to_string(capture_sequence.fetch_add(1, std::memory_order_relaxed)) + ".log");
+}
+
+template <typename F>
+static CapturedStderr capture_stderr(F&& body) {
+    CapturedStderr result;
+    result.path = next_stderr_capture_path();
+    ScratchCaptureFile capture(result.path);
+    if (!capture.stream || std::fflush(stderr) != 0) return result;
+#ifdef _WIN32
+    const int stderr_fd = _fileno(stderr);
+    const int saved = _dup(stderr_fd);
+    const bool redirected = saved >= 0 && _dup2(_fileno(capture.stream), stderr_fd) == 0;
+#else
+    const int stderr_fd = fileno(stderr);
+    const int saved = dup(stderr_fd);
+    const bool redirected = saved >= 0 && dup2(fileno(capture.stream), stderr_fd) >= 0;
+#endif
+    if (!redirected) {
+        if (saved >= 0) {
+#ifdef _WIN32
+            _close(saved);
+#else
+            close(saved);
+#endif
+        }
+        return result;
+    }
+
+    body();
+    std::fflush(stderr);
+#ifdef _WIN32
+    const bool restored = _dup2(saved, stderr_fd) == 0;
+    _close(saved);
+#else
+    const bool restored = dup2(saved, stderr_fd) >= 0;
+    close(saved);
+#endif
+    if (!restored) return result;
+    std::rewind(capture.stream);
+    char bytes[4096];
+    for (size_t count; (count = std::fread(bytes, 1, sizeof bytes, capture.stream)) != 0;)
+        result.output.append(bytes, count);
+    return result;
 }
 
 // Fullscreen triangle and solid green shaders assembled for gfx1030. These are also used by the
@@ -516,23 +602,89 @@ int main() {
     compute_config.threads_x = 130;
     compute_config.threads_y = compute_config.threads_z = 1;
     compute_config.tgid_x_en = true;
+    const RecompileDiagnosticContext diagnostic_a{
+        RecompileDiagnosticStage::Compute, 0x1111222233334444ull};
+    const RecompileDiagnosticContext diagnostic_b{
+        RecompileDiagnosticStage::Compute, 0xaaaabbbbccccddddull};
     const auto direct_compute = recompile_compute(
         kCompute, std::size(kCompute), &compute_table, compute_config);
+    uint64_t cached_compute_identity = 0, relocated_diagnostic_identity = 0,
+             push_constant_identity = 0;
     const auto cached_compute = recompile_compute_shader_cached(
-        kCompute, std::size(kCompute), &compute_table, compute_config);
+        kCompute, std::size(kCompute), &compute_table, compute_config,
+        &cached_compute_identity, diagnostic_a);
+    const auto relocated_diagnostic_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, compute_config,
+        &relocated_diagnostic_identity, diagnostic_b);
     ComputeShaderConfig new_push_constants = compute_config;
     new_push_constants.user_sgprs[4] = 0x12345678;
     const auto repeated_compute = recompile_compute_shader_cached(
-        kCompute, std::size(kCompute), &compute_table, new_push_constants);
+        kCompute, std::size(kCompute), &compute_table, new_push_constants,
+        &push_constant_identity, diagnostic_b);
     ComputeShaderConfig changed_launch = compute_config;
     changed_launch.local_x = 32;
     const auto changed_compute = recompile_compute_shader_cached(
         kCompute, std::size(kCompute), &compute_table, changed_launch);
     stats = shader_recompile_cache_stats();
     CHECK(!direct_compute.empty() && cached_compute == direct_compute &&
-              repeated_compute == direct_compute && !changed_compute.empty() &&
-              changed_compute != direct_compute && stats.misses == 2 && stats.hits == 1,
+              relocated_diagnostic_compute == direct_compute && repeated_compute == direct_compute &&
+              !changed_compute.empty() && changed_compute != direct_compute &&
+              stats.misses == 2 && stats.hits == 2,
           "compute cache reuses push-constant variants and separates launch-specialized modules");
+    CHECK(cached_compute_identity != 0 &&
+              relocated_diagnostic_identity == cached_compute_identity &&
+              push_constant_identity == cached_compute_identity,
+          "diagnostic provenance stays outside compute shader cache identity");
+
+    // Diagnostic provenance is not shader semantics. Force two recompiles of one rejected site so
+    // each call must carry its own immutable program identity through the cache wrapper, builder and
+    // structurizer, while a direct standalone call must remain explicitly neutral.
+    static const uint32_t kRejectedCompute[] = {
+        0xbf890000u, // s_cbranch_execnz with target pc1: unclaimed outside a recognized loop
+        0xbf810000u, // s_endpgm
+    };
+    set_test_env("PROSPER_DBG", "1");
+    set_test_env("PROSPER_NO_SHADER_CACHE", "1");
+    const CapturedStderr diagnostic_capture = capture_stderr([&] {
+        (void)recompile_compute_shader_cached(
+            kRejectedCompute, std::size(kRejectedCompute), nullptr, compute_config,
+            nullptr, diagnostic_a);
+        (void)recompile_compute_shader_cached(
+            kRejectedCompute, std::size(kRejectedCompute), nullptr, compute_config,
+            nullptr, diagnostic_b);
+        (void)recompile_compute(kRejectedCompute, std::size(kRejectedCompute), nullptr,
+                                compute_config);
+    });
+    const std::string& diagnostic_log = diagnostic_capture.output;
+    set_test_env("PROSPER_NO_SHADER_CACHE", nullptr);
+    set_test_env("PROSPER_DBG", nullptr);
+    std::error_code diagnostic_capture_error;
+    CHECK(diagnostic_capture.path.parent_path() == prosper_test::test_scratch_dir() &&
+              !std::filesystem::exists(diagnostic_capture.path, diagnostic_capture_error) &&
+              !diagnostic_capture_error,
+          "diagnostic capture uses and cleans the process-private test scratch directory");
+    CHECK(diagnostic_log.find(
+              "[compute-struct-reject] unclaimed execnz pc=0 stage=compute "
+              "program=0x1111222233334444 role=route-decline\n") != std::string::npos &&
+              diagnostic_log.find(
+              "[compute-struct-reject] unclaimed execnz pc=0 stage=compute "
+              "program=0xaaaabbbbccccdddd role=route-decline\n") != std::string::npos,
+          "distinct compute calls retain their own program identity at the structurizer site");
+    CHECK(diagnostic_log.find(
+              " stage=compute program=0x1111222233334444 role=terminal\n") !=
+              std::string::npos &&
+              diagnostic_log.find(
+              " stage=compute program=0xaaaabbbbccccdddd role=terminal\n") !=
+              std::string::npos,
+          "terminal instruction rejects retain the same per-call diagnostic identity");
+    CHECK(diagnostic_log.find(
+              "[compute-struct-reject] unclaimed execnz pc=0 stage=compute "
+              "program=none role=route-decline\n") !=
+              std::string::npos &&
+              diagnostic_log.find(
+              " stage=compute program=none role=terminal\n") !=
+              std::string::npos,
+          "standalone compute recompilation uses an explicit neutral program identity");
 
     // A one-record 16-bit V# emits an explicit index guard and typed tail marker. Keep the cache
     // partition compact (none/u16/f16), while ensuring a wider range or the sibling conversion can

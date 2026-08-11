@@ -443,7 +443,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
 // generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
 std::vector<uint32_t> recompile_compute_shader_cached(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
-    const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr);
+    const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr,
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Compute, 0});
 SharedShaderWords recompile_vertex_chain_cached_shared(
     const uint32_t* prolog, size_t prolog_dwords,
     const uint32_t* main, size_t main_dwords,
