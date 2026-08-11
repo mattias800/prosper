@@ -3631,6 +3631,26 @@ int main() {
     CHECK(got32c.size()==1 && std::fabs(got32c[0]-7.0f)<1e-3f,
           "kernel 32c LDS min/max atomics update shared memory exactly");
 
+    // Inactive lanes retain the old address VGPR when GTA narrows EXEC to lane zero. Give those
+    // lanes a deliberately out-of-range address before the exact B128+B64 gather: the six LDS
+    // AccessChain/OpLoad pairs must live inside their active branches, while OpPhi preserves each
+    // inactive destination. Counting the six structural regions pins that production call site;
+    // merely selecting the result after an unconditional load would have no such regions.
+    const uint32_t predicated_wide_lds_reads[] = {
+        0x7e0802ffu, 0xfffffffcu,            // v4 = stale/OOB byte address in every lane
+        0xbefe0481u,                         // s_mov_b64 exec, 1
+        0x7e080280u,                         // v_mov_b32 v4, 0 in lane zero only
+        0xdbfc0000u, 0x00000004u,            // exact ds_read_b128 v[0:3], v4
+        0xd9d80010u, 0x04000004u,            // exact ds_read_b64 v[4:5], v4
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> predicated_wide_lds_spv = recompile_valu(
+        predicated_wide_lds_reads, std::size(predicated_wide_lds_reads), 6, 0);
+    CHECK(!predicated_wide_lds_spv.empty() &&
+              count_spirv_opcode(predicated_wide_lds_spv, 247) == 6 &&
+              count_spirv_opcode(predicated_wide_lds_spv, 245) == 6,
+          "GTA's lane-zero B128+B64 gather branches around all six LDS loads and phi-merges fallbacks");
+
     // GTA V exec_cs_413ced900 pc69 is the exact non-returning DS_MIN_F32 packet below. The shader
     // initializes six LDS bounds to infinities, atomically reduces three minima and three maxima,
     // then reads the completed box. SPIR-V 1.3 has no core float atomic min/max, so the lowering
@@ -3654,6 +3674,7 @@ int main() {
         for (uint32_t vgpr = 6; vgpr <= 8; ++vgpr) literal(vgpr, 0xff800000u);
         for (uint32_t vgpr = 9; vgpr <= 11; ++vgpr) literal(vgpr, 0x7f800000u);
         code.push_back(0x7e000301u | (data_vgpr << 17u)); // v_mov_b32 data0, v1
+        literal(4, 0xfffffffcu);                          // stale/OOB in inactive gather lanes
         code.push_back(0xbefe0481u);                      // s_mov_b64 exec, 1
         for (uint32_t vgpr = 0; vgpr < 6; ++vgpr) literal(vgpr, initial[vgpr]);
         const uint32_t live_tail[] = {
@@ -3668,8 +3689,14 @@ int main() {
             0xd84c000cu, 0x00000600u,            // pc75/77/79 three exact DS_MAX_F32
             0xd84c0010u, 0x00000700u,
             0xd84c0014u, 0x00000800u,
-            0xbf8a0000u,                         // s_barrier
-            0xd8d80000u | byte_offset, 0x0a000000u, // ds_read_b32 v10, v0, matching offset
+            0xbefe0481u,                         // pc81 s_mov_b64 exec, 1
+            0x7e080280u,                         // pc82 v_mov_b32 v4, 0
+            0xdbfc0000u, 0x00000004u,            // pc83 ds_read_b128 v[0:3], v4
+            0xd9d80010u, 0x04000004u,            // pc85 ds_read_b64 v[4:5], v4
+            0xbf8cc17fu,                         // pc87 s_waitcnt lgkmcnt(0)
+            0xbefe04c1u,                         // s_mov_b64 exec, -1
+            0x7e0002ffu, byte_offset,            // v_mov_b32 v0, selected result address
+            0xd8d80000u, 0x0a000000u,            // ds_read_b32 v10, v0 (semantic check)
             0xbf810000u,
         };
         code.insert(code.end(), std::begin(live_tail), std::end(live_tail));
@@ -3689,7 +3716,10 @@ int main() {
                   count_spirv_opcode(spv, 237) == 0,
               "GTA DS_MIN/MAX_F32 group uses six compare-exchange loops, not integer min");
         CHECK(count_spirv_opcode(spv, 224) == 2,
-              "GTA lane-zero LDS initialization gains one publication barrier before its guest barrier");
+              "GTA LDS atomic group gains publication and completion barriers without a guest barrier");
+        CHECK(count_spirv_opcode(spv, 247) == 12 &&
+                  count_spirv_opcode(spv, 245) == 12,
+              "GTA lane-zero initializer and gather keep six LDS loads inside EXEC selections");
         if (spv.empty()) return std::vector<float>{};
         std::vector<float> input(WG * 2u);
         for (uint32_t lane = 0; lane < WG; ++lane) {
@@ -3705,6 +3735,34 @@ int main() {
             return bits_of(value) == expected;
         });
     };
+
+    // EXEC=1 means one ordinary-store writer per guest wave, not per workgroup. GTA's live
+    // local64/Wave64 launch therefore has exactly one initializer; a two-wave workgroup would race
+    // the same six addresses and must stay fail-visible in both portable and native subgroup modes.
+    const std::vector<uint32_t> ds_fminmax_launch_code = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    ComputeShaderConfig portable_ds_fminmax_config;
+    portable_ds_fminmax_config.local_x = 64;
+    portable_ds_fminmax_config.wave_size = 64;
+    const std::vector<uint32_t> portable_ds_fminmax_spv = recompile_compute(
+        ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+        portable_ds_fminmax_config);
+    ComputeShaderConfig native_ds_fminmax_config = portable_ds_fminmax_config;
+    native_ds_fminmax_config.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_ds_fminmax_spv = recompile_compute(
+        ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+        native_ds_fminmax_config);
+    CHECK(!portable_ds_fminmax_spv.empty() && !native_ds_fminmax_spv.empty(),
+          "GTA's single-wave LDS float atomic launch recompiles in portable and native modes");
+    ComputeShaderConfig portable_multiwave_ds_fminmax_config = portable_ds_fminmax_config;
+    portable_multiwave_ds_fminmax_config.local_x = 128;
+    ComputeShaderConfig native_multiwave_ds_fminmax_config = native_ds_fminmax_config;
+    native_multiwave_ds_fminmax_config.local_x = 128;
+    CHECK(recompile_compute(ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+                            portable_multiwave_ds_fminmax_config).empty() &&
+              recompile_compute(ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+                                native_multiwave_ds_fminmax_config).empty(),
+          "GTA's lane-zero LDS initializer rejects an unproved multi-wave workgroup in both modes");
 
     const std::vector<float> got32c_fmin = run_ds_fminmax(
         0xd8480000u, 0x00000900u, 0x7f800000u,
@@ -3773,6 +3831,33 @@ int main() {
     CHECK(recompile_valu(
               skipped_ds_fmin_lane0.data(), skipped_ds_fmin_lane0.size(), 2, 10).empty(),
           "branch entering after GTA's lane-zero EXEC writer invalidates the single-writer proof");
+    std::vector<uint32_t> crossed_ds_fmin_completion = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    const auto completion_first_fmin = std::find(
+        crossed_ds_fmin_completion.begin(), crossed_ds_fmin_completion.end(), 0xd8480000u);
+    const auto completion_lane0 = std::find(
+        completion_first_fmin, crossed_ds_fmin_completion.end(), 0xbefe0481u);
+    const auto completion_read64 = std::find(
+        completion_lane0, crossed_ds_fmin_completion.end(), 0xd9d80010u);
+    CHECK(completion_first_fmin != crossed_ds_fmin_completion.end() &&
+              completion_lane0 != crossed_ds_fmin_completion.end() &&
+              completion_read64 != crossed_ds_fmin_completion.end(),
+          "GTA LDS completion regression contains the exact atomic/gather suffix");
+    if (completion_lane0 != crossed_ds_fmin_completion.end() &&
+        completion_read64 != crossed_ds_fmin_completion.end()) {
+        const uint32_t target_pc = static_cast<uint32_t>(
+            std::distance(crossed_ds_fmin_completion.begin(), completion_lane0));
+        const auto branch_at = completion_read64 + 2;
+        const uint32_t branch_pc = static_cast<uint32_t>(
+            std::distance(crossed_ds_fmin_completion.begin(), branch_at));
+        const int32_t simm = static_cast<int32_t>(target_pc) -
+                             static_cast<int32_t>(branch_pc + 1u);
+        crossed_ds_fmin_completion.insert(
+            branch_at, 0xbf820000u | static_cast<uint16_t>(simm));
+    }
+    CHECK(recompile_valu(crossed_ds_fmin_completion.data(),
+                         crossed_ds_fmin_completion.size(), 2, 10).empty(),
+          "back-edge after GTA's gather cannot cross the synthesized completion barrier");
 
     // Encoding boundaries: the live opcode is LDS-only and has no DATA1/VDST operand. These two
     // one-bit mutations perturb that exact production packet and must remain fail-visible.

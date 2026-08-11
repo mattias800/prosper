@@ -435,7 +435,11 @@ int main(int argc, char** argv) {
                             0xd84c000cu, 0x00000600u,
                             0xd84c0010u, 0x00000700u,
                             0xd84c0014u, 0x00000800u,
-                            0xbf8a0000u, 0xd8d80000u, 0x00000000u, 0xbf810000u};
+                            0xbefe0481u,                         // pc81 exec = lane zero
+                            0x7e080280u,                         // pc82 v4 = byte address zero
+                            0xdbfc0000u, 0x00000004u,            // pc83 ds_read_b128 v[0:3], v4
+                            0xd9d80010u, 0x04000004u,            // pc85 ds_read_b64 v[4:5], v4
+                            0xbf8cc17fu, 0xbf810000u};           // wait; end (no guest barrier)
       dump(dir, "compute_ds_min_f32", recompile_valu(c, std::size(c), 2, 0)); }
     // Compute MUBUF store (buffer_store_format_x).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0xe0102000u,0x80020302u,0xbf810000u};
