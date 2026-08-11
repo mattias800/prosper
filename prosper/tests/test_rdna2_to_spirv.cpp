@@ -1730,7 +1730,7 @@ int main() {
         0xd761001fu, 0x00010a7eu, // spill EXEC_LO through v31 lane 5
         0xbefe04c1u,              // restore full EXEC for the dispatcher
         0xd7600006u, 0x00010b1fu, // restore EXEC_LO into s6
-        0xbe860380u,              // exact overwrite site: s_mov_b32 s6,0
+        0xb0060000u,              // exact overwrite site: s_movk_i32 s6,0
         0xd7600007u, 0x00010d1fu, // restore EXEC_HI into adjacent s7
         0xbefe0406u,              // must not consume stale LO plus fresh HI as a mask
     };
