@@ -4906,48 +4906,73 @@ int main() {
     }
     printf("  [ok]   compute atomic-buffer view rejects compressed and mip-tail images\n");
 
-    // Astro Bot's world-map traversal kernel uses the RTIP 1.1 BVH instruction with eleven NSA
-    // address operands. It is lowered to ordinary SSBO loads and scalar ALU, so this remains usable
-    // on Vulkan devices without a ray-query feature. Keep the gate exact: accepting a nearby MIMG
-    // flag combination would silently assign the wrong hardware intersection contract.
-    const uint32_t cs_bvh_intersect[] = {
-        0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+    // GTA V's program 0x205b5e8600 uses the supported RTIP 1.1 BVH instruction at exact pc 1476
+    // with eleven NSA address operands and a 64-byte descriptor. It is lowered to ordinary SSBO
+    // loads and scalar ALU, so this remains usable on Vulkan devices without a ray-query feature.
+    // Keep the gate exact: accepting a nearby MIMG flag combination would silently assign the wrong
+    // hardware intersection contract.
+    constexpr uint32_t gta_bvh_pc = 1476u;
+    std::vector<uint32_t> cs_bvh_intersect(gta_bvh_pc, 0xbf800000u); // s_nop 0
+    const uint32_t gta_bvh_packet[] = {
+        0xf1989f07u, 0x00060202u, 0x28292c23u, 0x22262725u, 0x00002a24u,
         0xbf810000u,
     };
-    uint32_t bvh_node_words[32]{};
+    cs_bvh_intersect.insert(cs_bvh_intersect.end(), std::begin(gta_bvh_packet),
+                            std::end(gta_bvh_packet));
+    uint32_t bvh_node_words[16]{};
     ShaderResourceTable rt_bvh;
     { ShaderResource bvh{}; bvh.cls = ResourceClass::ConstantBuffer;
       bvh.format = DataFormat::Uint32; bvh.num_components = 1;
-      bvh.binding = 4; bvh.size = sizeof(bvh_node_words); bvh.fetch_pc = 0;
+      bvh.binding = 4; bvh.size = sizeof(bvh_node_words); bvh.fetch_pc = gta_bvh_pc;
       bvh.host_data = reinterpret_cast<uint8_t*>(bvh_node_words);
       bvh.host_data_size = sizeof(bvh_node_words); rt_bvh.resources.push_back(bvh); }
     ComputeShaderConfig bvh_config;
     bvh_config.local_x = 1;
     const std::vector<uint32_t> bvh_spv = recompile_compute(
-        cs_bvh_intersect, std::size(cs_bvh_intersect), &rt_bvh, bvh_config);
+        cs_bvh_intersect.data(), cs_bvh_intersect.size(), &rt_bvh, bvh_config);
     const DescriptorValidationReport bvh_report = validate_spirv_descriptor_interface(
         bvh_spv, &rt_bvh, 0, SpirvShaderStage::Compute, false);
     if (bvh_spv.empty() || !bvh_report.ok() || bvh_report.descriptors.size() != 1 ||
         bvh_report.descriptors[0].kind != SpirvDescriptorKind::StorageBuffer ||
         !has_opcode(bvh_spv, 61u) || !has_opcode(bvh_spv, 129u) ||
         !has_opcode(bvh_spv, 133u) || !has_opcode(bvh_spv, 169u)) {
-        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY lacks its SSBO/ALU lowering\n");
+        printf("  [FAIL] GTA's 64-byte IMAGE_BVH_INTERSECT_RAY lacks its SSBO/ALU lowering\n");
         return 1;
     }
-    if (!recompile_compute(cs_bvh_intersect, std::size(cs_bvh_intersect),
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
                            nullptr, bvh_config).empty()) {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY was accepted without its BVH bytes\n");
         return 1;
     }
-    uint32_t unsupported_bvh[std::size(cs_bvh_intersect)];
-    std::copy(std::begin(cs_bvh_intersect), std::end(cs_bvh_intersect), unsupported_bvh);
-    unsupported_bvh[0] &= ~(1u << 15); // R128=0 has a different destination contract.
-    if (!recompile_compute(unsupported_bvh, std::size(unsupported_bvh),
+    std::vector<uint32_t> unsupported_bvh = cs_bvh_intersect;
+    unsupported_bvh[gta_bvh_pc] &= ~(1u << 15); // R128=0 has a different destination contract.
+    if (!recompile_compute(unsupported_bvh.data(), unsupported_bvh.size(),
                            &rt_bvh, bvh_config).empty()) {
         printf("  [FAIL] unverified IMAGE_BVH_INTERSECT_RAY flags were accepted\n");
         return 1;
     }
-    printf("  [ok]   Astro IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
+    ShaderResourceTable short_bvh = rt_bvh;
+    short_bvh.resources[0].size = 60u;
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
+                           &short_bvh, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a sub-64-byte BVH\n");
+        return 1;
+    }
+    ShaderResourceTable misaligned_bvh = rt_bvh;
+    misaligned_bvh.resources[0].size = 66u;
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
+                           &misaligned_bvh, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a non-dword-aligned BVH\n");
+        return 1;
+    }
+    ShaderResourceTable wrong_class_bvh = rt_bvh;
+    wrong_class_bvh.resources[0].cls = ResourceClass::VertexBuffer;
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
+                           &wrong_class_bvh, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a non-constant-buffer resource\n");
+        return 1;
+    }
+    printf("  [ok]   GTA's exact-pc 64-byte IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting

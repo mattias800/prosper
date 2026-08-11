@@ -8790,7 +8790,36 @@ int main() {
         CHECK(edge_grown_ok,
               "IMAGE_BVH_INTERSECT_RAY applies descriptor-selected box growth");
 
-        std::vector<uint32_t> tri_words(32, 0u);
+        ShaderResourceTable bvh64_rt = bvh_rt;
+        bvh64_rt.resources[0].size = 64u;
+        bvh64_rt.resources[0].bvh_box_grow = 0u;
+
+        // A 64-byte allocation cannot contain a complete FP32 box node. It must therefore return
+        // no-hit even though the first child's ID and six bounds fit in the allocation and describe
+        // a hit. This catches unsigned underflow in the 128-byte node bound: (64-128)/8 would make
+        // every node offset appear valid while the individually-clamped loads conceal the OOB read.
+        std::vector<uint32_t> short_box_words(16, 0u);
+        short_box_words[0] = 0x100u;
+        short_box_words[4] = bits_of(-1.0f); short_box_words[5] = bits_of(-1.0f);
+        short_box_words[6] = bits_of(-1.0f); short_box_words[7] = bits_of( 1.0f);
+        short_box_words[8] = bits_of( 1.0f); short_box_words[9] = bits_of( 1.0f);
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+            set_ray(lane, 5u, 0.0f, 0.0f, -5.0f);
+        bool short_box_ok = true;
+        for (uint32_t component = 0; component < 4; ++component) {
+            const std::vector<uint32_t> module = recompile_valu(
+                bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh64_rt);
+            const std::vector<float> output = module.empty() ? std::vector<float>{} :
+                prosper::test::run_compute(
+                    module, bvh_inputs, lanes, lanes, short_box_words);
+            short_box_ok &= !module.empty() && output.size() == lanes;
+            for (uint32_t lane = 0; lane < output.size(); ++lane)
+                short_box_ok &= bits_of(output[lane]) == 0xffffffffu;
+        }
+        CHECK(short_box_ok,
+              "64-byte IMAGE_BVH_INTERSECT_RAY rejects an incomplete FP32 box node");
+
+        std::vector<uint32_t> tri_words(16, 0u);
         tri_words[0] = bits_of(9.0f); tri_words[1] = bits_of(9.0f); tri_words[2] = bits_of(9.0f);
         tri_words[3] = bits_of(0.0f); tri_words[4] = bits_of(0.0f); tri_words[5] = bits_of(0.0f); // V1
         tri_words[6] = bits_of(0.0f); tri_words[7] = bits_of(1.0f); tri_words[8] = bits_of(0.0f); // V2
@@ -8798,13 +8827,15 @@ int main() {
         tri_words[15] = 0x00000900u; // type-1 I=vertex1, J=vertex2
         for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 1u, 0.25f, 0.25f, -1.0f);
         const std::vector<uint32_t> tri_module = recompile_valu(
-            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
-        const std::vector<float> tri_output = prosper::test::run_compute(
-            tri_module, bvh_inputs, lanes, lanes, tri_words);
+            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh64_rt);
+        const std::vector<float> tri_output = tri_module.empty() ? std::vector<float>{} :
+            prosper::test::run_compute(
+                tri_module, bvh_inputs, lanes, lanes, tri_words);
         bool tri_ok = tri_output.size() == lanes;
         for (uint32_t lane = 0; lane < tri_output.size(); ++lane)
             tri_ok &= bits_of(tri_output[lane]) == bits_of(-1.0f);
-        CHECK(tri_ok, "IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
+        CHECK(!tri_module.empty() && tri_ok,
+              "64-byte IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

@@ -11015,7 +11015,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     in.mimg_glc || in.src[2].value != 0 || (in.words[4] & 0xffff0000u) != 0u ||
                     !bvh || bvh->cls != ResourceClass::ConstantBuffer ||
                     bvh->format != DataFormat::Uint32 || bvh->num_components != 1u ||
-                    bvh->size < 128u || (bvh->size & 3u) != 0u) {
+                    bvh->size < 64u || (bvh->size & 3u) != 0u) {
                     ok = false;
                     return true;
                 }
@@ -11049,7 +11049,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t dword_count = bvh->size / 4u;
                 const uint32_t valid64 = b.ucmp(
                     Op_ULessThanEqual, node_offset, b.uconst((bvh->size - 64u) / 8u));
-                const uint32_t valid128 = b.ucmp(
+                const uint32_t valid128 = bvh->size < 128u ? b.bfalse() : b.ucmp(
                     Op_ULessThanEqual, node_offset, b.uconst((bvh->size - 128u) / 8u));
 
                 // Every speculative load is independently clamped to dword zero. Results from a

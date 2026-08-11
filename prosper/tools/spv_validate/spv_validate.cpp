@@ -459,6 +459,18 @@ int main(int argc, char** argv) {
       ComputeShaderConfig cfg; cfg.local_x=1;
       dump(dir, "compute_bvh_intersect", recompile_compute(c, sizeof(c)/4, &rt, cfg),
            "recompile_compute"); }
+    // GTA V's exact program 0x205b5e8600 pc1476 packet uses a 64-byte BVH. This separately covers
+    // the constant-false 128-byte-node bound that triangle and FP16-box allocations require.
+    { constexpr uint32_t pc = 1476u;
+      std::vector<uint32_t> c(pc, 0xbf800000u); // s_nop 0
+      const uint32_t tail[] = {0xf1989f07u,0x00060202u,0x28292c23u,0x22262725u,0x00002a24u,
+                               0xbf810000u};
+      c.insert(c.end(), tail, tail + sizeof(tail)/sizeof(tail[0]));
+      ShaderResourceTable rt; ShaderResource bvh{}; bvh.cls=ResourceClass::ConstantBuffer;
+      bvh.format=DataFormat::Uint32; bvh.num_components=1; bvh.binding=4;
+      bvh.size=64; bvh.fetch_pc=pc; rt.resources.push_back(bvh);
+      ComputeShaderConfig cfg; cfg.local_x=1;
+      dump(dir, "compute_bvh_intersect_64", recompile_compute(c.data(), c.size(), &rt, cfg)); }
     // Compute EXEC-predicated store (v_cmpx + guard execz + store).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0x7e0a0284u,0x7da20b02u,0xbf880002u,0xe0102000u,0x80020302u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
