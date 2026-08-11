@@ -3765,6 +3765,14 @@ int main() {
     CHECK(recompile_valu(
               skipped_ds_fmin_barrier.data(), skipped_ds_fmin_barrier.size(), 2, 10).empty(),
           "branch that skips the LDS publication boundary remains rejected");
+    std::vector<uint32_t> skipped_ds_fmin_lane0 = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    const auto lane0_exec = std::find(
+        skipped_ds_fmin_lane0.begin(), skipped_ds_fmin_lane0.end(), 0xbefe0481u);
+    skipped_ds_fmin_lane0.insert(lane0_exec, 0xbf840001u); // branch over EXEC=1 only
+    CHECK(recompile_valu(
+              skipped_ds_fmin_lane0.data(), skipped_ds_fmin_lane0.size(), 2, 10).empty(),
+          "branch entering after GTA's lane-zero EXEC writer invalidates the single-writer proof");
 
     // Encoding boundaries: the live opcode is LDS-only and has no DATA1/VDST operand. These two
     // one-bit mutations perturb that exact production packet and must remain fail-visible.
@@ -3794,6 +3802,14 @@ int main() {
     };
     CHECK(recompile_valu(unproved_ds_fmin_store, std::size(unproved_ds_fmin_store), 10, 0).empty(),
           "ordinary LDS store before DS_MIN_F32 stays rejected without a uniform publication proof");
+    const uint32_t unproved_ds_write2_b64_fmin[] = {
+        0x7e000280u,
+        0xd9380000u, 0x00030100u, // ds_write2_b64 v0, v[1:2], v[3:4]
+        0xd8480000u, 0x00000900u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(
+              unproved_ds_write2_b64_fmin, std::size(unproved_ds_write2_b64_fmin), 10, 0).empty(),
+          "DS_WRITE2_B64 before DS_MIN_F32 remains an inventoried unsynchronized store");
 
     // Plucky Squire's first-gameplay compute shaders use the non-returning DS_OR_B32 form. Seed an
     // LDS dword with 4, OR in 3 using the exact opcode-0x0a encoding, then read back 7.
