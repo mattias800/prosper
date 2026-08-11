@@ -426,6 +426,86 @@ struct SpirvCompute {
     // mirror it exactly and bitcast back. The result is UNDEFINED when the operand is zero —
     // every caller must exclude that input rather than relying on a -1 that is not specified.
     uint32_t find_umsb(uint32_t a) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, Glsl_FindUMsb, a}); return i2u(ri); }
+    // IEEE-754 binary32 ldexp on raw bits, with round-to-nearest-even for a subnormal result.
+    // GLSL.std.450 Ldexp is NOT sufficient here: its contract leaves an overflowing product and
+    // exp>128 undefined, while a guest exponent is an arbitrary i32. Keep the whole operation in
+    // the integer domain so zero signs, infinities and NaN payloads survive exactly, and so every
+    // shift remains in SPIR-V's defined [0,31] range. Exponents outside [-512,512] can be clamped
+    // before the calculation: every finite nonzero binary32 must overflow above that interval or
+    // round to signed zero below it.
+    uint32_t ldexp_f32_bits(uint32_t bits, uint32_t exponent) {
+        const uint32_t sign = ibin(Op_BitwiseAnd, bits, uconst(0x80000000u));
+        const uint32_t magnitude = ibin(Op_BitwiseAnd, bits, uconst(0x7fffffffu));
+        const uint32_t raw_exp = ibin(Op_ShiftRightLogical, magnitude, uconst(23));
+        const uint32_t fraction = ibin(Op_BitwiseAnd, magnitude, uconst(0x007fffffu));
+
+        // Normalize a subnormal input into a 24-bit significand with bit 23 set. FindUMsb is
+        // undefined at zero, so substitute one for that otherwise-dead calculation; signed zero
+        // is selected back unchanged at the end.
+        const uint32_t fraction_zero = ucmp(Op_IEqual, fraction, uconst(0));
+        const uint32_t safe_fraction = sel(fraction_zero, uconst(1), fraction);
+        const uint32_t sub_shift = ibin(Op_ISub, uconst(23), find_umsb(safe_fraction));
+        const uint32_t sub_significand =
+            ibin(Op_ShiftLeftLogical, fraction, sub_shift); // sub_shift is in [1,23]
+        const uint32_t normal_significand =
+            ibin(Op_BitwiseOr, fraction, uconst(0x00800000u));
+        const uint32_t input_subnormal = ucmp(Op_IEqual, raw_exp, uconst(0));
+        const uint32_t significand =
+            sel(input_subnormal, sub_significand, normal_significand);
+        const uint32_t normal_unbiased = ibin(Op_ISub, raw_exp, uconst(127));
+        const uint32_t sub_unbiased = ibin(Op_ISub, uconst(static_cast<uint32_t>(-126)),
+                                           sub_shift);
+        const uint32_t unbiased = sel(input_subnormal, sub_unbiased, normal_unbiased);
+
+        const uint32_t bounded_exponent = sext2(
+            Glsl_SMin,
+            sext2(Glsl_SMax, exponent, uconst(static_cast<uint32_t>(-512))),
+            uconst(512));
+        const uint32_t adjusted = ibin(Op_IAdd, unbiased, bounded_exponent);
+
+        const uint32_t normal_exp = ibin(
+            Op_ShiftLeftLogical, ibin(Op_IAdd, adjusted, uconst(127)), uconst(23));
+        const uint32_t normal_result = ibin(
+            Op_BitwiseOr, normal_exp,
+            ibin(Op_BitwiseAnd, significand, uconst(0x007fffffu)));
+
+        // For adjusted<-126, shift the normalized 24-bit significand into the subnormal range.
+        // The calculations exist in SSA for every input, so clamp the working shift to [1,24]
+        // even when the normal/overflow result is ultimately selected. shift>=25 is strictly below
+        // half the least subnormal (shift==24 retains the exact halfway tie and its RNE decision).
+        const uint32_t under_shift =
+            ibin(Op_ISub, uconst(static_cast<uint32_t>(-126)), adjusted);
+        const uint32_t safe_under_shift = uext2(
+            Glsl_UMax, uconst(1), uext2(Glsl_UMin, under_shift, uconst(24)));
+        const uint32_t truncated =
+            ibin(Op_ShiftRightLogical, significand, safe_under_shift);
+        const uint32_t remainder_mask = ibin(
+            Op_ISub, ibin(Op_ShiftLeftLogical, uconst(1), safe_under_shift), uconst(1));
+        const uint32_t remainder = ibin(Op_BitwiseAnd, significand, remainder_mask);
+        const uint32_t half = ibin(
+            Op_ShiftLeftLogical, uconst(1), ibin(Op_ISub, safe_under_shift, uconst(1)));
+        const uint32_t remainder_gt_half = ucmp(Op_UGreaterThan, remainder, half);
+        const uint32_t remainder_eq_half = ucmp(Op_IEqual, remainder, half);
+        const uint32_t truncated_odd = ucmp(
+            Op_INotEqual, ibin(Op_BitwiseAnd, truncated, uconst(1)), uconst(0));
+        const uint32_t round_up = lor(remainder_gt_half,
+                                      land(remainder_eq_half, truncated_odd));
+        const uint32_t rounded = ibin(
+            Op_IAdd, truncated, sel(round_up, uconst(1), uconst(0)));
+        const uint32_t too_small = scmp(Op_SGreaterThanEqual, under_shift, uconst(25));
+        const uint32_t subnormal_result = sel(too_small, uconst(0), rounded);
+
+        const uint32_t is_underflow =
+            scmp(Op_SLessThan, adjusted, uconst(static_cast<uint32_t>(-126)));
+        const uint32_t is_overflow = scmp(Op_SGreaterThan, adjusted, uconst(127));
+        uint32_t finite_result = sel(is_underflow, subnormal_result, normal_result);
+        finite_result = sel(is_overflow, uconst(0x7f800000u), finite_result);
+        finite_result = ibin(Op_BitwiseOr, sign, finite_result);
+
+        const uint32_t is_special = ucmp(Op_IEqual, raw_exp, uconst(255));
+        const uint32_t is_zero = ucmp(Op_IEqual, magnitude, uconst(0));
+        return sel(is_special, bits, sel(is_zero, bits, finite_result));
+    }
     // GLSL.std.450 float ext-instructions on bit-operands -> bit-result.
     uint32_t fext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a)}); return bcu(r); }
     uint32_t fext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a), bcf(b)}); return bcu(r); }
@@ -9286,6 +9366,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
                 uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
+            } else if (in.opcode == 0x362) {                          // v_ldexp_f32
+                // AMD opcode 866: D.f = S0.f * 2**S1.i. The exact GTA V production packet is
+                // d7620000,0002030d (`v_ldexp_f32 v0,v13,v1`) with no modifiers. Admit that proven
+                // shape only for now: ABS/NEG on the integer exponent and output-modifier denormal
+                // behavior need separate contracts, and silently ignoring either would corrupt
+                // mip/scale reconstruction. ldexp_f32_bits covers the full unmodified i32 exponent
+                // domain without relying on GLSL.std.450 Ldexp's undefined overflow cases.
+                if (in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                    in.clamp || in.omod) {
+                    ok = false;
+                } else {
+                    vreg[in.dst.value] = b.ldexp_f32_bits(
+                        val(in.src[0]), val(in.src[1]));
+                }
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):
                 // v_cubeid_f32 (0x144) face id, v_cubesc_f32 (0x145) S numerator, v_cubetc_f32

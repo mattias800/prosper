@@ -92,6 +92,27 @@ int main() {
     // inst6: v_fma_f32 v0, v1, v2, v3 (VOP3) -> dst VGPR0, srcs VGPR1/2/3
     CHECK(isV(ins[6].dst, 0) && ins[6].n_src == 3 && isV(ins[6].src[0], 1) &&
           isV(ins[6].src[1], 2) && isV(ins[6].src[2], 3), "v_fma_f32 VOP3 operands");
+    // GTA V exec_cs_413d1bf00 pc458, exact llvm-mc gfx1010 packet:
+    // `v_ldexp_f32 v0, v13, v1`. It is a two-source VOP3A op; the zeroed reserved SRC2 field must
+    // not escape as a phantom s0 dependency. Keep modifier decoding visible so the bounded emitter
+    // can reject unproved forms instead of silently dropping them.
+    const uint32_t gta_ldexp_words[] = {0xd7620000u, 0x0002030du};
+    const Rdna2Inst gta_ldexp = rdna2_decode_one(gta_ldexp_words, 2);
+    CHECK(gta_ldexp.fmt == Rdna2Format::VOP3 && gta_ldexp.opcode == 0x362u &&
+          gta_ldexp.n_src == 2 && isV(gta_ldexp.dst, 0) &&
+          isV(gta_ldexp.src[0], 13) && isV(gta_ldexp.src[1], 1) &&
+          gta_ldexp.src[2].kind == OperandKind::None &&
+          !gta_ldexp.clamp && gta_ldexp.omod == 0 &&
+          !gta_ldexp.src_abs[0] && !gta_ldexp.src_abs[1] &&
+          !gta_ldexp.src_neg[0] && !gta_ldexp.src_neg[1],
+          "GTA V v_ldexp_f32 decodes two sources and no phantom s0/modifiers");
+    const uint32_t gta_ldexp_modifier_words[] = {
+        0xd7628100u, 0x2802030du, // src0 ABS, CLAMP, src0 NEG, OMOD x2
+    };
+    const Rdna2Inst gta_ldexp_modifier = rdna2_decode_one(gta_ldexp_modifier_words, 2);
+    CHECK(gta_ldexp_modifier.src_abs[0] && gta_ldexp_modifier.src_neg[0] &&
+          gta_ldexp_modifier.clamp && gta_ldexp_modifier.omod == 1,
+          "v_ldexp_f32 modifier bits remain visible to the fail-closed emitter");
     // inst7: s_load_dwordx4 s[0:3], s[4:5], 0x0 (SMEM) -> op 0x2, SDATA s0, SBASE s4 (pair), offset 0
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");

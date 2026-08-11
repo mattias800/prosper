@@ -472,6 +472,14 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
+            // V_LDEXP_F32 is likewise a two-source VOP3A instruction. Its reserved SRC2 bits are
+            // zero in GTA V's exact packet and therefore decode as s0 unless cleared here. Exposing
+            // that phantom scalar read can make CFG/provenance analysis reject an otherwise valid
+            // instruction when s0 differs across a merge, before the opcode emitter is reached.
+            if (i.opcode == 0x362u) {
+                i.src[2] = {};
+                i.n_src = 2;
+            }
             // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
             // VERIFIED(llvm-mc gfx1030): 0x351/0x354/0x357 are v_min3_f16/v_max3_f16/v_med3_f16

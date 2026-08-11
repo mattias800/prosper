@@ -309,6 +309,11 @@ int main(int argc, char** argv) {
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};
       dump(dir, "compute_alignbyte", recompile_valu(c, std::size(c), 6, 6), "recompile_valu"); }
+    // GTA V exec_cs_413d1bf00 pc458: exact V_LDEXP_F32 production packet. This exercises the
+    // integer-domain edge lowering under the strict Vulkan SPIR-V validator, not merely the generic
+    // recompile_valu entry point above.
+    { const uint32_t c[] = {0xd7620000u, 0x0002030du, 0xbf810000u};
+      dump(dir, "compute_ldexp", recompile_valu(c, sizeof(c) / sizeof(c[0]), 14, 0)); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }

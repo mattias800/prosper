@@ -2482,6 +2482,46 @@ int main() {
     }
     printf("  [ok]   GTA V v_ffbh_u32 lowers in crossing Wave64 CFG; SDWA NEG stays rejected\n");
 
+    // GTA V exec_cs_413d1bf00 stops at pc458 on this exact packet. Require the production words,
+    // the two-source decode, and the portable integer-domain lowering. GLSL.std.450 Ldexp (53) is
+    // deliberately forbidden here because its overflow/large-exponent result is undefined; the
+    // FindUMsb used to normalize a nonzero subnormal input is guarded inside the builder helper.
+    const uint32_t gta_ldexp_f32[] = {
+        0xd7620000u, 0x0002030du,             // v_ldexp_f32 v0,v13,v1
+        0xbf810000u,
+    };
+    const auto gta_ldexp_f32_spv = recompile_valu(
+        gta_ldexp_f32, std::size(gta_ldexp_f32), 14, 0);
+    if (gta_ldexp_f32_spv.empty() || has_glsl_ext_inst(gta_ldexp_f32_spv, 53) ||
+        !has_glsl_ext_inst(gta_ldexp_f32_spv, 75) ||
+        !has_signed_i32_type(gta_ldexp_f32_spv) ||
+        !type_result_ids_are_nonzero(gta_ldexp_f32_spv, nullptr)) {
+        printf("  [FAIL] GTA V v_ldexp_f32 did not emit its defined integer-domain SPIR-V\n");
+        return 1;
+    }
+    // Same-site modifier mutations remain outside this bounded admission. These exact bits exercise
+    // each generic VOP3 modifier field; accepting one would mean the opcode case silently lost it.
+    const uint32_t ldexp_abs0[]  = {0xd7620100u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_abs1[]  = {0xd7620200u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_abs2[]  = {0xd7620400u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_neg0[]  = {0xd7620000u, 0x2002030du, 0xbf810000u};
+    const uint32_t ldexp_neg1[]  = {0xd7620000u, 0x4002030du, 0xbf810000u};
+    const uint32_t ldexp_neg2[]  = {0xd7620000u, 0x8002030du, 0xbf810000u};
+    const uint32_t ldexp_clamp[] = {0xd7628000u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_omod[]  = {0xd7620000u, 0x0802030du, 0xbf810000u};
+    if (!recompile_valu(ldexp_abs0, std::size(ldexp_abs0), 14, 0).empty() ||
+        !recompile_valu(ldexp_abs1, std::size(ldexp_abs1), 14, 0).empty() ||
+        !recompile_valu(ldexp_abs2, std::size(ldexp_abs2), 14, 0).empty() ||
+        !recompile_valu(ldexp_neg0, std::size(ldexp_neg0), 14, 0).empty() ||
+        !recompile_valu(ldexp_neg1, std::size(ldexp_neg1), 14, 0).empty() ||
+        !recompile_valu(ldexp_neg2, std::size(ldexp_neg2), 14, 0).empty() ||
+        !recompile_valu(ldexp_clamp, std::size(ldexp_clamp), 14, 0).empty() ||
+        !recompile_valu(ldexp_omod, std::size(ldexp_omod), 14, 0).empty()) {
+        printf("  [FAIL] v_ldexp_f32 admitted an unsupported VOP3 modifier mutation\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V v_ldexp_f32 emits defined SPIR-V; modifier mutations reject\n");
+
     // GTA V follows its row reduction with this identity QUAD_PERM and partial ROW_MASK. Prefix the
     // exact packet to the crossing CFG above so it reaches the dispatcher lowering used by the live
     // shader. Rows 1/3 add distinct v19, rows 0/2 keep the old in-place v20 because BC is zero.

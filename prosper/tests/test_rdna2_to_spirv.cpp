@@ -4122,6 +4122,71 @@ int main() {
     CHECK(recompile_valu(code32r19b, std::size(code32r19b), 0, 2).empty(),
           "kernel 32r19b REJECTS a VCC predicate read after s_flbit overwrote the pair with data");
 
+    // Kernel 32r19c (LIVE, exec_cs_413d1bf00 pc458): exact production packet
+    // `v_ldexp_f32 v0,v13,v1`. Exercise it as raw bits because the guest exponent is i32, not f32,
+    // and because signed zero, NaN payloads, and subnormal rounding are observable contracts. The
+    // expected values cover both RNE tie directions and the exponent extremes that make the standard
+    // GLSL Ldexp instruction undefined; the emitter uses only defined integer SPIR-V for this reason.
+    const uint32_t code32r19c[] = {
+        0xd7620000u, 0x0002030du,
+        0xbf810000u,
+    };
+    struct LdexpVector { uint32_t x; int32_t exponent; uint32_t expected; };
+    const LdexpVector ldexp_vectors[] = {
+        {0x00000000u, INT32_MAX, 0x00000000u}, // +0 retains sign at arbitrarily large exponent
+        {0x80000000u, INT32_MIN, 0x80000000u}, // -0 retains sign at arbitrarily small exponent
+        {0x3fc00000u,          2, 0x40c00000u}, // 1.5 * 4 = 6
+        {0xbfc00000u,         -1, 0xbf400000u}, // -1.5 / 2 = -0.75
+        {0x00800000u,         -1, 0x00400000u}, // minimum normal -> exact subnormal
+        {0x00800001u,         -1, 0x00400000u}, // halfway, even truncated significand: round down
+        {0x00800003u,         -1, 0x00400002u}, // halfway, odd truncated significand: round up
+        {0x00ffffffu,         -1, 0x00800000u}, // subnormal rounding carries into minimum normal
+        {0x00800000u,        -24, 0x00000000u}, // exact half-min-subnormal tie rounds to even zero
+        {0x00800001u,        -24, 0x00000001u}, // just over the tie rounds to min subnormal
+        {0x00000001u,          0, 0x00000001u}, // minimum subnormal survives identity
+        {0x00000001u,          1, 0x00000002u}, // subnormal input is normalized before scaling
+        {0x007fffffu,          1, 0x00fffffeu}, // maximum subnormal crosses into normal range
+        {0x7f7fffffu,          1, 0x7f800000u}, // positive overflow
+        {0xff7fffffu,          1, 0xff800000u}, // negative overflow retains sign
+        {0x7f800000u, INT32_MIN, 0x7f800000u}, // +Inf is exponent-independent
+        {0xff800000u, INT32_MAX, 0xff800000u}, // -Inf is exponent-independent
+        {0x7fc12345u,        100, 0x7fc12345u}, // quiet NaN payload is retained bit-exactly
+        {0xffc12345u,       -100, 0xffc12345u}, // negative quiet NaN sign/payload retained
+        {0x3f800000u, INT32_MAX, 0x7f800000u}, // arbitrary positive i32 exponent is defined
+        {0xbf800000u, INT32_MIN, 0x80000000u}, // arbitrary negative i32 exponent -> signed zero
+        {0x3f000000u,        128, 0x7f000000u}, // exp=128 can still produce a finite result
+        {0x3f800000u,       -149, 0x00000001u}, // exact minimum subnormal
+        {0x3f800000u,       -150, 0x00000000u}, // halfway underflow tie -> zero
+        {0x3f800001u,       -150, 0x00000001u}, // just above halfway -> minimum subnormal
+        {0xbf800000u,       -150, 0x80000000u}, // underflow preserves negative-zero sign
+    };
+    const std::vector<uint32_t> spv32r19c = recompile_valu(
+        code32r19c, std::size(code32r19c), 14, 0);
+    CHECK(!spv32r19c.empty(),
+          "recompiled kernel 32r19c (exact GTA V v_ldexp_f32 packet) -> SPIR-V");
+    std::vector<float> in32r19c(std::size(ldexp_vectors) * 14, 0.0f);
+    for (size_t i = 0; i < std::size(ldexp_vectors); ++i) {
+        in32r19c[i * 14 + 13] = std::bit_cast<float>(ldexp_vectors[i].x);
+        in32r19c[i * 14 + 1] =
+            std::bit_cast<float>(static_cast<uint32_t>(ldexp_vectors[i].exponent));
+    }
+    const std::vector<float> got32r19c = spv32r19c.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r19c, in32r19c,
+                                     std::size(ldexp_vectors), std::size(ldexp_vectors));
+    uint32_t bad32r19c = 0;
+    for (size_t i = 0; i < std::size(ldexp_vectors) && got32r19c.size() == std::size(ldexp_vectors); ++i) {
+        const uint32_t got_bits = bits_of(got32r19c[i]);
+        if (got_bits != ldexp_vectors[i].expected) {
+            ++bad32r19c;
+            printf("  ldexp[%zu] x=%08x exp=%d got=%08x expect=%08x\n", i,
+                   ldexp_vectors[i].x, ldexp_vectors[i].exponent,
+                   got_bits, ldexp_vectors[i].expected);
+        }
+    }
+    CHECK(got32r19c.size() == std::size(ldexp_vectors) && bad32r19c == 0,
+          "kernel 32r19c preserves ldexp zero/normal/subnormal/overflow/Inf/NaN contracts");
+
     // Kernel 32r20 (LIVE encoding, exec_cs_290000eb00 pc=34; raised in review): the **SDWA** form of
     // the 16-bit compare. 32r16 covers the plain e32 encodings, so nothing executed the composition
     // of the SDWA source select with the 16-bit narrowing until this kernel.
