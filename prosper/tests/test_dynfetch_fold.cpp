@@ -1454,6 +1454,106 @@ int main() {
               built_bvh.type == 8u && built_bvh.triangle_return_mode,
           "Astro's carry/shift descriptor builder resolves the exact BVH binding");
 
+    // GTA V builds the same RTIP 1.1 descriptor from a pointer inside a mapped 16-dword object
+    // header. Both live programs enable BOX_SORT_EN. The second relocates the final descriptor from
+    // the loaded s8:s23 range into s44:s47, so a load-time snapshot alone cannot prove it.
+    astro_bvh_backing[22] = 63u; // descriptor stores count-minus-one: 64 * 64 = 4096 bytes
+    astro_bvh_backing[23] = 0u;
+    alignas(8) std::array<uint32_t, 16> gta_bvh_header{};
+    gta_bvh_header[12] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_bvh_header[13] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    const uint64_t gta_bvh_header_addr = reinterpret_cast<uint64_t>(gta_bvh_header.data());
+    auto put_words = [](std::vector<uint32_t>& code, uint32_t pc,
+                        std::initializer_list<uint32_t> words) {
+        std::copy(words.begin(), words.end(), code.begin() + pc);
+    };
+
+    std::vector<uint32_t> gta_bvh_pc1180(1186u, 0xbf800000u); // s_nop 0
+    put_words(gta_bvh_pc1180, 1107u, {0xf4100226u, 0xfa000000u});
+    put_words(gta_bvh_pc1180, 1158u, {
+        0x8715ff15u, 0x003fffffu,             // s_and_b32 s21,s21,0x003fffff
+        0x8f948314u,                          // s_lshl_b64 s[20:21],s[20:21],3
+        0xf408000au, 0xfa000058u,             // s_load_dwordx4 s[0:3],s[20:21],0x58
+        0x9490ff14u, 0x00280008u,             // s_bfe_u64 s[16:17],s[20:21],8:40
+        0xbf8cc07fu,                          // s_waitcnt
+        0x816a8100u,                          // s_add_i32 vcc_lo,s0,1
+        0x8801ff15u, 0x00080000u,             // unrelated header patch
+        0x80126ac1u,                          // s_add_u32 s18,-1,vcc_lo
+        0xbe800314u,                          // unrelated move
+        0x821380c1u,                          // s_addc_u32 s19,-1,0
+        0xbe8303ffu, 0x00016204u,             // unrelated move
+        0x876a13ffu, 0x000003ffu,             // s_and_b32 vcc_lo,0x3ff,s19
+        0xbe911d9fu,                          // s_bitset1_b32 s17,31
+        0x8813ff6au, 0x81000000u,             // s_or_b32 s19,vcc_lo,TYPE/mode
+        0xbf8c3f70u,
+        0xf1989f07u, 0x00040006u, 0x2726251cu, 0x2f2a2928u, 0x00002d2eu,
+        0xbf810000u,
+    });
+    std::array<uint32_t, 78> gta_pc1180_seed{};
+    gta_pc1180_seed[76] = static_cast<uint32_t>(gta_bvh_header_addr);
+    gta_pc1180_seed[77] = static_cast<uint32_t>(gta_bvh_header_addr >> 32);
+    std::vector<SrtUse> gta_pc1180_uses;
+    resolve_dynamic_fetch(gta_bvh_pc1180.data(), gta_bvh_pc1180.size(),
+                          gta_pc1180_seed.data(), gta_pc1180_seed.size(), 0,
+                          &gta_pc1180_uses);
+    CHECK(gta_pc1180_uses.size() == 1 && gta_pc1180_uses[0].kind == 2 &&
+              gta_pc1180_uses[0].use_pc == 1180u &&
+              decode_bvh_descriptor(gta_pc1180_uses[0].bvh4.data()).sort_enabled,
+          "GTA pc1180 publishes its exact sorted BVH descriptor");
+    ShaderResourceTable gta_pc1180_table;
+    add_compute_buffer_resources(gta_pc1180_table, gta_bvh_pc1180.data(),
+                                 gta_bvh_pc1180.size(), gta_pc1180_seed.data(),
+                                 gta_pc1180_seed.size());
+    CHECK(gta_pc1180_table.resources.size() == 1 &&
+              gta_pc1180_table.resources[0].fetch_pc == 1180u &&
+              gta_pc1180_table.resources[0].gpu_addr == astro_bvh_base &&
+              gta_pc1180_table.resources[0].size == sizeof(astro_bvh_backing) &&
+              gta_pc1180_table.resources[0].bvh_sort_enabled,
+          "GTA pc1180 materializes BOX_SORT_EN in its instruction-scoped BVH binding");
+
+    std::vector<uint32_t> gta_bvh_pc313(319u, 0xbf800000u); // s_nop 0
+    put_words(gta_bvh_pc313, 244u, {0xf4100203u, 0xfa000000u});
+    put_words(gta_bvh_pc313, 294u, {
+        0x8715ff15u, 0x003fffffu,             // s_and_b32 s21,s21,0x003fffff
+        0x8f888314u,                          // s_lshl_b64 s[8:9],s[20:21],3
+        0xf4080304u, 0xfa000058u,             // s_load_dwordx4 s[12:15],s[8:9],0x58
+        0xbf8cc07fu,
+        0x816a810cu,                          // s_add_i32 vcc_lo,s12,1
+        0x94acff08u, 0x00280008u,             // s_bfe_u64 s[44:45],s[8:9],8:40
+        0x802e6ac1u,                          // s_add_u32 s46,-1,vcc_lo
+        0xbe8a030eu,                          // unrelated move
+        0x822f80c1u,                          // s_addc_u32 s47,-1,0
+        0xbe891d93u,                          // unrelated bitset
+        0x876a2fffu, 0x000003ffu,             // s_and_b32 vcc_lo,0x3ff,s47
+        0xbead1d9fu,                          // s_bitset1_b32 s45,31
+        0x882fff6au, 0x81000000u,             // s_or_b32 s47,vcc_lo,TYPE/mode
+        0xbf8c3f70u,
+        0xf1989f07u, 0x000b0004u, 0x2322211bu, 0x2b262524u, 0x0000292au,
+        0xbf810000u,
+    });
+    std::array<uint32_t, 26> gta_pc313_seed{};
+    gta_pc313_seed[6] = static_cast<uint32_t>(gta_bvh_header_addr);
+    gta_pc313_seed[7] = static_cast<uint32_t>(gta_bvh_header_addr >> 32);
+    gta_pc313_seed[24] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_pc313_seed[25] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> gta_pc313_uses;
+    resolve_dynamic_fetch(gta_bvh_pc313.data(), gta_bvh_pc313.size(),
+                          gta_pc313_seed.data(), gta_pc313_seed.size(), 0,
+                          &gta_pc313_uses);
+    CHECK(gta_pc313_uses.size() == 1 && gta_pc313_uses[0].kind == 2 &&
+              gta_pc313_uses[0].use_pc == 313u &&
+              decode_bvh_descriptor(gta_pc313_uses[0].bvh4.data()).sort_enabled,
+          "GTA pc313 proves the relocated sorted BVH descriptor builder");
+
+    std::vector<uint32_t> gta_unproven_pc313 = gta_bvh_pc313;
+    gta_unproven_pc313[296] = 0x8f888318u; // same lshl site, identical seed value, no x16 origin
+    std::vector<SrtUse> gta_unproven_pc313_uses;
+    resolve_dynamic_fetch(gta_unproven_pc313.data(), gta_unproven_pc313.size(),
+                          gta_pc313_seed.data(), gta_pc313_seed.size(), 0,
+                          &gta_unproven_pc313_uses);
+    CHECK(gta_unproven_pc313_uses.empty(),
+          "GTA pc313 rejects byte-identical descriptor values from an unproven pointer origin");
+
     // Astro Bot's live visibility packet consumes a direct R32_UINT T# in s[0:7]. Opcode 0x0f is
     // IMAGE_ATOMIC_SWAP, so its instruction-scoped resource must be materialized as a storage image
     // even though the packet's unused SSAMP field aliases s0.

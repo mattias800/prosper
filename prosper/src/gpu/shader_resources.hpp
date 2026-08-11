@@ -248,6 +248,11 @@ struct ShaderResource {
     // ConstantBuffer view created from a validated BVH descriptor.
     uint32_t      bvh_box_grow  = 0;
 
+    // BVH descriptor BOX_SORT_EN (bit 63). When set, IMAGE_BVH_INTERSECT_RAY returns box-child
+    // pointers in increasing intersection-time order instead of physical node order. This changes
+    // generated SPIR-V and therefore participates in compile-cache and capture identity.
+    bool          bvh_sort_enabled = false;
+
     // FLAT-window (#1171) provenance: for a general flat_load whose 64-bit source pointer lives in the
     // consecutive user SGPRs s[flat_base_sgpr : +1], the executor binds the containing guest allocation
     // as this SSBO (keyed by the load's fetch_pc) and the emitter lowers the load to an indexed read at

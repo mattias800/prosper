@@ -4944,6 +4944,14 @@ int main() {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY was accepted without its BVH bytes\n");
         return 1;
     }
+    ShaderResourceTable sorted_bvh = rt_bvh;
+    sorted_bvh.resources[0].bvh_sort_enabled = true;
+    const std::vector<uint32_t> sorted_bvh_spv = recompile_compute(
+        cs_bvh_intersect.data(), cs_bvh_intersect.size(), &sorted_bvh, bvh_config);
+    if (sorted_bvh_spv.empty() || sorted_bvh_spv == bvh_spv) {
+        printf("  [FAIL] sorted IMAGE_BVH_INTERSECT_RAY lacks distinct box-order lowering\n");
+        return 1;
+    }
     std::vector<uint32_t> unsupported_bvh = cs_bvh_intersect;
     unsupported_bvh[gta_bvh_pc] &= ~(1u << 15); // R128=0 has a different destination contract.
     if (!recompile_compute(unsupported_bvh.data(), unsupported_bvh.size(),
@@ -4972,7 +4980,7 @@ int main() {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a non-constant-buffer resource\n");
         return 1;
     }
-    printf("  [ok]   GTA's exact-pc 64-byte IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
+    printf("  [ok]   GTA's exact-pc sorted/unsorted IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting

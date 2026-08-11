@@ -294,6 +294,7 @@ struct ShaderResourceCompileKey {
     uint32_t fetch_index_mode = 0;
     uint32_t flat_base_sgpr = 0;
     uint32_t bvh_box_grow = 0;
+    bool bvh_sort_enabled = false;
     bool null_bvh = false;
     bool zero_record_raw = false;
     bool srgb = false;
@@ -479,6 +480,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.flat_base_sgpr);
             hash = hash_mix(hash, resource.bvh_box_grow);
+            hash = hash_mix(hash, resource.bvh_sort_enabled);
             hash = hash_mix(hash, resource.null_bvh);
             hash = hash_mix(hash, resource.zero_record_raw);
             hash = hash_mix(hash, resource.srgb);
@@ -1205,6 +1207,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
             compiled.bvh_box_grow = resource.bvh_box_grow;
+            compiled.bvh_sort_enabled = resource.bvh_sort_enabled;
             compiled.null_bvh = is_proven_null_bvh(resource);
             // gpu_addr/size intentionally stay out of the module key, but this semantic is compiled
             // into zero-producing/no-op instructions. Partition exactly this proven marker so a
@@ -2106,6 +2109,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> null_chain_origin{};
     std::bitset<kFoldSgprs> null_chain_known;
     uint32_t next_null_chain_origin = 0;
+    // Exact provenance for GTA V's RTIP 1.1 descriptor builder. A successful mapped x16 header
+    // load seeds candidate qword origins; only the observed mask/lshl/load-count/bfe/carry/header
+    // chain can turn one into a complete descriptor. This is deliberately separate from concrete
+    // value knowledge: four literal-built words that merely decode as TYPE=8 remain unresolved.
+    enum class BvhBuildRole : uint8_t {
+        None,
+        HeaderLo, HeaderHi,
+        PointerLo, PointerHi,
+        CountLo, CountHi, CountPlusOne,
+        SizeLo, SizeHi, SizeHiMasked, DescriptorHi,
+        BaseLo, BaseHi, SortedBaseHi,
+    };
+    std::array<uint32_t, kFoldSgprs> bvh_build_origin{};
+    std::array<BvhBuildRole, kFoldSgprs> bvh_build_role{};
+    uint32_t next_bvh_build_origin = 0;
+    uint32_t bvh_count_carry_origin = 0;
     // SGPRs overwritten by an s_load since seeding — the seed-V# MUBUF fallback below must not use a
     // stale user-data snapshot once the register was RELOADED from memory (ALU patches deliberately
     // don't count: descriptor snapshots are load-time semantics, pre-patch, like `descr`).
@@ -2167,6 +2186,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
+            bvh_build_origin[(size_t)r] = 0;
+            bvh_build_role[(size_t)r] = BvhBuildRole::None;
             mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
@@ -2179,6 +2200,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
+            bvh_build_origin[(size_t)r] = 0;
+            bvh_build_role[(size_t)r] = BvhBuildRole::None;
             mask_state[(size_t)r] = FoldMask::Unknown;
             // Remember WHICH instruction made this register unknown (#2412). `[mubuf-unknown]` names
             // the V# word that is not provable; it could not name the instruction responsible, so the
@@ -2322,6 +2345,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr8_key_known;
         std::array<uint32_t, kFoldSgprs> null_chain_origin;
         std::bitset<kFoldSgprs> null_chain_known;
+        std::array<uint32_t, kFoldSgprs> bvh_build_origin;
+        std::array<BvhBuildRole, kFoldSgprs> bvh_build_role;
+        uint32_t bvh_count_carry_origin;
         std::bitset<kFoldSgprs> reloaded;
         std::array<FoldMask, kFoldSgprs> mask_state;
         std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
@@ -2359,6 +2385,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
         s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
+        s.bvh_build_origin = bvh_build_origin; s.bvh_build_role = bvh_build_role;
+        s.bvh_count_carry_origin = bvh_count_carry_origin;
         s.reloaded = reloaded; s.mask_state = mask_state;
         s.vector_index_mode = vector_index_mode; s.scc = scc;
         return s;
@@ -2373,6 +2401,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
         null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
+        bvh_build_origin = s.bvh_build_origin; bvh_build_role = s.bvh_build_role;
+        bvh_count_carry_origin = s.bvh_count_carry_origin;
         reloaded = s.reloaded; mask_state = s.mask_state;
         vector_index_mode = s.vector_index_mode; scc = s.scc;
     };
@@ -2415,6 +2445,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         if (!origin || !valid_reg(r)) return;
         null_chain_origin[(size_t)r] = origin;
         null_chain_known.set((size_t)r);
+    };
+    auto mark_bvh_build = [&](int r, uint32_t origin, BvhBuildRole role) {
+        if (!origin || role == BvhBuildRole::None || !valid_reg(r)) return;
+        bvh_build_origin[(size_t)r] = origin;
+        bvh_build_role[(size_t)r] = role;
+    };
+    auto operand_bvh_build = [&](const Operand& operand, BvhBuildRole role,
+                                 uint32_t& origin) {
+        if ((operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special) ||
+            !valid_reg(operand.value) || bvh_build_role[(size_t)operand.value] != role)
+            return false;
+        origin = bvh_build_origin[(size_t)operand.value];
+        return origin != 0;
     };
     auto operand_null_origin = [&](const Operand& operand) -> uint32_t {
         if ((operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
@@ -2659,6 +2702,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // provenance while applying that constant field patch.
                     uint32_t old_value = 0, bit_index = 0;
                     const uint32_t old_null_origin = null_origin(in.dst.value);
+                    const uint32_t old_bvh_origin = valid_reg(in.dst.value)
+                        ? bvh_build_origin[(size_t)in.dst.value] : 0u;
+                    const BvhBuildRole old_bvh_role = valid_reg(in.dst.value)
+                        ? bvh_build_role[(size_t)in.dst.value] : BvhBuildRole::None;
                     const bool old_known = known(in.dst.value, old_value);
                     const bool bit_known = in.src[0].kind == OperandKind::Literal
                         ? (bit_index = in.literal, true) : srcval(in.src[0], bit_index);
@@ -2670,6 +2717,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         forget(in.dst.value);
                     }
                     mark_null_origin(in.dst.value, old_null_origin);
+                    if (in.opcode == 0x1d && bit_known && bit_index == 31u &&
+                        old_bvh_role == BvhBuildRole::BaseHi)
+                        mark_bvh_build(in.dst.value, old_bvh_origin,
+                                       BvhBuildRole::SortedBaseHi);
                 } else if (in.opcode == 0x04 &&                 // s_mov_b64
                            in.dst.kind == OperandKind::SGPR &&
                            in.src[0].kind == OperandKind::SGPR) {
@@ -2769,7 +2820,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
                 // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
-                if (in.opcode != 0x03 && in.opcode != 0x04) scc = -1;
+                if (in.opcode != 0x03 && in.opcode != 0x04) {
+                    scc = -1;
+                    bvh_count_carry_origin = 0;
+                }
                 break;
             case Rdna2Format::SOP2: {
                 // s_cselect_b64 is commonly used to make an all-lanes/zero mask for the following
@@ -2796,6 +2850,26 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 int next_scc = scc;
                 const uint32_t null0 = operand_null_origin(in.src[0]);
                 const uint32_t null1 = operand_null_origin(in.src[1]);
+                auto source_bvh_state = [&](const Operand& operand, int add,
+                                            uint32_t& origin, BvhBuildRole& role) {
+                    const int reg = operand.value + add;
+                    if ((operand.kind != OperandKind::SGPR &&
+                         operand.kind != OperandKind::Special) || !valid_reg(reg)) {
+                        origin = 0;
+                        role = BvhBuildRole::None;
+                        return;
+                    }
+                    origin = bvh_build_origin[(size_t)reg];
+                    role = bvh_build_role[(size_t)reg];
+                };
+                uint32_t bvh0_origin = 0, bvh1_origin = 0, bvh0_hi_origin = 0;
+                BvhBuildRole bvh0_role = BvhBuildRole::None;
+                BvhBuildRole bvh1_role = BvhBuildRole::None;
+                BvhBuildRole bvh0_hi_role = BvhBuildRole::None;
+                source_bvh_state(in.src[0], 0, bvh0_origin, bvh0_role);
+                source_bvh_state(in.src[1], 0, bvh1_origin, bvh1_role);
+                source_bvh_state(in.src[0], 1, bvh0_hi_origin, bvh0_hi_role);
+                const uint32_t previous_bvh_count_carry_origin = bvh_count_carry_origin;
                 // s_addc_u32 remains derived from the same pointer chain even when its concrete
                 // carry is unknown; the taint is provenance, not a claim about the folded value.
                 const bool null_chain_opcode =
@@ -2926,7 +3000,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
                 scc = ok ? next_scc : -1;
-                if (ok) { set_value(d, r); if (wrote_pair) set_value(d + 1, hi64); }
+                if (ok) {
+                    set_value(d, r);
+                    if (wrote_pair) set_value(d + 1, hi64);
+                }
                 // A 64-bit-dst op invalidates BOTH dwords even when its source was unknown (the
                 // opcode switch may not have reached the point that marks wrote_pair).
                 else    { forget(d); if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 ||
@@ -2934,9 +3011,65 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 mark_null_origin(d, propagated_null_origin);
                 if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 || in.opcode == 0x29)
                     mark_null_origin(d + 1, propagated_null_origin);
+                // Every SOP2 writes SCC, so a count carry survives only when this exact instruction
+                // creates it. Capture the old origin above for the following s_addc_u32.
+                bvh_count_carry_origin = 0;
+                if (ok) {
+                    auto role_plus_constant = [&](BvhBuildRole wanted, uint32_t constant,
+                                                  uint32_t& origin) {
+                        if (bvh0_role == wanted && c == constant) {
+                            origin = bvh0_origin;
+                            return origin != 0;
+                        }
+                        if (bvh1_role == wanted && a == constant) {
+                            origin = bvh1_origin;
+                            return origin != 0;
+                        }
+                        return false;
+                    };
+                    uint32_t origin = 0;
+                    if (in.opcode == 0x0Eu &&
+                        role_plus_constant(BvhBuildRole::HeaderHi, 0x003fffffu, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::HeaderHi);
+                    } else if (in.opcode == 0x1Fu && c == 3u &&
+                               bvh0_role == BvhBuildRole::HeaderLo &&
+                               bvh0_hi_role == BvhBuildRole::HeaderHi &&
+                               bvh0_origin && bvh0_origin == bvh0_hi_origin) {
+                        mark_bvh_build(d, bvh0_origin, BvhBuildRole::PointerLo);
+                        mark_bvh_build(d + 1, bvh0_origin, BvhBuildRole::PointerHi);
+                    } else if (in.opcode == 0x29u && c == 0x00280008u &&
+                               bvh0_role == BvhBuildRole::PointerLo &&
+                               bvh0_hi_role == BvhBuildRole::PointerHi &&
+                               bvh0_origin && bvh0_origin == bvh0_hi_origin) {
+                        mark_bvh_build(d, bvh0_origin, BvhBuildRole::BaseLo);
+                        mark_bvh_build(d + 1, bvh0_origin, BvhBuildRole::BaseHi);
+                    } else if (in.opcode == 0x02u &&
+                               role_plus_constant(BvhBuildRole::CountLo, 1u, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::CountPlusOne);
+                    } else if (in.opcode == 0x00u &&
+                               role_plus_constant(BvhBuildRole::CountPlusOne,
+                                                  UINT32_MAX, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::SizeLo);
+                        bvh_count_carry_origin = origin;
+                    } else if (in.opcode == 0x04u &&
+                               previous_bvh_count_carry_origin &&
+                               ((a == UINT32_MAX && c == 0u) ||
+                                (c == UINT32_MAX && a == 0u))) {
+                        mark_bvh_build(d, previous_bvh_count_carry_origin,
+                                       BvhBuildRole::SizeHi);
+                    } else if (in.opcode == 0x0Eu &&
+                               role_plus_constant(BvhBuildRole::SizeHi, 0x3ffu, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::SizeHiMasked);
+                    } else if (in.opcode == 0x10u &&
+                               role_plus_constant(BvhBuildRole::SizeHiMasked,
+                                                  0x81000000u, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::DescriptorHi);
+                    }
+                }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
+                bvh_count_carry_origin = 0;
                 uint32_t a, c;
                 bool ka = (in.src[0].kind == OperandKind::Literal) ? (a = in.literal, true) : srcval(in.src[0], a);
                 bool kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
@@ -3239,7 +3372,32 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
+                uint32_t bvh_count_origin = 0;
+                if (!is_buffer && n == 4 && imm_only && in.literal == 0x58u &&
+                    valid_reg(sbase) && valid_reg(sbase + 1) &&
+                    bvh_build_role[(size_t)sbase] == BvhBuildRole::PointerLo &&
+                    bvh_build_role[(size_t)(sbase + 1)] == BvhBuildRole::PointerHi &&
+                    bvh_build_origin[(size_t)sbase] &&
+                    bvh_build_origin[(size_t)sbase] ==
+                        bvh_build_origin[(size_t)(sbase + 1)])
+                    bvh_count_origin = bvh_build_origin[(size_t)sbase];
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
+                if (bvh_count_origin) {
+                    mark_bvh_build(sdst, bvh_count_origin, BvhBuildRole::CountLo);
+                    mark_bvh_build(sdst + 1, bvh_count_origin, BvhBuildRole::CountHi);
+                }
+                if (!is_buffer && n == 16 && imm_only && in.literal == 0u) {
+                    // The title's object header is fetched as one mapped 16-dword block. Seed each
+                    // aligned qword independently: only the qword later consumed by the exact
+                    // descriptor builder can reach a ray instruction, and unrelated header fields
+                    // must not share provenance with it.
+                    for (uint32_t first = 0; first < n; first += 2) {
+                        uint32_t origin = ++next_bvh_build_origin;
+                        if (!origin) origin = ++next_bvh_build_origin;
+                        mark_bvh_build(sdst + (int)first, origin, BvhBuildRole::HeaderLo);
+                        mark_bvh_build(sdst + (int)first + 1, origin, BvhBuildRole::HeaderHi);
+                    }
+                }
                 if (!is_buffer && n == 2 && mem[0] == 0 && mem[1] == 0) {
                     uint32_t origin = ++next_null_chain_origin;
                     if (!origin) origin = ++next_null_chain_origin;
@@ -3358,9 +3516,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         const bool seed_provenance = !snapshot_provenance &&
                             (untouched_seed_range(bbase, 4) ||
                              consecutive_seed_copy_range(bbase, 4));
+                        uint32_t builder_origin = valid_reg(bbase)
+                            ? bvh_build_origin[(size_t)bbase] : 0u;
+                        const BvhBuildRole expected_builder_roles[4] = {
+                            BvhBuildRole::BaseLo, BvhBuildRole::SortedBaseHi,
+                            BvhBuildRole::SizeLo, BvhBuildRole::DescriptorHi,
+                        };
+                        bool builder_provenance = builder_origin != 0 && valid_reg(bbase + 3);
+                        for (int k = 0; builder_provenance && k < 4; ++k)
+                            builder_provenance =
+                                bvh_build_origin[(size_t)(bbase + k)] == builder_origin &&
+                                bvh_build_role[(size_t)(bbase + k)] ==
+                                    expected_builder_roles[k];
                         const DecodedBvhDescriptor d = live_known
                             ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
-                        const bool plausible = live_known && (snapshot_provenance || seed_provenance) &&
+                        const bool plausible = live_known &&
+                            (snapshot_provenance || seed_provenance || builder_provenance) &&
                             d.type == 8u && d.base > 0x10000u && d.size_bytes != 0;
                         uint32_t proven_null_origin = valid_reg(bbase) ? null_origin(bbase) : 0u;
                         for (int k = 1; proven_null_origin && k < 4; ++k)
@@ -3370,9 +3541,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             guarded_bvh_use(ins, in.pc);
                         if (trc) {
                             fprintf(stderr,
-                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d "
+                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d builder=%d "
                                     "live_known=%d bvh=",
-                                    in.pc, bbase, snapshot_provenance, seed_provenance, live_known);
+                                    in.pc, bbase, snapshot_provenance, seed_provenance,
+                                    builder_provenance, live_known);
                             if (live_known) {
                                 for (uint32_t word : live_bvh) fprintf(stderr, "%08x ", word);
                             } else {
@@ -3850,6 +4022,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
                 // confidently-wrong V# patch.
                 scc = -1;
+                bvh_count_carry_origin = 0;
                 if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
                 break;
             default:
@@ -4036,7 +4209,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
             if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||
                 d.size_bytes > 0x10000000u || d.size_bytes > UINT32_MAX ||
-                !d.triangle_return_mode || d.box_node_64b || d.sort_enabled)
+                !d.triangle_return_mode || d.box_node_64b)
                 continue;
             const uint64_t dk = 0x8000000200000000ull | u.use_pc;
             if (!seen.insert(dk).second) continue;
@@ -4044,7 +4217,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
                     r0.size != static_cast<uint32_t>(d.size_bytes) ||
-                    r0.bvh_box_grow != d.box_grow)
+                    r0.bvh_box_grow != d.box_grow ||
+                    r0.bvh_sort_enabled != d.sort_enabled)
                     continue;
                 if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
                 if (r0.fetch_pc == u.use_pc) { mapped = true; break; }
@@ -4058,6 +4232,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             r.size = static_cast<uint32_t>(d.size_bytes);
             r.fetch_pc = u.use_pc;
             r.bvh_box_grow = d.box_grow;
+            r.bvh_sort_enabled = d.sort_enabled;
             table.resources.push_back(r);
             continue;
         }

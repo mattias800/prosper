@@ -9436,6 +9436,41 @@ int main() {
         }
         CHECK(box_ok, "IMAGE_BVH_INTERSECT_RAY returns the four unsorted FP32-box child hits");
 
+        // GTA V sets BOX_SORT_EN. Keep the same live instruction and node-production site, but make
+        // every child hit at a deliberately shuffled distance. The false arm proves physical order;
+        // toggling only descriptor semantics proves the production compare-swap path.
+        const float shuffled_near[4] = {4.0f, 1.0f, 3.0f, 2.0f};
+        for (uint32_t child = 0; child < 4; ++child) {
+            const uint32_t base = 4u + child * 6u;
+            box_words[base + 0] = bits_of(-1.0f);
+            box_words[base + 1] = bits_of(-1.0f);
+            box_words[base + 2] = bits_of(-5.0f + shuffled_near[child]);
+            box_words[base + 3] = bits_of(1.0f);
+            box_words[base + 4] = bits_of(1.0f);
+            box_words[base + 5] = bits_of(-4.5f + shuffled_near[child]);
+        }
+        const uint32_t physical_expect[4] = {0x100u, 0x200u, 0x300u, 0x400u};
+        const uint32_t sorted_expect[4] = {0x200u, 0x400u, 0x300u, 0x100u};
+        auto box_order_matches = [&](const uint32_t expected[4]) {
+            bool matches = true;
+            for (uint32_t component = 0; component < 4; ++component) {
+                const std::vector<uint32_t> module = recompile_valu(
+                    bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh_rt);
+                const std::vector<float> output = prosper::test::run_compute(
+                    module, bvh_inputs, lanes, lanes, box_words);
+                matches &= !module.empty() && output.size() == lanes;
+                for (uint32_t lane = 0; lane < output.size(); ++lane)
+                    matches &= bits_of(output[lane]) == expected[component];
+            }
+            return matches;
+        };
+        CHECK(box_order_matches(physical_expect),
+              "BOX_SORT_EN=0 preserves physical box-child order");
+        bvh_rt.resources[0].bvh_sort_enabled = true;
+        CHECK(box_order_matches(sorted_expect),
+              "BOX_SORT_EN=1 stably returns box children from nearest to furthest");
+        bvh_rt.resources[0].bvh_sort_enabled = false;
+
         // Make the X near edge one float ULP beyond the Y far edge. BOX_GROW=0 must miss;
         // BOX_GROW=6 expands the far edge by six 2^-24 increments and retains the child.
         for (uint32_t lane = 0; lane < lanes; ++lane) {

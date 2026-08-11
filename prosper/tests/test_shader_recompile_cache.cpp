@@ -1231,6 +1231,10 @@ int main() {
     bvh_table.resources[0].bvh_box_grow = 0;
     const auto bvh_grow_0_again = recompile_compute_shader_cached(
         kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    bvh_table.resources[0].bvh_sort_enabled = true;
+    const auto sorted_bvh = recompile_compute_shader_cached(
+        kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    bvh_table.resources[0].bvh_sort_enabled = false;
     alignas(256) static uint32_t null_bvh_words[64] = {};
     bvh_table.resources[0].size = sizeof(null_bvh_words);
     bvh_table.resources[0].host_data = reinterpret_cast<uint8_t*>(null_bvh_words);
@@ -1245,10 +1249,11 @@ int main() {
     stats = shader_recompile_cache_stats();
     CHECK(!bvh_grow_0.empty() && !bvh_grow_6.empty() &&
               bvh_grow_0 != bvh_grow_6 && bvh_grow_0_again == bvh_grow_0 &&
+              !sorted_bvh.empty() && sorted_bvh != bvh_grow_0 &&
               !guarded_null_bvh.empty() && guarded_null_bvh != bvh_grow_0 &&
               bvh_grow_0_after_null == bvh_grow_0 &&
-              stats.misses == 3 && stats.hits == 2 && stats.entries == 3,
-          "compute cache separates BVH box growth and guarded-null lowering");
+              stats.misses == 4 && stats.hits == 2 && stats.entries == 4,
+          "compute cache separates BVH box growth, sorting, and guarded-null lowering");
 
     // Manual shadow comparison bakes the enable, compare op, filter mode, address modes, and border
     // color into SPIR-V. In particular depth_compare=false must not reuse a previously successful
