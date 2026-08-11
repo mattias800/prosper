@@ -141,7 +141,8 @@ enum : uint32_t {
     Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQuerySize=104,
     Op_ImageQueryLod=105, Op_ImageQueryLevels=106,
-    Op_TypeArray=28, Op_ControlBarrier=224, Op_MemoryBarrier=225, Op_AtomicExchange=229, Op_AtomicIAdd=234,
+    Op_TypeArray=28, Op_ControlBarrier=224, Op_MemoryBarrier=225, Op_AtomicLoad=227,
+    Op_AtomicExchange=229, Op_AtomicCompareExchange=230, Op_AtomicIAdd=234,
     Op_AtomicISub=235,
     Op_AtomicSMin=236, Op_AtomicUMin=237, Op_AtomicSMax=238, Op_AtomicUMax=239,
     Op_AtomicAnd=240, Op_AtomicOr=241, Op_AtomicXor=242,
@@ -193,7 +194,8 @@ enum : uint32_t {
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformRelease=0x44,                          // Release | UniformMemory
-    MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage-buffer/LDS AcquireRelease semantics
+    MemSem_UniformAcqRel=0x48, MemSem_WGAcquire=0x102,
+    MemSem_WGAcqRel=0x108,                              // storage-buffer/LDS AcquireRelease semantics
     MemSem_ImageAcqRel=0x808,                            // AcquireRelease | ImageMemory
     MemAccess_Volatile=0x1,
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
@@ -2308,6 +2310,74 @@ struct SpirvCompute {
         };
         if (!predicated) { emit(); return; }
         uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        emit();
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+    }
+    // RDNA2 DS_MIN/MAX_F32 are numeric floating-point atomics: one NaN yields the number, infinities
+    // and denormals retain their IEEE ordering, and signed-zero ties choose -0 for min / +0 for max.
+    // SPIR-V 1.3 has no core floating atomic min/max, while integer AtomicS/UMin orders the raw bits
+    // incorrectly. Implement the architectural operation as a u32 compare-exchange loop instead.
+    // The ordering key is monotonic for every non-NaN binary32 bit pattern and therefore does not
+    // depend on the host driver's denormal mode. AMD's both-NaN MINNUM/MAXNUM rule returns a quieted
+    // first operand; the resident `*ptr` value is that first operand for an atomic min/max update.
+    void lds_atomic_fminmax(uint32_t idx, uint32_t value, bool is_min,
+                            bool predicated, uint32_t pred) {
+        auto ordered_key = [&](uint32_t bits) {
+            const uint32_t negative = ucmp(
+                Op_INotEqual, ibin(Op_BitwiseAnd, bits, uconst(0x80000000u)), uconst(0));
+            return sel(negative, iun(Op_Not, bits),
+                       ibin(Op_BitwiseXor, bits, uconst(0x80000000u)));
+        };
+        auto minmax_bits = [&](uint32_t resident) {
+            const uint32_t resident_abs = ibin(
+                Op_BitwiseAnd, resident, uconst(0x7fffffffu));
+            const uint32_t value_abs = ibin(
+                Op_BitwiseAnd, value, uconst(0x7fffffffu));
+            const uint32_t resident_nan = ucmp(
+                Op_UGreaterThan, resident_abs, uconst(0x7f800000u));
+            const uint32_t value_nan = ucmp(
+                Op_UGreaterThan, value_abs, uconst(0x7f800000u));
+            const uint32_t ordered = ucmp(
+                is_min ? Op_ULessThan : Op_UGreaterThan,
+                ordered_key(value), ordered_key(resident));
+            const uint32_t numeric = sel(ordered, value, resident);
+            const uint32_t resident_number = sel(value_nan, resident, numeric);
+            const uint32_t quiet_resident = ibin(
+                Op_BitwiseOr, resident, uconst(0x00400000u));
+            return sel(resident_nan, sel(value_nan, quiet_resident, value), resident_number);
+        };
+        auto emit = [&]() {
+            const uint32_t p = id();
+            putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
+            const uint32_t initial = id();
+            put(code, Op_AtomicLoad,
+                {t_u32, initial, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcquire)});
+
+            const uint32_t preheader = cur_block;
+            const uint32_t header = id(), again = id(), merge = id();
+            put(code, Op_Branch, {header});
+            put(code, Op_Label, {header}); cur_block = header;
+            size_t retry_patch = 0;
+            const uint32_t expected = emit_phi2(t_u32, initial, preheader, retry_patch);
+            const uint32_t desired = minmax_bits(expected);
+            const uint32_t observed = id();
+            put(code, Op_AtomicCompareExchange,
+                {t_u32, observed, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel),
+                 uconst(MemSem_WGAcquire), desired, expected});
+            const uint32_t succeeded = ucmp(Op_IEqual, observed, expected);
+            put(code, Op_LoopMerge, {merge, again, 0});
+            put(code, Op_BranchConditional, {succeeded, merge, again});
+            put(code, Op_Label, {again}); cur_block = again;
+            put(code, Op_Branch, {header});
+            patch_phi(retry_patch, observed, again);
+            put(code, Op_Label, {merge}); cur_block = merge;
+        };
+        if (!predicated) { emit(); return; }
+        const uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
         put(code, Op_Label, {then}); cur_block = then;
@@ -12200,7 +12270,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 (in.opcode != 0x00 && in.opcode != 0x05 && in.opcode != 0x06 &&
                                   in.opcode != 0x07 && in.opcode != 0x08 &&
                                   in.opcode != 0x09 && in.opcode != 0x0a &&
-                                  in.opcode != 0x0b && in.opcode != 0x20 &&
+                                  in.opcode != 0x0b && in.opcode != 0x12 &&
+                                  in.opcode != 0x13 && in.opcode != 0x20 &&
                                   in.opcode != 0x2d &&
                                   in.opcode != 0x0d && in.opcode != 0x0e &&
                                   in.opcode != 0x36 && in.opcode != 0x37 &&
@@ -12302,6 +12373,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (b.ngg_private_lds && (in.opcode == 0x00 || in.opcode == 0x07 || in.opcode == 0x08 ||
+                                     in.opcode == 0x12 || in.opcode == 0x13 ||
                                      in.opcode == 0x20 || in.opcode == 0x2d)) {
                 // Cross-lane/atomic NGG LDS effects do not have a proven single-lane reduction yet.
                 ok = false; return true;
@@ -12309,6 +12381,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0x00) {                     // ds_add_u32: LDS += DATA0, no VGPR return
                 b.lds_atomic(Op_AtomicIAdd, idx, vread(in.src[1].value),
                              rs.exec_narrowed, rs.exec);
+            } else if (in.opcode == 0x12 || in.opcode == 0x13) {
+                // Exact ordinary GFX10 encoding: ADDR + DATA0 only. DATA1 and VDST are reserved for
+                // these non-returning forms (llvm-mc gfx1030 emits both as zero); reject a packet
+                // carrying either field instead of interpreting an unmodeled SRC2/return variant.
+                if ((in.words[1] & 0xffff0000u) != 0u) { ok = false; return true; }
+                b.lds_atomic_fminmax(idx, vread(in.src[1].value), in.opcode == 0x12,
+                                     rs.exec_narrowed, rs.exec);
             } else if (in.opcode >= 0x05 && in.opcode <= 0x0b) {
                 // Non-returning 32-bit LDS atomics map directly to SPIR-V atomics. DS_OR_B32
                 // (0x0a) occurs in Plucky's first-gameplay compute path; supporting the adjacent
