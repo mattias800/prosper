@@ -136,6 +136,17 @@ int main() {
           rdna2_vgpr_write_count(gta_lshlrev_b64) == 2u &&
           rdna2_vgpr_destination_span(gta_lshlrev_b64) == 2u,
           "GTA V v_lshlrev_b64 decodes two sources and a two-VGPR destination");
+    // GTA V exec_cs_205b54f200 pc21, exact llvm-mc gfx1030 packet:
+    // `v_cvt_rpi_i32_f32_e32 v1, v1`. Keep the plain one-dword form distinct from the
+    // modifier encodings that the emitter intentionally leaves unsupported.
+    const uint32_t gta_cvt_rpi_words[] = {0x7e021901u};
+    const Rdna2Inst gta_cvt_rpi = rdna2_decode_one(gta_cvt_rpi_words, 1);
+    CHECK(gta_cvt_rpi.fmt == Rdna2Format::VOP1 && gta_cvt_rpi.len_dwords == 1u &&
+          gta_cvt_rpi.opcode == 0x0cu && isV(gta_cvt_rpi.dst, 1) &&
+          gta_cvt_rpi.n_src == 1u && isV(gta_cvt_rpi.src[0], 1) &&
+          !gta_cvt_rpi.has_literal && !gta_cvt_rpi.has_modifier &&
+          !gta_cvt_rpi.has_sdwa && !gta_cvt_rpi.has_dpp,
+          "GTA V v_cvt_rpi_i32_f32 decodes exact plain VOP1 operands");
     // inst7: s_load_dwordx4 s[0:3], s[4:5], 0x0 (SMEM) -> op 0x2, SDATA s0, SBASE s4 (pair), offset 0
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");

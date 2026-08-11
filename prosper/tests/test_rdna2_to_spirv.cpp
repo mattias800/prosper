@@ -3269,6 +3269,76 @@ int main() {
     CHECK(got32b3.size()==1 && std::fabs(got32b3[0]-189.0f)<1e-3f,
           "kernel 32b3 masks U24 multiplication and floors negative f32 before i32 conversion");
 
+    // GTA V exec_cs_205b54f200 pc21: exact `v_cvt_rpi_i32_f32_e32 v1, v1` packet.
+    // RDNA2 specifies floor(x + 0.5): nearest integer with halfway cases toward +infinity.
+    // Read the integer result bits directly so the positive rail checks INT_MAX itself rather than
+    // losing that distinction in an i32->f32 round-trip. Exceptional values follow prosper's
+    // adjacent saturating f32->i32 convention: NaN -> 0, infinities/overflow -> signed rails.
+    const uint32_t code32b3_rpi[] = {
+        0x7e021901u,               // live pc21: v_cvt_rpi_i32_f32 v1, v1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv32b3_rpi = recompile_valu(
+        code32b3_rpi, std::size(code32b3_rpi), 2, 1);
+    CHECK(!spv32b3_rpi.empty(),
+          "recompiled GTA V pc21 v_cvt_rpi_i32_f32 packet -> SPIR-V");
+    CHECK(count_spirv_opcode(spv32b3_rpi, 110) == 0 &&
+              count_spirv_opcode(spv32b3_rpi, 109) != 0,
+          "v_cvt_rpi_i32_f32 uses the defined saturating conversion path");
+    const float rpi_sources[] = {
+        -INFINITY, -2147483904.0f, -2147483648.0f,
+        -2.75f, -2.5f, -2.25f, -1.5f, -0.75f, -0.5f, -0.25f,
+        -std::numeric_limits<float>::denorm_min(), -0.0f, 0.0f,
+        std::numeric_limits<float>::denorm_min(),
+        std::nextafter(0.5f, 0.0f), 0.5f, std::nextafter(0.5f, 1.0f),
+        0.75f, 1.25f, 1.5f, 1.75f,
+        2147483520.0f, 2147483648.0f, INFINITY, std::nanf(""),
+    };
+    const uint32_t rpi_expected[] = {
+        0x80000000u, 0x80000000u, 0x80000000u,
+        0xfffffffdu, 0xfffffffeu, 0xfffffffeu, 0xffffffffu,
+        0xffffffffu, 0u, 0u, 0u, 0u, 0u, 0u,
+        0u, 1u, 1u, 1u, 1u, 2u, 2u,
+        0x7fffff80u, 0x7fffffffu, 0x7fffffffu, 0u,
+    };
+    static_assert(std::size(rpi_sources) == std::size(rpi_expected));
+    std::vector<float> in32b3_rpi(std::size(rpi_sources) * 2u, 0.0f);
+    for (size_t i = 0; i < std::size(rpi_sources); ++i)
+        in32b3_rpi[i * 2u + 1u] = rpi_sources[i];
+    const std::vector<float> got32b3_rpi = prosper::test::run_compute(
+        spv32b3_rpi, in32b3_rpi, static_cast<uint32_t>(std::size(rpi_sources)),
+        static_cast<uint32_t>(std::size(rpi_sources)));
+    uint32_t bad32b3_rpi = 0;
+    for (size_t i = 0; i < got32b3_rpi.size() && i < std::size(rpi_expected); ++i) {
+        if (bits_of(got32b3_rpi[i]) == rpi_expected[i]) continue;
+        if (bad32b3_rpi == 0)
+            printf("  pc21 first mismatch i=%zu src=0x%08x got=0x%08x expect=0x%08x\n",
+                   i, bits_of(rpi_sources[i]), bits_of(got32b3_rpi[i]), rpi_expected[i]);
+        ++bad32b3_rpi;
+    }
+    CHECK(got32b3_rpi.size() == std::size(rpi_expected) && bad32b3_rpi == 0,
+          "GTA V pc21 rounds fractions/ties and saturates exceptional values exactly");
+
+    // Modifier-bearing siblings are not part of the proven live shape. The trivial-DWORD SDWA
+    // packet is deliberately useful here: the decoder admits it structurally, so this assertion
+    // reaches the opcode's own fail-visible gate rather than a generic malformed-packet reject.
+    const uint32_t cvt_rpi_sdwa[] = {
+        0x7e0218f9u, 0x00060601u,  // v_cvt_rpi_i32_f32_sdwa v1,v1, DWORD/PAD/DWORD
+        0xbf810000u,
+    };
+    const uint32_t cvt_rpi_sdwa_neg[] = {
+        0x7e0218f9u, 0x00160601u,  // same packet with src0 negate
+        0xbf810000u,
+    };
+    const uint32_t cvt_rpi_dpp[] = {
+        0x7e0218fau, 0xff00e401u,  // identity quad_perm, full row/bank masks
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(cvt_rpi_sdwa, std::size(cvt_rpi_sdwa), 2, 1).empty() &&
+              recompile_valu(cvt_rpi_sdwa_neg, std::size(cvt_rpi_sdwa_neg), 2, 1).empty() &&
+              recompile_valu(cvt_rpi_dpp, std::size(cvt_rpi_dpp), 2, 1).empty(),
+          "unproven v_cvt_rpi_i32_f32 SDWA/DPP/modifier forms remain fail-visible");
+
     // Kernel 32b4: exact DS_WRITE_B96/B128 and DS_READ_B96/B128 forms from Astro. Store 1,2,3 at
     // byte 0x510 and 4,5,6,7 at byte 0, read both vectors back, and sum all seven dwords to 28.
     const uint32_t code32b4[] = {
