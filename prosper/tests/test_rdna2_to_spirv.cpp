@@ -5889,6 +5889,79 @@ int main() {
     CHECK(zero_store_after == zero_store_sentinel,
           "zero-record raw store is a no-op and cannot mutate a shared dummy backing");
 
+    // Fully-known NUM_RECORDS=0 atomics use the same exact-PC marker, but their VDATA behavior is
+    // distinct. GLC=1 returns the pre-op value (zero for an empty descriptor) only to active EXEC
+    // lanes; GLC=0 preserves VDATA for every lane. Neither shape may declare a storage binding or
+    // emit an OpAtomic -- there is no backing allocation on which an atomic can operate.
+    auto spirv_atomic_count = [](const std::vector<uint32_t>& spirv) {
+        size_t count = count_spirv_opcode(spirv, 229); // OpAtomicExchange
+        for (uint16_t opcode = 234; opcode <= 242; ++opcode) // IAdd..Xor
+            count += count_spirv_opcode(spirv, opcode);
+        return count;
+    };
+
+    // v2=7; narrow EXEC to u0>u1; exact GTA 0x413e1ac add packet with GLC; restore EXEC;
+    // convert/output v2. Active lanes receive zero and masked lanes retain seven.
+    const uint32_t code68_zero_atomic_glc[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040287u, 0x7DA80300u,
+        0xE0C86000u, 0x80030201u,
+        0xBEFE04C1u, 0x7E040D02u, 0xBF810000u,
+    };
+    ShaderResourceTable rt68_zero_atomic_glc;
+    rt68_zero_atomic_glc.resources.push_back(zero_record_resource(4));
+    const std::vector<uint32_t> spv68_zero_atomic_glc = recompile_valu(
+        code68_zero_atomic_glc, std::size(code68_zero_atomic_glc), 2, 2,
+        &rt68_zero_atomic_glc);
+    CHECK(!spv68_zero_atomic_glc.empty() &&
+              spirv_atomic_count(spv68_zero_atomic_glc) == 0,
+          "zero-record GLC atomic emits no OpAtomic");
+    const std::vector<uint32_t> zero_atomic_glc_sentinel = {
+        0xDEADBEEFu, 0xCAFEBABEu,
+    };
+    std::vector<uint32_t> zero_atomic_glc_after;
+    const std::vector<float> got68_zero_atomic_glc = prosper::test::run_compute(
+        spv68_zero_atomic_glc, in68_zero_load, N, N, {}, zero_atomic_glc_sentinel,
+        &zero_atomic_glc_after);
+    uint32_t bad68_zero_atomic_glc = 0;
+    for (uint32_t i = 0; i < N && got68_zero_atomic_glc.size() == N; ++i)
+        if (got68_zero_atomic_glc[i] != expected68_zero_load[i])
+            ++bad68_zero_atomic_glc;
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_atomic_glc.size() == N && bad68_zero_atomic_glc == 0 &&
+              zero_atomic_glc_after == zero_atomic_glc_sentinel,
+          "zero-record GLC atomic returns zero only to active EXEC lanes and touches no memory");
+
+    // Preserve the live 0x413d884 pc163 OR packet, including VDATA=v23 and GLC=0. The synthetic
+    // marker isolates the architectural empty-resource behavior; the production fold test above is
+    // where the exact live PC and descriptor provenance are checked.
+    const uint32_t code68_zero_atomic_no_glc[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E2E0287u, 0x7DA80300u,
+        0xE0E82000u, 0x80051700u,
+        0xBEFE04C1u, 0x7E2E0D17u, 0xBF810000u,
+    };
+    ShaderResourceTable rt68_zero_atomic_no_glc;
+    rt68_zero_atomic_no_glc.resources.push_back(zero_record_resource(4));
+    const std::vector<uint32_t> spv68_zero_atomic_no_glc = recompile_valu(
+        code68_zero_atomic_no_glc, std::size(code68_zero_atomic_no_glc), 2, 23,
+        &rt68_zero_atomic_no_glc);
+    CHECK(!spv68_zero_atomic_no_glc.empty() &&
+              spirv_atomic_count(spv68_zero_atomic_no_glc) == 0,
+          "zero-record non-GLC atomic emits no OpAtomic");
+    const std::vector<uint32_t> zero_atomic_no_glc_sentinel = {
+        0x12345678u, 0x89ABCDEFu,
+    };
+    std::vector<uint32_t> zero_atomic_no_glc_after;
+    const std::vector<float> got68_zero_atomic_no_glc = prosper::test::run_compute(
+        spv68_zero_atomic_no_glc, in68_zero_load, N, N, {}, zero_atomic_no_glc_sentinel,
+        &zero_atomic_no_glc_after);
+    const uint32_t retained68_zero_atomic_no_glc = static_cast<uint32_t>(std::count(
+        got68_zero_atomic_no_glc.begin(), got68_zero_atomic_no_glc.end(), 7.0f));
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_atomic_no_glc.size() == N &&
+              retained68_zero_atomic_no_glc == N &&
+              zero_atomic_no_glc_after == zero_atomic_no_glc_sentinel,
+          "zero-record non-GLC atomic preserves VDATA in active and inactive lanes without memory");
+
     // Kernel N: v_nop (VOP1 op 0x00) between real ALU ops must be a transparent no-op. This was the
     // #121 blocker — PPSA02664's vertex shaders contain v_nop (a common scheduling/hazard filler), and
     // the recompiler rejected it, failing the whole shader and skipping ~182 draws/frame (black screen).
