@@ -1511,6 +1511,25 @@ int main() {
               gta_pc1180_table.resources[0].bvh_sort_enabled,
           "GTA pc1180 materializes BOX_SORT_EN in its instruction-scoped BVH binding");
 
+    std::vector<uint32_t> gta_unproven_pc1180 = gta_bvh_pc1180;
+    gta_unproven_pc1180[1160] = 0x8f948318u; // same lshl site/value, but s24:s25 has no x16 origin
+    std::array<uint32_t, 78> gta_unproven_pc1180_seed = gta_pc1180_seed;
+    gta_unproven_pc1180_seed[24] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_unproven_pc1180_seed[25] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> gta_unproven_pc1180_uses;
+    resolve_dynamic_fetch(gta_unproven_pc1180.data(), gta_unproven_pc1180.size(),
+                          gta_unproven_pc1180_seed.data(), gta_unproven_pc1180_seed.size(), 0,
+                          &gta_unproven_pc1180_uses);
+    CHECK(gta_unproven_pc1180_uses.empty(),
+          "GTA pc1180 rejects byte-identical descriptor values from an unproven pointer origin");
+    ShaderResourceTable gta_unproven_pc1180_table;
+    add_compute_buffer_resources(gta_unproven_pc1180_table, gta_unproven_pc1180.data(),
+                                 gta_unproven_pc1180.size(),
+                                 gta_unproven_pc1180_seed.data(),
+                                 gta_unproven_pc1180_seed.size());
+    CHECK(gta_unproven_pc1180_table.resources.empty(),
+          "GTA pc1180 cannot materialize an ALU-modified historical x16 snapshot");
+
     std::vector<uint32_t> gta_bvh_pc313(319u, 0xbf800000u); // s_nop 0
     put_words(gta_bvh_pc313, 244u, {0xf4100203u, 0xfa000000u});
     put_words(gta_bvh_pc313, 294u, {

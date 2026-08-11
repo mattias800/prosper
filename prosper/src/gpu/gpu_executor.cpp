@@ -3511,8 +3511,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         bool live_known = valid_reg(bbase) && valid_reg(bbase + 3);
                         for (int k = 0; live_known && k < 4; ++k)
                             live_known &= known(bbase + k, live_bvh[(size_t)k]);
+                        const DecodedBvhDescriptor d = live_known
+                            ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
+                        // GTA V's sorted builder rewrites an aligned four-word window from its x16
+                        // header load. A historical snapshot proves only the bytes it actually loaded;
+                        // if the sorted live words differ, require the exact builder chain below. Keep
+                        // the established snapshot semantics for unsorted descriptors, whose supported
+                        // builders predate the narrow BOX_SORT_EN provenance proof.
                         const bool snapshot_provenance = valid_reg(bbase) &&
-                            descr_known.test((size_t)bbase);
+                            descr_known.test((size_t)bbase) &&
+                            (!d.sort_enabled ||
+                             (live_known && live_bvh == descr[(size_t)bbase]));
                         const bool seed_provenance = !snapshot_provenance &&
                             (untouched_seed_range(bbase, 4) ||
                              consecutive_seed_copy_range(bbase, 4));
@@ -3528,8 +3537,6 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 bvh_build_origin[(size_t)(bbase + k)] == builder_origin &&
                                 bvh_build_role[(size_t)(bbase + k)] ==
                                     expected_builder_roles[k];
-                        const DecodedBvhDescriptor d = live_known
-                            ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
                         const bool plausible = live_known &&
                             (snapshot_provenance || seed_provenance || builder_provenance) &&
                             d.type == 8u && d.base > 0x10000u && d.size_bytes != 0;
