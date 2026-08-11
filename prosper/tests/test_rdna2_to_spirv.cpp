@@ -3635,33 +3635,61 @@ int main() {
     // initializes six LDS bounds to infinities, atomically reduces three minima and three maxima,
     // then reads the completed box. SPIR-V 1.3 has no core float atomic min/max, so the lowering
     // must use an integer compare-exchange loop while preserving AMD MINNUM/MAXNUM semantics.
-    auto run_ds_fminmax = [&](uint32_t atomic_word0, uint32_t atomic_word1,
-                              uint32_t initial_bits,
-                              const std::vector<uint32_t>& operand_bits,
-                              const char* compile_message) {
+    auto build_ds_fminmax = [&](uint32_t atomic_word0, uint32_t atomic_word1,
+                                uint32_t initial_bits) {
         const uint32_t byte_offset = atomic_word0 & 0xffffu;
         const uint32_t data_vgpr = (atomic_word1 >> 8u) & 0xffu;
-        std::vector<uint32_t> code = {
-            0x7e000301u | (data_vgpr << 17u),    // v_mov_b32 data0, v1 (per-lane operand)
-            0x7e000f00u,                         // v_cvt_u32_f32 v0, v0 (lane index)
-            0x7e0402ffu, initial_bits,           // v_mov_b32 v2, initial_bits
-            0x7da40080u,                         // v_cmpx_eq_u32 0, v0 (lane zero initializes)
-            0x7e000280u,                         // v_mov_b32 v0, 0
-            0xd8340000u | byte_offset, 0x00000200u, // ds_write_b32 v0, v2, matching offset
-            0xbefe04c1u,                         // s_mov_b64 exec, -1
-            0x7e000280u,                         // v_mov_b32 v0, 0 (live has no pre-atomic barrier)
-            atomic_word0, atomic_word1,          // exact live vaddr/data0 fields
+        std::array<uint32_t, 6> initial = {
+            0x7f800000u, 0x7f800000u, 0x7f800000u,
+            0xff800000u, 0xff800000u, 0xff800000u,
+        };
+        initial[byte_offset / 4u] = initial_bits;
+        std::vector<uint32_t> code;
+        auto literal = [&](uint32_t vgpr, uint32_t bits) {
+            code.push_back(0x7e0002ffu | (vgpr << 17u));
+            code.push_back(bits);
+        };
+        // Neutral operands for the other five exact live atomics; overwrite the selected source
+        // from v1 before GTA's lane-zero EXEC mask narrows the initializer sequence.
+        for (uint32_t vgpr = 6; vgpr <= 8; ++vgpr) literal(vgpr, 0xff800000u);
+        for (uint32_t vgpr = 9; vgpr <= 11; ++vgpr) literal(vgpr, 0x7f800000u);
+        code.push_back(0x7e000301u | (data_vgpr << 17u)); // v_mov_b32 data0, v1
+        code.push_back(0xbefe0481u);                      // s_mov_b64 exec, 1
+        for (uint32_t vgpr = 0; vgpr < 6; ++vgpr) literal(vgpr, initial[vgpr]);
+        const uint32_t live_tail[] = {
+            0x7e180280u,                         // v_mov_b32 v12, 0
+            0xd9340010u, 0x0000040cu,            // pc63 ds_write_b64 v12, v[4:5] offset:16
+            0xdb7c0000u, 0x0000000cu,            // pc65 ds_write_b128 v12, v[0:3]
+            0xbefe04c1u,                         // pc67 s_mov_b64 exec, -1
+            0x7e000280u,                         // pc68 v_mov_b32 v0, 0
+            0xd8480000u, 0x00000900u,            // pc69/71/73 three exact DS_MIN_F32
+            0xd8480004u, 0x00000a00u,
+            0xd8480008u, 0x00000b00u,
+            0xd84c000cu, 0x00000600u,            // pc75/77/79 three exact DS_MAX_F32
+            0xd84c0010u, 0x00000700u,
+            0xd84c0014u, 0x00000800u,
             0xbf8a0000u,                         // s_barrier
             0xd8d80000u | byte_offset, 0x0a000000u, // ds_read_b32 v10, v0, matching offset
             0xbf810000u,
         };
+        code.insert(code.end(), std::begin(live_tail), std::end(live_tail));
+        return code;
+    };
+    auto run_ds_fminmax = [&](uint32_t atomic_word0, uint32_t atomic_word1,
+                              uint32_t initial_bits,
+                              const std::vector<uint32_t>& operand_bits,
+                              const char* compile_message) {
+        std::vector<uint32_t> code = build_ds_fminmax(
+            atomic_word0, atomic_word1, initial_bits);
         std::vector<uint32_t> spv = recompile_valu(
             code.data(), code.size(), 2, 10);
         CHECK(!spv.empty(), compile_message);
-        CHECK(count_spirv_opcode(spv, 230) == 1 &&
+        CHECK(count_spirv_opcode(spv, 230) == 6 &&
                   count_spirv_opcode(spv, 236) == 0 &&
                   count_spirv_opcode(spv, 237) == 0,
-              "GTA DS_MIN/MAX_F32 uses one compare-exchange loop, not integer min");
+              "GTA DS_MIN/MAX_F32 group uses six compare-exchange loops, not integer min");
+        CHECK(count_spirv_opcode(spv, 224) == 2,
+              "GTA lane-zero LDS initialization gains one publication barrier before its guest barrier");
         if (spv.empty()) return std::vector<float>{};
         std::vector<float> input(WG * 2u);
         for (uint32_t lane = 0; lane < WG; ++lane) {
@@ -3711,6 +3739,33 @@ int main() {
     CHECK(all_bits_are(got32c_fmin_nan, 0x7fe12345u),
           "GTA DS_MIN_F32 quiets and preserves the resident payload when both operands are NaN");
 
+    // GTA reaches this publication point after a completed two-edge loop. Prove the synthesized
+    // barrier remains top-level through that control-flow route as well as the straight-line
+    // execution arms above; neither edge crosses the initializer/atomic boundary.
+    const uint32_t pre_atomic_loop[] = {
+        0xb0020005u, 0xbe800380u, 0x7e020280u, 0xbf0a0200u,
+        0xbf840003u, 0x4a020200u, 0x81008100u, 0xbf82fffbu,
+    };
+    std::vector<uint32_t> looped_ds_fmin = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    looped_ds_fmin.insert(
+        looped_ds_fmin.begin(), std::begin(pre_atomic_loop), std::end(pre_atomic_loop));
+    const std::vector<uint32_t> looped_ds_fmin_spv = recompile_valu(
+        looped_ds_fmin.data(), looped_ds_fmin.size(), 2, 10);
+    CHECK(!looped_ds_fmin_spv.empty() && count_spirv_opcode(looped_ds_fmin_spv, 224) == 2,
+          "GTA-style completed pre-atomic loop retains a top-level LDS publication barrier");
+    std::vector<uint32_t> skipped_ds_fmin_barrier = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    const auto first_fmin = std::find(
+        skipped_ds_fmin_barrier.begin(), skipped_ds_fmin_barrier.end(), 0xd8480000u);
+    const uint32_t first_fmin_pc = static_cast<uint32_t>(
+        std::distance(skipped_ds_fmin_barrier.begin(), first_fmin));
+    skipped_ds_fmin_barrier.insert(
+        skipped_ds_fmin_barrier.begin(), 0xbf840000u | first_fmin_pc);
+    CHECK(recompile_valu(
+              skipped_ds_fmin_barrier.data(), skipped_ds_fmin_barrier.size(), 2, 10).empty(),
+          "branch that skips the LDS publication boundary remains rejected");
+
     // Encoding boundaries: the live opcode is LDS-only and has no DATA1/VDST operand. These two
     // one-bit mutations perturb that exact production packet and must remain fail-visible.
     const uint32_t bad_ds_fmin_gds[] = {
@@ -3723,6 +3778,22 @@ int main() {
           "GTA DS_MIN_F32 GDS mutation remains rejected");
     CHECK(recompile_valu(bad_ds_fmin_data1, std::size(bad_ds_fmin_data1), 10, 0).empty(),
           "GTA DS_MIN_F32 reserved DATA1 mutation remains rejected");
+    std::vector<uint32_t> bad_ds_fmin_restore = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    auto restore = std::find(
+        bad_ds_fmin_restore.begin(), bad_ds_fmin_restore.end(), 0xbefe04c1u);
+    CHECK(restore != bad_ds_fmin_restore.end(),
+          "GTA LDS initializer regression contains the exact full-EXEC restore");
+    if (restore != bad_ds_fmin_restore.end()) *restore ^= 1u;
+    CHECK(recompile_valu(bad_ds_fmin_restore.data(), bad_ds_fmin_restore.size(), 2, 10).empty(),
+          "GTA LDS initializer restore mutation cannot bypass the publication proof");
+    const uint32_t unproved_ds_fmin_store[] = {
+        0x7e000280u, 0x7e0402ffu, 0x7f800000u,
+        0xd8340000u, 0x00000200u,
+        0xd8480000u, 0x00000900u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(unproved_ds_fmin_store, std::size(unproved_ds_fmin_store), 10, 0).empty(),
+          "ordinary LDS store before DS_MIN_F32 stays rejected without a uniform publication proof");
 
     // Plucky Squire's first-gameplay compute shaders use the non-returning DS_OR_B32 form. Seed an
     // LDS dword with 4, OR in 3 using the exact opcode-0x0a encoding, then read back 7.

@@ -425,10 +425,17 @@ int main(int argc, char** argv) {
       dump(dir, "compute_lds", recompile_valu(c, sizeof(c)/4, 1, 0)); }
     // GTA V exec_cs_413ced900 pc69: exact DS_MIN_F32 fields. Strictly validate the core-SPIR-V
     // compare-exchange loop used in place of an unavailable portable float atomic min.
-    { const uint32_t c[] = {0x7e000280u, 0x7e120301u,
-                            0xd8340000u, 0x00000900u,
+    { const uint32_t c[] = {0xbefe0481u, 0x7e180280u,
+                            0xd9340010u, 0x0000040cu,
+                            0xdb7c0000u, 0x0000000cu,
+                            0xbefe04c1u, 0x7e000280u,
                             0xd8480000u, 0x00000900u,
-                            0xd8d80000u, 0x00000000u, 0xbf810000u};
+                            0xd8480004u, 0x00000a00u,
+                            0xd8480008u, 0x00000b00u,
+                            0xd84c000cu, 0x00000600u,
+                            0xd84c0010u, 0x00000700u,
+                            0xd84c0014u, 0x00000800u,
+                            0xbf8a0000u, 0xd8d80000u, 0x00000000u, 0xbf810000u};
       dump(dir, "compute_ds_min_f32", recompile_valu(c, std::size(c), 2, 0)); }
     // Compute MUBUF store (buffer_store_format_x).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0xe0102000u,0x80020302u,0xbf810000u};
