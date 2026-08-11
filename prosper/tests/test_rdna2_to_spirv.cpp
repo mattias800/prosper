@@ -1586,6 +1586,25 @@ int main() {
                             native_linear_cfg17d).empty(),
           "Wave64 complete-pair bridge rejects a same-site scalar-domain mutation");
 
+    // Guard the source-domain half of that proof independently. The first B32 logical derives
+    // VCC_LO from the live mask, then a dispatcher edge reloads the physical scalar register file.
+    // Its uint Function variable contains only a placeholder and must not become a scalar-word
+    // fact. If it does, the exact cross-half packet below takes the scalar path and compiles zero.
+    std::vector<uint32_t> code17d1_vcc_scalar_source_mutated = {
+        0x7d8800a1u,              // establish a genuine Wave64 VCC mask
+        0xbf060000u,
+        0x856b8081u,              // scalar VCC_HI=1 while VCC_LO remains a mask
+        0x876a816au,              // VCC_LO = mask VCC_LO & scalar 1
+        0xbf880000u,              // same target/fallthrough forces a dispatcher reload
+        0x876a6b6au,              // exact cross-half packet must not read the uint placeholder
+    };
+    code17d1_vcc_scalar_source_mutated.insert(
+        code17d1_vcc_scalar_source_mutated.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(code17d1_vcc_scalar_source_mutated.data(),
+                            code17d1_vcc_scalar_source_mutated.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "Wave64 scalar-pair proof rejects a mask-derived source after dispatcher reload");
+
     // GTA 0x205b658800 spills EXEC_LO/HI through v31 lanes 5/6, then restores each as ordinary
     // scalar data for V_AND_B32. The dispatcher Bool slots retain the mask value but not its physical
     // half, so a separate MUST proof has to select ballot .x/.y at the exact readlane PCs.
@@ -1598,6 +1617,12 @@ int main() {
         0x7e3002c1u,              // v_mov_b32 v24,-1
         0x7e3202c1u,              // v_mov_b32 v25,-1
         0xd7600006u, 0x00010b1fu, // exact pc261: v_readlane s6,v31,5
+        0xbf060000u,              // make the following dispatcher edge deterministic
+        0xbf840000u,              // same target/fallthrough, but force an SGPR reload
+        0xd761001fu, 0x00010a06u, // write the restored EXEC_LO half back through s6
+        0xbf060000u,
+        0xbf840000u,              // force a second reload before the observing readlane
+        0xd7600006u, 0x00010b1fu, // restore lane 5 again after the alias write
         0x36023006u,              // exact pc263: v_and_b32 v1,s6,v24
         0xd7600006u, 0x00010d1fu, // exact pc264: v_readlane s6,v31,6
         0x36043206u,              // exact pc266: v_and_b32 v2,s6,v25
@@ -1612,9 +1637,9 @@ int main() {
         native_linear_cfg17d);
     CHECK(!spv17d1_mask_half_spill.empty() &&
               count_spirv_opcode(spv17d1_mask_half_spill, 339) ==
-                  count_spirv_opcode(native_linear_spv17d, 339) + 2 &&
+                  count_spirv_opcode(native_linear_spv17d, 339) + 3 &&
               count_spirv_composite_extract_index(spv17d1_mask_half_spill, 0) ==
-                  count_spirv_composite_extract_index(native_linear_spv17d, 0) + 1 &&
+                  count_spirv_composite_extract_index(native_linear_spv17d, 0) + 2 &&
               count_spirv_composite_extract_index(spv17d1_mask_half_spill, 1) ==
                   count_spirv_composite_extract_index(native_linear_spv17d, 1) + 1,
           "Wave64 readlane spills materialize exact low and high ballot dwords");
@@ -1659,16 +1684,31 @@ int main() {
         code17d1_mask_half_spill;
     code17d1_mask_half_vcc_mutated[5] =
         0x00010a6au;              // same-site mutation: spill unproved VCC_LO, not EXEC_LO
+    std::vector<uint32_t> code17d1_mask_half_alias_mutated =
+        code17d1_mask_half_spill;
+    code17d1_mask_half_alias_mutated[14] =
+        0x00010a7fu;              // same alias-write site: EXEC_HI replaces restored EXEC_LO
+    const std::vector<uint32_t> spv17d1_mask_half_alias_mutated = recompile_compute(
+        code17d1_mask_half_alias_mutated.data(), code17d1_mask_half_alias_mutated.size(),
+        &rt17d1, native_linear_cfg17d);
+    CHECK(!spv17d1_mask_half_alias_mutated.empty() &&
+              count_spirv_composite_extract_index(spv17d1_mask_half_alias_mutated, 0) ==
+                  count_spirv_composite_extract_index(native_linear_spv17d, 0) + 1 &&
+              count_spirv_composite_extract_index(spv17d1_mask_half_alias_mutated, 1) ==
+                  count_spirv_composite_extract_index(native_linear_spv17d, 1) + 2,
+          "same-site alias mutation selects EXEC_HI instead of the proved EXEC_LO half");
     CHECK(recompile_compute(code17d1_mask_half_spill.data(),
                             code17d1_mask_half_spill.size(), &rt17d1,
-                            portable_cfg17d1_mask_half).empty() &&
-              recompile_compute(code17d1_mask_half_spill_mutated.data(),
-                                code17d1_mask_half_spill_mutated.size(), &rt17d1,
-                                native_linear_cfg17d).empty() &&
-              recompile_compute(code17d1_mask_half_vcc_mutated.data(),
-                                code17d1_mask_half_vcc_mutated.size(), &rt17d1,
-                                native_linear_cfg17d).empty(),
-          "Wave64 mask-half spills reject portable, unknown-lane, and unproved-VCC forms");
+                            portable_cfg17d1_mask_half).empty(),
+          "Wave64 mask-half spill rejects without an exact native subgroup");
+    CHECK(recompile_compute(code17d1_mask_half_spill_mutated.data(),
+                            code17d1_mask_half_spill_mutated.size(), &rt17d1,
+                            native_linear_cfg17d).empty(),
+          "Wave64 mask-half spill rejects a same-site unknown-lane read");
+    CHECK(recompile_compute(code17d1_mask_half_vcc_mutated.data(),
+                            code17d1_mask_half_vcc_mutated.size(), &rt17d1,
+                            native_linear_cfg17d).empty(),
+          "Wave64 mask-half spill rejects a same-site unproved VCC source");
     ComputeShaderConfig native_cfg17d1;
     native_cfg17d1.local_x = 64;
     native_cfg17d1.wave_size = 32;
