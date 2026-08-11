@@ -2284,6 +2284,24 @@ struct SpirvCompute {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
+    // EXEC-predicated LDS load. The inactive arm must not merely discard a loaded value: its
+    // address VGPR retains the old, potentially arbitrary bits when the instruction is masked off,
+    // so even forming an AccessChain/OpLoad there can access outside the Workgroup array or race an
+    // active lane. Keep the memory access inside the active selection and join the architectural
+    // old destination through OpPhi, matching the returning-atomic helper below.
+    uint32_t lds_load(uint32_t idx, bool predicated, uint32_t pred, uint32_t fallback) {
+        if (!predicated) return lds_load(idx);
+        const uint32_t entry = cur_block;
+        const uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        const uint32_t result = lds_load(idx);
+        const uint32_t then_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
+    }
     // Store to LDS[idx]; EXEC-predicated (conditional store) under a narrowed mask, like cbuf_store.
     void lds_store(uint32_t idx, uint32_t value, bool predicated, uint32_t pred) {
         if (!predicated) {
@@ -12213,8 +12231,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 rs.exec_narrowed, rs.exec);
                 } else {
                     const uint32_t old = vreg_old(b, rs, in.dst.value);
-                    rs.vreg[in.dst.value] = b.lds_load(idx);
-                    predicate_write(b, rs, in.dst.value, old);
+                    rs.vreg[in.dst.value] = b.lds_load(
+                        idx, rs.exec_narrowed, rs.exec, old);
                 }
                 return true;
             }
@@ -12331,8 +12349,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 for (int k = 0; k < 4; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
-                    rs.vreg[in.dst.value + k] = b.lds_load(indices[k]);
-                    predicate_write(b, rs, in.dst.value + k, old);
+                    rs.vreg[in.dst.value + k] = b.lds_load(
+                        indices[k], rs.exec_narrowed, rs.exec, old);
                 }
                 return true;
             }
@@ -12347,8 +12365,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 for (int k = 0; k < 2; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
-                    rs.vreg[in.dst.value + k] = b.lds_load(indices[k]);
-                    predicate_write(b, rs, in.dst.value + k, old);
+                    rs.vreg[in.dst.value + k] = b.lds_load(
+                        indices[k], rs.exec_narrowed, rs.exec, old);
                 }
                 return true;
             }
@@ -12430,13 +12448,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 for (int k = 0; k < dwords; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
                     const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst((uint32_t)k)) : idx;
-                    rs.vreg[in.dst.value + k] = b.lds_load(at);
-                    predicate_write(b, rs, in.dst.value + k, old);
+                    rs.vreg[in.dst.value + k] = b.lds_load(
+                        at, rs.exec_narrowed, rs.exec, old);
                 }
             } else {                                    // ds_read_b32: VDST = LDS[idx]
                 uint32_t old = vreg_old(b, rs, in.dst.value);
-                rs.vreg[in.dst.value] = b.lds_load(idx);
-                predicate_write(b, rs, in.dst.value, old);
+                rs.vreg[in.dst.value] = b.lds_load(
+                    idx, rs.exec_narrowed, rs.exec, old);
             }
             return true;
         }
@@ -16641,15 +16659,19 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
 // idiom: select EXEC=1, initialize six adjacent dwords with one B64 and one B128 write, restore
 // EXEC=-1, set vaddr=0, then issue three DS_MIN_F32 and three DS_MAX_F32 operations.
 //
-// Recognize only that byte-exact sequence and insert an emitter-only S_BARRIER before the first
-// atomic. A straight-line shader emits it directly. With scalar control flow, a no-crossing-edge
-// proof keeps the boundary top-level in the compact structurizer or lets the existing phase route
-// lift it outside a complex dispatcher, so every workgroup invocation reaches the same dynamic
-// barrier. Any other float atomic following an unsynchronized ordinary LDS store rejects visibly;
-// a real guest barrier, or an atomic with no preceding ordinary store in its phase, remains
-// architectural and needs no synthesized edge.
+// Recognize only that byte-exact sequence, including its lane-zero B128+B64 gather, and insert
+// emitter-only S_BARRIERs before and after the six atomics. The first publishes lane zero's plain
+// stores before every lane enters the CAS group; the second makes every lane finish all six CAS
+// loops before lane zero reads the result. AcquireRelease on an individual atomic orders memory but
+// is not an arrival barrier, so neither edge can be omitted. A straight-line shader emits both
+// directly. With scalar control flow, a no-crossing-edge proof keeps each boundary top-level in the
+// compact structurizer or lets the existing phase route lift it outside a complex dispatcher, so
+// every workgroup invocation reaches the same dynamic barrier. Any other float atomic following an
+// unsynchronized ordinary LDS store rejects visibly; a real guest barrier, or an atomic with no
+// preceding ordinary store in its phase, remains architectural and needs no synthesized edge.
 bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
-                                         RecompileDiagnosticContext diagnostic) {
+                                         RecompileDiagnosticContext diagnostic,
+                                         bool at_most_one_guest_wave) {
     auto ordinary_lds_store = [](const Rdna2Inst& in) {
         if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
         return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x4d ||
@@ -16687,7 +16709,7 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
         }
         if (!float_lds_atomic(in) || phase_stores.empty()) continue;
 
-        bool exact = i >= 4 && i + 5 < ins.size() && phase_stores.size() == 2 &&
+        bool exact = i >= 4 && i + 9 < ins.size() && phase_stores.size() == 2 &&
             phase_stores[0] == i - 4 && phase_stores[1] == i - 3 &&
             words_are(ins[i - 4], 0xd9340010u, 0x0000040cu) &&
             words_are(ins[i - 3], 0xdb7c0000u, 0x0000000cu) &&
@@ -16695,6 +16717,11 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
             ins[i - 1].words[0] == 0x7e000280u;   // v_mov_b32 v0, 0
         for (size_t atomic = 0; exact && atomic < 6; ++atomic)
             exact = words_are(ins[i + atomic], kAtomicWord0[atomic], kAtomicWord1[atomic]);
+        exact = exact &&
+            ins[i + 6].words[0] == 0xbefe0481u && // pc81 s_mov_b64 exec, 1
+            ins[i + 7].words[0] == 0x7e080280u && // pc82 v_mov_b32 v4, 0
+            words_are(ins[i + 8], 0xdbfc0000u, 0x00000004u) && // pc83 ds_read_b128 v[0:3],v4
+            words_are(ins[i + 9], 0xd9d80010u, 0x04000004u);   // pc85 ds_read_b64 v[4:5],v4
 
         bool found_lane0 = false;
         uint32_t lane0_pc = UINT32_MAX;
@@ -16742,10 +16769,21 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
                 "pc=%u reason=unsynchronized-lds-store-before-ds-fminmax", in.pc);
             return false;
         }
+        // EXEC=1 selects lane zero independently in every guest wave. The exact initializer uses
+        // ordinary same-address stores, so more than one wave would race even though each wave has
+        // only one active lane. Keep the title-observed single-wave workgroup admissible and leave a
+        // different launch shape fail-visible until its cross-wave ownership can be proved.
+        if (!at_most_one_guest_wave) {
+            log_recompile_diagnostic(
+                diagnostic, "compute-recompile-reject", "terminal",
+                "pc=%u reason=multiwave-lds-fminmax-initializer", in.pc);
+            return false;
+        }
 
         synth_before.push_back(i);
+        synth_before.push_back(i + 6);
         phase_stores.clear();
-        i += 5; // the byte-exact six-atomic group shares the one publication barrier
+        i += 9; // both synthesized boundaries belong to this complete live atomic/gather group
     }
 
     std::vector<uint32_t> synth_pcs;
@@ -18014,7 +18052,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
     (void)extend_terminating_if_else(code, dwords, ins);
-    if (!prepare_lds_fminmax_synchronization(ins, {})) return {};
+    // The synthetic test shell is one Wave64 workgroup, matching the live GTA dispatch.
+    if (!prepare_lds_fminmax_synchronization(ins, {}, true)) return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
@@ -18045,6 +18084,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    const uint32_t local_x = std::max(1u, config.local_x);
+    const uint32_t local_y = std::max(1u, config.local_y);
+    const uint32_t local_z = std::max(1u, config.local_z);
+    const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
+    const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
@@ -18056,7 +18100,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
-    if (!prepare_lds_fminmax_synchronization(ins, diagnostic)) return {};
+    if (!prepare_lds_fminmax_synchronization(
+            ins, diagnostic, local_count <= wave_size))
+        return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     b.diagnostic = diagnostic;
@@ -18064,11 +18110,6 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         uint32_t dw = (config.lds_bytes + 3) / 4;
         b.lds_dwords = std::min(16384u, std::max(1u, dw));
     }
-    const uint32_t local_x = std::max(1u, config.local_x);
-    const uint32_t local_y = std::max(1u, config.local_y);
-    const uint32_t local_z = std::max(1u, config.local_z);
-    const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
-    const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
     const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
                                        config.threads_y % local_y != 0 ||
                                        config.threads_z % local_z != 0;
