@@ -635,6 +635,186 @@ int main() {
                     exec_ballot_subgroup.size);
     }
 
+    // GTA V's Wave64 traversal kernels count complete EXEC, VCC, and VOPC-saved masks.  A native
+    // subgroup reduction is exact only under the required 64-lane contract.  The asymmetric VCC
+    // predicate contains 33 lanes, including lane 32, while the second wave is empty; doubling the
+    // result also keeps the immediately-preceding SCC=false observable after S_BCNT.
+    const uint32_t code9_bcnt_vcc[] = {
+        0x7d8800a1u,              // v_cmp_gt_u32 vcc, 33, v0 -> wave0 lanes 0..32
+        0xbe810381u,              // s_mov_b32 s1, 1
+        0xbf068001u,              // s_cmp_eq_u32 s1, 0 -> SCC=false
+        0xbe84106au,              // s_bcnt1_i32_b64 s4, vcc
+        0x85058081u,              // s_cselect_b32 s5, 1, 0 -> 0 only if SCC is preserved
+        0x8f048104u,              // s_lshl_b32 s4, s4, 1
+        0x80040504u,              // s_add_u32 s4, s4, s5
+        0x7e020204u,              // v_mov_b32 v1, s4
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable bcnt_table;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      bcnt_table.resources.push_back(output); }
+    ComputeShaderConfig bcnt_wave64_config;
+    bcnt_wave64_config.local_x = 128;
+    bcnt_wave64_config.wave_size = 64;
+    bcnt_wave64_config.native_subgroup_size = 64;
+    const std::vector<uint32_t> spv9_bcnt_vcc = recompile_compute(
+        code9_bcnt_vcc, std::size(code9_bcnt_vcc), &bcnt_table, bcnt_wave64_config);
+    CHECK(!spv9_bcnt_vcc.empty() && count_spirv_opcode(spv9_bcnt_vcc, 349) == 1 &&
+              count_spirv_opcode(spv9_bcnt_vcc, 339) == 0,
+          "Wave64 VCC s_bcnt emits one exact subgroup IAdd reduction");
+
+    // The exact live EXEC packet (`be86107e`) and saved-mask packet (`beea1006`) exercise the two
+    // other source resolvers.  The saved predicate has only lane 40 set, so a low-half truncation
+    // produces zero rather than one.  Both publish ordinary scalar DATA for the following move.
+    const uint32_t code9_bcnt_exec[] = {
+        0x7d8800a1u,              // v_cmp_gt_u32 vcc, 33, v0
+        0xbefe046au,              // s_mov_b64 exec, vcc
+        0xbe86107eu,              // GTA pc337: s_bcnt1_i32_b64 s6, exec
+        0xbefe04c1u,              // restore EXEC before vector write/store
+        0x7e020206u,              // v_mov_b32 v1, s6
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    const uint32_t code9_bcnt_saved[] = {
+        0x7e0202a8u,              // v_mov_b32 v1, 40
+        0x7d8402f9u, 0x06068600u, // v_cmp_eq_u32_sdwa s[6:7], v0, v1
+        0xbeea1006u,              // GTA pc2007: s_bcnt1_i32_b64 vcc_lo, s[6:7]
+        0x7e02026au,              // v_mov_b32 v1, vcc_lo (scalar-data lifetime)
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_bcnt_exec = recompile_compute(
+        code9_bcnt_exec, std::size(code9_bcnt_exec), &bcnt_table, bcnt_wave64_config);
+    const std::vector<uint32_t> spv9_bcnt_saved = recompile_compute(
+        code9_bcnt_saved, std::size(code9_bcnt_saved), &bcnt_table, bcnt_wave64_config);
+    CHECK(!spv9_bcnt_exec.empty() && count_spirv_opcode(spv9_bcnt_exec, 349) == 1 &&
+              !spv9_bcnt_saved.empty() && count_spirv_opcode(spv9_bcnt_saved, 349) == 1,
+          "exact EXEC and saved-mask s_bcnt packets lower through the Wave64 reduction");
+
+    const bool can_execute_bcnt = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    if (can_execute_bcnt && !spv9_bcnt_vcc.empty() && !spv9_bcnt_exec.empty() &&
+        !spv9_bcnt_saved.empty()) {
+        auto run_bcnt = [&](const std::vector<uint32_t>& spv) {
+            std::vector<uint32_t> got;
+            prosper::test::run_compute(spv, std::vector<float>(128, 0.0f), 128, 128, {},
+                                       std::vector<uint32_t>(128, 0), &got, 128);
+            return got;
+        };
+        const std::vector<uint32_t> got_bcnt_vcc = run_bcnt(spv9_bcnt_vcc);
+        const std::vector<uint32_t> got_bcnt_exec = run_bcnt(spv9_bcnt_exec);
+        const std::vector<uint32_t> got_bcnt_saved = run_bcnt(spv9_bcnt_saved);
+        uint32_t bad_bcnt = 0;
+        for (uint32_t lane = 0; lane < 128 && got_bcnt_vcc.size() == 128 &&
+             got_bcnt_exec.size() == 128 && got_bcnt_saved.size() == 128; ++lane) {
+            bad_bcnt += got_bcnt_vcc[lane] != (lane < 64 ? 66u : 0u);
+            bad_bcnt += got_bcnt_exec[lane] != (lane < 64 ? 33u : 0u);
+            bad_bcnt += got_bcnt_saved[lane] != (lane < 64 ? 1u : 0u);
+        }
+        CHECK(got_bcnt_vcc.size() == 128 && got_bcnt_exec.size() == 128 &&
+                  got_bcnt_saved.size() == 128 && bad_bcnt == 0,
+              "Wave64 s_bcnt counts high-half/empty masks and preserves SCC=false");
+    } else {
+        std::printf("  [skip] Wave64 s_bcnt execution: host subgroup is %u or lacks arithmetic\n",
+                    exec_ballot_subgroup.size);
+    }
+
+    // Width/domain and destination guards mutate the same op0x10 production gate and resolver as
+    // the positive packets.  Plain scalar B64 remains covered by T8b below; unknown masks, ambiguous
+    // mask+data state, non-Wave64 execution, and writes to either EXEC half stay fail-visible.
+    ComputeShaderConfig bcnt_native32_config = bcnt_wave64_config;
+    bcnt_native32_config.native_subgroup_size = 32;
+    ComputeShaderConfig bcnt_unknown_config = bcnt_wave64_config;
+    bcnt_unknown_config.native_subgroup_size = 0;
+    ComputeShaderConfig bcnt_wave32_config = bcnt_wave64_config;
+    bcnt_wave32_config.wave_size = 32;
+    bcnt_wave32_config.native_subgroup_size = 32;
+    const uint32_t code9_bcnt_exec_scalar[] = {
+        0xbe84107eu,              // s_bcnt1_i32_b64 s4, exec
+        0x7e020204u,
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
+                            bcnt_native32_config).empty() &&
+              recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
+                                bcnt_unknown_config).empty() &&
+              recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
+                                bcnt_wave32_config).empty(),
+          "S_BCNT1_I32_B64 rejects native32, unknown-width, and Wave32 mask execution");
+    const uint32_t code9_bcnt_unknown_pair[] = {0xbe841006u, 0xbf810000u};
+    const uint32_t code9_bcnt_ambiguous[] = {
+        0xbe8604c1u,              // s_mov_b64 s[6:7], -1 (mask and scalar-data views)
+        0xbe841006u,              // s_bcnt1_i32_b64 s4, s[6:7]
+        0xbf810000u,
+    };
+    const uint32_t code9_bcnt_exec_lo_dst[] = {0xbefe107eu, 0xbf810000u};
+    const uint32_t code9_bcnt_exec_hi_dst[] = {0xbeff107eu, 0xbf810000u};
+    const uint32_t code9_bcnt_scalar_exec_lo_dst[] = {0xbefe10c1u, 0xbf810000u};
+    const uint32_t code9_bcnt_scalar_exec_hi_dst[] = {0xbeff10c1u, 0xbf810000u};
+    CHECK(recompile_compute(code9_bcnt_unknown_pair, std::size(code9_bcnt_unknown_pair), nullptr,
+                            bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_ambiguous, std::size(code9_bcnt_ambiguous), nullptr,
+                                bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_exec_lo_dst, std::size(code9_bcnt_exec_lo_dst), nullptr,
+                                bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_exec_hi_dst, std::size(code9_bcnt_exec_hi_dst), nullptr,
+                                bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_scalar_exec_lo_dst,
+                                std::size(code9_bcnt_scalar_exec_lo_dst), nullptr,
+                                bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_scalar_exec_hi_dst,
+                                std::size(code9_bcnt_scalar_exec_hi_dst), nullptr,
+                                bcnt_wave64_config).empty(),
+          "Wave64 s_bcnt rejects unknown/ambiguous masks and scalar/mask writes to EXEC");
+
+    // A scalar result overwriting VCC_LO, or the high half of a saved pair, destroys that mask.
+    // Subsequent implicit VCC/EXEC consumers must not observe the pre-S_BCNT Boolean lifetime.
+    const uint32_t code9_bcnt_stale_vcc[] = {
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0 (live complete VCC)
+        0xbeea107eu,              // s_bcnt1_i32_b64 vcc_lo, exec (scalar result)
+        0x02000501u,              // v_cndmask_b32 v0, v1, v2, stale implicit VCC
+        0xbf810000u,
+    };
+    const uint32_t code9_bcnt_stale_saved[] = {
+        0x7e0202a8u,
+        0x7d8402f9u, 0x06068600u, // saved mask rooted at s6
+        0xbe87107eu,              // s_bcnt1_i32_b64 s7, exec overwrites its high half
+        0xbefe0406u,              // s_mov_b64 exec, s[6:7] must not see the stale mask
+        0xbf810000u,
+    };
+    const uint32_t code9_bcnt_scalar_stale_vcc[] = {
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0 (live complete VCC)
+        0xbe880381u,              // s_mov_b32 s8, 1 (ordinary scalar-data pair)
+        0xbe890380u,              // s_mov_b32 s9, 0
+        0xbeeb1008u,              // s_bcnt1_i32_b64 vcc_hi, s[8:9]
+        0x02000501u,              // v_cndmask_b32 v0, v1, v2, stale implicit VCC
+        0xbf810000u,
+    };
+    const uint32_t code9_bcnt_scalar_stale_saved[] = {
+        0x7e0202a8u,
+        0x7d8402f9u, 0x06068600u, // saved mask rooted at s6
+        0xbe880381u,              // s_mov_b32 s8, 1 (ordinary scalar-data pair)
+        0xbe890380u,              // s_mov_b32 s9, 0
+        0xbe871008u,              // s_bcnt1_i32_b64 s7, s[8:9] overwrites saved high half
+        0xbefe0406u,              // s_mov_b64 exec, s[6:7] must not see the stale mask
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code9_bcnt_stale_vcc, std::size(code9_bcnt_stale_vcc), nullptr,
+                            bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_stale_saved, std::size(code9_bcnt_stale_saved), nullptr,
+                                bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_scalar_stale_vcc,
+                                std::size(code9_bcnt_scalar_stale_vcc), nullptr,
+                                bcnt_wave64_config).empty() &&
+              recompile_compute(code9_bcnt_scalar_stale_saved,
+                                std::size(code9_bcnt_scalar_stale_saved), nullptr,
+                                bcnt_wave64_config).empty(),
+          "S_BCNT scalar and mask sources invalidate stale VCC and saved-mask aliases");
+
     // Plucky Squire's post-Desk transition shader clears the top bit of a scalar-data VCC_HI
     // lifetime before combining the two VCC dwords into a buffer address. This is the exact
     // gfx1030 s_bitset0_b32 packet retained by the failed-dispatch capsule for #1554.
@@ -1185,6 +1365,187 @@ int main() {
         std::printf("  [skip] s_ff1 execution: host default subgroup is %u or lacks vote/arithmetic\n",
                     subgroup17d1.size);
     }
+
+    // Kernel 17d1b: GTA V's compact-BVH traversal writes a complete Wave64 VOPC predicate to
+    // s[16:17], scans it with the exact live `beea1410`, and consumes VCC_LO as a scalar lane index
+    // through V_READLANE.  Lane 40 is deliberately above the low dword: truncating the reduction to
+    // B32, deleting the saved-mask resolver, or failing to publish scalar DATA makes this arm red.
+    const uint32_t code17d1b_saved[] = {
+        0x7e0202a8u,              // v_mov_b32 v1, 40
+        0x7e060300u,              // v_mov_b32 v3, v0
+        0x7d8402f9u, 0x06069000u, // v_cmp_eq_u32_sdwa s[16:17], v0, v1
+        0xbeea1410u,              // GTA pc1486: s_ff1_i32_b64 vcc_lo, s[16:17]
+        0xd7600004u, 0x0000d503u, // GTA consumer: v_readlane_b32 s4, v3, vcc_lo
+        0x7e020204u,              // v_mov_b32 v1, s4
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig native_cfg17d1b = native_cfg17d;
+    native_cfg17d1b.local_x = 64;
+    native_cfg17d1b.local_y = 1;
+    const std::vector<uint32_t> native_spv17d1b_saved = recompile_compute(
+        code17d1b_saved, std::size(code17d1b_saved), &rt17d1, native_cfg17d1b);
+    CHECK(!native_spv17d1b_saved.empty() &&
+              count_spirv_opcode(native_spv17d1b_saved, 349) >= 2 &&
+              count_spirv_opcode(native_spv17d1b_saved, 335) >= 1 &&
+              count_spirv_opcode(native_spv17d1b_saved, 345) >= 1,
+          "Wave64 saved-mask s_ff1 lowers to exact reduction and scalar V_READLANE index");
+
+    // The EXEC-source/elect form (`beea147e`) exercises the other captured resolver.  Two Wave64
+    // subgroups share one 128-thread workgroup: wave zero has a sole hit at lane 40 and wave one is
+    // empty.  Seed SCC=false, select through it immediately after S_FF1, and then shift the scalar
+    // result.  Expected 80 / 0xfffffffe therefore catches high-half loss, SCC modification, and a
+    // result left in the mask domain instead of ordinary scalar DATA.
+    const uint32_t code17d1b_exec[] = {
+        0xbe8003a8u,              // s_mov_b32 s0, 40
+        0x7d840000u,              // v_cmp_eq_u32 vcc, s0, v0
+        0xbefe046au,              // s_mov_b64 exec, vcc
+        0xbe810381u,              // s_mov_b32 s1, 1
+        0xbf068001u,              // s_cmp_eq_u32 s1, 0 -> SCC=false
+        0xbeea147eu,              // s_ff1_i32_b64 vcc_lo, exec
+        0x85058081u,              // s_cselect_b32 s5, 1, 0 -> 0 only if SCC was preserved
+        0x8f04816au,              // s_lshl_b32 s4, vcc_lo, 1
+        0x80040504u,              // s_add_u32 s4, s4, s5
+        0xbefe04c1u,              // restore EXEC before vector write/store
+        0x7e020204u,              // v_mov_b32 v1, s4
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig native_cfg17d1b_exec = native_cfg17d1b;
+    native_cfg17d1b_exec.local_x = 128;
+    const std::vector<uint32_t> native_spv17d1b_exec = recompile_compute(
+        code17d1b_exec, std::size(code17d1b_exec), &rt17d1, native_cfg17d1b_exec);
+    CHECK(!native_spv17d1b_exec.empty() &&
+              count_spirv_opcode(native_spv17d1b_exec, 349) >= 2 &&
+              count_spirv_opcode(native_spv17d1b_exec, 335) >= 1,
+          "Wave64 EXEC s_ff1 elect form emits exclusive/reduce IAdd plus Any");
+
+    const bool can_execute17d1b = subgroup17d1.size == 64 &&
+        (subgroup17d1.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    const bool can_shuffle17d1b = can_execute17d1b &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    if (can_shuffle17d1b && !native_spv17d1b_saved.empty()) {
+        std::vector<uint32_t> got17d1b_saved;
+        prosper::test::run_compute(native_spv17d1b_saved, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(64, 0),
+                                   &got17d1b_saved);
+        uint32_t bad17d1b_saved = 0;
+        for (uint32_t lane = 0; lane < 64 && got17d1b_saved.size() == 64; ++lane)
+            bad17d1b_saved += got17d1b_saved[lane] != 40u;
+        CHECK(got17d1b_saved.size() == 64 && bad17d1b_saved == 0,
+              "Wave64 saved-mask s_ff1 feeds lane 40 to V_READLANE for every invocation");
+    } else {
+        std::printf("  [skip] saved-mask s_ff1 execution: host subgroup is %u or lacks vote/arithmetic/shuffle\n",
+                    subgroup17d1.size);
+    }
+    if (can_execute17d1b && !native_spv17d1b_exec.empty()) {
+        std::vector<uint32_t> got17d1b_exec;
+        prosper::test::run_compute(native_spv17d1b_exec, std::vector<float>(128, 0.0f),
+                                   128, 128, {}, std::vector<uint32_t>(128, 0),
+                                   &got17d1b_exec, 128);
+        uint32_t bad17d1b_exec = 0;
+        for (uint32_t lane = 0; lane < 128 && got17d1b_exec.size() == 128; ++lane) {
+            const uint32_t expected = lane < 64 ? 80u : 0xfffffffeu;
+            bad17d1b_exec += got17d1b_exec[lane] != expected;
+        }
+        CHECK(got17d1b_exec.size() == 128 && bad17d1b_exec == 0,
+              "Wave64 EXEC s_ff1 returns lane 40 / -1 and preserves SCC=false");
+    } else {
+        std::printf("  [skip] EXEC s_ff1 execution: host subgroup is %u or lacks vote/arithmetic\n",
+                    subgroup17d1.size);
+    }
+
+    // VCC is the third admitted complete-mask source.  This structural arm is intentionally
+    // separate from the two exact GTA words above so the resolver cannot accidentally cover only
+    // EXEC and saved SGPR pairs.
+    const uint32_t code17d1b_vcc[] = {
+        0xbe8003a8u,              // s_mov_b32 s0, 40
+        0x7d840000u,              // v_cmp_eq_u32 vcc, s0, v0
+        0xbe84146au,              // s_ff1_i32_b64 s4, vcc
+        0x8f048104u,              // s_lshl_b32 s4, s4, 1
+        0x7e040204u,              // v_mov_b32 v2, s4
+        0xbf810000u,
+    };
+    CHECK(!recompile_compute(code17d1b_vcc, std::size(code17d1b_vcc), nullptr,
+                             native_cfg17d1b).empty(),
+          "exact Wave64 s_ff1 resolves a complete VCC source to scalar data");
+
+    // Fail-visible domain/width arms.  They mutate the same op0x14 production gate and mask
+    // resolver as the positive packets: mismatched/unknown subgroups, plain scalar B64 data,
+    // mask+data ambiguity, an absent saved pair, and either EXEC-half destination must all reject.
+    ComputeShaderConfig native32_cfg17d1b = native_cfg17d1b;
+    native32_cfg17d1b.native_subgroup_size = 32;
+    ComputeShaderConfig unknown_cfg17d1b = native_cfg17d1b;
+    unknown_cfg17d1b.native_subgroup_size = 0;
+    ComputeShaderConfig wave32_cfg17d1b = native_cfg17d1b;
+    wave32_cfg17d1b.wave_size = 32;
+    wave32_cfg17d1b.native_subgroup_size = 32;
+    const uint32_t code17d1b_exec_scalar[] = {
+        0xbe84147eu,              // s_ff1_i32_b64 s4, exec
+        0x7e040204u,              // v_mov_b32 v2, s4
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
+                            native32_cfg17d1b).empty() &&
+              recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
+                                unknown_cfg17d1b).empty() &&
+              recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
+                                wave32_cfg17d1b).empty(),
+          "S_FF1_I32_B64 rejects native32, unknown-width, and Wave32 execution");
+    const uint32_t code17d1b_unknown_pair[] = {
+        0xbe841410u,              // s_ff1_i32_b64 s4, untracked s[16:17]
+        0xbf810000u,
+    };
+    const uint32_t code17d1b_plain_data[] = {
+        0xbe900381u,              // s_mov_b32 s16, 1
+        0xbe910380u,              // s_mov_b32 s17, 0
+        0xbe841410u,              // s_ff1_i32_b64 s4, scalar s[16:17]
+        0xbf810000u,
+    };
+    const uint32_t code17d1b_ambiguous[] = {
+        0xbe9004c1u,              // s_mov_b64 s[16:17], -1 (both mask and scalar-data views)
+        0xbe841410u,              // s_ff1_i32_b64 s4, ambiguous s[16:17]
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1b_unknown_pair, std::size(code17d1b_unknown_pair), nullptr,
+                            native_cfg17d1b).empty() &&
+              recompile_compute(code17d1b_plain_data, std::size(code17d1b_plain_data), nullptr,
+                                native_cfg17d1b).empty() &&
+              recompile_compute(code17d1b_ambiguous, std::size(code17d1b_ambiguous), nullptr,
+                                native_cfg17d1b).empty(),
+          "Wave64 s_ff1 rejects unknown, scalar-data, and ambiguous B64 sources");
+    const uint32_t code17d1b_exec_lo_dst[] = {0xbefe147eu, 0xbf810000u};
+    const uint32_t code17d1b_exec_hi_dst[] = {0xbeff147eu, 0xbf810000u};
+    CHECK(recompile_compute(code17d1b_exec_lo_dst, std::size(code17d1b_exec_lo_dst), nullptr,
+                            native_cfg17d1b).empty() &&
+              recompile_compute(code17d1b_exec_hi_dst, std::size(code17d1b_exec_hi_dst), nullptr,
+                                native_cfg17d1b).empty(),
+          "Wave64 s_ff1 keeps both EXEC-half scalar destinations fail-visible");
+
+    // A scalar result in VCC_LO destroys the complete Wave64 predicate; it must not be rebuilt from
+    // one dword or left stale.  Likewise, writing the high half of a saved pair ends that pair's
+    // mask lifetime.  These arms specifically kill destination-alias cleanup mutations.
+    const uint32_t code17d1b_stale_vcc[] = {
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0 (live complete VCC)
+        0xbeea147eu,              // s_ff1_i32_b64 vcc_lo, exec (new scalar lifetime)
+        0x02000501u,              // v_cndmask_b32 v0, v1, v2, stale implicit VCC
+        0xbf810000u,
+    };
+    const uint32_t code17d1b_stale_saved_pair[] = {
+        0x7e0202a8u,              // v_mov_b32 v1, 40
+        0x7d8402f9u, 0x06069000u, // v_cmp_eq_u32_sdwa s[16:17], v0, v1
+        0xbe91147eu,              // s_ff1_i32_b64 s17, exec (overwrites saved-mask high half)
+        0xbefe0410u,              // s_mov_b64 exec, s[16:17] must not see stale mask
+        0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1b_stale_vcc, std::size(code17d1b_stale_vcc), nullptr,
+                            native_cfg17d1b).empty() &&
+              recompile_compute(code17d1b_stale_saved_pair,
+                                std::size(code17d1b_stale_saved_pair), nullptr,
+                                native_cfg17d1b).empty(),
+          "S_FF1 scalar destinations invalidate stale VCC and overlapping saved-mask aliases");
 
     // Kernel 17d1m: Astro reuses physical VCC_LO as ordinary scalar data, then copies that complete
     // dword into EXEC_LO.  A Wave32 translation must select this invocation's bit from the scalar
@@ -5616,6 +5977,33 @@ int main() {
     CHECK(count_spirv_opcode(native_spv63, 224) == 0,
           "straight-line exact-wave MBCNT emits no workgroup control barrier");
 
+    // Kernel 63a: GTA V saves EXEC in a physical SGPR pair and names the low/high dwords
+    // independently at MBCNT. The Bool-domain mask is keyed only by the pair root (s4): LOW names
+    // s4 directly, while HIGH names s5 and must resolve through s4 rather than an exact s5 key.
+    const uint32_t code63a[] = {
+        0xBE84047Eu,                // s_mov_b64 s[4:5], exec
+        0xD7650001u, 0x00010004u,   // v_mbcnt_lo_u32_b32 v1, s4, 0
+        0xD7660001u, 0x00020205u,   // v_mbcnt_hi_u32_b32 v1, s5, v1
+        0x7E020D01u,                // v_cvt_f32_u32 v1, v1
+        0xBF810000u,                // s_endpgm
+    };
+    const std::vector<uint32_t> spv63a = recompile_valu(
+        code63a, std::size(code63a), 1, /*out_vgpr*/1);
+    const std::vector<float> got63a = spv63a.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv63a, in63, N, N);
+    uint32_t bad63a = 0;
+    for (uint32_t i = 0; i < N && got63a.size() == N; ++i)
+        if (std::fabs(got63a[i] - exp63[i]) > 1e-3f) ++bad63a;
+    CHECK(!spv63a.empty() && got63a.size() == N && bad63a == 0,
+          "saved-EXEC MBCNT resolves LOW/even and HIGH/odd through one mask-pair root");
+
+    uint32_t code63a_wrong_high[std::size(code63a)];
+    std::copy(std::begin(code63a), std::end(code63a), code63a_wrong_high);
+    code63a_wrong_high[4] = 0x00020204u; // same HIGH site, but s5 -> s4 (not the high half of s[4:5])
+    CHECK(recompile_valu(code63a_wrong_high, std::size(code63a_wrong_high), 1, 1).empty(),
+          "saved-EXEC MBCNT rejects a HIGH source that names the pair root instead of its odd half");
+
     // Kernel 64: v_mbcnt with DIVERGENT exec — the real compaction use. v_cmpx narrows exec to (a>thr);
     // then mbcnt gives each active lane its index among active lanes. Even lanes active (a=1>0.5), odd
     // inactive (a=0): active lane L -> L/2 (count of active lanes below); inactive lanes keep 0 (the
@@ -5654,6 +6042,60 @@ int main() {
     uint32_t bad65=0; for(uint32_t i=0;i<N&&got65.size()==N;i++) if(std::fabs(got65[i]-exp65[i])>1e-3f) bad65++;
     printf("  kernel65 mismatches=%u (out[9]=%g exp=%g)\n", bad65, got65.size()==N?got65[9]:-1, exp65[9]);
     CHECK(got65.size()==N && bad65==0, "recompiled kernel 65 (v_mbcnt -1 = localid) correct");
+
+    // Kernel 65b: GTA V exec_cs_413d22d00 pc605, exact `v_bfm_b32 v22,v22,0`.
+    // Width and offset use only five bits, so widths 32/64 wrap to zero rather than all ones.
+    const uint32_t code65b[] = {
+        0xD7630016u, 0x00010116u,
+        0xBF810000u,
+    };
+    const uint32_t widths65b[] = {0u, 1u, 5u, 31u, 32u, 33u, 63u};
+    const uint32_t expected65b[] = {
+        0u, 1u, 0x1fu, 0x7fffffffu, 0u, 1u, 0x7fffffffu,
+    };
+    std::vector<float> in65b(std::size(widths65b) * 23u, 0.0f);
+    for (size_t i = 0; i < std::size(widths65b); ++i)
+        in65b[i * 23u + 22u] = std::bit_cast<float>(widths65b[i]);
+    const std::vector<uint32_t> spv65b = recompile_valu(
+        code65b, std::size(code65b), 23, /*out_vgpr*/22);
+    const std::vector<float> got65b = prosper::test::run_compute(
+        spv65b, in65b, std::size(widths65b), std::size(widths65b));
+    uint32_t bad65b = 0;
+    for (size_t i = 0; i < std::size(widths65b) && got65b.size() == std::size(widths65b); ++i)
+        if (bits_of(got65b[i]) != expected65b[i]) ++bad65b;
+    CHECK(!spv65b.empty() && got65b.size() == std::size(widths65b) && bad65b == 0,
+          "GTA V v_bfm_b32 applies five-bit width semantics exactly");
+
+    // Same-site modifier mutations: no modifier spelling is defined for V_BFM. Test every raw
+    // ABS/OP_SEL/CLAMP/OMOD/NEG bit on the production packet so the admission cannot silently grow.
+    const uint32_t bfm_word0_modifiers[] = {
+        0x00000100u, 0x00000200u, 0x00000400u,
+        0x00000800u, 0x00001000u, 0x00002000u, 0x00004000u,
+        0x00008000u,
+    };
+    const uint32_t bfm_word1_modifiers[] = {
+        0x08000000u, 0x10000000u,
+        0x20000000u, 0x40000000u, 0x80000000u,
+    };
+    bool bfm_modifiers_reject = true;
+    for (uint32_t modifier : bfm_word0_modifiers) {
+        const uint32_t mutant[] = {
+            code65b[0] | modifier, code65b[1], 0xBF810000u,
+        };
+        const RecompileCoverage coverage = recompile_coverage(mutant, std::size(mutant));
+        bfm_modifiers_reject &= recompile_valu(
+            mutant, std::size(mutant), 23, 22).empty() && coverage.unsupported == 1;
+    }
+    for (uint32_t modifier : bfm_word1_modifiers) {
+        const uint32_t mutant[] = {
+            code65b[0], code65b[1] | modifier, 0xBF810000u,
+        };
+        const RecompileCoverage coverage = recompile_coverage(mutant, std::size(mutant));
+        bfm_modifiers_reject &= recompile_valu(
+            mutant, std::size(mutant), 23, 22).empty() && coverage.unsupported == 1;
+    }
+    CHECK(bfm_modifiers_reject,
+          "GTA V v_bfm_b32 same-site modifier mutations remain fail-visible");
 
     // Kernel 66: RAW MUBUF SRSRC RESOLUTION (#91). Same code as kernel 21 (buffer_load_dword v0, v0
     // offen, SRSRC s[8:11]) but WITH a resource table mapping s[8:11] -> binding 3. The load must
@@ -5888,6 +6330,79 @@ int main() {
                                zero_store_sentinel, &zero_store_after);
     CHECK(zero_store_after == zero_store_sentinel,
           "zero-record raw store is a no-op and cannot mutate a shared dummy backing");
+
+    // Fully-known NUM_RECORDS=0 atomics use the same exact-PC marker, but their VDATA behavior is
+    // distinct. GLC=1 returns the pre-op value (zero for an empty descriptor) only to active EXEC
+    // lanes; GLC=0 preserves VDATA for every lane. Neither shape may declare a storage binding or
+    // emit an OpAtomic -- there is no backing allocation on which an atomic can operate.
+    auto spirv_atomic_count = [](const std::vector<uint32_t>& spirv) {
+        size_t count = count_spirv_opcode(spirv, 229); // OpAtomicExchange
+        for (uint16_t opcode = 234; opcode <= 242; ++opcode) // IAdd..Xor
+            count += count_spirv_opcode(spirv, opcode);
+        return count;
+    };
+
+    // v2=7; narrow EXEC to u0>u1; exact GTA 0x413e1ac add packet with GLC; restore EXEC;
+    // convert/output v2. Active lanes receive zero and masked lanes retain seven.
+    const uint32_t code68_zero_atomic_glc[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040287u, 0x7DA80300u,
+        0xE0C86000u, 0x80030201u,
+        0xBEFE04C1u, 0x7E040D02u, 0xBF810000u,
+    };
+    ShaderResourceTable rt68_zero_atomic_glc;
+    rt68_zero_atomic_glc.resources.push_back(zero_record_resource(4));
+    const std::vector<uint32_t> spv68_zero_atomic_glc = recompile_valu(
+        code68_zero_atomic_glc, std::size(code68_zero_atomic_glc), 2, 2,
+        &rt68_zero_atomic_glc);
+    CHECK(!spv68_zero_atomic_glc.empty() &&
+              spirv_atomic_count(spv68_zero_atomic_glc) == 0,
+          "zero-record GLC atomic emits no OpAtomic");
+    const std::vector<uint32_t> zero_atomic_glc_sentinel = {
+        0xDEADBEEFu, 0xCAFEBABEu,
+    };
+    std::vector<uint32_t> zero_atomic_glc_after;
+    const std::vector<float> got68_zero_atomic_glc = prosper::test::run_compute(
+        spv68_zero_atomic_glc, in68_zero_load, N, N, {}, zero_atomic_glc_sentinel,
+        &zero_atomic_glc_after);
+    uint32_t bad68_zero_atomic_glc = 0;
+    for (uint32_t i = 0; i < N && got68_zero_atomic_glc.size() == N; ++i)
+        if (got68_zero_atomic_glc[i] != expected68_zero_load[i])
+            ++bad68_zero_atomic_glc;
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_atomic_glc.size() == N && bad68_zero_atomic_glc == 0 &&
+              zero_atomic_glc_after == zero_atomic_glc_sentinel,
+          "zero-record GLC atomic returns zero only to active EXEC lanes and touches no memory");
+
+    // Preserve the live 0x413d884 pc163 OR packet, including VDATA=v23 and GLC=0. The synthetic
+    // marker isolates the architectural empty-resource behavior; the production fold test above is
+    // where the exact live PC and descriptor provenance are checked.
+    const uint32_t code68_zero_atomic_no_glc[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E2E0287u, 0x7DA80300u,
+        0xE0E82000u, 0x80051700u,
+        0xBEFE04C1u, 0x7E2E0D17u, 0xBF810000u,
+    };
+    ShaderResourceTable rt68_zero_atomic_no_glc;
+    rt68_zero_atomic_no_glc.resources.push_back(zero_record_resource(4));
+    const std::vector<uint32_t> spv68_zero_atomic_no_glc = recompile_valu(
+        code68_zero_atomic_no_glc, std::size(code68_zero_atomic_no_glc), 2, 23,
+        &rt68_zero_atomic_no_glc);
+    CHECK(!spv68_zero_atomic_no_glc.empty() &&
+              spirv_atomic_count(spv68_zero_atomic_no_glc) == 0,
+          "zero-record non-GLC atomic emits no OpAtomic");
+    const std::vector<uint32_t> zero_atomic_no_glc_sentinel = {
+        0x12345678u, 0x89ABCDEFu,
+    };
+    std::vector<uint32_t> zero_atomic_no_glc_after;
+    const std::vector<float> got68_zero_atomic_no_glc = prosper::test::run_compute(
+        spv68_zero_atomic_no_glc, in68_zero_load, N, N, {}, zero_atomic_no_glc_sentinel,
+        &zero_atomic_no_glc_after);
+    const uint32_t retained68_zero_atomic_no_glc = static_cast<uint32_t>(std::count(
+        got68_zero_atomic_no_glc.begin(), got68_zero_atomic_no_glc.end(), 7.0f));
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_atomic_no_glc.size() == N &&
+              retained68_zero_atomic_no_glc == N &&
+              zero_atomic_no_glc_after == zero_atomic_no_glc_sentinel,
+          "zero-record non-GLC atomic preserves VDATA in active and inactive lanes without memory");
 
     // Kernel N: v_nop (VOP1 op 0x00) between real ALU ops must be a transparent no-op. This was the
     // #121 blocker — PPSA02664's vertex shaders contain v_nop (a common scheduling/hazard filler), and

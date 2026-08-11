@@ -634,11 +634,11 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
-            // V_LDEXP_F32 is likewise a two-source VOP3A instruction. Its reserved SRC2 bits are
-            // zero in GTA V's exact packet and therefore decode as s0 unless cleared here. Exposing
-            // that phantom scalar read can make CFG/provenance analysis reject an otherwise valid
-            // instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (i.opcode == 0x362u) {
+            // V_LDEXP_F32 and V_BFM_B32 are two-source VOP3A instructions. Their reserved SRC2 bits
+            // are zero in GTA V's exact packets and therefore decode as s0 unless cleared here.
+            // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
+            // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
+            if (i.opcode == 0x362u || i.opcode == 0x363u) {
                 i.src[2] = {};
                 i.n_src = 2;
             }

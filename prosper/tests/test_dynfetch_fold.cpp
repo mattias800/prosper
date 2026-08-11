@@ -2736,8 +2736,131 @@ int main() {
     resolve_dynamic_fetch(direct_atomic_add, std::size(direct_atomic_add), empty_atomic_seed,
                           std::size(empty_atomic_seed), 0, &empty_atomic_uses);
     CHECK(unknown_atomic_uses.empty() && oversized_atomic_uses.empty() &&
-              empty_atomic_uses.empty(),
-          "supported atomics still require a fully-known bounded nonempty live V#");
+              empty_atomic_uses.size() == 1 && empty_atomic_uses[0].zero_record_raw &&
+              empty_atomic_uses[0].use_pc == 0,
+          "supported atomics require a fully-known bounded or exact zero-record live V#");
+
+    // GTA V 0x413e1ac pc12 is the directly-proven empty site. Its sibling dispatch loads the same
+    // table base and publishes an all-zero V# at offset 0x10. Retain the exact packet, load key, and
+    // consuming PC: a direct-SGPR fallback or a generic address-zero shortcut cannot satisfy these
+    // assertions. The marker has no descriptor in the generated module.
+    alignas(16) uint32_t gta_413e1ac_table_words[8] = {};
+    const uint64_t gta_413e1ac_table_base =
+        reinterpret_cast<uint64_t>(gta_413e1ac_table_words);
+    const uint32_t gta_413e1ac_seed[2] = {
+        static_cast<uint32_t>(gta_413e1ac_table_base),
+        static_cast<uint32_t>(gta_413e1ac_table_base >> 32),
+    };
+    std::vector<uint32_t> gta_413e1ac_site(12, 0xBF800000u); // s_nop padding to exact pc
+    gta_413e1ac_site[8] = 0xF4080300u;  // s_load_dwordx4 s[12:15], s[0:1], 0x10
+    gta_413e1ac_site[9] = 0xFA000010u;
+    gta_413e1ac_site[10] = 0xBF8CC07Fu;
+    gta_413e1ac_site.push_back(0xE0C86000u); // exact pc12 buffer_atomic_add, idxen+glc
+    gta_413e1ac_site.push_back(0x80030201u);
+    gta_413e1ac_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_413e1ac_table;
+    const std::vector<SrtUse> gta_413e1ac_uses = add_compute_buffer_resources(
+        gta_413e1ac_table, gta_413e1ac_site.data(), gta_413e1ac_site.size(),
+        gta_413e1ac_seed, std::size(gta_413e1ac_seed));
+    assign_convention_bindings(gta_413e1ac_table, 2);
+    ComputeShaderConfig gta_413e1ac_config;
+    gta_413e1ac_config.user_sgprs.assign(std::begin(gta_413e1ac_seed),
+                                         std::end(gta_413e1ac_seed));
+    gta_413e1ac_config.local_x = gta_413e1ac_config.local_y =
+        gta_413e1ac_config.local_z = 1;
+    const std::vector<uint32_t> gta_413e1ac_spirv = recompile_compute(
+        gta_413e1ac_site.data(), gta_413e1ac_site.size(), &gta_413e1ac_table,
+        gta_413e1ac_config);
+    const DescriptorValidationReport gta_413e1ac_report =
+        validate_spirv_descriptor_interface(gta_413e1ac_spirv, &gta_413e1ac_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(gta_413e1ac_uses.size() == 1 && gta_413e1ac_uses[0].zero_record_raw &&
+              gta_413e1ac_uses[0].key == 0x10u && gta_413e1ac_uses[0].use_pc == 12u &&
+              gta_413e1ac_table.resources.size() == 1 &&
+              is_zero_record_raw_buffer(gta_413e1ac_table.resources[0]) &&
+              gta_413e1ac_table.resources[0].fetch_pc == 12u &&
+              !gta_413e1ac_spirv.empty() && gta_413e1ac_report.ok() &&
+              gta_413e1ac_report.descriptors.empty(),
+          "GTA V 0x413e1ac pc12 exact empty atomic becomes a binding-free PC marker");
+
+    // 0x413d22d pc33 loads its V# from table offset 0x50. Adjacent live slots are proven empty and
+    // the fully-known target descriptor can only be zero-sized or rejected as oversized; unlike the
+    // site above, no sibling capture directly published this slot. This synthetic zero descriptor
+    // therefore verifies the exact packet/key behavior, not an additional live descriptor claim.
+    alignas(16) uint32_t gta_413d22d_table_words[24] = {};
+    const uint64_t gta_413d22d_table_base =
+        reinterpret_cast<uint64_t>(gta_413d22d_table_words);
+    uint32_t gta_413d22d_seed[4] = {};
+    gta_413d22d_seed[2] = static_cast<uint32_t>(gta_413d22d_table_base);
+    gta_413d22d_seed[3] = static_cast<uint32_t>(gta_413d22d_table_base >> 32);
+    std::vector<uint32_t> gta_413d22d_site(33, 0xBF800000u);
+    gta_413d22d_site[30] = 0xF4080101u; // s_load_dwordx4 s[4:7], s[2:3], 0x50
+    gta_413d22d_site[31] = 0xFA000050u;
+    gta_413d22d_site[32] = 0xBF8CC07Fu;
+    gta_413d22d_site.push_back(0xE0C84000u); // exact pc33 buffer_atomic_add, glc
+    gta_413d22d_site.push_back(0x80010200u);
+    gta_413d22d_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_413d22d_table;
+    const std::vector<SrtUse> gta_413d22d_uses = add_compute_buffer_resources(
+        gta_413d22d_table, gta_413d22d_site.data(), gta_413d22d_site.size(),
+        gta_413d22d_seed, std::size(gta_413d22d_seed));
+    ComputeShaderConfig gta_413d22d_config;
+    gta_413d22d_config.user_sgprs.assign(std::begin(gta_413d22d_seed),
+                                         std::end(gta_413d22d_seed));
+    gta_413d22d_config.local_x = gta_413d22d_config.local_y =
+        gta_413d22d_config.local_z = 1;
+    const std::vector<uint32_t> gta_413d22d_spirv = recompile_compute(
+        gta_413d22d_site.data(), gta_413d22d_site.size(), &gta_413d22d_table,
+        gta_413d22d_config);
+    const DescriptorValidationReport gta_413d22d_report =
+        validate_spirv_descriptor_interface(gta_413d22d_spirv, &gta_413d22d_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(gta_413d22d_uses.size() == 1 && gta_413d22d_uses[0].zero_record_raw &&
+              gta_413d22d_uses[0].key == 0x50u && gta_413d22d_uses[0].use_pc == 33u &&
+              gta_413d22d_table.resources.size() == 1 &&
+              is_zero_record_raw_buffer(gta_413d22d_table.resources[0]) &&
+              gta_413d22d_table.resources[0].fetch_pc == 33u &&
+              !gta_413d22d_spirv.empty() && gta_413d22d_report.ok() &&
+              gta_413d22d_report.descriptors.empty(),
+          "GTA V 0x413d22d pc33 exact synthetic empty packet recompiles binding-free");
+
+    // 0x413d884 pc163 has no surviving SRT tag. The live fold knows base/stride/type and dword2,
+    // but the unpublished value is inferred to be zero because every bounded nonzero value would
+    // already materialize (an oversized value would remain rejected). Use the observed descriptor
+    // fields plus a synthetic zero count to prove only the exact-PC path and exact OR packet.
+    uint32_t gta_413d884_seed[24] = {};
+    gta_413d884_seed[20] = 0xF8480000u;
+    gta_413d884_seed[21] = 0x00040020u; // base 0x20f8480000, stride 4
+    gta_413d884_seed[22] = 0u;          // inferred empty count, not direct live proof
+    gta_413d884_seed[23] = 0x00016204u;
+    std::vector<uint32_t> gta_413d884_site(163, 0xBF800000u);
+    gta_413d884_site.push_back(0xE0E82000u); // exact pc163 buffer_atomic_or, idxen, glc=0
+    gta_413d884_site.push_back(0x80051700u);
+    gta_413d884_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_413d884_table;
+    const std::vector<SrtUse> gta_413d884_uses = add_compute_buffer_resources(
+        gta_413d884_table, gta_413d884_site.data(), gta_413d884_site.size(),
+        gta_413d884_seed, std::size(gta_413d884_seed));
+    ComputeShaderConfig gta_413d884_config;
+    gta_413d884_config.user_sgprs.assign(std::begin(gta_413d884_seed),
+                                         std::end(gta_413d884_seed));
+    gta_413d884_config.local_x = gta_413d884_config.local_y =
+        gta_413d884_config.local_z = 1;
+    const std::vector<uint32_t> gta_413d884_spirv = recompile_compute(
+        gta_413d884_site.data(), gta_413d884_site.size(), &gta_413d884_table,
+        gta_413d884_config);
+    const DescriptorValidationReport gta_413d884_report =
+        validate_spirv_descriptor_interface(gta_413d884_spirv, &gta_413d884_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(gta_413d884_uses.size() == 1 && gta_413d884_uses[0].zero_record_raw &&
+              gta_413d884_uses[0].key == 0xFFFFFFFFu &&
+              gta_413d884_uses[0].use_pc == 163u &&
+              gta_413d884_table.resources.size() == 1 &&
+              is_zero_record_raw_buffer(gta_413d884_table.resources[0]) &&
+              gta_413d884_table.resources[0].fetch_pc == 163u &&
+              !gta_413d884_spirv.empty() && gta_413d884_report.ok() &&
+              gta_413d884_report.descriptors.empty(),
+          "GTA V 0x413d884 pc163 exact synthetic empty OR recompiles binding-free by PC");
 
     // These encodings need distinct operands or semantics. In particular op 0x50 is GTA V's
     // buffer_atomic_swap_x2, not a 32-bit atomic with a neighboring opcode. They must not acquire a
@@ -2752,6 +2875,8 @@ int main() {
     uint32_t unsupported_atomic_uses = 0;
     uint32_t unsupported_atomic_resources = 0;
     uint32_t unsupported_atomic_recompiles = 0;
+    uint32_t unsupported_empty_atomic_uses = 0;
+    uint32_t unsupported_empty_atomic_resources = 0;
     for (uint32_t dw0 : unsupported_atomic_dw0) {
         const uint32_t code[] = { dw0, 0x80000000u, 0xBF810000u };
         std::vector<SrtUse> uses;
@@ -2764,10 +2889,19 @@ int main() {
         unsupported_atomic_resources += !table.resources.empty();
         unsupported_atomic_recompiles +=
             !recompile_compute(code, std::size(code), &table, atomic_config).empty();
+        std::vector<SrtUse> empty_uses;
+        resolve_dynamic_fetch(code, std::size(code), empty_atomic_seed,
+                              std::size(empty_atomic_seed), 0, &empty_uses);
+        unsupported_empty_atomic_uses += !empty_uses.empty();
+        ShaderResourceTable empty_table;
+        add_compute_buffer_resources(empty_table, code, std::size(code), empty_atomic_seed,
+                                     std::size(empty_atomic_seed));
+        unsupported_empty_atomic_resources += !empty_table.resources.empty();
     }
     CHECK(unsupported_atomic_uses == 0 && unsupported_atomic_resources == 0 &&
-              unsupported_atomic_recompiles == 0,
-          "unsupported cmp-swap/csub/inc/dec/x2 MUBUF atomics remain fail-closed");
+              unsupported_atomic_recompiles == 0 && unsupported_empty_atomic_uses == 0 &&
+              unsupported_empty_atomic_resources == 0,
+          "unsupported cmp-swap/csub/inc/dec/x2 atomics remain fail-closed even when empty");
 
     // Terminator 2D supplies descriptor dwords separately, then reassembles its destination V# in
     // s[0:3] with four scalar moves immediately before format stores. This has no SRT-load tag and
