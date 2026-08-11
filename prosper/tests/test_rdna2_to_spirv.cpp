@@ -8151,7 +8151,7 @@ int main() {
             partialRor8Spv, std::vector<float>(73, 0.0f), 73, 73, {},
             std::vector<uint32_t>(73, 0xdeadbeefu), &partialRor8Got);
     CHECK(!partialRor8Spv.empty() && partialRor8Got == partialRor8Expected,
-          "T25b-ror8: BC1 zero-fills missing sources in a partial final DPP16 row");
+          "T25b-ror8: FI0 zero-fills inactive sources in a partial final DPP16 row");
     const bool canExecuteNativeRor8 = subgroupT25b.size == 64 &&
         (subgroupT25b.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
         (subgroupT25b.operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
@@ -8302,6 +8302,63 @@ int main() {
               "T25b-ror8-family: native Wave64 executes exact V_MAX/V_MOV semantics");
     } else {
         std::printf("  [skip] T25b-ror8-family native execution: host contract unavailable\n");
+    }
+
+    // The direct native kernels above exercise emit_alu. The generic CFG dispatcher has a separate
+    // native DPP site, so keep the established irreducible prefix from kernel 17d in front of each
+    // exact GTA packet. Both kernels execute the operation after leaving the loop and write its
+    // result to a real buffer. The expected values distinguish the dispatcher's NMax arm from NMin
+    // and its MOV arm from the lane-local SRC1 placeholder used by binary operations.
+    const uint32_t codeT25bRor8MaxNativeCfg[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e060d00u,                         // v_cvt_f32_u32 v3,v0
+        0x200406fau, 0xff092803u,            // exact V_MAX_F32 ROW_ROR:8
+        0x7e020302u,                         // v_mov_b32 v1,v2
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const uint32_t codeT25bRor8MovNativeCfg[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e220d00u,                         // v_cvt_f32_u32 v17,v0
+        0x7e2402fau, 0xff092811u,            // exact V_MOV_B32 ROW_ROR:8
+        0x7e020312u,                         // v_mov_b32 v1,v18
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> nativeRor8MaxCfgSpv = recompile_compute(
+        codeT25bRor8MaxNativeCfg, std::size(codeT25bRor8MaxNativeCfg),
+        &ror8BackendTable, nativeRor8Config);
+    const std::vector<uint32_t> nativeRor8MovCfgSpv = recompile_compute(
+        codeT25bRor8MovNativeCfg, std::size(codeT25bRor8MovNativeCfg),
+        &ror8BackendTable, nativeRor8Config);
+    CHECK(!nativeRor8MaxCfgSpv.empty() && !nativeRor8MovCfgSpv.empty() &&
+              count_spirv_opcode(nativeRor8MaxCfgSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MovCfgSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MaxCfgSpv, 224) == 0 &&
+              count_spirv_opcode(nativeRor8MovCfgSpv, 224) == 0,
+          "T25b-ror8-family: native CFG dispatcher lowers exact V_MAX/V_MOV to shuffles");
+    if (canExecuteNativeRor8 && !nativeRor8MaxCfgSpv.empty() &&
+        !nativeRor8MovCfgSpv.empty()) {
+        std::vector<uint32_t> nativeCfgMaxGot, nativeCfgMovGot;
+        prosper::test::run_compute(
+            nativeRor8MaxCfgSpv, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &nativeCfgMaxGot);
+        prosper::test::run_compute(
+            nativeRor8MovCfgSpv, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &nativeCfgMovGot);
+        std::vector<uint32_t> nativeCfgMaxExpected(64), nativeCfgMovExpected(64);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            nativeCfgMaxExpected[lane] = bits_of(static_cast<float>(
+                std::max(lane, lane ^ 8u)));
+            nativeCfgMovExpected[lane] = bits_of(static_cast<float>(lane ^ 8u));
+        }
+        CHECK(nativeCfgMaxGot == nativeCfgMaxExpected &&
+                  nativeCfgMovGot == nativeCfgMovExpected,
+              "T25b-ror8-family: native CFG dispatcher executes V_MAX/V_MOV semantics");
+    } else {
+        std::printf("  [skip] T25b-ror8-family native CFG execution: host contract unavailable\n");
     }
 
     const uint32_t unsupportedRor8[][2] = {
@@ -9693,7 +9750,7 @@ int main() {
     // The exact sibling regression for GTA V's V_MIN_F32 ROW_ROR:8. Whole-stream scratch sizing
     // must see the later rotate even though the first phase itself needs only one plane. Convert
     // local ID to f32 so the execution oracle is independent of subnormal flushing; in the partial
-    // final DPP16 row, BC1 supplies zero when XOR 8 names an absent padded invocation.
+    // final DPP16 row, FI=0 supplies zero when XOR 8 names an inactive padded invocation.
     std::vector<uint32_t> phasedRorScratch(
         std::begin(phasedDppScratch), std::end(phasedDppScratch));
     phasedRorScratch[5] = 0x7E020D00u;        // v_cvt_f32_u32 v1,v0
