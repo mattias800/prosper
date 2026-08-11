@@ -5977,6 +5977,33 @@ int main() {
     CHECK(count_spirv_opcode(native_spv63, 224) == 0,
           "straight-line exact-wave MBCNT emits no workgroup control barrier");
 
+    // Kernel 63a: GTA V saves EXEC in a physical SGPR pair and names the low/high dwords
+    // independently at MBCNT. The Bool-domain mask is keyed only by the pair root (s4): LOW names
+    // s4 directly, while HIGH names s5 and must resolve through s4 rather than an exact s5 key.
+    const uint32_t code63a[] = {
+        0xBE84047Eu,                // s_mov_b64 s[4:5], exec
+        0xD7650001u, 0x00010004u,   // v_mbcnt_lo_u32_b32 v1, s4, 0
+        0xD7660001u, 0x00020205u,   // v_mbcnt_hi_u32_b32 v1, s5, v1
+        0x7E020D01u,                // v_cvt_f32_u32 v1, v1
+        0xBF810000u,                // s_endpgm
+    };
+    const std::vector<uint32_t> spv63a = recompile_valu(
+        code63a, std::size(code63a), 1, /*out_vgpr*/1);
+    const std::vector<float> got63a = spv63a.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv63a, in63, N, N);
+    uint32_t bad63a = 0;
+    for (uint32_t i = 0; i < N && got63a.size() == N; ++i)
+        if (std::fabs(got63a[i] - exp63[i]) > 1e-3f) ++bad63a;
+    CHECK(!spv63a.empty() && got63a.size() == N && bad63a == 0,
+          "saved-EXEC MBCNT resolves LOW/even and HIGH/odd through one mask-pair root");
+
+    uint32_t code63a_wrong_high[std::size(code63a)];
+    std::copy(std::begin(code63a), std::end(code63a), code63a_wrong_high);
+    code63a_wrong_high[4] = 0x00020204u; // same HIGH site, but s5 -> s4 (not the high half of s[4:5])
+    CHECK(recompile_valu(code63a_wrong_high, std::size(code63a_wrong_high), 1, 1).empty(),
+          "saved-EXEC MBCNT rejects a HIGH source that names the pair root instead of its odd half");
+
     // Kernel 64: v_mbcnt with DIVERGENT exec — the real compaction use. v_cmpx narrows exec to (a>thr);
     // then mbcnt gives each active lane its index among active lanes. Even lanes active (a=1>0.5), odd
     // inactive (a=0): active lane L -> L/2 (count of active lanes below); inactive lanes keep 0 (the
@@ -6015,6 +6042,60 @@ int main() {
     uint32_t bad65=0; for(uint32_t i=0;i<N&&got65.size()==N;i++) if(std::fabs(got65[i]-exp65[i])>1e-3f) bad65++;
     printf("  kernel65 mismatches=%u (out[9]=%g exp=%g)\n", bad65, got65.size()==N?got65[9]:-1, exp65[9]);
     CHECK(got65.size()==N && bad65==0, "recompiled kernel 65 (v_mbcnt -1 = localid) correct");
+
+    // Kernel 65b: GTA V exec_cs_413d22d00 pc605, exact `v_bfm_b32 v22,v22,0`.
+    // Width and offset use only five bits, so widths 32/64 wrap to zero rather than all ones.
+    const uint32_t code65b[] = {
+        0xD7630016u, 0x00010116u,
+        0xBF810000u,
+    };
+    const uint32_t widths65b[] = {0u, 1u, 5u, 31u, 32u, 33u, 63u};
+    const uint32_t expected65b[] = {
+        0u, 1u, 0x1fu, 0x7fffffffu, 0u, 1u, 0x7fffffffu,
+    };
+    std::vector<float> in65b(std::size(widths65b) * 23u, 0.0f);
+    for (size_t i = 0; i < std::size(widths65b); ++i)
+        in65b[i * 23u + 22u] = std::bit_cast<float>(widths65b[i]);
+    const std::vector<uint32_t> spv65b = recompile_valu(
+        code65b, std::size(code65b), 23, /*out_vgpr*/22);
+    const std::vector<float> got65b = prosper::test::run_compute(
+        spv65b, in65b, std::size(widths65b), std::size(widths65b));
+    uint32_t bad65b = 0;
+    for (size_t i = 0; i < std::size(widths65b) && got65b.size() == std::size(widths65b); ++i)
+        if (bits_of(got65b[i]) != expected65b[i]) ++bad65b;
+    CHECK(!spv65b.empty() && got65b.size() == std::size(widths65b) && bad65b == 0,
+          "GTA V v_bfm_b32 applies five-bit width semantics exactly");
+
+    // Same-site modifier mutations: no modifier spelling is defined for V_BFM. Test every raw
+    // ABS/OP_SEL/CLAMP/OMOD/NEG bit on the production packet so the admission cannot silently grow.
+    const uint32_t bfm_word0_modifiers[] = {
+        0x00000100u, 0x00000200u, 0x00000400u,
+        0x00000800u, 0x00001000u, 0x00002000u, 0x00004000u,
+        0x00008000u,
+    };
+    const uint32_t bfm_word1_modifiers[] = {
+        0x08000000u, 0x10000000u,
+        0x20000000u, 0x40000000u, 0x80000000u,
+    };
+    bool bfm_modifiers_reject = true;
+    for (uint32_t modifier : bfm_word0_modifiers) {
+        const uint32_t mutant[] = {
+            code65b[0] | modifier, code65b[1], 0xBF810000u,
+        };
+        const RecompileCoverage coverage = recompile_coverage(mutant, std::size(mutant));
+        bfm_modifiers_reject &= recompile_valu(
+            mutant, std::size(mutant), 23, 22).empty() && coverage.unsupported == 1;
+    }
+    for (uint32_t modifier : bfm_word1_modifiers) {
+        const uint32_t mutant[] = {
+            code65b[0], code65b[1] | modifier, 0xBF810000u,
+        };
+        const RecompileCoverage coverage = recompile_coverage(mutant, std::size(mutant));
+        bfm_modifiers_reject &= recompile_valu(
+            mutant, std::size(mutant), 23, 22).empty() && coverage.unsupported == 1;
+    }
+    CHECK(bfm_modifiers_reject,
+          "GTA V v_bfm_b32 same-site modifier mutations remain fail-visible");
 
     // Kernel 66: RAW MUBUF SRSRC RESOLUTION (#91). Same code as kernel 21 (buffer_load_dword v0, v0
     // offen, SRSRC s[8:11]) but WITH a resource table mapping s[8:11] -> binding 3. The load must

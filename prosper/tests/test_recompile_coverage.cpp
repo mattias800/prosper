@@ -894,6 +894,88 @@ int main() {
                             compute_cfg_dispatch_ambiguous_ff1_b64.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
           "a Wave64 mask/scalar join remains ambiguous at the exact S_FF1 consumer");
+    // GTA V also consumes saved EXEC halves through V_MBCNT after dispatcher boundaries. LOW names
+    // the pair root and HIGH names its following dword; both consumers must be admitted only where
+    // the Wave64 MUST-domain proof says that same B64 mask lifetime reaches the exact PC.
+    std::vector<uint32_t> compute_cfg_dispatch_persisted_mbcnt_b64 = {
+        0xBE900381u, // earlier scalar lifetime: s_mov_b32 s16, 1
+        0xBE910382u, //                          s_mov_b32 s17, 2
+        0xBE90047Eu, // s_mov_b64 s[16:17], exec (saved-mask lifetime begins)
+    };
+    compute_cfg_dispatch_persisted_mbcnt_b64.insert(
+        compute_cfg_dispatch_persisted_mbcnt_b64.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch) - 1);
+    compute_cfg_dispatch_persisted_mbcnt_b64.insert(
+        compute_cfg_dispatch_persisted_mbcnt_b64.end(), {
+            0xBEFE0410u,              // s_mov_b64 exec, s[16:17]
+            0xD7650003u, 0x00010010u, // v_mbcnt_lo_u32_b32 v3, s16, 0
+            0xD7660003u, 0x00020611u, // v_mbcnt_hi_u32_b32 v3, s17, v3
+            0xBF810000u,
+        });
+    CHECK(!recompile_compute(compute_cfg_dispatch_persisted_mbcnt_b64.data(),
+                             compute_cfg_dispatch_persisted_mbcnt_b64.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "the native Wave64 dispatcher preserves saved EXEC through LOW/even and HIGH/odd MBCNT");
+    ComputeShaderConfig portable_wave64_dispatch_config = wave64_dispatch_config;
+    portable_wave64_dispatch_config.native_subgroup_size = 0;
+    CHECK(!recompile_compute(compute_cfg_dispatch_persisted_mbcnt_b64.data(),
+                             compute_cfg_dispatch_persisted_mbcnt_b64.size(), &dispatch_rt,
+                             portable_wave64_dispatch_config).empty(),
+          "the portable Wave64 dispatcher preserves saved EXEC through synchronized MBCNT");
+
+    std::vector<uint32_t> compute_cfg_dispatch_overwritten_mbcnt_b64 =
+        compute_cfg_dispatch_persisted_mbcnt_b64;
+    compute_cfg_dispatch_overwritten_mbcnt_b64[
+        compute_cfg_dispatch_overwritten_mbcnt_b64.size() - 6] =
+        0xBE910380u; // replace the restore with an s17 overwrite immediately before MBCNT
+    CHECK(recompile_compute(compute_cfg_dispatch_overwritten_mbcnt_b64.data(),
+                            compute_cfg_dispatch_overwritten_mbcnt_b64.size(), &dispatch_rt,
+                            wave64_dispatch_config).empty(),
+          "saved-pair MBCNT rejects after an overlapping high-half scalar overwrite");
+
+    std::vector<uint32_t> compute_cfg_dispatch_ambiguous_mbcnt_b64(
+        compute_cfg_dispatch_persisted_mbcnt_b64.begin(),
+        compute_cfg_dispatch_persisted_mbcnt_b64.end() - 6);
+    compute_cfg_dispatch_ambiguous_mbcnt_b64.insert(
+        compute_cfg_dispatch_ambiguous_mbcnt_b64.end(), {
+            0xBF068014u, // s_cmp_eq_u32 s20, 0
+            0xBF840001u, // s_cbranch_scc0 +1: one predecessor preserves the mask
+            0xBE910380u, // other predecessor overwrites s17
+        });
+    compute_cfg_dispatch_ambiguous_mbcnt_b64.insert(
+        compute_cfg_dispatch_ambiguous_mbcnt_b64.end(),
+        compute_cfg_dispatch_persisted_mbcnt_b64.end() - 6,
+        compute_cfg_dispatch_persisted_mbcnt_b64.end());
+    CHECK(recompile_compute(compute_cfg_dispatch_ambiguous_mbcnt_b64.data(),
+                            compute_cfg_dispatch_ambiguous_mbcnt_b64.size(), &dispatch_rt,
+                            wave64_dispatch_config).empty(),
+          "saved-pair MBCNT rejects a mask/scalar predecessor join at its exact consumer");
+
+    // A forward exact-wave branch normally remains on the compact structured path. A real MBCNT
+    // after its merge still needs the dispatcher's synchronized common phase (the all-ones
+    // lane-index idiom remains locally scalarizable and does not take this route).
+    const uint32_t compute_structured_saved_mbcnt_b64[] = {
+        0xBE84047Eu,                // s_mov_b64 s[4:5], exec
+        0x7E060280u,                // v_mov_b32 v3, 0 (merge live-in)
+        0x7C020300u,                // v_cmp_lt_f32 vcc, v0, v1 (varying guest-wave branch)
+        0xBF860001u,                // s_cbranch_vccz +1 -> merge
+        0x7E060281u,                // guarded write keeps the structured branch live
+        0xD7650003u, 0x00010004u,   // v_mbcnt_lo_u32_b32 v3, s4, 0
+        0xD7660003u, 0x00020605u,   // v_mbcnt_hi_u32_b32 v3, s5, v3
+        0xBF810000u,
+    };
+    const std::vector<uint32_t> native_structured_saved_mbcnt_b64 = recompile_compute(
+        compute_structured_saved_mbcnt_b64,
+        std::size(compute_structured_saved_mbcnt_b64), nullptr,
+        wave64_dispatch_config);
+    CHECK(!native_structured_saved_mbcnt_b64.empty(),
+          "structured compute routes saved-mask MBCNT through the native common phase");
+    const std::vector<uint32_t> portable_structured_saved_mbcnt_b64 = recompile_compute(
+        compute_structured_saved_mbcnt_b64,
+        std::size(compute_structured_saved_mbcnt_b64), nullptr,
+        portable_wave64_dispatch_config);
+    CHECK(!portable_structured_saved_mbcnt_b64.empty(),
+          "structured compute routes saved-mask MBCNT through the portable common phase");
     // GTA V's exec_cs_413d88400 reaches the exact `beea147e` packet at PC336 after
     // structured divergent loops.  Their EXEC restores are represented separately from the
     // architectural EXEC mask, so loop-carried scalar placeholders for s126/s127 must not make
