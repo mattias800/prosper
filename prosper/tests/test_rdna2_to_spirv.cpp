@@ -1345,6 +1345,14 @@ int main() {
     write17d0[16] = 0x00000300u;
     CHECK(recompile_valu(write17d0.data(), write17d0.size(), 1, /*out_vgpr*/2).empty(),
           "EXEC-loop LDS writes remain rejected even after a proved barrier");
+    std::vector<uint32_t> inactive_read17d0(std::begin(code17d0), std::end(code17d0));
+    inactive_read17d0[14] = 0xbf880005u; // shifted exit target: pc20
+    inactive_read17d0.insert(inactive_read17d0.begin() + 15,
+                             0xbefe0480u); // s_mov_b64 exec,0 before ds_read_b32
+    inactive_read17d0[19] = 0xbf82fffau;   // shifted back-edge: pc14
+    CHECK(recompile_valu(inactive_read17d0.data(), inactive_read17d0.size(),
+                         1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS reads reject when an intervening write can deactivate the lane");
     std::vector<uint32_t> stale17d0(std::begin(code17d0), std::end(code17d0));
     stale17d0[9] = 0x7e060280u; // v_mov_b32 v3,0: no fresh EXEC condition at the latch
     CHECK(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2).empty(),
