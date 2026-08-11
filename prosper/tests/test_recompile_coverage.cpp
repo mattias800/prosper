@@ -823,6 +823,77 @@ int main() {
                              compute_cfg_dispatch_ff1_b64.size(), &dispatch_rt,
                              wave64_dispatch_config).empty(),
           "the exact Wave64 dispatcher lowers GTA's saved-mask S_FF1_I32_B64 site");
+    // The immediate producer above does not cross a dispatcher edge.  GTA's later saved-mask sites
+    // do: the dispatcher persists both the Bool-domain mask and synthetic scalar placeholders for
+    // its physical SGPR pair.  A mask proven live on every predecessor must still reach the exact
+    // S_FF1/S_BCNT reduction packet after that save/reload boundary.
+    std::vector<uint32_t> compute_cfg_dispatch_persisted_ff1_b64 = {
+        0xBE900381u, // earlier scalar lifetime: s_mov_b32 s16, 1
+        0xBE910382u, //                          s_mov_b32 s17, 2
+        0x7E060210u, // v_mov_b32 v3, s16
+        0xBE8203A8u, // s_mov_b32 s2, 40
+        0x7D840002u, // v_cmp_eq_u32 vcc, s2, v0
+        0xBEFE046Au, // s_mov_b64 exec, vcc
+        0xBE90246Au, // s_and_saveexec_b64 s[16:17], vcc
+    };
+    compute_cfg_dispatch_persisted_ff1_b64.insert(
+        compute_cfg_dispatch_persisted_ff1_b64.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch) - 1);
+    compute_cfg_dispatch_persisted_ff1_b64.insert(
+        compute_cfg_dispatch_persisted_ff1_b64.end(), {
+            0xBEFE0410u, // s_mov_b64 exec, s[16:17]
+            0xBEEA1410u, // s_ff1_i32_b64 vcc_lo, s[16:17] (GTA PC1486)
+            0x7E04026Au, // v_mov_b32 v2, vcc_lo
+            0xBF810000u, // s_endpgm
+        });
+    CHECK(!recompile_compute(compute_cfg_dispatch_persisted_ff1_b64.data(),
+                             compute_cfg_dispatch_persisted_ff1_b64.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "the Wave64 dispatcher preserves a saved mask through GTA's exact S_FF1 reduction");
+    std::vector<uint32_t> compute_cfg_dispatch_persisted_bcnt_b64 = {
+        0xBE860381u, // earlier scalar lifetime: s_mov_b32 s6, 1
+        0xBE870382u, //                          s_mov_b32 s7, 2
+        0x7E060206u, // v_mov_b32 v3, s6
+        0xBE8203A8u, // s_mov_b32 s2, 40
+        0x7D840002u, // v_cmp_eq_u32 vcc, s2, v0
+        0xBEFE046Au, // s_mov_b64 exec, vcc
+        0xBE86246Au, // s_and_saveexec_b64 s[6:7], vcc (GTA PC2005 producer)
+    };
+    compute_cfg_dispatch_persisted_bcnt_b64.insert(
+        compute_cfg_dispatch_persisted_bcnt_b64.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch) - 1);
+    compute_cfg_dispatch_persisted_bcnt_b64.insert(
+        compute_cfg_dispatch_persisted_bcnt_b64.end(), {
+            0xBEFE0406u, // s_mov_b64 exec, s[6:7]
+            0xBEEA1006u, // s_bcnt1_i32_b64 vcc_lo, s[6:7] (GTA PC2007)
+            0x7E04026Au, // v_mov_b32 v2, vcc_lo
+            0xBF810000u, // s_endpgm
+        });
+    CHECK(!recompile_compute(compute_cfg_dispatch_persisted_bcnt_b64.data(),
+                             compute_cfg_dispatch_persisted_bcnt_b64.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "the Wave64 dispatcher preserves a saved mask through GTA's exact S_BCNT reduction");
+    std::vector<uint32_t> compute_cfg_dispatch_ambiguous_ff1_b64 = {
+        0xBF068008u, // s_cmp_eq_u32 s8, 0
+        0xBF840003u, // s_cbranch_scc0 +3 -> mask-producing arm
+        0xBE900381u, // scalar-data arm: s_mov_b32 s16, 1
+        0xBE910380u, //                  s_mov_b32 s17, 0
+        0xBF820001u, // s_branch +1 -> merge
+        0xBE90047Eu, // mask arm: s_mov_b64 s[16:17], exec
+    };
+    compute_cfg_dispatch_ambiguous_ff1_b64.insert(
+        compute_cfg_dispatch_ambiguous_ff1_b64.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch) - 1);
+    compute_cfg_dispatch_ambiguous_ff1_b64.insert(
+        compute_cfg_dispatch_ambiguous_ff1_b64.end(), {
+            0xBE841410u, // merge: s_ff1_i32_b64 s4, s[16:17]
+            0x7E040204u, // v_mov_b32 v2, s4
+            0xBF810000u, // s_endpgm
+        });
+    CHECK(recompile_compute(compute_cfg_dispatch_ambiguous_ff1_b64.data(),
+                            compute_cfg_dispatch_ambiguous_ff1_b64.size(), &dispatch_rt,
+                            wave64_dispatch_config).empty(),
+          "a Wave64 mask/scalar join remains ambiguous at the exact S_FF1 consumer");
     // GTA V's exec_cs_413d88400 reaches the exact `beea147e` packet at PC336 after
     // structured divergent loops.  Their EXEC restores are represented separately from the
     // architectural EXEC mask, so loop-carried scalar placeholders for s126/s127 must not make
