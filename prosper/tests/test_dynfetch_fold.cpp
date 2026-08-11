@@ -1581,6 +1581,45 @@ int main() {
     CHECK(gta_null_unproven_pc1180_uses.empty(),
           "GTA pc1180 rejects byte-identical nulls from an unproven qword");
 
+    // Each aligned zero qword receives a distinct origin. Copy one dword from each of two adjacent
+    // qwords into a nominal 64-bit operand: the shift must not collapse that splice onto one origin.
+    std::vector<uint32_t> gta_null_spliced_pc1180 = gta_null_pc1180;
+    gta_null_spliced_pc1180[1156] = 0xbe980314u; // s_mov_b32 s24,s20 (qword A low)
+    gta_null_spliced_pc1180[1157] = 0xbe990316u; // s_mov_b32 s25,s22 (qword B low)
+    gta_null_spliced_pc1180[1160] = 0x8f948318u; // consume spliced s24:s25 pair
+    std::vector<SrtUse> gta_null_spliced_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_spliced_pc1180.data(), gta_null_spliced_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_spliced_pc1180_uses);
+    CHECK(gta_null_spliced_pc1180_uses.empty(),
+          "GTA pc1180 rejects a 64-bit pair spliced from distinct header qwords");
+
+    // A conditional edge may not bypass the mapped x16 load and then enter its dependent builder.
+    // Seed the skipped path with a non-null root so accepting the linear walk as null would change
+    // guest-visible ray results, not merely attach an imprecise provenance label.
+    std::vector<uint32_t> gta_null_skipped_load_pc1180 = gta_null_pc1180;
+    gta_null_skipped_load_pc1180[1105] = 0xbf850003u; // s_cbranch_scc1 pc1109
+    std::array<uint32_t, 78> gta_null_skipped_load_seed = gta_null_pc1180_seed;
+    gta_null_skipped_load_seed[20] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_null_skipped_load_seed[21] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> gta_null_skipped_load_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_skipped_load_pc1180.data(),
+                          gta_null_skipped_load_pc1180.size(),
+                          gta_null_skipped_load_seed.data(),
+                          gta_null_skipped_load_seed.size(), 0,
+                          &gta_null_skipped_load_pc1180_uses);
+    CHECK(gta_null_skipped_load_pc1180_uses.empty(),
+          "GTA pc1180 rejects null provenance whose x16 seed does not dominate the use");
+
+    std::vector<uint32_t> gta_null_indirect_pc1180 = gta_null_pc1180;
+    gta_null_indirect_pc1180[1101] = 0xbe802000u; // s_setpc_b64 s[0:1]
+    std::vector<SrtUse> gta_null_indirect_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_indirect_pc1180.data(), gta_null_indirect_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_indirect_pc1180_uses);
+    CHECK(gta_null_indirect_pc1180_uses.empty(),
+          "GTA pc1180 rejects a null proof in a program with indirect control flow");
+
     std::vector<uint32_t> gta_null_unguarded_pc1180 = gta_null_pc1180;
     gta_null_unguarded_pc1180[1100] = 0xbf800000u; // remove exact EXECZ region proof
     std::vector<SrtUse> gta_null_unguarded_pc1180_uses;

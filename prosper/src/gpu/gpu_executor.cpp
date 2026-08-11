@@ -1966,6 +1966,10 @@ bool has_indirect_control_flow(const std::vector<Rdna2Inst>& instructions) {
 }
 
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
+    // An indirect target can enter the guarded interval after its EXECZ check, or leave and later
+    // re-enter it. No scan over direct SOPP displacements can prove dominance in that program.
+    if (has_indirect_control_flow(instructions)) return false;
+
     const auto& is_branch = sopp_is_branch;
     const auto& target = sopp_branch_target;
 
@@ -1998,6 +2002,27 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
         if (!external_entry) return true;
     }
     return false;
+}
+
+// The x16-header null proof deliberately accepts one observed straight-line descriptor builder, not
+// a general scalar phi analysis. Every instruction that carries the root from its mapped load to the
+// ray must therefore execute whenever the ray does. Reject a branch inside that interval, or any
+// edge entering it after the load; branches that skip both the load and the ray remain harmless.
+bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructions,
+                                        uint32_t definition_pc, uint32_t use_pc) {
+    if (definition_pc >= use_pc) return false;
+    bool found_definition = false, found_use = false;
+    for (const Rdna2Inst& in : instructions) {
+        found_definition |= in.pc == definition_pc;
+        found_use |= in.pc == use_pc;
+        if (!sopp_is_branch(in)) continue;
+        const int64_t branch_target = sopp_branch_target(in);
+        if (in.pc > definition_pc && in.pc < use_pc) return false;
+        if (branch_target > static_cast<int64_t>(definition_pc) &&
+            branch_target <= static_cast<int64_t>(use_pc))
+            return false;
+    }
+    return found_definition && found_use;
 }
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
@@ -2139,6 +2164,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> null_chain_origin{};
     std::bitset<kFoldSgprs> null_chain_known;
     uint32_t next_null_chain_origin = 0;
+    // Only x16-header roots need the narrow straight-line dominance contract added for GTA V. The
+    // generic mapped-qword null proof predates this shape and has separate loop/CFG validation.
+    // Origin ids are monotonic and never restored, so this metadata is immutable once published.
+    std::vector<uint32_t> x16_null_origin_pc(1u, UINT32_MAX);
     // Null-pointer provenance carried by SCC between the low and high halves of an exact
     // s_add_u32/s_addc_u32 pair. The concrete carry can be unknown after a failed null dereference;
     // this records only that the high result still belongs to that null chain.
@@ -2888,6 +2917,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 int next_scc = scc;
                 const uint32_t null0 = operand_null_origin(in.src[0]);
                 const uint32_t null1 = operand_null_origin(in.src[1]);
+                uint32_t null0_hi = 0;
+                if ((in.src[0].kind == OperandKind::SGPR ||
+                     in.src[0].kind == OperandKind::Special) &&
+                    valid_reg(in.src[0].value + 1))
+                    null0_hi = null_origin(in.src[0].value + 1);
                 auto source_bvh_state = [&](const Operand& operand, int add,
                                             uint32_t& origin, BvhBuildRole& role) {
                     const int reg = operand.value + add;
@@ -2918,7 +2952,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     in.opcode == 0x27 || in.opcode == 0x1F || in.opcode == 0x21 ||
                     in.opcode == 0x29;
                 uint32_t propagated_null_origin = 0;
-                if (null_chain_opcode) {
+                const bool null_chain_64bit_opcode =
+                    in.opcode == 0x1Fu || in.opcode == 0x21u || in.opcode == 0x29u;
+                if (null_chain_64bit_opcode) {
+                    // A 64-bit value is one provenance unit. Looking only at its low SGPR lets two
+                    // independently loaded zero qwords be spliced with scalar moves and then
+                    // collapsed onto one origin by the shift/BFE result.
+                    if (null0 && null0_hi == null0 && kc)
+                        propagated_null_origin = null0;
+                } else if (null_chain_opcode) {
                     if (null0 && null1 && null0 == null1) propagated_null_origin = null0;
                     else if (null0 && !null1 && kc) propagated_null_origin = null0;
                     else if (null1 && !null0 && ka) propagated_null_origin = null1;
@@ -3490,6 +3532,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (mem[first] == 0u && mem[first + 1] == 0u) {
                             uint32_t null_origin = ++next_null_chain_origin;
                             if (!null_origin) null_origin = ++next_null_chain_origin;
+                            if (x16_null_origin_pc.size() <= null_origin)
+                                x16_null_origin_pc.resize((size_t)null_origin + 1u, UINT32_MAX);
+                            x16_null_origin_pc[(size_t)null_origin] = in.pc;
                             mark_null_origin(sdst + (int)first, null_origin);
                             mark_null_origin(sdst + (int)first + 1, null_origin);
                         }
@@ -3641,8 +3686,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         for (int k = 1; proven_null_origin && k < 4; ++k)
                             if (null_origin(bbase + k) != proven_null_origin)
                                 proven_null_origin = 0;
+                        bool null_control_proven = true;
+                        if (proven_null_origin < x16_null_origin_pc.size() &&
+                            x16_null_origin_pc[(size_t)proven_null_origin] != UINT32_MAX)
+                            null_control_proven = straight_line_null_chain_dominates(
+                                ins, x16_null_origin_pc[(size_t)proven_null_origin], in.pc);
                         const bool guarded_null = !plausible && proven_null_origin &&
-                            guarded_bvh_use(ins, in.pc);
+                            null_control_proven && guarded_bvh_use(ins, in.pc);
                         if (trc) {
                             fprintf(stderr,
                                     "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d builder=%d "
