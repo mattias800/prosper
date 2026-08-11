@@ -1383,6 +1383,116 @@ int main() {
       dst.format = DataFormat::Uint32; dst.num_components = 1;
       dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
       rt17d1.resources.push_back(dst); }
+
+    // GTA V 0x413e15400 pc152 recycles only Wave64 VCC_LO as scalar scratch, copies that dword to
+    // v10, then replaces the complete VCC pair before any implicit mask consumer. Keep the exact
+    // pc106..153 loop suffix to exercise its scalar semantics and high-half liveness proof.
+    const uint32_t code17d1_vcc_low[] = {
+        0xbe820380u, 0xbe8c0380u, 0xbf0a1202u, 0xbf840020u,
+        0xbefc0302u, 0x81028102u, 0xbf8c3f70u, 0x7e148701u,
+        0x4c121480u, 0xbeea287eu, 0x02281480u, 0x4a2828fau,
+        0xff011114u, 0x4a2828fau, 0xff011214u, 0x4a2828fau,
+        0xff011414u, 0x4a2828fau, 0xff011814u, 0xd7781013u,
+        0x03058314u, 0x4a2826fau, 0xaf00e414u, 0x92fea0a0u,
+        0xd7600000u, 0x00013f14u, 0x4a282800u, 0xbefe046au,
+        0xd76d0009u, 0x0426280cu, 0xd760006au, 0x00017f14u,
+        0x7e140314u, 0x7e028509u, 0x810c6a0cu, 0xbf82ffdeu,
+        0x8801ff09u, 0x00080000u, 0xbe800308u, 0xbe82030du,
+        0xbe8303ffu, 0x00016204u, 0xbefe0481u, 0x7e26020fu,
+        0xbf08800fu, 0x7e12020cu,
+        0x856a8281u,              // exact pc152: s_cselect_b32 vcc_lo,1,2
+        0x7e14026au,              // exact pc153: v_mov_b32 v10,vcc_lo
+        0x7d840100u,              // complete VOPC replacement makes old VCC_HI dead
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d1_vcc_low = recompile_valu(
+        code17d1_vcc_low, std::size(code17d1_vcc_low), 1, /*out_vgpr*/10);
+    CHECK(!spv17d1_vcc_low.empty(),
+          "GTA Wave64 VCC_LO scalar scratch recompiles with its captured loop suffix");
+    if (!spv17d1_vcc_low.empty()) {
+        const std::vector<float> got17d1_vcc_low = prosper::test::run_compute(
+            spv17d1_vcc_low, std::vector<float>(64, 0.0f), 64, 64);
+        uint32_t bad17d1_vcc_low = 0;
+        for (uint32_t lane = 0; lane < got17d1_vcc_low.size(); ++lane)
+            bad17d1_vcc_low += bits_of(got17d1_vcc_low[lane]) != (lane == 0 ? 2u : 0u);
+        CHECK(got17d1_vcc_low.size() == 64 && bad17d1_vcc_low == 0,
+              "Wave64 VCC_LO scratch copies the selected dword to the active lane exactly");
+    }
+
+    // The live dispatcher's pair-domain ambiguity is established before pc106, across the repeated
+    // optional descriptor loads. Preserve the exact pc0..153 CFG and replace only those nine MUBUF
+    // packets with equal-width NOPs so this remains a resource-free regression. Without clearing
+    // the proved mixed lifetime at the exact pc152 write, pc153 rejects as an ambiguous mask read.
+    const uint32_t code17d1_vcc_low_dispatch[] = {
+        0xbfa00003u, 0x8790817eu, 0xbefe0410u, 0xbf880003u,
+        0x7e020281u, 0xbf800000u, 0xbf800000u, 0xbf8c3f70u,
+        0xd760000fu, 0x00010101u, 0xbefe04c1u, 0x9012860cu,
+        0xbf0a1280u, 0x93000c0fu, 0x4a240000u, 0x7d88240eu,
+        0xbf840006u, 0x7e020280u, 0xbefe046au, 0xbf880002u,
+        0xbf800000u, 0xbf800000u, 0xbefe04c1u, 0xd76d0011u,
+        0x04018000u, 0xbf0a1281u, 0x7d88220eu, 0xbf840006u,
+        0x7e040280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d0010u, 0x0401fe00u,
+        0x00000080u, 0xbf0a1282u, 0x7d88200eu, 0xbf840006u,
+        0x7e060280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000fu, 0x0401fe00u,
+        0x000000c0u, 0xbf0a1283u, 0x7d881e0eu, 0xbf840006u,
+        0x7e080280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000eu, 0x0401fe00u,
+        0x00000100u, 0xbf0a1284u, 0x7d881c0eu, 0xbf840006u,
+        0x7e0a0280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000du, 0x0401fe00u,
+        0x00000140u, 0xbf0a1285u, 0x7d881a0eu, 0xbf840006u,
+        0x7e0c0280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000cu, 0x0401fe00u,
+        0x00000180u, 0xbf0a1286u, 0x7d88180eu, 0xbf840006u,
+        0x7e0e0280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000bu, 0x0401fe00u,
+        0x000001c0u, 0xbf0a1287u, 0x7d88160eu, 0xbf840006u,
+        0x7e100280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xbe820380u, 0xbe8c0380u,
+        0xbf0a1202u, 0xbf840020u, 0xbefc0302u, 0x81028102u,
+        0xbf8c3f70u, 0x7e148701u, 0x4c121480u, 0xbeea287eu,
+        0x02281480u, 0x4a2828fau, 0xff011114u, 0x4a2828fau,
+        0xff011214u, 0x4a2828fau, 0xff011414u, 0x4a2828fau,
+        0xff011814u, 0xd7781013u, 0x03058314u, 0x4a2826fau,
+        0xaf00e414u, 0x92fea0a0u, 0xd7600000u, 0x00013f14u,
+        0x4a282800u, 0xbefe046au, 0xd76d0009u, 0x0426280cu,
+        0xd760006au, 0x00017f14u, 0x7e140314u, 0x7e028509u,
+        0x810c6a0cu, 0xbf82ffdeu, 0x8801ff09u, 0x00080000u,
+        0xbe800308u, 0xbe82030du, 0xbe8303ffu, 0x00016204u,
+        0xbefe0481u, 0x7e26020fu, 0xbf08800fu, 0x7e12020cu,
+        0x856a8281u,              // exact pc152: s_cselect_b32 vcc_lo,1,2
+        0x7e14026au,              // exact pc153: v_mov_b32 v10,vcc_lo
+        0x7d840100u,              // complete VCC replacement
+        0xbf870001u,              // force the whole shader through the CFG dispatcher
+        0xbf82fffdu, 0xbf810000u,
+    };
+    CHECK(!recompile_compute(code17d1_vcc_low_dispatch,
+                             std::size(code17d1_vcc_low_dispatch), nullptr,
+                             native_cfg17d).empty(),
+          "GTA Wave64 VCC_LO scalar scratch resolves the live dispatcher ambiguity");
+
+    // Same-site packet mutation and a surviving implicit VCC read both remain fail-visible. The
+    // first prevents this byte-exact exception from silently becoming a general Wave64 bridge; the
+    // second proves the old high-half mask really must be dead, not merely unused by the assertion.
+    const uint32_t code17d1_vcc_low_mutated[] = {
+        0xbe8f0380u, 0xbf08800fu,
+        0x856a8381u,              // s_cselect_b32 vcc_lo,1,3 (mutated live packet)
+        0x7e02026au, 0x7d840100u, 0xbf810000u,
+    };
+    const uint32_t code17d1_vcc_low_mask_live[] = {
+        0xbe8f0380u, 0xbf08800fu, 0x856a8281u, 0x7e02026au,
+        0xbf860001u,              // implicit VCCZ observes the untouched high half
+        0xbf800000u, 0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1_vcc_low_mutated,
+                            std::size(code17d1_vcc_low_mutated), nullptr,
+                            native_cfg17d).empty() &&
+              recompile_compute(code17d1_vcc_low_mask_live,
+                                std::size(code17d1_vcc_low_mask_live), nullptr,
+                                native_cfg17d).empty(),
+          "Wave64 VCC_LO scalar exception rejects packet drift and a live high-half mask");
     ComputeShaderConfig native_cfg17d1;
     native_cfg17d1.local_x = 64;
     native_cfg17d1.wave_size = 32;

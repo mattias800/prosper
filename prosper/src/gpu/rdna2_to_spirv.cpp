@@ -415,6 +415,11 @@ struct SpirvCompute {
     // phase/CFG emitters see the proof derived from the original complete instruction stream.
     bool cselect_b64_low_only_analysis_done = false;
     std::unordered_set<uint32_t> cselect_b64_low_only_pcs;
+    // GTA V also selects one B32 scalar directly into Wave64 VCC_LO and consumes only that low word.
+    // The untouched VCC_HI mask is unrepresentable once the pair becomes a mixed data/mask lifetime;
+    // retain only sites whose whole-stream proof shows that high half dead before any mask read.
+    bool vcc_b32_low_only_analysis_done = false;
+    std::unordered_set<uint32_t> vcc_b32_low_only_pcs;
     bool     declared_subgroup=0, declared_subgroup_vote=0, declared_subgroup_arithmetic=0;
     // When non-zero, the backend promises to create this compute pipeline with an exact required
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
@@ -3895,6 +3900,29 @@ std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
     return result;
 }
 
+// GTA V 0x413e15400 pc152 selects the scalar constant 1 or 2 into VCC_LO, copies that dword to a
+// VGPR, and then replaces architectural VCC before any mask consumer. The low word is exactly
+// representable as scalar data; the old high-half predicate is not. Admit only this byte-exact
+// packet and only when the shared CFG liveness walk proves VCC_HI dead on every successor path.
+bool is_gtav_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0au &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
+        in.src[0].kind == OperandKind::InlineInt && in.src[0].value == 1 &&
+        in.src[1].kind == OperandKind::InlineInt && in.src[1].value == 2;
+}
+
+std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
+        const std::vector<Rdna2Inst>& ins) {
+    std::unordered_set<uint32_t> result;
+    for (const Rdna2Inst& in : ins) {
+        if (in.is_end) break;
+        if (is_gtav_wave64_vcc_lo_scalar_cselect(in) &&
+            sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
+            result.insert(in.pc);
+    }
+    return result;
+}
+
 // #2418: does this shader read SCC anywhere? Used to decide whether the fragment stage should pay for
 // an exact wave vote when a mask op writes SCC. Deliberately CONSERVATIVE and whole-shader: it answers
 // "could SCC ever be consumed", not "is this particular write live". A false positive costs one shader a
@@ -7205,6 +7233,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::SOP2: {
+            if (b.is_compute && b.wave_size == 64 && in.opcode == 0x0a &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value == 106) {
+                // A B32 write leaves Wave64 VCC_HI untouched, so the resulting mixed physical pair
+                // cannot remain in the architectural mask domain. Keep every non-live packet and
+                // every path with a later high-half/mask read fail-visible. At the proved GTA site,
+                // preserve only the selected low scalar word and poison VCC until its later VOPC
+                // replacement; the liveness proof guarantees nothing can observe that poison.
+                if (!is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
+                    !b.vcc_b32_low_only_pcs.contains(in.pc) || !rs.scc) {
+                    ok = false; return true;
+                }
+                const uint32_t selected = b.sel(
+                    rs.scc, val(in.src[0]), val(in.src[1]));
+                if (!ok) return true;
+                rs.sreg[106] = selected;
+                rs.sreg_srt.erase(106);
+                rs.sreg_bool.erase(106);
+                rs.sreg_bool_narrowed.erase(106);
+                rs.sreg_bool_b32.erase(106);
+                rs.vcc = 0;
+                return true;
+            }
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
                 in.opcode == 0x0a &&
@@ -14585,6 +14635,12 @@ bool emit_cfg_state_machine(
                 }
             };
             for_each_scalar_write(in, erase_overlapping, /*wave32_one_word_masks*/false);
+            // This exact B32 write resolves VCC_LO to scalar data while the whole-stream proof
+            // guarantees the untouched high half cannot be observed before a complete replacement.
+            // It is therefore safe to clear the pair-domain ambiguity for this path; a later join
+            // with a mask path will recreate the ambiguity in the ordinary MUST merge below.
+            if (b.vcc_b32_low_only_pcs.contains(in.pc))
+                ambiguous.erase(106);
             // An implicit VOPC destination is architectural VCC and is absent from the explicit
             // scalar-writer inventory.
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
@@ -16888,6 +16944,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
         b.cselect_b64_low_only_analysis_done = true;
     }
+    if (!b.vcc_b32_low_only_analysis_done) {
+        b.vcc_b32_low_only_pcs = proven_wave64_vcc_b32_low_only_pcs(ins);
+        b.vcc_b32_low_only_analysis_done = true;
+    }
     if (!rs.smem_x16_descriptor_analysis_done) {
         rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
         rs.smem_x16_descriptor_analysis_done = true;
@@ -18540,6 +18600,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     SpirvCompute b; b.begin(1);
     b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
     b.cselect_b64_low_only_analysis_done = true;
+    b.vcc_b32_low_only_pcs = proven_wave64_vcc_b32_low_only_pcs(ins);
+    b.vcc_b32_low_only_analysis_done = true;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
