@@ -9492,6 +9492,43 @@ int main() {
     CHECK(phasedDppResult.size() == kPartialLaunch && phasedDppBad == 0,
           "#2481: later portable DPP phase produces exact rows and preserves padded canaries");
 
+    // The exact sibling regression for GTA V's V_MIN_F32 ROW_ROR:8. Whole-stream scratch sizing
+    // must see the later rotate even though the first phase itself needs only one plane. Convert
+    // local ID to f32 so the execution oracle is independent of subnormal flushing; in the partial
+    // final DPP16 row, BC1 supplies zero when XOR 8 names an absent padded invocation.
+    std::vector<uint32_t> phasedRorScratch(
+        std::begin(phasedDppScratch), std::end(phasedDppScratch));
+    phasedRorScratch[5] = 0x7E020D00u;        // v_cvt_f32_u32 v1,v0
+    phasedRorScratch[12] = 0x1E0202FAu;       // v_min_f32_dpp v1,v1,v1
+    phasedRorScratch[13] = 0xFF092801u;       //   row_ror:8 BC:1
+    const std::vector<uint32_t> phasedRorSpv = recompile_compute(
+        phasedRorScratch.data(), phasedRorScratch.size(), &partialBarrierTable,
+        partialBarrierConfig);
+    CHECK(!phasedRorSpv.empty() &&
+              spirv_has_array_length(phasedRorSpv, kPhasedDppScratchDwords),
+          "#2481: phased portable ROW_ROR pre-sizes both scratch planes");
+    std::vector<uint32_t> phasedRorInitial(kPartialLaunch, kPartialCanary), phasedRorResult;
+    if (!phasedRorSpv.empty())
+        prosper::test::run_compute(
+            phasedRorSpv, std::vector<float>(1, 0.0f), kPartialThreads, 1,
+            {}, phasedRorInitial, &phasedRorResult, 256);
+    uint32_t phasedRorBad = 0;
+    for (uint32_t lane = 0; lane < phasedRorResult.size(); ++lane) {
+        uint32_t expected = kPartialCanary;
+        if (lane < kPartialThreads) {
+            const uint32_t groupBase = lane & ~255u;
+            const uint32_t local = lane & 255u;
+            const uint32_t source = (local & ~15u) | ((local & 15u) ^ 8u);
+            const uint32_t activeInGroup = std::min(256u, kPartialThreads - groupBase);
+            const float result = source < activeInGroup
+                ? static_cast<float>(std::min(local, source)) : 0.0f;
+            expected = bits_of(result);
+        }
+        phasedRorBad += phasedRorResult[lane] != expected;
+    }
+    CHECK(phasedRorResult.size() == kPartialLaunch && phasedRorBad == 0,
+          "#2481: phased ROW_ROR executes full rows, BC1 partial rows, and padded canaries");
+
     // #2396: a CFG-dispatcher attempt that fails PART WAY THROUGH must not leave its half-written
     // dispatcher in the module. emit_cfg_state_machine writes the dispatcher loop's OpLoopMerge,
     // its OpSelectionMerge and the OpSwitch before it emits the per-case bodies, so a reject inside
