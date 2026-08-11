@@ -1719,6 +1719,36 @@ int main() {
                             native_linear_cfg17d).empty(),
           "Wave64 mask-half alias cannot masquerade as a complete B64 predicate");
 
+    // Restoring both adjacent halves may legitimately promote them to a complete B64 predicate,
+    // but an intervening ordinary scalar write ends the first half's lifetime.  The runtime state
+    // must mirror the CFG MUST transfer: retaining s6's old dedicated Bool would combine it with
+    // the fresh s7 half and make S_MOV_B64 ignore the hardware zero written to s6.
+    std::vector<uint32_t> code17d1_mask_half_between_overwrite = {
+        0x7d8800a1u,              // EXEC source: low=ffffffff, high=1
+        0xbefe046au,              // s_mov_b64 exec,vcc
+        0xd761001fu, 0x00010c7fu, // spill EXEC_HI through v31 lane 6
+        0xd761001fu, 0x00010a7eu, // spill EXEC_LO through v31 lane 5
+        0xbefe04c1u,              // restore full EXEC for the dispatcher
+        0xd7600006u, 0x00010b1fu, // restore EXEC_LO into s6
+        0xbe860380u,              // exact overwrite site: s_mov_b32 s6,0
+        0xd7600007u, 0x00010d1fu, // restore EXEC_HI into adjacent s7
+        0xbefe0406u,              // must not consume stale LO plus fresh HI as a mask
+    };
+    code17d1_mask_half_between_overwrite.insert(
+        code17d1_mask_half_between_overwrite.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(code17d1_mask_half_between_overwrite.data(),
+                            code17d1_mask_half_between_overwrite.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "scalar overwrite between Wave64 half reloads prevents stale pair promotion");
+    std::vector<uint32_t> code17d1_mask_half_between_overwrite_mutated =
+        code17d1_mask_half_between_overwrite;
+    code17d1_mask_half_between_overwrite_mutated[9] =
+        0xbf800000u;              // same-site mutation: no scalar overwrite, pair is complete
+    CHECK(!recompile_compute(code17d1_mask_half_between_overwrite_mutated.data(),
+                             code17d1_mask_half_between_overwrite_mutated.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "removing the exact intervening write permits Wave64 half-pair promotion");
+
     // V_MOVRELD writes VGPR[VDST+M0], not merely its encoded VDST. Overwrite the exact v31 spill
     // array through v0+31, cross a dispatcher edge, then attempt the original lane read. Both the
     // half-identity proof and spill-validity analysis must cover the emitter's full dynamic range;
