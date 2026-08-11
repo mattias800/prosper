@@ -8,7 +8,7 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 ## Summary
 
@@ -25,7 +25,7 @@ Last updated: 2026-08-10
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
-| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Title and main menu | [#1873](https://github.com/mattias800/prosper/issues/1873) |
+| *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Gameplay entry: HUD and radar render; 3D world absent | [#1873](https://github.com/mattias800/prosper/issues/1873) |
 | *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Title and first-run setup | [#1874](https://github.com/mattias800/prosper/issues/1874) |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First-level gameplay | [#1875](https://github.com/mattias800/prosper/issues/1875) |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Level 1 gameplay | [#1876](https://github.com/mattias800/prosper/issues/1876) |
@@ -182,7 +182,10 @@ The manor entrance hall renders with real 3D gameplay content. See the [tracker]
 <p align="center"><img src="assets/screenshots/gta5-title.png" alt="Grand Theft Auto V — title screen"></p>
 <p align="center"><img src="assets/screenshots/gta5-main-menu.png" alt="Grand Theft Auto V — main menu"></p>
 
-The title and STORY/ONLINE main menu render. See the [tracker](https://github.com/mattias800/prosper/issues/1873).
+The title and STORY/ONLINE main menu render. A checked-in pad route also reaches Story Mode gameplay:
+the HUD, radar and tutorial text are visible, but the 3D world is still black. See the
+[tracker](https://github.com/mattias800/prosper/issues/1873) and the exact compute-failure census in
+[#2481](https://github.com/mattias800/prosper/issues/2481).
 
 ## Dragon Quest VII Reimagined — `PPSA17942`
 

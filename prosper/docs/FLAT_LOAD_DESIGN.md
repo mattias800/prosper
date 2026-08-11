@@ -1,10 +1,12 @@
 # General FLAT_LOAD design (#1171) — raw 64-bit-address memory reads in the compute recompiler
 
-**Status:** design / feasibility (2026-07-22). No implementation yet. Closing blocker for GTA V (PPSA04263)
-#1163/#1165 (loading-screen collage + missing legal text), whose content is produced by the rejected
-texture-decode compute kernel `exec_cs_2042d47600`.
+**Status:** implemented and regression-covered; retained as a historical design record (2026-07-22).
+The raw-address windowed load path described here removed the original GTA V (`PPSA04263`)
+`exec_cs_2042d47600` loading-screen blocker. It is not the current explanation for the black 3D world
+at gameplay entry; the runtime-selected descriptor lift is complete and current evidence is tracked
+by exact failed compute program in #2412/#2481.
 
-## The problem
+## The original problem
 
 A general FLAT load reads from a raw 64-bit guest GPU virtual address held in a VGPR pair. prosper's
 recompiler only models FLAT for the compiler's private scratch spill (a per-invocation `SC_Function`

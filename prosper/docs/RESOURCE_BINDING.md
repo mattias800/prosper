@@ -1,5 +1,11 @@
 # Resource binding — the front-half ↔ recompiler contract
 
+> **Current note (2026-08-11): the contract and its front-half materialization are implemented.** GTA V's
+> six-stage runtime-selected descriptor-array lift now covers capability negotiation, reflection,
+> SPIR-V indexing, descriptor layouts/writes and pipeline-cache identity. The black world at routed
+> gameplay entry persisted after that lift, so #2412/#2481 track the current exact compute terminals.
+> The staged plan below is retained to explain the contract, not as an open implementation checklist.
+
 **Purpose.** Unblock the format/descriptor-dependent shader memory instructions — `s_buffer_load_*`
 (multi-buffer uniforms), `buffer_load_format_*` (vertex fetch), and `image_sample`/`image_load`
 (textures) — *correctly*, without guessing formats. The seam is `src/gpu/shader_resources.hpp`.
@@ -104,25 +110,24 @@ lives front-half (it owns the descriptor bit layout); the recompiler only consum
   `v_interp_p1/p2/mov` → interpolated Input varying (deferred EntryPoint so varyings join the interface).
 - **`s_cbranch_execz` guard-to-`s_endpgm`** linearization; **SCC** (`s_cmp`/`s_cselect`).
 
-**Status:** the recompiler covers the full shape of a real textured, interpolated, buffer-reading/
-writing draw. The remaining gap to recompiling the game's *own* format-dependent shaders is not the
-recompiler — it is the **resource table**, which `build_shader_resources` (agc_shader_layout) can only
-fill from the shader's *bound user-data SGPRs* (V#/T#/S# descriptors), which the game sets at DRAW time.
-So it is gated on the game reaching draw submission = the parked GfxDevice boot wall (front-half). The
-table-less coverage metric (~74%) therefore *understates* real render-path coverage: every MIMG /
-`buffer_load_format` "blocker" it reports is a shape the recompiler already handles given a table.
+**Historical status at the end of the staged plan:** the recompiler covered the full shape of a real
+textured, interpolated, buffer-reading/writing draw, while the runtime resource-table producer was the
+next missing piece. That producer has since landed: graphics and compute discovery recover direct,
+indirect and runtime-selected V#/T#/S# descriptors, materialize their resources, and pass a reflected
+table to the recompiler. A raw table-less coverage metric still cannot classify a table-dependent
+instruction; use a live or resource-bearing replay result instead.
 
 Stage 2 was the high-value unlock (real VS recompile → real VS+PS frames from the game). Stages 1–3
 depend only on this contract + the front-half filling the table for constant/vertex buffers; stage 4
 adds textures.
 
-## Front-half deliverable (agent 2's next piece)
+## Historical front-half deliverable (implemented)
 
-`ShaderResourceTable build_shader_resources(const Shader& shdr)` (or equivalent): walk the shader's
-`user_data`/SRT, read each V#/T#/S# descriptor, decode `DataFormat`/dims/base/stride, assign bindings,
-and fill `srt_offset` with each descriptor's user_data byte offset. Provide the referenced guest
-bytes to the pipeline via `gpu_addr` (1:1-mapped, so it's a host pointer). No recompiler knowledge
-needed — just the descriptors → the table.
+The implemented producer walks the shader's `user_data`/SRT, reads each V#/T#/S# descriptor, decodes
+format/dimensions/base/stride, assigns bindings, and records the direct SGPR or indirect SRT provenance
+used by the instruction. It then makes the referenced guest bytes or image available to the backend
+and passes the resulting `ShaderResourceTable` into recompilation. Runtime-selected arrays extend this
+same contract with reflected descriptor count and dynamic-index metadata; they are not a parallel path.
 
 ## Ruled out
 

@@ -62,7 +62,7 @@ prosper/
 Key docs to orient: `prosper/README.md` (status) and `prosper/docs/ROADMAP.md` (what is planned).
 For anything title- or subsystem-specific, use the table in the next section rather than guessing.
 
-## Where the project stands (2026-08-10)
+## Where the project stands (2026-08-11)
 
 `COMPATIBILITY.md` is authoritative for the **user-facing per-title milestones** — 39 tracked titles
 at this refresh. Do not duplicate its rung counts here; read it, then open the one doc named below for
@@ -93,7 +93,7 @@ shared-GPU policy, the instrument-not-the-subject list, and the dated current ha
 | *ArcRunner* `PPSA21406` | rung 0 — renderer bring-up reaches real GPU submissions, then the render thread faults (#1226) | `docs/ARCRUNNER_STATUS.md` |
 | *Sonic Frontiers* `PPSA03831` | rung 2 — 4K opening sequence, auto-save notice, title screen and main menu on a default launch. The four-session black-screen wall was one unregistered NID answering `SCE_OK`: `sceSaveDataTransferringMountPs4` (#2023). The menu heading draws the wrong string (#2206) | `docs/SONIC_FRONTIERS_STATUS.md` |
 | *Sonic Racing: CrossWorlds* `PPSA08804` | rung 2 — a pulsed pad route reaches the complete 4K title screen and profile menu; the profile panel is black and the sequence later holds on white (#2013 / #2358 / #2360) | `docs/SONIC_CROSSWORLDS_STATUS.md` |
-| *Grand Theft Auto V* `PPSA04263` | rung 2 — title and STORY/ONLINE menu. Routed gameplay entry renders the HUD over an absent 3D world; the descriptor-array lift is complete and the current evidence points at compute CFG structurization (#2412 / #2481) | `docs/FLAT_LOAD_DESIGN.md`, tracker #1873, issue #2481 |
+| *Grand Theft Auto V* `PPSA04263` | rung 3 — routed gameplay entry with real GPU draws; the HUD, radar and tutorial text render over an absent 3D world. The descriptor-array lift is complete; use the exact program-tagged terminal census in #2481 rather than the superseded aggregate CFG count | `docs/FLAT_LOAD_DESIGN.md` (historical design), tracker #1873, issue #2481 |
 | *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 3 / rung 3 / rung 1 — Sonic's black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id); it renders the 4K SEGA logo and then holds on white | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
 | Concurrent title work | the 2026-07-31 lane allocation is historical; use live issue claims for ownership and the dated checkpoint for the current cross-lane handoff | `docs/GAME_COMPAT_ORCHESTRATION.md` |
 | *Tactics Ogre: Reborn* `PPSA03839` | rung 3 — gameplay reached; HEVC movies render, sprite/HUD composition remains open | `docs/TACTICS_OGRE_STATUS.md` |
