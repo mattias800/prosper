@@ -1492,6 +1492,203 @@ int main() {
               atomic_add_uses[0].t8 == expected_atomic_t8,
           "image_atomic_add publishes the live direct T# as a storage-image use");
 
+    // GTA V's gameplay compute programs supply IMAGE_LOAD_MIP's final address VGPR and
+    // IMAGE_STORE_MIP's NSA mip VGPR with a plain move from a zero wave-uniform SGPR. The proof is
+    // instruction-scoped: changing that exact reaching definition, its scalar value, or its basic
+    // block must clear the marker while retaining the ordinary image use for fail-visible lowering.
+    uint32_t zero_mip_seed[28]{};
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed), zero_mip_seed + 20);
+    const uint32_t gta_load_mip_2d[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7 (known zero)
+        0xf0043108u, 0x00050000u,            // IMAGE_LOAD_MIP 2D [v0,v1,v2], s[20:27]
+        0xbf810000u,
+    };
+    std::vector<SrtUse> zero_mip_load_uses;
+    resolve_dynamic_fetch(gta_load_mip_2d, std::size(gta_load_mip_2d),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &zero_mip_load_uses);
+    CHECK(zero_mip_load_uses.size() == 1 && !zero_mip_load_uses[0].is_storage_image &&
+              zero_mip_load_uses[0].use_pc == 1 && zero_mip_load_uses[0].proven_zero_mip,
+          "GTA V IMAGE_LOAD_MIP 2D carries its same-block v2=zero proof");
+
+    const uint32_t gta_load_mip_2da[] = {
+        0x7e060206u,                         // v_mov_b32 v3, s6 (known zero; v2 is slice)
+        0xf0043128u, 0x00050000u,            // IMAGE_LOAD_MIP 2D_ARRAY [v0,v1,v2,v3]
+        0xbf810000u,
+    };
+    std::vector<SrtUse> zero_mip_array_uses;
+    resolve_dynamic_fetch(gta_load_mip_2da, std::size(gta_load_mip_2da),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &zero_mip_array_uses);
+    CHECK(zero_mip_array_uses.size() == 1 && zero_mip_array_uses[0].proven_zero_mip,
+          "GTA V IMAGE_LOAD_MIP 2D_ARRAY proves v3 without consuming the v2 slice");
+
+    uint32_t nonzero_mip_seed[28]{};
+    std::copy(std::begin(zero_mip_seed), std::end(zero_mip_seed), nonzero_mip_seed);
+    nonzero_mip_seed[7] = 1u;
+    std::vector<SrtUse> nonzero_mip_uses;
+    resolve_dynamic_fetch(gta_load_mip_2d, std::size(gta_load_mip_2d),
+                          nonzero_mip_seed, std::size(nonzero_mip_seed), 0,
+                          &nonzero_mip_uses);
+    CHECK(nonzero_mip_uses.size() == 1 && !nonzero_mip_uses[0].proven_zero_mip,
+          "nonzero wave-uniform mip remains an image use but receives no specialization marker");
+
+    std::array<uint32_t, std::size(gta_load_mip_2d)> changed_mip_writer{};
+    std::copy(std::begin(gta_load_mip_2d), std::end(gta_load_mip_2d),
+              changed_mip_writer.begin());
+    changed_mip_writer[0] = 0x7e060207u;     // same site now writes v3, not the consumed v2
+    clear_shader_decode_cache();
+    std::vector<SrtUse> changed_mip_writer_uses;
+    resolve_dynamic_fetch(changed_mip_writer.data(), changed_mip_writer.size(),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &changed_mip_writer_uses);
+    CHECK(changed_mip_writer_uses.size() == 1 &&
+              !changed_mip_writer_uses[0].proven_zero_mip,
+          "same-site v_mov destination mutation removes the IMAGE_LOAD_MIP proof");
+
+    const uint32_t branched_zero_mip[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0xbf820000u,                         // s_branch to the immediately following new block
+        0xf0043108u, 0x00050000u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> branched_zero_mip_uses;
+    resolve_dynamic_fetch(branched_zero_mip, std::size(branched_zero_mip),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &branched_zero_mip_uses);
+    CHECK(branched_zero_mip_uses.size() == 1 &&
+              !branched_zero_mip_uses[0].proven_zero_mip,
+          "a control-flow boundary prevents a stale zero-mip reaching-definition proof");
+
+    const uint32_t dropped_block_start_zero_mip[] = {
+        0x7e040207u,                         // pc0: v_mov_b32 v2, s7
+        0xbf820000u,                         // pc1: s_branch pc2
+        0xf80000cfu, 0x00000000u,            // pc2: exp (omitted from the compact fold stream)
+        0xf0043108u, 0x00050000u,            // pc4: IMAGE_LOAD_MIP
+        0xbf810000u,
+    };
+    std::vector<SrtUse> dropped_block_start_uses;
+    resolve_dynamic_fetch(dropped_block_start_zero_mip,
+                          std::size(dropped_block_start_zero_mip),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &dropped_block_start_uses);
+    CHECK(dropped_block_start_uses.size() == 1 &&
+              !dropped_block_start_uses[0].proven_zero_mip,
+          "a compacted-out first instruction still starts a new zero-mip proof block");
+
+    const uint32_t exec_changed_zero_mip[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0x7da40100u,                         // v_cmpx_eq_u32 v0,v0 (implicit EXEC write)
+        0xf0043108u, 0x00050000u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> exec_changed_zero_mip_uses;
+    resolve_dynamic_fetch(exec_changed_zero_mip, std::size(exec_changed_zero_mip),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &exec_changed_zero_mip_uses);
+    CHECK(exec_changed_zero_mip_uses.size() == 1 &&
+              !exec_changed_zero_mip_uses[0].proven_zero_mip,
+          "an otherwise-compacted v_cmpx invalidates the predicated all-lanes zero proof");
+
+    const uint32_t predicated_zero_move[] = {
+        0x7da40100u,                         // v_cmpx_eq_u32 v0,v0 (EXEC is now untracked)
+        0x7e040207u,                         // predicated v_mov_b32 v2, s7
+        0xf0043108u, 0x00050000u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> predicated_zero_move_uses;
+    resolve_dynamic_fetch(predicated_zero_move, std::size(predicated_zero_move),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &predicated_zero_move_uses);
+    CHECK(predicated_zero_move_uses.size() == 1 &&
+              !predicated_zero_move_uses[0].proven_zero_mip,
+          "a v_mov after an untracked EXEC mutation cannot manufacture an all-lanes zero proof");
+
+    const uint32_t valu_overwrites_zero_mip[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0x4a040300u,                         // v_add_nc_u32 v2, v0, v1 (compacted without retention)
+        0xf0043108u, 0x00050000u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> valu_overwrites_zero_mip_uses;
+    resolve_dynamic_fetch(valu_overwrites_zero_mip, std::size(valu_overwrites_zero_mip),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &valu_overwrites_zero_mip_uses);
+    CHECK(valu_overwrites_zero_mip_uses.size() == 1 &&
+              !valu_overwrites_zero_mip_uses[0].proven_zero_mip,
+          "an otherwise-compacted overlapping VALU writer kills the retained zero proof");
+
+    const uint32_t mimg_overwrites_zero_mip[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0xf0003108u, 0x00050200u,            // IMAGE_LOAD v2, [v0,v1], s[20:27]
+        0xf0043108u, 0x00050000u,            // IMAGE_LOAD_MIP consumes the overwritten v2
+        0xbf810000u,
+    };
+    std::vector<SrtUse> mimg_overwrites_zero_mip_uses;
+    resolve_dynamic_fetch(mimg_overwrites_zero_mip, std::size(mimg_overwrites_zero_mip),
+                          zero_mip_seed, std::size(zero_mip_seed), 0,
+                          &mimg_overwrites_zero_mip_uses);
+    const auto overwritten_mip_use = std::find_if(
+        mimg_overwrites_zero_mip_uses.begin(), mimg_overwrites_zero_mip_uses.end(),
+        [](const SrtUse& use) { return use.use_pc == 3u; });
+    CHECK(overwritten_mip_use != mimg_overwrites_zero_mip_uses.end() &&
+              !overwritten_mip_use->proven_zero_mip,
+          "an intervening MIMG VDATA write kills the zero proof at the later mip use");
+
+    uint32_t zero_store_mip_seed[20]{};
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              zero_store_mip_seed + 12);
+    const uint32_t gta_store_mip_2d[] = {
+        0x7e0a0206u,                         // v_mov_b32 v5, s6 (known zero)
+        0xf024310au, 0x00030004u, 0x00000503u, // IMAGE_STORE_MIP v4,[v0,v3,v5],s[12:19]
+        0xbf810000u,
+    };
+    std::vector<SrtUse> zero_store_mip_uses;
+    resolve_dynamic_fetch(gta_store_mip_2d, std::size(gta_store_mip_2d),
+                          zero_store_mip_seed, std::size(zero_store_mip_seed), 0,
+                          &zero_store_mip_uses);
+    CHECK(zero_store_mip_uses.size() == 1 && zero_store_mip_uses[0].is_storage_image &&
+              zero_store_mip_uses[0].use_pc == 1 &&
+              zero_store_mip_uses[0].proven_zero_mip,
+          "GTA V IMAGE_STORE_MIP is classified as storage and carries its v5=zero proof");
+
+    const uint32_t gta_store_mip_xyzw_2d[] = {
+        0x7e0c0206u,                         // v_mov_b32 v6, s6 (known zero)
+        0xf0243f0au, 0x00030005u, 0x00000604u,
+        0xbf810000u,
+    };
+    std::vector<SrtUse> zero_store_mip_xyzw_uses;
+    resolve_dynamic_fetch(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d),
+                          zero_store_mip_seed, std::size(zero_store_mip_seed), 0,
+                          &zero_store_mip_xyzw_uses);
+    CHECK(zero_store_mip_xyzw_uses.size() == 1 &&
+              zero_store_mip_xyzw_uses[0].is_storage_image &&
+              zero_store_mip_xyzw_uses[0].proven_zero_mip,
+          "GTA V 0x2042f49800 dmask-xyzw IMAGE_STORE_MIP carries its exact v6 proof");
+
+    Gen5ImageFormatInfo zero_mip_format{};
+    const DecodedImageDescriptor zero_mip_descriptor =
+        decode_image_descriptor(atomic_image_seed);
+    CHECK(gen5_image_format(zero_mip_descriptor.format, &zero_mip_format),
+          "zero-mip materialization fixture uses a mapped image format");
+    const DecodedImageView zero_mip_view =
+        image_base_level_view(zero_mip_descriptor, zero_mip_format);
+    const SrtUse materialized_zero_mip_use = zero_mip_load_uses.empty()
+        ? SrtUse{} : zero_mip_load_uses[0];
+    CHECK(shader_resource_allows_zero_mip_specialization(
+              materialized_zero_mip_use, zero_mip_descriptor, zero_mip_view),
+          "single-level uncompressed T# admits the proven IMAGE_LOAD_MIP use at materialization");
+    uint32_t dcc_zero_mip_t8[8]{};
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed), dcc_zero_mip_t8);
+    dcc_zero_mip_t8[6] = 0x00280000u;       // live 0x2042f49a DCC/pipe-aligned control shape
+    dcc_zero_mip_t8[7] = 0x20553100u;       // nonzero metadata address payload
+    const DecodedImageDescriptor dcc_zero_mip_descriptor =
+        decode_image_descriptor(dcc_zero_mip_t8);
+    CHECK(dcc_zero_mip_descriptor.compression_enabled &&
+              !shader_resource_allows_zero_mip_specialization(
+                  materialized_zero_mip_use, dcc_zero_mip_descriptor, zero_mip_view),
+          "GTA V's DCC-backed IMAGE_LOAD_MIP remains fail-visible at materialization");
+
     // The same live Astro visibility kernel assembles a sampled T# in s[44:51] from four
     // consecutive entry-user-data pairs before image_load. Preserve both lanes of s_mov_b64 and
     // accept the reassembled descriptor only while all eight entry origins remain consecutive.

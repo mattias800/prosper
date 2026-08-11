@@ -481,6 +481,31 @@ int main(int argc, char** argv) {
       // image_load 2D_MSAA_ARRAY (dim 7): coords (x,y,layer) + sample — needs Arrayed+MS + ImageMSArray cap.
       const uint32_t cmsa[] = {0xF0000F3Au,0x00000000u,0x00030201u,0xBF8C3F70u,0xBF810000u};
       dump(dir, "storage_msaa_array_2d", recompile_valu(cmsa, sizeof(cmsa)/4, 1, 0, &rt)); }
+    // GTA V's audited one-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. Validate both sampled
+    // image shapes (including the retained array layer) and the NSA storage write strictly.
+    { ShaderResourceTable rt;
+      ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Uint32;
+      t.num_components=1; t.binding=4; t.fetch_pc=1; t.img_dim=1;
+      t.width=4; t.height=4; t.depth=1; t.size=64; t.proven_zero_mip=true;
+      rt.resources.push_back(t);
+      const uint32_t c[] = {0x7e040207u,0xf0043f08u,0x00050000u,0xbf810000u};
+      dump(dir, "compute_load_mip_zero_2d", recompile_valu(c, sizeof(c)/4, 1, 0, &rt));
+      rt.resources[0].img_dim=5; rt.resources[0].depth=2; rt.resources[0].size=128;
+      const uint32_t ca[] = {0x7e060206u,0xf0043128u,0x00050000u,0xbf810000u};
+      dump(dir, "compute_load_mip_zero_array", recompile_valu(ca, sizeof(ca)/4, 1, 0, &rt)); }
+    { ShaderResourceTable rt;
+      ShaderResource s{}; s.cls=ResourceClass::StorageImage; s.format=DataFormat::Uint32;
+      s.num_components=1; s.binding=4; s.fetch_pc=1; s.img_dim=1;
+      s.width=4; s.height=4; s.depth=1; s.size=64; s.proven_zero_mip=true;
+      rt.resources.push_back(s);
+      const uint32_t c[] = {
+          0x7e0a0206u,0xf024310au,0x00030004u,0x00000503u,0xbf810000u};
+      dump(dir, "compute_store_mip_zero_2d", recompile_valu(c, sizeof(c)/4, 1, 0, &rt));
+      rt.resources[0].format=DataFormat::Uint8; rt.resources[0].num_components=4;
+      const uint32_t cf[] = {
+          0x7e0c0206u,0xf0243f0au,0x00030005u,0x00000604u,0xbf810000u};
+      dump(dir, "compute_store_mip_zero_xyzw_2d",
+           recompile_valu(cf, sizeof(cf)/4, 1, 0, &rt)); }
     // Compute that SAMPLES a texture and STORES to a storage image (the bloom/downsample shape, shader 006):
     // exercises the sampled-texture path inside a compute shell (needs vec4<float> declared there).
     { ShaderResourceTable rt;

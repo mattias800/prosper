@@ -82,6 +82,21 @@ bool vopc_is_cmpx(uint32_t opcode) {
            (opcode >= 0xF0u && opcode <= 0xFFu);     // u64 / f16
 }
 
+bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
+    // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
+    if (in.fmt == Rdna2Format::SOP1 &&
+        ((in.opcode >= 0x24u && in.opcode <= 0x2bu) ||
+         in.opcode == 0x37u || in.opcode == 0x38u ||
+         in.opcode == 0x3cu || in.opcode == 0x40u || in.opcode == 0x44u))
+        return true;
+    auto is_exec = [](const Operand& operand) {
+        return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
+               (operand.value == 126 || operand.value == 127);
+    };
+    return is_exec(in.dst) || is_exec(in.sdst);
+}
+
 // VERIFIED(round-trip llvm-mc gfx1030, VOP1): 0x54 v_rcp_f16, 0x55 v_sqrt_f16, 0x56 v_rsq_f16,
 // 0x57 v_log_f16, 0x58 v_exp_f16, 0x59 v_frexp_mant_f16, 0x5A v_frexp_exp_i16_f16, 0x5B v_floor_f16,
 // 0x5C v_ceil_f16, 0x5D v_trunc_f16, 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16,
@@ -952,6 +967,34 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
         if (i.is_end || i.fmt == Rdna2Format::Unknown) break;
     }
     return pc;
+}
+
+bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
+    if (in.fmt != Rdna2Format::MIMG || !in.mimg_unorm || !in.mimg_glc ||
+        in.mimg_dlc || in.mimg_r128 ||
+        in.mimg_tfe || in.mimg_lwe || in.mimg_slc || in.mimg_a16 || in.mimg_d16 ||
+        in.mimg_reserved || in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0)
+        return false;
+
+    uint32_t reg = 0;
+    if (in.opcode == 0x01u && (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
+        (in.mimg_dim == 1u || in.mimg_dim == 5u) &&
+        in.mimg_nsa == 0u && in.len_dwords == 2u) {
+        // IMAGE_LOAD_MIP: 2D=[x,y,mip], 2D_ARRAY=[x,y,slice,mip].
+        reg = static_cast<uint32_t>(in.src[0].value) +
+              (in.mimg_dim == 5u ? 3u : 2u);
+    } else if (in.opcode == 0x09u && (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
+               in.mimg_dim == 1u &&
+               in.mimg_nsa == 1u && in.len_dwords == 3u &&
+               (in.words[2] & 0xffff0000u) == 0u) {
+        // IMAGE_STORE_MIP NSA 2D: coord0 is VADDR, then word2 bytes name y and mip.
+        reg = (in.words[2] >> 8) & 0xffu;
+    } else {
+        return false;
+    }
+    if (reg >= 256u) return false;
+    if (mip_vgpr) *mip_vgpr = reg;
+    return true;
 }
 
 uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_t sgpr_base) {

@@ -483,6 +483,62 @@ int main() {
           n3.mimg_nsa == 1u && n3.mimg_dim == 2u &&
           (n3.words[1] & 0xFFu) == 0u && (n3.words[2] & 0xFFu) == 7u && ((n3.words[2] >> 8) & 0xFFu) == 3u,
           "NSA MIMG 3D captures the extra address dword; coords decode to v0,v7,v3");
+    // GTA V gameplay compute packets. The helper identifies only the audited zero-specializable
+    // IMAGE_*_MIP shapes and returns the dimension-specific mip VGPR; it does not prove its value.
+    const uint32_t gta_load_mip_2d_words[] = {0xf0043108u, 0x00050000u};
+    const uint32_t gta_load_mip_2d_xyzw_words[] = {0xf0043f08u, 0x00050000u};
+    const uint32_t gta_load_mip_2da_words[] = {0xf0043128u, 0x00050000u};
+    const uint32_t gta_store_mip_2d_words[] = {
+        0xf024310au, 0x00030004u, 0x00000503u,
+    };
+    const uint32_t gta_store_mip_2d_xyzw_words[] = {
+        0xf0243f0au, 0x00030005u, 0x00000604u,
+    };
+    const Rdna2Inst gta_load_mip_2d = rdna2_decode_one(gta_load_mip_2d_words, 2);
+    const Rdna2Inst gta_load_mip_2d_xyzw =
+        rdna2_decode_one(gta_load_mip_2d_xyzw_words, 2);
+    const Rdna2Inst gta_load_mip_2da = rdna2_decode_one(gta_load_mip_2da_words, 2);
+    const Rdna2Inst gta_store_mip_2d = rdna2_decode_one(gta_store_mip_2d_words, 3);
+    const Rdna2Inst gta_store_mip_2d_xyzw =
+        rdna2_decode_one(gta_store_mip_2d_xyzw_words, 3);
+    uint32_t mip_vgpr = UINT32_MAX;
+    CHECK(gta_load_mip_2d.opcode == 0x01u && gta_load_mip_2d.mimg_dim == 1u &&
+              rdna2_mimg_zero_mip_shape(gta_load_mip_2d, &mip_vgpr) && mip_vgpr == 2u,
+          "GTA V IMAGE_LOAD_MIP 2D identifies v2 as its mip operand");
+    CHECK(gta_load_mip_2d_xyzw.mimg_dmask == 0xfu &&
+              rdna2_mimg_zero_mip_shape(gta_load_mip_2d_xyzw, &mip_vgpr) &&
+              mip_vgpr == 2u,
+          "GTA V 0x2042f49800 IMAGE_LOAD_MIP accepts its exact xyzw result mask");
+    CHECK(gta_load_mip_2da.opcode == 0x01u && gta_load_mip_2da.mimg_dim == 5u &&
+              rdna2_mimg_zero_mip_shape(gta_load_mip_2da, &mip_vgpr) && mip_vgpr == 3u,
+          "GTA V IMAGE_LOAD_MIP 2D_ARRAY identifies v3 after the preserved slice");
+    CHECK(gta_store_mip_2d.opcode == 0x09u && gta_store_mip_2d.mimg_dim == 1u &&
+              gta_store_mip_2d.mimg_nsa == 1u &&
+              rdna2_mimg_zero_mip_shape(gta_store_mip_2d, &mip_vgpr) && mip_vgpr == 5u,
+          "GTA V IMAGE_STORE_MIP NSA 2D identifies its explicit v5 mip operand");
+    CHECK(gta_store_mip_2d_xyzw.mimg_dmask == 0xfu &&
+              gta_store_mip_2d_xyzw.dst.kind == OperandKind::VGPR &&
+              gta_store_mip_2d_xyzw.dst.value == 0 &&
+              gta_store_mip_2d_xyzw.src[0].kind == OperandKind::VGPR &&
+              gta_store_mip_2d_xyzw.src[0].value == 5 &&
+              rdna2_mimg_zero_mip_shape(gta_store_mip_2d_xyzw, &mip_vgpr) &&
+              mip_vgpr == 6u,
+          "GTA V 0x2042f49800 IMAGE_STORE_MIP keeps v[0:3], (v5,v4), and v6 mip exact");
+    const uint32_t ordinary_load_words[] = {0xf0003108u, 0x00050000u};
+    const uint32_t load_without_glc_words[] = {0xf0041108u, 0x00050000u};
+    const uint32_t load_partial_mask_words[] = {0xf0043308u, 0x00050000u};
+    const uint32_t store_extra_address_words[] = {
+        0xf024310au, 0x00030004u, 0x00010503u,
+    };
+    const uint32_t store_partial_mask_words[] = {
+        0xf024330au, 0x00030004u, 0x00000503u,
+    };
+    CHECK(!rdna2_mimg_zero_mip_shape(rdna2_decode_one(ordinary_load_words, 2)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(load_without_glc_words, 2)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(load_partial_mask_words, 2)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(store_extra_address_words, 3)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(store_partial_mask_words, 3)),
+          "zero-mip shape rejects opcode, control, and unused-address mutations at the packet gate");
     // Astro Bot's world-map ray traversal uses the maximum three NSA dwords to name eleven input
     // VGPRs. Retaining dword4 is required for ray_inv_dir.y/z (v71/v72).
     const uint32_t mimg_bvh[] = {

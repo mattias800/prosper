@@ -4486,21 +4486,6 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
     }
 }
 
-bool instruction_may_change_exec(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
-    // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
-    if (in.fmt == Rdna2Format::SOP1 &&
-        ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
-         in.opcode == 0x37 || in.opcode == 0x38 ||
-         in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44))
-        return true;
-    auto is_exec = [](const Operand& operand) {
-        return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
-               (operand.value == 126 || operand.value == 127);
-    };
-    return is_exec(in.dst) || is_exec(in.sdst);
-}
-
 // IMAGE_GET_LOD currently models only the ordinary FP32 sampled-image form. Keep the unsupported
 // Table 100 control families separate so each can be mutation-tested, while production and the
 // table-less coverage classifier consume one shared predicate and cannot drift apart.
@@ -4607,7 +4592,7 @@ bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch
             // EXEC rule: any later mask change could expose a lane that retained an older value.
             for (const auto& between : ins)
                 if (between.pc > it->pc && between.pc < compare->pc &&
-                    instruction_may_change_exec(between)) return false;
+                    rdna2_instruction_may_change_exec(between)) return false;
 
             bool pure_lane_alu = false;
             if (it->fmt == Rdna2Format::VOP1) {
@@ -5551,7 +5536,7 @@ bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
     // Obligation (1): EXEC is full at the branch along every path.
     const std::vector<uint8_t> exec_full = must_fact_at(
         ins, exec_write_sets_full_mask,
-        [](const Rdna2Inst& in) { return instruction_may_change_exec(in); }, true);
+        [](const Rdna2Inst& in) { return rdna2_instruction_may_change_exec(in); }, true);
     if (exec_full.empty() || !exec_full[branch_index]) return false;
 
     auto is_branch = [](const Rdna2Inst& in) {
@@ -5641,7 +5626,7 @@ bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
         switch (in.fmt) {
             case Rdna2Format::SOP1:
                 if (in.opcode == 0x1f) return true;                     // s_getpc_b64
-                if (instruction_may_change_exec(in) || in.n_src != 1) return false;
+                if (rdna2_instruction_may_change_exec(in) || in.n_src != 1) return false;
                 return uniform_operand(in.src[0], scalar_write_width(in) == 2 ? 2u : 1u, w, depth);
             case Rdna2Format::SOP2: {
                 // Carry and cselect forms consume SCC as well as their decoded operands; the mask
@@ -11234,7 +11219,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //
             // Opcodes verified by assembling each with llvm-mc, positive control image_atomic_add ->
             // word0 0xf0440128, byte-identical to the dword decoded from the guest here.
-            const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x0f ||
+            const bool storage_only_op = in.opcode == 0x08 || in.opcode == 0x09 ||
+                                         in.opcode == 0x0f ||
                                          (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
             if ((storage_only_op && res && res->cls != ResourceClass::StorageImage) ||
                 (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
@@ -11259,10 +11245,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                       res->format == DataFormat::Uint16 ||
                                       res->format == DataFormat::Uint32;
 
-            // --- Storage-image path: image_load (0x00), image_store (0x08), and R32_UINT
+            // --- Storage-image path: image_load (0x00), image_store[_mip] (0x08/0x09), and R32_UINT
             if (res->cls == ResourceClass::StorageImage) {
                 const bool is_ld = in.opcode == 0x00;
-                const bool is_st = in.opcode == 0x08;
+                const bool is_zero_mip_st = in.opcode == 0x09;
+                const bool is_st = in.opcode == 0x08 || is_zero_mip_st;
+                // The backend exposes one materialized mip, but that alone is not permission to
+                // discard a guest operand. IMAGE_STORE_MIP is admitted only for the exact captured
+                // 2D packet whose mip VGPR was proven zero at this use and whose descriptor declares
+                // one uncompressed base level. The live dmask-f packet is exact to the captured
+                // fmt60 Uint8x4 resource; other formats and dynamic/nonzero/general or DCC-backed
+                // forms remain fail-visible.
+                if (is_zero_mip_st &&
+                    (!rdna2_mimg_zero_mip_shape(in) || !res->proven_zero_mip ||
+                     res->img_dim != SQ_DIM_2D || res->sample_count != 1u ||
+                     res->declared_mip_levels != 1u || res->in_mip_tail ||
+                     res->compression_enabled ||
+                     (in.mimg_dmask == 0xfu &&
+                      (res->format != DataFormat::Uint8 || res->num_components != 4u)))) {
+                    ok = false;
+                    return true;
+                }
                 // Opcodes verified with llvm-mc; add/positive-control matches the guest's own word0 (#2275).
                 uint16_t spirv_atomic = 0;
                 switch (in.opcode) {
@@ -11502,7 +11505,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // op and the "samples a 2D texture" behavior are live-title evidence; the exact high-bit
             // family (an RDNA2 gfx10.3 sample variant) is not yet llvm-mc round-trip-verified, so a
             // future title exercising its distinguishing modifier may need a dedicated lowering.
-            const bool is_sample = (in.opcode == 0x20) || (in.opcode == 0xa0), is_load = (in.opcode == 0x00);
+            const bool is_sample = (in.opcode == 0x20) || (in.opcode == 0xa0);
+            const bool is_zero_mip_load = in.opcode == 0x01;
+            const bool is_load = in.opcode == 0x00 || is_zero_mip_load;
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
             const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
             const bool is_sample_c_lz = (in.opcode == 0x2f);
@@ -11537,6 +11542,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                  !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
                 (!dim2d && !dim3d && !dimcube && !dim_msaa)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
+            // IMAGE_LOAD_MIP's final address is a real guest mip selector. Specialize it away only
+            // after the per-use fold and the materialized-resource checks agree. The 2D_ARRAY form
+            // retains its slice coordinate; only the separately proven mip operand is discarded.
+            if (is_zero_mip_load &&
+                (!rdna2_mimg_zero_mip_shape(in) || !res->proven_zero_mip ||
+                 res->img_dim != in.mimg_dim || res->sample_count != 1u ||
+                 res->declared_mip_levels != 1u || res->in_mip_tail ||
+                 res->compression_enabled || (in.mimg_dim == 5u && !b.is_compute))) {
+                ok = false;
+                return true;
+            }
             // Guest 2D_MSAA IMAGE_LOAD is represented exactly as a host single-sample 2D array: the
             // guest sample coordinate selects the array layer. Asterix's resolve PS mixes the ordinary
             // consecutive-vaddr packet with three one-extra-dword NSA packets; llvm-mc gfx1030 confirms
@@ -11734,13 +11750,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
+                const bool mip_load_2d_array = b.is_compute && is_zero_mip_load &&
+                    in.mimg_dim == 5u && res->img_dim == 5u;
                 const bool array_sample = b.is_compute && in.mimg_dim == 5u &&
                     res->img_dim == 5u && (is_sample || is_sample_l || is_sample_lz);
-                const bool host_array = array_sample || msaa_array_fetch;
+                const bool host_array = mip_load_2d_array || array_sample || msaa_array_fetch;
                 if (!b.declare_texture(res->binding, Dim_2D, uint_texture, host_array)) {
                     ok = false; return true;
                 }
-                if (msaa_array_fetch) {
+                if (msaa_array_fetch || mip_load_2d_array) {
                     b.image_fetch_2d_array(
                         res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 } else if (array_sample) {
@@ -15837,10 +15855,10 @@ bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins,
             switch (writer.fmt) {
                 case Rdna2Format::SOP1: {
                     // GETPC is identical for every wave. Mask/saveexec operations consume EXEC and
-                    // are rejected by instruction_may_change_exec; ordinary scalar operations trace
+                    // are rejected by rdna2_instruction_may_change_exec; ordinary scalar operations trace
                     // their source at the destination's architectural width.
                     if (writer.opcode == 0x1f) return true;
-                    if (instruction_may_change_exec(writer) || writer.n_src != 1) return false;
+                    if (rdna2_instruction_may_change_exec(writer) || writer.n_src != 1) return false;
                     return uniform_operand(writer.src[0], scalar_write_width(writer) == 2 ? 2u : 1u);
                 }
                 case Rdna2Format::SOP2: {
@@ -16219,7 +16237,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
                     candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
                     candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||
-                    (instruction_may_change_exec(candidate) && !balanced_nested_exec) ||
+                    (rdna2_instruction_may_change_exec(candidate) && !balanced_nested_exec) ||
                     clobbers_guard_mask ||
                     (candidate.fmt == Rdna2Format::SOPP && candidate.opcode == 0x0a)) {
                     side_effect_free = false;
@@ -17590,6 +17608,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                         return i.mimg_dim == 6u && !i.mimg_unorm && !i.has_modifier &&
                                msaa_address_shape;
                     }
+                    if (i.opcode == 0x01u || i.opcode == 0x09u)
+                        return rdna2_mimg_zero_mip_shape(i);
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
                     if (i.opcode == 0x0fu || i.opcode == 0x11u)   // image_atomic_swap/add R32_UINT 2D / 2D_ARRAY
                         // #2265: 2D_ARRAY (dim 5) admitted alongside 2D. This is the COVERAGE
@@ -18451,7 +18471,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                 candidate.fmt != Rdna2Format::SOPK)
                 return false;
             bool wrote_data = false;
-            bool safe = !instruction_may_change_exec(candidate);
+            bool safe = !rdna2_instruction_may_change_exec(candidate);
             for_each_scalar_write(candidate, [&](int base, uint32_t width) {
                 wrote_data = true;
                 safe &= base >= 0 && base + static_cast<int>(width) <= 106;
@@ -18618,7 +18638,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                         restores_saved_exec = true;
                         break;
                     }
-                    bool clobbers_saved_mask = instruction_may_change_exec(candidate) ||
+                    bool clobbers_saved_mask = rdna2_instruction_may_change_exec(candidate) ||
                         candidate.fmt == Rdna2Format::VOPC;
                     for_each_scalar_write(candidate, [&](int base, uint32_t width) {
                         clobbers_saved_mask |= base < 108 && 106 < base + static_cast<int>(width);

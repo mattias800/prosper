@@ -42,12 +42,17 @@ struct Operand {
 Operand decode_src_field(uint32_t field);
 // The float value an InlineFloat operand encodes (0.5, 1.0, ... , 1/(2*pi)); 0 for non-float codes.
 float inline_float_value(uint32_t code);
+struct Rdna2Inst;
 // True when a VOPC opcode is the `v_cmpx_*` form, which writes EXEC instead of a VCC/SGPR mask.
 // Every one sits at its `v_cmp_*` counterpart + 0x10, so `opcode - 0x10` recovers the base compare.
 // The six windows and the two invalid holes are enumerated (and sourced) at the definition in
 // rdna2_decode.cpp. This is a property of the ENCODING, so it is shared: the decoder's SDWA
 // admission and the recompiler's EXEC/mask bookkeeping must not carry separate copies (#2120).
 bool vopc_is_cmpx(uint32_t opcode);
+// True for every decoded instruction that can explicitly or implicitly write EXEC. This is shared
+// by control-flow analysis and instruction-scoped value proofs: overlooking a mask mutation can
+// turn a predicated VALU definition into a false all-lanes fact.
+bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
 // True for the VOP1 f16 unary family: one f16 operand in, one f16 result out, no side effects —
 // 0x54-0x58 (rcp/sqrt/rsq/log/exp) and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos). The two
 // FREXP opcodes 0x59/0x5A sit inside that numeric span and are deliberately excluded: 0x59 returns a
@@ -200,6 +205,12 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords);
 // Walk from code[0], appending each decoded instruction to `out`, until S_ENDPGM, an Unknown
 // encoding, or the end of the buffer. Returns the number of dwords consumed.
 size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& out);
+
+// Exact IMAGE_LOAD_MIP / IMAGE_STORE_MIP packet subset whose mip operand may be specialized after
+// an independent value proof. Returns the dimension-specific mip VGPR when requested. This checks
+// only packet shape; callers must still prove that VGPR is zero and that the resource has one
+// materialized, uncompressed mip.
+bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers

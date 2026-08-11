@@ -281,8 +281,10 @@ struct ShaderResourceCompileKey {
     uint32_t depth = 0;
     uint32_t img_dim = 0;
     uint32_t sample_count = 1;
+    uint32_t declared_mip_levels = 1;
     bool in_mip_tail = false;
     bool compression_enabled = false;
+    bool proven_zero_mip = false;
     uint32_t binding = 0;
     uint32_t stride = 0;
     uint32_t one_record_tail_semantic = 0;
@@ -464,8 +466,10 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.depth);
             hash = hash_mix(hash, resource.img_dim);
             hash = hash_mix(hash, resource.sample_count);
+            hash = hash_mix(hash, resource.declared_mip_levels);
             hash = hash_mix(hash, resource.in_mip_tail);
             hash = hash_mix(hash, resource.compression_enabled);
+            hash = hash_mix(hash, resource.proven_zero_mip);
             hash = hash_mix(hash, resource.binding);
             hash = hash_mix(hash, resource.stride);
             hash = hash_mix(hash, resource.one_record_tail_semantic);
@@ -727,11 +731,15 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         // retain their spill VGPR writes too, so an ordinary VGPR write invalidates any saved lane values.
         std::set<int> scalar_spill_vgprs;
         std::set<int> fetch_vaddr_vgprs;
+        std::set<int> zero_mip_vgprs;
         for (const Rdna2Inst& instruction : decoded) {
             if ((instruction.fmt == Rdna2Format::MUBUF ||
                  instruction.fmt == Rdna2Format::MTBUF) &&
                 instruction.src[0].kind == OperandKind::VGPR)
                 fetch_vaddr_vgprs.insert(instruction.src[0].value);
+            uint32_t mip_vgpr = 0;
+            if (rdna2_mimg_zero_mip_shape(instruction, &mip_vgpr))
+                zero_mip_vgprs.insert(static_cast<int>(mip_vgpr));
             if (instruction.fmt == Rdna2Format::VOP3) {
                 if (instruction.opcode == 0x361 && instruction.dst.kind == OperandKind::VGPR)
                     scalar_spill_vgprs.insert(instruction.dst.value);       // v_writelane_b32
@@ -760,6 +768,23 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                                fetch_vaddr_vgprs.contains(instruction.dst.value);
                 const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
                                                        scalar_spill_vgprs.contains(instruction.dst.value);
+                // The zero-mip proof needs the unambiguous reaching definition of one exact address
+                // VGPR. Retain every possible writer whose (at most four-dword) result overlaps it;
+                // false-positive retention is cheap, while dropping one would accept a stale v_mov.
+                bool zero_mip_write = false;
+                if (instruction.dst.kind == OperandKind::VGPR) {
+                    for (int reg : zero_mip_vgprs)
+                        if (instruction.dst.value <= reg && instruction.dst.value + 3 >= reg) {
+                            zero_mip_write = true;
+                            break;
+                        }
+                }
+                const bool zero_mip_definition = zero_mip_write &&
+                    instruction.fmt == Rdna2Format::VOP1 && instruction.opcode == 0x01u &&
+                    instruction.len_dwords == 1u && !instruction.has_modifier &&
+                    instruction.src[0].kind == OperandKind::SGPR;
+                const bool zero_mip_intervening_write =
+                    zero_mip_write && !zero_mip_definition;
                 const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
                                          instruction.fmt == Rdna2Format::SOP2 ||
                                          instruction.fmt == Rdna2Format::SOPC ||
@@ -769,8 +794,11 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                          instruction.fmt == Rdna2Format::MIMG ||
                                          instruction.fmt == Rdna2Format::MUBUF ||
                                          instruction.fmt == Rdna2Format::MTBUF;
-                if (fold_format || scalar_spill || vector_index_select || fetch_vaddr_write ||
-                    scalar_spill_invalidation || instruction.dst.kind == OperandKind::SGPR)
+                if (fold_format || rdna2_instruction_may_change_exec(instruction) ||
+                    scalar_spill || vector_index_select || fetch_vaddr_write ||
+                    scalar_spill_invalidation || zero_mip_definition ||
+                    zero_mip_intervening_write ||
+                    instruction.dst.kind == OperandKind::SGPR)
                     retained.push_back(instruction);
             }
         };
@@ -1155,8 +1183,12 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.depth = (storage_image || normalize_unnormalized) ? resource.depth : 0u;
             compiled.img_dim = (texture || storage_image) ? resource.img_dim : 0u;
             compiled.sample_count = (texture || storage_image) ? resource.sample_count : 1u;
-            compiled.in_mip_tail = storage_image && resource.in_mip_tail;
-            compiled.compression_enabled = storage_image && resource.compression_enabled;
+            compiled.declared_mip_levels = (texture || storage_image)
+                ? resource.declared_mip_levels : 1u;
+            compiled.in_mip_tail = (texture || storage_image) && resource.in_mip_tail;
+            compiled.compression_enabled =
+                (texture || storage_image) && resource.compression_enabled;
+            compiled.proven_zero_mip = (texture || storage_image) && resource.proven_zero_mip;
             compiled.binding = resource.binding;
             compiled.stride = resource.stride;
             const bool one_record_tail = resource.num_components == 1u &&
@@ -1931,18 +1963,6 @@ bool has_indirect_control_flow(const std::vector<Rdna2Inst>& instructions) {
 }
 
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
-    auto changes_exec = [](const Rdna2Inst& in) {
-        // Every v_cmpx writes EXEC. This listed three of the six windows, so a cmpx from
-        // 0x30-0x3f / 0xb0-0xbe / 0xf0-0xff read as NOT touching EXEC and the dominance proof
-        // below could accept a region whose guard it had mis-located. Use the shared predicate so
-        // this cannot drift from the decoder again (#2120).
-        if (in.fmt == Rdna2Format::VOPC)
-            return vopc_is_cmpx(in.opcode);
-        return in.fmt == Rdna2Format::SOP1 &&
-               ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
-                in.opcode == 0x37 || in.opcode == 0x38 ||
-                in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44);
-    };
     const auto& is_branch = sopp_is_branch;
     const auto& target = sopp_branch_target;
 
@@ -1957,7 +1977,7 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
         const uint32_t merge = static_cast<uint32_t>(merge64);
         const Rdna2Inst& exec_writer = instructions[i - 1];
         if (exec_writer.pc + exec_writer.len_dwords != guard.pc ||
-            !changes_exec(exec_writer))
+            !rdna2_instruction_may_change_exec(exec_writer))
             continue;
         if (std::none_of(instructions.begin(), instructions.end(),
                          [&](const Rdna2Inst& in) { return in.pc == merge; }))
@@ -2450,11 +2470,59 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         return FoldMask::Unknown;
     };
 
-    for (const auto& in : ins) {
+    // A zero mip is useful only when it is a property of the exact use, not a global VGPR guess.
+    // Track plain scalar-to-vector zero moves inside one basic block and clear the proof on every
+    // block boundary or possible overlapping write. Branch targets and branch fall-throughs both
+    // begin blocks; indirect control flow makes this finite edge inventory incomplete and disables
+    // the proof for the whole program. Any EXEC writer also disables later proofs globally: without
+    // a mask dataflow model, a subsequent v_mov may still execute on only a subset of lanes.
+    const bool zero_mip_cfg_known = !has_indirect_control_flow(ins);
+    std::set<uint32_t> zero_mip_block_starts;
+    if (!ins.empty()) zero_mip_block_starts.insert(ins.front().pc);
+    if (zero_mip_cfg_known) {
+        for (const Rdna2Inst& candidate : ins) {
+            if (!sopp_is_branch(candidate)) continue;
+            const int64_t target = sopp_branch_target(candidate);
+            if (target >= 0 && target <= static_cast<int64_t>(UINT32_MAX))
+                zero_mip_block_starts.insert(static_cast<uint32_t>(target));
+            zero_mip_block_starts.insert(candidate.pc + candidate.len_dwords);
+        }
+    }
+    std::bitset<256> same_block_zero_vgprs;
+    uint32_t current_zero_mip_block = UINT32_MAX;
+    bool zero_mip_exec_pristine = true;
+
+    for (size_t instruction_index = 0; instruction_index < ins.size(); ++instruction_index) {
+        const auto& in = ins[instruction_index];
         watch_pc = in.pc;
         watch_w0 = in.words[0]; watch_w1 = in.len_dwords > 1 ? in.words[1] : 0u;
         watch_len = in.len_dwords;
         if (in.is_end) break;
+        uint32_t zero_mip_block = UINT32_MAX;
+        if (zero_mip_cfg_known) {
+            // The retained fold stream may omit the first physical instruction of a block (EXP is
+            // a common example). Classify by the greatest start not after this PC instead of
+            // waiting to observe the start itself, or a pre-branch proof could leak across a block
+            // whose first instruction was compacted out.
+            auto block = zero_mip_block_starts.upper_bound(in.pc);
+            if (block != zero_mip_block_starts.begin())
+                zero_mip_block = *std::prev(block);
+        }
+        if (!zero_mip_cfg_known ||
+            (instruction_index != 0 && zero_mip_block != current_zero_mip_block))
+            same_block_zero_vgprs.reset();
+        current_zero_mip_block = zero_mip_block;
+        // A plain v_mov is still lane-predicated by EXEC. Without tracking the active mask and its
+        // later restoration, no pre-mutation all-lanes zero fact can survive any explicit or
+        // implicit EXEC write (including every v_cmpx encoding).
+        if (rdna2_instruction_may_change_exec(in)) {
+            same_block_zero_vgprs.reset();
+            zero_mip_exec_pristine = false;
+        }
+        uint32_t mip_vgpr = 0;
+        const bool proven_zero_mip_at_use =
+            rdna2_mimg_zero_mip_shape(in, &mip_vgpr) &&
+            same_block_zero_vgprs.test(mip_vgpr);
         // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
         // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
         // be BOTH a qualifying target and the sole-predecessor branch of a later target: a block
@@ -2513,6 +2581,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 in.dst.value < static_cast<int>(kFoldVgprs)) {
                 vector_index_mode[(size_t)in.dst.value] = VertexFetchIndexMode::Shader;
             }
+        }
+        if (in.dst.kind == OperandKind::VGPR && in.dst.value >= 0) {
+            // Four is the largest ordinary vector payload retained by this fold. Clearing an extra
+            // bit for a scalar result only makes the proof decline; it cannot manufacture one.
+            for (int reg = in.dst.value; reg < in.dst.value + 4 && reg < 256; ++reg)
+                same_block_zero_vgprs.reset(static_cast<size_t>(reg));
+        }
+        if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x01u &&
+            in.len_dwords == 1u && !in.has_modifier &&
+            in.dst.kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value < 256 &&
+            in.src[0].kind == OperandKind::SGPR) {
+            uint32_t scalar = 1;
+            if (zero_mip_exec_pristine && known(in.src[0].value, scalar) && scalar == 0u)
+                same_block_zero_vgprs.set(static_cast<size_t>(in.dst.value));
         }
         switch (in.fmt) {
             case Rdna2Format::SOP1:
@@ -3387,8 +3469,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // which is exactly the set the RECOMPILER emitted: classifier and emitter kept in lockstep,
                         // neither generalised. Opcodes verified with llvm-mc, positive control image_atomic_add ->
                         // word0 0xf0440128, byte-identical to the guest's own dword (#2275).
-                        u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x0f ||
+                        u.is_storage_image = in.opcode == 0x08 || in.opcode == 0x09 ||
+                                             in.opcode == 0x0f ||
                                              (in.opcode >= 0x11 && in.opcode <= 0x1a && in.opcode != 0x13);
+                        u.proven_zero_mip = proven_zero_mip_at_use;
                         u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
                                              (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
                                              (in.opcode >= 0x58 && in.opcode <= 0x5f);
@@ -3814,6 +3898,15 @@ static uint32_t linear_dispatch_raw_store_size(const uint32_t* code, size_t dwor
     if (!required || required > descriptor.size_bytes || required > kMaxProvenLinearStore)
         return 0;
     return static_cast<uint32_t>(required);
+}
+
+bool shader_resource_allows_zero_mip_specialization(
+    const SrtUse& use, const DecodedImageDescriptor& descriptor,
+    const DecodedImageView& view) {
+    return use.proven_zero_mip && descriptor.sample_count == 1u &&
+        descriptor.base_level == 0u && descriptor.last_level == 0u &&
+        descriptor.max_mip == 0u && !view.in_mip_tail &&
+        !descriptor.compression_enabled;
 }
 
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
@@ -4842,6 +4935,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         continue;
                     }
                     const uint32_t img_dim = image_type_to_dim(d.type);
+                    const bool proven_zero_mip =
+                        shader_resource_allows_zero_mip_specialization(u, d, view);
                     {
                         bool mapped = false;
                         for (auto& r0 : t.resources)
@@ -4850,6 +4945,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 r0.depth == d.depth && r0.format == fi.format &&
                                 r0.img_dim == img_dim && r0.sample_count == d.sample_count &&
                                 r0.depth_compare == u.is_depth_compare &&
+                                r0.proven_zero_mip == proven_zero_mip &&
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
@@ -4891,6 +4987,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
                     r.img_dim = img_dim;
                     r.depth_compare = u.is_depth_compare;
+                    r.proven_zero_mip = proven_zero_mip;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     const uint64_t backing_bytes_per_sample = is_bcn
@@ -5345,6 +5442,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                                                    : ResourceClass::Texture;
                     const DataFormat view_format = mapped_fmt ? fi.format : DataFormat::Unknown;
                     const uint32_t img_dim = image_type_to_dim(d.type);
+                    // This is deliberately narrower than "the backend currently uploads one mip".
+                    // The instruction proof belongs to this exact use, and the descriptor must also
+                    // declare one uncompressed base level. In particular, do not reinterpret a DCC
+                    // allocation as raw texels merely because IMAGE_*_MIP selected level zero.
+                    const bool proven_zero_mip =
+                        shader_resource_allows_zero_mip_specialization(u, d, view);
                     {
                         bool mapped = false;
                         for (auto& r0 : table->resources)
@@ -5353,6 +5456,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                 r0.depth == d.depth && r0.format == view_format &&
                                 r0.img_dim == img_dim && r0.sample_count == d.sample_count &&
                                 r0.depth_compare == u.is_depth_compare &&
+                                r0.proven_zero_mip == proven_zero_mip &&
                                 r0.in_mip_tail == view.in_mip_tail &&
                                 r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
                                 r0.mip_tail_x == view.mip_tail_x &&
@@ -5413,6 +5517,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
                     r.img_dim = img_dim;
                     r.depth_compare = u.is_depth_compare;
+                    r.proven_zero_mip = proven_zero_mip;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;

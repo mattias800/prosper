@@ -72,6 +72,13 @@ alignas(256) static const uint32_t kDccPs[] = {
     0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
 };
 alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
+alignas(256) static const uint32_t kRealizeZeroMipCs[] = {
+    0xf40c0500u, 0xfa000000u,                // s_load_dwordx8 s[20:27], s[0:1], 0
+    0x7e040207u,                             // v_mov_b32 v2, s7
+    0xbf8cc07fu,                             // s_waitcnt lgkmcnt(0)
+    0xf0043f08u, 0x00050000u,                // IMAGE_LOAD_MIP, exact 2D dmask-xyzw shape
+    0xbf810000u,
+};
 alignas(256) static uint32_t kOrderedLateCs[] = {0u};
 static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* p) {
     uint64_t a = (uint64_t)(uintptr_t)p;
@@ -85,6 +92,17 @@ static void set_test_env(const char* name, const char* value) {
 #else
     if (value) setenv(name, value, 1); else unsetenv(name);
 #endif
+}
+
+static void make_zero_mip_tsharp(uint32_t t[8], uint64_t base,
+                                 uint32_t width, uint32_t height) {
+    std::memset(t, 0, 8u * sizeof(uint32_t));
+    const uint64_t encoded_base = base >> 8;
+    t[0] = static_cast<uint32_t>(encoded_base);
+    t[1] = static_cast<uint32_t>((encoded_base >> 32) & 0xffu) |
+           (60u << 20) | (((width - 1u) & 0x3u) << 30); // Uint8x4
+    t[2] = (((width - 1u) >> 2) & 0xfffu) | (((height - 1u) & 0x3fffu) << 14);
+    t[3] = (9u << 28) | 0xfacu;               // 2D, linear, identity component selection
 }
 
 int main() {
@@ -253,6 +271,99 @@ int main() {
     // An empty (state-only) submit renders nothing — mirrors the game's setup Dcb (0 draws).
     GpuState empty; empty.draws.clear();
     CHECK(execute_gpustate(empty, backend).empty(), "a draw-less GpuState renders no frame (state-only submit)");
+
+    // Exercise the complete compute realization path: user pointer -> s_load T# fold -> per-use zero
+    // proof -> descriptor materialization -> cached recompile. This pins the production assignment in
+    // realize_compute_dispatches, while the unsafe arms prove DCC/multilevel descriptors cannot gain
+    // the marker or reuse the safe module.
+    {
+        auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+        AgcShaderHeader zero_mip_compute_header{};
+        zero_mip_compute_header.file_header = 0x34333231u;
+        zero_mip_compute_header.version = 0x18u;
+        zero_mip_compute_header.shader_size = sizeof(kRealizeZeroMipCs);
+        zero_mip_compute_header.type = 0;
+        void* registered_zero_mip_compute = nullptr;
+        CHECK(create_shader &&
+                  create_shader(reinterpret_cast<uint64_t>(&registered_zero_mip_compute),
+                                reinterpret_cast<uint64_t>(&zero_mip_compute_header),
+                                reinterpret_cast<uint64_t>(kRealizeZeroMipCs), 0, 0, 0) == 0 &&
+                  registered_zero_mip_compute == &zero_mip_compute_header,
+              "register production-realization IMAGE_LOAD_MIP compute shader");
+
+        alignas(256) static uint8_t realized_zero_mip_bytes[8192]{};
+        alignas(256) static uint8_t realized_zero_mip_metadata[256]{};
+        alignas(32) uint32_t safe_tsharp[8];
+        make_zero_mip_tsharp(safe_tsharp,
+                             reinterpret_cast<uint64_t>(realized_zero_mip_bytes), 4, 4);
+        alignas(32) uint32_t multilevel_tsharp[8];
+        std::copy(std::begin(safe_tsharp), std::end(safe_tsharp), multilevel_tsharp);
+        multilevel_tsharp[3] |= 1u << 16;
+        multilevel_tsharp[5] |= 1u << 4;
+        alignas(32) uint32_t dcc_tsharp[8];
+        std::copy(std::begin(safe_tsharp), std::end(safe_tsharp), dcc_tsharp);
+        const uint64_t metadata_field =
+            reinterpret_cast<uint64_t>(realized_zero_mip_metadata) >> 8;
+        dcc_tsharp[6] = 0x00280000u |
+            (static_cast<uint32_t>(metadata_field) << 24);
+        dcc_tsharp[7] = static_cast<uint32_t>(metadata_field >> 8);
+
+        auto make_zero_mip_submit = [&](const uint32_t* descriptor) {
+            GpuState submit;
+            auto dispatch_state = std::make_shared<GpuState>();
+            set_pgm(*dispatch_state, P::COMPUTE_PGM_LO, P::COMPUTE_PGM_HI,
+                    kRealizeZeroMipCs);
+            dispatch_state->sh[P::COMPUTE_PGM_RSRC2] =
+                8u << P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT;
+            dispatch_state->sh[P::COMPUTE_NUM_THREAD_X] = 1;
+            dispatch_state->sh[P::COMPUTE_NUM_THREAD_Y] = 1;
+            dispatch_state->sh[P::COMPUTE_NUM_THREAD_Z] = 1;
+            const uint64_t descriptor_addr = reinterpret_cast<uint64_t>(descriptor);
+            dispatch_state->sh[P::COMPUTE_USER_DATA_0 + 0] =
+                static_cast<uint32_t>(descriptor_addr);
+            dispatch_state->sh[P::COMPUTE_USER_DATA_0 + 1] =
+                static_cast<uint32_t>(descriptor_addr >> 32);
+            dispatch_state->sh[P::COMPUTE_USER_DATA_0 + 7] = 0;
+            GpuState::Dispatch dispatch;
+            dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
+            dispatch.state = std::move(dispatch_state);
+            submit.dispatches.push_back(std::move(dispatch));
+            return submit;
+        };
+
+        clear_shader_recompile_cache();
+        std::vector<OperationRealizationFailure> safe_failures;
+        const std::vector<ComputeItem> safe_items = realize_compute_dispatches(
+            make_zero_mip_submit(safe_tsharp), 2481, &safe_failures);
+        const ShaderResource* safe_texture = safe_items.size() == 1 && safe_items[0].resources
+            ? safe_items[0].resources->by_fetch_pc(4) : nullptr;
+        CHECK(safe_items.size() == 1 && safe_failures.empty() && safe_texture &&
+                  safe_texture->proven_zero_mip &&
+                  safe_texture->declared_mip_levels == 1 &&
+                  !safe_texture->compression_enabled,
+              "realize_compute_dispatches carries the exact safe zero-mip marker into recompilation");
+
+        auto unsafe_realization_fails = [&](const uint32_t* descriptor,
+                                            bool expect_compressed,
+                                            uint32_t expect_levels) {
+            std::vector<OperationRealizationFailure> failures;
+            const std::vector<ComputeItem> items = realize_compute_dispatches(
+                make_zero_mip_submit(descriptor), 2482, &failures);
+            const ShaderResource* texture = nullptr;
+            if (failures.size() == 1 && failures[0].stages.size() == 1 &&
+                failures[0].stages[0].resources)
+                texture = failures[0].stages[0].resources->by_fetch_pc(4);
+            return items.empty() && failures.size() == 1 &&
+                failures[0].reason == RealizationFailureReason::ShaderRecompile && texture &&
+                !texture->proven_zero_mip &&
+                texture->compression_enabled == expect_compressed &&
+                texture->declared_mip_levels == expect_levels;
+        };
+        CHECK(unsafe_realization_fails(multilevel_tsharp, false, 2),
+              "compute realization keeps a multilevel IMAGE_LOAD_MIP fail-visible");
+        CHECK(unsafe_realization_fails(dcc_tsharp, true, 1),
+              "compute realization keeps GTA-shaped DCC IMAGE_LOAD_MIP fail-visible");
+    }
 
     // #584: graphics and compute are one PM4 timeline. The planner must retain the asymmetric
     // draw-before-dispatch-before-draw dependency that exposed Dead Cells' future buffer read.

@@ -4426,6 +4426,137 @@ int main() {
     }
     printf("  [ok]   compute-shell image_sample lowers to OpImageSampleExplicitLod (LOD 0)\n");
 
+    // GTA V gameplay's exact single-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. The resource
+    // marker is the independent materialization proof; removing it, changing the descriptor to DCC,
+    // or changing the storage classification must reject instead of silently treating mip as zero.
+    constexpr uint32_t OpImageFetch = 95, OpImageWrite = 99;
+    const uint32_t gta_load_mip_2d[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7 (production fold proves zero)
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP xyzw 2D, T# s[20:27]
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_mip_2d;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Uint32; texture.num_components = 1;
+      texture.binding = 4; texture.fetch_pc = 1; texture.img_dim = 1;
+      texture.width = 4; texture.height = 4; texture.depth = 1; texture.size = 64;
+      texture.proven_zero_mip = true; rt_zero_mip_2d.resources.push_back(texture); }
+    const std::vector<uint32_t> gta_load_mip_spv = recompile_valu(
+        gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0, &rt_zero_mip_2d);
+    if (gta_load_mip_spv.empty() || !has_opcode(gta_load_mip_spv, OpImageFetch)) {
+        printf("  [FAIL] proven GTA V IMAGE_LOAD_MIP 2D did not lower to OpImageFetch\n");
+        return 1;
+    }
+    ShaderResourceTable unproven_load_mip = rt_zero_mip_2d;
+    unproven_load_mip.resources[0].proven_zero_mip = false;
+    ShaderResourceTable compressed_load_mip = rt_zero_mip_2d;
+    compressed_load_mip.resources[0].compression_enabled = true;
+    ShaderResourceTable multilevel_load_mip = rt_zero_mip_2d;
+    multilevel_load_mip.resources[0].declared_mip_levels = 2;
+    if (!recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &unproven_load_mip).empty() ||
+        !recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &compressed_load_mip).empty() ||
+        !recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &multilevel_load_mip).empty()) {
+        printf("  [FAIL] IMAGE_LOAD_MIP accepted an unproven, DCC, or multilevel resource\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_LOAD_MIP 2D requires the exact one-level uncompressed proof\n");
+
+    const uint32_t gta_load_mip_2da[] = {
+        0x7e060206u,                         // v_mov_b32 v3, s6; v2 remains the slice
+        0xf0043128u, 0x00050000u,            // IMAGE_LOAD_MIP 2D_ARRAY
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_mip_2da = rt_zero_mip_2d;
+    rt_zero_mip_2da.resources[0].img_dim = 5;
+    rt_zero_mip_2da.resources[0].depth = 2;
+    rt_zero_mip_2da.resources[0].size = 128;
+    const std::vector<uint32_t> gta_load_mip_array_spv = recompile_valu(
+        gta_load_mip_2da, std::size(gta_load_mip_2da), 1, 0, &rt_zero_mip_2da);
+    const DescriptorValidationReport gta_load_mip_array_report =
+        validate_spirv_descriptor_interface(
+            gta_load_mip_array_spv, &rt_zero_mip_2da, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* gta_load_mip_array_descriptor = nullptr;
+    for (const auto& descriptor : gta_load_mip_array_report.descriptors)
+        if (descriptor.binding == 4u) gta_load_mip_array_descriptor = &descriptor;
+    if (gta_load_mip_array_spv.empty() || !has_opcode(gta_load_mip_array_spv, OpImageFetch) ||
+        !gta_load_mip_array_descriptor || !gta_load_mip_array_descriptor->image_arrayed) {
+        printf("  [FAIL] IMAGE_LOAD_MIP 2D_ARRAY dropped its slice/view contract\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_LOAD_MIP 2D_ARRAY preserves its slice in an arrayed OpImageFetch\n");
+
+    const uint32_t gta_store_mip_2d[] = {
+        0x7e0a0206u,                         // v_mov_b32 v5, s6 (production fold proves zero)
+        0xf024310au, 0x00030004u, 0x00000503u,
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_store_mip;
+    { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+      image.format = DataFormat::Uint32; image.num_components = 1;
+      image.binding = 4; image.fetch_pc = 1; image.img_dim = 1;
+      image.width = 4; image.height = 4; image.depth = 1; image.size = 64;
+      image.proven_zero_mip = true; rt_zero_store_mip.resources.push_back(image); }
+    const std::vector<uint32_t> gta_store_mip_spv = recompile_valu(
+        gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0, &rt_zero_store_mip);
+    ShaderResourceTable misclassified_store_mip = rt_zero_store_mip;
+    misclassified_store_mip.resources[0].cls = ResourceClass::Texture;
+    ShaderResourceTable unproven_store_mip = rt_zero_store_mip;
+    unproven_store_mip.resources[0].proven_zero_mip = false;
+    std::array<uint32_t, std::size(gta_store_mip_2d)> changed_store_packet{};
+    std::copy(std::begin(gta_store_mip_2d), std::end(gta_store_mip_2d),
+              changed_store_packet.begin());
+    changed_store_packet[1] &= ~0x2000u;     // same instruction loses GLC: no longer audited shape
+    if (gta_store_mip_spv.empty() || !has_opcode(gta_store_mip_spv, OpImageWrite) ||
+        !recompile_valu(gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0,
+                        &misclassified_store_mip).empty() ||
+        !recompile_valu(gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0,
+                        &unproven_store_mip).empty() ||
+        !recompile_valu(changed_store_packet.data(), changed_store_packet.size(), 1, 0,
+                        &rt_zero_store_mip).empty()) {
+        printf("  [FAIL] IMAGE_STORE_MIP lowering/classification/packet gate drifted\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_STORE_MIP requires storage classification and its exact proven packet\n");
+
+    const uint32_t gta_store_mip_xyzw_2d[] = {
+        0x7e0c0206u,                         // v_mov_b32 v6, s6
+        0xf0243f0au, 0x00030005u, 0x00000604u, // live pc17: v[0:3], (v5,v4), mip v6
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_store_mip_xyzw = rt_zero_store_mip;
+    rt_zero_store_mip_xyzw.resources[0].format = DataFormat::Uint8;
+    rt_zero_store_mip_xyzw.resources[0].num_components = 4;
+    const std::vector<uint32_t> gta_store_mip_xyzw_spv = recompile_valu(
+        gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+        &rt_zero_store_mip_xyzw);
+    ShaderResourceTable wrong_format_store_mip = rt_zero_store_mip_xyzw;
+    wrong_format_store_mip.resources[0].format = DataFormat::Uint32;
+    ShaderResourceTable compressed_store_mip = rt_zero_store_mip_xyzw;
+    compressed_store_mip.resources[0].compression_enabled = true;
+    ShaderResourceTable multilevel_store_mip = rt_zero_store_mip_xyzw;
+    multilevel_store_mip.resources[0].declared_mip_levels = 2;
+    std::array<uint32_t, std::size(gta_store_mip_xyzw_2d)> partial_store_packet{};
+    std::copy(std::begin(gta_store_mip_xyzw_2d), std::end(gta_store_mip_xyzw_2d),
+              partial_store_packet.begin());
+    partial_store_packet[1] = (partial_store_packet[1] & ~0xf00u) | 0x300u;
+    if (gta_store_mip_xyzw_spv.empty() ||
+        !has_opcode(gta_store_mip_xyzw_spv, OpImageWrite) ||
+        !recompile_valu(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+                        &wrong_format_store_mip).empty() ||
+        !recompile_valu(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+                        &compressed_store_mip).empty() ||
+        !recompile_valu(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+                        &multilevel_store_mip).empty() ||
+        !recompile_valu(partial_store_packet.data(), partial_store_packet.size(), 1, 0,
+                        &rt_zero_store_mip_xyzw).empty()) {
+        printf("  [FAIL] live dmask-xyzw IMAGE_STORE_MIP widened past its exact format/safety gate\n");
+        return 1;
+    }
+    printf("  [ok]   live dmask-xyzw IMAGE_STORE_MIP keeps exact format/DCC/mip/dmask gates\n");
+
     // Vertex shell: image_sample then export the result as the position.
     const uint32_t vs_sample[] = { 0xf0800f08u, 0x00820000u, 0xf80008cfu, 0x03020100u, 0xbf810000u };
     std::vector<uint32_t> vsspv = recompile_vertex(vs_sample, sizeof(vs_sample)/sizeof(vs_sample[0]), &rt_tex);

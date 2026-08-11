@@ -227,13 +227,25 @@ struct SrtUse {
     // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
     // the same per-instruction provenance the vertex fetches use) is unambiguous.
     uint32_t use_pc = 0xFFFFFFFFu;   // exact consuming pc for key-less texture/buffer uses
-    // The consuming image op requires a STORAGE image (image_store 0x08 or an image atomic such as
-    // IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for kind 0.
+    // The consuming image op requires a STORAGE image (image_store 0x08, image_store_mip 0x09, or
+    // an image atomic such as IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for
+    // kind 0.
     bool is_storage_image = false;
+    // IMAGE_LOAD_MIP / IMAGE_STORE_MIP have one more address operand than their base-level
+    // siblings. The current Vulkan compute backend materializes one mip only, so the fold may
+    // specialize that operand away only after proving its exact VGPR was written in the same basic
+    // block by a plain v_mov_b32 from a known-zero wave-uniform SGPR.
+    bool proven_zero_mip = false;
     // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
     // property of the use, not merely the S# compare function: NEVER is a valid compare op.
     bool is_depth_compare = false;
 };
+
+// Materialization half of the IMAGE_*_MIP specialization contract. Kept observable so regression
+// tests can mutate the exact DCC/single-level gate used by live resource construction.
+bool shader_resource_allows_zero_mip_specialization(
+    const SrtUse& use, const DecodedImageDescriptor& descriptor,
+    const DecodedImageView& view);
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
                                             uint32_t user_sgpr_base,

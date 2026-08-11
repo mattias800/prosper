@@ -291,6 +291,11 @@ struct ShaderResource {
     // levels instead use mip_tail_x/y within each slice base.
     uint32_t      layer_stride_bytes = 0;
     uint32_t      layer_mip_offset_bytes = 0;
+    // Instruction-scoped proof for IMAGE_LOAD_MIP / IMAGE_STORE_MIP. This is compile semantics,
+    // not descriptor metadata: only the exact fetch_pc whose dimension-specific mip VGPR has a
+    // same-block plain-v_mov zero proof may set it. Cache/capture identity must preserve the marker
+    // so a zero-specialized module can never be reused for a dynamic or nonzero mip.
+    bool          proven_zero_mip   = false;
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 

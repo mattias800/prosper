@@ -868,6 +868,89 @@ int main() {
               count_occurrences(live_reject_capture.output, live_reject_program) == 1,
           "live shader-recompile failure reports its final dispatch-skipped consequence");
 
+    // IMAGE_LOAD_MIP level-zero lowering is compiled semantics, not runtime descriptor data. A
+    // captured or later dispatch without the instruction-scoped proof must miss and reject rather
+    // than reuse the specialized module; restoring the proof should hit the original entry.
+    clear_shader_recompile_cache();
+    static const uint32_t kZeroMipCompute[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP xyzw 2D, T# s[20:27]
+        0xbf810000u,
+    };
+    ShaderResource zero_mip_texture;
+    zero_mip_texture.cls = ResourceClass::Texture;
+    zero_mip_texture.format = DataFormat::Uint32;
+    zero_mip_texture.num_components = 1;
+    zero_mip_texture.binding = 4;
+    zero_mip_texture.fetch_pc = 1;
+    zero_mip_texture.img_dim = 1;
+    zero_mip_texture.width = zero_mip_texture.height = 4;
+    zero_mip_texture.depth = 1;
+    zero_mip_texture.size = 64;
+    zero_mip_texture.proven_zero_mip = true;
+    ShaderResourceTable zero_mip_table;
+    zero_mip_table.resources.push_back(zero_mip_texture);
+    ComputeShaderConfig zero_mip_config;
+    zero_mip_config.user_sgprs.resize(28);
+    zero_mip_config.local_x = 1;
+    const auto cached_proven_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].proven_zero_mip = false;
+    const auto cached_unproven_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].proven_zero_mip = true;
+    const auto repeated_proven_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].declared_mip_levels = 2;
+    const auto cached_multilevel_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].declared_mip_levels = 1;
+    zero_mip_table.resources[0].compression_enabled = true;
+    const auto cached_dcc_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].compression_enabled = false;
+    zero_mip_table.resources[0].in_mip_tail = true;
+    const auto cached_tail_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!cached_proven_zero_mip.empty() && cached_unproven_zero_mip.empty() &&
+              repeated_proven_zero_mip == cached_proven_zero_mip &&
+              cached_multilevel_zero_mip.empty() && cached_dcc_zero_mip.empty() &&
+              cached_tail_zero_mip.empty() &&
+              stats.misses == 5 && stats.hits == 1 && stats.entries == 5,
+          "compute cache partitions zero-mip proof, levels, DCC, and texture-tail safety");
+
+    clear_shader_recompile_cache();
+    static const uint32_t kZeroStoreMipCompute[] = {
+        0x7e0a0206u,
+        0xf024310au, 0x00030004u, 0x00000503u,
+        0xbf810000u,
+    };
+    ShaderResource zero_store_mip_image;
+    zero_store_mip_image.cls = ResourceClass::StorageImage;
+    zero_store_mip_image.format = DataFormat::Uint32;
+    zero_store_mip_image.num_components = 1;
+    zero_store_mip_image.binding = 4;
+    zero_store_mip_image.fetch_pc = 1;
+    zero_store_mip_image.img_dim = 1;
+    zero_store_mip_image.width = zero_store_mip_image.height = 4;
+    zero_store_mip_image.depth = 1;
+    zero_store_mip_image.size = 64;
+    zero_store_mip_image.proven_zero_mip = true;
+    ShaderResourceTable zero_store_mip_table;
+    zero_store_mip_table.resources.push_back(zero_store_mip_image);
+    const auto cached_zero_store_mip = recompile_compute_shader_cached(
+        kZeroStoreMipCompute, std::size(kZeroStoreMipCompute),
+        &zero_store_mip_table, zero_mip_config);
+    zero_store_mip_table.resources[0].declared_mip_levels = 2;
+    const auto cached_multilevel_store_mip = recompile_compute_shader_cached(
+        kZeroStoreMipCompute, std::size(kZeroStoreMipCompute),
+        &zero_store_mip_table, zero_mip_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!cached_zero_store_mip.empty() && cached_multilevel_store_mip.empty() &&
+              stats.misses == 2 && stats.hits == 0 && stats.entries == 2,
+          "compute cache keys storage-image declared mip levels inspected by the emitter");
+
     // A one-record 16-bit V# emits an explicit index guard and typed tail marker. Keep the cache
     // partition compact (none/u16/f16), while ensuring a wider range or the sibling conversion can
     // never reuse that specialized module.

@@ -110,7 +110,8 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v46 (#1853): retain the selected direct V#'s four raw stage USER_DATA dwords and each dword's
 // PM4 last-write provenance. Replay decodes this input independently and compares it with the v45
 // normalized descriptor; unsupported/ambiguous paths are recorded as explicitly unavailable.
-constexpr uint32_t kVersion = 46;
+// v47 (#2481): retain each realized/failed-stage image resource's instruction-scoped zero-mip proof.
+constexpr uint32_t kVersion = 47;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -2684,6 +2685,23 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const uint64_t write : provenance.input_last_writes) w.u64(write);
         for (const uint64_t source : provenance.input_write_sources) w.u64(source);
     }
+    // v47 preserves the instruction-scoped zero-mip specialization marker for every realized and
+    // failed-stage resource. Raw replay can recompile captured RDNA2, so omitting this bit would let
+    // it silently reuse the level-zero lowering for an instruction whose mip value was never proven.
+    // Keep the same complete resource enumeration as v44's sample-count tail.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_zero_mip_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources)
+            w.u8(captured.resource.proven_zero_mip ? 1u : 0u);
+    };
+    for (const auto& draw : c.draws) {
+        write_zero_mip_state(draw.vrt);
+        write_zero_mip_state(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_zero_mip_state(compute.resources);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            write_zero_mip_state(stage.resource_table);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3791,6 +3809,45 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             for (auto& source : provenance.input_write_sources) if (!r.u64(source)) return false;
         }
         if (!validate_resource_provenance(c, error)) return false;
+    }
+    if (version >= 47) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid resource zero-mip state count";
+            return false;
+        }
+        auto read_zero_mip_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint8_t proven = 0;
+                if (!r.u8(proven) || proven > 1u) return false;
+                captured.resource.proven_zero_mip = proven != 0;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_zero_mip_state(draw.vrt) || !read_zero_mip_state(draw.prt)) {
+                error = "invalid resource zero-mip state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_zero_mip_state(compute.resources)) {
+                error = "invalid resource zero-mip state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_zero_mip_state(stage.resource_table)) {
+                    error = "invalid resource zero-mip state";
+                    return false;
+                }
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
