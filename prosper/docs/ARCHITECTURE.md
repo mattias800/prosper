@@ -84,9 +84,12 @@ SPIR-V declaration/indexing, pool/layout/write arity and pipeline-cache identity
 
 The remaining work is data-driven rather than one old percentage: unsupported instructions and
 unprovable resource/operand paths fail visibly, and `recompile_coverage`, live reject diagnostics and
-`shader_inspect` identify the next exact program counter. The current GTA V workload, for example,
-is dominated by compute CFG structurization sites after the descriptor-array lift, not by missing
-`SMEM`/`MUBUF` support (#2481). See `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md` and
+`shader_inspect` identify the next exact program counter. GTA V is tracked by routed terminal program
+address + instruction PC with the real resource table, not by raw structurizer line counts: the
+`structured emission stopped` family is consequent, and most `backward else` reports are secondary to
+later instruction, mask-domain or resource failures. Post-lift Wave32 carry, zero-record RAW-buffer and
+DPP-row fixes advance their exact targets while the gameplay 3D world remains black (#2481). See
+`docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md` and
 `docs/RECOMPILER_REMAINING.md`, including each document's `## Ruled out` section, before extending
 the translator.
 

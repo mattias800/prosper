@@ -24,7 +24,7 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
-## Current status (2026-08-10) — at a glance
+## Current status (2026-08-11) — at a glance
 
 - **Compatibility breadth:** 39 title trackers cover Unity/IL2CPP, Unreal Engine, RAGE, Hedgehog Engine and
   custom engines. `COMPATIBILITY.md` is the user-facing milestone index; tracker issues and their comments are
@@ -36,10 +36,14 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   routed run reaches gameplay entry with the HUD visible over an absent 3D world. Dragon Quest VII boots and
   submits continuously on Windows after the `%fs`/`%gs` null-read fix (#2447).
 - **Current graphics frontier:** GTA V's six-stage runtime-selected descriptor-array lift is complete. Live
-  post-lift evidence on Linux/RADV and Windows/NVIDIA shows that the missing 3D world is not waiting on that lift;
-  the dominant measured gap is about 57 distinct compute CFG structurization sites (#2412/#2481). Native subgroup
-  adoption is a per-dispatch contract, not merely a device width: a quarter of routed wave64 compute dispatches on
-  a 64-wide RADV device decline it because of workgroup shape (#2429).
+  post-lift evidence on Linux/RADV and Windows/NVIDIA shows that the missing 3D world is not waiting on that lift.
+  The first routed terminal-program census on Linux found 53 static compute failures; reviewed Wave32 carry,
+  zero-record RAW-buffer and DPP-row lowering advances every targeted site and reduces that set to 49, but gameplay
+  still presents the HUD/radar over a fully black 3D world (#2412/#2481). The earlier "about 57 CFG sites" framing
+  overstated the independent control-flow work: `structured emission stopped` is a consequent wrapper, and most
+  `backward else` reports precede a later instruction, mask-domain or resource failure. Native subgroup adoption is
+  also a per-dispatch contract, not merely a device width: a quarter of routed wave64 compute dispatches on a
+  64-wide RADV device decline it because of workgroup shape (#2429).
 - **Current Windows frontier:** routed Dragon Quest VII progression can fail a fixed `sceKernelBatchMap` with
   ENOMEM. UE4 then deliberately enters `LowLevelFatalError`; the resulting exit 139 is not a wild-pointer crash.
   The high-volume memory logger suppresses the timing-sensitive failure, so diagnosis is being carried on the
