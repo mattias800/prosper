@@ -16634,6 +16634,146 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
     return result;
 }
 
+// RDNA waves order their own LDS instructions, but the portable compute shell represents guest
+// wave lanes as independent Vulkan invocations. A plain OpStore performed by lane 0 therefore does
+// not publish its value to a following cross-lane atomic merely because every invocation reaches
+// the atomic later in program order. GTA V's BVH bounds kernel uses this exact wave-synchronous
+// idiom: select EXEC=1, initialize six adjacent dwords with one B64 and one B128 write, restore
+// EXEC=-1, set vaddr=0, then issue three DS_MIN_F32 and three DS_MAX_F32 operations.
+//
+// Recognize only that byte-exact sequence and insert an emitter-only S_BARRIER before the first
+// atomic. A straight-line shader emits it directly. With scalar control flow, a no-crossing-edge
+// proof keeps the boundary top-level in the compact structurizer or lets the existing phase route
+// lift it outside a complex dispatcher, so every workgroup invocation reaches the same dynamic
+// barrier. Any other float atomic following an unsynchronized ordinary LDS store rejects visibly;
+// a real guest barrier, or an atomic with no preceding ordinary store in its phase, remains
+// architectural and needs no synthesized edge.
+bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
+                                         RecompileDiagnosticContext diagnostic) {
+    auto ordinary_lds_store = [](const Rdna2Inst& in) {
+        if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
+        return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x4d ||
+               in.opcode == 0xb0 || in.opcode == 0xde || in.opcode == 0xdf;
+    };
+    auto float_lds_atomic = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::DS && !in.ds_gds &&
+               (in.opcode == 0x12 || in.opcode == 0x13);
+    };
+    auto words_are = [](const Rdna2Inst& in, uint32_t word0, uint32_t word1) {
+        return in.words[0] == word0 && in.words[1] == word1;
+    };
+
+    static constexpr uint32_t kAtomicWord0[6] = {
+        0xd8480000u, 0xd8480004u, 0xd8480008u,
+        0xd84c000cu, 0xd84c0010u, 0xd84c0014u,
+    };
+    static constexpr uint32_t kAtomicWord1[6] = {
+        0x00000900u, 0x00000a00u, 0x00000b00u,
+        0x00000600u, 0x00000700u, 0x00000800u,
+    };
+
+    std::vector<size_t> phase_stores;
+    std::vector<size_t> synth_before;
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) {
+            phase_stores.clear();
+            continue;
+        }
+        if (ordinary_lds_store(in)) {
+            phase_stores.push_back(i);
+            continue;
+        }
+        if (!float_lds_atomic(in) || phase_stores.empty()) continue;
+
+        bool exact = i >= 4 && i + 5 < ins.size() && phase_stores.size() == 2 &&
+            phase_stores[0] == i - 4 && phase_stores[1] == i - 3 &&
+            words_are(ins[i - 4], 0xd9340010u, 0x0000040cu) &&
+            words_are(ins[i - 3], 0xdb7c0000u, 0x0000000cu) &&
+            ins[i - 2].words[0] == 0xbefe04c1u && // s_mov_b64 exec, -1
+            ins[i - 1].words[0] == 0x7e000280u;   // v_mov_b32 v0, 0
+        for (size_t atomic = 0; exact && atomic < 6; ++atomic)
+            exact = words_are(ins[i + atomic], kAtomicWord0[atomic], kAtomicWord1[atomic]);
+
+        bool found_lane0 = false;
+        if (exact) {
+            for (size_t j = i - 4; j-- > 0;) {
+                const Rdna2Inst& prefix = ins[j];
+                if (prefix.words[0] == 0xbefe0481u) { // s_mov_b64 exec, 1
+                    found_lane0 = true;
+                    for (size_t k = j + 1; k < i - 2; ++k) {
+                        const Rdna2Inst& between = ins[k];
+                        if (between.fmt == Rdna2Format::SOPP ||
+                            (rdna2_instruction_may_change_exec(between) &&
+                             between.words[0] != 0xbefe04c1u)) {
+                            found_lane0 = false;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                if (prefix.fmt == Rdna2Format::SOPP ||
+                    rdna2_instruction_may_change_exec(prefix))
+                    break;
+            }
+        }
+        if (!exact || !found_lane0) {
+            log_recompile_diagnostic(
+                diagnostic, "compute-recompile-reject", "terminal",
+                "pc=%u reason=unsynchronized-lds-store-before-ds-fminmax", in.pc);
+            return false;
+        }
+
+        synth_before.push_back(i);
+        phase_stores.clear();
+        i += 5; // the byte-exact six-atomic group shares the one publication barrier
+    }
+
+    std::vector<uint32_t> synth_pcs;
+    synth_pcs.reserve(synth_before.size());
+    for (size_t index : synth_before) synth_pcs.push_back(ins[index].pc);
+    for (auto it = synth_before.rbegin(); it != synth_before.rend(); ++it) {
+        Rdna2Inst barrier;
+        barrier.pc = ins[*it].pc; // boundary immediately before the atomic at this guest PC
+        barrier.fmt = Rdna2Format::SOPP;
+        barrier.opcode = 0x0a;
+        barrier.words[0] = 0xbf8a0000u;
+        barrier.len_dwords = 0;   // emitter-only marker; never part of the guest byte stream
+        ins.insert(ins.begin() + static_cast<std::ptrdiff_t>(*it), barrier);
+    }
+
+    // Prove each synthesized boundary is top-level even when the compact structurizer (rather than
+    // the phase dispatcher) owns the program. Branches and loops may finish before the boundary,
+    // but no edge may skip it, enter it from the far side, or carry only part of a workgroup back
+    // across it. Traps/indirect PC changes before it also fail closed. This is the same edge
+    // invariant used by the barrier-phase route without its unrelated >2-branch selection policy.
+    for (uint32_t barrier_pc : synth_pcs) {
+        bool uniform = true;
+        for (const Rdna2Inst& in : ins) {
+            if (in.pc < barrier_pc &&
+                (in.is_end ||
+                 (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12) ||
+                 (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)))
+                uniform = false;
+            if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
+                in.opcode == 0x03 || in.opcode == 0x0a)
+                continue;
+            const uint32_t target = branch_target(in);
+            if ((in.pc < barrier_pc && target >= barrier_pc) ||
+                (in.pc > barrier_pc && target <= barrier_pc))
+                uniform = false;
+        }
+        if (!uniform) {
+            log_recompile_diagnostic(
+                diagnostic, "compute-recompile-reject", "terminal",
+                "pc=%u reason=lds-fminmax-publication-barrier-not-workgroup-uniform",
+                barrier_pc);
+            return false;
+        }
+    }
+    return true;
+}
+
 // Emit the instruction body (shared by every stage). Handles a single recognized COUNTED loop as a real
 // structured SPIR-V loop (OpLoopMerge + OpPhi for loop-carried registers); loop-FREE streams walk straight
 // through, byte-identical to the pre-loop-feature behavior. `exp_fn` handles an EXP instruction per stage
@@ -17855,6 +17995,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
     (void)extend_terminating_if_else(code, dwords, ins);
+    if (!prepare_lds_fminmax_synchronization(ins, {})) return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
@@ -17896,6 +18037,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
+    if (!prepare_lds_fminmax_synchronization(ins, diagnostic)) return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     b.diagnostic = diagnostic;
