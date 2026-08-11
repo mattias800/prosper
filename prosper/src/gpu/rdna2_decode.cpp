@@ -97,6 +97,133 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
     return is_exec(in.dst) || is_exec(in.sdst);
 }
 
+static uint32_t mtbuf_vdata_dwords(const Rdna2Inst& in) {
+    if (in.opcode > 15u) return 0;
+    const uint32_t components = (in.opcode & 3u) + 1u;
+    return in.opcode >= 8u ? (components + 1u) / 2u : components;
+}
+
+static uint32_t mimg_vdata_dwords(const Rdna2Inst& in) {
+    uint32_t components = 0;
+    if (in.opcode == 0x47u || in.opcode == 0x57u) {
+        components = 4u; // gather4
+    } else {
+        for (uint32_t component = 0; component < 4; ++component)
+            components += (in.mimg_dmask >> component) & 1u;
+        if (!components) components = 4u; // unknown/empty mask: account conservatively.
+    }
+    return in.mimg_d16 ? (components + 1u) / 2u : components;
+}
+
+uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
+    if (in.dst.kind != OperandKind::VGPR) return 0;
+    switch (in.fmt) {
+        case Rdna2Format::VOP1:
+            return in.opcode == 0x02u ? 0u : 1u; // v_readfirstlane writes the decoded SGPR.
+        case Rdna2Format::VOP2:
+        case Rdna2Format::VOP3P:
+            return 1;
+        case Rdna2Format::VOP3:
+            if (in.opcode == 0x360u) return 0; // v_readlane_b32 writes an SGPR.
+            // v_div_scale_f64 and the two integer MAD64 forms write a VGPR pair.
+            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ? 2u : 1u;
+        case Rdna2Format::DS:
+            // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
+            // encodings in that subset are stores or no-return atomics whose VDST field is a source.
+            if (in.opcode == 0x35u || in.opcode == 0x36u || in.opcode == 0x3du ||
+                in.opcode == 0x3eu || in.opcode == 0xb1u || in.opcode == 0x20u ||
+                in.opcode == 0x2du)
+                return 1;
+            if (in.opcode == 0x37u || in.opcode == 0x76u) return 2;
+            if (in.opcode == 0xfeu) return 3;
+            if (in.opcode == 0x77u || in.opcode == 0xffu) return 4;
+            return 0;
+        case Rdna2Format::MUBUF:
+            // Format and raw stores read VDATA. Loads use the gfx10 ordering where x3 follows x4.
+            if ((in.opcode >= 0x04u && in.opcode <= 0x07u) ||
+                (in.opcode >= 0x1cu && in.opcode <= 0x1fu))
+                return 0;
+            if (in.opcode <= 0x03u) return in.opcode + 1u;
+            if (in.opcode >= 0x08u && in.opcode <= 0x0cu) return 1;
+            if (in.opcode == 0x0du) return 2;
+            if (in.opcode == 0x0eu) return 4;
+            if (in.opcode == 0x0fu) return 3;
+            // Supported return-value atomics are one dword. Unknown buffer operations remain a
+            // conservative one-register clobber, matching the prior analysis contract.
+            return 1;
+        case Rdna2Format::MTBUF:
+            if (in.opcode <= 3u || (in.opcode >= 8u && in.opcode <= 11u))
+                return mtbuf_vdata_dwords(in); // ordinary and packed-D16 typed loads
+            return 0; // typed stores read VDATA; TFE's trailing status is handled separately.
+        case Rdna2Format::FLAT:
+            switch (in.opcode) {
+                case 0x08u: case 0x09u: case 0x0au: case 0x0bu: case 0x0cu: return 1;
+                case 0x0du: return 2;
+                case 0x0eu: return 4;
+                case 0x0fu: return 3;
+                default: return 0; // audited store/deferred forms do not produce a VGPR result.
+            }
+        case Rdna2Format::MIMG: {
+            if (in.opcode == 0x08u || in.opcode == 0x09u) return 0; // IMAGE_STORE[_MIP]
+            return mimg_vdata_dwords(in);
+        }
+        case Rdna2Format::VINTRP:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int rdna2_tfe_status_vgpr(const Rdna2Inst& in) {
+    if (in.dst.kind != OperandKind::VGPR || in.dst.value < 0) return -1;
+    if (in.fmt == Rdna2Format::MIMG && in.mimg_tfe)
+        return in.dst.value + static_cast<int>(mimg_vdata_dwords(in));
+    if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) {
+        const uint32_t data_dwords = mtbuf_vdata_dwords(in);
+        if (data_dwords) return in.dst.value + static_cast<int>(data_dwords);
+    }
+    return -1;
+}
+
+uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in) {
+    const uint32_t writes = rdna2_vgpr_write_count(in);
+    if (in.dst.kind != OperandKind::VGPR || in.dst.value < 0) return 0;
+    uint32_t span = writes;
+
+    if (!span) switch (in.fmt) {
+        case Rdna2Format::MUBUF:
+            if (in.opcode >= 0x04u && in.opcode <= 0x07u) span = in.opcode - 3u;
+            else if (in.opcode == 0x1cu) span = 1;
+            else if (in.opcode == 0x1du) span = 2;
+            else if (in.opcode == 0x1eu) span = 4;
+            else if (in.opcode == 0x1fu) span = 3;
+            break;
+        case Rdna2Format::MTBUF:
+            span = mtbuf_vdata_dwords(in);
+            break;
+        case Rdna2Format::FLAT:
+            switch (in.opcode) {
+                case 0x18u: case 0x1au: case 0x1cu: span = 1; break;
+                case 0x1du: span = 2; break;
+                case 0x1eu: span = 4; break;
+                case 0x1fu: span = 3; break;
+                default: break;
+            }
+            break;
+        case Rdna2Format::MIMG: {
+            if (in.opcode == 0x08u || in.opcode == 0x09u)
+                span = mimg_vdata_dwords(in);
+            break;
+        }
+        default:
+            break;
+    }
+    const int status_vgpr = rdna2_tfe_status_vgpr(in);
+    if (status_vgpr >= in.dst.value)
+        span = std::max(span, static_cast<uint32_t>(status_vgpr - in.dst.value + 1));
+    return span;
+}
+
 // VERIFIED(round-trip llvm-mc gfx1030, VOP1): 0x54 v_rcp_f16, 0x55 v_sqrt_f16, 0x56 v_rsq_f16,
 // 0x57 v_log_f16, 0x58 v_exp_f16, 0x59 v_frexp_mant_f16, 0x5A v_frexp_exp_i16_f16, 0x5B v_floor_f16,
 // 0x5C v_ceil_f16, 0x5D v_trunc_f16, 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16,

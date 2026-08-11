@@ -4442,65 +4442,6 @@ struct DivLoop {
     bool continue_on_set = true;
 };
 
-// Number of consecutive VGPRs an instruction writes, starting at dst. This is intentionally an
-// over-approximation for memory operations: treating a store's VDATA as clobbered can only make the
-// uniformity proof below reject, while missing a multi-register load could make it accept stale data.
-uint32_t vgpr_write_count(const Rdna2Inst& in) {
-    if (in.dst.kind != OperandKind::VGPR) return 0;
-    switch (in.fmt) {
-        case Rdna2Format::VOP1:
-            return in.opcode == 0x02 ? 0 : 1;                   // v_readfirstlane writes an SGPR
-        case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
-            return 1;
-        case Rdna2Format::VOP3:
-            // v_readlane_b32 (0x360) encodes its destination in VDST but writes an SGPR, exactly like
-            // v_readfirstlane_b32 above; every other consumer of the decode already models it that way
-            // (loop_written_regs / sgpr_write_count). Counting it as a VGPR write made a readlane whose
-            // destination SGPR number collides with a scalar-spill VGPR number look like an ordinary
-            // clobber of that spill slot, which rejected DQ VII's title grading kernel (#1483).
-            if (in.opcode == 0x360) return 0;
-            // 64-bit VGPR results: v_mad_u64_u32 (0x176), v_mad_i64_i32 (0x177), v_div_scale_f64
-            // (0x16E) — ISA opcodes 374/375/366 (the latter two are unimplemented in emit_alu but
-            // must count correctly the day they land).
-            return (in.opcode == 0x176 || in.opcode == 0x177 || in.opcode == 0x16E) ? 2 : 1;
-        case Rdna2Format::DS:
-            // Keep in sync with the DS opcodes the emitter accepts: the rtn atomics ds_add_rtn_u32
-            // (0x20) / ds_wrxchg_rtn_b32 (0x2d) write VDST, ds_read_b96/b128 (0xfe/0xff) write 3/4
-            // VGPRs — returning 0 for them hid their definitions from loop-header phi collection
-            // and from the #615 uniformity proof's defining-write scan.
-            if (in.opcode == 0x35 || in.opcode == 0x36 || in.opcode == 0x3d || in.opcode == 0x3e || in.opcode == 0xb1 ||
-                in.opcode == 0x20 || in.opcode == 0x2d) return 1;
-            if (in.opcode == 0x37 || in.opcode == 0x76) return 2;
-            if (in.opcode == 0xfe) return 3;
-            if (in.opcode == 0x77 || in.opcode == 0xff) return 4;
-            return 0;
-        case Rdna2Format::MUBUF:
-            switch (in.opcode) {
-                case 0x1: case 0x5: case 0xD: return 2;
-                case 0x2: case 0x6: case 0xF: return 3;
-                case 0x3: case 0x7: case 0xE: return 4;
-                default: return 1;
-            }
-        case Rdna2Format::MTBUF:
-            if (in.opcode >= 4u) return 0; // stores read VDATA; they do not write it
-            return in.opcode + 1u;
-        case Rdna2Format::FLAT: {
-            const FlatAccessInfo access = flat_access_info(in.opcode);
-            return access.valid && !access.store ? access.components : 0;
-        }
-        case Rdna2Format::MIMG: {
-            if (in.opcode == 0x47 || in.opcode == 0x57) return 4;  // gather4 always returns four texels
-            uint32_t n = 0;
-            for (uint32_t c = 0; c < 4; ++c) n += (in.mimg_dmask >> c) & 1u;
-            return n ? n : 4;                                     // unknown/empty mask: reject conservatively
-        }
-        case Rdna2Format::VINTRP:
-            return 1;   // v_interp_p1/p2/mov write VDST (per-lane interpolated data — inherently divergent)
-        default:
-            return 0;
-    }
-}
-
 // IMAGE_GET_LOD currently models only the ordinary FP32 sampled-image form. Keep the unsupported
 // Table 100 control families separate so each can be mutation-tested, while production and the
 // table-less coverage classifier consume one shared predicate and cannot drift apart.
@@ -4599,7 +4540,8 @@ bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch
         if (operand.kind != OperandKind::VGPR) return false;
         for (auto it = ins.rbegin(); it != ins.rend(); ++it) {
             if (it->pc >= use_pc) continue;
-            const uint32_t writes = vgpr_write_count(*it);
+            if (operand.value == rdna2_tfe_status_vgpr(*it)) return false;
+            const uint32_t writes = rdna2_vgpr_write_count(*it);
             if (!writes || operand.value < it->dst.value ||
                 operand.value >= it->dst.value + (int32_t)writes) continue;
             if (it->dst.value != operand.value || it->has_dpp) return false;
@@ -5919,9 +5861,10 @@ int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
         for (uint32_t source = 0; source < in.n_src; ++source)
             if (in.src[source].kind == OperandKind::VGPR)
                 highest = std::max(highest, in.src[source].value);
-        const uint32_t writes = vgpr_write_count(in);
-        if (writes)
-            highest = std::max(highest, in.dst.value + static_cast<int>(writes) - 1);
+        const uint32_t destination_span = rdna2_vgpr_destination_span(in);
+        if (destination_span)
+            highest = std::max(highest,
+                in.dst.value + static_cast<int>(destination_span) - 1);
     }
     return highest;
 }
@@ -5946,18 +5889,20 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             case Rdna2Format::VOP3:
                 if (in.opcode == 0x360) sregs.insert(in.dst.value);       // v_readlane -> SGPR
                 else {
-                    for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
+                    for (uint32_t k = 0; k < rdna2_vgpr_write_count(in); ++k)
                         vregs.insert(in.dst.value + (int)k);
                 }
                 break;                                                    // (writelane: slots, not SSA)
             case Rdna2Format::DS:
-                for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
+                for (uint32_t k = 0; k < rdna2_vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
             case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
             case Rdna2Format::FLAT:
-                for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
+                for (uint32_t k = 0; k < rdna2_vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
+                if (const int tfe_status = rdna2_tfe_status_vgpr(in); tfe_status >= 0)
+                    vregs.insert(tfe_status);
                 break;
             case Rdna2Format::SOP1:
                 sregs.insert(in.dst.value); break;
@@ -14250,11 +14195,13 @@ bool emit_cfg_state_machine(
                 if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
                     invalidated.contains(in.src[0].value))
                     return reject_cfg(in.pc, "invalidated-vgpr-lane-slot");
-                const uint32_t writes = vgpr_write_count(in);
+                const uint32_t writes = rdna2_vgpr_write_count(in);
                 for (uint32_t word = 0; word < writes; ++word) {
                     const int reg = in.dst.value + static_cast<int>(word);
                     if (spill_vgprs.contains(reg)) invalidated.insert(reg);
                 }
+                const int tfe_status = rdna2_tfe_status_vgpr(in);
+                if (spill_vgprs.contains(tfe_status)) invalidated.insert(tfe_status);
             }
             for (uint32_t successor : successors[block]) {
                 if (!invalidated_reachable[successor]) {

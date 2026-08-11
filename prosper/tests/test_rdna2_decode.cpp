@@ -524,6 +524,54 @@ int main() {
               rdna2_mimg_zero_mip_shape(gta_store_mip_2d_xyzw, &mip_vgpr) &&
               mip_vgpr == 6u,
           "GTA V 0x2042f49800 IMAGE_STORE_MIP keeps v[0:3], (v5,v4), and v6 mip exact");
+    const uint32_t gta_pc10_vop2_word[] = {0x4a000804u};
+    const uint32_t wide_vop3_words[] = {0xd5761e01u, 0x040a0100u};
+    const uint32_t wide_mimg_words[] = {0xf0003f08u, 0x00050000u};
+    const uint32_t mimg_tfe_words[] = {0xf0010308u, 0x00050000u};
+    const uint32_t mimg_store_tfe_words[] = {0xf0210308u, 0x00050000u};
+    const uint32_t mimg_store_mip_tfe_words[] = {0xf0250308u, 0x00050003u};
+    const uint32_t mtbuf_store_tfe_words[] = {0xe9e72000u, 0x80882008u};
+    const uint32_t wide_mubuf_words[] = {0xe0382020u, 0x80020000u};
+    const Rdna2Inst gta_pc10_vop2 = rdna2_decode_one(gta_pc10_vop2_word, 1);
+    const Rdna2Inst wide_vop3 = rdna2_decode_one(wide_vop3_words, 2);
+    const Rdna2Inst wide_mimg = rdna2_decode_one(wide_mimg_words, 2);
+    const Rdna2Inst mimg_tfe = rdna2_decode_one(mimg_tfe_words, 2);
+    const Rdna2Inst mimg_store_tfe = rdna2_decode_one(mimg_store_tfe_words, 2);
+    const Rdna2Inst mimg_store_mip_tfe = rdna2_decode_one(mimg_store_mip_tfe_words, 2);
+    const Rdna2Inst mtbuf_store_tfe = rdna2_decode_one(mtbuf_store_tfe_words, 2);
+    const Rdna2Inst wide_mubuf = rdna2_decode_one(wide_mubuf_words, 2);
+    CHECK(gta_pc10_vop2.fmt == Rdna2Format::VOP2 && gta_pc10_vop2.dst.value == 0 &&
+              rdna2_vgpr_write_count(gta_pc10_vop2) == 1u &&
+              wide_vop3.fmt == Rdna2Format::VOP3 && wide_vop3.dst.value == 1 &&
+              rdna2_vgpr_write_count(wide_vop3) == 2u &&
+              rdna2_vgpr_write_count(wide_mimg) == 4u &&
+              mimg_tfe.mimg_tfe && mimg_tfe.mimg_dmask == 3u &&
+              rdna2_vgpr_write_count(mimg_tfe) == 2u &&
+              rdna2_tfe_status_vgpr(mimg_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mimg_tfe) == 3u &&
+              rdna2_vgpr_write_count(wide_mubuf) == 4u &&
+              rdna2_vgpr_write_count(mt_tfe) == 1u &&
+              rdna2_tfe_status_vgpr(mt_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mt_tfe) == 2u &&
+              rdna2_vgpr_write_count(gta_store_mip_2d_xyzw) == 0u &&
+              rdna2_vgpr_destination_span(gta_store_mip_2d_xyzw) == 4u,
+          "shared VGPR writer inventory distinguishes scalar, pair, wide memory, and store packets");
+    CHECK(mimg_store_tfe.fmt == Rdna2Format::MIMG &&
+              mimg_store_tfe.opcode == 0x08u && mimg_store_tfe.mimg_tfe &&
+              mimg_store_tfe.mimg_dmask == 3u &&
+              rdna2_vgpr_write_count(mimg_store_tfe) == 0u &&
+              rdna2_tfe_status_vgpr(mimg_store_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mimg_store_tfe) == 3u &&
+              mimg_store_mip_tfe.opcode == 0x09u && mimg_store_mip_tfe.mimg_tfe &&
+              rdna2_vgpr_write_count(mimg_store_mip_tfe) == 0u &&
+              rdna2_tfe_status_vgpr(mimg_store_mip_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mimg_store_mip_tfe) == 3u &&
+              mtbuf_store_tfe.fmt == Rdna2Format::MTBUF &&
+              mtbuf_store_tfe.opcode == 7u && mtbuf_store_tfe.mtbuf_tfe &&
+              rdna2_vgpr_write_count(mtbuf_store_tfe) == 0u &&
+              rdna2_tfe_status_vgpr(mtbuf_store_tfe) == 36 &&
+              rdna2_vgpr_destination_span(mtbuf_store_tfe) == 5u,
+          "store TFE keeps its VDATA source prefix separate from the trailing status write");
     const uint32_t ordinary_load_words[] = {0xf0003108u, 0x00050000u};
     const uint32_t load_without_glc_words[] = {0xf0041108u, 0x00050000u};
     const uint32_t load_partial_mask_words[] = {0xf0043308u, 0x00050000u};

@@ -2583,10 +2583,25 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             }
         }
         if (in.dst.kind == OperandKind::VGPR && in.dst.value >= 0) {
-            // Four is the largest ordinary vector payload retained by this fold. Clearing an extra
-            // bit for a scalar result only makes the proof decline; it cannot manufacture one.
-            for (int reg = in.dst.value; reg < in.dst.value + 4 && reg < 256; ++reg)
-                same_block_zero_vgprs.reset(static_cast<size_t>(reg));
+            // Invalidate the exact decoded result range. GTA V writes v0 between its v2=zero
+            // definition and IMAGE_LOAD_MIP; treating that scalar VOP2 as a four-dword memory
+            // payload erased the unrelated live mip proof. Wide MIMG/buffer/VALU results still
+            // clear every register in their shared audited result-width inventory.
+            if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x42u) {
+                // v_movreld_b32 writes VGPR[VDST+M0]. M0 is not tracked by this proof, so no
+                // individual zero fact is safe across the dynamic destination write. Keep this
+                // separate from the consecutive-width inventory; CFG phi discovery models the
+                // same instruction dynamically through loop_written_regs.
+                same_block_zero_vgprs.reset();
+            } else {
+                const uint32_t write_count = rdna2_vgpr_write_count(in);
+                for (int reg = in.dst.value;
+                     reg < in.dst.value + static_cast<int>(write_count) && reg < 256; ++reg)
+                    same_block_zero_vgprs.reset(static_cast<size_t>(reg));
+                const int tfe_status = rdna2_tfe_status_vgpr(in);
+                if (tfe_status >= 0 && tfe_status < 256)
+                    same_block_zero_vgprs.reset(static_cast<size_t>(tfe_status));
+            }
         }
         if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x01u &&
             in.len_dwords == 1u && !in.has_modifier &&

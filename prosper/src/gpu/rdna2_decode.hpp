@@ -53,6 +53,21 @@ bool vopc_is_cmpx(uint32_t opcode);
 // by control-flow analysis and instruction-scoped value proofs: overlooking a mask mutation can
 // turn a predicated VALU definition into a false all-lanes fact.
 bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
+// Number of consecutive data VGPRs an instruction writes from its decoded destination. This
+// inventory is shared by control-flow analyses and instruction-scoped value proofs so scalar VALU
+// results are not mistaken for four-register memory payloads, while actual wide results still
+// invalidate every register they define. Known store encodings return zero because their VDATA
+// field is a source. Appended TFE status and dynamic destinations such as v_movreld_b32 are separate:
+// consumers must also use `rdna2_tfe_status_vgpr` and handle dynamic destinations fail-closed.
+uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in);
+// Appended TFE status destination, or -1 when the instruction has none. Unlike the consecutive data
+// result above, a store's decoded VDATA is a source prefix and only the trailing status is written.
+// This remains exact for decoded MTBUF forms that emission rejects, including packed-D16 forms.
+int rdna2_tfe_status_vgpr(const Rdna2Inst& in);
+// Width of the complete consecutive VGPR field rooted at `dst`, including VDATA sources on stores
+// and an appended TFE status destination. Register-file sizing needs this broader footprint even
+// though dataflow invalidation must distinguish sources from writes.
+uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in);
 // True for the VOP1 f16 unary family: one f16 operand in, one f16 result out, no side effects —
 // 0x54-0x58 (rcp/sqrt/rsq/log/exp) and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos). The two
 // FREXP opcodes 0x59/0x5A sit inside that numeric span and are deliberately excluded: 0x59 returns a
