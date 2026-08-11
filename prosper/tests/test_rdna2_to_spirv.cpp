@@ -6634,10 +6634,109 @@ int main() {
         std::memcpy(&inT28b[i * 2 + 1], &addend_bitsT28b, sizeof(uint32_t));
         expT28b[i] = (((i % 64u) / 16u) & 1u) ? 2.0f : 1.0f;
     }
-    std::vector<float> gotT28b = prosper::test::run_compute(
-        spvT28b, inT28b, 128, 128);
+    std::vector<float> gotT28b = spvT28b.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28b, inT28b, 128, 128);
     CHECK(gotT28b == expT28b,
           "T28b: ROW_MASK=0xa adds rows 1/3 and BC0 preserves rows 0/2 per wave64");
+
+    // T28c (#2481): the terminal GTA V compute cohort uses this exact in-place ROW_SHR:1 packet
+    // outside the CFG dispatcher. Narrow EXEC in a 0,1,1,0 pattern: lane 1 must preserve VDST
+    // because its source lane is inactive, lane 2 must add its active predecessor, and lane 3 must
+    // preserve VDST because the destination itself is inactive. Restoring EXEC exposes every result.
+    const uint32_t codeT28c[] = {
+        0x7da80300u,                         // v_cmpx_gt_u32 vcc,v0,v1
+        0x4a0e0efau, 0xff011107u,            // exact live v_add_nc_u32_dpp v7,v7,v7 row_shr:1
+        0xbefe04c1u,                         // s_mov_b64 exec,-1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT28c = recompile_valu(
+        codeT28c, std::size(codeT28c), 8, 7);
+    CHECK(!spvT28c.empty(),
+          "recompiled T28c (GTA V ordinary in-place DPP add) -> SPIR-V");
+    std::vector<float> inT28c(128 * 8, 0.0f);
+    std::vector<uint32_t> expT28c(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        const bool activeT28c = (i & 3u) == 1u || (i & 3u) == 2u;
+        const uint32_t maskT28c = activeT28c ? 0xffffffffu : 0u;
+        const uint32_t thresholdT28c = 1u;
+        const uint32_t valueT28c = i + 1u;
+        std::memcpy(&inT28c[i * 8], &maskT28c, sizeof(uint32_t));
+        std::memcpy(&inT28c[i * 8 + 1], &thresholdT28c, sizeof(uint32_t));
+        std::memcpy(&inT28c[i * 8 + 7], &valueT28c, sizeof(uint32_t));
+        expT28c[i] = (i & 3u) == 2u ? valueT28c + i : valueT28c;
+    }
+    const std::vector<float> gotT28c = spvT28c.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28c, inT28c, 128, 128);
+    uint32_t badT28c = 0;
+    for (uint32_t i = 0; i < 128 && gotT28c.size() == 128; ++i)
+        badT28c += bits_of(gotT28c[i]) != expT28c[i];
+    CHECK(gotT28c.size() == 128 && badT28c == 0,
+          "T28c: ordinary DPP add honors arithmetic, BC0, source EXEC, and destination EXEC");
+
+    // The other two live programs carry the v1 form inside ordinary scalar structured control.
+    // SCC is true, so the forward SCC0 branch does not skip the exact {1,2,4,8} ladder. Together
+    // the four packets compute an inclusive prefix sum within every DPP16 row; every amount is
+    // needed to reach the row's last lane, while row-leading lanes exercise BC0 at every packet.
+    const uint32_t codeT28d[] = {
+        0xbe800380u,                         // s_mov_b32 s0,0
+        0xbf060000u,                         // s_cmp_eq_u32 s0,s0
+        0xbf840008u,                         // s_cbranch_scc0 -> end
+        0x4a0202fau, 0xff011101u,            // exact live v_add_nc_u32_dpp v1,v1,v1 row_shr:1
+        0x4a0202fau, 0xff011201u,            // row_shr:2
+        0x4a0202fau, 0xff011401u,            // row_shr:4
+        0x4a0202fau, 0xff011801u,            // row_shr:8
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT28d = recompile_valu(
+        codeT28d, std::size(codeT28d), 2, 1);
+    CHECK(!spvT28d.empty(),
+          "recompiled T28d (GTA V structured in-place DPP add) -> SPIR-V");
+    std::vector<float> inT28d(128 * 2, 0.0f);
+    std::vector<uint32_t> expT28d(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        const uint32_t valueT28d = i + 1u;
+        std::memcpy(&inT28d[i * 2 + 1], &valueT28d, sizeof(uint32_t));
+        expT28d[i] = 0;
+        for (uint32_t lane = i & ~15u; lane <= i; ++lane)
+            expT28d[i] += lane + 1u;
+    }
+    const std::vector<float> gotT28d = spvT28d.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28d, inT28d, 128, 128);
+    uint32_t badT28d = 0;
+    for (uint32_t i = 0; i < 128 && gotT28d.size() == 128; ++i)
+        badT28d += bits_of(gotT28d[i]) != expT28d[i];
+    CHECK(gotT28d.size() == 128 && badT28d == 0,
+          "T28d: structured {1,2,4,8} DPP ladder computes a per-row inclusive prefix sum");
+
+    // T28e (#2481): the longer live shader carries the exact partial-row identity tail in the
+    // same ordinary structured region as its ladder. Rows 1/3 add SRC1; rows 0/2 preserve VDST.
+    const uint32_t codeT28e[] = {
+        0xbe800380u,                         // s_mov_b32 s0,0
+        0xbf060000u,                         // s_cmp_eq_u32 s0,s0
+        0xbf840002u,                         // s_cbranch_scc0 -> end
+        0x4a0e0cfau, 0xaf00e407u,            // exact live v_add_nc_u32_dpp v7,v7,v6
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT28e = recompile_valu(
+        codeT28e, std::size(codeT28e), 8, 7);
+    CHECK(!spvT28e.empty(),
+          "recompiled T28e (GTA V structured partial-row DPP add) -> SPIR-V");
+    std::vector<float> inT28e(128 * 8, 0.0f);
+    std::vector<uint32_t> expT28e(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        const uint32_t valueT28e = i + 1u;
+        const uint32_t addendT28e = 7u;
+        std::memcpy(&inT28e[i * 8 + 6], &addendT28e, sizeof(uint32_t));
+        std::memcpy(&inT28e[i * 8 + 7], &valueT28e, sizeof(uint32_t));
+        expT28e[i] = (((i % 64u) / 16u) & 1u) ? valueT28e + addendT28e : valueT28e;
+    }
+    const std::vector<float> gotT28e = spvT28e.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28e, inT28e, 128, 128);
+    uint32_t badT28e = 0;
+    for (uint32_t i = 0; i < 128 && gotT28e.size() == 128; ++i)
+        badT28e += bits_of(gotT28e[i]) != expT28e[i];
+    CHECK(gotT28e.size() == 128 && badT28e == 0,
+          "T28e: structured partial-row DPP add updates only rows 1/3 per wave64");
 
     // T29: exact S_BFM_B64 word from Astro's title reduction shader.  It creates VCC with the low
     // 32 lanes set, then saveexec predicates a write.  The operation repeats independently in each

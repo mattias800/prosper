@@ -5689,6 +5689,28 @@ uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
     }
 }
 
+// Exact in-place integer-add DPP row reduction emitted by GTA V compute shaders. Keeping the
+// register/control contract shared between the ordinary emitter and CFG dispatcher prevents one
+// path from silently widening beyond the reviewed full-mask, BC0 VDST/SRC0/SRC1 shape.
+bool is_inplace_vadd_nc_u32_dpp_row_shr(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x25 && in.has_dpp &&
+        !in.dpp_bound_ctrl && in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
+        in.dpp_row_mask == 0xfu && in.dpp_bank_mask == 0xfu &&
+        in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
+        in.src[1].kind == OperandKind::VGPR && in.dst.value == in.src[0].value &&
+        in.dst.value == in.src[1].value;
+}
+
+// Exact identity-QUAD_PERM tail of the same reduction. No value crosses lanes; ROW_MASK selects
+// architectural DPP16 rows 1 and 3, while the other rows preserve VDST.
+bool is_vadd_nc_u32_dpp_partial_row(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x25 && in.has_dpp &&
+        !in.dpp_bound_ctrl && in.dpp_ctrl == 0xe4u && in.dpp_row_mask == 0xau &&
+        in.dpp_bank_mask == 0xfu && in.dst.kind == OperandKind::VGPR &&
+        in.src[0].kind == OperandKind::VGPR && in.src[1].kind == OperandKind::VGPR &&
+        in.dst.value == in.src[0].value && in.dst.value != in.src[1].value;
+}
+
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
@@ -7934,6 +7956,40 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         case Rdna2Format::VOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
             uint32_t dpp_active = 0;
+            // The non-dispatch GTA V cohort uses the exact {1,2,4,8} ROW_SHR reduction ladder.
+            // FI=0 makes an EXEC-inactive source invalid, BC0 preserves VDST at the row
+            // edge/invalid source, and the destination write remains independently
+            // EXEC-predicated. Other shift amounts remain limited to the event-isolated CFG
+            // dispatcher below.
+            const bool compute_inplace_add_row_shr = b.is_compute &&
+                is_inplace_vadd_nc_u32_dpp_row_shr(in) &&
+                (in.dpp_ctrl == 0x111u || in.dpp_ctrl == 0x112u ||
+                 in.dpp_ctrl == 0x114u || in.dpp_ctrl == 0x118u);
+            if (compute_inplace_add_row_shr) {
+                uint32_t valid_source = 0;
+                const uint32_t shifted = b.subgroup_row_shr(
+                    a, rs.exec, in.dpp_ctrl - 0x110u, &valid_source);
+                const uint32_t result = b.ibin(Op_IAdd, a, shifted);
+                vreg[in.dst.value] = b.sel(valid_source, result, old_d);
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
+            if (b.is_compute && is_vadd_nc_u32_dpp_partial_row(in)) {
+                const uint32_t lane = b.ibin(
+                    Op_BitwiseAnd, b.guest_lane_id(), b.uconst(b.wave_size - 1u));
+                const uint32_t row = b.ibin(
+                    Op_ShiftRightLogical, lane, b.uconst(4));
+                const uint32_t row_bit = b.ibin(
+                    Op_ShiftLeftLogical, b.uconst(1), row);
+                const uint32_t row_selected = b.ucmp(
+                    Op_INotEqual,
+                    b.ibin(Op_BitwiseAnd, row_bit, b.uconst(in.dpp_row_mask)),
+                    b.uconst(0));
+                const uint32_t result = b.ibin(Op_IAdd, a, c);
+                vreg[in.dst.value] = b.sel(row_selected, result, old_d);
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             // DPP16 quad_perm on src0 (#273): fragment FLOAT ops and compute quad swaps.  Bounded
             // ROW_SHR in the proven one-live-lane NGG projection supplies zero for lane 0.
             if (in.has_dpp) {
@@ -12573,14 +12629,7 @@ bool emit_cfg_state_machine(
     // portable dispatcher publishes it as an event below because a host subgroup may be narrower
     // than Wave64 and another guest wave can be parked at a different static instruction.
     auto compute_dpp_add_row_shr = [&](const Rdna2Inst& in) {
-        return b.is_compute && in.fmt == Rdna2Format::VOP2 &&
-            in.opcode == 0x25 && in.has_dpp && !in.dpp_bound_ctrl &&
-            in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11fu &&
-            in.dst.kind == OperandKind::VGPR &&
-            in.src[0].kind == OperandKind::VGPR &&
-            in.src[1].kind == OperandKind::VGPR &&
-            in.dst.value == in.src[0].value &&
-            in.dst.value == in.src[1].value;
+        return b.is_compute && is_inplace_vadd_nc_u32_dpp_row_shr(in);
     };
 
     // The row reduction is followed by an identity QUAD_PERM whose partial ROW_MASK selects rows
@@ -12588,15 +12637,7 @@ bool emit_cfg_state_machine(
     // distinct SRC1, while masked rows preserve VDST. Keeping this a dedicated dispatcher case
     // avoids granting arbitrary partial DPP masks to the generic ALU emitter.
     auto compute_dpp_add_row_mask = [&](const Rdna2Inst& in) {
-        return b.is_compute && in.fmt == Rdna2Format::VOP2 &&
-            in.opcode == 0x25 && in.has_dpp && !in.dpp_bound_ctrl &&
-            in.dpp_ctrl == 0xe4u && in.dpp_row_mask == 0xau &&
-            in.dpp_bank_mask == 0xfu &&
-            in.dst.kind == OperandKind::VGPR &&
-            in.src[0].kind == OperandKind::VGPR &&
-            in.src[1].kind == OperandKind::VGPR &&
-            in.dst.value == in.src[0].value &&
-            in.dst.value != in.src[1].value;
+        return b.is_compute && is_vadd_nc_u32_dpp_partial_row(in);
     };
 
     // VOPC e64 can compare a complete 64-bit scalar mask as integer data. Generated Wave64 code
