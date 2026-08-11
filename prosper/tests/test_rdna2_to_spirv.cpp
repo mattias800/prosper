@@ -7902,6 +7902,99 @@ int main() {
         std::printf("  [skip] T25b execution: host lacks compute subgroup shuffle support\n");
     }
 
+    // T25b-ror8 (#2481): GTA V's two screen-space compute programs use the exact full-mask,
+    // bounded V_MIN_F32 ROW_ROR:8 packets below. A rotate by eight exchanges the two halves of
+    // every DPP16 row, transforms SRC0 only, and leaves SRC1 in the destination lane.
+    const uint32_t codeT25bRor8[] = {
+        0x1e0000fau, 0xff092800u,             // exact live v_min_f32_dpp v0,v0,v0 row_ror:8 BC:1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8 = recompile_valu(
+        codeT25bRor8, std::size(codeT25bRor8), 1, 0);
+    CHECK(!spvT25bRor8.empty(),
+          "recompiled T25b-ror8 (GTA V exact V_MIN_F32 ROW_ROR:8) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25bRor8) == 16,
+          "T25b-ror8: row rotate advertises its 16-lane host contract");
+
+    const uint32_t codeT25bRor8Distinct[] = {
+        0x1e0402fau, 0xff092800u,             // v_min_f32_dpp v2,v0,v1 row_ror:8 BC:1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Distinct = recompile_valu(
+        codeT25bRor8Distinct, std::size(codeT25bRor8Distinct), 3, 2);
+    CHECK(!spvT25bRor8Distinct.empty(),
+          "T25b-ror8: distinct VDST/SRC0/SRC1 form recompiles");
+
+    // The second exact live packet executes under narrowed EXEC. Lanes 0..7 of each row are
+    // destinations whose rotated sources (lanes 8..15) are inactive. FI=0 makes those sources
+    // invalid and BOUND_CTRL=1 substitutes zero; inactive destinations independently preserve v2.
+    const uint32_t codeT25bRor8Exec[] = {
+        0x7da80300u,                         // v_cmpx_gt_u32 vcc,v0,v1
+        0x1e0404fau, 0xff092802u,            // exact live v_min_f32_dpp v2,v2,v2 row_ror:8 BC:1
+        0xbefe04c1u,                         // s_mov_b64 exec,-1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Exec = recompile_valu(
+        codeT25bRor8Exec, std::size(codeT25bRor8Exec), 3, 2);
+    CHECK(!spvT25bRor8Exec.empty(),
+          "T25b-ror8: exact live v2 packet recompiles with narrowed EXEC");
+
+    if (can_shuffleT25b && subgroupT25b.size >= 16 &&
+        !spvT25bRor8.empty() && !spvT25bRor8Distinct.empty() &&
+        !spvT25bRor8Exec.empty()) {
+        std::vector<float> inRor8(128), expectedRor8(128);
+        std::vector<float> inRor8Distinct(128 * 3), expectedRor8Distinct(128);
+        std::vector<float> inRor8Exec(128 * 3), expectedRor8Exec(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            const uint32_t source = (i & ~15u) | ((i & 15u) ^ 8u);
+            inRor8[i] = static_cast<float>(100u + i);
+
+            inRor8Distinct[i * 3] = static_cast<float>(400u + i);
+            inRor8Distinct[i * 3 + 1] = (i & 1u) ? 50.0f : 1000.0f;
+
+            const uint32_t control = (i & 15u) < 8u ? 0xffffffffu : 0u;
+            const uint32_t threshold = 1u;
+            std::memcpy(&inRor8Exec[i * 3], &control, sizeof(control));
+            std::memcpy(&inRor8Exec[i * 3 + 1], &threshold, sizeof(threshold));
+            inRor8Exec[i * 3 + 2] = static_cast<float>(200u + i);
+
+            expectedRor8[i] = std::min(
+                static_cast<float>(100u + source), inRor8[i]);
+            expectedRor8Distinct[i] = std::min(
+                static_cast<float>(400u + source), inRor8Distinct[i * 3 + 1]);
+            expectedRor8Exec[i] = (i & 15u) < 8u ? 0.0f : inRor8Exec[i * 3 + 2];
+        }
+        const std::vector<float> gotRor8 = prosper::test::run_compute(
+            spvT25bRor8, inRor8, 128, 128);
+        const std::vector<float> gotRor8Distinct = prosper::test::run_compute(
+            spvT25bRor8Distinct, inRor8Distinct, 128, 128);
+        const std::vector<float> gotRor8Exec = prosper::test::run_compute(
+            spvT25bRor8Exec, inRor8Exec, 128, 128);
+        CHECK(gotRor8 == expectedRor8,
+              "T25b-ror8: exact packet rotates within each DPP16 row before V_MIN_F32");
+        CHECK(gotRor8Distinct == expectedRor8Distinct,
+              "T25b-ror8: DPP transforms SRC0 while SRC1 stays in the current lane");
+        CHECK(gotRor8Exec == expectedRor8Exec,
+              "T25b-ror8: BC1 source invalidation and destination EXEC are independent");
+    } else {
+        std::printf("  [skip] T25b-ror8 execution: host subgroup %u is narrower than 16\n",
+                    subgroupT25b.size);
+    }
+
+    const uint32_t unsupportedRor8[][2] = {
+        {0x1e0000fau, 0xff012800u},           // V_MIN_F32 BOUND_CTRL=0
+        {0x1e0000fau, 0xff092900u},           // V_MIN_F32 ROW_ROR:9
+        {0x1e0000fau, 0xef092800u},           // partial ROW_MASK
+        {0x1e0000fau, 0xff192800u},           // source modifier
+        {0x200000fau, 0xff092800u},           // V_MAX_F32
+        {0x7e0002fau, 0xff092800u},           // V_MOV_B32
+    };
+    for (const auto& unsupported : unsupportedRor8) {
+        const uint32_t code[] = {unsupported[0], unsupported[1], 0xbf810000u};
+        CHECK(recompile_valu(code, std::size(code), 1, 0).empty(),
+              "T25b-ror8: unsupported controls/opcodes remain fail-visible");
+    }
+
     // T25c (#1390): Plucky's second gameplay dispatch converts a permuted float after arbitrary
     // quad tables (not merely XOR swaps). Exercise its exact 0xee control: [2,3,2,3].
     const uint32_t codeT25c[] = {

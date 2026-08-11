@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdint>
+#include <utility>
 
 using namespace prosper::gpu;
 
@@ -425,6 +426,37 @@ int main() {
           dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl &&
           dp.dpp_row_mask == 0xfu && dp.dpp_bank_mask == 0xfu,
           "VOP2 DPP16 ROW_SHR form retains its unbounded lane control");
+    const uint32_t gta_vmin_row_ror8[] = { 0x1e2024fau, 0xff092812u };
+    Rdna2Inst gvr = rdna2_decode_one(gta_vmin_row_ror8, 2);
+    CHECK(gvr.fmt == Rdna2Format::VOP2 && gvr.opcode == 0x0fu &&
+          gvr.len_dwords == 2u && !gvr.has_modifier && gvr.has_dpp &&
+          gvr.dpp_ctrl == 0x128u && gvr.dpp_bound_ctrl &&
+          gvr.dpp_row_mask == 0xfu && gvr.dpp_bank_mask == 0xfu &&
+          isV(gvr.dst, 16) && isV(gvr.src[0], 18) && isV(gvr.src[1], 18),
+          "GTA V V_MIN_F32 ROW_ROR:8 packet retains exact control and operands");
+    const uint32_t gta_vmin_row_ror8_v0[] = { 0x1e0000fau, 0xff092800u };
+    Rdna2Inst gvr0 = rdna2_decode_one(gta_vmin_row_ror8_v0, 2);
+    CHECK(gvr0.fmt == Rdna2Format::VOP2 && gvr0.opcode == 0x0fu &&
+          !gvr0.has_modifier && gvr0.has_dpp && gvr0.dpp_ctrl == 0x128u &&
+          gvr0.dpp_bound_ctrl && isV(gvr0.dst, 0) &&
+          isV(gvr0.src[0], 0) && isV(gvr0.src[1], 0),
+          "GTA V in-place V_MIN_F32 ROW_ROR:8 packet decodes its DPP SRC0");
+    const std::pair<uint32_t, uint32_t> gta_vmin_row_ror8_mutants[] = {
+        {0x1c2024fau, 0xff092812u}, // different VOP2 opcode
+        {0x1e2024fau, 0xff012812u}, // BOUND_CTRL=0
+        {0x1e2024fau, 0xff092912u}, // ROW_ROR:9
+        {0x1e2024fau, 0xef092812u}, // partial ROW_MASK
+        {0x1e2024fau, 0xfe092812u}, // partial BANK_MASK
+        {0x1e2024fau, 0xff192812u}, // SRC0_NEG
+        {0x1e2024fau, 0xff0d2812u}, // FI=1
+        {0x7e2002fau, 0xff092812u}, // V_MOV_B32 rather than V_MIN_F32
+    };
+    for (const auto& mutant : gta_vmin_row_ror8_mutants) {
+        const uint32_t words[] = {mutant.first, mutant.second};
+        Rdna2Inst rejected = rdna2_decode_one(words, 2);
+        CHECK(rejected.has_modifier && !rejected.has_dpp,
+              "GTA V ROW_ROR:8 admission rejects opcode/control/mask/modifier mutations");
+    }
     const uint32_t gta_row_mask_add[] = { 0x4a2826fau, 0xaf00e414u };
     Rdna2Inst grm = rdna2_decode_one(gta_row_mask_add, 2);
     CHECK(grm.fmt == Rdna2Format::VOP2 && grm.opcode == 0x25u &&

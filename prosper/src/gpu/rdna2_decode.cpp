@@ -950,7 +950,15 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             if (src0 == 0xFAu && max_dwords >= 2 && vf != Rdna2Format::VOPC) {
                 const uint32_t d1 = code[1];
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
-                const bool modeled_ctrl = ctrl < 0x100u || (ctrl >= 0x111u && ctrl <= 0x11Fu);
+                // GTA V's screen-space compute passes use one additional exact DPP form:
+                // V_MIN_F32 ROW_ROR:8 with full masks and BOUND_CTRL=1.  Keep the opcode and
+                // bound behavior in this admission predicate so the neighboring V_MOV/V_MAX
+                // rotates, other rotate amounts, and BC0 remain fail-visible.
+                const bool gta_vmin_row_ror8 =
+                    vf == Rdna2Format::VOP2 && ((w >> 25) & 0x3Fu) == 0x0Fu &&
+                    ctrl == 0x128u && ((d1 >> 19) & 1u) == 1u;
+                const bool modeled_ctrl = ctrl < 0x100u ||
+                    (ctrl >= 0x111u && ctrl <= 0x11Fu) || gta_vmin_row_ror8;
                 if (modeled_ctrl && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
