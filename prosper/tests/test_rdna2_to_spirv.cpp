@@ -3285,6 +3285,80 @@ int main() {
     CHECK(!spv_atomic_or.empty() && or_buf_out.size() == 1 && or_buf_out[0] == 7u,
           "#590: buffer_atomic_or is idempotent (4 | 3 = 7), distinct from add/max/swap");
 
+    // GTA V's dominant compute terminal is six consecutive BUFFER_ATOMIC_FMIN/FMAX packets at
+    // pc88..99. SPIR-V 1.3 cannot express these directly; the recompiler uses a raw-u32 CAS loop
+    // with the same MINNUM/MAXNUM semantics as the already-executed LDS float atomic family.
+    // Exercise the exact first packet under contention so this proves a real Device-memory atomic,
+    // not merely that the new opcode passes the decoder.
+    ShaderResourceTable rt_atomic_float;
+    { ShaderResource ab{}; ab.cls = ResourceClass::ConstantBuffer;
+      ab.format = DataFormat::Uint32; ab.num_components = 1;
+      ab.binding = 3; ab.stride = 4; ab.sgpr_base = 4; ab.fetch_pc = 0;
+      rt_atomic_float.resources.push_back(ab); }
+    const uint32_t code_atomic_fmin[] = {
+        0xe0fc0000u, 0x80010000u,  // exact GTA pc88: buffer_atomic_fmin v0, off, s[4:7], 0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv_atomic_fmin = recompile_valu(
+        code_atomic_fmin, std::size(code_atomic_fmin), 1, 0, &rt_atomic_float);
+    CHECK(!spv_atomic_fmin.empty() && count_spirv_opcode(spv_atomic_fmin, 230) == 1 &&
+              count_spirv_opcode(spv_atomic_fmin, 236) == 0 &&
+              count_spirv_opcode(spv_atomic_fmin, 237) == 0,
+          "GTA pc88 BUFFER_ATOMIC_FMIN uses one compare-exchange loop, not integer min");
+    std::vector<float> atomic_float_operands(N);
+    const uint32_t atomic_float_operand_bits[] = {
+        0x7fc12345u, 0x40800000u, 0xc0600000u, 0x00000001u, 0x80000001u,
+    };
+    for (uint32_t lane = 0; lane < N; ++lane)
+        atomic_float_operands[lane] =
+            std::bit_cast<float>(atomic_float_operand_bits[lane % std::size(atomic_float_operand_bits)]);
+    std::vector<uint32_t> atomic_fmin_out;
+    prosper::test::run_compute(spv_atomic_fmin, atomic_float_operands, N, N, {},
+                               {0x7f800000u}, &atomic_fmin_out);
+    CHECK(atomic_fmin_out.size() == 1 && atomic_fmin_out[0] == 0xc0600000u,
+          "GTA BUFFER_ATOMIC_FMIN atomically reduces finite, NaN, and denormal operands");
+
+    const uint32_t code_atomic_fmax[] = {
+        0xe1000000u, 0x80010000u,  // GTA pc94 opcode: buffer_atomic_fmax v0, off, s[4:7], 0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv_atomic_fmax = recompile_valu(
+        code_atomic_fmax, std::size(code_atomic_fmax), 1, 0, &rt_atomic_float);
+    std::vector<uint32_t> atomic_fmax_out;
+    prosper::test::run_compute(spv_atomic_fmax, atomic_float_operands, N, N, {},
+                               {0xff800000u}, &atomic_fmax_out);
+    CHECK(!spv_atomic_fmax.empty() && atomic_fmax_out.size() == 1 &&
+              atomic_fmax_out[0] == 0x40800000u,
+          "GTA BUFFER_ATOMIC_FMAX atomically selects the numeric maximum and ignores lone NaNs");
+
+    // GLC=1 returns the resident value while still publishing the update. GLC=0 is the exact GTA
+    // packet above and leaves VDATA untouched. This one-lane arm distinguishes those contracts.
+    const uint32_t code_atomic_fmin_glc[] = {
+        0xe0fc4000u, 0x80010000u,  // same instruction with GLC set
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv_atomic_fmin_glc = recompile_valu(
+        code_atomic_fmin_glc, std::size(code_atomic_fmin_glc), 1, 0, &rt_atomic_float);
+    std::vector<uint32_t> atomic_fmin_glc_out;
+    const std::vector<float> atomic_fmin_glc_input = {std::bit_cast<float>(0xc0600000u)};
+    const std::vector<float> atomic_fmin_glc_result = prosper::test::run_compute(
+        spv_atomic_fmin_glc, atomic_fmin_glc_input, 1, 1, {}, {0x40800000u},
+        &atomic_fmin_glc_out);
+    CHECK(!spv_atomic_fmin_glc.empty() && atomic_fmin_glc_result.size() == 1 &&
+              bits_of(atomic_fmin_glc_result[0]) == 0x40800000u &&
+              atomic_fmin_glc_out.size() == 1 && atomic_fmin_glc_out[0] == 0xc0600000u,
+          "BUFFER_ATOMIC_FMIN GLC returns pre-op bits while memory receives the minimum");
+
+    // Mutation arm: perturb the production pc88 opcode itself to the still-deferred two-operand
+    // CMPSWAP shape. If admission drifts away from the exact FMIN/FMAX switch site this must fail.
+    uint32_t code_atomic_fmin_mutated[] = {
+        0xe0c40000u, 0x80010000u,  // buffer_atomic_cmpswap, deliberately unsupported here
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(code_atomic_fmin_mutated, std::size(code_atomic_fmin_mutated),
+                         1, 0, &rt_atomic_float).empty(),
+          "GTA pc88 mutation to BUFFER_ATOMIC_CMPSWAP remains fail-visible");
+
     // GTA V rebuilds this exact stride-8 V# with a dispatch-sized record count. Use its live two-
     // record arm: two valid lanes prove the dynamic qword index, and indices {0,2} prove the compiled
     // count bound. Results are copied through binding 3 so both VDATA halves remain observable.
