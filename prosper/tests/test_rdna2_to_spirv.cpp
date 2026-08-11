@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <tuple>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -75,6 +76,32 @@ static bool has_spirv_local_size(const std::vector<uint32_t>& spv,
             spv[word + 2] == ExecutionModeLocalSize && spv[word + 3] == x &&
             spv[word + 4] == y && spv[word + 5] == z)
             return true;
+        word += count;
+    }
+    return false;
+}
+
+static bool spirv_has_array_length(const std::vector<uint32_t>& spv,
+                                   uint32_t expected_length) {
+    constexpr uint16_t OpTypeArray = 28, OpConstant = 43;
+    std::map<uint32_t, uint32_t> constants;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpConstant && count == 4)
+            constants[spv[word + 2]] = spv[word + 3];
+        word += count;
+    }
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpTypeArray && count == 4) {
+            const auto length = constants.find(spv[word + 3]);
+            if (length != constants.end() && length->second == expected_length)
+                return true;
+        }
         word += count;
     }
     return false;
@@ -8346,6 +8373,227 @@ int main() {
         CHECK(recompile_valu(overlap_cs, std::size(overlap_cs), 1, 2).empty(),
               "#590: partially-overlapping loops remain REJECTED (unstructured region)");
     }
+
+    // #2481: GTA V's three exact-wave barrier rejects do not branch through a guest barrier. Their
+    // large CFGs are three concrete sequences of barrier-free phases, so compile each phase through
+    // the arbitrary-CFG dispatcher and reconverge before emitting the guest barrier. Preserve the
+    // capture PCs in these reduced streams: mutation must perturb the same boundary proof as the fix.
+    auto barrier_phase_skeleton = [](uint32_t end_pc,
+                                     std::initializer_list<uint32_t> barriers,
+                                     std::initializer_list<std::tuple<uint32_t, uint32_t, uint32_t>>
+                                         branches) {
+        std::vector<uint32_t> code(end_pc + 1, 0xBF800000u); // s_nop 0
+        for (uint32_t pc : barriers) code[pc] = 0xBF8A0000u;
+        for (const auto& [pc, target, opcode] : branches) {
+            const int32_t delta = static_cast<int32_t>(target) -
+                static_cast<int32_t>(pc + 1);
+            code[pc] = opcode | static_cast<uint16_t>(delta);
+        }
+        code[end_pc] = 0xBF810000u;
+        return code;
+    };
+    std::vector<uint32_t> gta205BarrierPhases = barrier_phase_skeleton(
+        155, {153}, {{30, 56, 0xBF880000u}, {66, 96, 0xBF860000u},
+                     {97, 108, 0xBF880000u}});
+    std::vector<uint32_t> gta413c340BarrierPhases = barrier_phase_skeleton(
+        65, {51, 64}, {{11, 38, 0xBF880000u}, {25, 33, 0xBF880000u},
+                       {32, 23, 0xBF820000u}, {45, 49, 0xBF840000u},
+                       {53, 62, 0xBF880000u}});
+    std::vector<uint32_t> gta413c670BarrierPhases = barrier_phase_skeleton(
+        130, {116, 129}, {{40, 73, 0xBF880000u}, {49, 55, 0xBF860000u},
+                          {60, 67, 0xBF870000u}, {75, 103, 0xBF880000u},
+                          {90, 98, 0xBF880000u}, {97, 88, 0xBF820000u},
+                          {110, 114, 0xBF840000u}, {118, 127, 0xBF880000u}});
+    ComputeShaderConfig gtaBarrierPhaseConfig;
+    gtaBarrierPhaseConfig.local_x = 256;
+    gtaBarrierPhaseConfig.wave_size = 64;
+    gtaBarrierPhaseConfig.exact_thread_extent = true;
+    gtaBarrierPhaseConfig.threads_x = 256;
+    gtaBarrierPhaseConfig.threads_y = gtaBarrierPhaseConfig.threads_z = 1;
+    ComputeShaderConfig gtaPartialPhaseConfig = gtaBarrierPhaseConfig;
+    gtaPartialPhaseConfig.threads_x = 255; // force synchronized partial-workgroup phases
+    const std::vector<uint32_t> gta205BarrierSpv = recompile_compute(
+        gta205BarrierPhases.data(), gta205BarrierPhases.size(), nullptr,
+        gtaBarrierPhaseConfig);
+    const std::vector<uint32_t> gta413c340BarrierSpv = recompile_compute(
+        gta413c340BarrierPhases.data(), gta413c340BarrierPhases.size(), nullptr,
+        gtaBarrierPhaseConfig);
+    const std::vector<uint32_t> gta413c670BarrierSpv = recompile_compute(
+        gta413c670BarrierPhases.data(), gta413c670BarrierPhases.size(), nullptr,
+        gtaBarrierPhaseConfig);
+    CHECK(!gta205BarrierSpv.empty() && !gta413c340BarrierSpv.empty() &&
+              !gta413c670BarrierSpv.empty(),
+          "#2481: all three captured top-level barrier phase layouts recompile");
+
+    // An unconditional branch to the real S_ENDPGM is otherwise a legal proven exit from the
+    // synthetic first-phase dispatcher. This makes the assertion specifically sensitive to the
+    // production phase-boundary proof, rather than to a downstream CFG rejection.
+    std::vector<uint32_t> gtaForwardBarrierCrossing = gta413c340BarrierPhases;
+    gtaForwardBarrierCrossing[45] =
+        0xBF820000u | static_cast<uint16_t>(65 - 46);
+    CHECK(recompile_compute(gtaForwardBarrierCrossing.data(),
+                            gtaForwardBarrierCrossing.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: unconditional pc45 exit across pc51/64 rejects at the phase proof");
+    std::vector<uint32_t> gtaBackwardBarrierCrossing = gta413c340BarrierPhases;
+    gtaBackwardBarrierCrossing[53] =
+        0xBF820000u | static_cast<uint16_t>(50 - 54);
+    CHECK(recompile_compute(gtaBackwardBarrierCrossing.data(),
+                            gtaBackwardBarrierCrossing.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: backward pc53 edge across pc51 rejects at the phase proof");
+    std::vector<uint32_t> gtaIndirectBarrierCrossing = gta413c340BarrierPhases;
+    gtaIndirectBarrierCrossing[40] = 0xBE802000u; // s_setpc_b64 s[0:1]
+    CHECK(recompile_compute(gtaIndirectBarrierCrossing.data(),
+                            gtaIndirectBarrierCrossing.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: indirect PC changes remain incompatible with barrier phase splitting");
+    std::vector<uint32_t> gtaConditionalBarrier = gta205BarrierPhases;
+    gtaConditionalBarrier[97] = 0xBF880000u | static_cast<uint16_t>(154 - 98);
+    CHECK(recompile_compute(gtaConditionalBarrier.data(), gtaConditionalBarrier.size(), nullptr,
+                            gtaBarrierPhaseConfig).empty(),
+          "#2481: mutating the captured pc97 edge around pc153 keeps a conditional barrier rejected");
+    std::vector<uint32_t> gtaTrapBeforeBarrier = gta205BarrierPhases;
+    gtaTrapBeforeBarrier[120] = 0xBF920000u; // s_trap 0
+    CHECK(recompile_compute(gtaTrapBeforeBarrier.data(), gtaTrapBeforeBarrier.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: a wave-terminating trap before a later workgroup barrier rejects");
+
+    // The two 0x413d... programs launch 2063 real threads in nine 256-wide Vulkan workgroups. The
+    // final 241 padded invocations must remain in every dispatcher/common/barrier block but execute
+    // no guest instruction. Store a canary-indexed result after two phase boundaries: successful
+    // completion proves the complete host workgroup reaches the barriers, while the untouched tail
+    // proves padded lanes never acquire a guest PC even though guest code may rewrite EXEC.
+    const uint32_t partialBarrierPhases[] = {
+        0xBE810380u,              //  0: s_mov_b32 s1, 0
+        0xBF0A8101u,              //  1: loop: s_cmp_lt_u32 s1, 1
+        0xBF840002u,              //  2: s_cbranch_scc0 +2 -> 5
+        0x81018101u,              //  3: s_add_i32 s1, s1, 1
+        0xBF82FFFCu,              //  4: s_branch -4 -> 1
+        0xBF800000u,              //  5: s_nop 0
+        0xBF8A0000u,              //  6: s_barrier
+        0x7D840100u,              //  7: v_cmp_eq_u32 vcc, v0, v0
+        0xBF860001u,              //  8: s_cbranch_vccz +1 -> 10
+        0xBE820381u,              //  9: s_mov_b32 s2, 1
+        0xBEFE04C1u,              // 10: s_mov_b64 exec, -1 (must not reactivate padding)
+        0xBF8A0000u,              // 11: s_barrier
+        0x8F008800u,              // 12: s_lshl_b32 s0, s0, 8 (group index * 256)
+        0x4A000000u,              // 13: v_add_nc_u32 v0, s0, v0
+        0x7E020287u,              // 14: v_mov_b32 v1, 7
+        0xE0702000u, 0x80020100u, // 15: buffer_store_dword v1, v0, s[8:11] idxen
+        0xBF810000u,              // 17: s_endpgm
+    };
+    ShaderResourceTable partialBarrierTable;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
+      partialBarrierTable.resources.push_back(dst); }
+
+    // DIRECT descriptors are valid only while none of their four entry SGPR words was overwritten.
+    // The first phase writes s8; the tail must see that provenance even though its persistent scalar
+    // value is otherwise independently reconstructed by a new dispatcher.
+    std::vector<uint32_t> phaseDescriptorOverwrite = barrier_phase_skeleton(
+        68, {51, 64}, {{11, 38, 0xBF880000u}, {25, 33, 0xBF880000u},
+                       {32, 23, 0xBF820000u}, {45, 49, 0xBF840000u},
+                       {53, 62, 0xBF880000u}});
+    phaseDescriptorOverwrite[0] = 0xBE880380u;       // s_mov_b32 s8, 0
+    phaseDescriptorOverwrite[65] = 0xE0301000u;      // buffer_load_dword v0, v0,
+    phaseDescriptorOverwrite[66] = 0x80020000u;      //   s[8:11], 0 offen
+    CHECK(recompile_compute(phaseDescriptorOverwrite.data(),
+                            phaseDescriptorOverwrite.size(), &partialBarrierTable,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: a pre-barrier DIRECT descriptor-word overwrite invalidates its tail use");
+
+    // An ordinary write to a VGPR ends a v_writelane scalar-spill lifetime. The tombstone is
+    // compile-time metadata, so it must cross a phase separately from the persisted slot value.
+    std::vector<uint32_t> phaseInvalidatedSpill = barrier_phase_skeleton(
+        68, {51, 64}, {{11, 38, 0xBF880000u}, {25, 33, 0xBF880000u},
+                       {32, 23, 0xBF820000u}, {45, 49, 0xBF840000u},
+                       {53, 62, 0xBF880000u}});
+    phaseInvalidatedSpill[0] = 0xBE800381u; // s_mov_b32 s0, 1
+    phaseInvalidatedSpill[1] = 0xD7610001u; // v_writelane_b32 v1, s0, 0
+    phaseInvalidatedSpill[2] = 0x00010000u;
+    phaseInvalidatedSpill[3] = 0x7E020285u; // ordinary v_mov_b32 v1, 5
+    phaseInvalidatedSpill[65] = 0xD7600002u; // invalid v_readlane_b32 s2, v1, 0
+    phaseInvalidatedSpill[66] = 0x00010101u;
+    CHECK(recompile_compute(phaseInvalidatedSpill.data(), phaseInvalidatedSpill.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: a pre-barrier ordinary VGPR write keeps its spill tombstone in the tail");
+
+    ComputeShaderConfig partialBarrierConfig;
+    partialBarrierConfig.local_x = 256;
+    partialBarrierConfig.wave_size = 64;
+    partialBarrierConfig.native_subgroup_size = 64; // safe route must force portable for padding
+    partialBarrierConfig.exact_thread_extent = true;
+    partialBarrierConfig.threads_x = 2063;
+    partialBarrierConfig.threads_y = partialBarrierConfig.threads_z = 1;
+    partialBarrierConfig.tgid_x_en = true;
+    const std::vector<uint32_t> partialBarrierSpv = recompile_compute(
+        partialBarrierPhases, std::size(partialBarrierPhases), &partialBarrierTable,
+        partialBarrierConfig);
+    CHECK(!partialBarrierSpv.empty() && has_spirv_local_size(partialBarrierSpv, 256, 1, 1),
+          "#2481: 2063/256 partial workgroup barrier phases recompile through portable CFG");
+    constexpr uint32_t kPartialThreads = 2063;
+    constexpr uint32_t kPartialLaunch = 9 * 256;
+    constexpr uint32_t kPartialCanary = 0xccccccccu;
+    std::vector<uint32_t> partialInitial(kPartialLaunch, kPartialCanary), partialResult;
+    prosper::test::run_compute(
+        partialBarrierSpv, std::vector<float>(1, 0.0f), kPartialThreads, 1,
+        {}, partialInitial, &partialResult, 256);
+    uint32_t partialBad = 0;
+    for (uint32_t lane = 0; lane < partialResult.size(); ++lane) {
+        const uint32_t expected = lane < kPartialThreads ? 7u : kPartialCanary;
+        partialBad += partialResult[lane] != expected;
+    }
+    CHECK(partialResult.size() == kPartialLaunch && partialBad == 0,
+          "#2481: padded invocations reach both barriers but produce no guest buffer effects");
+
+    // The first phase has no DPP event and therefore asks for only the ordinary vote/liveness
+    // layout. The second phase's portable ROW_SHR add needs a second complete lane plane. Execute
+    // the partial final workgroup and inspect OpTypeArray so both the allocation and all dynamic
+    // accesses are covered by the same regression.
+    const uint32_t phasedDppScratch[] = {
+        0xBE810380u,              //  0: s_mov_b32 s1, 0
+        0xBF0A8101u,              //  1: loop: s_cmp_lt_u32 s1, 1
+        0xBF840002u,              //  2: s_cbranch_scc0 +2 -> 5
+        0x81018101u,              //  3: s_add_i32 s1, s1, 1
+        0xBF82FFFCu,              //  4: s_branch -4 -> 1
+        0x7E020300u,              //  5: v_mov_b32 v1, v0 (local invocation index)
+        0xBF8A0000u,              //  6: s_barrier
+        0x7D840100u,              //  7: v_cmp_eq_u32 vcc, v0, v0
+        0xBF860001u,              //  8: s_cbranch_vccz +1 -> 10
+        0xBE820381u,              //  9: s_mov_b32 s2, 1
+        0xBEFE04C1u,              // 10: s_mov_b64 exec, -1
+        0xBF8A0000u,              // 11: s_barrier
+        0x4A0202FAu, 0xFF011101u, // 12: v_add_nc_u32_dpp v1,v1,v1 row_shr:1
+        0x8F008800u,              // 14: s_lshl_b32 s0, s0, 8 (group index * 256)
+        0x4A000000u,              // 15: v_add_nc_u32 v0, s0, v0
+        0xE0702000u, 0x80020100u, // 16: buffer_store_dword v1, v0, s[8:11] idxen
+        0xBF810000u,              // 18: s_endpgm
+    };
+    const std::vector<uint32_t> phasedDppSpv = recompile_compute(
+        phasedDppScratch, std::size(phasedDppScratch), &partialBarrierTable,
+        partialBarrierConfig);
+    constexpr uint32_t kPhasedDppScratchDwords = 256 * 2 + 4 + 1;
+    CHECK(!phasedDppSpv.empty() &&
+              spirv_has_array_length(phasedDppSpv, kPhasedDppScratchDwords),
+          "#2481: whole phased stream pre-sizes portable DPP scratch to 517 dwords");
+    std::vector<uint32_t> phasedDppInitial(kPartialLaunch, kPartialCanary), phasedDppResult;
+    if (!phasedDppSpv.empty())
+        prosper::test::run_compute(
+            phasedDppSpv, std::vector<float>(1, 0.0f), kPartialThreads, 1,
+            {}, phasedDppInitial, &phasedDppResult, 256);
+    uint32_t phasedDppBad = 0;
+    for (uint32_t lane = 0; lane < phasedDppResult.size(); ++lane) {
+        uint32_t expected = kPartialCanary;
+        if (lane < kPartialThreads) {
+            const uint32_t local = lane & 255u;
+            expected = (local & 15u) ? 2u * local - 1u : local;
+        }
+        phasedDppBad += phasedDppResult[lane] != expected;
+    }
+    CHECK(phasedDppResult.size() == kPartialLaunch && phasedDppBad == 0,
+          "#2481: later portable DPP phase produces exact rows and preserves padded canaries");
 
     // #2396: a CFG-dispatcher attempt that fails PART WAY THROUGH must not leave its half-written
     // dispatcher in the module. emit_cfg_state_machine writes the dispatcher loop's OpLoopMerge,

@@ -373,6 +373,11 @@ struct SpirvCompute {
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
     uint32_t globalid_comp[3] = {0, 0, 0}, groupid[3] = {0, 0, 0}, localid_comp[3] = {0, 0, 0};
     uint32_t invocation_guard_merge = 0;
+    // Set only by the barrier-phase emitter when a partial workgroup remains in uniform control
+    // flow and uses the dispatcher's separate ACTIVE bit to suppress padded guest invocations.
+    // recompile_compute uses this proof bit to distinguish that route from the ordinary divergent
+    // entry guard, which is never legal around a workgroup barrier.
+    bool partial_barrier_phases_emitted = false;
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
@@ -2313,13 +2318,18 @@ struct SpirvCompute {
 
     // Dispatcher-only scratch. Unlike guest LDS, this is private recompiler state: one flag slot per
     // padded hardware-wave lane, one result per wave, and one whole-workgroup liveness result.
-    uint32_t cfg_scratch = 0, t_ptr_cfg_u32 = 0;
-    void declare_cfg_scratch(uint32_t dwords) {
-        if (cfg_scratch) return;
+    uint32_t cfg_scratch = 0, t_ptr_cfg_u32 = 0, cfg_scratch_dwords = 0;
+    bool declare_cfg_scratch(uint32_t dwords) {
+        // OpTypeArray is immutable once emitted. A later phased dispatcher may require a wider
+        // layout than the first phase; fail closed if its caller did not pre-size from the complete
+        // stream instead of emitting an out-of-bounds Workgroup access.
+        if (cfg_scratch) return dwords <= cfg_scratch_dwords;
         uint32_t t_arr = id(); put(types, Op_TypeArray, {t_arr, t_u32, uconst(dwords)});
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
         cfg_scratch = id(); put(types, Op_Variable, {t_ptr, cfg_scratch, SC_Workgroup});
         t_ptr_cfg_u32 = id(); put(types, Op_TypePointer, {t_ptr_cfg_u32, SC_Workgroup, t_u32});
+        cfg_scratch_dwords = dwords;
+        return true;
     }
     uint32_t cfg_scratch_load(uint32_t idx) {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_cfg_u32, p, cfg_scratch, idx});
@@ -2787,10 +2797,15 @@ struct SpirvCompute {
     // AGC thread-dimension mode can request a non-multiple of the shader's local size. Vulkan still
     // launches the final complete workgroup, so make its excess invocations branch directly to the
     // function merge instead of executing guest instructions (and, in particular, memory stores).
-    void guard_invocation_extent(uint32_t threads_x, uint32_t threads_y, uint32_t threads_z) {
+    uint32_t invocation_within_extent(uint32_t threads_x, uint32_t threads_y,
+                                      uint32_t threads_z) {
         uint32_t within = ucmp(Op_ULessThan, globalid_comp[0], uconst(threads_x));
         within = land(within, ucmp(Op_ULessThan, globalid_comp[1], uconst(threads_y)));
         within = land(within, ucmp(Op_ULessThan, globalid_comp[2], uconst(threads_z)));
+        return within;
+    }
+    void guard_invocation_extent(uint32_t threads_x, uint32_t threads_y, uint32_t threads_z) {
+        const uint32_t within = invocation_within_extent(threads_x, threads_y, threads_z);
         const uint32_t active = id();
         invocation_guard_merge = id();
         emit_selmerge(invocation_guard_merge);
@@ -13074,7 +13089,7 @@ bool emit_cfg_state_machine(
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
     bool allow_exec_update, bool allow_smem,
     const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
-    const uint32_t* code, size_t dwords) {
+    const uint32_t* code, size_t dwords, uint32_t initial_active = 0) {
     const bool graphics = b.is_fragment || b.is_vertex;
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -13494,8 +13509,9 @@ bool emit_cfg_state_machine(
     const uint32_t wave_result_base = padded_lanes +
         (has_portable_compute_dpp_add ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
-    if (b.is_compute && !b.native_subgroup_size)
-        b.declare_cfg_scratch(group_active_slot + 1);
+    if (b.is_compute && !b.native_subgroup_size &&
+        !b.declare_cfg_scratch(group_active_slot + 1))
+        return reject_cfg(ins.front().pc, "cfg-scratch-too-small");
     start_set.insert(end_pc);
     std::vector<uint32_t> starts(start_set.begin(), start_set.end());
     if (starts.empty() || starts.front() != ins.front().pc) return false;
@@ -14210,6 +14226,8 @@ bool emit_cfg_state_machine(
     std::set<int> spill_vgprs;
     for (const auto& slot : lane_slots) spill_vgprs.insert(slot.first);
     for (const auto& slot : mask_lane_slots) spill_vgprs.insert(slot.first);
+    std::unordered_set<int> terminal_invalidated_vgpr_lane_slots =
+        initial.invalidated_vgpr_lane_slots;
     if (!spill_vgprs.empty()) {
         std::vector<std::set<int>> invalidated_in(starts.size());
         std::vector<bool> invalidated_reachable(starts.size(), false);
@@ -14250,6 +14268,11 @@ bool emit_cfg_state_machine(
                 if (invalidated_in[successor].size() != before) pending.push_back(successor);
             }
         }
+        if (const auto terminal = block_for_pc.find(end_pc);
+            terminal != block_for_pc.end() && invalidated_reachable[terminal->second])
+            terminal_invalidated_vgpr_lane_slots = {
+                invalidated_in[terminal->second].begin(),
+                invalidated_in[terminal->second].end()};
     }
 
     uint32_t ptr_u32 = 0, ptr_bool = 0;
@@ -14366,7 +14389,7 @@ bool emit_cfg_state_machine(
     b.store_function(vcc_var, initial.vcc ? initial.vcc : no);
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
-    b.store_function(active_var, yes);
+    b.store_function(active_var, initial_active ? initial_active : yes);
     b.store_function(swizzle_source_var, zero);
     b.store_function(swizzle_source_lane_var, zero);
     b.store_function(swizzle_dst_var, zero);
@@ -14387,9 +14410,12 @@ bool emit_cfg_state_machine(
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
+        state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;
         state.smem_x16_descriptor_loads = initial.smem_x16_descriptor_loads;
         state.smem_x16_descriptor_analysis_done = initial.smem_x16_descriptor_analysis_done;
+        state.reads_scc = initial.reads_scc;
+        state.invalidated_vgpr_lane_slots = initial.invalidated_vgpr_lane_slots;
         for (const auto& kv : vv) {
             if (dispatch != UINT32_MAX &&
                 !dispatch_vector_reads[dispatch].contains(kv.first)) continue;
@@ -15748,6 +15774,16 @@ bool emit_cfg_state_machine(
     // Expose the final emulated state to the caller. Graphics exports are emitted in their exact
     // cases, while any post-body bookkeeping still sees this invocation's final register values.
     initial = load_state();
+    if (const auto terminal = block_for_pc.find(end_pc);
+        terminal != block_for_pc.end() && scalar_reachable[terminal->second]) {
+        initial.sreg_written = scalar_may_write_in[terminal->second];
+        for (int reg : initial.sreg_written) initial.sreg_input.erase(reg);
+    }
+    initial.invalidated_vgpr_lane_slots =
+        std::move(terminal_invalidated_vgpr_lane_slots);
+    // sreg_srt and lds_addtid are path-sensitive SSA provenance without dispatcher function
+    // variables. Not reconstructing them across a phase is intentional and fail-closed: a later
+    // descriptor/LDS consumer rejects instead of reviving provenance from an arbitrary path.
     if (proven_wave32_masks) {
         const auto end_block = block_for_pc.find(end_pc);
         if (end_block != block_for_pc.end() &&
@@ -15766,6 +15802,7 @@ struct BarrierPhasedCompute {
     size_t guard_index = 0;
     size_t end_index = 0;
     std::vector<size_t> barriers;
+    bool guarded = false;
     bool found = false;
 };
 
@@ -15912,9 +15949,12 @@ bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins,
     return false;
 }
 
-// Recognize a workgroup-uniform scalar terminal guard around barrier-separated compute phases.
-// Keeping this proof shared is important: emit_body uses it to split the shader, while the native
-// subgroup policy uses the same result to make nested wave votes legal inside an individual phase.
+// Recognize barrier-separated compute phases. A generated kernel may wrap the phases in one proven
+// workgroup-uniform terminal SCC guard, but the guard is not essential: an unconditional top-level
+// barrier is itself a valid phase boundary. In either form, every explicit scalar edge must stay in
+// one phase and indirect PC changes fail closed. Keeping this proof shared is important: emit_body
+// uses it to split the shader, while the native subgroup policy uses the same result to make nested
+// wave votes legal inside an individual phase.
 BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>& ins) {
     BarrierPhasedCompute result;
     result.end_index = ins.size();
@@ -15942,9 +15982,8 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
             result.guard_index = i;
     }
 
-    bool valid = result.guard_index < first_barrier && first_barrier < result.end_index &&
-        branch_count > 2;
-    bool scalar_prefix = valid;
+    bool guarded = result.guard_index < first_barrier && first_barrier < result.end_index;
+    bool scalar_prefix = guarded;
     for (size_t i = 0; scalar_prefix && i < result.guard_index; ++i) {
         const Rdna2Inst& in = ins[i];
         // Scalar ALU/loads retain workgroup-uniform values when entered from compute user data and
@@ -15967,16 +16006,36 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
         for (uint32_t source = 0; source < in.n_src; ++source)
             if (is_exec(in.src[source])) scalar_prefix = false;
     }
-    if (valid && !scalar_prefix)
-        valid = terminal_guard_scc_is_workgroup_uniform(ins, result.guard_index);
+    if (guarded && !scalar_prefix)
+        guarded = terminal_guard_scc_is_workgroup_uniform(ins, result.guard_index);
 
-    for (size_t i = result.guard_index + 1; valid && i < result.end_index; ++i)
+    // If a candidate terminal guard was not proved uniform, include it in the ordinary edge proof.
+    // Since it jumps across every barrier to S_ENDPGM, that proof rejects the conditional barrier.
+    // A proved guard is deliberately excluded: every invocation in the workgroup takes it together.
+    result.guarded = guarded;
+    const size_t body_begin = guarded ? result.guard_index + 1 : 0;
+    bool valid = result.end_index < ins.size() && branch_count > 2;
+
+    for (size_t i = body_begin; valid && i < result.end_index; ++i)
         if (ins[i].fmt == Rdna2Format::SOPP && ins[i].opcode == 0x0a)
             result.barriers.push_back(i);
+    valid = valid && !result.barriers.empty();
+
+    for (size_t i = body_begin; valid && i < result.end_index; ++i) {
+        const Rdna2Inst& in = ins[i];
+        // A trap deactivates its guest wave in the dispatcher. Emitting a host workgroup barrier
+        // afterward would then require an invocation that has left the phase to participate.
+        // Final-phase traps are fine because no outer barrier follows them.
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12 &&
+            i < result.barriers.back())
+            valid = false;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
+            valid = false;
+    }
     // A phase boundary is valid only when no guest branch jumps across it in either direction.
     for (size_t barrier_index : result.barriers) {
         const uint32_t barrier_pc = ins[barrier_index].pc;
-        for (size_t i = result.guard_index + 1; valid && i < result.end_index; ++i) {
+        for (size_t i = body_begin; valid && i < result.end_index; ++i) {
             const Rdna2Inst& in = ins[i];
             if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
                 in.opcode == 0x03 || in.opcode == 0x0a) continue;
@@ -15986,7 +16045,7 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
                 valid = false;
         }
     }
-    result.found = valid && !result.barriers.empty();
+    result.found = valid;
     return result;
 }
 
@@ -16001,7 +16060,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0,
                const std::unordered_set<uint32_t>* inherited_dead_masks = nullptr,
-               bool allow_cfg_dispatcher = true) {
+               bool allow_cfg_dispatcher = true,
+               uint32_t initial_dispatch_active = 0,
+               bool force_barrier_phases = false) {
                // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
                // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
@@ -16030,22 +16091,60 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // barrier remains uniform while the final phase can use the ordinary CFG dispatcher.
     if (b.is_compute) {
         const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
-        if (phased.found) {
-            const std::vector<Rdna2Inst> prefix(
-                ins.begin(), ins.begin() + phased.guard_index);
-            if (!prefix.empty() &&
-                !emit_body(b, rs, prefix, safe, rt, allow_exec_update, allow_smem,
-                           exp_fn, code, dwords, &dead_masks))
-                return false;
-            if (!rs.scc) return false;
-            const uint32_t execute_body = ins[phased.guard_index].opcode == 0x04
-                ? rs.scc : b.logical_not(rs.scc);
-            const uint32_t body_label = b.id(), merge_label = b.id();
-            b.emit_selmerge(merge_label);
-            b.emit_condbranch(execute_body, body_label, merge_label);
-            b.emit_label(body_label);
+        if (phased.found &&
+            (phased.guarded || initial_dispatch_active || force_barrier_phases)) {
+            // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
+            // phased stream before the first dispatcher: a later portable DPP add needs a second
+            // per-lane plane even when the earlier phase needed only votes/liveness.
+            if (!b.native_subgroup_size) {
+                const uint32_t wave_count =
+                    (b.local_count + b.wave_size - 1) / b.wave_size;
+                const uint32_t padded_lanes = wave_count * b.wave_size;
+                const bool has_portable_dpp_add = std::any_of(
+                    ins.begin(), ins.begin() + phased.end_index,
+                    [](const Rdna2Inst& in) {
+                        return is_inplace_vadd_nc_u32_dpp_row_shr(in);
+                    });
+                const uint32_t scratch_dwords = padded_lanes +
+                    (has_portable_dpp_add ? padded_lanes : 0u) + wave_count + 1;
+                if (!b.declare_cfg_scratch(scratch_dwords)) return false;
+            }
+            uint32_t merge_label = 0;
+            if (phased.guarded) {
+                // Padded invocations cannot follow a divergent extent guard around this selection.
+                // Keep that uncommon combination on the existing fail-closed path; the unguarded
+                // phase form below is the one proved safe for partial workgroups.
+                if (initial_dispatch_active) return false;
+                const std::vector<Rdna2Inst> prefix(
+                    ins.begin(), ins.begin() + phased.guard_index);
+                if (!prefix.empty() &&
+                    !emit_body(b, rs, prefix, safe, rt, allow_exec_update, allow_smem,
+                               exp_fn, code, dwords, &dead_masks))
+                    return false;
+                if (!rs.scc) return false;
+                const uint32_t execute_body = ins[phased.guard_index].opcode == 0x04
+                    ? rs.scc : b.logical_not(rs.scc);
+                const uint32_t body_label = b.id();
+                merge_label = b.id();
+                b.emit_selmerge(merge_label);
+                b.emit_condbranch(execute_body, body_label, merge_label);
+                b.emit_label(body_label);
+            }
 
-            size_t phase_begin = phased.guard_index + 1;
+            auto emit_phase = [&](std::vector<Rdna2Inst>& phase) {
+                // Unguarded phases are admitted specifically because the whole-stream exact-wave
+                // dispatcher was blocked by a guest barrier. Use that dispatcher directly for each
+                // now barrier-free region; re-entering the narrow structurizer could reject the same
+                // backward-else/complex shape before it ever reaches the fallback.
+                if (!phased.guarded || initial_dispatch_active)
+                    return emit_cfg_state_machine(
+                        b, rs, phase, safe, rt, allow_exec_update, allow_smem,
+                        exp_fn, code, dwords, initial_dispatch_active);
+                return emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
+                                 exp_fn, code, dwords, &dead_masks);
+            };
+
+            size_t phase_begin = phased.guarded ? phased.guard_index + 1 : 0;
             for (size_t barrier_index : phased.barriers) {
                 std::vector<Rdna2Inst> phase(
                     ins.begin() + phase_begin, ins.begin() + barrier_index);
@@ -16067,8 +16166,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
                                      phase.front().pc, phase[phase.size() - 2].pc,
                                      ins[barrier_index].pc);
-                    if (!emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
-                                   exp_fn, code, dwords, &dead_masks)) {
+                    if (!emit_phase(phase)) {
                         log_recompile_diagnostic(
                             b.diagnostic, "compute-phase-reject", "consequent",
                             "begin=%u end=%u", phase.front().pc, phase[phase.size() - 2].pc);
@@ -16078,21 +16176,24 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 b.barrier();
                 phase_begin = barrier_index + 1;
             }
-            const std::vector<Rdna2Inst> tail(ins.begin() + phase_begin, ins.end());
+            std::vector<Rdna2Inst> tail(ins.begin() + phase_begin, ins.end());
             if (!tail.empty()) {
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr, "[compute-phase] begin=%u end=%u tail=1\n",
                                  tail.front().pc, tail.back().pc);
-                if (!emit_body(b, rs, tail, safe, rt, allow_exec_update, allow_smem,
-                               exp_fn, code, dwords, &dead_masks)) {
+                if (!emit_phase(tail)) {
                     log_recompile_diagnostic(b.diagnostic, "compute-phase-reject", "consequent",
                                              "begin=%u end=%u tail=1",
                                              tail.front().pc, tail.back().pc);
                     return false;
                 }
             }
-            b.emit_branch(merge_label);
-            b.emit_label(merge_label);
+            if (phased.guarded) {
+                b.emit_branch(merge_label);
+                b.emit_label(merge_label);
+            }
+            if (initial_dispatch_active)
+                b.partial_barrier_phases_emitted = true;
             return true;
         }
     }
@@ -16664,6 +16765,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // a guest barrier; nested wave branches still need this dispatcher. If a guest barrier
             // makes that transformation unsafe, reject rather than silently changing the branch domain.
             if (!cfg_dispatch_safe) {
+                const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
+                if (phased.found && !phased.guarded)
+                    return emit_body(
+                        b, rs, ins, safe, rt, allow_exec_update, allow_smem,
+                        exp_fn, code, dwords, &dead_masks, allow_cfg_dispatcher,
+                        /*initial_dispatch_active=*/0, /*force_barrier_phases=*/true);
                 log_recompile_diagnostic(
                     b.diagnostic, "compute-cfg-reject", "terminal",
                     "reason=exact-wave-dispatcher-unsafe guest-barrier=1");
@@ -17190,8 +17297,17 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
     const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
+    const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
+                                       config.threads_y % local_y != 0 ||
+                                       config.threads_z % local_z != 0;
+    const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
+    const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
+        barrier_phases.found && !barrier_phases.guarded;
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+    // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
+    // operations cannot be entered by only the real prefix of the final host subgroup.
+    if (partial_barrier_phases) b.native_subgroup_size = 0;
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
     // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
@@ -17250,7 +17366,10 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                          b.native_subgroup_size,
                          b.native_subgroup_size
                              ? "width-dependent lowerings ENABLED"
-                             : (config.native_subgroup_size == 0
+                             : (partial_barrier_phases
+                                    ? "DISABLED: partial barrier phases require the portable "
+                                      "dispatcher"
+                                : (config.native_subgroup_size == 0
                                     ? "DISABLED: no native width adopted -- "
                                       "select_native_compute_subgroup_size() declined"
                                     : (config.native_subgroup_size != wave_size
@@ -17259,7 +17378,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                                   ? "DISABLED: local_count exceeds the plausibility "
                                                     "guard"
                                                   : "DISABLED: workgroup is not a whole number "
-                                                    "of waves"))));
+                                                    "of waves")))));
     }
     b.native_storage_format_support = config.native_storage_format_support;
     b.packed_r11_storage = config.packed_r11_storage;
@@ -17267,10 +17386,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.allow_b32_masks = wave_size == 32;
     b.declare_guest_scratch(scratch);
-    const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
-                                       config.threads_y % local_y != 0 ||
-                                       config.threads_z % local_z != 0;
-    if (config.exact_thread_extent && has_partial_workgroup)
+    uint32_t initial_dispatch_active = 0;
+    if (partial_barrier_phases)
+        initial_dispatch_active = b.invocation_within_extent(
+            config.threads_x, config.threads_y, config.threads_z);
+    else if (config.exact_thread_extent && has_partial_workgroup)
         b.guard_invocation_extent(config.threads_x, config.threads_y, config.threads_z);
 
     RegState rs;
@@ -17312,13 +17432,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
-                   /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; }, code, dwords))
+                   /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; },
+                   code, dwords, nullptr, true, initial_dispatch_active))
         return {};
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
     // recompiler synthesizes for wave operations. Reject this uncommon combination instead of emitting
     // a module that could deadlock or observe undefined workgroup-memory behavior.
-    if (has_partial_workgroup && b.uses_barrier) {
+    if (has_partial_workgroup && b.uses_barrier && !b.partial_barrier_phases_emitted) {
         log_recompile_diagnostic(
             b.diagnostic, "compute-recompile-reject", "terminal",
             "reason=partial-workgroup-barrier threads=%ux%ux%u local=%ux%ux%u",
@@ -17346,10 +17467,12 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
     }
     if (!guest_barrier || !code) return false;
 
-    // The phase splitter's shared proof is stronger than the whole-stream CFG shape: branches and
-    // loops inside one barrier-free phase do not make the outer uniform guard or its barriers
-    // divergent. Such kernels need an exact native subgroup for nested guest-wave votes.
-    if (analyze_barrier_phased_compute(ins).found) return true;
+    // The guarded phase splitter's shared proof is stronger than the whole-stream CFG shape:
+    // branches and loops inside one barrier-free phase do not make the outer uniform guard or its
+    // barriers divergent. Such kernels need an exact native subgroup for nested guest-wave votes.
+    if (const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
+        phased.found && phased.guarded)
+        return true;
 
     // Mirror the conservative, acyclic subset of emit_body's structured-compute admission. Counting
     // raw VCC/EXEC opcodes is insufficient: kill-mask branches may be safely linearized, loop exits

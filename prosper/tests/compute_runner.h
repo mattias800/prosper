@@ -1,7 +1,7 @@
 // compute_runner.h — inline helper to run a compute SPIR-V module over an input float buffer and
 // return the output float buffer, via real Vulkan compute (2 storage buffers: binding 0 = in,
-// binding 1 = out; local_size_x = 64). Shared by the execution-differential tests so the Vulkan
-// boilerplate lives in one place. Header-only; the including test links Vulkan::Vulkan.
+// binding 1 = out; local_size_x defaults to 64). Shared by the execution-differential tests so the
+// Vulkan boilerplate lives in one place. Header-only; the including test links Vulkan::Vulkan.
 #pragma once
 #include <vulkan/vulkan.h>
 #include <cstdint>
@@ -42,13 +42,15 @@ inline ComputeSubgroupProperties default_compute_subgroup_properties() {
 }
 
 // Run `spirv` over storage buffer 0 = `input`, storage buffer 1 = output. `invocations` compute
-// threads are dispatched (default = input.size()); the output buffer holds `out_count` floats
-// (default = input.size()). Returns the output, or {} on any Vulkan failure (incl. rejected SPIR-V).
+// threads are dispatched (default = input.size()) in groups of `local_size_x` (default 64); the
+// output buffer holds `out_count` floats (default = input.size()). Returns the output, or {} on any
+// Vulkan failure (including rejected SPIR-V).
 inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
                                       uint32_t invocations = 0, uint32_t out_count = 0,
                                       const std::vector<uint32_t>& cbuf = {},
                                       const std::vector<uint32_t>& cbuf1 = {},
-                                      std::vector<uint32_t>* cbuf1_out = nullptr) {
+                                      std::vector<uint32_t>* cbuf1_out = nullptr,
+                                      uint32_t local_size_x = 64) {
     const uint32_t IN_N = (uint32_t)input.size();
     if (invocations == 0) invocations = IN_N;
     if (out_count == 0)   out_count = IN_N;
@@ -175,7 +177,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkBeginCommandBuffer(cmd, &cbbi);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &dset, 0, nullptr);
-    vkCmdDispatch(cmd, (invocations + 63) / 64, 1, 1);
+    vkCmdDispatch(cmd, (invocations + local_size_x - 1) / local_size_x, 1, 1);
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
