@@ -1415,6 +1415,21 @@ int main() {
     CHECK(recompile_compute(code17d1s.data(), code17d1s.size(), nullptr,
                             portable_cfg17d1s).empty(),
           "Wave32 mask SCC branch rejects without an exact native subgroup contract");
+
+    // A literal operand is also one complete Wave32 mask word. Keep the irreducible dispatcher
+    // suffix and branch immediately on the new VCC lifetime: this specifically exercises the
+    // dispatcher's mask-domain classification, not only emit_alu's literal lowering.
+    std::vector<uint32_t> code17d1_literal_mask = {
+        0x7d840100u,              // v_cmp_eq_u32 vcc,v0,v0
+        0x876aff6au, 0x55555555u, // s_and_b32 vcc_lo,vcc_lo,0x55555555
+        0xbf860001u,              // s_cbranch_vccz +1
+        0xbf800000u,              // fallthrough work
+    };
+    code17d1_literal_mask.insert(
+        code17d1_literal_mask.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_literal_mask.data(), code17d1_literal_mask.size(),
+                             nullptr, native_cfg17d1).empty(),
+          "Wave32 literal mask remains live through an irreducible VCC branch");
     const std::vector<uint32_t> native_spv17d1 = recompile_compute(
         code17d1, std::size(code17d1), &rt17d1, native_cfg17d1);
     CHECK(!native_spv17d1.empty() && count_spirv_opcode(native_spv17d1, 349) >= 2 &&
@@ -1430,6 +1445,43 @@ int main() {
         (subgroup17d1.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+
+    // Kernel 17d1h: GTA V's Wave32 terrain kernel uses VCC_HI as ordinary scalar scratch. The
+    // exact pc57 packet materializes EXEC_LO, masks it into VCC_HI, and later reads that dword at
+    // pc67. VCC_LO remains the architectural mask: pc59 narrows it, and pc68 reads its complete
+    // dword through the same exact Wave32 ballot. Append the irreducible dispatcher tail so this
+    // exercises the same emit_alu call site as the live shader rather than only straight-line code.
+    std::vector<uint32_t> code17d1h = {
+        0xbe9403c1u,              // s_mov_b32 s20,-1
+        0x7d840100u,              // v_cmp_eq_u32 vcc,v0,v0
+        0x876bff7eu, 0x0fffffffu, // pc57: s_and_b32 vcc_hi,exec_lo,0x0fffffff
+        0xbf068000u,              // synthetic scalar condition keeps the exact lifetime at a join
+        0xbf840001u,              // s_cbranch_scc0 +1
+        0xbf800000u,              // alternate-path work
+        0x876aff6au, 0x7ffffffeu, // pc59: s_and_b32 vcc_lo,vcc_lo,0x7ffffffe
+        0x871a6b14u,              // pc67: s_and_b32 s26,s20,vcc_hi
+        0x811b6a82u,              // pc68: s_add_u32 s27,2,vcc_lo
+        0x811a1b1au,              // s_add_u32 s26,s26,s27
+        0x7e02021au,              // v_mov_b32 v1,s26
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+    };
+    code17d1h.insert(code17d1h.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> native_spv17d1h = recompile_compute(
+        code17d1h.data(), code17d1h.size(), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1h.empty() && count_spirv_opcode(native_spv17d1h, 339) == 2,
+          "GTA Wave32 VCC_HI scratch materializes exact EXEC/VCC ballots");
+    CHECK(recompile_compute(code17d1h.data(), code17d1h.size(), &rt17d1,
+                            portable_cfg17d1).empty(),
+          "Wave32 VCC_HI scratch rejects without an exact subgroup ballot");
+    const bool can_execute17d1h = can_execute17d1 &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    if (can_execute17d1h) {
+        std::vector<uint32_t> got17d1h;
+        prosper::test::run_compute(native_spv17d1h, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(64, 0u), &got17d1h);
+        CHECK(got17d1h == std::vector<uint32_t>(64, 0x8fffffffu),
+              "VCC_HI scalar scratch and VCC_LO mask dwords remain independently exact");
+    }
     if (can_execute17d1) {
         std::vector<uint32_t> initial17d1(64, 0u), got17d1;
         prosper::test::run_compute(native_spv17d1, std::vector<float>(64, 0.0f),
