@@ -6438,6 +6438,49 @@ int main() {
               got68_zero_load.size() == N && bad68_zero_load == 0,
           "zero-record raw load returns zero under EXEC and preserves masked VGPR lanes");
 
+    // GTA V 0x413d59600 pc67: exact buffer_load_format_xyz packet through a zero-record V#.
+    // Pad with real v_nop encodings so the exact-PC resource marker remains 67. The active lanes
+    // receive zero while masked lanes retain v17=7, and the module must add no storage-buffer access.
+    std::vector<uint32_t> code68_zero_format(72, 0x7e000000u);
+    code68_zero_format[0] = 0x7E000F00u; // v_cvt_u32_f32 v0, v0
+    code68_zero_format[1] = 0x7E020F01u; // v_cvt_u32_f32 v1, v1
+    code68_zero_format[2] = 0x7E220287u; // v_mov_b32 v17, 7
+    code68_zero_format[3] = 0x7DA80300u; // v_cmpx_gt_u32 vcc, v0, v1
+    code68_zero_format[67] = 0xE0082000u;
+    code68_zero_format[68] = 0x8000110Cu;
+    code68_zero_format[69] = 0xBEFE04C1u; // s_mov_b64 exec, -1
+    code68_zero_format[70] = 0x7E220D11u; // v_cvt_f32_u32 v17, v17
+    code68_zero_format[71] = 0xBF810000u;
+    ShaderResourceTable rt68_zero_format;
+    rt68_zero_format.resources.push_back(zero_record_resource(67));
+    const std::vector<uint32_t> spv68_zero_format = recompile_valu(
+        code68_zero_format.data(), code68_zero_format.size(), 2, 17,
+        &rt68_zero_format);
+    std::vector<uint32_t> code68_zero_format_control = code68_zero_format;
+    code68_zero_format_control[67] = 0x7E000000u;
+    code68_zero_format_control[68] = 0x7E000000u;
+    const std::vector<uint32_t> spv68_zero_format_control = recompile_valu(
+        code68_zero_format_control.data(), code68_zero_format_control.size(), 2, 17,
+        &rt68_zero_format);
+    CHECK(!spv68_zero_format.empty() && !spv68_zero_format_control.empty() &&
+              count_spirv_opcode(spv68_zero_format, 61) ==
+                  count_spirv_opcode(spv68_zero_format_control, 61) &&
+              count_spirv_opcode(spv68_zero_format, 62) ==
+                  count_spirv_opcode(spv68_zero_format_control, 62) &&
+              count_spirv_opcode(spv68_zero_format, 65) ==
+                  count_spirv_opcode(spv68_zero_format_control, 65),
+          "exact zero-record FORMAT load adds no storage-buffer access/load/store instructions");
+    const std::vector<float> got68_zero_format = spv68_zero_format.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv68_zero_format, in68_zero_load, N, N, {},
+                                     std::vector<uint32_t>(1, 0xDEADBEEFu));
+    uint32_t bad68_zero_format = 0;
+    for (uint32_t i = 0; i < N && got68_zero_format.size() == N; ++i)
+        if (got68_zero_format[i] != expected68_zero_load[i]) ++bad68_zero_format;
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_format.size() == N && bad68_zero_format == 0,
+          "exact zero-record FORMAT load preserves masked VGPR lanes");
+
     ShaderResourceTable rt68_zero_store;
     rt68_zero_store.resources.push_back(zero_record_resource(2));
     const std::vector<uint32_t> spv68_zero_store = recompile_valu(

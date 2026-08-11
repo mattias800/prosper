@@ -3119,6 +3119,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // below (SBASE and SDST ranges may overlap).
                 SrtUse pending_srt_use;
                 bool have_pending_srt_use = false;
+                bool live_sbase_vsharp_known = false;
                 if (srt_uses && is_buffer) {
                     bool current_known = true, current_key_known = true;
                     uint32_t current_key = 0;
@@ -3153,6 +3154,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         pending_srt_use.use_pc = in.pc;
                         have_pending_srt_use = true;
                     }
+                }
+                // The zero-record decision below must be based on the four words live at this
+                // instruction, never only on an older descriptor snapshot. Callers that do not
+                // request SRT uses still need the known-zero result to propagate to later consumers.
+                std::array<uint32_t, 4> live_sbase_vsharp{};
+                if (is_buffer) {
+                    live_sbase_vsharp_known = true;
+                    for (int k = 0; k < 4; ++k)
+                        live_sbase_vsharp_known &= known(sbase + k, live_sbase_vsharp[(size_t)k]);
                 }
                 // RAW-POINTER scalar load (#2412). `s_load_dword`/`x2` (op < 8) take SBASE as a plain
                 // 64-bit pointer rather than a V#, and no use was recorded for them at all — the
@@ -3221,6 +3231,31 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                  "soff_field=%u soff_val=0x%x soff_ok=%d imm=0x%x n=%u\n", in.opcode,
                                  is_buffer ? "bufload" : "load", sdst, sbase, (unsigned long long)base, base_ok,
                                  soff_field, soff_val, soff_ok, in.literal, n);
+                if (n != 0 && live_sbase_vsharp_known) {
+                    const DecodedBufferDescriptor d =
+                        decode_buffer_descriptor(live_sbase_vsharp.data());
+                    if (d.num_records == 0u && d.size_bytes == 0u) {
+                        // A zero-record V# makes every S_BUFFER_LOAD address OOB, including one whose
+                        // SOFFSET comes from a wave value the CPU fold cannot know. Publish the outer
+                        // descriptor at this exact pc so the SPIR-V emitter can remove the memory
+                        // access, and make the result itself exact zero so a descriptor loaded through
+                        // it remains provably empty at a later MUBUF consumer.
+                        if (srt_uses && have_pending_srt_use) {
+                            pending_srt_use.zero_record_raw = true;
+                            pending_srt_use.required_size = 0;
+                            srt_uses->push_back(pending_srt_use);
+                        }
+                        for (uint32_t k = 0; k < n; ++k)
+                            set_value(sdst + static_cast<int>(k), 0u);
+                        if (n == 4 && valid_reg(sdst) && valid_reg(sdst + 3)) {
+                            descr[(size_t)sdst] = {0u, 0u, 0u, 0u};
+                            descr_known.set((size_t)sdst);
+                            descr_key[(size_t)sdst] = 0xFFFFFFFFu;
+                            descr_key_known.set((size_t)sdst);
+                        }
+                        break;
+                    }
+                }
                 if (n == 0 || !base_ok || !soff_ok) {
                     // A wave-derived scalar SOFFSET (for example v_readfirstlane -> VCC_LO) is
                     // deliberately not concrete in this CPU-side fold. The V# can still be exact,
@@ -3690,8 +3725,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             case Rdna2Format::MTBUF: {
                 const bool is_mtbuf = in.fmt == Rdna2Format::MTBUF;
                 // Buffer stores, raw loads/stores, and supported atomics need a kind-1 resource use.
-                // Format loads are intentionally handled only by DynFetch below: it snapshots the V#
-                // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
+                // Nonempty format loads are intentionally handled only by DynFetch below: it snapshots
+                // the V# live at the instruction and resolves by exact pc, avoiding a duplicate stale
+                // SRT use. An empty format load is the exception because it has no materializable
+                // DynFetch resource, yet its exact zero result needs the same no-backing marker.
+                const bool format_load_use = !is_mtbuf && in.opcode <= 0x03;
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
                      (in.opcode >= 0x1C && in.opcode <= 0x1F));
@@ -3703,7 +3741,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     !is_mtbuf &&
                     (in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
                      (in.opcode >= 0x35 && in.opcode <= 0x3B));
-                if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
+                if (srt_uses &&
+                    (format_load_use || format_store_use || raw_buffer_use || atomic_buffer_use)) {
                     const int srsrc = in.src[1].value;
                     std::array<uint32_t, 4> current{};
                     bool current_known = true;
@@ -3787,18 +3826,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
                         // Typed format stores retain the strided record requirement.
                         const bool stride_supported = !format_store_use || d.stride != 0;
-                        // A fully-known raw/untyped MUBUF with NUM_RECORDS=0 is not a missing
-                        // descriptor: hardware returns zero for loads, drops stores, and range-checks
-                        // an atomic as one all-or-nothing access. Preserve that proof at this exact
-                        // consumer pc for ordinary raw operations and the exact 32-bit atomic set
-                        // admitted above. MTBUF, format stores, unsupported atomics, and an addr0
-                        // descriptor with nonzero records remain outside the marker contract.
-                        const bool zero_record_raw = (raw_buffer_use || atomic_buffer_use) &&
-                                                     d.num_records == 0u &&
-                                                     d.size_bytes == 0u;
-                        if (zero_record_raw ||
+                        // A fully-known admitted V# with NUM_RECORDS=0 is not a missing descriptor:
+                        // hardware returns zero for loads, drops stores, and range-checks an atomic
+                        // as one all-or-nothing access. Preserve that proof at this exact consumer pc.
+                        // MTBUF, format stores, unsupported atomics, and an addr0 descriptor with
+                        // nonzero records remain outside the marker contract.
+                        const bool zero_record_raw =
+                            (format_load_use || raw_buffer_use || atomic_buffer_use) &&
+                            d.num_records == 0u && d.size_bytes == 0u;
+                        if (zero_record_raw || (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
-                             d.size_bytes <= 0x10000000u && stride_supported && format_supported)) {
+                             d.size_bytes <= 0x10000000u && stride_supported && format_supported))) {
                             u.zero_record_raw = zero_record_raw;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "

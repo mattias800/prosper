@@ -2125,6 +2125,141 @@ int main() {
                                  &wave_offset_sbuffer_table, direct_sbuffer_config).empty(),
           "Astro wave-derived SOFFSET binds its descriptor range and recompiles dynamically");
 
+    // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
+    // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
+    // has NUM_RECORDS=0, so every possible access is OOB: publish a marker for the scalar load itself,
+    // propagate four exact zero dwords, and let the exact raw-MUBUF consumer publish its own marker.
+    // These are the live scalar-load and first consumer packets (relocated to pc1/pc3 in the fixture).
+    const uint32_t zero_record_sbuffer_chain[] = {
+        0x7ed40500u,              // v_readfirstlane_b32 vcc_lo, v0 (runtime-uniform, fold-unknown)
+        0xf4280202u, 0xd4000008u, // s_buffer_load_dwordx4 s[8:11], s[4:7], vcc_lo offset:8
+        0xe0382000u, 0x80020006u, // buffer_load_dwordx4 v[0:3], v6, s[8:11], 0
+        0xbf810000u,
+    };
+    uint32_t zero_record_sbuffer_seed[8]{};
+    std::vector<SrtUse> zero_record_sbuffer_uses;
+    resolve_dynamic_fetch(zero_record_sbuffer_chain, std::size(zero_record_sbuffer_chain),
+                          zero_record_sbuffer_seed, std::size(zero_record_sbuffer_seed), 0,
+                          &zero_record_sbuffer_uses);
+    CHECK(zero_record_sbuffer_uses.size() == 2 &&
+              zero_record_sbuffer_uses[0].use_pc == 1 &&
+              zero_record_sbuffer_uses[0].zero_record_raw &&
+              zero_record_sbuffer_uses[1].use_pc == 3 &&
+              zero_record_sbuffer_uses[1].zero_record_raw &&
+              std::all_of(zero_record_sbuffer_uses[1].v4.begin(),
+                          zero_record_sbuffer_uses[1].v4.end(),
+                          [](uint32_t word) { return word == 0u; }),
+          "zero-record dynamic-SOFFSET S_BUFFER_LOAD produces an exact zero V# consumer");
+    ShaderResourceTable zero_record_sbuffer_table;
+    add_compute_buffer_resources(zero_record_sbuffer_table, zero_record_sbuffer_chain,
+                                 std::size(zero_record_sbuffer_chain), zero_record_sbuffer_seed,
+                                 std::size(zero_record_sbuffer_seed));
+    assign_convention_bindings(zero_record_sbuffer_table, 2);
+    ComputeShaderConfig zero_record_sbuffer_config;
+    zero_record_sbuffer_config.user_sgprs.assign(
+        zero_record_sbuffer_seed,
+        zero_record_sbuffer_seed + std::size(zero_record_sbuffer_seed));
+    zero_record_sbuffer_config.local_x = zero_record_sbuffer_config.local_y =
+        zero_record_sbuffer_config.local_z = 1;
+    const std::vector<uint32_t> zero_record_sbuffer_spirv = recompile_compute(
+        zero_record_sbuffer_chain, std::size(zero_record_sbuffer_chain),
+        &zero_record_sbuffer_table, zero_record_sbuffer_config);
+    const DescriptorValidationReport zero_record_sbuffer_report =
+        validate_spirv_descriptor_interface(zero_record_sbuffer_spirv,
+                                            &zero_record_sbuffer_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(zero_record_sbuffer_table.resources.size() == 2 &&
+              is_zero_record_raw_buffer(zero_record_sbuffer_table.resources[0]) &&
+              is_zero_record_raw_buffer(zero_record_sbuffer_table.resources[1]) &&
+              zero_record_sbuffer_table.by_fetch_pc(1) &&
+              zero_record_sbuffer_table.by_fetch_pc(3) &&
+              !zero_record_sbuffer_spirv.empty() && zero_record_sbuffer_report.ok() &&
+              zero_record_sbuffer_report.descriptors.empty(),
+          "production zero-record scalar-load chain recompiles without backing buffers");
+
+    // The sibling 0x413ce6d00 site uses the same shape at pc148 with different registers. Preserve
+    // its exact scalar packet and first raw consumer too, so register-specific decode drift cannot
+    // leave one program behind while the other fixture stays green.
+    const uint32_t zero_record_sbuffer_chain_6d[] = {
+        0x7ed40500u,
+        0xf4280508u, 0xd4000008u, // s_buffer_load_dwordx4 s[20:23], s[16:19], vcc_lo offset:8
+        0xe0382000u, 0x80050006u, // buffer_load_dwordx4 v[0:3], v6, s[20:23], 0
+        0xbf810000u,
+    };
+    uint32_t zero_record_sbuffer_seed_6d[20]{};
+    std::vector<SrtUse> zero_record_sbuffer_uses_6d;
+    resolve_dynamic_fetch(zero_record_sbuffer_chain_6d,
+                          std::size(zero_record_sbuffer_chain_6d),
+                          zero_record_sbuffer_seed_6d,
+                          std::size(zero_record_sbuffer_seed_6d), 0,
+                          &zero_record_sbuffer_uses_6d);
+    CHECK(zero_record_sbuffer_uses_6d.size() == 2 &&
+              zero_record_sbuffer_uses_6d[0].use_pc == 1 &&
+              zero_record_sbuffer_uses_6d[0].zero_record_raw &&
+              zero_record_sbuffer_uses_6d[1].use_pc == 3 &&
+              zero_record_sbuffer_uses_6d[1].zero_record_raw,
+          "second GTA V zero-record scalar packet reaches its exact raw consumer");
+
+    // 0x413d59600 consumes the same empty V# through x4, x1 and x16 scalar loads. These are its
+    // exact pc16/pc20/pc22 packets, relocated together after one fold-unknown VCC producer.
+    const uint32_t zero_record_sbuffer_widths[] = {
+        0x7ed40500u,
+        0xf4280b06u, 0xd4000004u, // x4  s[44:47], s[12:15], vcc_lo offset:4
+        0xf42000c6u, 0xd4000014u, // x1  s3,       s[12:15], vcc_lo offset:20
+        0xf4300706u, 0xd4000038u, // x16 s[28:43], s[12:15], vcc_lo offset:56
+        0xbf810000u,
+    };
+    uint32_t zero_record_sbuffer_width_seed[16]{};
+    ShaderResourceTable zero_record_sbuffer_width_table;
+    const std::vector<SrtUse> zero_record_sbuffer_width_uses = add_compute_buffer_resources(
+        zero_record_sbuffer_width_table, zero_record_sbuffer_widths,
+        std::size(zero_record_sbuffer_widths), zero_record_sbuffer_width_seed,
+        std::size(zero_record_sbuffer_width_seed));
+    assign_convention_bindings(zero_record_sbuffer_width_table, 2);
+    ComputeShaderConfig zero_record_sbuffer_width_config;
+    zero_record_sbuffer_width_config.user_sgprs.assign(
+        zero_record_sbuffer_width_seed,
+        zero_record_sbuffer_width_seed + std::size(zero_record_sbuffer_width_seed));
+    zero_record_sbuffer_width_config.local_x = zero_record_sbuffer_width_config.local_y =
+        zero_record_sbuffer_width_config.local_z = 1;
+    const std::vector<uint32_t> zero_record_sbuffer_width_spirv = recompile_compute(
+        zero_record_sbuffer_widths, std::size(zero_record_sbuffer_widths),
+        &zero_record_sbuffer_width_table, zero_record_sbuffer_width_config);
+    const DescriptorValidationReport zero_record_sbuffer_width_report =
+        validate_spirv_descriptor_interface(zero_record_sbuffer_width_spirv,
+                                            &zero_record_sbuffer_width_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(zero_record_sbuffer_width_uses.size() == 3 &&
+              zero_record_sbuffer_width_table.resources.size() == 3 &&
+              std::all_of(zero_record_sbuffer_width_uses.begin(),
+                          zero_record_sbuffer_width_uses.end(),
+                          [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              !zero_record_sbuffer_width_spirv.empty() &&
+              zero_record_sbuffer_width_report.ok() &&
+              zero_record_sbuffer_width_report.descriptors.empty(),
+          "GTA V zero-record x1/x4/x16 scalar loads compile to exact zeros without bindings");
+
+    // NUM_RECORDS is the production-site boundary. A null-base descriptor with one record does not
+    // make a runtime SOFFSET knowable and must not acquire either zero marker.
+    uint32_t one_record_sbuffer_seed[8]{};
+    one_record_sbuffer_seed[6] = 1u;
+    ShaderResourceTable one_record_sbuffer_table;
+    const std::vector<SrtUse> one_record_sbuffer_uses = add_compute_buffer_resources(
+        one_record_sbuffer_table, zero_record_sbuffer_chain,
+        std::size(zero_record_sbuffer_chain), one_record_sbuffer_seed,
+        std::size(one_record_sbuffer_seed));
+    ComputeShaderConfig one_record_sbuffer_config = zero_record_sbuffer_config;
+    one_record_sbuffer_config.user_sgprs.assign(
+        one_record_sbuffer_seed, one_record_sbuffer_seed + std::size(one_record_sbuffer_seed));
+    CHECK(one_record_sbuffer_table.resources.empty() &&
+              std::none_of(one_record_sbuffer_uses.begin(), one_record_sbuffer_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              recompile_compute(zero_record_sbuffer_chain,
+                                std::size(zero_record_sbuffer_chain),
+                                &one_record_sbuffer_table,
+                                one_record_sbuffer_config).empty(),
+          "base-zero one-record scalar-load chain stays unresolved");
+
     // Evergate's title PS uses a bounded PC-relative dispatch. An omitted alternative reloads the
     // same T# SGPRs that the selected arm consumes directly; a linear fold used to walk that reload
     // and attach the alternative texture to the selected image_sample's pc. Specialize the fold to
@@ -2288,6 +2423,44 @@ int main() {
                                  std::size(addr0_nonzero_record_seed));
     CHECK(addr0_nonzero_record_uses.empty() && addr0_nonzero_record_table.resources.empty(),
           "addr0 plus nonzero NUM_RECORDS stays rejected at the zero-record boundary");
+
+    // GTA V 0x413d59600 pc67 uses this exact FORMAT-load packet through the all-zero descriptor
+    // produced by its earlier zero-record scalar loads. Keep the exact pc because the marker is
+    // deliberately per-consumer; ordinary nonempty format loads remain on DynFetch's typed path.
+    std::vector<uint32_t> zero_record_format_load(70, 0x7e000000u); // v_nop padding
+    zero_record_format_load[67] = 0xe0082000u;
+    zero_record_format_load[68] = 0x8000110cu;
+    zero_record_format_load[69] = 0xbf810000u;
+    const uint32_t zero_record_format_seed[4]{};
+    ShaderResourceTable zero_record_format_table;
+    const std::vector<SrtUse> zero_record_format_uses = add_compute_buffer_resources(
+        zero_record_format_table, zero_record_format_load.data(), zero_record_format_load.size(),
+        zero_record_format_seed, std::size(zero_record_format_seed));
+    assign_convention_bindings(zero_record_format_table, 2);
+    ComputeShaderConfig zero_record_format_config;
+    zero_record_format_config.user_sgprs.assign(
+        zero_record_format_seed, zero_record_format_seed + std::size(zero_record_format_seed));
+    zero_record_format_config.local_x = zero_record_format_config.local_y =
+        zero_record_format_config.local_z = 1;
+    CHECK(zero_record_format_uses.size() == 1 &&
+              zero_record_format_uses[0].use_pc == 67 &&
+              zero_record_format_uses[0].zero_record_raw &&
+              zero_record_format_table.resources.size() == 1 &&
+              is_zero_record_raw_buffer(zero_record_format_table.resources[0]) &&
+              zero_record_format_table.by_fetch_pc(67) &&
+              !recompile_compute(zero_record_format_load.data(), zero_record_format_load.size(),
+                                 &zero_record_format_table,
+                                 zero_record_format_config).empty(),
+          "exact GTA V pc67 zero-record FORMAT load lowers without a backing buffer");
+
+    uint32_t one_record_format_seed[4]{};
+    one_record_format_seed[2] = 1u;
+    ShaderResourceTable one_record_format_table;
+    const std::vector<SrtUse> one_record_format_uses = add_compute_buffer_resources(
+        one_record_format_table, zero_record_format_load.data(), zero_record_format_load.size(),
+        one_record_format_seed, std::size(one_record_format_seed));
+    CHECK(one_record_format_uses.empty() && one_record_format_table.resources.empty(),
+          "exact GTA V pc67 FORMAT load keeps base-zero one-record V# unresolved");
 
     // Astro Bot's 7f5f world-map NGG shader patches only NUM_RECORDS in its direct s[16:19] V#
     // (`s_mov_b32 s18, 1`) before a raw buffer_load_dwordx4 at pc2761. The consumer is itself the
