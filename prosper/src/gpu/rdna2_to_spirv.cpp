@@ -16653,6 +16653,7 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
     auto ordinary_lds_store = [](const Rdna2Inst& in) {
         if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
         return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x4d ||
+               in.opcode == 0x4e ||
                in.opcode == 0xb0 || in.opcode == 0xde || in.opcode == 0xdf;
     };
     auto float_lds_atomic = [](const Rdna2Inst& in) {
@@ -16696,11 +16697,13 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
             exact = words_are(ins[i + atomic], kAtomicWord0[atomic], kAtomicWord1[atomic]);
 
         bool found_lane0 = false;
+        uint32_t lane0_pc = UINT32_MAX;
         if (exact) {
             for (size_t j = i - 4; j-- > 0;) {
                 const Rdna2Inst& prefix = ins[j];
                 if (prefix.words[0] == 0xbefe0481u) { // s_mov_b64 exec, 1
                     found_lane0 = true;
+                    lane0_pc = prefix.pc;
                     for (size_t k = j + 1; k < i - 2; ++k) {
                         const Rdna2Inst& between = ins[k];
                         if (between.fmt == Rdna2Format::SOPP ||
@@ -16715,6 +16718,22 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
                 if (prefix.fmt == Rdna2Format::SOPP ||
                     rdna2_instruction_may_change_exec(prefix))
                     break;
+            }
+        }
+        if (found_lane0) {
+            const uint32_t last_store_pc = ins[i - 3].pc;
+            for (const Rdna2Inst& edge : ins) {
+                if (edge.pc >= lane0_pc || edge.fmt != Rdna2Format::SOPP ||
+                    edge.opcode < 0x02 || edge.opcode > 0x09 || edge.opcode == 0x03)
+                    continue;
+                const uint32_t target = branch_target(edge);
+                // The exact EXEC=1 writer must dominate both initializer stores. An edge from its
+                // prefix may target the writer itself, but entering after it can leave EXEC full
+                // and turn the supposedly single-writer OpStores into same-address races.
+                if (target > lane0_pc && target <= last_store_pc) {
+                    found_lane0 = false;
+                    break;
+                }
             }
         }
         if (!exact || !found_lane0) {
