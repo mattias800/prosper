@@ -909,6 +909,18 @@ struct SpirvCompute {
             {t_u32, first, uconst(Scope_Subgroup), GroupOp_Reduce, selected_lane});
         return sel(native_wave_any(mask_bit), first, uconst(0xffffffffu));
     }
+    uint32_t native_wave_popcount(uint32_t mask_bit) {
+        if (!native_subgroup_size || !mask_bit) return 0;
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        const uint32_t contribution = sel(mask_bit, uconst(1), uconst(0));
+        uint32_t result = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, result, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
+        return result;
+    }
     uint32_t native_compute_mbcnt(uint32_t mask_bit, uint32_t acc_bits, uint32_t lo) {
         if (!native_subgroup_size) return 0;
         const uint32_t lane = subgroup_local_id();
@@ -6501,16 +6513,47 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // A VOPC may write an arbitrary SGPR pair as a wave mask.  In the portable vertex
                 // shell that pair contains the one represented guest lane, so its exact population
                 // count is 0/1.  Ordinary data pairs retain full uint semantics and use two native
-                // OpBitCount operations.  Multi-lane mask reductions remain fail-closed here; their
-                // compute/fragment lowering needs a real wave reduction rather than scalar data.
+                // OpBitCount operations.  GTA's compute shaders also count EXEC, VCC, and saved
+                // VOPC masks.  Those are exact only when one native subgroup is the complete guest
+                // Wave64; a narrower or unknown host width would silently discard guest lanes.
+                // EXEC is tracked separately from scalar DATA.  Until the scalar count can be
+                // expanded into architectural EXEC bits, reject either EXEC destination for every
+                // source domain rather than only for the native-wave reduction below.
+                if (in.dst.value == 126 || in.dst.value == 127) {
+                    ok = false;
+                    return true;
+                }
                 uint32_t result = 0;
+                bool reduced_wave_mask = false;
                 auto mask = rs.sreg_bool.find(in.src[0].value);
-                if (!b.is_compute && !b.is_fragment && b.ngg_one_lane &&
-                    mask != rs.sreg_bool.end()) {
+                if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64) {
+                    const auto data_word_present = [&](int reg) {
+                        return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                    };
+                    const int source = in.src[0].value;
+                    const bool competing_data = data_word_present(source) ||
+                                                data_word_present(source + 1);
+                    uint32_t source_mask = 0;
+                    if (!competing_data && source == 126) {
+                        source_mask = rs.exec;
+                    } else if (!competing_data && source == 106) {
+                        source_mask = rs.vcc;
+                    } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
+                               !rs.sreg_bool_b32.contains(source) &&
+                               mask != rs.sreg_bool.end()) {
+                        source_mask = mask->second;
+                    }
+                    if (source_mask) {
+                        result = b.native_wave_popcount(source_mask);
+                        reduced_wave_mask = true;
+                    }
+                }
+                if (!reduced_wave_mask && !b.is_compute && !b.is_fragment && b.ngg_one_lane &&
+                           mask != rs.sreg_bool.end()) {
                     result = b.sel(mask->second, b.uconst(1), b.uconst(0));
-                } else {
+                } else if (!reduced_wave_mask) {
                     // A Boolean-domain pair is a whole wave mask, not two ordinary scalar dwords.
-                    // Only the byte-exact one-lane NGG projection above can reduce it locally.
+                    // Only the exact native-wave and one-lane NGG projections above can reduce it.
                     if (mask != rs.sreg_bool.end()) { ok = false; return true; }
                     auto scalar_half = [&](int reg, uint32_t& value) {
                         auto current = rs.sreg.find(reg);
@@ -6535,6 +6578,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     result = b.ibin(Op_IAdd, b.iun(Op_BitCount, lo), b.iun(Op_BitCount, hi));
                 }
+                // The result is ordinary scalar DATA regardless of whether its source was a wave
+                // mask or a scalar pair.  A one-dword write can overlap either half of a saved B64
+                // mask, so terminate both possible Boolean-domain aliases.  VCC has the same
+                // split-register hazard and must not retain an older implicit predicate.
+                const auto erase_mask_alias = [&](int base) {
+                    rs.sreg_bool.erase(base);
+                    rs.sreg_bool_narrowed.erase(base);
+                    rs.sreg_bool_b32.erase(base);
+                };
+                erase_mask_alias(in.dst.value);
+                if (in.dst.value > 0) erase_mask_alias(in.dst.value - 1);
+                if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
                 rs.sreg[in.dst.value] = result;
                 rs.sreg_srt.erase(in.dst.value);
                 // A B32 write to VCC_LO also replaces virtual lane zero's architectural mask bit.
