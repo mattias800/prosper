@@ -2139,6 +2139,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> null_chain_origin{};
     std::bitset<kFoldSgprs> null_chain_known;
     uint32_t next_null_chain_origin = 0;
+    // Null-pointer provenance carried by SCC between the low and high halves of an exact
+    // s_add_u32/s_addc_u32 pair. The concrete carry can be unknown after a failed null dereference;
+    // this records only that the high result still belongs to that null chain.
+    uint32_t null_count_carry_origin = 0;
     // Exact provenance for GTA V's RTIP 1.1 descriptor builder. A successful mapped x16 header
     // load seeds candidate qword origins; only the observed mask/lshl/load-count/bfe/carry/header
     // chain can turn one into a complete descriptor. This is deliberately separate from concrete
@@ -2375,6 +2379,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr8_key_known;
         std::array<uint32_t, kFoldSgprs> null_chain_origin;
         std::bitset<kFoldSgprs> null_chain_known;
+        uint32_t null_count_carry_origin;
         std::array<uint32_t, kFoldSgprs> bvh_build_origin;
         std::array<BvhBuildRole, kFoldSgprs> bvh_build_role;
         uint32_t bvh_count_carry_origin;
@@ -2415,6 +2420,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
         s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
+        s.null_count_carry_origin = null_count_carry_origin;
         s.bvh_build_origin = bvh_build_origin; s.bvh_build_role = bvh_build_role;
         s.bvh_count_carry_origin = bvh_count_carry_origin;
         s.reloaded = reloaded; s.mask_state = mask_state;
@@ -2431,6 +2437,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
         null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
+        null_count_carry_origin = s.null_count_carry_origin;
         bvh_build_origin = s.bvh_build_origin; bvh_build_role = s.bvh_build_role;
         bvh_count_carry_origin = s.bvh_count_carry_origin;
         reloaded = s.reloaded; mask_state = s.mask_state;
@@ -2852,6 +2859,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
                 if (in.opcode != 0x03 && in.opcode != 0x04) {
                     scc = -1;
+                    null_count_carry_origin = 0;
                     bvh_count_carry_origin = 0;
                 }
                 break;
@@ -2899,6 +2907,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 source_bvh_state(in.src[0], 0, bvh0_origin, bvh0_role);
                 source_bvh_state(in.src[1], 0, bvh1_origin, bvh1_role);
                 source_bvh_state(in.src[0], 1, bvh0_hi_origin, bvh0_hi_role);
+                const uint32_t previous_null_count_carry_origin = null_count_carry_origin;
                 const uint32_t previous_bvh_count_carry_origin = bvh_count_carry_origin;
                 // s_addc_u32 remains derived from the same pointer chain even when its concrete
                 // carry is unknown; the taint is provenance, not a claim about the folded value.
@@ -2914,6 +2923,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     else if (null0 && !null1 && kc) propagated_null_origin = null0;
                     else if (null1 && !null0 && ka) propagated_null_origin = null1;
                 }
+                // GTA V forms the high descriptor count with `s_add_u32 -1,null_value` followed by
+                // `s_addc_u32 -1,0`. The failed dereference intentionally makes the concrete SCC
+                // unknown, but the carry still depends exclusively on the same proven null chain.
+                // Keep this narrower than general SCC taint: accept only that exact constant pair.
+                if (in.opcode == 0x04u && previous_null_count_carry_origin && ka && kc &&
+                    ((a == UINT32_MAX && c == 0u) || (c == UINT32_MAX && a == 0u)))
+                    propagated_null_origin = previous_null_count_carry_origin;
                 if (ok) switch (in.opcode) {
                     case 0x00: {                                           // s_add_u32
                         const uint64_t sum = static_cast<uint64_t>(a) + c;
@@ -3043,6 +3059,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     mark_null_origin(d + 1, propagated_null_origin);
                 // Every SOP2 writes SCC, so a count carry survives only when this exact instruction
                 // creates it. Capture the old origin above for the following s_addc_u32.
+                null_count_carry_origin = 0;
+                if (in.opcode == 0x00u && propagated_null_origin &&
+                    ((null0 && kc && c == UINT32_MAX) ||
+                     (null1 && ka && a == UINT32_MAX)))
+                    null_count_carry_origin = propagated_null_origin;
                 bvh_count_carry_origin = 0;
                 if (ok) {
                     auto role_plus_constant = [&](BvhBuildRole wanted, uint32_t constant,
@@ -3099,6 +3120,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
+                null_count_carry_origin = 0;
                 bvh_count_carry_origin = 0;
                 uint32_t a, c;
                 bool ka = (in.src[0].kind == OperandKind::Literal) ? (a = in.literal, true) : srcval(in.src[0], a);
@@ -3461,6 +3483,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (!origin) origin = ++next_bvh_build_origin;
                         mark_bvh_build(sdst + (int)first, origin, BvhBuildRole::HeaderLo);
                         mark_bvh_build(sdst + (int)first + 1, origin, BvhBuildRole::HeaderHi);
+
+                        // A zero qword in the same successful header read is also an exact null
+                        // pointer. Give each pair its own origin so adjacent zero fields cannot be
+                        // spliced into one descriptor, then let only dependent scalar ALU retain it.
+                        if (mem[first] == 0u && mem[first + 1] == 0u) {
+                            uint32_t null_origin = ++next_null_chain_origin;
+                            if (!null_origin) null_origin = ++next_null_chain_origin;
+                            mark_null_origin(sdst + (int)first, null_origin);
+                            mark_null_origin(sdst + (int)first + 1, null_origin);
+                        }
                     }
                 }
                 if (!is_buffer && n == 2 && mem[0] == 0 && mem[1] == 0) {
@@ -4099,6 +4131,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
                 // confidently-wrong V# patch.
                 scc = -1;
+                null_count_carry_origin = 0;
                 bvh_count_carry_origin = 0;
                 if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
                 break;

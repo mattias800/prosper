@@ -1530,6 +1530,67 @@ int main() {
     CHECK(gta_unproven_pc1180_table.resources.empty(),
           "GTA pc1180 cannot materialize an ALU-modified historical x16 snapshot");
 
+    // The live pc1180 dispatch carries a null root in header qword s20:s21. Unlike the non-null
+    // positive above, its count dereference at pc1161 must fail; the exact scalar chain still proves
+    // that all four descriptor words derive from that one null qword. Keep the real EXEC writer and
+    // EXECZ branch, shortened only by replacing their distant merge body with NOPs.
+    alignas(8) std::array<uint32_t, 17> gta_null_bvh_header{};
+    const uint64_t gta_null_bvh_header_addr =
+        reinterpret_cast<uint64_t>(gta_null_bvh_header.data());
+    std::vector<uint32_t> gta_null_pc1180 = gta_bvh_pc1180;
+    gta_null_pc1180.resize(1489u, 0xbf800000u);
+    gta_null_pc1180[1099] = 0xbeca246au; // s_and_saveexec_b64 s[74:75],vcc
+    gta_null_pc1180[1100] = 0xbf880182u; // s_cbranch_execz pc1487
+    gta_null_pc1180[1185] = 0xbf800000u; // do not terminate before the guard merge
+    gta_null_pc1180[1487] = 0xbf800000u;
+    gta_null_pc1180[1488] = 0xbf810000u;
+    std::array<uint32_t, 78> gta_null_pc1180_seed{};
+    gta_null_pc1180_seed[76] = static_cast<uint32_t>(gta_null_bvh_header_addr);
+    gta_null_pc1180_seed[77] = static_cast<uint32_t>(gta_null_bvh_header_addr >> 32);
+    std::vector<SrtUse> gta_null_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_pc1180.data(), gta_null_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_pc1180_uses);
+    CHECK(gta_null_pc1180_uses.size() == 1 && gta_null_pc1180_uses[0].kind == 3 &&
+              gta_null_pc1180_uses[0].use_pc == 1180u,
+          "GTA pc1180 publishes its guarded x16-header null BVH use");
+    ShaderResourceTable gta_null_pc1180_table;
+    add_compute_buffer_resources(gta_null_pc1180_table, gta_null_pc1180.data(),
+                                 gta_null_pc1180.size(), gta_null_pc1180_seed.data(),
+                                 gta_null_pc1180_seed.size());
+    CHECK(gta_null_pc1180_table.resources.size() == 1 &&
+              gta_null_pc1180_table.resources[0].fetch_pc == 1180u &&
+              is_proven_null_bvh(gta_null_pc1180_table.resources[0]),
+          "GTA pc1180 materializes its guarded null root as a no-hit BVH marker");
+
+    std::vector<uint32_t> gta_null_offset_pc1180 = gta_null_pc1180;
+    gta_null_offset_pc1180[1108] = 0xfa000004u; // same x16 load, not the header-base site
+    std::vector<SrtUse> gta_null_offset_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_offset_pc1180.data(), gta_null_offset_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_offset_pc1180_uses);
+    CHECK(gta_null_offset_pc1180_uses.empty(),
+          "GTA pc1180 does not seed null provenance from a shifted x16 header load");
+
+    std::vector<uint32_t> gta_null_unproven_pc1180 = gta_null_pc1180;
+    gta_null_unproven_pc1180[1160] = 0x8f948318u; // s24:s25 is zero but not header-derived
+    std::vector<SrtUse> gta_null_unproven_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_unproven_pc1180.data(), gta_null_unproven_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_unproven_pc1180_uses);
+    CHECK(gta_null_unproven_pc1180_uses.empty(),
+          "GTA pc1180 rejects byte-identical nulls from an unproven qword");
+
+    std::vector<uint32_t> gta_null_unguarded_pc1180 = gta_null_pc1180;
+    gta_null_unguarded_pc1180[1100] = 0xbf800000u; // remove exact EXECZ region proof
+    std::vector<SrtUse> gta_null_unguarded_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_unguarded_pc1180.data(),
+                          gta_null_unguarded_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_unguarded_pc1180_uses);
+    CHECK(gta_null_unguarded_pc1180_uses.empty(),
+          "GTA pc1180 keeps an unguarded x16-header null BVH fail-visible");
+
     std::vector<uint32_t> gta_bvh_pc313(319u, 0xbf800000u); // s_nop 0
     put_words(gta_bvh_pc313, 244u, {0xf4100203u, 0xfa000000u});
     put_words(gta_bvh_pc313, 294u, {
