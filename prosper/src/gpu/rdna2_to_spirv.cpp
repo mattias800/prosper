@@ -6180,6 +6180,52 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
+            if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 &&
+                in.opcode == 0x14) { // s_ff1_i32_b64
+                // RDNA2 scans the complete 64-bit source from its least-significant bit and
+                // returns the first set index, or 0xffffffff for an empty mask.  The captured GTA
+                // compute sites feed EXEC, VCC, or a VOPC-saved mask pair into this scalar result.
+                // A required native Wave64 subgroup makes native_wave_first_active architectural;
+                // a 32-wide or unknown subgroup would silently lose bits 32..63.
+                const auto data_word_present = [&](int reg) {
+                    return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                };
+                const int source = in.src[0].value;
+                const bool competing_data = data_word_present(source) ||
+                    data_word_present(source + 1);
+                uint32_t mask = 0;
+                if (!competing_data && source == 126) {
+                    mask = rs.exec;
+                } else if (!competing_data && source == 106) {
+                    mask = rs.vcc;
+                } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
+                           !rs.sreg_bool_b32.contains(source)) {
+                    const auto saved = rs.sreg_bool.find(source);
+                    if (saved != rs.sreg_bool.end()) mask = saved->second;
+                }
+                if (!mask || in.dst.value == 126 || in.dst.value == 127) {
+                    ok = false;
+                    return true;
+                }
+
+                const uint32_t result = b.native_wave_first_active(mask);
+                rs.sreg[in.dst.value] = result;
+                rs.sreg_srt.erase(in.dst.value);
+
+                // S_FF1 writes ordinary 32-bit scalar DATA.  End every complete-mask lifetime
+                // overlapping that physical dword, including a pair rooted one register earlier;
+                // otherwise a later implicit predicate consumer could observe the pre-S_FF1 mask.
+                const auto erase_mask_alias = [&](int base) {
+                    rs.sreg_bool.erase(base);
+                    rs.sreg_bool_narrowed.erase(base);
+                    rs.sreg_bool_b32.erase(base);
+                };
+                erase_mask_alias(in.dst.value);
+                if (in.dst.value > 0) erase_mask_alias(in.dst.value - 1);
+                if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
+                // S_FF1 does not modify SCC.
+                return true;
+            }
             if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.opcode == 0x13) { // s_ff1_i32_b32
                 // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty
