@@ -7909,6 +7909,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x36: d = b.fext1(Glsl_Cos, b.fbin(Op_FMul, a, b.uconst(fbits(6.28318530717958647692f)))); break;
                 case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
                 case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
+                case 0x39: {                                         // v_ffbh_u32 (plain e32)
+                    // AMD RDNA2 ISA: count the zeroes preceding the first set bit from the MSB;
+                    // return -1 when no bit is set. GLSL.std.450 FindUMsb instead returns the SET
+                    // BIT INDEX (and all bits set at zero). OR bit zero in before calling it (which
+                    // leaves every nonzero input's highest bit unchanged), convert index -> count,
+                    // then explicitly select the architectural zero sentinel. GTA V uses the exact in-place
+                    // e32 packets 7e087304 / 7e047302 in its compute culling kernels.
+                    //
+                    // Keep SDWA out of this admission. The decoder's generic DWORD SDWA path can
+                    // carry NEG/ABS, which the VOP1 prologue above applies in the f32 domain; that
+                    // is not an integer source modifier and would silently change FFBH's operand.
+                    // DPP reaches and rejects in the stage-specific source-transform block above.
+                    if (in.has_sdwa || in.has_dpp) { ok = false; break; }
+                    const uint32_t safe = b.ibin(Op_BitwiseOr, a, b.uconst(1));
+                    const uint32_t leading_zeroes = b.ibin(
+                        Op_ISub, b.uconst(31), b.find_umsb(safe));
+                    d = b.sel(b.ucmp(Op_INotEqual, a, b.uconst(0)),
+                              leading_zeroes, b.uconst(0xffffffffu));
+                    break;
+                }
                 case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
                     // M0 is written by plain scalar ALU (s_mov/s_or m0, … decode dst as SGPR 124), so
                     // its per-invocation value lives in rs.sreg[124]. The source register NUMBER is
