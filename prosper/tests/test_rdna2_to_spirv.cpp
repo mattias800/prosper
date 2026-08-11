@@ -52,6 +52,20 @@ static size_t count_spirv_opcode(const std::vector<uint32_t>& spv, uint16_t opco
     }
     return matches;
 }
+static size_t count_spirv_composite_extract_index(const std::vector<uint32_t>& spv,
+                                                  uint32_t index) {
+    constexpr uint16_t OpCompositeExtract = 81;
+    size_t matches = 0;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return 0;
+        if ((spv[word] & 0xffffu) == OpCompositeExtract && count == 5 &&
+            spv[word + 4] == index)
+            ++matches;
+        word += count;
+    }
+    return matches;
+}
 static bool has_spirv_builtin(const std::vector<uint32_t>& spv, uint32_t builtin) {
     constexpr uint16_t OpDecorate = 71;
     constexpr uint32_t DecorationBuiltIn = 11;
@@ -1473,12 +1487,26 @@ int main() {
                              native_cfg17d).empty(),
           "GTA Wave64 VCC_LO scalar scratch resolves the live dispatcher ambiguity");
 
+    // GTA 0x205b654a00 pc114 uses another inline pair, 1/-1. The liveness proof, rather than the
+    // selected constants, is what makes this a low-only scalar lifetime.
+    const uint32_t code17d1_vcc_low_inline_pair[] = {
+        0xbe8f0380u, 0xbf08800fu,
+        0x856ac181u,              // exact pc114: s_cselect_b32 vcc_lo,1,-1
+        0x7e02026au,              // one-dword scalar consumer
+        0x7d840100u,              // complete VCC replacement
+        0xbf810000u,
+    };
+    CHECK(!recompile_compute(code17d1_vcc_low_inline_pair,
+                             std::size(code17d1_vcc_low_inline_pair), nullptr,
+                             native_cfg17d).empty(),
+          "Wave64 low-only VCC scalar select accepts GTA's 1/-1 inline pair");
+
     // Same-site packet mutation and a surviving implicit VCC read both remain fail-visible. The
-    // first prevents this byte-exact exception from silently becoming a general Wave64 bridge; the
+    // first changes an inline scalar source to a mask half at the production instruction; the
     // second proves the old high-half mask really must be dead, not merely unused by the assertion.
     const uint32_t code17d1_vcc_low_mutated[] = {
         0xbe8f0380u, 0xbf08800fu,
-        0x856a8381u,              // s_cselect_b32 vcc_lo,1,3 (mutated live packet)
+        0x856a6b81u,              // same-site mutation: src1 becomes VCC_HI mask state
         0x7e02026au, 0x7d840100u, 0xbf810000u,
     };
     const uint32_t code17d1_vcc_low_mask_live[] = {
@@ -1493,6 +1521,71 @@ int main() {
                                 std::size(code17d1_vcc_low_mask_live), nullptr,
                                 native_cfg17d).empty(),
           "Wave64 VCC_LO scalar exception rejects packet drift and a live high-half mask");
+
+    // GTA 0x205b5e8600 pc238/242 first defines scalar VCC_HI, then computes scalar VCC_LO from it.
+    // The irreducible tail forces a dispatcher reload, so map presence alone cannot make this pass:
+    // the Wave64 MUST analysis has to prove the sibling word before rebuilding the complete mask.
+    std::vector<uint32_t> code17d1_vcc_scalar_pair = {
+        0xbe8f0380u, 0xbf08800fu,
+        0x856b8081u,              // exact pc238: s_cselect_b32 vcc_hi,1,0
+        0xbf08800fu,              // exact pc240 role: re-arm SCC
+        0x876a6bfdu,              // exact pc242: s_and_b32 vcc_lo,scc,vcc_hi
+        0x7e02026au,              // scalar-data consumer of the new low word
+        0x7d840100u,              // complete VCC replacement
+    };
+    code17d1_vcc_scalar_pair.insert(
+        code17d1_vcc_scalar_pair.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> spv17d1_vcc_scalar_pair = recompile_compute(
+        code17d1_vcc_scalar_pair.data(), code17d1_vcc_scalar_pair.size(), nullptr,
+        native_cfg17d);
+    CHECK(!spv17d1_vcc_scalar_pair.empty(),
+          "Wave64 dispatcher rebuilds VCC from a proved complete scalar pair");
+    std::vector<uint32_t> code17d1_vcc_scalar_pair_mutated =
+        code17d1_vcc_scalar_pair;
+    code17d1_vcc_scalar_pair_mutated[4] =
+        0x877e6bfdu;              // same-site mutation: destination VCC_LO -> EXEC_LO
+    CHECK(recompile_compute(code17d1_vcc_scalar_pair_mutated.data(),
+                            code17d1_vcc_scalar_pair_mutated.size(), nullptr,
+                            native_cfg17d).empty(),
+          "Wave64 complete-pair bridge rejects a same-site destination mutation");
+
+    // GTA 0x205b658800 spills EXEC_LO/HI through v31 lanes 5/6, then restores each as ordinary
+    // scalar data for V_AND_B32. The dispatcher Bool slots retain the mask value but not its physical
+    // half, so a separate MUST proof has to select ballot .x/.y at the exact readlane PCs.
+    std::vector<uint32_t> code17d1_mask_half_spill = {
+        0xd761001fu, 0x00010c7fu, // exact pc95:  v_writelane v31,exec_hi,6
+        0xd761001fu, 0x00010a7eu, // exact pc106: v_writelane v31,exec_lo,5
+        0xd7600006u, 0x00010b1fu, // exact pc261: v_readlane s6,v31,5
+        0x36023006u,              // exact pc263: v_and_b32 v1,s6,v24
+        0xd7600006u, 0x00010d1fu, // exact pc264: v_readlane s6,v31,6
+        0x36043206u,              // exact pc266: v_and_b32 v2,s6,v25
+    };
+    code17d1_mask_half_spill.insert(
+        code17d1_mask_half_spill.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> spv17d1_mask_half_spill = recompile_compute(
+        code17d1_mask_half_spill.data(), code17d1_mask_half_spill.size(), nullptr,
+        native_cfg17d);
+    CHECK(!spv17d1_mask_half_spill.empty() &&
+              count_spirv_opcode(spv17d1_mask_half_spill, 339) ==
+                  count_spirv_opcode(native_spv17d, 339) + 2 &&
+              count_spirv_composite_extract_index(spv17d1_mask_half_spill, 0) ==
+                  count_spirv_composite_extract_index(native_spv17d, 0) + 1 &&
+              count_spirv_composite_extract_index(spv17d1_mask_half_spill, 1) ==
+                  count_spirv_composite_extract_index(native_spv17d, 1) + 1,
+          "Wave64 readlane spills materialize exact low and high ballot dwords");
+    ComputeShaderConfig portable_cfg17d1_mask_half = native_cfg17d;
+    portable_cfg17d1_mask_half.native_subgroup_size = 0;
+    std::vector<uint32_t> code17d1_mask_half_spill_mutated =
+        code17d1_mask_half_spill;
+    code17d1_mask_half_spill_mutated[5] =
+        0x0001051fu;              // same-site mutation: read unwritten v31 lane 2
+    CHECK(recompile_compute(code17d1_mask_half_spill.data(),
+                            code17d1_mask_half_spill.size(), nullptr,
+                            portable_cfg17d1_mask_half).empty() &&
+              recompile_compute(code17d1_mask_half_spill_mutated.data(),
+                                code17d1_mask_half_spill_mutated.size(), nullptr,
+                                native_cfg17d).empty(),
+          "Wave64 mask-half spills reject portable execution and an unwritten-lane mutation");
     ComputeShaderConfig native_cfg17d1;
     native_cfg17d1.local_x = 64;
     native_cfg17d1.wave_size = 32;
