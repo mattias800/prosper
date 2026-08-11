@@ -6481,6 +6481,14 @@ int main() {
               got68_zero_format.size() == N && bad68_zero_format == 0,
           "exact zero-record FORMAT load preserves masked VGPR lanes");
 
+    ShaderResourceTable rt68_zero_format_one;
+    ShaderResource zero_record_format_one = zero_record_resource(67);
+    zero_record_format_one.swizzle[0] = 1u; // SQ_SEL_1: OOB result is one, never zero
+    rt68_zero_format_one.resources.push_back(zero_record_format_one);
+    CHECK(recompile_valu(code68_zero_format.data(), code68_zero_format.size(), 2, 17,
+                         &rt68_zero_format_one).empty(),
+          "zero-record FORMAT marker rejects SQ_SEL_1 instead of emitting a wrong zero");
+
     ShaderResourceTable rt68_zero_store;
     rt68_zero_store.resources.push_back(zero_record_resource(2));
     const std::vector<uint32_t> spv68_zero_store = recompile_valu(

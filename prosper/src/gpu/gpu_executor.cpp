@@ -2012,6 +2012,36 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
 // value that would depend on a VGPR/lane is left unknown (the op's dest becomes unknown), so we never
 // fabricate a per-lane-dependent descriptor. CONFIDENCE: MED (covers this game's fetch-shader shape).
 // External linkage (DynFetch + declaration in gpu_execute.hpp) so the fold is unit-testable.
+static bool zero_record_sbuffer_access_is_oob(const Rdna2Inst& in,
+                                              const DecodedBufferDescriptor& descriptor) {
+    if (in.fmt != Rdna2Format::SMEM || in.opcode < 0x8u || in.opcode > 0xCu ||
+        descriptor.num_records != 0u || descriptor.size_bytes != 0u ||
+        static_cast<int32_t>(in.literal) < 0)
+        return false;
+
+    // Scalar-buffer bounds differ from vector-buffer bounds when STRIDE=0: hardware substitutes a
+    // one-dword M_SIZE instead of using NUM_RECORDS directly. SOFFSET is unsigned, so the immediate
+    // names the minimum possible dword. Only specialize when even that minimum begins out of range.
+    const uint32_t scalar_dwords = descriptor.stride == 0u ? 1u : descriptor.num_records;
+    const uint32_t minimum_dword = in.literal >> 2;
+    return minimum_dword >= scalar_dwords;
+}
+
+static bool zero_record_format_selectors_are_zero(const Rdna2Inst& in,
+                                                   const uint32_t descriptor_words[4]) {
+    if (in.fmt != Rdna2Format::MUBUF || in.opcode > 0x3u)
+        return false;
+    const uint32_t components = in.opcode + 1u;
+    for (uint32_t component = 0; component < components; ++component) {
+        const uint32_t selector = (descriptor_words[3] >> (component * 3u)) & 0x7u;
+        // SQ_SEL_0 and X/Y/Z/W all yield zero for an OOB record. SQ_SEL_1 yields one; 2/3 are
+        // reserved and stay fail-closed rather than acquiring an invented constant value.
+        if (selector != 0u && selector < 4u)
+            return false;
+    }
+    return true;
+}
+
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
@@ -3234,12 +3264,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (n != 0 && live_sbase_vsharp_known) {
                     const DecodedBufferDescriptor d =
                         decode_buffer_descriptor(live_sbase_vsharp.data());
-                    if (d.num_records == 0u && d.size_bytes == 0u) {
-                        // A zero-record V# makes every S_BUFFER_LOAD address OOB, including one whose
-                        // SOFFSET comes from a wave value the CPU fold cannot know. Publish the outer
-                        // descriptor at this exact pc so the SPIR-V emitter can remove the memory
-                        // access, and make the result itself exact zero so a descriptor loaded through
-                        // it remains provably empty at a later MUBUF consumer.
+                    if (zero_record_sbuffer_access_is_oob(in, d)) {
+                        // This exact scalar access begins beyond the descriptor's effective M_SIZE,
+                        // including at the minimum value of a wave-derived SOFFSET. Publish the outer
+                        // descriptor at this pc so the SPIR-V emitter can remove the memory access,
+                        // and make the result exact zero so a descriptor loaded through it remains
+                        // provably empty at a later MUBUF consumer.
                         if (srt_uses && have_pending_srt_use) {
                             pending_srt_use.zero_record_raw = true;
                             pending_srt_use.required_size = 0;
@@ -3831,8 +3861,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // as one all-or-nothing access. Preserve that proof at this exact consumer pc.
                         // MTBUF, format stores, unsupported atomics, and an addr0 descriptor with
                         // nonzero records remain outside the marker contract.
+                        const bool zero_record_format =
+                            format_load_use && zero_record_format_selectors_are_zero(in, u.v4.data());
                         const bool zero_record_raw =
-                            (format_load_use || raw_buffer_use || atomic_buffer_use) &&
+                            (zero_record_format || raw_buffer_use || atomic_buffer_use) &&
                             d.num_records == 0u && d.size_bytes == 0u;
                         if (zero_record_raw || (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
@@ -4305,6 +4337,16 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             if (u.instruction_format != UINT32_MAX || d.num_records != 0u ||
                 d.size_bytes != 0u || u.required_size != 0u)
                 continue;
+            if (u.use_pc >= dwords)
+                continue;
+            const Rdna2Inst marker_consumer =
+                rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
+            if (marker_consumer.fmt == Rdna2Format::SMEM &&
+                !zero_record_sbuffer_access_is_oob(marker_consumer, d))
+                continue;
+            if (marker_consumer.fmt == Rdna2Format::MUBUF && marker_consumer.opcode <= 0x3u &&
+                !zero_record_format_selectors_are_zero(marker_consumer, u.v4.data()))
+                continue;
             ShaderResource r;
             r.cls = ResourceClass::ConstantBuffer;
             r.format = DataFormat::Unknown;
@@ -4315,6 +4357,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             r.srt_offset = 0xFFFFFFFFu;
             r.sgpr_base = 0xFFFFFFFFu;
             r.fetch_pc = u.use_pc;
+            for (uint32_t component = 0; component < 4u; ++component)
+                r.swizzle[component] = (u.v4[3] >> (component * 3u)) & 0x7u;
             table.resources.push_back(r);
             continue;
         }

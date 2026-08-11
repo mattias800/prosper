@@ -210,12 +210,12 @@ struct SrtUse {
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     std::array<uint32_t, 4> bvh4{};  // BVH descriptor dwords live at IMAGE_BVH_INTERSECT_RAY (kind 2)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
-    // Fully-known V# whose NUM_RECORDS is zero. This covers scalar buffer loads, ordinary RAW
-    // loads/stores, the exact format-load shapes admitted by the producer, and the emitter-supported
-    // 32-bit atomic set; unsupported shapes remain fail-closed. It is distinct from the scalar-SMEM
-    // raw-pointer convention, where a zero decoded size means "unbounded" and required_size supplies
-    // the proven access span. Only resolve_dynamic_fetch may set this after decoding all four live
-    // descriptor words at the exact consuming instruction.
+    // Fully-known V# whose NUM_RECORDS is zero. This covers scalar buffer loads proven to begin beyond
+    // their effective scalar bound, ordinary RAW loads/stores, format loads whose selected OOB values
+    // are all zero, and the emitter-supported 32-bit atomic set; unsupported shapes remain fail-closed.
+    // It is distinct from the scalar-SMEM raw-pointer convention, where a zero decoded size means
+    // "unbounded" and required_size supplies the proven access span. Only resolve_dynamic_fetch may set
+    // this after decoding all four live descriptor words at the exact consuming instruction.
     bool zero_record_raw = false;
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)

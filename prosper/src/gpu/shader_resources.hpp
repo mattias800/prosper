@@ -456,10 +456,10 @@ inline bool is_proven_null_bvh(const ShaderResource& resource) {
 }
 
 // Exact-PC marker for a fully-known buffer descriptor with NUM_RECORDS=0. Such a descriptor has
-// architectural zero-read/drop-write behavior for the admitted scalar, raw, format-load, and atomic
-// operations, regardless of its base, so it deliberately has no guest or host backing. The unusual
-// Unknown/zero-component shape keeps it distinct from an ordinary explicit null buffer and survives
-// capture/replay without adding a serialized descriptor field.
+// architectural zero-read/drop-write behavior for the admitted bounded scalar, raw, format-load, and
+// atomic operations, regardless of its base, so it deliberately has no guest or host backing. The
+// unusual Unknown/zero-component shape keeps it distinct from an ordinary explicit null buffer and
+// survives capture/replay without adding a serialized descriptor field.
 inline bool is_zero_record_raw_buffer(const ShaderResource& resource) {
     return resource.cls == ResourceClass::ConstantBuffer &&
            resource.format == DataFormat::Unknown && resource.num_components == 0u &&

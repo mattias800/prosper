@@ -2127,8 +2127,9 @@ int main() {
 
     // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
     // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
-    // has NUM_RECORDS=0, so every possible access is OOB: publish a marker for the scalar load itself,
-    // propagate four exact zero dwords, and let the exact raw-MUBUF consumer publish its own marker.
+    // has NUM_RECORDS=0, while the positive immediate begins beyond its effective scalar bound: publish
+    // a marker for the scalar load itself, propagate four exact zero dwords, and let the exact raw-MUBUF
+    // consumer publish its own marker.
     // These are the live scalar-load and first consumer packets (relocated to pc1/pc3 in the fixture).
     const uint32_t zero_record_sbuffer_chain[] = {
         0x7ed40500u,              // v_readfirstlane_b32 vcc_lo, v0 (runtime-uniform, fold-unknown)
@@ -2259,6 +2260,30 @@ int main() {
                                 &one_record_sbuffer_table,
                                 one_record_sbuffer_config).empty(),
           "base-zero one-record scalar-load chain stays unresolved");
+
+    // NUM_RECORDS=0 does not by itself make a stride-zero scalar descriptor empty: scalar SMEM uses
+    // an effective one-dword M_SIZE. With immediate zero the first dword remains in range, so the
+    // unknown SOFFSET prevents folding and neither the scalar load nor its consumer gets a marker.
+    const uint32_t zero_record_sbuffer_at_zero[] = {
+        0x7ed40500u,
+        0xf4280202u, 0xd4000000u,
+        0xe0382000u, 0x80020006u,
+        0xbf810000u,
+    };
+    ShaderResourceTable zero_record_sbuffer_at_zero_table;
+    const std::vector<SrtUse> zero_record_sbuffer_at_zero_uses = add_compute_buffer_resources(
+        zero_record_sbuffer_at_zero_table, zero_record_sbuffer_at_zero,
+        std::size(zero_record_sbuffer_at_zero), zero_record_sbuffer_seed,
+        std::size(zero_record_sbuffer_seed));
+    CHECK(zero_record_sbuffer_at_zero_table.resources.empty() &&
+              std::none_of(zero_record_sbuffer_at_zero_uses.begin(),
+                           zero_record_sbuffer_at_zero_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              recompile_compute(zero_record_sbuffer_at_zero,
+                                std::size(zero_record_sbuffer_at_zero),
+                                &zero_record_sbuffer_at_zero_table,
+                                zero_record_sbuffer_config).empty(),
+          "stride-zero zero-record scalar load at immediate zero stays unresolved");
 
     // Evergate's title PS uses a bounded PC-relative dispatch. An omitted alternative reloads the
     // same T# SGPRs that the selected arm consumes directly; a linear fold used to walk that reload
@@ -2447,6 +2472,9 @@ int main() {
               zero_record_format_uses[0].zero_record_raw &&
               zero_record_format_table.resources.size() == 1 &&
               is_zero_record_raw_buffer(zero_record_format_table.resources[0]) &&
+              std::all_of(std::begin(zero_record_format_table.resources[0].swizzle),
+                          std::end(zero_record_format_table.resources[0].swizzle),
+                          [](uint32_t selector) { return selector == 0u; }) &&
               zero_record_format_table.by_fetch_pc(67) &&
               !recompile_compute(zero_record_format_load.data(), zero_record_format_load.size(),
                                  &zero_record_format_table,
@@ -2461,6 +2489,19 @@ int main() {
         one_record_format_seed, std::size(one_record_format_seed));
     CHECK(one_record_format_uses.empty() && one_record_format_table.resources.empty(),
           "exact GTA V pc67 FORMAT load keeps base-zero one-record V# unresolved");
+
+    // SQ_SEL_1 is the other zero-record boundary: an OOB FORMAT component selected as constant one
+    // does not have an all-zero result. It must not acquire the no-backing zero marker.
+    uint32_t one_selector_format_seed[4]{};
+    one_selector_format_seed[3] = 1u; // DST_SEL_X = SQ_SEL_1
+    ShaderResourceTable one_selector_format_table;
+    const std::vector<SrtUse> one_selector_format_uses = add_compute_buffer_resources(
+        one_selector_format_table, zero_record_format_load.data(), zero_record_format_load.size(),
+        one_selector_format_seed, std::size(one_selector_format_seed));
+    CHECK(one_selector_format_table.resources.empty() &&
+              std::none_of(one_selector_format_uses.begin(), one_selector_format_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }),
+          "zero-record FORMAT load with SQ_SEL_1 stays unresolved");
 
     // Astro Bot's 7f5f world-map NGG shader patches only NUM_RECORDS in its direct s[16:19] V#
     // (`s_mov_b32 s18, 1`) before a raw buffer_load_dwordx4 at pc2761. The consumer is itself the
