@@ -83,7 +83,7 @@ enum : uint32_t {
     Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQuerySize=104,
     Op_ImageQueryLod=105, Op_ImageQueryLevels=106,
-    Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicExchange=229, Op_AtomicIAdd=234,
+    Op_TypeArray=28, Op_ControlBarrier=224, Op_MemoryBarrier=225, Op_AtomicExchange=229, Op_AtomicIAdd=234,
     Op_AtomicISub=235,
     Op_AtomicSMin=236, Op_AtomicUMin=237, Op_AtomicSMax=238, Op_AtomicUMax=239,
     Op_AtomicAnd=240, Op_AtomicOr=241, Op_AtomicXor=242,
@@ -134,10 +134,13 @@ enum : uint32_t {
     ImgFmt_R32ui=kSpirvImageFormatR32ui, // exact uint32 storage image format required by image atomics
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
+    MemSem_UniformRelease=0x44,                          // Release | UniformMemory
     MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage-buffer/LDS AcquireRelease semantics
     MemSem_ImageAcqRel=0x808,                            // AcquireRelease | ImageMemory
+    MemAccess_Volatile=0x1,
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoPerspective=13, Dec_Flat=14,
-    Dec_Centroid=16, Dec_Sample=17, Dec_Location=30, Dec_Binding=33,
+    Dec_Centroid=16, Dec_Sample=17, Dec_Aliased=20, Dec_Coherent=23,
+    Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     // Decoration 5300 -- descriptor indexing's NonUniform, unrelated to the GroupNonUniform ops.
     Dec_NonUniform=5300,
@@ -331,6 +334,7 @@ struct SpirvCompute {
     // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
     std::map<uint32_t, StorageBufferTailSemantic> cbuf_zero_pad_candidates;
     std::set<uint32_t> cbuf_ordinary_accesses;
+    std::set<uint32_t> cbuf_coherent_vars;
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_vertex=0;                            // true in every vertex shell
     bool     allow_b32_masks=0;                      // proven Wave32 or byte-exact graphics exception
@@ -790,6 +794,15 @@ struct SpirvCompute {
         uint32_t result = id();
         put(code, Op_Load, {t_bool, result, v_helper_invocation});
         return result;
+    }
+    // Distinct guest descriptors can name the same allocation. Under the GLSL450 memory model,
+    // separate StorageBuffer variables otherwise promise non-aliasing to the SPIR-V consumer. The
+    // runtime binding addresses are deliberately absent from the shader cache key, so every external
+    // guest-backed buffer declaration must retain the possibility of aliasing. Internal GDS uses its
+    // own host allocation and intentionally does not go through this helper.
+    void declare_external_storage_buffer(uint32_t pointer_type, uint32_t variable) {
+        put(types, Op_Variable, {pointer_type, variable, SC_StorageBuffer});
+        put(deco, Op_Decorate, {variable, Dec_Aliased});
     }
     void declare_internal_gds(uint32_t set = 1, uint32_t binding = 0) {
         if (v_internal_gds) return;
@@ -1913,6 +1926,15 @@ struct SpirvCompute {
         if (binding == 3) return v_cbuf1;
         auto it = cbuf_var.find(binding); return it != cbuf_var.end() ? it->second : v_cbuf;
     }
+    void mark_cbuf_coherent(uint32_t binding) {
+        const uint32_t buf = buf_for_binding(binding);
+        if (cbuf_coherent_vars.insert(buf).second)
+            put(deco, Op_Decorate, {buf, Dec_Coherent});
+    }
+    void device_uniform_release_barrier() {
+        put(code, Op_MemoryBarrier,
+            {uconst(Scope_Device), uconst(MemSem_UniformRelease)});
+    }
     // Load one dword (raw bits) from the constant/vertex buffer at descriptor `binding` at dword index
     // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
     // THE only place a storage-buffer element pointer is built. There were FOUR identical
@@ -1950,38 +1972,46 @@ struct SpirvCompute {
         putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, uconst(0), idx});
         return ptr;
     }
-    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding) {
+    uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding, bool coherent_access) {
         uint32_t buf = buf_for_binding(binding);
+        if (coherent_access) mark_cbuf_coherent(binding);
         uint32_t p = cbuf_element_ptr(buf, binding, idx);
-        uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+        uint32_t r = id();
+        if (coherent_access) put(code, Op_Load, {t_u32, r, p, MemAccess_Volatile});
+        else                 put(code, Op_Load, {t_u32, r, p});
+        return r;
     }
-    uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2) {
+    uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
-        return cbuf_load_impl(idx, binding);
+        return cbuf_load_impl(idx, binding, coherent_access);
     }
     uint32_t cbuf_load_zero_padded_tail(uint32_t binding,
-                                        StorageBufferTailSemantic semantic) {
+                                        StorageBufferTailSemantic semantic,
+                                        bool coherent_access = false) {
         auto [candidate, inserted] = cbuf_zero_pad_candidates.emplace(binding, semantic);
         if (!inserted && candidate->second != semantic)
             cbuf_ordinary_accesses.insert(binding);
-        return cbuf_load_impl(uconst(0), binding);
+        return cbuf_load_impl(uconst(0), binding, coherent_access);
     }
     // Store one dword `value` to the buffer at descriptor `binding` at dword index `idx` (MUBUF store).
     // When `predicated`, the store is wrapped in a selection merge on `pred` (the per-lane EXEC bool) so
     // inactive lanes do not write — a real conditional store, not a select of a loaded old value.
-    void cbuf_store(uint32_t idx, uint32_t value, uint32_t binding, bool predicated, uint32_t pred) {
+    void cbuf_store(uint32_t idx, uint32_t value, uint32_t binding, bool predicated,
+                    uint32_t pred, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
         uint32_t buf = buf_for_binding(binding);
-        if (!predicated) {
+        if (coherent_access) mark_cbuf_coherent(binding);
+        auto emit = [&]() {
             uint32_t p = cbuf_element_ptr(buf, binding, idx);
-            put(code, Op_Store, {p, value}); return;
-        }
+            if (coherent_access) put(code, Op_Store, {p, value, MemAccess_Volatile});
+            else                 put(code, Op_Store, {p, value});
+        };
+        if (!predicated) { emit(); return; }
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
         put(code, Op_Label, {then}); cur_block = then;
-        uint32_t p = cbuf_element_ptr(buf, binding, idx);
-        put(code, Op_Store, {p, value});
+        emit();
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
     }
@@ -2033,7 +2063,7 @@ struct SpirvCompute {
         const uint32_t variable = id();
         put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {variable, Dec_Binding, binding});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, variable, SC_StorageBuffer});
+        declare_external_storage_buffer(t_ptr_sb_struct_u, variable);
         cbuf_var[binding] = variable;
         atomic_img_buf_bindings.insert(binding);
         return true;
@@ -2401,7 +2431,7 @@ struct SpirvCompute {
             else                            put(types, Op_TypeArray, {arr, t_struct_u, uconst(arity)});
             const uint32_t arr_ptr = id();
             put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
-            put(types, Op_Variable, {arr_ptr, var, SC_StorageBuffer});
+            declare_external_storage_buffer(arr_ptr, var);
             cbuf_table_arity[binding] = arity;
             const uint32_t sgpr = index_sgpr_for(binding);
             if (sgpr != 0xFFFFFFFFu) cbuf_table_index_sgpr[binding] = sgpr;
@@ -2421,9 +2451,9 @@ struct SpirvCompute {
         // is still fail-visible, not silently wrong -- but "loud" here means a dropped draw, not a
         // validator, and nothing reports it as a type error at the point the mistake was made.
         if (arity2) declare_as_array(2, v_cbuf, arity2);
-        else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
+        else        declare_external_storage_buffer(t_ptr_sb_struct_u, v_cbuf);
         if (arity3) declare_as_array(3, v_cbuf1, arity3);
-        else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
+        else        declare_external_storage_buffer(t_ptr_sb_struct_u, v_cbuf1);
         put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
         cbuf_var[2] = v_cbuf; cbuf_var[3] = v_cbuf1;
         // N-buffer model: declare an additional storage buffer for each distinct constant/vertex buffer
@@ -2460,14 +2490,14 @@ struct SpirvCompute {
                     }
                     const uint32_t arr_ptr = id();
                     put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
-                    put(types, Op_Variable, {arr_ptr, v, SC_StorageBuffer});
+                    declare_external_storage_buffer(arr_ptr, v);
                     cbuf_var[r.binding] = v;
                     cbuf_table_arity[r.binding] = r.table_index_count;
                     if (r.table_index_sgpr != 0xFFFFFFFFu)
                         cbuf_table_index_sgpr[r.binding] = r.table_index_sgpr;
                     continue;
                 }
-                put(types, Op_Variable, {t_ptr_sb_struct_u, v, SC_StorageBuffer});
+                declare_external_storage_buffer(t_ptr_sb_struct_u, v);
                 cbuf_var[r.binding] = v;
             }
         }
@@ -2566,8 +2596,8 @@ struct SpirvCompute {
         put(types, Op_TypeRuntimeArray, {t_rta, t_f32});
         put(types, Op_TypeStruct, {t_struct, t_rta});
         put(types, Op_TypePointer, {t_ptr_sb_struct, SC_StorageBuffer, t_struct});
-        put(types, Op_Variable, {t_ptr_sb_struct, v_in, SC_StorageBuffer});
-        put(types, Op_Variable, {t_ptr_sb_struct, v_out, SC_StorageBuffer});
+        declare_external_storage_buffer(t_ptr_sb_struct, v_in);
+        declare_external_storage_buffer(t_ptr_sb_struct, v_out);
         put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer, t_f32});
         declare_cbufs(rt); // scalar-memory buffers, including table-assigned bindings beyond 2/3
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
@@ -7588,14 +7618,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     break;
                 }
-                // s_waitcnt_vscnt/vmcnt/expcnt/lgkmcnt: wait-for-counter — benign no-ops in our
-                // synchronous model (like SOPP s_waitcnt). These are SOPK on gfx10, NOT SOPP 0x7d
-                // as previously claimed (that case was unreachable dead code, and a real
-                // s_waitcnt_vscnt — routinely emitted after buffer/image stores — failed the whole
-                // shader recompile via this default). VERIFIED(round-trip llvm-mc gfx1010):
+                // Scalar wait counters are SOPK on gfx10, NOT SOPP 0x7d. Loads/stores themselves
+                // are synchronous SSA operations in SPIR-V, so vmcnt/expcnt/lgkmcnt remain no-ops.
+                // A completed vscnt(0), however, is also the guest's publication point: GTA V writes
+                // scan data, waits for those stores, then writes a ready flag that other workgroups
+                // poll. Preserve that device-wide UniformMemory ordering with a release barrier.
+                // VERIFIED(round-trip llvm-mc gfx1010):
                 // vscnt=0xBBFD0000 (op 0x17), vmcnt=0xBC7D0000 (0x18), expcnt=0xBCFD0000 (0x19),
                 // lgkmcnt=0xBD7D0000 (0x1A).
-                case 0x17: case 0x18: case 0x19: case 0x1A: break;
+                case 0x17:
+                    if (in.dst.kind == OperandKind::SGPR && in.dst.value == 125 &&
+                        in.simm16 == 0)
+                        b.device_uniform_release_barrier();
+                    break;
+                case 0x18: case 0x19: case 0x1A: break;
                 default: ok = false;
             }
             return true;
@@ -9872,6 +9908,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+            // GLC/DLC ordinary loads must observe device-visible writes rather than a cached value;
+            // GLC ordinary stores publish through the device cache. Atomics retain their existing
+            // Device/AcquireRelease operands and GLC's separate return-pre-op-value contract below.
+            const bool coherent_load = !is_store && !is_atomic &&
+                                       (in.mubuf_glc || in.mubuf_dlc);
+            const bool coherent_store = is_store && in.mubuf_glc;
             // PC-relative EMBEDDED TABLE (#273): this load's V# was built from s_getpc_b64 and the
             // table bytes live inside the shader blob — detect_pcrel_tables already copied them out.
             // Fold to a compile-time constant lookup: dword index = (inst offset + offen VADDR) >> 2;
@@ -10233,6 +10275,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 addr = b.ibin(Op_IAdd, addr, val(in.src[2]));          // SOFFSET
             }
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            // Keep the instruction's cache policy at one ordinary-load propagation site. Every raw,
+            // typed, packed, and dynamically addressed component below consumes dwords through this
+            // wrapper, so adding another format shape cannot accidentally drop GLC/DLC semantics.
+            auto load_dword = [&](uint32_t dword_idx) {
+                return b.cbuf_load(dword_idx, binding, coherent_load);
+            };
             if (is_atomic) {
                 const int d = in.dst.value;
                 const uint32_t old = vreg_old(b, rs, d);
@@ -10248,6 +10296,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             if (is_store) {
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+                if (coherent_store) b.mark_cbuf_coherent(binding);
+                // As with loads, keep Volatile propagation shared by raw and packed ordinary stores.
+                auto store_dword = [&](uint32_t dword_idx, uint32_t value) {
+                    b.cbuf_store(dword_idx, value, binding, rs.exec_narrowed, rs.exec,
+                                 coherent_store);
+                };
                 if (dyn_int_store) {
                     // Integer sub-dword store: clear then set THIS lane's disjoint field of the containing
                     // dword with two atomics. Disjoint fields commute (And clears only this field's bits,
@@ -10287,7 +10341,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Raw/Float32/Uint32: one dword per component.
                     for (uint32_t k = 0; k < store_n; k++) {
                         uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
-                        b.cbuf_store(kidx, vread(in.dst.value + (int)k), binding, rs.exec_narrowed, rs.exec);
+                        store_dword(kidx, vread(in.dst.value + (int)k));
                     }
                 } else {
                     // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
@@ -10305,7 +10359,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             acc = b.ibin(Op_BitwiseOr, acc, field);
                         }
                         uint32_t did = d ? b.ibin(Op_IAdd, idx, b.uconst(d)) : idx;
-                        b.cbuf_store(did, acc, binding, rs.exec_narrowed, rs.exec);
+                        store_dword(did, acc);
                     }
                 }
                 return true;
@@ -10327,7 +10381,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     value = b.uconst(in.fmt != Rdna2Format::MTBUF && k == 3 ? one : 0u);
                 } else if (one_record_16bit_tail) {
                     const uint32_t packed_value = b.cbuf_load_zero_padded_tail(
-                        binding, one_record_tail_semantic);
+                        binding, one_record_tail_semantic, coherent_load);
                     const uint32_t in_bounds = b.ucmp(
                         Op_IEqual, val(in.src[0]), b.uconst(0));
                     const uint32_t typed_value =
@@ -10339,12 +10393,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Raw byte/short loads use their full byte address, unlike typed packed-format
                     // loads whose component packing is descriptor-defined. A 16-bit access may begin
                     // at byte 3 and straddle two dwords, so join the adjacent words before extracting.
-                    const uint32_t dw0 = b.cbuf_load(idx, binding);
+                    const uint32_t dw0 = load_dword(idx);
                     const uint32_t byte_in_dw = b.ibin(Op_BitwiseAnd, addr, b.uconst(3));
                     const uint32_t shift = b.ibin(Op_ShiftLeftLogical, byte_in_dw, b.uconst(3));
                     uint32_t joined = b.ibin(Op_ShiftRightLogical, dw0, shift);
                     if (raw_bits == 16) {
-                        const uint32_t dw1 = b.cbuf_load(b.ibin(Op_IAdd, idx, b.uconst(1)), binding);
+                        const uint32_t dw1 = load_dword(
+                            b.ibin(Op_IAdd, idx, b.uconst(1)));
                         const uint32_t inv_shift = b.ibin(
                             Op_BitwiseAnd,
                             b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
@@ -10358,12 +10413,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         : b.bfe_u(joined, b.uconst(0), b.uconst(raw_bits));
                 } else if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
-                    value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
+                    value = load_dword(kidx);  // raw 32-bit component
                 } else if (packed_word) {
                     // All requested components share one packed dword. GFX10 names layouts from high
                     // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
                     // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
-                    uint32_t dw = b.cbuf_load(idx, binding);
+                    uint32_t dw = load_dword(idx);
                     uint32_t boff = packed_10_11_11 ? (k == 0 ? 0u : k == 1 ? 11u : 22u)
                                                     : (k == 0 ? 0u : k == 1 ? 10u : k == 2 ? 20u : 30u);
                     uint32_t bits = packed_10_11_11 ? (k < 2 ? 11u : 10u) : (k < 3 ? 10u : 2u);
@@ -10386,8 +10441,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                     const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
                                                   b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
-                    uint32_t joined = b.ibin(Op_ShiftRightLogical, b.cbuf_load(cidx, binding), shift);
-                    const uint32_t dw1 = b.cbuf_load(b.ibin(Op_IAdd, cidx, b.uconst(1)), binding);
+                    uint32_t joined = b.ibin(
+                        Op_ShiftRightLogical, load_dword(cidx), shift);
+                    const uint32_t dw1 = load_dword(
+                        b.ibin(Op_IAdd, cidx, b.uconst(1)));
                     const uint32_t inv_shift = b.ibin(Op_BitwiseAnd,
                         b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
                     const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
@@ -10404,9 +10461,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
                     const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
                                                   b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
-                    uint32_t joined = b.ibin(Op_ShiftRightLogical, b.cbuf_load(cidx, binding), shift);
+                    uint32_t joined = b.ibin(
+                        Op_ShiftRightLogical, load_dword(cidx), shift);
                     if (comp_bytes == 2) {
-                        const uint32_t dw1 = b.cbuf_load(b.ibin(Op_IAdd, cidx, b.uconst(1)), binding);
+                        const uint32_t dw1 = load_dword(
+                            b.ibin(Op_IAdd, cidx, b.uconst(1)));
                         const uint32_t inv_shift = b.ibin(Op_BitwiseAnd,
                             b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
                         const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
@@ -10422,7 +10481,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t byte_off = k * comp_bytes;
                     uint32_t drel = byte_off / 4, boff = (byte_off % 4) * 8;
                     uint32_t did = drel ? b.ibin(Op_IAdd, idx, b.uconst(drel)) : idx;
-                    uint32_t dw  = b.cbuf_load(did, binding);
+                    uint32_t dw  = load_dword(did);
                     value = is_half ? b.unpack_half(dw, boff ? 1u : 0u)
                           : is_uint ? b.bfe_u(dw, b.uconst(boff), b.uconst(comp_bytes * 8))
                           : is_sint ? b.bfe_s(dw, b.uconst(boff), b.uconst(comp_bytes * 8))

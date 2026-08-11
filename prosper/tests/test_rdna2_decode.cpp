@@ -544,6 +544,20 @@ int main() {
     const uint32_t mubuf_noglc[] = { 0xe0e00004u, 0x80000000u };
     CHECK(rdna2_decode_one(mubuf_glc, 2).mubuf_glc && !rdna2_decode_one(mubuf_noglc, 2).mubuf_glc,
           "MUBUF GLC bit 14 decodes (atomics: return pre-op value)");
+    // GTA V pc224: buffer_load_dword ... glc dlc. Clearing only bit 15 is the mutation arm: GLC
+    // remains set while DLC must disappear, so this checks the production decoder field itself.
+    const uint32_t mubuf_glc_dlc[] = { 0xe030e010u, 0x80001e1du };
+    const uint32_t mubuf_glc_only[] = { 0xe0306010u, 0x80001e1du };
+    const Rdna2Inst mubuf_both = rdna2_decode_one(mubuf_glc_dlc, 2);
+    const Rdna2Inst mubuf_without_dlc = rdna2_decode_one(mubuf_glc_only, 2);
+    CHECK(mubuf_both.mubuf_glc && mubuf_both.mubuf_dlc &&
+              mubuf_without_dlc.mubuf_glc && !mubuf_without_dlc.mubuf_dlc,
+          "MUBUF DLC bit 15 decodes independently from GLC on GTA V's exact polling load");
+    const uint32_t mtbuf_dlc[] = { 0xe8b0a000u, 0x80020100u };
+    const uint32_t mtbuf_nodlc[] = { 0xe8b02000u, 0x80020100u };
+    CHECK(rdna2_decode_one(mtbuf_dlc, 2).mubuf_dlc &&
+              !rdna2_decode_one(mtbuf_nodlc, 2).mubuf_dlc,
+          "MTBUF shares the decoded DLC bit 15 cache-policy field");
     // MUBUF LDS (bit 16): hand-set on the plain dword load (llvm-mc gfx1030 rejects the syntax,
     // but the field is architectural — Table 98).
     const uint32_t mubuf_lds[] = { 0xe0310000u, 0x80000000u };

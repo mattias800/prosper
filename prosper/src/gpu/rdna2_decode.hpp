@@ -132,9 +132,11 @@ struct Rdna2Inst {
     uint32_t exp_en = 0;
     bool     exp_compr = false;     // COMPR: the 4 channels are two f16x2 pairs in src[0] (r,g) / src[1] (b,a)
 
-    // MUBUF-only flags (ISA Table 98): GLC (bit 14) — for atomics, "return pre-op value to VGPR";
-    // LDS (bit 16) — transfer between LDS and memory instead of VGPRs (rejected until modeled).
+    // MUBUF/MTBUF flags (ISA Table 98): GLC (bit 14) — for atomics, "return pre-op value to VGPR";
+    // DLC (bit 15) — device-level cache policy for ordinary loads; LDS (bit 16, MUBUF only) —
+    // transfer between LDS and memory instead of VGPRs (rejected until modeled).
     bool     mubuf_glc = false;
+    bool     mubuf_dlc = false;
     bool     mubuf_lds = false;
     // MTBUF carries the GFX10 combined 7-bit BUF_FMT at dword0[25:19], just like a Gen5 V#.
     // Interpreting these bits as the older PS4 DFMT/NFMT split maps valid gfx1030 formats to the

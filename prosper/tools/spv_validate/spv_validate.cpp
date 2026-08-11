@@ -396,6 +396,21 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
       vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "compute_store", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
+    // GTA V's cross-workgroup scan publication shape: distinct descriptor variables alias one guest
+    // allocation, a GLC store is released by vscnt(0), and a GLC+DLC load polls through the alias.
+    // This representative module strictly validates Aliased/Coherent decorations, per-access
+    // Volatile operands, and Device-scope UniformMemory release under SPIR-V 1.3 + Vulkan 1.1.
+    { const uint32_t c[] = {0xe0744008u,0x80001100u,0xbf8c3f70u,0xbbfd0000u,
+                            0xe0706010u,0x80001211u,0xe030e010u,0x80001e1du,
+                            0xbf810000u};
+      ShaderResourceTable rt;
+      ShaderResource publish{}; publish.cls=ResourceClass::ConstantBuffer;
+      publish.format=DataFormat::Uint32; publish.binding=4; publish.gpu_addr=0x1000;
+      publish.size=180; publish.stride=20; publish.fetch_pc=0; rt.resources.push_back(publish);
+      ShaderResource flag=publish; flag.binding=5; flag.fetch_pc=4; rt.resources.push_back(flag);
+      ShaderResource poll=publish; poll.binding=6; poll.fetch_pc=6; rt.resources.push_back(poll);
+      ComputeShaderConfig cfg; cfg.local_x=64; cfg.wave_size=64;
+      dump(dir, "compute_coherent_alias", recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
     // Astro Bot exact raw buffer_store_dwordx3 packet.
     { const uint32_t c[] = {0x7e140f00u,0x7e060281u,0x7e080282u,0x7e0a0283u,
                             0xe07c2000u,0x8004030au,0xbf810000u};

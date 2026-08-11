@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -73,6 +74,113 @@ static bool has_spirv_local_size(const std::vector<uint32_t>& spv,
         if ((spv[word] & 0xFFFFu) == OpExecutionMode && count == 6 &&
             spv[word + 2] == ExecutionModeLocalSize && spv[word + 3] == x &&
             spv[word + 4] == y && spv[word + 5] == z)
+            return true;
+        word += count;
+    }
+    return false;
+}
+
+struct SpirvBufferAccessSummary {
+    uint32_t variable = 0;
+    bool aliased = false;
+    bool coherent = false;
+    size_t loads = 0;
+    size_t volatile_loads = 0;
+    size_t stores = 0;
+    size_t volatile_stores = 0;
+};
+
+static SpirvBufferAccessSummary spirv_buffer_access_summary(
+        const std::vector<uint32_t>& spv, uint32_t binding) {
+    constexpr uint16_t OpVariable = 59, OpLoad = 61, OpStore = 62;
+    constexpr uint16_t OpAccessChain = 65, OpDecorate = 71;
+    constexpr uint32_t StorageBuffer = 12, DecorationAliased = 20;
+    constexpr uint32_t DecorationCoherent = 23, DecorationBinding = 33;
+    constexpr uint32_t MemoryAccessVolatile = 1;
+    SpirvBufferAccessSummary out;
+    std::map<uint32_t, uint32_t> pointer_base;
+    std::set<uint32_t> storage_variables;
+    std::set<uint32_t> aliased, coherent;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return {};
+        if (opcode == OpVariable && count == 4 && spv[word + 3] == StorageBuffer)
+            storage_variables.insert(spv[word + 2]);
+        if (opcode == OpDecorate && count >= 3) {
+            if (spv[word + 2] == DecorationBinding && count >= 4 &&
+                spv[word + 3] == binding)
+                out.variable = spv[word + 1];
+            if (spv[word + 2] == DecorationAliased) aliased.insert(spv[word + 1]);
+            if (spv[word + 2] == DecorationCoherent) coherent.insert(spv[word + 1]);
+        }
+        if (opcode == OpAccessChain && count >= 4)
+            pointer_base[spv[word + 2]] = spv[word + 3];
+        word += count;
+    }
+    if (!storage_variables.count(out.variable)) out.variable = 0;
+    out.aliased = aliased.count(out.variable) != 0;
+    out.coherent = coherent.count(out.variable) != 0;
+    auto root = [&](uint32_t pointer) {
+        std::set<uint32_t> seen;
+        while (pointer_base.count(pointer) && seen.insert(pointer).second)
+            pointer = pointer_base[pointer];
+        return pointer;
+    };
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return {};
+        if (opcode == OpLoad && count >= 4 && root(spv[word + 3]) == out.variable) {
+            ++out.loads;
+            if (count >= 5 && (spv[word + 4] & MemoryAccessVolatile))
+                ++out.volatile_loads;
+        }
+        if (opcode == OpStore && count >= 3 && root(spv[word + 1]) == out.variable) {
+            ++out.stores;
+            if (count >= 4 && (spv[word + 3] & MemoryAccessVolatile))
+                ++out.volatile_stores;
+        }
+        word += count;
+    }
+    return out;
+}
+
+static bool spirv_storage_buffer_has_decoration(const std::vector<uint32_t>& spv,
+                                                uint32_t binding,
+                                                uint32_t decoration) {
+    const SpirvBufferAccessSummary summary = spirv_buffer_access_summary(spv, binding);
+    if (!summary.variable) return false;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xffffu) == 71u && count >= 3 &&
+            spv[word + 1] == summary.variable && spv[word + 2] == decoration)
+            return true;
+        word += count;
+    }
+    return false;
+}
+
+static bool spirv_has_device_uniform_release_barrier(const std::vector<uint32_t>& spv) {
+    constexpr uint16_t OpConstant = 43, OpMemoryBarrier = 225;
+    constexpr uint32_t ScopeDevice = 1, MemorySemanticsUniformRelease = 0x44;
+    std::map<uint32_t, uint32_t> constants;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpConstant && count == 4)
+            constants[spv[word + 2]] = spv[word + 3];
+        word += count;
+    }
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpMemoryBarrier && count == 3 &&
+            constants[spv[word + 1]] == ScopeDevice &&
+            constants[spv[word + 2]] == MemorySemanticsUniformRelease)
             return true;
         word += count;
     }
@@ -1306,6 +1414,220 @@ int main() {
     printf("  kernel21 mismatches=%u (out[7]=%g expect=107)\n", bad21, got21.size()==N?got21[7]:-1);
     CHECK(got21.size()==N && bad21==0, "recompiled kernel 21 (MUBUF per-lane buffer_load -> cbuf[gid]) correct");
 
+    // GTA V's decoupled-lookback scan publishes a record through one V# and polls the same backing
+    // through another. These are the exact pc199 data store, pc201 vmcnt(0), pc202 vscnt(0), pc207
+    // flag store, and pc224 polling-load packet words from exec_cs_413e16400, kept in their original
+    // publication order. Distinct bindings 4/5/6 deliberately carry the same guest address: emitted
+    // variables must permit aliasing, the requested accesses must be individually volatile/coherent,
+    // and the store-completion wait must publish prior UniformMemory writes at Device scope.
+    const uint32_t coherent_publish_poll[] = {
+        0xe0744008u, 0x80001100u, // pc199: buffer_store_dwordx2 ... glc
+        0xbf8c3f70u,              // pc201: s_waitcnt vmcnt(0)
+        0xbbfd0000u,              // pc202: s_waitcnt_vscnt null, 0
+        0xe0706010u, 0x80001211u, // pc207: buffer_store_dword ... glc (ready flag)
+        0xe030e010u, 0x80001e1du, // pc224: buffer_load_dword ... glc dlc (poll)
+        0xbf810000u,
+    };
+    ShaderResourceTable coherent_rt;
+    { ShaderResource publish{}; publish.cls = ResourceClass::ConstantBuffer;
+      publish.format = DataFormat::Uint32; publish.binding = 4; publish.gpu_addr = 0x1000;
+      publish.size = 180; publish.stride = 20; publish.fetch_pc = 0;
+      coherent_rt.resources.push_back(publish); }
+    { ShaderResource flag{}; flag.cls = ResourceClass::ConstantBuffer;
+      flag.format = DataFormat::Uint32; flag.binding = 5; flag.gpu_addr = 0x1000;
+      flag.size = 180; flag.stride = 20; flag.fetch_pc = 4;
+      coherent_rt.resources.push_back(flag); }
+    { ShaderResource poll{}; poll.cls = ResourceClass::ConstantBuffer;
+      poll.format = DataFormat::Uint32; poll.binding = 6; poll.gpu_addr = 0x1000;
+      poll.size = 180; poll.stride = 20; poll.fetch_pc = 6;
+      coherent_rt.resources.push_back(poll); }
+    ComputeShaderConfig coherent_cfg;
+    coherent_cfg.local_x = 64;
+    coherent_cfg.wave_size = 64;
+    const std::vector<uint32_t> coherent_spv = recompile_compute(
+        coherent_publish_poll, std::size(coherent_publish_poll), &coherent_rt, coherent_cfg);
+    const SpirvBufferAccessSummary publish_access =
+        spirv_buffer_access_summary(coherent_spv, 4);
+    const SpirvBufferAccessSummary flag_access =
+        spirv_buffer_access_summary(coherent_spv, 5);
+    const SpirvBufferAccessSummary poll_access =
+        spirv_buffer_access_summary(coherent_spv, 6);
+    CHECK(!coherent_spv.empty() && publish_access.stores == 2 &&
+              publish_access.volatile_stores == 2 && publish_access.coherent &&
+              flag_access.stores == 1 && flag_access.volatile_stores == 1 &&
+              flag_access.coherent &&
+              poll_access.loads == 1 && poll_access.volatile_loads == 1 &&
+              poll_access.coherent,
+          "GLC store and GLC+DLC polling load lower to exact Volatile accesses on Coherent roots");
+    bool every_external_root_aliased = true;
+    for (uint32_t binding : {0u, 1u, 2u, 3u, 4u, 5u, 6u})
+        every_external_root_aliased &=
+            spirv_storage_buffer_has_decoration(coherent_spv, binding, 20u);
+    CHECK(every_external_root_aliased && publish_access.aliased && flag_access.aliased &&
+              poll_access.aliased,
+          "every external StorageBuffer root is Aliased, including aliased views of one guest allocation");
+    CHECK(count_spirv_opcode(coherent_spv, 225) == 1 &&
+              spirv_has_device_uniform_release_barrier(coherent_spv),
+          "exact s_waitcnt_vscnt null,0 emits one Device UniformMemory Release barrier");
+
+    // Negative arms at the same packet sites: clear GLC/DLC without changing either access, then
+    // replace only vscnt with vmcnt. The ordinary accesses remain present but gain no Volatile or
+    // Coherent semantics; vmcnt remains a synchronous-SSA no-op rather than publishing stores.
+    const uint32_t ordinary_publish_poll[] = {
+        0xe0740008u, 0x80001100u,
+        0xbf8c3f70u,
+        0xbbfd0000u,
+        0xe0702010u, 0x80001211u,
+        0xe0302010u, 0x80001e1du,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> ordinary_spv = recompile_compute(
+        ordinary_publish_poll, std::size(ordinary_publish_poll), &coherent_rt, coherent_cfg);
+    const SpirvBufferAccessSummary ordinary_publish =
+        spirv_buffer_access_summary(ordinary_spv, 4);
+    const SpirvBufferAccessSummary ordinary_flag =
+        spirv_buffer_access_summary(ordinary_spv, 5);
+    const SpirvBufferAccessSummary ordinary_poll =
+        spirv_buffer_access_summary(ordinary_spv, 6);
+    CHECK(!ordinary_spv.empty() && ordinary_publish.stores == 2 &&
+              ordinary_publish.volatile_stores == 0 && !ordinary_publish.coherent &&
+              ordinary_flag.stores == 1 && ordinary_flag.volatile_stores == 0 &&
+              !ordinary_flag.coherent &&
+              ordinary_poll.loads == 1 && ordinary_poll.volatile_loads == 0 &&
+              !ordinary_poll.coherent && ordinary_publish.aliased && ordinary_flag.aliased &&
+              ordinary_poll.aliased,
+          "unmarked ordinary packets keep their accesses non-Volatile/non-Coherent but still Aliased");
+
+    // Each load flag independently requests the same conservative SPIR-V coherence contract. The
+    // combined GTA packet alone cannot distinguish an accidental `GLC && DLC` gate from the required
+    // `GLC || DLC` gate. Conversely DLC alone is not the ordinary-store publication request: only
+    // GLC marks a store coherent/volatile.
+    ShaderResourceTable cache_flag_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.binding = 4; buffer.size = 180;
+      buffer.stride = 20; buffer.fetch_pc = 0; cache_flag_rt.resources.push_back(buffer); }
+    const uint32_t glc_only_load[] = {0xe0306010u, 0x80001e1du, 0xbf810000u};
+    const uint32_t dlc_only_load[] = {0xe030a010u, 0x80001e1du, 0xbf810000u};
+    const uint32_t dlc_only_store[] = {0xe070a010u, 0x80001211u, 0xbf810000u};
+    const SpirvBufferAccessSummary glc_only_access = spirv_buffer_access_summary(
+        recompile_compute(glc_only_load, std::size(glc_only_load), &cache_flag_rt, coherent_cfg), 4);
+    const SpirvBufferAccessSummary dlc_only_access = spirv_buffer_access_summary(
+        recompile_compute(dlc_only_load, std::size(dlc_only_load), &cache_flag_rt, coherent_cfg), 4);
+    const SpirvBufferAccessSummary dlc_store_access = spirv_buffer_access_summary(
+        recompile_compute(dlc_only_store, std::size(dlc_only_store), &cache_flag_rt, coherent_cfg), 4);
+    CHECK(glc_only_access.loads == 1 && glc_only_access.volatile_loads == 1 &&
+              glc_only_access.coherent && dlc_only_access.loads == 1 &&
+              dlc_only_access.volatile_loads == 1 && dlc_only_access.coherent,
+          "GLC-only and DLC-only ordinary loads each emit Volatile access on a Coherent root");
+    CHECK(dlc_store_access.stores == 1 && dlc_store_access.volatile_stores == 0 &&
+              !dlc_store_access.coherent,
+          "DLC alone does not broaden ordinary-store semantics reserved for GLC");
+
+    // Representative non-dword branches still route through the single instruction-policy wrapper.
+    // Keep separate assertions so a future raw-subword or packed-format bypass is mutation-visible.
+    ShaderResourceTable coherent_raw_rt;
+    { ShaderResource raw{}; raw.cls = ResourceClass::ConstantBuffer;
+      raw.format = DataFormat::Uint32; raw.num_components = 1; raw.binding = 4;
+      raw.size = 16; raw.sgpr_base = 8; raw.fetch_pc = 0;
+      coherent_raw_rt.resources.push_back(raw); }
+    const uint32_t glc_raw_ubyte_load[] = {
+        0xe0205000u, 0x80020000u, 0xbf810000u,
+    };
+    const SpirvBufferAccessSummary glc_raw_ubyte_access = spirv_buffer_access_summary(
+        recompile_compute(glc_raw_ubyte_load, std::size(glc_raw_ubyte_load),
+                          &coherent_raw_rt, coherent_cfg), 4);
+    CHECK(glc_raw_ubyte_access.loads == 1 &&
+              glc_raw_ubyte_access.volatile_loads == 1 && glc_raw_ubyte_access.coherent,
+          "raw ubyte GLC load uses the shared Volatile/Coherent dword policy");
+
+    ShaderResourceTable coherent_packed_rt;
+    { ShaderResource packed{}; packed.cls = ResourceClass::ConstantBuffer;
+      packed.format = DataFormat::Uint2_10_10_10; packed.num_components = 4;
+      packed.binding = 5; packed.size = 16; packed.stride = 4;
+      packed.sgpr_base = 8; packed.fetch_pc = 0;
+      coherent_packed_rt.resources.push_back(packed); }
+    const uint32_t dlc_packed_load[] = {
+        0xe000a000u, 0x80020000u, 0xbf810000u,
+    };
+    const SpirvBufferAccessSummary dlc_packed_access = spirv_buffer_access_summary(
+        recompile_compute(dlc_packed_load, std::size(dlc_packed_load),
+                          &coherent_packed_rt, coherent_cfg), 5);
+    CHECK(dlc_packed_access.loads == 1 && dlc_packed_access.volatile_loads == 1 &&
+              dlc_packed_access.coherent,
+          "packed Uint2_10_10_10 DLC load uses the shared Volatile/Coherent dword policy");
+
+    // Dynamic integer subword stores deliberately bypass ordinary OpStore: atomic clear+set keeps
+    // adjacent Uint16 elements in one dword race-free. GLC must still decorate that root Coherent,
+    // while changing neither the atomic pair nor the ISA atomic-return behavior tested by T32/T32b.
+    ShaderResourceTable coherent_subword_store_rt;
+    { ShaderResource subword{}; subword.cls = ResourceClass::ConstantBuffer;
+      subword.format = DataFormat::Uint16; subword.num_components = 1;
+      subword.binding = 4; subword.size = 64; subword.stride = 2;
+      subword.sgpr_base = 8; subword.fetch_pc = 0;
+      coherent_subword_store_rt.resources.push_back(subword); }
+    const uint32_t glc_subword_store[] = {
+        0xe0106000u, 0x80020100u, 0xbf810000u,
+    };
+    const uint32_t ordinary_subword_store[] = {
+        0xe0102000u, 0x80020100u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> glc_subword_spv = recompile_compute(
+        glc_subword_store, std::size(glc_subword_store),
+        &coherent_subword_store_rt, coherent_cfg);
+    const std::vector<uint32_t> ordinary_subword_spv = recompile_compute(
+        ordinary_subword_store, std::size(ordinary_subword_store),
+        &coherent_subword_store_rt, coherent_cfg);
+    const SpirvBufferAccessSummary glc_subword_access =
+        spirv_buffer_access_summary(glc_subword_spv, 4);
+    const SpirvBufferAccessSummary ordinary_subword_access =
+        spirv_buffer_access_summary(ordinary_subword_spv, 4);
+    CHECK(!glc_subword_spv.empty() &&
+              spirv_storage_buffer_has_decoration(glc_subword_spv, 4, 23u) &&
+              count_spirv_opcode(glc_subword_spv, 240u) == 1 &&
+              count_spirv_opcode(glc_subword_spv, 241u) == 1 &&
+              glc_subword_access.stores == 0,
+          "dynamic Uint16 GLC store keeps atomic clear/set lowering on a Coherent root");
+    CHECK(!ordinary_subword_spv.empty() &&
+              !spirv_storage_buffer_has_decoration(ordinary_subword_spv, 4, 23u) &&
+              count_spirv_opcode(ordinary_subword_spv, 240u) == 1 &&
+              count_spirv_opcode(ordinary_subword_spv, 241u) == 1 &&
+              ordinary_subword_access.stores == 0,
+          "dynamic Uint16 store without GLC keeps the same atomic pair without Coherent");
+
+    // The one-record 16-bit zero-pad contract uses a dedicated load helper rather than the shared
+    // raw/packed dword wrapper. Exercise that propagation site directly: the packet pair differs only
+    // by GLC, while both retain the same exact format_x access and two-byte descriptor shape.
+    ShaderResourceTable coherent_tail_rt;
+    { ShaderResource tail{}; tail.cls = ResourceClass::ConstantBuffer;
+      tail.format = DataFormat::Uint16; tail.num_components = 1; tail.binding = 4;
+      tail.size = 2; tail.stride = 2; tail.sgpr_base = 8; tail.fetch_pc = 1;
+      coherent_tail_rt.resources.push_back(tail); }
+    const uint32_t glc_tail_load[] = {
+        0x7e020f00u, 0xe0006000u, 0x80020101u, 0xbf810000u,
+    };
+    const uint32_t ordinary_tail_load[] = {
+        0x7e020f00u, 0xe0002000u, 0x80020101u, 0xbf810000u,
+    };
+    const SpirvBufferAccessSummary glc_tail_access = spirv_buffer_access_summary(
+        recompile_compute(glc_tail_load, std::size(glc_tail_load),
+                          &coherent_tail_rt, coherent_cfg), 4);
+    const SpirvBufferAccessSummary ordinary_tail_access = spirv_buffer_access_summary(
+        recompile_compute(ordinary_tail_load, std::size(ordinary_tail_load),
+                          &coherent_tail_rt, coherent_cfg), 4);
+    CHECK(glc_tail_access.loads == 1 && glc_tail_access.volatile_loads == 1 &&
+              glc_tail_access.coherent && ordinary_tail_access.loads == 1 &&
+              ordinary_tail_access.volatile_loads == 0 && !ordinary_tail_access.coherent,
+          "one-record Uint16 tail load preserves GLC Volatile/Coherent policy at its dedicated site");
+
+    uint32_t vmcnt_publish_poll[std::size(coherent_publish_poll)];
+    std::copy(std::begin(coherent_publish_poll), std::end(coherent_publish_poll),
+              std::begin(vmcnt_publish_poll));
+    vmcnt_publish_poll[3] = 0xbc7d0000u; // same wait site, vmcnt(0) instead of vscnt(0)
+    const std::vector<uint32_t> vmcnt_spv = recompile_compute(
+        vmcnt_publish_poll, std::size(vmcnt_publish_poll), &coherent_rt, coherent_cfg);
+    CHECK(!vmcnt_spv.empty() && count_spirv_opcode(vmcnt_spv, 225) == 0,
+          "same-site vmcnt mutation does not emit the vscnt publication barrier");
+
     // Kernel 22: MULTI-buffer SMEM via descriptor provenance (the resource-binding contract). Two V#
     // descriptors loaded from SRT offsets 0x20 and 0x40; a ShaderResourceTable maps them to distinct
     // bindings (2 and 3); the two s_buffer_loads must route to two DIFFERENT constant buffers.
@@ -2298,6 +2620,11 @@ int main() {
               compute_gds_binding->kind == SpirvDescriptorKind::StorageBuffer &&
               compute_gds_binding->writable,
           "compute GDS module reflects its writable persistent storage-buffer binding");
+    const SpirvBufferAccessSummary internal_gds_access = spirv_buffer_access_summary(
+        compute_gds_spv, kComputeInternalGdsBinding);
+    CHECK(internal_gds_access.variable && internal_gds_access.stores == 1 &&
+              !internal_gds_access.aliased,
+          "backend-owned internal GDS stays outside the external-buffer Aliased policy");
 
     // Astro Bot's indirect-argument producer uses device-global append counters. Routing this exact
     // GDS form through workgroup LDS made every dispatch begin with undefined counter values and

@@ -605,6 +605,7 @@ void decode_operands(Rdna2Inst& i) {
             const uint32_t d1 = i.words[1];
             i.opcode = (w >> 18) & 0xFFu;
             i.mubuf_glc = ((w >> 14) & 1u) != 0;   // atomics: return pre-op value to VGPR
+            i.mubuf_dlc = ((w >> 15) & 1u) != 0;   // ordinary loads: bypass device-level cache
             i.mubuf_lds = ((w >> 16) & 1u) != 0;   // buffer<->LDS transfer (rejected in stage 2)
             i.dst    = vgpr(d1 >> 8);                          // VDATA
             i.src[0] = vgpr(d1);                              // VADDR
@@ -627,6 +628,7 @@ void decode_operands(Rdna2Inst& i) {
             i.mtbuf_format = (w >> 19) & 0x7Fu;
             i.mtbuf_tfe = ((d1 >> 23) & 1u) != 0;
             i.mubuf_glc = ((w >> 14) & 1u) != 0;
+            i.mubuf_dlc = ((w >> 15) & 1u) != 0;
             i.dst    = vgpr(d1 >> 8);
             i.src[0] = vgpr(d1);
             i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);
