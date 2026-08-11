@@ -6600,6 +6600,45 @@ int main() {
     CHECK(gotT28.size() == 128 && badT28 == 0,
           "T28: VOP2 DPP permutes only src0 and adds current-lane src1");
 
+    // T28b (#2481): GTA V's reduction follows its row-shift ladder with this exact in-place
+    // V_ADD_NC_U32 identity QUAD_PERM. ROW_MASK=0xa enables rows 1 and 3; BC0 keeps the old VDST
+    // in rows 0 and 2. The crossing tail forces the same portable CFG dispatcher as the live shader.
+    const uint32_t codeT28b[] = {
+        0x7e280300u,                         // v_mov_b32 v20,v0
+        0x7e260301u,                         // v_mov_b32 v19,v1
+        0x4a2826fau, 0xaf00e414u,            // exact GTA V partial-row DPP add
+        0x7d840000u,
+        0xd4e4006au, 0x0001006au,
+        0xbea0047eu,
+        0x87ea6a20u,
+        0x7e000280u,
+        0xbf840003u,
+        0x7d840100u,
+        0x02020100u,
+        0xbf860002u,
+        0xbf060000u,
+        0xbf850001u,
+        0x7e020280u,
+        0x7e000314u,                         // v_mov_b32 v0,v20
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT28b = recompile_valu(
+        codeT28b, std::size(codeT28b), 2, 0);
+    CHECK(!spvT28b.empty(),
+          "recompiled T28b (GTA V partial-row DPP add) -> SPIR-V");
+    std::vector<float> inT28b(128 * 2), expT28b(128);
+    constexpr uint32_t one_bitsT28b = 0x3f800000u;
+    constexpr uint32_t addend_bitsT28b = 0x00800000u;
+    for (uint32_t i = 0; i < 128; ++i) {
+        std::memcpy(&inT28b[i * 2], &one_bitsT28b, sizeof(uint32_t));
+        std::memcpy(&inT28b[i * 2 + 1], &addend_bitsT28b, sizeof(uint32_t));
+        expT28b[i] = (((i % 64u) / 16u) & 1u) ? 2.0f : 1.0f;
+    }
+    std::vector<float> gotT28b = prosper::test::run_compute(
+        spvT28b, inT28b, 128, 128);
+    CHECK(gotT28b == expT28b,
+          "T28b: ROW_MASK=0xa adds rows 1/3 and BC0 preserves rows 0/2 per wave64");
+
     // T29: exact S_BFM_B64 word from Astro's title reduction shader.  It creates VCC with the low
     // 32 lanes set, then saveexec predicates a write.  The operation repeats independently in each
     // architectural wave64 even when the Vulkan workgroup contains two waves.

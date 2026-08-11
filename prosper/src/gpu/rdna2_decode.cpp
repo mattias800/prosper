@@ -793,6 +793,24 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                          ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
                 }
+                // GTA V selects alternate 16-lane rows after its in-row reduction. QUAD_PERM
+                // identity keeps SRC0 in the current lane; ROW_MASK=0xa executes rows 1/3 while
+                // rows 0/2 preserve VDST. Admit only the exact live integer-add control form:
+                // BC=0, BANK_MASK=0xf, no FI/source modifiers, and retain both masks explicitly.
+                else if (vf == Rdna2Format::VOP2 && ((w >> 25) & 0x3Fu) == 0x25u &&
+                         ctrl == 0xe4u &&
+                         ((d1 >> 28) & 0xFu) == 0xau &&
+                         ((d1 >> 24) & 0xFu) == 0xfu &&
+                         ((d1 >> 20) & 0xFu) == 0u &&
+                         ((d1 >> 19) & 1u) == 0u &&
+                         ((d1 >> 18) & 1u) == 0u) {
+                    i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                }
+                if (i.has_dpp) {
+                    i.dpp_bound_ctrl = ((d1 >> 19) & 1u) != 0u;
+                    i.dpp_bank_mask = static_cast<uint8_t>((d1 >> 24) & 0xfu);
+                    i.dpp_row_mask = static_cast<uint8_t>((d1 >> 28) & 0xfu);
+                }
             }
         } else {
             // The six K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K: v_madmk_f32 (0x20),

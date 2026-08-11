@@ -457,6 +457,652 @@ bool dpp_min_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& spv) {
         shuffle_lanes.size() == 1 && min_reaches_store;
 }
 
+// Prove GTA V's portable compute DPP add lowering rather than merely finding an OpIAdd. The two
+// guest waves publish separate value/metadata scratch planes, address SRC0 with linear_id-amount
+// inside a DPP16 row, require the source's static event to match, and select the add over the old
+// persistent VGPR only on that guarded path. Instruction positions additionally prove that two
+// uniform workgroup barriers bracket the scratch exchange and its later reuse.
+bool compute_dpp_add_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& spv,
+                                                   uint32_t lanes,
+                                                   uint32_t expected_dst) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpAccessChain = 65, OpIAdd = 128, OpISub = 130,
+                       OpShiftRightLogical = 194, OpLogicalAnd = 167,
+                       OpSelect = 169, OpIEqual = 170, OpINotEqual = 171,
+                       OpUGreaterThanEqual = 174, OpShiftLeftLogical = 196,
+                       OpBitwiseOr = 197, OpBitwiseAnd = 199,
+                       OpControlBarrier = 224;
+    struct Binary { uint32_t first = 0, second = 0; };
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    struct Access { uint32_t base = 0, index = 0; };
+    struct Store { uint32_t pointer = 0, value = 0; size_t position = 0; };
+    struct Load { uint32_t pointer = 0; size_t position = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants;
+    std::unordered_map<uint32_t, Binary> iadds, isubs, shifts, shift_lefts,
+                                                logical_ands, equals, not_equals,
+                                                greater_equals, bitwise_ors,
+                                                bitwise_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::unordered_map<uint32_t, Access> accesses;
+    std::unordered_map<uint32_t, Load> loads;
+    std::vector<Store> stores;
+    std::vector<size_t> barriers;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            loads[spv[i + 2]] = {spv[i + 3], i};
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2], i});
+        else if (op == OpAccessChain && wc == 5)
+            accesses[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpIAdd && wc == 5)
+            iadds[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpISub && wc == 5)
+            isubs[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftRightLogical && wc == 5)
+            shifts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftLeftLogical && wc == 5)
+            shift_lefts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpIEqual && wc == 5)
+            equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpINotEqual && wc == 5)
+            not_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpUGreaterThanEqual && wc == 5)
+            greater_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseOr && wc == 5)
+            bitwise_ors[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseAnd && wc == 5)
+            bitwise_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        else if (op == OpControlBarrier)
+            barriers.push_back(i);
+        i += wc;
+    }
+
+    auto literal_other = [&](const Binary& binary, uint32_t literal,
+                             uint32_t* other) {
+        const auto first = constants.find(binary.first);
+        const auto second = constants.find(binary.second);
+        if (first != constants.end() && first->second == literal) {
+            if (other) *other = binary.second;
+            return true;
+        }
+        if (second != constants.end() && second->second == literal) {
+            if (other) *other = binary.first;
+            return true;
+        }
+        return false;
+    };
+    auto pointer_store = [&](uint32_t pointer, uint32_t value, size_t* position) {
+        const auto found = std::find_if(stores.begin(), stores.end(), [&](const Store& store) {
+            return store.pointer == pointer && (!value || store.value == value);
+        });
+        if (found == stores.end()) return false;
+        if (position) *position = found->position;
+        return true;
+    };
+
+    // Locate the loaded source event: scratch metadata >> 1 == the destination's event mailbox.
+    for (const auto& shifted_event : shifts) {
+        const auto one = constants.find(shifted_event.second.second);
+        const auto metadata_load = loads.find(shifted_event.second.first);
+        if (one == constants.end() || one->second != 1 || metadata_load == loads.end()) continue;
+        const auto metadata_access = accesses.find(metadata_load->second.pointer);
+        if (metadata_access == accesses.end()) continue;
+        const auto metadata_index_add = iadds.find(metadata_access->second.index);
+        uint32_t source_index = 0;
+        if (metadata_index_add == iadds.end() ||
+            !literal_other(metadata_index_add->second, lanes, &source_index))
+            continue;
+
+        uint32_t event_match = 0, event_load = 0;
+        for (const auto& equal : equals) {
+            if (equal.second.first == shifted_event.first && loads.contains(equal.second.second)) {
+                event_match = equal.first;
+                event_load = equal.second.second;
+                break;
+            }
+            if (equal.second.second == shifted_event.first && loads.contains(equal.second.first)) {
+                event_match = equal.first;
+                event_load = equal.second.first;
+                break;
+            }
+        }
+        if (!event_match) continue;
+
+        std::unordered_set<uint32_t> event_tags;
+        const uint32_t event_pointer = loads.at(event_load).pointer;
+        for (const auto& store : stores) {
+            if (store.pointer != event_pointer) continue;
+            const auto constant = constants.find(store.value);
+            if (constant != constants.end()) event_tags.insert(constant->second);
+        }
+        uint32_t nonzero_events = 0;
+        for (uint32_t event : event_tags) nonzero_events += event != 0;
+        if (!event_tags.contains(0) || nonzero_events < 2) continue;
+
+        const auto source_select = selects.find(source_index);
+        if (source_select == selects.end()) continue;
+        const auto source_subtract = isubs.find(source_select->second.yes);
+        const auto row_bound = greater_equals.find(source_select->second.condition);
+        uint32_t linear_lane = 0;
+        const auto row_lane = row_bound == greater_equals.end()
+            ? bitwise_ands.end() : bitwise_ands.find(row_bound->second.first);
+        if (source_subtract == isubs.end() || row_bound == greater_equals.end() ||
+            row_lane == bitwise_ands.end() ||
+            !literal_other(row_lane->second, 15, &linear_lane) ||
+            source_subtract->second.first != linear_lane ||
+            source_select->second.no != linear_lane ||
+            source_subtract->second.second != row_bound->second.second)
+            continue;
+        const uint32_t amount = source_subtract->second.second;
+        const auto amount_load = loads.find(amount);
+        if (amount_load == loads.end()) continue;
+        std::unordered_set<uint32_t> amounts;
+        for (const auto& store : stores) {
+            if (store.pointer != amount_load->second.pointer) continue;
+            const auto constant = constants.find(store.value);
+            if (constant != constants.end()) amounts.insert(constant->second);
+        }
+        if (!amounts.contains(1) || !amounts.contains(2) ||
+            !amounts.contains(4) || !amounts.contains(8))
+            continue;
+
+        // The value plane uses the identical dynamic source index and the same scratch variable.
+        uint32_t shifted_value = 0;
+        for (const auto& load : loads) {
+            const auto access = accesses.find(load.second.pointer);
+            if (access == accesses.end() ||
+                access->second.base != metadata_access->second.base)
+                continue;
+            const auto index_add = iadds.find(access->second.index);
+            uint32_t index = 0;
+            if (index_add != iadds.end() &&
+                literal_other(index_add->second, 0, &index) && index == source_index) {
+                shifted_value = load.first;
+                break;
+            }
+        }
+        if (!shifted_value) continue;
+
+        uint32_t add_result = 0, local_value = 0;
+        for (const auto& add : iadds) {
+            if (add.second.first == shifted_value || add.second.second == shifted_value) {
+                const uint32_t local = add.second.first == shifted_value
+                    ? add.second.second : add.second.first;
+                if (loads.contains(local)) {
+                    add_result = add.first;
+                    local_value = local;
+                    break;
+                }
+            }
+        }
+        if (!add_result) continue;
+
+        // Find both plane publications by their common destination invocation index.
+        size_t value_publish = 0, metadata_publish = 0;
+        uint32_t metadata_value = 0;
+        for (const auto& value_store : stores) {
+            const auto value_access = accesses.find(value_store.pointer);
+            if (value_access == accesses.end() ||
+                value_access->second.base != metadata_access->second.base ||
+                value_store.value != local_value)
+                continue;
+            const auto value_index = iadds.find(value_access->second.index);
+            uint32_t lane = 0;
+            if (value_index == iadds.end() ||
+                !literal_other(value_index->second, 0, &lane))
+                continue;
+            for (const auto& metadata_store : stores) {
+                const auto metadata_publish_access = accesses.find(metadata_store.pointer);
+                if (metadata_publish_access == accesses.end() ||
+                    metadata_publish_access->second.base != metadata_access->second.base)
+                    continue;
+                const auto metadata_publish_index =
+                    iadds.find(metadata_publish_access->second.index);
+                uint32_t metadata_lane = 0;
+                if (metadata_publish_index != iadds.end() &&
+                    literal_other(metadata_publish_index->second, lanes, &metadata_lane) &&
+                    metadata_lane == lane) {
+                    value_publish = value_store.position;
+                    metadata_publish = metadata_store.position;
+                    metadata_value = metadata_store.value;
+                    break;
+                }
+            }
+            if (value_publish && metadata_publish) break;
+        }
+        if (!value_publish || !metadata_publish || !metadata_value) continue;
+
+        // Recover the destination pending and EXEC mailboxes from the publication expression:
+        // pending ? ((event << 1) | (active ? 1 : 0)) : 0.
+        const auto metadata_select = selects.find(metadata_value);
+        if (metadata_select == selects.end() ||
+            !loads.contains(metadata_select->second.condition))
+            continue;
+        const auto metadata_zero = constants.find(metadata_select->second.no);
+        const auto encoded = bitwise_ors.find(metadata_select->second.yes);
+        if (metadata_zero == constants.end() || metadata_zero->second != 0 ||
+            encoded == bitwise_ors.end())
+            continue;
+        const uint32_t pending = metadata_select->second.condition;
+        uint32_t active = 0;
+        bool encodes_event = false;
+        for (uint32_t encoded_part : {encoded->second.first, encoded->second.second}) {
+            const auto event_shift = shift_lefts.find(encoded_part);
+            const auto active_select = selects.find(encoded_part);
+            if (event_shift != shift_lefts.end()) {
+                const auto one = constants.find(event_shift->second.second);
+                encodes_event = encodes_event ||
+                    (event_shift->second.first == event_load &&
+                     one != constants.end() && one->second == 1);
+            }
+            if (active_select != selects.end()) {
+                const auto one = constants.find(active_select->second.yes);
+                const auto zero = constants.find(active_select->second.no);
+                if (loads.contains(active_select->second.condition) &&
+                    one != constants.end() && one->second == 1 &&
+                    zero != constants.end() && zero->second == 0)
+                    active = active_select->second.condition;
+            }
+        }
+        if (!encodes_event || !active || active == pending) continue;
+
+        // The selected source lane contributes an independent EXEC predicate.
+        uint32_t source_active = 0;
+        for (const auto& masked : bitwise_ands) {
+            uint32_t metadata = 0;
+            if (!literal_other(masked.second, 1, &metadata) ||
+                metadata != shifted_event.second.first)
+                continue;
+            for (const auto& comparison : not_equals) {
+                uint32_t compared = 0;
+                if (literal_other(comparison.second, 0, &compared) &&
+                    compared == masked.first) {
+                    source_active = comparison.first;
+                    break;
+                }
+            }
+            if (source_active) break;
+        }
+        if (!source_active) continue;
+
+        // The final condition must select the mailbox's physical destination as well.
+        uint32_t destination_match = 0;
+        for (const auto& equal : equals) {
+            uint32_t mailbox = 0;
+            if (!literal_other(equal.second, expected_dst, &mailbox) ||
+                !loads.contains(mailbox))
+                continue;
+            const uint32_t pointer = loads.at(mailbox).pointer;
+            const bool initialized_for_dst = std::any_of(
+                stores.begin(), stores.end(), [&](const Store& store) {
+                    const auto value = constants.find(store.value);
+                    return store.pointer == pointer && value != constants.end() &&
+                        value->second == expected_dst;
+                });
+            if (initialized_for_dst) {
+                destination_match = equal.first;
+                break;
+            }
+        }
+        if (!destination_match) continue;
+
+        auto guard_contains = [&](auto&& self, uint32_t root, uint32_t leaf) -> bool {
+            if (root == leaf) return true;
+            const auto logical_and = logical_ands.find(root);
+            return logical_and != logical_ands.end() &&
+                (self(self, logical_and->second.first, leaf) ||
+                 self(self, logical_and->second.second, leaf));
+        };
+        size_t persistent_store_position = 0;
+        bool preserves_old_vgpr = false;
+        for (const auto& selected : selects) {
+            if (selected.second.yes != add_result ||
+                !loads.contains(selected.second.no) ||
+                !guard_contains(guard_contains, selected.second.condition, pending) ||
+                !guard_contains(guard_contains, selected.second.condition, active) ||
+                !guard_contains(guard_contains, selected.second.condition,
+                                source_select->second.condition) ||
+                !guard_contains(guard_contains, selected.second.condition, source_active) ||
+                !guard_contains(guard_contains, selected.second.condition, event_match) ||
+                !guard_contains(guard_contains, selected.second.condition, destination_match))
+                continue;
+            const uint32_t old_pointer = loads.at(selected.second.no).pointer;
+            const uint32_t source_mailbox_pointer = loads.at(local_value).pointer;
+            const bool old_reaches_source_mailbox = std::any_of(
+                stores.begin(), stores.end(), [&](const Store& store) {
+                    const auto source = loads.find(store.value);
+                    return store.pointer == source_mailbox_pointer &&
+                        source != loads.end() && source->second.pointer == old_pointer;
+                });
+            if (old_reaches_source_mailbox &&
+                pointer_store(old_pointer, selected.first, &persistent_store_position)) {
+                preserves_old_vgpr = true;
+                break;
+            }
+        }
+        if (!preserves_old_vgpr) continue;
+
+        const size_t publish_end = std::max(value_publish, metadata_publish);
+        const auto first_barrier = std::find_if(
+            barriers.begin(), barriers.end(), [&](size_t position) {
+                return position > publish_end && position < metadata_load->second.position;
+            });
+        const auto second_barrier = std::find_if(
+            barriers.begin(), barriers.end(), [&](size_t position) {
+                return position > persistent_store_position;
+            });
+        if (first_barrier != barriers.end() && second_barrier != barriers.end()) return true;
+    }
+    return false;
+}
+
+// Trace the native exact-wave form independently of the portable scratch path. Each live ladder
+// amount must select lane-amount inside a DPP16 row, shuffle both the value and its EXEC bit, add
+// only for EXEC-active destinations with an in-bounds active source, and otherwise keep the old
+// in-place VGPR before that value is persisted by the dispatcher.
+bool compute_dpp_add_native_row_shr_updates_dispatch_vgpr(
+    const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpIAdd = 128, OpISub = 130, OpLogicalAnd = 167,
+                       OpSelect = 169, OpINotEqual = 171,
+                       OpUGreaterThanEqual = 174, OpBitwiseAnd = 199,
+                       OpGroupNonUniformShuffle = 345;
+    struct Binary { uint32_t first = 0, second = 0; };
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    struct Shuffle { uint32_t value = 0, lane = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, load_pointers;
+    std::unordered_map<uint32_t, Binary> iadds, isubs, logical_ands,
+                                                not_equals, greater_equals,
+                                                bitwise_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::unordered_map<uint32_t, Shuffle> shuffles;
+    std::vector<std::array<uint32_t, 2>> stores;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            load_pointers[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpIAdd && wc == 5)
+            iadds[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpISub && wc == 5)
+            isubs[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpINotEqual && wc == 5)
+            not_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpUGreaterThanEqual && wc == 5)
+            greater_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseAnd && wc == 5)
+            bitwise_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        else if (op == OpGroupNonUniformShuffle && wc == 6)
+            shuffles[spv[i + 2]] = {spv[i + 4], spv[i + 5]};
+        i += wc;
+    }
+
+    auto literal_other = [&](const Binary& binary, uint32_t literal,
+                             uint32_t* other) {
+        const auto first = constants.find(binary.first);
+        const auto second = constants.find(binary.second);
+        if (first != constants.end() && first->second == literal) {
+            if (other) *other = binary.second;
+            return true;
+        }
+        if (second != constants.end() && second->second == literal) {
+            if (other) *other = binary.first;
+            return true;
+        }
+        return false;
+    };
+    auto exact_and = [&](const Binary& binary, uint32_t first, uint32_t second) {
+        return (binary.first == first && binary.second == second) ||
+               (binary.first == second && binary.second == first);
+    };
+
+    std::unordered_set<uint32_t> proven_amounts;
+    for (const auto& value_shuffle : shuffles) {
+        const uint32_t source_value = value_shuffle.second.value;
+        if (!load_pointers.contains(source_value)) continue;
+        const auto source_lane = selects.find(value_shuffle.second.lane);
+        if (source_lane == selects.end()) continue;
+        const auto source_subtract = isubs.find(source_lane->second.yes);
+        const auto in_bounds = greater_equals.find(source_lane->second.condition);
+        if (source_subtract == isubs.end() || in_bounds == greater_equals.end() ||
+            source_lane->second.no != source_subtract->second.first ||
+            source_subtract->second.second != in_bounds->second.second)
+            continue;
+        const uint32_t lane = source_subtract->second.first;
+        const uint32_t amount_id = source_subtract->second.second;
+        const auto amount = constants.find(amount_id);
+        if (amount == constants.end() ||
+            (amount->second != 1 && amount->second != 2 &&
+             amount->second != 4 && amount->second != 8))
+            continue;
+        const auto row_lane = bitwise_ands.find(in_bounds->second.first);
+        uint32_t row_lane_source = 0;
+        if (row_lane == bitwise_ands.end() ||
+            !literal_other(row_lane->second, 15, &row_lane_source) ||
+            row_lane_source != lane)
+            continue;
+
+        uint32_t destination_active = 0, source_active = 0;
+        for (const auto& active_shuffle : shuffles) {
+            if (active_shuffle.second.lane != value_shuffle.second.lane) continue;
+            const auto active_encoding = selects.find(active_shuffle.second.value);
+            if (active_encoding == selects.end() ||
+                !load_pointers.contains(active_encoding->second.condition))
+                continue;
+            const auto one = constants.find(active_encoding->second.yes);
+            const auto zero = constants.find(active_encoding->second.no);
+            if (one == constants.end() || one->second != 1 ||
+                zero == constants.end() || zero->second != 0)
+                continue;
+            for (const auto& comparison : not_equals) {
+                uint32_t compared = 0;
+                if (literal_other(comparison.second, 0, &compared) &&
+                    compared == active_shuffle.first) {
+                    destination_active = active_encoding->second.condition;
+                    source_active = comparison.first;
+                    break;
+                }
+            }
+            if (source_active) break;
+        }
+        if (!destination_active || !source_active) continue;
+
+        uint32_t valid_source = 0;
+        for (const auto& logical_and : logical_ands) {
+            if (exact_and(logical_and.second, source_lane->second.condition, source_active)) {
+                valid_source = logical_and.first;
+                break;
+            }
+        }
+        if (!valid_source) continue;
+        uint32_t shifted_or_old = 0;
+        for (const auto& selected : selects) {
+            if (selected.second.condition == valid_source &&
+                selected.second.yes == value_shuffle.first &&
+                selected.second.no == source_value) {
+                shifted_or_old = selected.first;
+                break;
+            }
+        }
+        if (!shifted_or_old) continue;
+        uint32_t add_result = 0;
+        for (const auto& add : iadds) {
+            if (exact_and(add.second, source_value, shifted_or_old)) {
+                add_result = add.first;
+                break;
+            }
+        }
+        if (!add_result) continue;
+        uint32_t write = 0;
+        for (const auto& logical_and : logical_ands) {
+            if (exact_and(logical_and.second, destination_active, valid_source)) {
+                write = logical_and.first;
+                break;
+            }
+        }
+        if (!write) continue;
+        for (const auto& selected : selects) {
+            if (selected.second.condition != write || selected.second.yes != add_result ||
+                selected.second.no != source_value)
+                continue;
+            const uint32_t pointer = load_pointers.at(source_value);
+            if (std::any_of(stores.begin(), stores.end(), [&](const auto& store) {
+                    return store[0] == pointer && store[1] == selected.first;
+                })) {
+                proven_amounts.insert(amount->second);
+                break;
+            }
+        }
+    }
+    return proven_amounts == std::unordered_set<uint32_t>({1, 2, 4, 8});
+}
+
+// Prove the exact GTA V identity-QUAD_PERM lowering with ROW_MASK=0xa. The selected rows must
+// integer-add two distinct persistent VGPRs, while the other rows keep the old destination. This
+// traces the emitted values to their persistent store so mutations of the production row selector,
+// add operands, or BC0 fallback cannot be hidden by unrelated SPIR-V instructions.
+bool compute_dpp_add_partial_rows_updates_dispatch_vgpr(
+    const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpIAdd = 128, OpLogicalAnd = 167, OpSelect = 169,
+                       OpINotEqual = 171, OpShiftRightLogical = 194,
+                       OpShiftLeftLogical = 196, OpBitwiseAnd = 199;
+    struct Binary { uint32_t first = 0, second = 0; };
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, load_pointers;
+    std::unordered_map<uint32_t, Binary> iadds, logical_ands, not_equals,
+                                                shift_rights, shift_lefts, bitwise_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::vector<std::array<uint32_t, 2>> stores;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            load_pointers[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpIAdd && wc == 5)
+            iadds[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpINotEqual && wc == 5)
+            not_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftRightLogical && wc == 5)
+            shift_rights[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftLeftLogical && wc == 5)
+            shift_lefts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseAnd && wc == 5)
+            bitwise_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        i += wc;
+    }
+
+    auto literal_other = [&](const Binary& binary, uint32_t literal,
+                             uint32_t* other) {
+        const auto first = constants.find(binary.first);
+        const auto second = constants.find(binary.second);
+        if (first != constants.end() && first->second == literal) {
+            if (other) *other = binary.second;
+            return true;
+        }
+        if (second != constants.end() && second->second == literal) {
+            if (other) *other = binary.first;
+            return true;
+        }
+        return false;
+    };
+
+    for (const auto& shift : shift_rights) {
+        const auto four = constants.find(shift.second.second);
+        if (four == constants.end() || four->second != 4) continue;
+        const auto lane_mask = bitwise_ands.find(shift.second.first);
+        if (lane_mask == bitwise_ands.end() ||
+            !literal_other(lane_mask->second, 63, nullptr))
+            continue;
+
+        uint32_t row_bit = 0;
+        for (const auto& left : shift_lefts) {
+            const auto one = constants.find(left.second.first);
+            if (one != constants.end() && one->second == 1 &&
+                left.second.second == shift.first) {
+                row_bit = left.first;
+                break;
+            }
+        }
+        if (!row_bit) continue;
+
+        uint32_t masked_rows = 0;
+        for (const auto& masked : bitwise_ands) {
+            uint32_t other = 0;
+            if (literal_other(masked.second, 0xa, &other) && other == row_bit) {
+                masked_rows = masked.first;
+                break;
+            }
+        }
+        if (!masked_rows) continue;
+
+        uint32_t row_selected = 0;
+        for (const auto& comparison : not_equals) {
+            uint32_t other = 0;
+            if (literal_other(comparison.second, 0, &other) && other == masked_rows) {
+                row_selected = comparison.first;
+                break;
+            }
+        }
+        if (!row_selected) continue;
+
+        std::unordered_set<uint32_t> row_guarded{row_selected};
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& logical_and : logical_ands) {
+                if ((row_guarded.contains(logical_and.second.first) ||
+                     row_guarded.contains(logical_and.second.second)) &&
+                    row_guarded.insert(logical_and.first).second)
+                    changed = true;
+            }
+        }
+
+        for (const auto& selected : selects) {
+            if (!row_guarded.contains(selected.second.condition)) continue;
+            const auto add = iadds.find(selected.second.yes);
+            if (add == iadds.end() || selected.second.no != add->second.first) continue;
+            const auto old_load = load_pointers.find(add->second.first);
+            const auto addend_load = load_pointers.find(add->second.second);
+            if (old_load == load_pointers.end() || addend_load == load_pointers.end() ||
+                old_load->second == addend_load->second)
+                continue;
+            if (std::any_of(stores.begin(), stores.end(), [&](const auto& store) {
+                    return store[0] == old_load->second && store[1] == selected.first;
+                }))
+                return true;
+        }
+    }
+    return false;
+}
+
 // Trace IMAGE_GET_LOD all the way from two known VGPR bit patterns to the fragment output. This is
 // deliberately a dataflow check rather than an opcode-presence check: it proves coordinate
 // provenance, AMD/SPIR-V x/y component order, compact dmask-to-VDATA placement, and the EXEC select
@@ -1534,6 +2180,87 @@ int main() {
     portable_wave64_compute_config.local_x = 128;
     portable_wave64_compute_config.wave_size = 64;
 
+    // GTA V's two live compute failures use this exact in-place V_ADD_NC_U32 DPP row ladder. Two
+    // alternate copies let separate guest waves park at different static events, while the appended
+    // nested/backward CFG forces the portable dispatcher. The host-independent lowering must use
+    // workgroup scratch rather than assuming a Wave64-capable host subgroup.
+    std::vector<uint32_t> gta_compute_dpp_add_cfg = {
+        0x7e280281u,                         // pc0:  v_mov_b32 v20,1
+        0x7d840100u,                         // pc1:  v_cmp_eq_u32 vcc,v0,v0
+        0xbf860009u,                         // pc2:  alternate ladder -> pc12
+        0x4a2828fau, 0xff011114u,            // pc3:  event 1 row_shr:1
+        0x4a2828fau, 0xff011214u,            // pc5:  event 2 row_shr:2
+        0x4a2828fau, 0xff011414u,            // pc7:  event 3 row_shr:4
+        0x4a2828fau, 0xff011814u,            // pc9:  event 4 row_shr:8
+        0xbf820008u,                         // pc11: join -> pc20
+        0x4a2828fau, 0xff011114u,            // pc12: event 5 row_shr:1
+        0x4a2828fau, 0xff011214u,            // pc14: event 6 row_shr:2
+        0x4a2828fau, 0xff011414u,            // pc16: event 7 row_shr:4
+        0x4a2828fau, 0xff011814u,            // pc18: event 8 row_shr:8
+        // Reduced nested/backward compute CFG from the existing dispatcher coverage fixture.
+        0xbe800380u, 0x7e000280u, 0x7e020300u,
+        0xd7610013u, 0x00014a7eu, 0xd7610013u, 0x0001507fu,
+        0xd760000eu, 0x00014b13u, 0xd760000fu, 0x00015113u, 0xbefe040eu,
+        0xe00c2000u, 0x80020400u, 0x7db900f9u, 0x86050007u,
+        0x7d020200u, 0xbf860006u, 0xbf0a8204u, 0x360000fdu, 0xbf840001u,
+        0x81008100u, 0x81008100u, 0xbf82fff4u, 0xbf810000u,
+    };
+    ShaderResourceTable gta_compute_dpp_table;
+    ShaderResource gta_compute_dpp_vb{};
+    gta_compute_dpp_vb.cls = ResourceClass::VertexBuffer;
+    gta_compute_dpp_vb.binding = 3;
+    gta_compute_dpp_vb.sgpr_base = 8;
+    gta_compute_dpp_vb.stride = 16;
+    gta_compute_dpp_vb.format = DataFormat::Float32;
+    gta_compute_dpp_vb.num_components = 4;
+    gta_compute_dpp_table.resources.push_back(gta_compute_dpp_vb);
+    const auto gta_compute_dpp_spv = recompile_compute(
+        gta_compute_dpp_add_cfg.data(), gta_compute_dpp_add_cfg.size(),
+        &gta_compute_dpp_table, portable_wave64_compute_config);
+    if (gta_compute_dpp_spv.empty() || !has_opcode(gta_compute_dpp_spv, 251) ||
+        !compute_dpp_add_row_shr_updates_dispatch_vgpr(gta_compute_dpp_spv, 128, 20) ||
+        !type_result_ids_are_nonzero(gta_compute_dpp_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_compute_dpp_spv)) {
+        printf("  [FAIL] portable Wave64 CFG did not event-isolate GTA V DPP add ladders\n");
+        return 1;
+    }
+
+    ComputeShaderConfig native_gta_compute_dpp_config = portable_wave64_compute_config;
+    native_gta_compute_dpp_config.local_x = 64;
+    native_gta_compute_dpp_config.native_subgroup_size = 64;
+    const auto native_gta_compute_dpp_spv = recompile_compute(
+        gta_compute_dpp_add_cfg.data(), gta_compute_dpp_add_cfg.size(),
+        &gta_compute_dpp_table, native_gta_compute_dpp_config);
+    if (native_gta_compute_dpp_spv.empty() ||
+        !has_opcode(native_gta_compute_dpp_spv, 345) ||
+        !compute_dpp_add_native_row_shr_updates_dispatch_vgpr(
+            native_gta_compute_dpp_spv) ||
+        !type_result_ids_are_nonzero(native_gta_compute_dpp_spv, nullptr) ||
+        !phi_ids_are_nonzero(native_gta_compute_dpp_spv)) {
+        printf("  [FAIL] native Wave64 CFG rejected GTA V DPP add ladders\n");
+        return 1;
+    }
+
+    std::vector<uint32_t> gta_compute_dpp_distinct_source = gta_compute_dpp_add_cfg;
+    std::vector<uint32_t> gta_compute_dpp_bound_ctrl = gta_compute_dpp_add_cfg;
+    for (size_t word : {4u, 6u, 8u, 10u, 13u, 15u, 17u, 19u}) {
+        gta_compute_dpp_distinct_source[word] =
+            (gta_compute_dpp_distinct_source[word] & ~0xffu) | 0x15u; // SRC0=v21
+        gta_compute_dpp_bound_ctrl[word] |= 1u << 19u;
+    }
+    if (!recompile_compute(gta_compute_dpp_distinct_source.data(),
+                           gta_compute_dpp_distinct_source.size(),
+                           &gta_compute_dpp_table,
+                           portable_wave64_compute_config).empty() ||
+        !recompile_compute(gta_compute_dpp_bound_ctrl.data(),
+                           gta_compute_dpp_bound_ctrl.size(),
+                           &gta_compute_dpp_table,
+                           portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] GTA V DPP add contract admitted distinct-source or BC1 mutations\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V compute DPP add ladders preserve row direction, events, and BC0 VDST\n");
+
     // Syberia source 87 is a real 960x544 dispatch whose only generic-coverage rejects are eight
     // v_max3_f16 instructions. Keep the first exact low/high pair: OPSEL chooses different source
     // halves for each result and the second instruction writes the high destination half. The decode
@@ -1604,6 +2331,34 @@ int main() {
         printf("  [FAIL] live B64 mask SCC did not reach its crossing dispatcher branch\n");
         return 1;
     }
+
+    // GTA V follows its row reduction with this identity QUAD_PERM and partial ROW_MASK. Prefix the
+    // exact packet to the crossing CFG above so it reaches the dispatcher lowering used by the live
+    // shader. Rows 1/3 add distinct v19, rows 0/2 keep the old in-place v20 because BC is zero.
+    std::vector<uint32_t> gta_compute_dpp_partial_rows = {
+        0x7e280300u,                         // pc0: v_mov_b32 v20,v0
+        0x7e260301u,                         // pc1: v_mov_b32 v19,v1
+        0x4a2826fau, 0xaf00e414u,            // pc2: exact live identity DPP add, ROW_MASK=0xa
+    };
+    gta_compute_dpp_partial_rows.insert(
+        gta_compute_dpp_partial_rows.end(),
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    gta_compute_dpp_partial_rows.back() = 0x7e000314u; // expose v20 through v0
+    gta_compute_dpp_partial_rows.push_back(0xbf810000u);
+    const auto gta_compute_dpp_partial_rows_spv = recompile_compute(
+        gta_compute_dpp_partial_rows.data(), gta_compute_dpp_partial_rows.size(), nullptr,
+        portable_wave64_compute_config);
+    if (gta_compute_dpp_partial_rows_spv.empty() ||
+        !has_opcode(gta_compute_dpp_partial_rows_spv, 251) ||
+        !compute_dpp_add_partial_rows_updates_dispatch_vgpr(
+            gta_compute_dpp_partial_rows_spv) ||
+        !type_result_ids_are_nonzero(gta_compute_dpp_partial_rows_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_compute_dpp_partial_rows_spv)) {
+        printf("  [FAIL] GTA V partial-row DPP add did not preserve masked dispatcher rows\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V partial-row DPP add selects rows 1/3 and preserves BC0 VDST\n");
 
     // A later SOPC owns SCC, so the old mask producer must not be selected speculatively. The
     // crossing graph remains valid and branches on the ordinary scalar comparison.

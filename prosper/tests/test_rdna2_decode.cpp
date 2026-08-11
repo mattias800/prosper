@@ -337,8 +337,23 @@ int main() {
     const uint32_t dpp16[] = { 0x4a0e0cfau, 0xff011106u };   // v_add_nc_u32_dpp v7, v6, v6 row_shr:1
     Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
     CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && !dp.has_modifier && dp.has_dpp &&
-          dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl,
+          dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl &&
+          dp.dpp_row_mask == 0xfu && dp.dpp_bank_mask == 0xfu,
           "VOP2 DPP16 ROW_SHR form retains its unbounded lane control");
+    const uint32_t gta_row_mask_add[] = { 0x4a2826fau, 0xaf00e414u };
+    Rdna2Inst grm = rdna2_decode_one(gta_row_mask_add, 2);
+    CHECK(grm.fmt == Rdna2Format::VOP2 && grm.opcode == 0x25u &&
+          !grm.has_modifier && grm.has_dpp && grm.dpp_ctrl == 0xe4u &&
+          !grm.dpp_bound_ctrl && grm.dpp_row_mask == 0xau &&
+          grm.dpp_bank_mask == 0xfu && isV(grm.dst, 20) &&
+          isV(grm.src[0], 20) && isV(grm.src[1], 19),
+          "GTA V identity DPP add retains exact partial row mask and operands");
+    for (uint32_t mutant : {0x9f00e414u, 0xae00e414u, 0xaf08e414u, 0xaf00e514u}) {
+        const uint32_t words[] = {0x4a2826fau, mutant};
+        Rdna2Inst rejected = rdna2_decode_one(words, 2);
+        CHECK(rejected.has_modifier && !rejected.has_dpp,
+              "GTA V partial DPP admission rejects row/bank/BC/control mutations");
+    }
     const uint32_t ngg_row_shift[] = { 0x4a1e1efau, 0xff09110fu };
     Rdna2Inst nrs = rdna2_decode_one(ngg_row_shift, 2);
     CHECK(nrs.fmt == Rdna2Format::VOP2 && nrs.opcode == 0x25u && !nrs.has_modifier &&

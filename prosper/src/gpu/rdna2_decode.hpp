@@ -74,13 +74,15 @@ struct Rdna2Inst {
     // (dst_sel defaults to DWORD=6, hardware PRESERVES the unwritten f16 half) from the SDWA
     // DWORD+UNUSED_PAD form (same field values, hardware ZERO-fills) — ISA Table 88 DST_U.
     bool        has_sdwa = false;
-    // DPP16 QUAD_PERM/ROW_SHR (#273/#1390): a full-mask operation with no neg/abs/FI.  The
-    // recompiler lowers quad permutations through stage-appropriate lane operations and bounded row
-    // shifts in the portable one-live-lane vertex shell.  src[0] holds the REAL source VGPR
-    // (dword1[7:0]); dpp_ctrl and dpp_bound_ctrl retain the architectural control fields.
+    // DPP16 QUAD_PERM/ROW_SHR (#273/#1390): an admitted operation with no neg/abs/FI. The
+    // recompiler lowers full-mask permutations through stage-appropriate lane operations; exact
+    // partial-mask shapes keep their row/bank fields so a narrow stage model can preserve masked
+    // destinations. src[0] holds the REAL source VGPR (dword1[7:0]).
     bool        has_dpp = false;
     uint16_t    dpp_ctrl = 0;
     bool        dpp_bound_ctrl = false;
+    uint8_t     dpp_bank_mask = 0;
+    uint8_t     dpp_row_mask = 0;
     // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0:1] as Fetch-Inactive and
     // BOUND_CTRL. Keep these separate from DPP's control word: permlane is a native VOP3 op whose
     // 64-bit selector comes from SRC1:SRC2.
