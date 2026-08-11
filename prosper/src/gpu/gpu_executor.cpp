@@ -3403,7 +3403,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
                      (in.opcode >= 0x1C && in.opcode <= 0x1F));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
-                const bool atomic_buffer_use = in.opcode == 0x38; // buffer_atomic_umax
+                // Keep this exact set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
+                // The holes are not aliases: cmp-swap/csub/inc/dec and the x2 family need different
+                // operand/result semantics and must remain fail-closed until those are implemented.
+                const bool atomic_buffer_use =
+                    in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
+                    (in.opcode >= 0x35 && in.opcode <= 0x3B);
                 if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
                     const int srsrc = in.src[1].value;
                     std::array<uint32_t, 4> current{};

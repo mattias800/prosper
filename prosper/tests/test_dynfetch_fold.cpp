@@ -2270,6 +2270,139 @@ int main() {
                              &atomic_table, atomic_config).empty(),
           "#636: production resource table keeps stride-zero supported atomic realizable");
 
+    // GTA V reaches the emitter with buffer_atomic_add/or packets whose descriptors are fully
+    // recoverable, but resource discovery historically recognized only atomic_umax. Keep the
+    // producer's accepted set in lock-step with the emitter's exact supported 32-bit RMW set. The
+    // two full packets below are the game's terminal encodings; using their real SRSRC positions
+    // also proves that the result is exact-PC provenance rather than the direct-SGPR fallback.
+    uint32_t exact_add_seed[8] = {};
+    std::copy(std::begin(atomic_seed), std::end(atomic_seed), exact_add_seed + 4);
+    const uint32_t gta_atomic_add[] = {
+        0xE0C84000u, 0x80010200u, // buffer_atomic_add v2, v0, s[4:7], 0 glc
+        0xBF810000u,
+    };
+    std::vector<SrtUse> gta_add_uses;
+    resolve_dynamic_fetch(gta_atomic_add, std::size(gta_atomic_add), exact_add_seed,
+                          std::size(exact_add_seed), 0, &gta_add_uses);
+    ShaderResourceTable gta_add_table;
+    add_compute_buffer_resources(gta_add_table, gta_atomic_add, std::size(gta_atomic_add),
+                                 exact_add_seed, std::size(exact_add_seed));
+    assign_convention_bindings(gta_add_table, 2);
+    ComputeShaderConfig gta_add_config;
+    gta_add_config.user_sgprs.assign(std::begin(exact_add_seed), std::end(exact_add_seed));
+    gta_add_config.local_x = gta_add_config.local_y = gta_add_config.local_z = 1;
+    CHECK(gta_add_uses.size() == 1 && gta_add_uses[0].use_pc == 0 &&
+              gta_add_table.resources.size() == 1 &&
+              gta_add_table.resources[0].fetch_pc == 0 &&
+              !recompile_compute(gta_atomic_add, std::size(gta_atomic_add),
+                                 &gta_add_table, gta_add_config).empty(),
+          "GTA V exact buffer_atomic_add publishes and consumes its exact-PC resource");
+
+    uint32_t exact_or_seed[36] = {};
+    std::copy(std::begin(atomic_seed), std::end(atomic_seed), exact_or_seed + 32);
+    const uint32_t gta_atomic_or[] = {
+        0xE0E82000u, 0x80080200u, // buffer_atomic_or v2, v0, s[32:35], 0
+        0xBF810000u,
+    };
+    std::vector<SrtUse> gta_or_uses;
+    resolve_dynamic_fetch(gta_atomic_or, std::size(gta_atomic_or), exact_or_seed,
+                          std::size(exact_or_seed), 0, &gta_or_uses);
+    ShaderResourceTable gta_or_table;
+    add_compute_buffer_resources(gta_or_table, gta_atomic_or, std::size(gta_atomic_or),
+                                 exact_or_seed, std::size(exact_or_seed));
+    assign_convention_bindings(gta_or_table, 2);
+    ComputeShaderConfig gta_or_config;
+    gta_or_config.user_sgprs.assign(std::begin(exact_or_seed), std::end(exact_or_seed));
+    gta_or_config.local_x = gta_or_config.local_y = gta_or_config.local_z = 1;
+    CHECK(gta_or_uses.size() == 1 && gta_or_uses[0].use_pc == 0 &&
+              gta_or_table.resources.size() == 1 &&
+              gta_or_table.resources[0].fetch_pc == 0 &&
+              !recompile_compute(gta_atomic_or, std::size(gta_atomic_or),
+                                 &gta_or_table, gta_or_config).empty(),
+          "GTA V exact buffer_atomic_or publishes and consumes its exact-PC resource");
+
+    const uint32_t supported_atomic_dw0[] = {
+        0xE0C00000u, // swap
+        0xE0C80000u, // add
+        0xE0CC0000u, // sub
+        0xE0D40000u, // smin
+        0xE0D80000u, // umin
+        0xE0DC0000u, // smax
+        0xE0E00000u, // umax
+        0xE0E40000u, // and
+        0xE0E80000u, // or
+        0xE0EC0000u, // xor
+    };
+    uint32_t supported_atomic_uses = 0;
+    for (uint32_t dw0 : supported_atomic_dw0) {
+        const uint32_t code[] = { dw0, 0x80000000u, 0xBF810000u };
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(code, std::size(code), atomic_seed, std::size(atomic_seed), 0,
+                              &uses);
+        supported_atomic_uses += uses.size() == 1 && uses[0].use_pc == 0;
+    }
+    CHECK(supported_atomic_uses == std::size(supported_atomic_dw0),
+          "resource discovery admits exactly every emitter-supported 32-bit MUBUF RMW opcode");
+
+    const uint32_t unknown_atomic_descriptor[] = {
+        0xBE801F00u,              // s_getpc_b64 s[0:1]: not a concrete entry V# anymore
+        0xE0C80000u, 0x80000000u, // buffer_atomic_add v0, v0, s[0:3]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> unknown_atomic_uses;
+    resolve_dynamic_fetch(unknown_atomic_descriptor, std::size(unknown_atomic_descriptor),
+                          atomic_seed, std::size(atomic_seed), 0, &unknown_atomic_uses);
+    const uint32_t direct_atomic_add[] = {
+        0xE0C80000u, 0x80000000u, // buffer_atomic_add v0, v0, s[0:3]
+        0xBF810000u,
+    };
+    uint32_t oversized_atomic_seed[4];
+    std::copy(std::begin(atomic_seed), std::end(atomic_seed), oversized_atomic_seed);
+    oversized_atomic_seed[2] = 0x10000001u; // stride zero: NUM_RECORDS is the byte size
+    std::vector<SrtUse> oversized_atomic_uses;
+    resolve_dynamic_fetch(direct_atomic_add, std::size(direct_atomic_add),
+                          oversized_atomic_seed, std::size(oversized_atomic_seed), 0,
+                          &oversized_atomic_uses);
+    uint32_t empty_atomic_seed[4];
+    std::copy(std::begin(atomic_seed), std::end(atomic_seed), empty_atomic_seed);
+    empty_atomic_seed[2] = 0;
+    std::vector<SrtUse> empty_atomic_uses;
+    resolve_dynamic_fetch(direct_atomic_add, std::size(direct_atomic_add), empty_atomic_seed,
+                          std::size(empty_atomic_seed), 0, &empty_atomic_uses);
+    CHECK(unknown_atomic_uses.empty() && oversized_atomic_uses.empty() &&
+              empty_atomic_uses.empty(),
+          "supported atomics still require a fully-known bounded nonempty live V#");
+
+    // These encodings need distinct operands or semantics. In particular op 0x50 is GTA V's
+    // buffer_atomic_swap_x2, not a 32-bit atomic with a neighboring opcode. They must not acquire a
+    // resource merely because their descriptor is concrete; both discovery and emission stay loud.
+    const uint32_t unsupported_atomic_dw0[] = {
+        0xE0C40000u, // cmp-swap
+        0xE0D00000u, // csub
+        0xE0F00000u, // inc
+        0xE0F40000u, // dec
+        0xE1402000u, // swap_x2, exact GTA V dword 0
+    };
+    uint32_t unsupported_atomic_uses = 0;
+    uint32_t unsupported_atomic_resources = 0;
+    uint32_t unsupported_atomic_recompiles = 0;
+    for (uint32_t dw0 : unsupported_atomic_dw0) {
+        const uint32_t code[] = { dw0, 0x80000000u, 0xBF810000u };
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(code, std::size(code), atomic_seed, std::size(atomic_seed), 0,
+                              &uses);
+        unsupported_atomic_uses += !uses.empty();
+        ShaderResourceTable table;
+        add_compute_buffer_resources(table, code, std::size(code), atomic_seed,
+                                     std::size(atomic_seed));
+        unsupported_atomic_resources += !table.resources.empty();
+        unsupported_atomic_recompiles +=
+            !recompile_compute(code, std::size(code), &table, atomic_config).empty();
+    }
+    CHECK(unsupported_atomic_uses == 0 && unsupported_atomic_resources == 0 &&
+              unsupported_atomic_recompiles == 0,
+          "unsupported cmp-swap/csub/inc/dec/x2 MUBUF atomics remain fail-closed");
+
     // Terminator 2D supplies descriptor dwords separately, then reassembles its destination V# in
     // s[0:3] with four scalar moves immediately before format stores. This has no SRT-load tag and
     // the destination range no longer equals its entry user data, but the four consecutive seed
