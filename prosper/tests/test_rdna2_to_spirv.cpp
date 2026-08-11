@@ -605,6 +605,75 @@ int main() {
     CHECK(got15c.size() == N && bad15c == 0,
           "recompiled kernel 15c counts leading zeroes and preserves the zero sentinel exactly");
 
+    // Kernel 15d: V_ALIGNBYTE_B32 (VOP3 0x14f).  Exercise every masked byte offset, including
+    // the 4..7 high-dword tail and 8..31 zero region.  Raw input bits avoid float conversion;
+    // src0 is the high dword and src1 the low dword in the ISA's {S0,S1} concatenation.
+    const uint32_t code15d[] = {
+        0xd54f0000u, 0x040a0300u, // v_alignbyte_b32 v0, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv15d = recompile_valu(
+        code15d, std::size(code15d), /*num_inputs*/3, /*out_vgpr*/0);
+    CHECK(!spv15d.empty(), "recompiled kernel 15d (v_alignbyte_b32) -> SPIR-V");
+    std::vector<float> in15d(N * 3);
+    std::vector<uint32_t> exp15d(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t s0 = 0xa1b2c3d4u ^ (i * 0x01010101u);
+        const uint32_t s1 = 0x11223344u ^ (i * 0x00010001u);
+        const uint32_t byte = i & 31u;
+        in15d[i * 3 + 0] = std::bit_cast<float>(s0);
+        in15d[i * 3 + 1] = std::bit_cast<float>(s1);
+        in15d[i * 3 + 2] = std::bit_cast<float>(byte);
+        if (byte < 4u) {
+            exp15d[i] = byte == 0u ? s1
+                                   : (s1 >> (byte * 8u)) | (s0 << ((4u - byte) * 8u));
+        } else if (byte < 8u) {
+            exp15d[i] = s0 >> ((byte - 4u) * 8u);
+        } else {
+            exp15d[i] = 0u;
+        }
+    }
+    const std::vector<float> got15d = spv15d.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spv15d, in15d, N, N);
+    uint32_t bad15d = 0;
+    for (uint32_t i = 0; i < N && got15d.size() == N; ++i)
+        if (bits_of(got15d[i]) != exp15d[i]) ++bad15d;
+    printf("  kernel15d mismatches=%u (offset7=0x%08x expect=0x%08x, offset8=0x%08x)\n",
+           bad15d, got15d.size() == N ? bits_of(got15d[7]) : 0u, exp15d[7],
+           got15d.size() == N ? bits_of(got15d[8]) : 0u);
+    CHECK(got15d.size() == N && bad15d == 0,
+          "recompiled kernel 15d aligns all byte offsets with zero fill bit-exactly");
+
+    // Kernel 15e: exact first GTA V packet, including literal placement and v5 byte offset.
+    // The captured src0 is zero, so offsets 0..3 select successive bytes of 0x3024240c and
+    // offsets >=4 are zero.  This pins the decoder/emitter path used by programs 0x413ce6000
+    // and 0x413ce6d00, in addition to the general register-source differential above.
+    const uint32_t code15e[] = {
+        0xd54f0006u, 0x0415fe80u, 0x3024240cu,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv15e = recompile_valu(
+        code15e, std::size(code15e), /*num_inputs*/6, /*out_vgpr*/6);
+    CHECK(!spv15e.empty(), "recompiled kernel 15e (GTA V exact v_alignbyte_b32) -> SPIR-V");
+    std::vector<float> in15e(N * 6, 0.0f);
+    std::vector<uint32_t> exp15e(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t byte = i & 31u;
+        in15e[i * 6 + 5] = std::bit_cast<float>(byte);
+        exp15e[i] = byte < 4u ? (0x3024240cu >> (byte * 8u)) : 0u;
+    }
+    const std::vector<float> got15e = spv15e.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spv15e, in15e, N, N);
+    uint32_t bad15e = 0;
+    for (uint32_t i = 0; i < N && got15e.size() == N; ++i)
+        if (bits_of(got15e[i]) != exp15e[i]) ++bad15e;
+    printf("  kernel15e mismatches=%u (offset0=0x%08x offset3=0x%08x offset4=0x%08x)\n",
+           bad15e, got15e.size() == N ? bits_of(got15e[0]) : 0u,
+           got15e.size() == N ? bits_of(got15e[3]) : 0u,
+           got15e.size() == N ? bits_of(got15e[4]) : 0u);
+    CHECK(got15e.size() == N && bad15e == 0,
+          "recompiled kernel 15e matches GTA V's exact literal packet bit-exactly");
+
     // Kernel 15b: kernel 15 with s_ttracedata (SOPP 0x16, 0xbf960000) spliced into the body. The
     // instruction sends M0 to the thread-trace stream — a profiling side channel that writes no
     // SGPR/VGPR/memory and does not branch — so the correct lowering emits nothing and the kernel must

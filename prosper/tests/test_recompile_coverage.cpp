@@ -50,6 +50,41 @@ int main() {
     CHECK(!co_spv.empty() && co_spv[0] == 0x07230203u,
           "v_add_co_u32 lowers to a valid compute SPIR-V module");
 
+    // GTA V's world-entry compute programs 0x413ce6000 and 0x413ce6d00 contain these exact
+    // V_ALIGNBYTE_B32 packets (including the literal dword).  This is a VOP3A integer result:
+    // {src0,src1} is shifted right by 8*src2[4:0], with src1 as the low dword, and no VCC output.
+    const uint32_t alignbyte_live[] = {
+        0xd54f0006u, 0x0415fe80u, 0x3024240cu, // v_alignbyte_b32 v6, 0, 0x3024240c, v5
+        0xd54f0008u, 0x0415fe80u, 0x00301818u, // v_alignbyte_b32 v8, 0, 0x00301818, v5
+        0xbf810000u,
+    };
+    const RecompileCoverage alignbyte_coverage = recompile_coverage(
+        alignbyte_live, std::size(alignbyte_live));
+    CHECK(alignbyte_coverage.total == 2 && alignbyte_coverage.alu == 2 &&
+              alignbyte_coverage.unsupported == 0 && alignbyte_coverage.first_bad_fmt < 0,
+          "GTA V's exact V_ALIGNBYTE_B32 literal packets report supported ALU coverage");
+    const std::vector<uint32_t> alignbyte_spv = recompile_valu(
+        alignbyte_live, std::size(alignbyte_live), /*num_inputs*/6, /*out_vgpr*/6);
+    CHECK(!alignbyte_spv.empty() && alignbyte_spv[0] == 0x07230203u,
+          "GTA V's exact V_ALIGNBYTE_B32 packet lowers to a compute SPIR-V module");
+
+    // Unsupported modifier encodings must not fall through as the unmodified integer operation.
+    // These mutate the same live production packet, one decoded modifier field at a time.
+    const auto alignbyte_rejects = [](uint32_t word0, uint32_t word1) {
+        const uint32_t code[] = {word0, word1, 0x3024240cu, 0xbf810000u};
+        const RecompileCoverage coverage = recompile_coverage(code, std::size(code));
+        return coverage.unsupported == 1 && coverage.first_bad_op == 0x14f &&
+               recompile_valu(code, std::size(code), 6, 6).empty();
+    };
+    CHECK(alignbyte_rejects(0xd54f0106u, 0x0415fe80u),
+          "V_ALIGNBYTE_B32 ABS mutation remains fail-visible");
+    CHECK(alignbyte_rejects(0xd54f0006u, 0x2415fe80u),
+          "V_ALIGNBYTE_B32 NEG mutation remains fail-visible");
+    CHECK(alignbyte_rejects(0xd54f8006u, 0x0415fe80u),
+          "V_ALIGNBYTE_B32 CLAMP mutation remains fail-visible");
+    CHECK(alignbyte_rejects(0xd54f0006u, 0x0c15fe80u),
+          "V_ALIGNBYTE_B32 OMOD mutation remains fail-visible");
+
     // analyze_flat_loads (#1171): resolve a general (non-scratch) flat_load's 64-bit address to its base
     // user-SGPR pointer pair. Encodings are byte-identical to GTA V's texture-decode kernel
     // exec_cs_2042d47600 (pc=0030/0040): the low address dword adds base-low s12, the high dword adds

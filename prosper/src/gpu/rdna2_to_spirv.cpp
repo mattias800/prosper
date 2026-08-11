@@ -9355,6 +9355,41 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t t1 = b.ibin(Op_BitwiseAnd, s0, val(in.src[1]));
                 uint32_t t2 = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, s0), val(in.src[2]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t1, t2);
+            } else if (in.opcode == 0x14F) {                          // v_alignbyte_b32
+                // RDNA2 defines D = ({S0,S1} >> (8 * S2[4:0])) & 0xffffffff, where
+                // S0 is the high dword and S1 the low dword.  Keep every SPIR-V shift
+                // below 32: OpSelect is not short-circuiting, so an apparently unused
+                // shift by 32 would still be undefined.  GTA V's live compute packets
+                // use the plain integer form; LLVM rejects ABS/NEG/OMOD for this opcode
+                // and CLAMP is not part of the documented operation, so those shapes
+                // remain fail-visible rather than silently ignoring their modifier bits.
+                const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                                      in.clamp || in.omod;
+                if (modified) {
+                    ok = false;
+                } else {
+                    const uint32_t s0 = val(in.src[0]);
+                    const uint32_t s1 = val(in.src[1]);
+                    const uint32_t byte = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
+                    const uint32_t shift = b.ibin(
+                        Op_BitwiseAnd, b.ibin(Op_ShiftLeftLogical, byte, b.uconst(3)),
+                        b.uconst(31));
+                    const uint32_t inv_shift = b.ibin(
+                        Op_BitwiseAnd, b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
+                    const uint32_t joined = b.ibin(
+                        Op_BitwiseOr, b.ibin(Op_ShiftRightLogical, s1, shift),
+                        b.ibin(Op_ShiftLeftLogical, s0, inv_shift));
+                    const uint32_t low = b.sel(b.ucmp(Op_IEqual, byte, b.uconst(0)), s1, joined);
+                    const uint32_t upper_byte = b.ibin(Op_ISub, byte, b.uconst(4));
+                    const uint32_t upper_shift = b.ibin(
+                        Op_BitwiseAnd, b.ibin(Op_ShiftLeftLogical, upper_byte, b.uconst(3)),
+                        b.uconst(31));
+                    const uint32_t upper = b.ibin(Op_ShiftRightLogical, s0, upper_shift);
+                    vreg[in.dst.value] = b.sel(
+                        b.ucmp(Op_ULessThan, byte, b.uconst(4)), low,
+                        b.sel(b.ucmp(Op_ULessThan, byte, b.uconst(8)), upper, b.uconst(0)));
+                }
             } else if (in.opcode == 0x364) {                          // v_bcnt_u32_b32
                 // AMD RDNA2: D = popcount(S0) + S1. The third VOP3 source field is unused.
                 vreg[in.dst.value] = b.ibin(Op_IAdd,

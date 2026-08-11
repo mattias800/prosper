@@ -305,6 +305,10 @@ int main(int argc, char** argv) {
     // Compute ALU (float chain).
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
+    // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
+    // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
+    { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};
+      dump(dir, "compute_alignbyte", recompile_valu(c, std::size(c), 6, 6), "recompile_valu"); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }
