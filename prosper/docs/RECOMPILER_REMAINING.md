@@ -4,7 +4,8 @@
 > coverage boundary.** Later routed gameplay exercises a much larger dynamic compute set and still
 > exposes fail-visible instruction, resource and control-flow gaps. The program-tagged terminal census
 > and current fixes live in #2481; do not reuse this document's old conclusion that the recompiler was
-> "done for this title."
+> "done for this title." The 2026-08-11 gameplay-entry sample contains 29 recompile-empty programs and
+> 6 invalid-descriptor programs (35 unique); those route-specific live counts supersede this corpus.
 
 **Date:** 2026-07-06. **Status: ~93.7% instruction coverage in-context; 38 of 41 shaders fully recompile.**
 (The earlier "34/41" was a coverage-tool undercount — it ran a per-instruction check that didn't credit

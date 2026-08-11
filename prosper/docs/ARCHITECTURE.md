@@ -89,10 +89,12 @@ dump is useful for proving that an instruction packet exists, but table-dependen
 unattributable without the real resource table. GTA V is tracked by routed terminal program address +
 instruction PC, not by raw structurizer line counts or adjacency in an interleaved stderr stream: the
 `structured emission stopped` family is consequent, and most `backward else` reports are secondary to
-later instruction, mask-domain or resource failures. Post-lift Wave32 carry, zero-record RAW-buffer,
-full DPP add, VCC-mask/deadness, guest-coherence, FFBH, V_ALIGNBYTE, V_LDEXP_F32 and subword-BFREV
-fixes reduce the routed terminal-program set from 53 to 35 while the gameplay 3D world remains black
-(#2481). See
+later instruction, mask-domain or resource failures. The reviewed post-lift stack now includes
+Wave32/64 mask and carry, scalar/vector/DPP coverage, guest coherence, zero-mip images, exact-wave
+barrier phasing and compact BVH nodes. On the 2026-08-11 gameplay-entry route the exact live set is 29
+recompile-empty plus 6 invalid-descriptor programs (35 unique), down from 39 in the preceding tagged
+sample with no new program failures; the 3D world remains black (#2481). Counts are route- and
+phase-specific, not title-wide totals. See
 `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md` and
 `docs/RECOMPILER_REMAINING.md`, including each document's `## Ruled out` section, before extending
 the translator.

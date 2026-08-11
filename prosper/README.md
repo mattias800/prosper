@@ -81,8 +81,10 @@ user-supplied and gitignored.
   the HUD, radar and tutorial text render over an absent 3D world. The six-stage runtime-selected
   descriptor-array lift is complete. Program-tagged live evidence proved that the earlier "about 57 CFG
   sites" count mixed consequent structurizer messages with independent terminal failures; reviewed work
-  now advances the exact failing programs one instruction or resource contract at a time (#2412/#2481),
-  with subgroup-contract limits tracked separately in #2429. Dragon Quest VII now boots and submits
+  now advances the exact failing programs one instruction or resource contract at a time. The current
+  routed sample has 29 recompile-empty programs plus 6 invalid-descriptor programs, a 35-program union
+  with no new failures versus the preceding sample (#2412/#2481). Subgroup-contract limits are tracked
+  separately in #2429. Dragon Quest VII now boots and submits
   continuously on Windows (#2447), but routed
   progression can hit a fixed `sceKernelBatchMap` ENOMEM whose high-volume memory logger suppresses the
   repro (#2448/#2450). Sonic Racing: CrossWorlds has advanced to rung 2: pulsed input reaches its full

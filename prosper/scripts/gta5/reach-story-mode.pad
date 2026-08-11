@@ -60,8 +60,8 @@ f6000-6020:cross
 # --- WHAT THIS ROUTE REACHES TODAY --------------------------------------------------------------
 #
 # Verified on Linux/RADV on 2026-08-11 (#2481): the route drives the title through the Continue card,
-# ONLINE/GTA+/STORY navigation and Resume Story into gameplay. A frame captured after the route at
-# frame 6281 shows the in-world radar and the tutorial text "The Radar shows your position within the
+# ONLINE/GTA+/STORY navigation and Resume Story into gameplay. A fixed 165-second capture at frame
+# 5597 shows the in-world radar and the tutorial text "The Radar shows your position within the
 # world." The 3D world is still black, which is a renderer/recompiler frontier rather than a route
 # uncertainty. The run exited normally with no device loss.
 #
