@@ -408,6 +408,12 @@ struct RecompileCoverage {
 };
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);
 
+// Test seam for the whole-stream liveness gate on GTA V's incomplete S_CSELECT_B64 source pair.
+// A returned PC is admitted at the select itself; later failure to materialize VCC_HI cannot make
+// this proof pass accidentally.
+std::vector<uint32_t> cselect_b64_low_only_pcs_for_test(
+    const uint32_t* code, size_t dwords);
+
 // A general (non-scratch) FLAT load resolved to a base user-SGPR pointer pair (#1171). The 64-bit
 // address VGPR pair of a `base + offset` flat access is `v[vaddr_lo_reg : vaddr_lo_reg+1]`, and the
 // base pointer's low/high dwords live in consecutive user SGPRs `s[base_sgpr : base_sgpr+1]`. With the

@@ -5308,6 +5308,59 @@ int main() {
     CHECK(pair_true_got.size() == 128 && pair_false_got.size() == 128 && pair_bad == 0,
           "S_CSELECT_B64 selects both scalar dwords for SCC true and false");
 
+    // Force the arbitrary-CFG dispatcher, select two ordinary scalar pairs in one case, then
+    // consume them with a second S_CSELECT_B64 after an explicit successor edge. The dispatcher's
+    // Bool backing variables exist because this opcode can also select masks, but mere variable
+    // existence must not reclassify these data lifetimes as masks when the successor reloads state.
+    const uint32_t code38_pair_dispatch[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0
+        0xbf860001u,              // s_cbranch_vccz +1
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7d840100u,              // fresh VCC for the loop exit
+        0xbf870001u,              // s_cbranch_vccnz +1
+        0xbf82fffdu,              // s_branch -3: forces generic dispatcher shape
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbe820395u,              // s_mov_b32 s2,21
+        0xbe830396u,              // s_mov_b32 s3,22
+        0xbe8c0381u,              // s_mov_b32 s12,1
+        0xbf07800cu,              // SCC=true
+        0x85840200u,              // s_cselect_b64 s[4:5],s[0:1],s[2:3] -> 11:12
+        0xbe8c0380u,              // s_mov_b32 s12,0
+        0xbf07800cu,              // SCC=false
+        0x85860200u,              // s_cselect_b64 s[6:7],s[0:1],s[2:3] -> 21:22
+        0xbf820001u,              // cross a dispatcher edge to pc19
+        0xbf800000u,
+        0xbe85038cu,              // replace s5 after reload; isolate low-root domain persistence
+        0xbe870396u,              // replace s7 after reload
+        0xbe8c0381u,              // s_mov_b32 s12,1
+        0xbf07800cu,              // SCC=true
+        0x858e0604u,              // s_cselect_b64 s[14:15],s[4:5],s[6:7]
+        0x7e02020eu,              // v_mov_b32 v1,s14
+        0xe0702000u, 0x80020100u, // output[lane] = selected low
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e02020fu,              // v_mov_b32 v1,s15
+        0xe0702000u, 0x80020102u, // output[64+lane] = selected high
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> pair_dispatch_words(
+        std::begin(code38_pair_dispatch), std::end(code38_pair_dispatch));
+    const auto pair_dispatch_portable = compile_cselect_pair(
+        pair_dispatch_words, cselect_portable_config);
+    const auto pair_dispatch_native = compile_cselect_pair(
+        pair_dispatch_words, cselect_native_config);
+    CHECK(!pair_dispatch_portable.empty() && !pair_dispatch_native.empty(),
+          "dispatcher preserves S_CSELECT_B64 scalar-pair domain across a successor edge");
+    const auto pair_dispatch_got = run_cselect_pair(pair_dispatch_portable);
+    uint32_t pair_dispatch_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && pair_dispatch_got.size() == 128; ++lane) {
+        pair_dispatch_bad += pair_dispatch_got[lane] != 11u;
+        pair_dispatch_bad += pair_dispatch_got[64 + lane] != 12u;
+    }
+    CHECK(pair_dispatch_got.size() == 128 && pair_dispatch_bad == 0,
+          "dispatcher successor consumes both selected scalar dwords as data");
+
     const uint32_t code38_vcc_true[] = {
         0xbe8003ffu, 0x80000001u, // source0 low: lanes 0 and 31
         0xbe8103ffu, 0x80000001u, // source0 high: lanes 32 and 63
@@ -5393,29 +5446,43 @@ int main() {
     gta_high_live[62] = 0x7e10026bu; // v_mov_b32 v8,vcc_hi: high output is now live
     std::vector<uint32_t> gta_site_mutation = gta_low_true;
     gta_site_mutation[60] = 0x85861000u; // same pc60 select into ordinary s[6:7]
+    const auto gta_low_only_pcs = cselect_b64_low_only_pcs_for_test(
+        gta_low_true.data(), gta_low_true.size());
+    const auto gta_high_live_pcs = cselect_b64_low_only_pcs_for_test(
+        gta_high_live.data(), gta_high_live.size());
+    const auto gta_site_mutation_pcs = cselect_b64_low_only_pcs_for_test(
+        gta_site_mutation.data(), gta_site_mutation.size());
+    CHECK(std::find(gta_low_only_pcs.begin(), gta_low_only_pcs.end(), 60u) !=
+              gta_low_only_pcs.end() &&
+              gta_high_live_pcs.empty() && gta_site_mutation_pcs.empty(),
+          "GTA low-only liveness seam admits pc60 and rejects high-live/destination mutations there");
     CHECK(compile_cselect_pair(gta_high_live, cselect_portable_config).empty() &&
               compile_cselect_pair(gta_high_live, cselect_native_config).empty() &&
               compile_cselect_pair(gta_site_mutation, cselect_portable_config).empty() &&
               compile_cselect_pair(gta_site_mutation, cselect_native_config).empty(),
-          "GTA low-only admission rejects a live high half and a pc60 destination mutation");
+          "GTA low-only negative streams remain fail-visible in portable/native modes");
     const bool can_execute_cselect_native = exec_ballot_subgroup.size == 64 &&
         (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT);
     if (can_execute_cselect_native) {
         const auto pair_true_native_got = run_cselect_pair(pair_true_native);
         const auto pair_false_native_got = run_cselect_pair(pair_false_native);
+        const auto pair_dispatch_native_got = run_cselect_pair(pair_dispatch_native);
         const auto vcc_true_native_got = run_cselect_pair(vcc_true_native);
         const auto vcc_false_native_got = run_cselect_pair(vcc_false_native);
         const auto gta_low_true_native_got = run_cselect_pair(gta_low_true_native);
         const auto gta_low_false_native_got = run_cselect_pair(gta_low_false_native);
         uint32_t native_bad = 0;
         for (uint32_t lane = 0; lane < 64 && pair_true_native_got.size() >= 128 &&
-             pair_false_native_got.size() >= 128 && vcc_true_native_got.size() >= 64 &&
+             pair_false_native_got.size() >= 128 && pair_dispatch_native_got.size() >= 128 &&
+             vcc_true_native_got.size() >= 64 &&
              vcc_false_native_got.size() >= 64 && gta_low_true_native_got.size() >= 64 &&
              gta_low_false_native_got.size() >= 64; ++lane) {
             native_bad += pair_true_native_got[lane] != 11u;
             native_bad += pair_true_native_got[64 + lane] != 12u;
             native_bad += pair_false_native_got[lane] != 21u;
             native_bad += pair_false_native_got[64 + lane] != 22u;
+            native_bad += pair_dispatch_native_got[lane] != 11u;
+            native_bad += pair_dispatch_native_got[64 + lane] != 12u;
             const bool true_bit = lane == 0 || lane == 31 || lane == 32 || lane == 63;
             const bool false_bit = lane == 1 || lane == 30 || lane == 33 || lane == 62;
             native_bad += vcc_true_native_got[lane] != (true_bit ? 22u : 11u);
@@ -5424,6 +5491,7 @@ int main() {
             native_bad += gta_low_false_native_got[lane] != 55u;
         }
         CHECK(pair_true_native_got.size() >= 128 && pair_false_native_got.size() >= 128 &&
+                  pair_dispatch_native_got.size() >= 128 &&
                   vcc_true_native_got.size() >= 64 && vcc_false_native_got.size() >= 64 &&
                   gta_low_true_native_got.size() >= 64 &&
                   gta_low_false_native_got.size() >= 64 && native_bad == 0,
