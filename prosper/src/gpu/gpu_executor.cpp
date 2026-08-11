@@ -3521,8 +3521,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // The holes are not aliases: cmp-swap/csub/inc/dec and the x2 family need different
                 // operand/result semantics and must remain fail-closed until those are implemented.
                 const bool atomic_buffer_use =
-                    in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
-                    (in.opcode >= 0x35 && in.opcode <= 0x3B);
+                    !is_mtbuf &&
+                    (in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
+                     (in.opcode >= 0x35 && in.opcode <= 0x3B));
                 if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
                     const int srsrc = in.src[1].value;
                     std::array<uint32_t, 4> current{};
@@ -3607,11 +3608,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
                         // Typed format stores retain the strided record requirement.
                         const bool stride_supported = !format_store_use || d.stride != 0;
-                        // A fully-known RAW MUBUF with NUM_RECORDS=0 is not a missing descriptor:
-                        // hardware returns zero for loads and drops stores. Preserve that proof at
-                        // this exact consumer pc, but do not generalize it to MTBUF, format stores,
-                        // atomics, or an addr0 descriptor with nonzero records.
-                        const bool zero_record_raw = raw_buffer_use && d.num_records == 0u &&
+                        // A fully-known raw/untyped MUBUF with NUM_RECORDS=0 is not a missing
+                        // descriptor: hardware returns zero for loads, drops stores, and range-checks
+                        // an atomic as one all-or-nothing access. Preserve that proof at this exact
+                        // consumer pc for ordinary raw operations and the exact 32-bit atomic set
+                        // admitted above. MTBUF, format stores, unsupported atomics, and an addr0
+                        // descriptor with nonzero records remain outside the marker contract.
+                        const bool zero_record_raw = (raw_buffer_use || atomic_buffer_use) &&
+                                                     d.num_records == 0u &&
                                                      d.size_bytes == 0u;
                         if (zero_record_raw ||
                             (d.base > 0x10000 && d.size_bytes != 0 &&

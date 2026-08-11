@@ -10536,11 +10536,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (is_zero_record_raw_buffer(*res)) {
                     // The front half proved all four live V# words at this exact instruction and
                     // decoded NUM_RECORDS=0. RDNA2's OOB contract returns zero for every raw load
-                    // component and drops raw stores. Keep inactive lanes' destination values just
-                    // like a normal EXEC-predicated load, and never touch a shared dummy buffer on
-                    // the store side. Atomics are outside the producer's admitted subset and remain
-                    // fail-closed if a hand-built table tries to apply the marker to one.
-                    if (is_atomic) { ok = false; return true; }
+                    // component, drops raw stores, and performs no memory operation for an atomic.
+                    // For atomics GLC=0 leaves VDATA untouched; GLC=1 returns the pre-op value, which
+                    // is zero for an empty descriptor. Apply that return only to active EXEC lanes,
+                    // exactly like an ordinary predicated VGPR write. Never declare or touch a dummy
+                    // binding: one empty operation cannot then leak state into another.
+                    if (is_atomic) {
+                        if (in.mubuf_glc) {
+                            const int d = in.dst.value;
+                            const uint32_t old = vreg_old(b, rs, d);
+                            rs.vreg[d] = b.uconst(0);
+                            predicate_write(b, rs, d, old);
+                        }
+                        return true;
+                    }
                     if (is_store) return true;
                     for (uint32_t k = 0; k < n; ++k) {
                         const int d = in.dst.value + static_cast<int>(k);
