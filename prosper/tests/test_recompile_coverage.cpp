@@ -1033,9 +1033,10 @@ int main() {
                             &dispatch_rt, wave64_dispatch_config).empty(),
           "v_readlane still rejects an ambiguous SGPR used as its real dynamic selector");
 
-    // Three ordinary VOP3A operations account for the other live GTA source-width rejects. Each
-    // scalar source is one broadcast dword. Keep VCC_HI unresolved after the join while replacing
-    // VCC_LO, then execute the exact observed packets so widening any of them to Pair fails here.
+    // Three ordinary VOP3A arithmetic operations account for the other live GTA source-width
+    // rejects. Each scalar source is one broadcast dword. Keep VCC_HI unresolved after the join
+    // while replacing VCC_LO, then execute the exact observed packets so widening any of them to
+    // Pair fails here.
     std::vector<uint32_t> compute_cfg_dispatch_exact_vop3_b32_sources = {
         0xBF068008u,                         // pc0: scalar branch condition
         0xBF840003u,                         // pc1: branch to mask-producing arm
@@ -1093,6 +1094,124 @@ int main() {
                             compute_cfg_dispatch_vop3_wrong_b32_half.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
           "GTA's exact VOP3A consumers reject when only the other VCC half is replaced");
+
+    // exec_cs_413d22d00 pc665 is V_CNDMASK_B32_E64 with scalar SRC1=s17. An unrelated
+    // mask/scalar join leaves s18 ambiguous, so widening the one-dword s17 operand to a pair
+    // incorrectly rejects this packet. Keep the production words intact and mutate SRC1 at that
+    // same site to s18 so the negative arm still observes the genuinely ambiguous dword.
+    std::vector<uint32_t> compute_cfg_dispatch_exact_vop3_cndmask_b32_source = {
+        0xBF068008u,                         // pc0: scalar branch condition
+        0xBF840003u,                         // pc1: branch to mask-producing arm
+        0xBE920381u,                         // pc2: scalar arm s18 = 1
+        0xBE930380u,                         // pc3: scalar arm s19 = 0
+        0xBF820001u,                         // pc4: merge
+        0xBE920A7Eu,                         // pc5: mask-only WQM s[18:19] = exec
+        0xBE910381u,                         // pc6: definite scalar s17 = 1
+        0x7E300280u,                         // pc7: v24 = 0
+        0x7E2A0280u,                         // pc8: v21 = 0
+        0x7D8414F9u, 0x06868E82u,            // pc9: exact live compare writes mask s[14:15]
+        0xD5010015u, 0x00382318u,            // pc11: exact live cndmask v21,v24,s17,s[14:15]
+    };
+    compute_cfg_dispatch_exact_vop3_cndmask_b32_source.insert(
+        compute_cfg_dispatch_exact_vop3_cndmask_b32_source.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_exact_vop3_cndmask_b32_source.data(),
+                             compute_cfg_dispatch_exact_vop3_cndmask_b32_source.size(),
+                             &dispatch_rt, wave64_dispatch_config).empty(),
+          "GTA's exact VOP3 cndmask consumes only its scalar source dword");
+
+    std::vector<uint32_t> compute_cfg_dispatch_vop3_cndmask_ambiguous_source =
+        compute_cfg_dispatch_exact_vop3_cndmask_b32_source;
+    compute_cfg_dispatch_vop3_cndmask_ambiguous_source[12] =
+        0x00382518u;                         // same pc11 packet with SRC1=s18
+    CHECK(recompile_compute(compute_cfg_dispatch_vop3_cndmask_ambiguous_source.data(),
+                            compute_cfg_dispatch_vop3_cndmask_ambiguous_source.size(),
+                            &dispatch_rt, wave64_dispatch_config).empty(),
+          "VOP3 cndmask rejects an unresolved scalar dword at its exact source field");
+
+    // exec_cs_205b654a00 pc2232 is V_LSHL_OR_B32 with scalar SRC0=s8. The preceding
+    // V_READFIRSTLANE definitely replaces s8, while the adjacent s9 remains ambiguous after a
+    // mask/scalar join. Every source of this integer VOP3A operation is one dword; mutating only
+    // SRC0 at the production packet to s9 must still observe and reject the unresolved value.
+    std::vector<uint32_t> compute_cfg_dispatch_exact_lshl_or_b32_source = {
+        0xBF068008u,                         // pc0: scalar branch condition
+        0xBF840003u,                         // pc1: branch to mask-producing arm
+        0xBE880381u,                         // pc2: scalar arm s8 = 1
+        0xBE890380u,                         // pc3: scalar arm s9 = 0
+        0xBF820001u,                         // pc4: merge
+        0xBE880A7Eu,                         // pc5: mask-only WQM s[8:9] = exec
+        0x7E000280u,                         // pc6: v0 = 0
+        0x7E100500u,                         // pc7: exact upstream readfirstlane s8,v0
+        0xBE920384u, 0xBE930382u,            // pc8: scalar s[18:19] = {4,2}
+        0xBE940384u, 0xBE950382u,            // pc10: scalar s[20:21] = {4,2}
+        0xBF068008u,                         // pc12: define SCC for the pair selection
+        0x85EA1412u,                         // pc13: materialize scalar pair in VCC
+        0xD76F0002u, 0x01A92008u,            // pc14: exact lshl_or v2,s8,16,vcc_lo
+        0xBE880480u,                         // pc16: clear the unrelated pair for the tail
+    };
+    const size_t lshl_or_dispatch_base =
+        compute_cfg_dispatch_exact_lshl_or_b32_source.size();
+    compute_cfg_dispatch_exact_lshl_or_b32_source.insert(
+        compute_cfg_dispatch_exact_lshl_or_b32_source.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    // This fixture deliberately overwrites s8, which is also the synthetic tail's direct V#.
+    // Preserve the tail's instruction count and CFG while removing that unrelated descriptor read.
+    compute_cfg_dispatch_exact_lshl_or_b32_source[lshl_or_dispatch_base + 12] = 0xBF800000u;
+    compute_cfg_dispatch_exact_lshl_or_b32_source[lshl_or_dispatch_base + 13] = 0xBF800000u;
+    CHECK(!recompile_compute(compute_cfg_dispatch_exact_lshl_or_b32_source.data(),
+                             compute_cfg_dispatch_exact_lshl_or_b32_source.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "GTA's exact VOP3 lshl_or consumes only its definitely replaced scalar dword");
+
+    std::vector<uint32_t> compute_cfg_dispatch_lshl_or_ambiguous_source =
+        compute_cfg_dispatch_exact_lshl_or_b32_source;
+    compute_cfg_dispatch_lshl_or_ambiguous_source[15] =
+        0x01A92009u;                         // same pc14 packet with SRC0=s9
+    CHECK(recompile_compute(compute_cfg_dispatch_lshl_or_ambiguous_source.data(),
+                            compute_cfg_dispatch_lshl_or_ambiguous_source.size(), &dispatch_rt,
+                            wave64_dispatch_config).empty(),
+          "VOP3 lshl_or rejects an unresolved scalar dword at its exact source field");
+
+    // exec_cs_205b658800 pc2546 is two-source V_MAC_F32 with real SRC0=s31. A scalar load
+    // replaces through s31, but s32 remains ambiguous. Keep a second ambiguity at s0 so this
+    // fixture also requires the decoder to suppress V_MAC's reserved SRC2 field. The same-site
+    // mutation changes only real SRC0 to s32 and must remain fail-visible.
+    std::vector<uint32_t> compute_cfg_dispatch_exact_vmac_b32_source = {
+        0xBF068008u,                         // pc0: first scalar branch condition
+        0xBF840003u,                         // pc1: branch to mask-producing arm
+        0xBE800381u,                         // pc2: scalar arm s0 = 1
+        0xBE810380u,                         // pc3: scalar arm s1 = 0
+        0xBF820001u,                         // pc4: merge
+        0xBE800A7Eu,                         // pc5: mask-only WQM s[0:1] = exec
+        0xBF068008u,                         // pc6: second scalar branch condition
+        0xBF840003u,                         // pc7: branch to mask-producing arm
+        0xBEA00381u,                         // pc8: scalar arm s32 = 1
+        0xBEA10380u,                         // pc9: scalar arm s33 = 0
+        0xBF820001u,                         // pc10: merge
+        0xBEA00A7Eu,                         // pc11: mask-only WQM s[32:33] = exec
+        0xBE9F0381u,                         // pc12: definite scalar s31 = 1
+        0x7E040280u,                         // pc13: v2 = 0
+        0x7E1E0280u,                         // pc14: old v15 = 0
+        0xD51F000Fu, 0x2002041Fu,            // pc15: exact v_mac v15,-s31,v2
+        0xBE800480u,                         // pc17: clear s[0:1] for the tail
+        0xBEA00480u,                         // pc18: clear s[32:33] for the tail
+    };
+    compute_cfg_dispatch_exact_vmac_b32_source.insert(
+        compute_cfg_dispatch_exact_vmac_b32_source.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_exact_vmac_b32_source.data(),
+                             compute_cfg_dispatch_exact_vmac_b32_source.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "GTA's exact VOP3 v_mac ignores reserved SRC2 and reads one scalar dword");
+
+    std::vector<uint32_t> compute_cfg_dispatch_vmac_ambiguous_source =
+        compute_cfg_dispatch_exact_vmac_b32_source;
+    compute_cfg_dispatch_vmac_ambiguous_source[16] =
+        0x20020420u;                         // same pc15 packet with real SRC0=s32
+    CHECK(recompile_compute(compute_cfg_dispatch_vmac_ambiguous_source.data(),
+                            compute_cfg_dispatch_vmac_ambiguous_source.size(), &dispatch_rt,
+                            wave64_dispatch_config).empty(),
+          "VOP3 v_mac rejects an unresolved scalar dword at its exact source field");
 
     // A B64 logical may combine a proved wave mask with a complete scalar ballot pair. Its earlier
     // VOP3B join roots an ambiguous mask pair at odd s55: the scalar operand starts at base+1 and
@@ -1167,6 +1286,39 @@ int main() {
                             compute_cfg_dispatch_unmaterialized_vcc_pair.size(), &dispatch_rt,
                             wave64_dispatch_config).empty(),
           "the mixed VCC join rejects when its entry producer lacks scalar ballot words");
+
+    // The next site in exec_cs_205b5e8600 joins early exits that retain scalar EXEC ballot words
+    // s[56:57] with the normal path's exact pc1798 S_ANDN2_B64 survivor mask. Under native Wave64,
+    // the logical result has the same exact ballot-word representation as the early path, so the
+    // pc1802 S_CMP_EQ_U64 consumer is safe. Replacing only pc1798 with mask-only WQM removes those
+    // scalar words and must reject at the unchanged full-pair consumer.
+    std::vector<uint32_t> compute_cfg_dispatch_logical_ballot_join = {
+        0xBEB8037Eu,                         // pc0: scalar s56 = exec_lo
+        0xBEB9037Fu,                         // pc1: scalar s57 = exec_hi
+        0x7E400280u,                         // pc2: v32 = 0
+        0xBF068008u,                         // pc3: unresolved choice keeps both paths
+        0xBF840003u,                         // pc4: early path skips pc5-pc7 to join
+        0x7D8A40C1u,                         // pc5: exact pc1797 compare creates VCC
+        0x8AB86A38u,                         // pc6: exact pc1798 andn2 s56,s56,vcc
+        0xBF800000u,                         // pc7: normal path reaches join
+        0xBF128038u,                         // pc8: exact pc1802 cmp_eq_u64 s[56:57],0
+    };
+    compute_cfg_dispatch_logical_ballot_join.insert(
+        compute_cfg_dispatch_logical_ballot_join.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_logical_ballot_join.data(),
+                             compute_cfg_dispatch_logical_ballot_join.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "native Wave64 retains exact scalar ballot words for a B64 logical result");
+
+    std::vector<uint32_t> compute_cfg_dispatch_mask_only_logical_join =
+        compute_cfg_dispatch_logical_ballot_join;
+    compute_cfg_dispatch_mask_only_logical_join[6] =
+        0xBEB80A7Eu;                         // same pc6: WQM has no scalar-word view
+    CHECK(recompile_compute(compute_cfg_dispatch_mask_only_logical_join.data(),
+                            compute_cfg_dispatch_mask_only_logical_join.size(), &dispatch_rt,
+                            wave64_dispatch_config).empty(),
+          "a mask-only mutation cannot supply pc1802's scalar pair");
 
     // A fresh VCC mask can itself overlap the high word of an older odd-rooted ambiguity. The exact
     // pc1467 packet reads VCC in the Bool domain and s[56:57] in the scalar domain, so only the latter
