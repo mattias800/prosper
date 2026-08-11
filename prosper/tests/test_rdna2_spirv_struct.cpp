@@ -115,6 +115,43 @@ uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return count;
 }
 
+bool has_capability(const std::vector<uint32_t>& spv, uint32_t capability) {
+    constexpr uint32_t OpCapability = 17;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpCapability && wc == 2 && spv[i + 1] == capability) return true;
+        i += wc;
+    }
+    return false;
+}
+
+bool has_u64_atomic_and_stride8_alias(const std::vector<uint32_t>& spv,
+                                      uint32_t atomic_opcode) {
+    constexpr uint32_t OpDecorate = 71;
+    constexpr uint32_t DecorationArrayStride = 6;
+    std::unordered_set<uint32_t> u64_types;
+    bool stride8 = false, u64_atomic = false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpTypeInt && wc == 4 && spv[i + 2] == 64u && spv[i + 3] == 0u)
+            u64_types.insert(spv[i + 1]);
+        if (op == OpDecorate && wc == 4 &&
+            spv[i + 2] == DecorationArrayStride && spv[i + 3] == 8u)
+            stride8 = true;
+        i += wc;
+    }
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == atomic_opcode && wc >= 7 && u64_types.contains(spv[i + 1]))
+            u64_atomic = true;
+        i += wc;
+    }
+    return stride8 && u64_atomic;
+}
+
 // Prove that a subgroup vote is persisted through the CFG dispatcher's bool register file and then
 // consumed as the condition of a later OpSelect.  This is the structural shape of a scalar mask
 // comparison followed by s_cselect: opcode presence alone would not prove that SCC survived the
@@ -4700,6 +4737,109 @@ int main() {
     }
     printf("  [ok]   image_get_resinfo 3D lowers to size/level image queries\n");
 
+    // GTA V's exact stride-8/25-record BUFFER_ATOMIC_SWAP_X2 must be one qword exchange. Include an
+    // ordinary dword load through the same binding so both the u32 and u64 Block variables are
+    // statically used; reflection must coalesce those compatible aliases into one Vulkan binding.
+    alignas(8) uint32_t swap_x2_backing[50] = {};
+    ShaderResourceTable rt_swap_x2;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1;
+      buffer.binding = 2; buffer.gpu_addr = reinterpret_cast<uint64_t>(swap_x2_backing);
+      buffer.size = 200; buffer.stride = 8; buffer.sgpr_base = 0; buffer.fetch_pc = 2;
+      buffer.atomic_x2_record_count = 25;
+      rt_swap_x2.resources.push_back(buffer); }
+    const uint32_t cs_swap_x2[] = {
+        0xe0302000u, 0x80000013u, // buffer_load_dword v0, v19, s[0:3], idxen
+        0xe1402000u, 0x80000913u, // buffer_atomic_swap_x2 v[9:10], v19, s[0:3], idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig swap_x2_config;
+    swap_x2_config.local_x = 1;
+    swap_x2_config.storage_buffer_int64_atomics = true;
+    const std::vector<uint32_t> swap_x2_spv = recompile_compute(
+        cs_swap_x2, std::size(cs_swap_x2), &rt_swap_x2, swap_x2_config);
+    const DescriptorValidationReport swap_x2_report = validate_spirv_descriptor_interface(
+        swap_x2_spv, &rt_swap_x2, 0, SpirvShaderStage::Compute, false);
+    if (swap_x2_spv.empty() || opcode_count(swap_x2_spv, 229u) != 1u ||
+        !has_capability(swap_x2_spv, 11u) || !has_capability(swap_x2_spv, 12u) ||
+        !has_u64_atomic_and_stride8_alias(swap_x2_spv, 229u) ||
+        !swap_x2_report.ok() || swap_x2_report.descriptors.size() != 1u ||
+        swap_x2_report.descriptors[0].required_bytes != 8u ||
+        !swap_x2_report.descriptors[0].readable ||
+        !swap_x2_report.descriptors[0].writable ||
+        !swap_x2_report.descriptors[0].atomic_access) {
+        printf("  [FAIL] swap_x2 is not one reflected u64 atomic over a stride-8 alias\n");
+        return 1;
+    }
+    printf("  [ok]   swap_x2 emits one u64 atomic and coalesces its u32/u64 binding aliases\n");
+
+    ShaderResourceTable mutated_swap_x2 = rt_swap_x2;
+    mutated_swap_x2.resources[0].atomic_x2_record_count = 0;
+    if (!recompile_compute(cs_swap_x2, std::size(cs_swap_x2), &mutated_swap_x2,
+                           swap_x2_config).empty()) {
+        printf("  [FAIL] swap_x2 emitter ignored its exact record-count production proof\n");
+        return 1;
+    }
+    ShaderResourceTable oversized_swap_x2 = rt_swap_x2;
+    oversized_swap_x2.resources[0].size = 0x10000008u;
+    oversized_swap_x2.resources[0].atomic_x2_record_count = 0x02000001u;
+    if (!recompile_compute(cs_swap_x2, std::size(cs_swap_x2), &oversized_swap_x2,
+                           swap_x2_config).empty()) {
+        printf("  [FAIL] swap_x2 emitter admitted an out-of-contract record count\n");
+        return 1;
+    }
+    ComputeShaderConfig unsupported_swap_x2 = swap_x2_config;
+    unsupported_swap_x2.storage_buffer_int64_atomics = false;
+    if (!recompile_compute(cs_swap_x2, std::size(cs_swap_x2), &rt_swap_x2,
+                           unsupported_swap_x2).empty()) {
+        printf("  [FAIL] swap_x2 emitted without the enabled int64-atomic device contract\n");
+        return 1;
+    }
+    printf("  [ok]   swap_x2 rejects marker and device-capability mutations at emission\n");
+
+    // pc172/183 use OR_X2 with GLC=1 as a qword atomic read/retry. It must be one u64 OpAtomicOr;
+    // replacing it with exchange or two independent dword ORs changes visible memory/return state.
+    ShaderResourceTable rt_or_x2 = rt_swap_x2;
+    rt_or_x2.resources[0].fetch_pc = 0;
+    const uint32_t cs_or_x2[] = {
+        0xe1686000u, 0x80000913u, // buffer_atomic_or_x2 v[9:10], v19, s[0:3], idxen glc
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> or_x2_spv = recompile_compute(
+        cs_or_x2, std::size(cs_or_x2), &rt_or_x2, swap_x2_config);
+    const DescriptorValidationReport or_x2_report = validate_spirv_descriptor_interface(
+        or_x2_spv, &rt_or_x2, 0, SpirvShaderStage::Compute, false);
+    if (or_x2_spv.empty() || opcode_count(or_x2_spv, 241u) != 1u ||
+        opcode_count(or_x2_spv, 229u) != 0u ||
+        !has_capability(or_x2_spv, 11u) || !has_capability(or_x2_spv, 12u) ||
+        !has_u64_atomic_and_stride8_alias(or_x2_spv, 241u) ||
+        !or_x2_report.ok() || or_x2_report.descriptors.size() != 1u ||
+        !or_x2_report.descriptors[0].readable ||
+        !or_x2_report.descriptors[0].writable ||
+        !or_x2_report.descriptors[0].atomic_access) {
+        printf("  [FAIL] or_x2 is not one reflected u64 atomic-or over a stride-8 alias\n");
+        return 1;
+    }
+    const uint32_t slc_or_x2[] = {
+        0xe1686000u, 0x80400913u,
+        0xbf810000u,
+    };
+    if (!recompile_compute(slc_or_x2, std::size(slc_or_x2), &rt_or_x2,
+                           swap_x2_config).empty()) {
+        printf("  [FAIL] or_x2 emitter accepted the unproved SLC packet sibling\n");
+        return 1;
+    }
+    const uint32_t reserved_or_x2[] = {
+        0xe16a6000u, 0x80000913u,
+        0xbf810000u,
+    };
+    if (!recompile_compute(reserved_or_x2, std::size(reserved_or_x2), &rt_or_x2,
+                           swap_x2_config).empty()) {
+        printf("  [FAIL] or_x2 emitter accepted reserved dword0 bit 17\n");
+        return 1;
+    }
+    printf("  [ok]   or_x2 emits one u64 OpAtomicOr and rejects exact-site packet mutations\n");
+
     // Astro Bot's exact visibility-image packet: exchange v9 with R32_UINT texel (v0,v1), GLC=1.
     // Both SPIR-V operations are essential: accepting the MIMG without a real texel pointer/atomic
     // would merely hide the rejection while dropping the image side effect.
@@ -4944,6 +5084,14 @@ int main() {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY was accepted without its BVH bytes\n");
         return 1;
     }
+    ShaderResourceTable sorted_bvh = rt_bvh;
+    sorted_bvh.resources[0].bvh_sort_enabled = true;
+    const std::vector<uint32_t> sorted_bvh_spv = recompile_compute(
+        cs_bvh_intersect.data(), cs_bvh_intersect.size(), &sorted_bvh, bvh_config);
+    if (sorted_bvh_spv.empty() || sorted_bvh_spv == bvh_spv) {
+        printf("  [FAIL] sorted IMAGE_BVH_INTERSECT_RAY lacks distinct box-order lowering\n");
+        return 1;
+    }
     std::vector<uint32_t> unsupported_bvh = cs_bvh_intersect;
     unsupported_bvh[gta_bvh_pc] &= ~(1u << 15); // R128=0 has a different destination contract.
     if (!recompile_compute(unsupported_bvh.data(), unsupported_bvh.size(),
@@ -4972,7 +5120,7 @@ int main() {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a non-constant-buffer resource\n");
         return 1;
     }
-    printf("  [ok]   GTA's exact-pc 64-byte IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
+    printf("  [ok]   GTA's exact-pc sorted/unsorted IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting

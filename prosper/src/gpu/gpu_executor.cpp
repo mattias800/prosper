@@ -288,12 +288,14 @@ struct ShaderResourceCompileKey {
     uint32_t binding = 0;
     uint32_t stride = 0;
     uint32_t one_record_tail_semantic = 0;
+    uint32_t atomic_x2_record_count = 0;
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
     uint32_t flat_base_sgpr = 0;
     uint32_t bvh_box_grow = 0;
+    bool bvh_sort_enabled = false;
     bool null_bvh = false;
     bool zero_record_raw = false;
     bool srgb = false;
@@ -335,6 +337,7 @@ struct ShaderCompileKey {
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
     uint32_t compute_native_storage_format_support = 0;
+    bool compute_storage_buffer_int64_atomics = false;
     bool compute_packed_r11_storage = true;
     uint32_t vertex_lds_dwords = 0;
     uint32_t vertices_per_instance = 0;
@@ -385,6 +388,8 @@ struct ShaderCompileKey {
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
+               compute_storage_buffer_int64_atomics ==
+                   other.compute_storage_buffer_int64_atomics &&
                compute_packed_r11_storage == other.compute_packed_r11_storage &&
                vertex_lds_dwords == other.vertex_lds_dwords &&
                vertices_per_instance == other.vertices_per_instance &&
@@ -448,6 +453,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_lds_bytes);
             hash = hash_mix(hash, key.compute_native_subgroup_size);
             hash = hash_mix(hash, key.compute_native_storage_format_support);
+            hash = hash_mix(hash, key.compute_storage_buffer_int64_atomics);
             hash = hash_mix(hash, key.compute_packed_r11_storage);
         }
         hash = hash_mix(hash, key.vertex_lds_dwords);
@@ -473,12 +479,14 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.binding);
             hash = hash_mix(hash, resource.stride);
             hash = hash_mix(hash, resource.one_record_tail_semantic);
+            hash = hash_mix(hash, resource.atomic_x2_record_count);
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.flat_base_sgpr);
             hash = hash_mix(hash, resource.bvh_box_grow);
+            hash = hash_mix(hash, resource.bvh_sort_enabled);
             hash = hash_mix(hash, resource.null_bvh);
             hash = hash_mix(hash, resource.zero_record_raw);
             hash = hash_mix(hash, resource.srgb);
@@ -1110,6 +1118,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
         key.compute_native_storage_format_support =
             compute_config->native_storage_format_support;
+        key.compute_storage_buffer_int64_atomics =
+            compute_config->storage_buffer_int64_atomics;
         key.compute_packed_r11_storage = compute_config->packed_r11_storage;
     }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
@@ -1199,12 +1209,25 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                     : one_record_tail && resource.format == DataFormat::Float16
                         ? StorageBufferTailSemantic::Float16
                         : StorageBufferTailSemantic::None);
+            // A warm cache hit bypasses emitter-side resource revalidation. Partition on the
+            // complete resource-side admission result, not the serialized marker alone, so an
+            // opaque/corrupt marker cannot borrow a valid module across size, alignment, or array
+            // shape changes. Address identity remains intentionally absent; only alignment matters.
+            const bool atomic_x2_exact_admission =
+                resource.atomic_x2_record_count != 0u &&
+                resource.atomic_x2_record_count <= 0x02000000u &&
+                static_cast<uint64_t>(resource.atomic_x2_record_count) * 8u == resource.size &&
+                resource.stride == 8u &&
+                (resource.gpu_addr & 7u) == 0u && resource.table_index_count == 0u;
+            compiled.atomic_x2_record_count =
+                atomic_x2_exact_admission ? resource.atomic_x2_record_count : 0u;
             compiled.srt_offset = resource.srt_offset;
             compiled.sgpr_base = resource.sgpr_base;
             compiled.fetch_pc = resource.fetch_pc;
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
             compiled.bvh_box_grow = resource.bvh_box_grow;
+            compiled.bvh_sort_enabled = resource.bvh_sort_enabled;
             compiled.null_bvh = is_proven_null_bvh(resource);
             // gpu_addr/size intentionally stay out of the module key, but this semantic is compiled
             // into zero-producing/no-op instructions. Partition exactly this proven marker so a
@@ -1963,6 +1986,10 @@ bool has_indirect_control_flow(const std::vector<Rdna2Inst>& instructions) {
 }
 
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
+    // An indirect target can enter the guarded interval after its EXECZ check, or leave and later
+    // re-enter it. No scan over direct SOPP displacements can prove dominance in that program.
+    if (has_indirect_control_flow(instructions)) return false;
+
     const auto& is_branch = sopp_is_branch;
     const auto& target = sopp_branch_target;
 
@@ -1997,6 +2024,27 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
     return false;
 }
 
+// The x16-header null proof deliberately accepts one observed straight-line descriptor builder, not
+// a general scalar phi analysis. Every instruction that carries the root from its mapped load to the
+// ray must therefore execute whenever the ray does. Reject a branch inside that interval, or any
+// edge entering it after the load; branches that skip both the load and the ray remain harmless.
+bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructions,
+                                        uint32_t definition_pc, uint32_t use_pc) {
+    if (definition_pc >= use_pc) return false;
+    bool found_definition = false, found_use = false;
+    for (const Rdna2Inst& in : instructions) {
+        found_definition |= in.pc == definition_pc;
+        found_use |= in.pc == use_pc;
+        if (!sopp_is_branch(in)) continue;
+        const int64_t branch_target = sopp_branch_target(in);
+        if (in.pc > definition_pc && in.pc < use_pc) return false;
+        if (branch_target > static_cast<int64_t>(definition_pc) &&
+            branch_target <= static_cast<int64_t>(use_pc))
+            return false;
+    }
+    return found_definition && found_use;
+}
+
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed
 // offset (e.g. `s_load_dwordx4 s[8:11], s[24:25], vcc_hi` where `vcc_hi = (s64<<4)&0x1f0` and
@@ -2009,6 +2057,66 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
 // value that would depend on a VGPR/lane is left unknown (the op's dest becomes unknown), so we never
 // fabricate a per-lane-dependent descriptor. CONFIDENCE: MED (covers this game's fetch-shader shape).
 // External linkage (DynFetch + declaration in gpu_execute.hpp) so the fold is unit-testable.
+static bool zero_record_sbuffer_access_is_oob(const Rdna2Inst& in,
+                                              const DecodedBufferDescriptor& descriptor) {
+    if (in.fmt != Rdna2Format::SMEM || in.opcode < 0x8u || in.opcode > 0xCu ||
+        descriptor.num_records != 0u || descriptor.size_bytes != 0u ||
+        static_cast<int32_t>(in.literal) < 0)
+        return false;
+
+    // Scalar-buffer bounds differ from vector-buffer bounds when STRIDE=0: hardware substitutes a
+    // one-dword M_SIZE instead of using NUM_RECORDS directly. SOFFSET is unsigned, so the immediate
+    // names the minimum possible dword. Only specialize when even that minimum begins out of range.
+    const uint32_t scalar_dwords = descriptor.stride == 0u ? 1u : descriptor.num_records;
+    const uint32_t minimum_dword = in.literal >> 2;
+    return minimum_dword >= scalar_dwords;
+}
+
+static bool zero_record_format_selectors_are_zero(const Rdna2Inst& in,
+                                                   const uint32_t descriptor_words[4]) {
+    if (in.fmt != Rdna2Format::MUBUF || in.opcode > 0x3u)
+        return false;
+    const uint32_t components = in.opcode + 1u;
+    for (uint32_t component = 0; component < components; ++component) {
+        const uint32_t selector = (descriptor_words[3] >> (component * 3u)) & 0x7u;
+        // SQ_SEL_0 and X/Y/Z/W all yield zero for an OOB record. SQ_SEL_1 yields one; 2/3 are
+        // reserved and stay fail-closed rather than acquiring an invented constant value.
+        if (selector != 0u && selector < 4u)
+            return false;
+    }
+    return true;
+}
+
+// GTA V rebuilds the same linear qword-atomic V# shape with dispatch-sized record counts (the routed
+// scene exercises 25, 2, 3, and 1). RDNA2 range-checks INDEX against NUM_RECORDS and OFFSET against
+// STRIDE, so the exact concrete count can be compiled as the all-or-nothing qword bound. Keep every
+// other packet/descriptor control deliberately narrow; SLC/TFE/reserved dword1 variants have
+// different or invalid contracts and the decoder does not otherwise retain those bits.
+static uint32_t exact_atomic_x2_record_count(
+        const Rdna2Inst& in, const DecodedBufferDescriptor& descriptor,
+        const uint32_t descriptor_words[4]) {
+    const uint32_t offset = in.literal & 0xfffu;
+    const bool offen = ((in.literal >> 12u) & 1u) != 0;
+    const bool idxen = ((in.literal >> 13u) & 1u) != 0;
+    const bool zero_soffset =
+        (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+        (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+    const bool supported_opcode = in.opcode == 0x50u || in.opcode == 0x5au;
+    const bool exact = in.fmt == Rdna2Format::MUBUF && supported_opcode &&
+           idxen && !offen && offset == 0u && zero_soffset &&
+           !in.mubuf_dlc && !in.mubuf_lds && (in.words[0] & 0x00020000u) == 0u &&
+           (in.words[1] & 0x00e00000u) == 0u &&
+           in.src[0].kind == OperandKind::VGPR && descriptor.base > 0x10000u &&
+           (descriptor.base & 7u) == 0u && descriptor.stride == 8u &&
+           descriptor.num_records != 0u && descriptor.num_records <= 0x02000000u &&
+           descriptor.size_bytes == static_cast<uint64_t>(descriptor.num_records) * 8u &&
+           (descriptor_words[1] & 0xc0000000u) == 0u && // no swizzled addressing
+           // Exact observed upper controls: no INDEX_STRIDE/ADD_TID/RESOURCE_LEVEL/reserved bits,
+           // OOB_SELECT=0, and buffer TYPE=0. The normalized ShaderResource retains none of these.
+           (descriptor_words[3] & 0xfff80000u) == 0u;
+    return exact ? descriptor.num_records : 0u;
+}
+
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
@@ -2106,6 +2214,30 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> null_chain_origin{};
     std::bitset<kFoldSgprs> null_chain_known;
     uint32_t next_null_chain_origin = 0;
+    // Only x16-header roots need the narrow straight-line dominance contract added for GTA V. The
+    // generic mapped-qword null proof predates this shape and has separate loop/CFG validation.
+    // Origin ids are monotonic and never restored, so this metadata is immutable once published.
+    std::vector<uint32_t> x16_null_origin_pc(1u, UINT32_MAX);
+    // Null-pointer provenance carried by SCC between the low and high halves of an exact
+    // s_add_u32/s_addc_u32 pair. The concrete carry can be unknown after a failed null dereference;
+    // this records only that the high result still belongs to that null chain.
+    uint32_t null_count_carry_origin = 0;
+    // Exact provenance for GTA V's RTIP 1.1 descriptor builder. A successful mapped x16 header
+    // load seeds candidate qword origins; only the observed mask/lshl/load-count/bfe/carry/header
+    // chain can turn one into a complete descriptor. This is deliberately separate from concrete
+    // value knowledge: four literal-built words that merely decode as TYPE=8 remain unresolved.
+    enum class BvhBuildRole : uint8_t {
+        None,
+        HeaderLo, HeaderHi,
+        PointerLo, PointerHi,
+        CountLo, CountHi, CountPlusOne,
+        SizeLo, SizeHi, SizeHiMasked, DescriptorHi,
+        BaseLo, BaseHi, SortedBaseHi,
+    };
+    std::array<uint32_t, kFoldSgprs> bvh_build_origin{};
+    std::array<BvhBuildRole, kFoldSgprs> bvh_build_role{};
+    uint32_t next_bvh_build_origin = 0;
+    uint32_t bvh_count_carry_origin = 0;
     // SGPRs overwritten by an s_load since seeding — the seed-V# MUBUF fallback below must not use a
     // stale user-data snapshot once the register was RELOADED from memory (ALU patches deliberately
     // don't count: descriptor snapshots are load-time semantics, pre-patch, like `descr`).
@@ -2167,6 +2299,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
+            bvh_build_origin[(size_t)r] = 0;
+            bvh_build_role[(size_t)r] = BvhBuildRole::None;
             mask_state[(size_t)r] = FoldMask::Unknown;
         }
     };
@@ -2179,6 +2313,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
+            bvh_build_origin[(size_t)r] = 0;
+            bvh_build_role[(size_t)r] = BvhBuildRole::None;
             mask_state[(size_t)r] = FoldMask::Unknown;
             // Remember WHICH instruction made this register unknown (#2412). `[mubuf-unknown]` names
             // the V# word that is not provable; it could not name the instruction responsible, so the
@@ -2322,6 +2458,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr8_key_known;
         std::array<uint32_t, kFoldSgprs> null_chain_origin;
         std::bitset<kFoldSgprs> null_chain_known;
+        uint32_t null_count_carry_origin;
+        std::array<uint32_t, kFoldSgprs> bvh_build_origin;
+        std::array<BvhBuildRole, kFoldSgprs> bvh_build_role;
+        uint32_t bvh_count_carry_origin;
         std::bitset<kFoldSgprs> reloaded;
         std::array<FoldMask, kFoldSgprs> mask_state;
         std::array<VertexFetchIndexMode, kFoldVgprs> vector_index_mode;
@@ -2359,6 +2499,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
         s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
+        s.null_count_carry_origin = null_count_carry_origin;
+        s.bvh_build_origin = bvh_build_origin; s.bvh_build_role = bvh_build_role;
+        s.bvh_count_carry_origin = bvh_count_carry_origin;
         s.reloaded = reloaded; s.mask_state = mask_state;
         s.vector_index_mode = vector_index_mode; s.scc = scc;
         return s;
@@ -2373,6 +2516,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
         null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
+        null_count_carry_origin = s.null_count_carry_origin;
+        bvh_build_origin = s.bvh_build_origin; bvh_build_role = s.bvh_build_role;
+        bvh_count_carry_origin = s.bvh_count_carry_origin;
         reloaded = s.reloaded; mask_state = s.mask_state;
         vector_index_mode = s.vector_index_mode; scc = s.scc;
     };
@@ -2415,6 +2561,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         if (!origin || !valid_reg(r)) return;
         null_chain_origin[(size_t)r] = origin;
         null_chain_known.set((size_t)r);
+    };
+    auto mark_bvh_build = [&](int r, uint32_t origin, BvhBuildRole role) {
+        if (!origin || role == BvhBuildRole::None || !valid_reg(r)) return;
+        bvh_build_origin[(size_t)r] = origin;
+        bvh_build_role[(size_t)r] = role;
+    };
+    auto operand_bvh_build = [&](const Operand& operand, BvhBuildRole role,
+                                 uint32_t& origin) {
+        if ((operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special) ||
+            !valid_reg(operand.value) || bvh_build_role[(size_t)operand.value] != role)
+            return false;
+        origin = bvh_build_origin[(size_t)operand.value];
+        return origin != 0;
     };
     auto operand_null_origin = [&](const Operand& operand) -> uint32_t {
         if ((operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
@@ -2659,6 +2818,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // provenance while applying that constant field patch.
                     uint32_t old_value = 0, bit_index = 0;
                     const uint32_t old_null_origin = null_origin(in.dst.value);
+                    const uint32_t old_bvh_origin = valid_reg(in.dst.value)
+                        ? bvh_build_origin[(size_t)in.dst.value] : 0u;
+                    const BvhBuildRole old_bvh_role = valid_reg(in.dst.value)
+                        ? bvh_build_role[(size_t)in.dst.value] : BvhBuildRole::None;
                     const bool old_known = known(in.dst.value, old_value);
                     const bool bit_known = in.src[0].kind == OperandKind::Literal
                         ? (bit_index = in.literal, true) : srcval(in.src[0], bit_index);
@@ -2670,6 +2833,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         forget(in.dst.value);
                     }
                     mark_null_origin(in.dst.value, old_null_origin);
+                    if (in.opcode == 0x1d && bit_known && bit_index == 31u &&
+                        old_bvh_role == BvhBuildRole::BaseHi)
+                        mark_bvh_build(in.dst.value, old_bvh_origin,
+                                       BvhBuildRole::SortedBaseHi);
                 } else if (in.opcode == 0x04 &&                 // s_mov_b64
                            in.dst.kind == OperandKind::SGPR &&
                            in.src[0].kind == OperandKind::SGPR) {
@@ -2769,7 +2936,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
                 // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
-                if (in.opcode != 0x03 && in.opcode != 0x04) scc = -1;
+                if (in.opcode != 0x03 && in.opcode != 0x04) {
+                    scc = -1;
+                    null_count_carry_origin = 0;
+                    bvh_count_carry_origin = 0;
+                }
                 break;
             case Rdna2Format::SOP2: {
                 // s_cselect_b64 is commonly used to make an all-lanes/zero mask for the following
@@ -2796,6 +2967,32 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 int next_scc = scc;
                 const uint32_t null0 = operand_null_origin(in.src[0]);
                 const uint32_t null1 = operand_null_origin(in.src[1]);
+                uint32_t null0_hi = 0;
+                if ((in.src[0].kind == OperandKind::SGPR ||
+                     in.src[0].kind == OperandKind::Special) &&
+                    valid_reg(in.src[0].value + 1))
+                    null0_hi = null_origin(in.src[0].value + 1);
+                auto source_bvh_state = [&](const Operand& operand, int add,
+                                            uint32_t& origin, BvhBuildRole& role) {
+                    const int reg = operand.value + add;
+                    if ((operand.kind != OperandKind::SGPR &&
+                         operand.kind != OperandKind::Special) || !valid_reg(reg)) {
+                        origin = 0;
+                        role = BvhBuildRole::None;
+                        return;
+                    }
+                    origin = bvh_build_origin[(size_t)reg];
+                    role = bvh_build_role[(size_t)reg];
+                };
+                uint32_t bvh0_origin = 0, bvh1_origin = 0, bvh0_hi_origin = 0;
+                BvhBuildRole bvh0_role = BvhBuildRole::None;
+                BvhBuildRole bvh1_role = BvhBuildRole::None;
+                BvhBuildRole bvh0_hi_role = BvhBuildRole::None;
+                source_bvh_state(in.src[0], 0, bvh0_origin, bvh0_role);
+                source_bvh_state(in.src[1], 0, bvh1_origin, bvh1_role);
+                source_bvh_state(in.src[0], 1, bvh0_hi_origin, bvh0_hi_role);
+                const uint32_t previous_null_count_carry_origin = null_count_carry_origin;
+                const uint32_t previous_bvh_count_carry_origin = bvh_count_carry_origin;
                 // s_addc_u32 remains derived from the same pointer chain even when its concrete
                 // carry is unknown; the taint is provenance, not a claim about the folded value.
                 const bool null_chain_opcode =
@@ -2805,11 +3002,26 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     in.opcode == 0x27 || in.opcode == 0x1F || in.opcode == 0x21 ||
                     in.opcode == 0x29;
                 uint32_t propagated_null_origin = 0;
-                if (null_chain_opcode) {
+                const bool null_chain_64bit_opcode =
+                    in.opcode == 0x1Fu || in.opcode == 0x21u || in.opcode == 0x29u;
+                if (null_chain_64bit_opcode) {
+                    // A 64-bit value is one provenance unit. Looking only at its low SGPR lets two
+                    // independently loaded zero qwords be spliced with scalar moves and then
+                    // collapsed onto one origin by the shift/BFE result.
+                    if (null0 && null0_hi == null0 && kc)
+                        propagated_null_origin = null0;
+                } else if (null_chain_opcode) {
                     if (null0 && null1 && null0 == null1) propagated_null_origin = null0;
                     else if (null0 && !null1 && kc) propagated_null_origin = null0;
                     else if (null1 && !null0 && ka) propagated_null_origin = null1;
                 }
+                // GTA V forms the high descriptor count with `s_add_u32 -1,null_value` followed by
+                // `s_addc_u32 -1,0`. The failed dereference intentionally makes the concrete SCC
+                // unknown, but the carry still depends exclusively on the same proven null chain.
+                // Keep this narrower than general SCC taint: accept only that exact constant pair.
+                if (in.opcode == 0x04u && previous_null_count_carry_origin && ka && kc &&
+                    ((a == UINT32_MAX && c == 0u) || (c == UINT32_MAX && a == 0u)))
+                    propagated_null_origin = previous_null_count_carry_origin;
                 if (ok) switch (in.opcode) {
                     case 0x00: {                                           // s_add_u32
                         const uint64_t sum = static_cast<uint64_t>(a) + c;
@@ -2926,7 +3138,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
                 scc = ok ? next_scc : -1;
-                if (ok) { set_value(d, r); if (wrote_pair) set_value(d + 1, hi64); }
+                if (ok) {
+                    set_value(d, r);
+                    if (wrote_pair) set_value(d + 1, hi64);
+                }
                 // A 64-bit-dst op invalidates BOTH dwords even when its source was unknown (the
                 // opcode switch may not have reached the point that marks wrote_pair).
                 else    { forget(d); if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 ||
@@ -2934,9 +3149,71 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 mark_null_origin(d, propagated_null_origin);
                 if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 || in.opcode == 0x29)
                     mark_null_origin(d + 1, propagated_null_origin);
+                // Every SOP2 writes SCC, so a count carry survives only when this exact instruction
+                // creates it. Capture the old origin above for the following s_addc_u32.
+                null_count_carry_origin = 0;
+                if (in.opcode == 0x00u && propagated_null_origin &&
+                    ((null0 && kc && c == UINT32_MAX) ||
+                     (null1 && ka && a == UINT32_MAX)))
+                    null_count_carry_origin = propagated_null_origin;
+                bvh_count_carry_origin = 0;
+                if (ok) {
+                    auto role_plus_constant = [&](BvhBuildRole wanted, uint32_t constant,
+                                                  uint32_t& origin) {
+                        if (bvh0_role == wanted && c == constant) {
+                            origin = bvh0_origin;
+                            return origin != 0;
+                        }
+                        if (bvh1_role == wanted && a == constant) {
+                            origin = bvh1_origin;
+                            return origin != 0;
+                        }
+                        return false;
+                    };
+                    uint32_t origin = 0;
+                    if (in.opcode == 0x0Eu &&
+                        role_plus_constant(BvhBuildRole::HeaderHi, 0x003fffffu, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::HeaderHi);
+                    } else if (in.opcode == 0x1Fu && c == 3u &&
+                               bvh0_role == BvhBuildRole::HeaderLo &&
+                               bvh0_hi_role == BvhBuildRole::HeaderHi &&
+                               bvh0_origin && bvh0_origin == bvh0_hi_origin) {
+                        mark_bvh_build(d, bvh0_origin, BvhBuildRole::PointerLo);
+                        mark_bvh_build(d + 1, bvh0_origin, BvhBuildRole::PointerHi);
+                    } else if (in.opcode == 0x29u && c == 0x00280008u &&
+                               bvh0_role == BvhBuildRole::PointerLo &&
+                               bvh0_hi_role == BvhBuildRole::PointerHi &&
+                               bvh0_origin && bvh0_origin == bvh0_hi_origin) {
+                        mark_bvh_build(d, bvh0_origin, BvhBuildRole::BaseLo);
+                        mark_bvh_build(d + 1, bvh0_origin, BvhBuildRole::BaseHi);
+                    } else if (in.opcode == 0x02u &&
+                               role_plus_constant(BvhBuildRole::CountLo, 1u, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::CountPlusOne);
+                    } else if (in.opcode == 0x00u &&
+                               role_plus_constant(BvhBuildRole::CountPlusOne,
+                                                  UINT32_MAX, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::SizeLo);
+                        bvh_count_carry_origin = origin;
+                    } else if (in.opcode == 0x04u &&
+                               previous_bvh_count_carry_origin &&
+                               ((a == UINT32_MAX && c == 0u) ||
+                                (c == UINT32_MAX && a == 0u))) {
+                        mark_bvh_build(d, previous_bvh_count_carry_origin,
+                                       BvhBuildRole::SizeHi);
+                    } else if (in.opcode == 0x0Eu &&
+                               role_plus_constant(BvhBuildRole::SizeHi, 0x3ffu, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::SizeHiMasked);
+                    } else if (in.opcode == 0x10u &&
+                               role_plus_constant(BvhBuildRole::SizeHiMasked,
+                                                  0x81000000u, origin)) {
+                        mark_bvh_build(d, origin, BvhBuildRole::DescriptorHi);
+                    }
+                }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
+                null_count_carry_origin = 0;
+                bvh_count_carry_origin = 0;
                 uint32_t a, c;
                 bool ka = (in.src[0].kind == OperandKind::Literal) ? (a = in.literal, true) : srcval(in.src[0], a);
                 bool kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
@@ -2986,6 +3263,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // below (SBASE and SDST ranges may overlap).
                 SrtUse pending_srt_use;
                 bool have_pending_srt_use = false;
+                bool live_sbase_vsharp_known = false;
                 if (srt_uses && is_buffer) {
                     bool current_known = true, current_key_known = true;
                     uint32_t current_key = 0;
@@ -3020,6 +3298,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         pending_srt_use.use_pc = in.pc;
                         have_pending_srt_use = true;
                     }
+                }
+                // The zero-record decision below must be based on the four words live at this
+                // instruction, never only on an older descriptor snapshot. Callers that do not
+                // request SRT uses still need the known-zero result to propagate to later consumers.
+                std::array<uint32_t, 4> live_sbase_vsharp{};
+                if (is_buffer) {
+                    live_sbase_vsharp_known = true;
+                    for (int k = 0; k < 4; ++k)
+                        live_sbase_vsharp_known &= known(sbase + k, live_sbase_vsharp[(size_t)k]);
                 }
                 // RAW-POINTER scalar load (#2412). `s_load_dword`/`x2` (op < 8) take SBASE as a plain
                 // 64-bit pointer rather than a V#, and no use was recorded for them at all — the
@@ -3088,6 +3375,31 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                  "soff_field=%u soff_val=0x%x soff_ok=%d imm=0x%x n=%u\n", in.opcode,
                                  is_buffer ? "bufload" : "load", sdst, sbase, (unsigned long long)base, base_ok,
                                  soff_field, soff_val, soff_ok, in.literal, n);
+                if (n != 0 && live_sbase_vsharp_known) {
+                    const DecodedBufferDescriptor d =
+                        decode_buffer_descriptor(live_sbase_vsharp.data());
+                    if (zero_record_sbuffer_access_is_oob(in, d)) {
+                        // This exact scalar access begins beyond the descriptor's effective M_SIZE,
+                        // including at the minimum value of a wave-derived SOFFSET. Publish the outer
+                        // descriptor at this pc so the SPIR-V emitter can remove the memory access,
+                        // and make the result exact zero so a descriptor loaded through it remains
+                        // provably empty at a later MUBUF consumer.
+                        if (srt_uses && have_pending_srt_use) {
+                            pending_srt_use.zero_record_raw = true;
+                            pending_srt_use.required_size = 0;
+                            srt_uses->push_back(pending_srt_use);
+                        }
+                        for (uint32_t k = 0; k < n; ++k)
+                            set_value(sdst + static_cast<int>(k), 0u);
+                        if (n == 4 && valid_reg(sdst) && valid_reg(sdst + 3)) {
+                            descr[(size_t)sdst] = {0u, 0u, 0u, 0u};
+                            descr_known.set((size_t)sdst);
+                            descr_key[(size_t)sdst] = 0xFFFFFFFFu;
+                            descr_key_known.set((size_t)sdst);
+                        }
+                        break;
+                    }
+                }
                 if (n == 0 || !base_ok || !soff_ok) {
                     // A wave-derived scalar SOFFSET (for example v_readfirstlane -> VCC_LO) is
                     // deliberately not concrete in this CPU-side fold. The V# can still be exact,
@@ -3239,7 +3551,45 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
+                uint32_t bvh_count_origin = 0;
+                if (!is_buffer && n == 4 && imm_only && in.literal == 0x58u &&
+                    valid_reg(sbase) && valid_reg(sbase + 1) &&
+                    bvh_build_role[(size_t)sbase] == BvhBuildRole::PointerLo &&
+                    bvh_build_role[(size_t)(sbase + 1)] == BvhBuildRole::PointerHi &&
+                    bvh_build_origin[(size_t)sbase] &&
+                    bvh_build_origin[(size_t)sbase] ==
+                        bvh_build_origin[(size_t)(sbase + 1)])
+                    bvh_count_origin = bvh_build_origin[(size_t)sbase];
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
+                if (bvh_count_origin) {
+                    mark_bvh_build(sdst, bvh_count_origin, BvhBuildRole::CountLo);
+                    mark_bvh_build(sdst + 1, bvh_count_origin, BvhBuildRole::CountHi);
+                }
+                if (!is_buffer && n == 16 && imm_only && in.literal == 0u) {
+                    // The title's object header is fetched as one mapped 16-dword block. Seed each
+                    // aligned qword independently: only the qword later consumed by the exact
+                    // descriptor builder can reach a ray instruction, and unrelated header fields
+                    // must not share provenance with it.
+                    for (uint32_t first = 0; first < n; first += 2) {
+                        uint32_t origin = ++next_bvh_build_origin;
+                        if (!origin) origin = ++next_bvh_build_origin;
+                        mark_bvh_build(sdst + (int)first, origin, BvhBuildRole::HeaderLo);
+                        mark_bvh_build(sdst + (int)first + 1, origin, BvhBuildRole::HeaderHi);
+
+                        // A zero qword in the same successful header read is also an exact null
+                        // pointer. Give each pair its own origin so adjacent zero fields cannot be
+                        // spliced into one descriptor, then let only dependent scalar ALU retain it.
+                        if (mem[first] == 0u && mem[first + 1] == 0u) {
+                            uint32_t null_origin = ++next_null_chain_origin;
+                            if (!null_origin) null_origin = ++next_null_chain_origin;
+                            if (x16_null_origin_pc.size() <= null_origin)
+                                x16_null_origin_pc.resize((size_t)null_origin + 1u, UINT32_MAX);
+                            x16_null_origin_pc[(size_t)null_origin] = in.pc;
+                            mark_null_origin(sdst + (int)first, null_origin);
+                            mark_null_origin(sdst + (int)first + 1, null_origin);
+                        }
+                    }
+                }
                 if (!is_buffer && n == 2 && mem[0] == 0 && mem[1] == 0) {
                     uint32_t origin = ++next_null_chain_origin;
                     if (!origin) origin = ++next_null_chain_origin;
@@ -3353,26 +3703,52 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         bool live_known = valid_reg(bbase) && valid_reg(bbase + 3);
                         for (int k = 0; live_known && k < 4; ++k)
                             live_known &= known(bbase + k, live_bvh[(size_t)k]);
+                        const DecodedBvhDescriptor d = live_known
+                            ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
+                        // GTA V's sorted builder rewrites an aligned four-word window from its x16
+                        // header load. A historical snapshot proves only the bytes it actually loaded;
+                        // if the sorted live words differ, require the exact builder chain below. Keep
+                        // the established snapshot semantics for unsorted descriptors, whose supported
+                        // builders predate the narrow BOX_SORT_EN provenance proof.
                         const bool snapshot_provenance = valid_reg(bbase) &&
-                            descr_known.test((size_t)bbase);
+                            descr_known.test((size_t)bbase) &&
+                            (!d.sort_enabled ||
+                             (live_known && live_bvh == descr[(size_t)bbase]));
                         const bool seed_provenance = !snapshot_provenance &&
                             (untouched_seed_range(bbase, 4) ||
                              consecutive_seed_copy_range(bbase, 4));
-                        const DecodedBvhDescriptor d = live_known
-                            ? decode_bvh_descriptor(live_bvh.data()) : DecodedBvhDescriptor{};
-                        const bool plausible = live_known && (snapshot_provenance || seed_provenance) &&
+                        uint32_t builder_origin = valid_reg(bbase)
+                            ? bvh_build_origin[(size_t)bbase] : 0u;
+                        const BvhBuildRole expected_builder_roles[4] = {
+                            BvhBuildRole::BaseLo, BvhBuildRole::SortedBaseHi,
+                            BvhBuildRole::SizeLo, BvhBuildRole::DescriptorHi,
+                        };
+                        bool builder_provenance = builder_origin != 0 && valid_reg(bbase + 3);
+                        for (int k = 0; builder_provenance && k < 4; ++k)
+                            builder_provenance =
+                                bvh_build_origin[(size_t)(bbase + k)] == builder_origin &&
+                                bvh_build_role[(size_t)(bbase + k)] ==
+                                    expected_builder_roles[k];
+                        const bool plausible = live_known &&
+                            (snapshot_provenance || seed_provenance || builder_provenance) &&
                             d.type == 8u && d.base > 0x10000u && d.size_bytes != 0;
                         uint32_t proven_null_origin = valid_reg(bbase) ? null_origin(bbase) : 0u;
                         for (int k = 1; proven_null_origin && k < 4; ++k)
                             if (null_origin(bbase + k) != proven_null_origin)
                                 proven_null_origin = 0;
+                        bool null_control_proven = true;
+                        if (proven_null_origin < x16_null_origin_pc.size() &&
+                            x16_null_origin_pc[(size_t)proven_null_origin] != UINT32_MAX)
+                            null_control_proven = straight_line_null_chain_dominates(
+                                ins, x16_null_origin_pc[(size_t)proven_null_origin], in.pc);
                         const bool guarded_null = !plausible && proven_null_origin &&
-                            guarded_bvh_use(ins, in.pc);
+                            null_control_proven && guarded_bvh_use(ins, in.pc);
                         if (trc) {
                             fprintf(stderr,
-                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d "
+                                    "[dyntrace] BVH pc=%u srsrc=s%d snapshot=%d seed=%d builder=%d "
                                     "live_known=%d bvh=",
-                                    in.pc, bbase, snapshot_provenance, seed_provenance, live_known);
+                                    in.pc, bbase, snapshot_provenance, seed_provenance,
+                                    builder_provenance, live_known);
                             if (live_known) {
                                 for (uint32_t word : live_bvh) fprintf(stderr, "%08x ", word);
                             } else {
@@ -3511,20 +3887,28 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             case Rdna2Format::MTBUF: {
                 const bool is_mtbuf = in.fmt == Rdna2Format::MTBUF;
                 // Buffer stores, raw loads/stores, and supported atomics need a kind-1 resource use.
-                // Format loads are intentionally handled only by DynFetch below: it snapshots the V#
-                // live at the instruction and resolves by exact pc, avoiding a duplicate stale SRT use.
+                // Nonempty format loads are intentionally handled only by DynFetch below: it snapshots
+                // the V# live at the instruction and resolves by exact pc, avoiding a duplicate stale
+                // SRT use. An empty format load is the exception because it has no materializable
+                // DynFetch resource, yet its exact zero result needs the same no-backing marker.
+                const bool format_load_use = !is_mtbuf && in.opcode <= 0x03;
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
                      (in.opcode >= 0x1C && in.opcode <= 0x1F));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
-                // Keep this exact set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
-                // The holes are not aliases: cmp-swap/csub/inc/dec and the x2 family need different
-                // operand/result semantics and must remain fail-closed until those are implemented.
-                const bool atomic_buffer_use =
+                // Keep the generic set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
+                // Opcodes 0x50/0x5a reach descriptor inspection separately: only GTA V's exact
+                // linear stride-8 qword proof below is published; every sibling x2 shape stays
+                // fail-closed rather than inheriting ordinary 32-bit bounds.
+                const bool atomic_buffer_use_32 =
                     !is_mtbuf &&
                     (in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
                      (in.opcode >= 0x35 && in.opcode <= 0x3B));
-                if (srt_uses && (format_store_use || raw_buffer_use || atomic_buffer_use)) {
+                const bool atomic_x2_candidate =
+                    !is_mtbuf && (in.opcode == 0x50u || in.opcode == 0x5au);
+                if (srt_uses &&
+                    (format_load_use || format_store_use || raw_buffer_use ||
+                     atomic_buffer_use_32 || atomic_x2_candidate)) {
                     const int srsrc = in.src[1].value;
                     std::array<uint32_t, 4> current{};
                     bool current_known = true;
@@ -3591,6 +3975,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             if (have_common_key) u.key = common_key;
                         }
                         DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        const uint32_t atomic_x2_record_count = atomic_x2_candidate
+                            ? exact_atomic_x2_record_count(in, d, u.v4.data()) : 0u;
+                        if (atomic_x2_record_count)
+                            u.atomic_x2_record_count = atomic_x2_record_count;
                         DataFormat inst_format = DataFormat::Unknown;
                         uint32_t inst_components = 0;
                         if (is_mtbuf)
@@ -3608,18 +3996,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // Byte-addressed raw/atomic V#s validly use stride zero: NUM_RECORDS is bytes.
                         // Typed format stores retain the strided record requirement.
                         const bool stride_supported = !format_store_use || d.stride != 0;
-                        // A fully-known raw/untyped MUBUF with NUM_RECORDS=0 is not a missing
-                        // descriptor: hardware returns zero for loads, drops stores, and range-checks
-                        // an atomic as one all-or-nothing access. Preserve that proof at this exact
-                        // consumer pc for ordinary raw operations and the exact 32-bit atomic set
-                        // admitted above. MTBUF, format stores, unsupported atomics, and an addr0
-                        // descriptor with nonzero records remain outside the marker contract.
-                        const bool zero_record_raw = (raw_buffer_use || atomic_buffer_use) &&
-                                                     d.num_records == 0u &&
-                                                     d.size_bytes == 0u;
-                        if (zero_record_raw ||
+                        // A fully-known admitted V# with NUM_RECORDS=0 is not a missing descriptor:
+                        // hardware returns zero for loads, drops stores, and range-checks an atomic
+                        // as one all-or-nothing access. Preserve that proof at this exact consumer pc.
+                        // MTBUF, format stores, unsupported atomics, and an addr0 descriptor with
+                        // nonzero records remain outside the marker contract.
+                        const bool zero_record_format =
+                            format_load_use && zero_record_format_selectors_are_zero(in, u.v4.data());
+                        const bool zero_record_raw =
+                            (zero_record_format || raw_buffer_use || atomic_buffer_use_32) &&
+                            d.num_records == 0u && d.size_bytes == 0u;
+                        if (zero_record_raw || (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
-                             d.size_bytes <= 0x10000000u && stride_supported && format_supported)) {
+                             d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
+                             (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
                             u.zero_record_raw = zero_record_raw;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
@@ -3850,6 +4240,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
                 // confidently-wrong V# patch.
                 scc = -1;
+                null_count_carry_origin = 0;
+                bvh_count_carry_origin = 0;
                 if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
                 break;
             default:
@@ -4036,7 +4428,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             const DecodedBvhDescriptor d = decode_bvh_descriptor(u.bvh4.data());
             if (d.type != 8u || d.base <= 0x10000u || d.size_bytes == 0 ||
                 d.size_bytes > 0x10000000u || d.size_bytes > UINT32_MAX ||
-                !d.triangle_return_mode || d.box_node_64b || d.sort_enabled)
+                !d.triangle_return_mode || d.box_node_64b)
                 continue;
             const uint64_t dk = 0x8000000200000000ull | u.use_pc;
             if (!seen.insert(dk).second) continue;
@@ -4044,7 +4436,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
                     r0.size != static_cast<uint32_t>(d.size_bytes) ||
-                    r0.bvh_box_grow != d.box_grow)
+                    r0.bvh_box_grow != d.box_grow ||
+                    r0.bvh_sort_enabled != d.sort_enabled)
                     continue;
                 if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
                 if (r0.fetch_pc == u.use_pc) { mapped = true; break; }
@@ -4058,6 +4451,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             r.size = static_cast<uint32_t>(d.size_bytes);
             r.fetch_pc = u.use_pc;
             r.bvh_box_grow = d.box_grow;
+            r.bvh_sort_enabled = d.sort_enabled;
             table.resources.push_back(r);
             continue;
         }
@@ -4085,6 +4479,16 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             if (u.instruction_format != UINT32_MAX || d.num_records != 0u ||
                 d.size_bytes != 0u || u.required_size != 0u)
                 continue;
+            if (u.use_pc >= dwords)
+                continue;
+            const Rdna2Inst marker_consumer =
+                rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
+            if (marker_consumer.fmt == Rdna2Format::SMEM &&
+                !zero_record_sbuffer_access_is_oob(marker_consumer, d))
+                continue;
+            if (marker_consumer.fmt == Rdna2Format::MUBUF && marker_consumer.opcode <= 0x3u &&
+                !zero_record_format_selectors_are_zero(marker_consumer, u.v4.data()))
+                continue;
             ShaderResource r;
             r.cls = ResourceClass::ConstantBuffer;
             r.format = DataFormat::Unknown;
@@ -4095,6 +4499,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             r.srt_offset = 0xFFFFFFFFu;
             r.sgpr_base = 0xFFFFFFFFu;
             r.fetch_pc = u.use_pc;
+            for (uint32_t component = 0; component < 4u; ++component)
+                r.swizzle[component] = (u.v4[3] >> (component * 3u)) & 0x7u;
             table.resources.push_back(r);
             continue;
         }
@@ -4116,7 +4522,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         } else if (scalar_size < u.required_size) {
             scalar_size = u.required_size;
         }
-        if (clash && !exact_mtbuf) {
+        if (clash && !exact_mtbuf && !u.atomic_x2_record_count) {
             bool piggybacked = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
@@ -4147,6 +4553,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         r.gpu_addr = d.base;
         r.size = scalar_size;
         r.stride = scalar_stride;
+        r.atomic_x2_record_count = u.atomic_x2_record_count;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
         r.fetch_pc = u.use_pc;
         table.resources.push_back(r);
@@ -5696,6 +6103,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             shared_vulkan.storage_image_write_without_format;
         config.native_storage_format_support = shared_compute_adoptable
             ? shared_vulkan.native_storage_format_support : 0;
+        config.storage_buffer_int64_atomics = shared_compute_adoptable &&
+            shared_vulkan.storage_buffer_int64_atomics;
         const uint32_t replay_native_storage_format_support =
             config.native_storage_format_support;
         config.packed_r11_storage =

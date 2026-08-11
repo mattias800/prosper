@@ -210,12 +210,12 @@ struct SrtUse {
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     std::array<uint32_t, 4> bvh4{};  // BVH descriptor dwords live at IMAGE_BVH_INTERSECT_RAY (kind 2)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
-    // Fully-known raw/untyped MUBUF V# whose NUM_RECORDS is zero. This covers ordinary RAW
-    // loads/stores and the emitter-supported 32-bit atomic set; typed and unsupported atomic shapes
-    // remain fail-closed. It is distinct from the scalar-SMEM raw-pointer convention, where a zero
-    // decoded size means "unbounded" and required_size supplies the proven access span. Only
-    // resolve_dynamic_fetch may set this after decoding all four live descriptor words at the exact
-    // consuming instruction.
+    // Fully-known V# whose NUM_RECORDS is zero. This covers scalar buffer loads proven to begin beyond
+    // their effective scalar bound, ordinary RAW loads/stores, format loads whose selected OOB values
+    // are all zero, and the emitter-supported 32-bit atomic set; unsupported shapes remain fail-closed.
+    // It is distinct from the scalar-SMEM raw-pointer convention, where a zero decoded size means
+    // "unbounded" and required_size supplies the proven access span. Only resolve_dynamic_fetch may set
+    // this after decoding all four live descriptor words at the exact consuming instruction.
     bool zero_record_raw = false;
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
@@ -223,6 +223,11 @@ struct SrtUse {
     // scalar descriptors carry usable base bits but do not expose a conventional bounded V# size;
     // the exact observed access span is sufficient for their pc-keyed upload.
     uint32_t required_size = 0;      // kind 1 only
+    // Exact RDNA2 qword-atomic V# contract exercised by GTA V: a dispatch-sized count of eight-byte
+    // records at an eight-byte-aligned base with OOB_SELECT=0. Keep the count/proof explicit because
+    // ShaderResource does not otherwise retain OOB_SELECT, and the emitter must not infer this
+    // all-or-nothing record-index contract from byte size alone.
+    uint32_t atomic_x2_record_count = 0;
     // PER-USE pc provenance (#273 — DOLL's title-composite image_sample_b): the pc of the consuming
     // image op. The load-immediate key model breaks when the same immediate appears against two
     // different table pointers (a key-0 EUD sharp colliding with a key-0 table T#) or when the load
@@ -761,6 +766,9 @@ struct SharedVulkanContext {
     // creation is the renderer's decision -- a physically capable device whose owner declined them cannot
     // execute an indexed descriptor array, and asking the driver would answer the wrong question.
     bool descriptor_indexing = false;
+    // VK_KHR_shader_atomic_int64's storage-buffer feature, ENABLED on the borrowed device together
+    // with core shaderInt64. Physical support alone is insufficient for module admission.
+    bool storage_buffer_int64_atomics = false;
     uint32_t max_compute_workgroup_subgroups = 0;
     uint32_t max_compute_workgroup_size_x = 0;
     uint32_t max_compute_workgroup_invocations = 0;

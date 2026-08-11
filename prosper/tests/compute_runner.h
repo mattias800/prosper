@@ -5,6 +5,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace prosper::test {
@@ -41,6 +42,43 @@ inline ComputeSubgroupProperties default_compute_subgroup_properties() {
     return result;
 }
 
+inline bool default_compute_buffer_int64_atomics_supported() {
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app;
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS || !instance) return false;
+    bool result = false;
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    if (count) {
+        std::vector<VkPhysicalDevice> devices(count);
+        vkEnumeratePhysicalDevices(instance, &count, devices.data());
+        VkPhysicalDeviceFeatures core{};
+        vkGetPhysicalDeviceFeatures(devices[0], &core);
+        uint32_t extension_count = 0;
+        vkEnumerateDeviceExtensionProperties(devices[0], nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(extension_count);
+        vkEnumerateDeviceExtensionProperties(
+            devices[0], nullptr, &extension_count, extensions.data());
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName,
+                            VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))
+                continue;
+            VkPhysicalDeviceShaderAtomicInt64Features atomics{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+            VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            features.pNext = &atomics;
+            vkGetPhysicalDeviceFeatures2(devices[0], &features);
+            result = core.shaderInt64 && atomics.shaderBufferInt64Atomics;
+            break;
+        }
+    }
+    vkDestroyInstance(instance, nullptr);
+    return result;
+}
+
 // Run `spirv` over storage buffer 0 = `input`, storage buffer 1 = output. `invocations` compute
 // threads are dispatched (default = input.size()) in groups of `local_size_x` (default 64); the
 // output buffer holds `out_count` floats (default = input.size()). Returns the output, or {} on any
@@ -50,7 +88,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
                                       const std::vector<uint32_t>& cbuf = {},
                                       const std::vector<uint32_t>& cbuf1 = {},
                                       std::vector<uint32_t>* cbuf1_out = nullptr,
-                                      uint32_t local_size_x = 64) {
+                                      uint32_t local_size_x = 64,
+                                      std::vector<uint32_t>* cbuf_out = nullptr) {
     const uint32_t IN_N = (uint32_t)input.size();
     if (invocations == 0) invocations = IN_N;
     if (out_count == 0)   out_count = IN_N;
@@ -79,7 +118,41 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     // robustBufferAccess: out-of-range storage-buffer reads/writes are well-defined (return 0 / no-op)
     // rather than UB — so a predicated memory op executed by an inactive lane (narrowed EXEC) is safe.
-    VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(phys, &supported);
+    VkPhysicalDeviceFeatures feats{};
+    // Preserve the harness's pre-existing fail-closed requirement: if robustBufferAccess is not
+    // supported, vkCreateDevice must fail rather than allowing OOB-sensitive tests to run with UB.
+    feats.robustBufferAccess = VK_TRUE;
+    feats.shaderInt64 = supported.shaderInt64;
+    dci.pEnabledFeatures = &feats;
+    VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+    std::vector<const char*> device_extensions;
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(phys, nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> available_extensions(extension_count);
+    vkEnumerateDeviceExtensionProperties(
+        phys, nullptr, &extension_count, available_extensions.data());
+    for (const auto& extension : available_extensions) {
+        if (std::strcmp(extension.extensionName,
+                        VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))
+            continue;
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features.pNext = &atomic_int64_features;
+        vkGetPhysicalDeviceFeatures2(phys, &features);
+        if (supported.shaderInt64 && atomic_int64_features.shaderBufferInt64Atomics) {
+            VkPhysicalDeviceShaderAtomicInt64Features want{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+            want.shaderBufferInt64Atomics = VK_TRUE;
+            atomic_int64_features = want;
+            dci.pNext = &atomic_int64_features;
+            device_extensions.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+        }
+        break;
+    }
+    dci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    dci.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
@@ -194,6 +267,12 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         void* rp = nullptr; vkMapMemory(dev, cbMem1, 0, cbBytes1, 0, &rp);
         for (uint32_t i = 0; i < CB1_N; i++) (*cbuf1_out)[i] = ((uint32_t*)rp)[i];
         vkUnmapMemory(dev, cbMem1);
+    }
+    if (cbuf_out) {
+        cbuf_out->resize(CB_N);
+        void* rp = nullptr; vkMapMemory(dev, cbMem, 0, cbBytes, 0, &rp);
+        for (uint32_t i = 0; i < CB_N; i++) (*cbuf_out)[i] = ((uint32_t*)rp)[i];
+        vkUnmapMemory(dev, cbMem);
     }
 
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);

@@ -2214,6 +2214,9 @@ struct VulkanComputeContext {
                 std::fprintf(stderr, "[compute] descriptor indexing %s (inherited from the adopted "
                                      "device)\n",
                              descriptor_indexing_support ? "ENABLED" : "unavailable");
+                std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s "
+                                     "(inherited from the adopted device)\n",
+                             shared.storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
                 return true;
             }
             // Anything failing here must fall through to a private device rather than killing the
@@ -2259,6 +2262,7 @@ struct VulkanComputeContext {
         }
         VkPhysicalDeviceFeatures enabled{};
         enabled.robustBufferAccess = VK_TRUE;
+        enabled.shaderInt64 = supported.shaderInt64;
         // Image bindings (#590): enable the format-free storage-image features when available.
         image_support = supported.shaderStorageImageReadWithoutFormat &&
                         supported.shaderStorageImageWriteWithoutFormat;
@@ -2333,6 +2337,40 @@ struct VulkanComputeContext {
         if (!di_ext_advertised)
             std::fprintf(stderr, "[compute] descriptor indexing unavailable: "
                                  "VK_EXT_descriptor_indexing not advertised by this device\n");
+        // Live raw translation chooses its qword-atomic config from SharedVulkanContext before this
+        // lazy private-device path can run, so private discovery deliberately does not advertise an
+        // admission capability. Still enable the feature here when available: this path can execute
+        // already-compiled/captured modules whose config was established by their replay owner.
+        VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+        bool atomic_int64_ext_advertised = false;
+        bool private_storage_buffer_int64_atomics = false;
+        { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+          std::vector<VkExtensionProperties> de(ne);
+          vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
+          for (const auto& e : de) {
+              if (std::strcmp(e.extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))
+                  continue;
+              atomic_int64_ext_advertised = true;
+              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+              f2.pNext = &atomic_int64_features;
+              vkGetPhysicalDeviceFeatures2(physical, &f2);
+              if (supported.shaderInt64 &&
+                  atomic_int64_features.shaderBufferInt64Atomics) {
+                  VkPhysicalDeviceShaderAtomicInt64Features want{
+                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+                  want.shaderBufferInt64Atomics = VK_TRUE;
+                  atomic_int64_features = want;
+                  atomic_int64_features.pNext = const_cast<void*>(dci.pNext);
+                  dci.pNext = &atomic_int64_features;
+                  dev_exts.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+                  private_storage_buffer_int64_atomics = true;
+              }
+              break;
+          } }
+        std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s (own device%s)\n",
+                     private_storage_buffer_int64_atomics ? "ENABLED" : "unavailable",
+                     atomic_int64_ext_advertised ? "" : ", extension not advertised");
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);

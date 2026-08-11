@@ -111,7 +111,11 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // PM4 last-write provenance. Replay decodes this input independently and compares it with the v45
 // normalized descriptor; unsupported/ambiguous paths are recorded as explicitly unavailable.
 // v47 (#2481): retain each realized/failed-stage image resource's instruction-scoped zero-mip proof.
-constexpr uint32_t kVersion = 47;
+// v48 (#2481): retain BVH BOX_SORT_EN for raw replay. Sorting changes generated SPIR-V, so replay
+// must not silently compile a sorted guest descriptor with the historical physical-child order.
+// v49 (#2481): retain the exact linear stride-8 qword-atomic record count. Size/stride alone do not
+// preserve the descriptor's OOB_SELECT proof, which controls the all-or-nothing record range check.
+constexpr uint32_t kVersion = 49;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -253,22 +257,24 @@ void write_compute_config(Writer& w, const ComputeShaderConfig& config) {
                           (config.tgid_y_en ? 2u : 0u) |
                           (config.tgid_z_en ? 4u : 0u) |
                           (config.tg_size_en ? 8u : 0u) |
-                          (config.packed_r11_storage ? 16u : 0u);
+                          (config.packed_r11_storage ? 16u : 0u) |
+                          (config.storage_buffer_int64_atomics ? 32u : 0u);
     w.u8(flags);
     w.u32(config.lds_bytes);
     w.u32(config.native_subgroup_size);
     w.u32(config.native_storage_format_support);
 }
 
-bool read_compute_config(Reader& r, ComputeShaderConfig& config) {
+bool read_compute_config(Reader& r, ComputeShaderConfig& config, uint32_t capture_version) {
     uint8_t exact = 0, flags = 0;
+    const uint8_t valid_flags = capture_version >= 49 ? 0x3fu : 0x1fu;
     if (!r.words_bounded(config.user_sgprs, 32,
                          "invalid compute user-SGPR count") ||
         !r.u32(config.local_x) || !r.u32(config.local_y) ||
         !r.u32(config.local_z) || !r.u8(exact) || exact > 1u ||
         !r.u32(config.threads_x) || !r.u32(config.threads_y) ||
         !r.u32(config.threads_z) || !r.u32(config.wave_size) ||
-        !r.u32(config.tidig_comp_cnt) || !r.u8(flags) || (flags & ~0x1fu) ||
+        !r.u32(config.tidig_comp_cnt) || !r.u8(flags) || (flags & ~valid_flags) ||
         !r.u32(config.lds_bytes) || !r.u32(config.native_subgroup_size) ||
         !r.u32(config.native_storage_format_support))
         return false;
@@ -278,6 +284,7 @@ bool read_compute_config(Reader& r, ComputeShaderConfig& config) {
     config.tgid_z_en = (flags & 4u) != 0;
     config.tg_size_en = (flags & 8u) != 0;
     config.packed_r11_storage = (flags & 16u) != 0;
+    config.storage_buffer_int64_atomics = capture_version >= 49 && (flags & 32u) != 0;
     return true;
 }
 
@@ -2702,6 +2709,36 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             write_zero_mip_state(stage.resource_table);
+    // v48 preserves the BVH sort semantic separately from the v40 BOX_GROW tail so every older
+    // capture prefix remains byte-exact. Non-BVH resources carry false in the same deterministic
+    // complete-resource enumeration used by v44/v47.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_bvh_sort_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources)
+            w.u8(captured.resource.bvh_sort_enabled ? 1u : 0u);
+    };
+    for (const auto& draw : c.draws) {
+        write_bvh_sort_state(draw.vrt);
+        write_bvh_sort_state(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_bvh_sort_state(compute.resources);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            write_bvh_sort_state(stage.resource_table);
+    // v49 retains the exact qword record count in the same complete resource enumeration.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_atomic_x2_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources)
+            w.u32(captured.resource.atomic_x2_record_count);
+    };
+    for (const auto& draw : c.draws) {
+        write_atomic_x2_state(draw.vrt);
+        write_atomic_x2_state(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_atomic_x2_state(compute.resources);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            write_atomic_x2_state(stage.resource_table);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3540,7 +3577,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
                 continue;
             }
-            if (!read_compute_config(r, compute.recompile_config)) return false;
+            if (!read_compute_config(r, compute.recompile_config, version)) return false;
             if (!validate_compute_recompile_state(compute, error)) return false;
         }
     }
@@ -3672,7 +3709,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 if (!stage.recompile_config_available) continue;
                 if (diagnostic.kind != SubmitOperationKind::Dispatch ||
                     stage.stage != ShaderProgramStage::Compute ||
-                    !read_compute_config(r, stage.recompile_config) ||
+                    !read_compute_config(r, stage.recompile_config, version) ||
                     !validate_compute_config(stage.recompile_config,
                                              diagnostic.compute_launch,
                                              stage.recompile_config.native_subgroup_size,
@@ -3846,6 +3883,85 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             for (auto& stage : diagnostic.stages)
                 if (!read_zero_mip_state(stage.resource_table)) {
                     error = "invalid resource zero-mip state";
+                    return false;
+                }
+    }
+    if (version >= 48) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid BVH sort-state count";
+            return false;
+        }
+        auto read_bvh_sort_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint8_t enabled = 0;
+                if (!r.u8(enabled) || enabled > 1u) return false;
+                captured.resource.bvh_sort_enabled = enabled != 0;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_bvh_sort_state(draw.vrt) || !read_bvh_sort_state(draw.prt)) {
+                error = "invalid BVH sort state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_bvh_sort_state(compute.resources)) {
+                error = "invalid BVH sort state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_bvh_sort_state(stage.resource_table)) {
+                    error = "invalid BVH sort state";
+                    return false;
+                }
+    }
+    if (version >= 49) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid atomic-x2 state count";
+            return false;
+        }
+        auto read_atomic_x2_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint32_t record_count = 0;
+                if (!r.u32(record_count)) return false;
+                captured.resource.atomic_x2_record_count = record_count;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_atomic_x2_state(draw.vrt) ||
+                !read_atomic_x2_state(draw.prt)) {
+                error = "invalid atomic-x2 state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_atomic_x2_state(compute.resources)) {
+                error = "invalid atomic-x2 state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_atomic_x2_state(stage.resource_table)) {
+                    error = "invalid atomic-x2 state";
                     return false;
                 }
     }

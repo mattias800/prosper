@@ -1286,6 +1286,86 @@ int main() {
     CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
           "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
+    // Kernel 17d0: GTA V's pc160..184 region is a bottom-tested EXEC loop whose body contains an
+    // ordinary nested EXEC loop. The old detector required the execz header form, discarded every
+    // loop when it saw the bottom `s_cbranch_execnz`, then misread the inner back-edge as a backward
+    // else. Keep a workgroup barrier immediately AFTER the outer loop: it makes the generic CFG
+    // dispatcher unavailable, while every invocation has reconverged and may legally reach it.
+    // The two read-only LDS loops after that barrier reproduce the surrounding captured context:
+    // the old all-or-nothing compute guard discarded EVERY recognized loop when it found either
+    // DS_READ_B32, then misclassified the earlier inner back-edge as a backward else. The inner loop
+    // executes once, clears EXEC, and exits on its second header check; the outer body restores EXEC,
+    // writes 7, clears EXEC again, and falls through its bottom test.
+    const uint32_t code17d0[] = {
+        0xbe82047eu,              // s_mov_b64 s[2:3],exec
+        0x7e040280u,              // v_mov_b32 v2,0
+        0x7e060280u,              // OUTER: v_mov_b32 v3,0
+        0xbf880003u,              // INNER: s_cbranch_execz pc7
+        0x7e040281u,              // v_mov_b32 v2,1
+        0xbefe0480u,              // s_mov_b64 exec,0
+        0xbf82fffcu,              // s_branch pc3
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0x7e040287u,              // v_mov_b32 v2,7
+        0xbefe0480u,              // s_mov_b64 exec,0 (bottom condition writer)
+        0xbf89fff7u,              // s_cbranch_execnz pc2
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbf8a0000u,              // s_barrier after reconvergence
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbf880004u,              // READ0: s_cbranch_execz pc19
+        0xd8d80000u, 0x03000000u, // ds_read_b32 v3,v0
+        0xbefe0480u,              // s_mov_b64 exec,0
+        0xbf82fffbu,              // s_branch READ0
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbf880004u,              // READ1: s_cbranch_execz pc26
+        0xd8d80000u, 0x04000000u, // ds_read_b32 v4,v0
+        0xbefe0480u,              // s_mov_b64 exec,0
+        0xbf82fffbu,              // s_branch READ1
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0x7e040d02u,              // v_cvt_f32_u32 v2,v2
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d0 = recompile_valu(
+        code17d0, std::size(code17d0), 1, /*out_vgpr*/2);
+    CHECK(!spv17d0.empty(),
+          "GTA bottom-tested EXEC loop nests structurally before a top-level barrier");
+    const std::vector<float> got17d0 = spv17d0.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv17d0, std::vector<float>(N, 0.0f), N, N);
+    CHECK(got17d0 == std::vector<float>(N, 7.0f),
+          "bottom-tested EXEC loop preserves its exit-iteration value and reconverges");
+    std::vector<uint32_t> late_barrier17d0(std::begin(code17d0), std::end(code17d0));
+    late_barrier17d0[12] = 0xbf800000u; // s_nop 0: reads no longer have a preceding phase boundary
+    late_barrier17d0.insert(late_barrier17d0.end() - 2, 0xbf8a0000u);
+    CHECK(recompile_valu(late_barrier17d0.data(), late_barrier17d0.size(),
+                         1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS reads reject when the proved barrier follows their phase");
+    std::vector<uint32_t> write17d0(std::begin(code17d0), std::end(code17d0));
+    write17d0[15] = 0xd8340000u; // ds_write_b32 v0,v3 in the post-barrier loop
+    write17d0[16] = 0x00000300u;
+    CHECK(recompile_valu(write17d0.data(), write17d0.size(), 1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS writes remain rejected even after a proved barrier");
+    std::vector<uint32_t> inactive_read17d0(std::begin(code17d0), std::end(code17d0));
+    inactive_read17d0[14] = 0xbf880005u; // shifted exit target: pc20
+    inactive_read17d0.insert(inactive_read17d0.begin() + 15,
+                             0xbefe0480u); // s_mov_b64 exec,0 before ds_read_b32
+    inactive_read17d0[19] = 0xbf82fffau;   // shifted back-edge: pc14
+    CHECK(recompile_valu(inactive_read17d0.data(), inactive_read17d0.size(),
+                         1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS reads reject when an intervening write can deactivate the lane");
+    std::vector<uint32_t> condition_read17d0(std::begin(code17d0), std::end(code17d0));
+    condition_read17d0[13] = 0xbefe0480u; // enter this loop with EXEC clear
+    condition_read17d0[14] = 0xd8d80000u; // move ds_read_b32 into the condition region
+    condition_read17d0[15] = 0x03000000u;
+    condition_read17d0[16] = 0xbf880002u; // s_cbranch_execz pc19 after the read
+    CHECK(recompile_valu(condition_read17d0.data(), condition_read17d0.size(),
+                         1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS reads reject before the active-lane header test");
+    std::vector<uint32_t> stale17d0(std::begin(code17d0), std::end(code17d0));
+    stale17d0[9] = 0x7e060280u; // v_mov_b32 v3,0: no fresh EXEC condition at the latch
+    CHECK(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2).empty(),
+          "bottom-tested EXEC loop rejects a stale entry mask at its back-edge");
+
     // Kernel 17d1: Astro's Wave32 BVH traversal turns a VOPC predicate into the first matching
     // lane with s_ff1_i32_b32, then immediately uses VCC_LO as ordinary scalar data. The first
     // subgroup has one match at lane 5; the second subgroup is empty and must return -1. Store the
@@ -1303,6 +1383,116 @@ int main() {
       dst.format = DataFormat::Uint32; dst.num_components = 1;
       dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
       rt17d1.resources.push_back(dst); }
+
+    // GTA V 0x413e15400 pc152 recycles only Wave64 VCC_LO as scalar scratch, copies that dword to
+    // v10, then replaces the complete VCC pair before any implicit mask consumer. Keep the exact
+    // pc106..153 loop suffix to exercise its scalar semantics and high-half liveness proof.
+    const uint32_t code17d1_vcc_low[] = {
+        0xbe820380u, 0xbe8c0380u, 0xbf0a1202u, 0xbf840020u,
+        0xbefc0302u, 0x81028102u, 0xbf8c3f70u, 0x7e148701u,
+        0x4c121480u, 0xbeea287eu, 0x02281480u, 0x4a2828fau,
+        0xff011114u, 0x4a2828fau, 0xff011214u, 0x4a2828fau,
+        0xff011414u, 0x4a2828fau, 0xff011814u, 0xd7781013u,
+        0x03058314u, 0x4a2826fau, 0xaf00e414u, 0x92fea0a0u,
+        0xd7600000u, 0x00013f14u, 0x4a282800u, 0xbefe046au,
+        0xd76d0009u, 0x0426280cu, 0xd760006au, 0x00017f14u,
+        0x7e140314u, 0x7e028509u, 0x810c6a0cu, 0xbf82ffdeu,
+        0x8801ff09u, 0x00080000u, 0xbe800308u, 0xbe82030du,
+        0xbe8303ffu, 0x00016204u, 0xbefe0481u, 0x7e26020fu,
+        0xbf08800fu, 0x7e12020cu,
+        0x856a8281u,              // exact pc152: s_cselect_b32 vcc_lo,1,2
+        0x7e14026au,              // exact pc153: v_mov_b32 v10,vcc_lo
+        0x7d840100u,              // complete VOPC replacement makes old VCC_HI dead
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d1_vcc_low = recompile_valu(
+        code17d1_vcc_low, std::size(code17d1_vcc_low), 1, /*out_vgpr*/10);
+    CHECK(!spv17d1_vcc_low.empty(),
+          "GTA Wave64 VCC_LO scalar scratch recompiles with its captured loop suffix");
+    if (!spv17d1_vcc_low.empty()) {
+        const std::vector<float> got17d1_vcc_low = prosper::test::run_compute(
+            spv17d1_vcc_low, std::vector<float>(64, 0.0f), 64, 64);
+        uint32_t bad17d1_vcc_low = 0;
+        for (uint32_t lane = 0; lane < got17d1_vcc_low.size(); ++lane)
+            bad17d1_vcc_low += bits_of(got17d1_vcc_low[lane]) != (lane == 0 ? 2u : 0u);
+        CHECK(got17d1_vcc_low.size() == 64 && bad17d1_vcc_low == 0,
+              "Wave64 VCC_LO scratch copies the selected dword to the active lane exactly");
+    }
+
+    // The live dispatcher's pair-domain ambiguity is established before pc106, across the repeated
+    // optional descriptor loads. Preserve the exact pc0..153 CFG and replace only those nine MUBUF
+    // packets with equal-width NOPs so this remains a resource-free regression. Without clearing
+    // the proved mixed lifetime at the exact pc152 write, pc153 rejects as an ambiguous mask read.
+    const uint32_t code17d1_vcc_low_dispatch[] = {
+        0xbfa00003u, 0x8790817eu, 0xbefe0410u, 0xbf880003u,
+        0x7e020281u, 0xbf800000u, 0xbf800000u, 0xbf8c3f70u,
+        0xd760000fu, 0x00010101u, 0xbefe04c1u, 0x9012860cu,
+        0xbf0a1280u, 0x93000c0fu, 0x4a240000u, 0x7d88240eu,
+        0xbf840006u, 0x7e020280u, 0xbefe046au, 0xbf880002u,
+        0xbf800000u, 0xbf800000u, 0xbefe04c1u, 0xd76d0011u,
+        0x04018000u, 0xbf0a1281u, 0x7d88220eu, 0xbf840006u,
+        0x7e040280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d0010u, 0x0401fe00u,
+        0x00000080u, 0xbf0a1282u, 0x7d88200eu, 0xbf840006u,
+        0x7e060280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000fu, 0x0401fe00u,
+        0x000000c0u, 0xbf0a1283u, 0x7d881e0eu, 0xbf840006u,
+        0x7e080280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000eu, 0x0401fe00u,
+        0x00000100u, 0xbf0a1284u, 0x7d881c0eu, 0xbf840006u,
+        0x7e0a0280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000du, 0x0401fe00u,
+        0x00000140u, 0xbf0a1285u, 0x7d881a0eu, 0xbf840006u,
+        0x7e0c0280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000cu, 0x0401fe00u,
+        0x00000180u, 0xbf0a1286u, 0x7d88180eu, 0xbf840006u,
+        0x7e0e0280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xd76d000bu, 0x0401fe00u,
+        0x000001c0u, 0xbf0a1287u, 0x7d88160eu, 0xbf840006u,
+        0x7e100280u, 0xbefe046au, 0xbf880002u, 0xbf800000u,
+        0xbf800000u, 0xbefe04c1u, 0xbe820380u, 0xbe8c0380u,
+        0xbf0a1202u, 0xbf840020u, 0xbefc0302u, 0x81028102u,
+        0xbf8c3f70u, 0x7e148701u, 0x4c121480u, 0xbeea287eu,
+        0x02281480u, 0x4a2828fau, 0xff011114u, 0x4a2828fau,
+        0xff011214u, 0x4a2828fau, 0xff011414u, 0x4a2828fau,
+        0xff011814u, 0xd7781013u, 0x03058314u, 0x4a2826fau,
+        0xaf00e414u, 0x92fea0a0u, 0xd7600000u, 0x00013f14u,
+        0x4a282800u, 0xbefe046au, 0xd76d0009u, 0x0426280cu,
+        0xd760006au, 0x00017f14u, 0x7e140314u, 0x7e028509u,
+        0x810c6a0cu, 0xbf82ffdeu, 0x8801ff09u, 0x00080000u,
+        0xbe800308u, 0xbe82030du, 0xbe8303ffu, 0x00016204u,
+        0xbefe0481u, 0x7e26020fu, 0xbf08800fu, 0x7e12020cu,
+        0x856a8281u,              // exact pc152: s_cselect_b32 vcc_lo,1,2
+        0x7e14026au,              // exact pc153: v_mov_b32 v10,vcc_lo
+        0x7d840100u,              // complete VCC replacement
+        0xbf870001u,              // force the whole shader through the CFG dispatcher
+        0xbf82fffdu, 0xbf810000u,
+    };
+    CHECK(!recompile_compute(code17d1_vcc_low_dispatch,
+                             std::size(code17d1_vcc_low_dispatch), nullptr,
+                             native_cfg17d).empty(),
+          "GTA Wave64 VCC_LO scalar scratch resolves the live dispatcher ambiguity");
+
+    // Same-site packet mutation and a surviving implicit VCC read both remain fail-visible. The
+    // first prevents this byte-exact exception from silently becoming a general Wave64 bridge; the
+    // second proves the old high-half mask really must be dead, not merely unused by the assertion.
+    const uint32_t code17d1_vcc_low_mutated[] = {
+        0xbe8f0380u, 0xbf08800fu,
+        0x856a8381u,              // s_cselect_b32 vcc_lo,1,3 (mutated live packet)
+        0x7e02026au, 0x7d840100u, 0xbf810000u,
+    };
+    const uint32_t code17d1_vcc_low_mask_live[] = {
+        0xbe8f0380u, 0xbf08800fu, 0x856a8281u, 0x7e02026au,
+        0xbf860001u,              // implicit VCCZ observes the untouched high half
+        0xbf800000u, 0xbf810000u,
+    };
+    CHECK(recompile_compute(code17d1_vcc_low_mutated,
+                            std::size(code17d1_vcc_low_mutated), nullptr,
+                            native_cfg17d).empty() &&
+              recompile_compute(code17d1_vcc_low_mask_live,
+                                std::size(code17d1_vcc_low_mask_live), nullptr,
+                                native_cfg17d).empty(),
+          "Wave64 VCC_LO scalar exception rejects packet drift and a live high-half mask");
     ComputeShaderConfig native_cfg17d1;
     native_cfg17d1.local_x = 64;
     native_cfg17d1.wave_size = 32;
@@ -1335,6 +1525,21 @@ int main() {
     CHECK(recompile_compute(code17d1s.data(), code17d1s.size(), nullptr,
                             portable_cfg17d1s).empty(),
           "Wave32 mask SCC branch rejects without an exact native subgroup contract");
+
+    // A literal operand is also one complete Wave32 mask word. Keep the irreducible dispatcher
+    // suffix and branch immediately on the new VCC lifetime: this specifically exercises the
+    // dispatcher's mask-domain classification, not only emit_alu's literal lowering.
+    std::vector<uint32_t> code17d1_literal_mask = {
+        0x7d840100u,              // v_cmp_eq_u32 vcc,v0,v0
+        0x876aff6au, 0x55555555u, // s_and_b32 vcc_lo,vcc_lo,0x55555555
+        0xbf860001u,              // s_cbranch_vccz +1
+        0xbf800000u,              // fallthrough work
+    };
+    code17d1_literal_mask.insert(
+        code17d1_literal_mask.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_literal_mask.data(), code17d1_literal_mask.size(),
+                             nullptr, native_cfg17d1).empty(),
+          "Wave32 literal mask remains live through an irreducible VCC branch");
     const std::vector<uint32_t> native_spv17d1 = recompile_compute(
         code17d1, std::size(code17d1), &rt17d1, native_cfg17d1);
     CHECK(!native_spv17d1.empty() && count_spirv_opcode(native_spv17d1, 349) >= 2 &&
@@ -1350,6 +1555,43 @@ int main() {
         (subgroup17d1.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+
+    // Kernel 17d1h: GTA V's Wave32 terrain kernel uses VCC_HI as ordinary scalar scratch. The
+    // exact pc57 packet materializes EXEC_LO, masks it into VCC_HI, and later reads that dword at
+    // pc67. VCC_LO remains the architectural mask: pc59 narrows it, and pc68 reads its complete
+    // dword through the same exact Wave32 ballot. Append the irreducible dispatcher tail so this
+    // exercises the same emit_alu call site as the live shader rather than only straight-line code.
+    std::vector<uint32_t> code17d1h = {
+        0xbe9403c1u,              // s_mov_b32 s20,-1
+        0x7d840100u,              // v_cmp_eq_u32 vcc,v0,v0
+        0x876bff7eu, 0x0fffffffu, // pc57: s_and_b32 vcc_hi,exec_lo,0x0fffffff
+        0xbf068000u,              // synthetic scalar condition keeps the exact lifetime at a join
+        0xbf840001u,              // s_cbranch_scc0 +1
+        0xbf800000u,              // alternate-path work
+        0x876aff6au, 0x7ffffffeu, // pc59: s_and_b32 vcc_lo,vcc_lo,0x7ffffffe
+        0x871a6b14u,              // pc67: s_and_b32 s26,s20,vcc_hi
+        0x811b6a82u,              // pc68: s_add_u32 s27,2,vcc_lo
+        0x811a1b1au,              // s_add_u32 s26,s26,s27
+        0x7e02021au,              // v_mov_b32 v1,s26
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+    };
+    code17d1h.insert(code17d1h.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> native_spv17d1h = recompile_compute(
+        code17d1h.data(), code17d1h.size(), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1h.empty() && count_spirv_opcode(native_spv17d1h, 339) == 2,
+          "GTA Wave32 VCC_HI scratch materializes exact EXEC/VCC ballots");
+    CHECK(recompile_compute(code17d1h.data(), code17d1h.size(), &rt17d1,
+                            portable_cfg17d1).empty(),
+          "Wave32 VCC_HI scratch rejects without an exact subgroup ballot");
+    const bool can_execute17d1h = can_execute17d1 &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    if (can_execute17d1h) {
+        std::vector<uint32_t> got17d1h;
+        prosper::test::run_compute(native_spv17d1h, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(64, 0u), &got17d1h);
+        CHECK(got17d1h == std::vector<uint32_t>(64, 0x8fffffffu),
+              "VCC_HI scalar scratch and VCC_LO mask dwords remain independently exact");
+    }
     if (can_execute17d1) {
         std::vector<uint32_t> initial17d1(64, 0u), got17d1;
         prosper::test::run_compute(native_spv17d1, std::vector<float>(64, 0.0f),
@@ -1671,6 +1913,57 @@ int main() {
                     subgroup17d1.size);
     }
 
+    // Kernel 17d1w64: GTA V's Wave64 BVH traversal repeatedly writes the scalar result of a mask
+    // scan into an ordinary VGPR at a dynamic scalar lane. Keep the exact first live packet after
+    // the established irreducible dispatcher prefix. Selector 127 must wrap to lane 63,
+    // distinguishing the full Wave64 selector from the established Wave32 form above.
+    const uint32_t code17d1w64[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7c020300u,              // v_cmp_lt_u32 vcc, v0, v1
+        0xbf860001u,              // s_cbranch_vccz pc4
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0
+        0xbf870001u,              // s_cbranch_vccnz pc7
+        0xbf82fffdu,              // s_branch pc4 (irreducible dispatcher back-edge)
+        0x7e3c0300u,              // v_mov_b32 v30, v0
+        0xbe9003ffu, 0x0000007bu, // s_mov_b32 s16, 123
+        0xbed603ffu, 0x0000007fu, // s_mov_b32 s86, 127
+        0xd761001eu, 0x0000ac10u, // GTA pc12: v_writelane_b32 v30, s16, s86
+        0xe0702000u, 0x80021e00u, // buffer_store_dword v30, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig native_cfg17d1w64 = native_cfg17d;
+    native_cfg17d1w64.local_x = 64;
+    native_cfg17d1w64.local_y = 1;
+    const std::vector<uint32_t> native_spv17d1w64 = recompile_compute(
+        code17d1w64, std::size(code17d1w64), &rt17d1, native_cfg17d1w64);
+    CHECK(!native_spv17d1w64.empty(),
+          "GTA Wave64 dynamic v_writelane lowers inside the exact native CFG dispatcher");
+    ComputeShaderConfig portable_cfg17d1w64 = native_cfg17d1w64;
+    portable_cfg17d1w64.native_subgroup_size = 0;
+    ComputeShaderConfig mismatched_cfg17d1w64 = native_cfg17d1w64;
+    mismatched_cfg17d1w64.native_subgroup_size = 32;
+    CHECK(recompile_compute(code17d1w64, std::size(code17d1w64), &rt17d1,
+                            portable_cfg17d1w64).empty() &&
+              recompile_compute(code17d1w64, std::size(code17d1w64), &rt17d1,
+                                mismatched_cfg17d1w64).empty(),
+          "Wave64 dynamic v_writelane rejects portable and mismatched subgroup contracts");
+    if (can_execute17d1b && !native_spv17d1w64.empty()) {
+        std::vector<uint32_t> initial17d1w64(64, 0u), got17d1w64;
+        prosper::test::run_compute(native_spv17d1w64, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, initial17d1w64, &got17d1w64);
+        uint32_t bad17d1w64 = 0;
+        for (uint32_t lane = 0; lane < 64 && got17d1w64.size() == 64; ++lane) {
+            const uint32_t expected = lane == 63u ? 123u : lane;
+            bad17d1w64 += got17d1w64[lane] != expected;
+        }
+        CHECK(got17d1w64.size() == 64 && bad17d1w64 == 0,
+              "Wave64 dynamic writelane masks its selector to six bits and updates only lane 63");
+    } else {
+        std::printf("  [skip] Wave64 dynamic writelane execution: host default subgroup is %u\n",
+                    subgroup17d1.size);
+    }
+
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
     // the generic dispatcher.  Wave 0's mask is empty and selects all lanes; wave 1 has one set bit in
@@ -1833,14 +2126,8 @@ int main() {
                 count_spirv_opcode(native_spv17d, 335),
                 count_spirv_opcode(native_spv17d2v, 335),
                 count_spirv_opcode(native_ambiguous_join, 335));
-    CHECK(!portable_ambiguous_join.empty() &&
-              count_spirv_opcode(portable_ambiguous_join, 224) ==
-                  count_spirv_opcode(spv17d, 224),
-          "portable VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
-    CHECK(!native_ambiguous_join.empty() &&
-              count_spirv_opcode(native_ambiguous_join, 335) ==
-                  count_spirv_opcode(native_spv17d, 335),
-          "native VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
+    CHECK(portable_ambiguous_join.empty() && native_ambiguous_join.empty(),
+          "Wave64 VCC mask/scalar lifetime join rejects before its u64 consumer");
 
     // Kernel 17d2x: Syberia's fullscreen compute pass compares current EXEC with a mask written
     // directly to s[16:17] by VOPC.  Keep the irreducible prefix so the comparison must use the
@@ -2713,6 +3000,139 @@ int main() {
     CHECK(!spv_atomic_or.empty() && or_buf_out.size() == 1 && or_buf_out[0] == 7u,
           "#590: buffer_atomic_or is idempotent (4 | 3 = 7), distinct from add/max/swap");
 
+    // GTA V rebuilds this exact stride-8 V# with a dispatch-sized record count. Use its live two-
+    // record arm: two valid lanes prove the dynamic qword index, and indices {0,2} prove the compiled
+    // count bound. Results are copied through binding 3 so both VDATA halves remain observable.
+    alignas(8) uint32_t swap_x2_backing[4] = {};
+    ShaderResourceTable rt_swap_x2;
+    { ShaderResource atomic{}; atomic.cls = ResourceClass::ConstantBuffer;
+      atomic.format = DataFormat::Uint32; atomic.num_components = 1;
+      atomic.binding = 2; atomic.gpu_addr = reinterpret_cast<uint64_t>(swap_x2_backing);
+      atomic.size = 16; atomic.stride = 8; atomic.sgpr_base = 0; atomic.fetch_pc = 3;
+      atomic.atomic_x2_record_count = 2;
+      rt_swap_x2.resources.push_back(atomic);
+      ShaderResource result{}; result.cls = ResourceClass::ConstantBuffer;
+      result.format = DataFormat::Uint32; result.num_components = 1;
+      result.binding = 3; result.size = 16; result.stride = 8;
+      result.sgpr_base = 4; result.fetch_pc = 5;
+      rt_swap_x2.resources.push_back(result); }
+    const uint32_t swap_x2_no_glc[] = {
+        0x7e260300u,               // v_mov_b32 v19, v0 (LocalInvocationId.x)
+        0x7e120291u,               // v_mov_b32 v9, 17
+        0x7e1402a2u,               // v_mov_b32 v10, 34
+        0xe1402000u, 0x80000913u,  // buffer_atomic_swap_x2 v[9:10], v19, s[0:3], idxen
+        0xe0742000u, 0x80010900u,  // buffer_store_dwordx2 v[9:10], v0, s[4:7], idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig swap_x2_config;
+    swap_x2_config.local_x = 2;
+    swap_x2_config.storage_buffer_int64_atomics = true;
+    const std::vector<uint32_t> swap_x2_no_glc_spv = recompile_compute(
+        swap_x2_no_glc, std::size(swap_x2_no_glc), &rt_swap_x2, swap_x2_config);
+    CHECK(!swap_x2_no_glc_spv.empty(),
+          "GTA V swap_x2 GLC=0 recompiles through the exact int64-atomic contract");
+
+    if (prosper::test::default_compute_buffer_int64_atomics_supported()) {
+        const std::vector<float> swap_x2_dummy(2, 0.0f);
+        std::vector<uint32_t> initial_qwords(4, 0u);
+        initial_qwords[0] = 0x11223344u;
+        initial_qwords[1] = 0x55667788u;
+        initial_qwords[2] = 0x99aabbccu;
+        initial_qwords[3] = 0xddeeff00u;
+        const std::vector<uint32_t> result_seed(4, 0xdeadbeefu);
+        std::vector<uint32_t> no_glc_results, no_glc_memory;
+        prosper::test::run_compute(swap_x2_no_glc_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &no_glc_results, 2,
+                                   &no_glc_memory);
+        std::vector<uint32_t> swapped_qwords = initial_qwords;
+        swapped_qwords[0] = swapped_qwords[2] = 17u;
+        swapped_qwords[1] = swapped_qwords[3] = 34u;
+        CHECK(no_glc_memory == swapped_qwords &&
+                  no_glc_results == std::vector<uint32_t>({17u, 34u, 17u, 34u}),
+              "swap_x2 GLC=0 indexes two qwords and preserves both lanes' VDATA pairs");
+
+        const uint32_t swap_x2_glc[] = {
+            0x7e260300u, 0x7e120291u, 0x7e1402a2u,
+            0xe1406000u, 0x80000913u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> swap_x2_glc_spv = recompile_compute(
+            swap_x2_glc, std::size(swap_x2_glc), &rt_swap_x2, swap_x2_config);
+        std::vector<uint32_t> glc_results, glc_memory;
+        prosper::test::run_compute(swap_x2_glc_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &glc_results, 2, &glc_memory);
+        CHECK(glc_memory == swapped_qwords &&
+                  glc_results ==
+                      std::vector<uint32_t>({0x11223344u, 0x55667788u,
+                                             0x99aabbccu, 0xddeeff00u}),
+              "swap_x2 GLC=1 returns each dynamically indexed pre-operation qword");
+
+        const uint32_t swap_x2_oob[] = {
+            0x34260081u,             // v_lshlrev_b32 v19, 1, v0 -> indices {0,2}
+            0x7e120291u, 0x7e1402a2u,
+            0xe1406000u, 0x80000913u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> swap_x2_oob_spv = recompile_compute(
+            swap_x2_oob, std::size(swap_x2_oob), &rt_swap_x2, swap_x2_config);
+        std::vector<uint32_t> oob_results, oob_memory;
+        prosper::test::run_compute(swap_x2_oob_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &oob_results, 2, &oob_memory);
+        std::vector<uint32_t> one_swapped_qword = initial_qwords;
+        one_swapped_qword[0] = 17u;
+        one_swapped_qword[1] = 34u;
+        CHECK(oob_memory == one_swapped_qword &&
+                  oob_results ==
+                      std::vector<uint32_t>({0x11223344u, 0x55667788u, 0u, 0u}),
+              "swap_x2 GLC=1 returns zero and drops the complete qword at index==record_count");
+
+        const uint32_t or_x2_glc[] = {
+            0x7e260300u, 0x7e120291u, 0x7e1402a2u,
+            0xe1686000u, 0x80000913u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> or_x2_glc_spv = recompile_compute(
+            or_x2_glc, std::size(or_x2_glc), &rt_swap_x2, swap_x2_config);
+        std::vector<uint32_t> initial_or_qwords(4, 0u);
+        initial_or_qwords[0] = 1u; initial_or_qwords[1] = 2u;
+        initial_or_qwords[2] = 4u; initial_or_qwords[3] = 8u;
+        std::vector<uint32_t> or_x2_results, or_x2_memory;
+        prosper::test::run_compute(or_x2_glc_spv, swap_x2_dummy, 2, 2,
+                                   initial_or_qwords, result_seed,
+                                   &or_x2_results, 2, &or_x2_memory);
+        std::vector<uint32_t> expected_or_qwords = initial_or_qwords;
+        expected_or_qwords[0] = 17u; expected_or_qwords[1] = 34u;
+        expected_or_qwords[2] = 21u; expected_or_qwords[3] = 42u;
+        CHECK(or_x2_memory == expected_or_qwords &&
+                  or_x2_results == std::vector<uint32_t>({1u, 2u, 4u, 8u}),
+              "or_x2 performs one u64 OR per record and returns both old dwords");
+
+        // Narrow EXEC to u0>u1 after mapping VADDR to {0,2}: lane 0 is inactive/in-bounds and lane
+        // 1 is active/OOB. Restoring EXEC before the result store exposes both fallback contracts.
+        ShaderResourceTable rt_swap_x2_exec = rt_swap_x2;
+        rt_swap_x2_exec.resources[0].fetch_pc = 5;
+        rt_swap_x2_exec.resources[1].fetch_pc = 8;
+        const uint32_t swap_x2_exec[] = {
+            0x34260081u, 0x7e020280u, 0x7e120291u, 0x7e1402a2u,
+            0x7da80300u,
+            0xe1406000u, 0x80000913u,
+            0xbefe04c1u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> swap_x2_exec_spv = recompile_compute(
+            swap_x2_exec, std::size(swap_x2_exec), &rt_swap_x2_exec, swap_x2_config);
+        std::vector<uint32_t> exec_results, exec_memory;
+        prosper::test::run_compute(swap_x2_exec_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &exec_results, 2, &exec_memory);
+        CHECK(exec_memory == initial_qwords &&
+                  exec_results == std::vector<uint32_t>({17u, 34u, 0u, 0u}),
+              "swap_x2 inactive in-bounds lane preserves VDATA and cannot exchange memory");
+    }
+
     // Kernel 24store (#590): integer sub-dword FORMAT store at a runtime byte address. Every lane stores
     // its gid as a Uint16 into element[gid] of a stride-2 buffer, so elements 2k and 2k+1 SHARE dword k.
     // A plain read-modify-write would race; the atomicAnd(clear field)+atomicOr(set field) of each lane's
@@ -3269,6 +3689,76 @@ int main() {
     CHECK(got32b3.size()==1 && std::fabs(got32b3[0]-189.0f)<1e-3f,
           "kernel 32b3 masks U24 multiplication and floors negative f32 before i32 conversion");
 
+    // GTA V exec_cs_205b54f200 pc21: exact `v_cvt_rpi_i32_f32_e32 v1, v1` packet.
+    // RDNA2 specifies floor(x + 0.5): nearest integer with halfway cases toward +infinity.
+    // Read the integer result bits directly so the positive rail checks INT_MAX itself rather than
+    // losing that distinction in an i32->f32 round-trip. Exceptional values follow prosper's
+    // adjacent saturating f32->i32 convention: NaN -> 0, infinities/overflow -> signed rails.
+    const uint32_t code32b3_rpi[] = {
+        0x7e021901u,               // live pc21: v_cvt_rpi_i32_f32 v1, v1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv32b3_rpi = recompile_valu(
+        code32b3_rpi, std::size(code32b3_rpi), 2, 1);
+    CHECK(!spv32b3_rpi.empty(),
+          "recompiled GTA V pc21 v_cvt_rpi_i32_f32 packet -> SPIR-V");
+    CHECK(count_spirv_opcode(spv32b3_rpi, 110) == 0 &&
+              count_spirv_opcode(spv32b3_rpi, 109) != 0,
+          "v_cvt_rpi_i32_f32 uses the defined saturating conversion path");
+    const float rpi_sources[] = {
+        -INFINITY, -2147483904.0f, -2147483648.0f,
+        -2.75f, -2.5f, -2.25f, -1.5f, -0.75f, -0.5f, -0.25f,
+        -std::numeric_limits<float>::denorm_min(), -0.0f, 0.0f,
+        std::numeric_limits<float>::denorm_min(),
+        std::nextafter(0.5f, 0.0f), 0.5f, std::nextafter(0.5f, 1.0f),
+        0.75f, 1.25f, 1.5f, 1.75f,
+        2147483520.0f, 2147483648.0f, INFINITY, std::nanf(""),
+    };
+    const uint32_t rpi_expected[] = {
+        0x80000000u, 0x80000000u, 0x80000000u,
+        0xfffffffdu, 0xfffffffeu, 0xfffffffeu, 0xffffffffu,
+        0xffffffffu, 0u, 0u, 0u, 0u, 0u, 0u,
+        0u, 1u, 1u, 1u, 1u, 2u, 2u,
+        0x7fffff80u, 0x7fffffffu, 0x7fffffffu, 0u,
+    };
+    static_assert(std::size(rpi_sources) == std::size(rpi_expected));
+    std::vector<float> in32b3_rpi(std::size(rpi_sources) * 2u, 0.0f);
+    for (size_t i = 0; i < std::size(rpi_sources); ++i)
+        in32b3_rpi[i * 2u + 1u] = rpi_sources[i];
+    const std::vector<float> got32b3_rpi = prosper::test::run_compute(
+        spv32b3_rpi, in32b3_rpi, static_cast<uint32_t>(std::size(rpi_sources)),
+        static_cast<uint32_t>(std::size(rpi_sources)));
+    uint32_t bad32b3_rpi = 0;
+    for (size_t i = 0; i < got32b3_rpi.size() && i < std::size(rpi_expected); ++i) {
+        if (bits_of(got32b3_rpi[i]) == rpi_expected[i]) continue;
+        if (bad32b3_rpi == 0)
+            printf("  pc21 first mismatch i=%zu src=0x%08x got=0x%08x expect=0x%08x\n",
+                   i, bits_of(rpi_sources[i]), bits_of(got32b3_rpi[i]), rpi_expected[i]);
+        ++bad32b3_rpi;
+    }
+    CHECK(got32b3_rpi.size() == std::size(rpi_expected) && bad32b3_rpi == 0,
+          "GTA V pc21 rounds fractions/ties and saturates exceptional values exactly");
+
+    // Modifier-bearing siblings are not part of the proven live shape. The trivial-DWORD SDWA
+    // packet is deliberately useful here: the decoder admits it structurally, so this assertion
+    // reaches the opcode's own fail-visible gate rather than a generic malformed-packet reject.
+    const uint32_t cvt_rpi_sdwa[] = {
+        0x7e0218f9u, 0x00060601u,  // v_cvt_rpi_i32_f32_sdwa v1,v1, DWORD/PAD/DWORD
+        0xbf810000u,
+    };
+    const uint32_t cvt_rpi_sdwa_neg[] = {
+        0x7e0218f9u, 0x00160601u,  // same packet with src0 negate
+        0xbf810000u,
+    };
+    const uint32_t cvt_rpi_dpp[] = {
+        0x7e0218fau, 0xff00e401u,  // identity quad_perm, full row/bank masks
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(cvt_rpi_sdwa, std::size(cvt_rpi_sdwa), 2, 1).empty() &&
+              recompile_valu(cvt_rpi_sdwa_neg, std::size(cvt_rpi_sdwa_neg), 2, 1).empty() &&
+              recompile_valu(cvt_rpi_dpp, std::size(cvt_rpi_dpp), 2, 1).empty(),
+          "unproven v_cvt_rpi_i32_f32 SDWA/DPP/modifier forms remain fail-visible");
+
     // Kernel 32b4: exact DS_WRITE_B96/B128 and DS_READ_B96/B128 forms from Astro. Store 1,2,3 at
     // byte 0x510 and 4,5,6,7 at byte 0, read both vectors back, and sum all seven dwords to 28.
     const uint32_t code32b4[] = {
@@ -3435,6 +3925,271 @@ int main() {
     std::vector<float> got32c = prosper::test::run_compute(spv32c, std::vector<float>(1), 1, 1);
     CHECK(got32c.size()==1 && std::fabs(got32c[0]-7.0f)<1e-3f,
           "kernel 32c LDS min/max atomics update shared memory exactly");
+
+    // Inactive lanes retain the old address VGPR when GTA narrows EXEC to lane zero. Give those
+    // lanes a deliberately out-of-range address before the exact B128+B64 gather: the six LDS
+    // AccessChain/OpLoad pairs must live inside their active branches, while OpPhi preserves each
+    // inactive destination. Counting the six structural regions pins that production call site;
+    // merely selecting the result after an unconditional load would have no such regions.
+    const uint32_t predicated_wide_lds_reads[] = {
+        0x7e0802ffu, 0xfffffffcu,            // v4 = stale/OOB byte address in every lane
+        0xbefe0481u,                         // s_mov_b64 exec, 1
+        0x7e080280u,                         // v_mov_b32 v4, 0 in lane zero only
+        0xdbfc0000u, 0x00000004u,            // exact ds_read_b128 v[0:3], v4
+        0xd9d80010u, 0x04000004u,            // exact ds_read_b64 v[4:5], v4
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> predicated_wide_lds_spv = recompile_valu(
+        predicated_wide_lds_reads, std::size(predicated_wide_lds_reads), 6, 0);
+    CHECK(!predicated_wide_lds_spv.empty() &&
+              count_spirv_opcode(predicated_wide_lds_spv, 247) == 6 &&
+              count_spirv_opcode(predicated_wide_lds_spv, 245) == 6,
+          "GTA's lane-zero B128+B64 gather branches around all six LDS loads and phi-merges fallbacks");
+
+    // GTA V exec_cs_413ced900 pc69 is the exact non-returning DS_MIN_F32 packet below. The shader
+    // initializes six LDS bounds to infinities, atomically reduces three minima and three maxima,
+    // then reads the completed box. SPIR-V 1.3 has no core float atomic min/max, so the lowering
+    // must use an integer compare-exchange loop while preserving AMD MINNUM/MAXNUM semantics.
+    auto build_ds_fminmax = [&](uint32_t atomic_word0, uint32_t atomic_word1,
+                                uint32_t initial_bits) {
+        const uint32_t byte_offset = atomic_word0 & 0xffffu;
+        const uint32_t data_vgpr = (atomic_word1 >> 8u) & 0xffu;
+        std::array<uint32_t, 6> initial = {
+            0x7f800000u, 0x7f800000u, 0x7f800000u,
+            0xff800000u, 0xff800000u, 0xff800000u,
+        };
+        initial[byte_offset / 4u] = initial_bits;
+        std::vector<uint32_t> code;
+        auto literal = [&](uint32_t vgpr, uint32_t bits) {
+            code.push_back(0x7e0002ffu | (vgpr << 17u));
+            code.push_back(bits);
+        };
+        // Neutral operands for the other five exact live atomics; overwrite the selected source
+        // from v1 before GTA's lane-zero EXEC mask narrows the initializer sequence.
+        for (uint32_t vgpr = 6; vgpr <= 8; ++vgpr) literal(vgpr, 0xff800000u);
+        for (uint32_t vgpr = 9; vgpr <= 11; ++vgpr) literal(vgpr, 0x7f800000u);
+        code.push_back(0x7e000301u | (data_vgpr << 17u)); // v_mov_b32 data0, v1
+        literal(4, 0xfffffffcu);                          // stale/OOB in inactive gather lanes
+        code.push_back(0xbefe0481u);                      // s_mov_b64 exec, 1
+        for (uint32_t vgpr = 0; vgpr < 6; ++vgpr) literal(vgpr, initial[vgpr]);
+        const uint32_t live_tail[] = {
+            0x7e180280u,                         // v_mov_b32 v12, 0
+            0xd9340010u, 0x0000040cu,            // pc63 ds_write_b64 v12, v[4:5] offset:16
+            0xdb7c0000u, 0x0000000cu,            // pc65 ds_write_b128 v12, v[0:3]
+            0xbefe04c1u,                         // pc67 s_mov_b64 exec, -1
+            0x7e000280u,                         // pc68 v_mov_b32 v0, 0
+            0xd8480000u, 0x00000900u,            // pc69/71/73 three exact DS_MIN_F32
+            0xd8480004u, 0x00000a00u,
+            0xd8480008u, 0x00000b00u,
+            0xd84c000cu, 0x00000600u,            // pc75/77/79 three exact DS_MAX_F32
+            0xd84c0010u, 0x00000700u,
+            0xd84c0014u, 0x00000800u,
+            0xbefe0481u,                         // pc81 s_mov_b64 exec, 1
+            0x7e080280u,                         // pc82 v_mov_b32 v4, 0
+            0xdbfc0000u, 0x00000004u,            // pc83 ds_read_b128 v[0:3], v4
+            0xd9d80010u, 0x04000004u,            // pc85 ds_read_b64 v[4:5], v4
+            0xbf8cc17fu,                         // pc87 s_waitcnt lgkmcnt(0)
+            0xbefe04c1u,                         // s_mov_b64 exec, -1
+            0x7e0002ffu, byte_offset,            // v_mov_b32 v0, selected result address
+            0xd8d80000u, 0x0a000000u,            // ds_read_b32 v10, v0 (semantic check)
+            0xbf810000u,
+        };
+        code.insert(code.end(), std::begin(live_tail), std::end(live_tail));
+        return code;
+    };
+    auto run_ds_fminmax = [&](uint32_t atomic_word0, uint32_t atomic_word1,
+                              uint32_t initial_bits,
+                              const std::vector<uint32_t>& operand_bits,
+                              const char* compile_message) {
+        std::vector<uint32_t> code = build_ds_fminmax(
+            atomic_word0, atomic_word1, initial_bits);
+        std::vector<uint32_t> spv = recompile_valu(
+            code.data(), code.size(), 2, 10);
+        CHECK(!spv.empty(), compile_message);
+        CHECK(count_spirv_opcode(spv, 230) == 6 &&
+                  count_spirv_opcode(spv, 236) == 0 &&
+                  count_spirv_opcode(spv, 237) == 0,
+              "GTA DS_MIN/MAX_F32 group uses six compare-exchange loops, not integer min");
+        CHECK(count_spirv_opcode(spv, 224) == 2,
+              "GTA LDS atomic group gains publication and completion barriers without a guest barrier");
+        CHECK(count_spirv_opcode(spv, 247) == 12 &&
+                  count_spirv_opcode(spv, 245) == 12,
+              "GTA lane-zero initializer and gather keep six LDS loads inside EXEC selections");
+        if (spv.empty()) return std::vector<float>{};
+        std::vector<float> input(WG * 2u);
+        for (uint32_t lane = 0; lane < WG; ++lane) {
+            input[lane * 2u] = static_cast<float>(lane);
+            const uint32_t bits = operand_bits[lane % operand_bits.size()];
+            std::memcpy(&input[lane * 2u + 1u], &bits, sizeof(bits));
+        }
+        return prosper::test::run_compute(spv, input, WG, WG);
+    };
+    auto all_bits_are = [&](const std::vector<float>& values, uint32_t expected) {
+        if (values.size() != WG) return false;
+        return std::all_of(values.begin(), values.end(), [&](float value) {
+            return bits_of(value) == expected;
+        });
+    };
+
+    // EXEC=1 means one ordinary-store writer per guest wave, not per workgroup. GTA's live
+    // local64/Wave64 launch therefore has exactly one initializer; a two-wave workgroup would race
+    // the same six addresses and must stay fail-visible in both portable and native subgroup modes.
+    const std::vector<uint32_t> ds_fminmax_launch_code = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    ComputeShaderConfig portable_ds_fminmax_config;
+    portable_ds_fminmax_config.local_x = 64;
+    portable_ds_fminmax_config.wave_size = 64;
+    const std::vector<uint32_t> portable_ds_fminmax_spv = recompile_compute(
+        ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+        portable_ds_fminmax_config);
+    ComputeShaderConfig native_ds_fminmax_config = portable_ds_fminmax_config;
+    native_ds_fminmax_config.native_subgroup_size = 64;
+    const std::vector<uint32_t> native_ds_fminmax_spv = recompile_compute(
+        ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+        native_ds_fminmax_config);
+    CHECK(!portable_ds_fminmax_spv.empty() && !native_ds_fminmax_spv.empty(),
+          "GTA's single-wave LDS float atomic launch recompiles in portable and native modes");
+    ComputeShaderConfig portable_multiwave_ds_fminmax_config = portable_ds_fminmax_config;
+    portable_multiwave_ds_fminmax_config.local_x = 128;
+    ComputeShaderConfig native_multiwave_ds_fminmax_config = native_ds_fminmax_config;
+    native_multiwave_ds_fminmax_config.local_x = 128;
+    CHECK(recompile_compute(ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+                            portable_multiwave_ds_fminmax_config).empty() &&
+              recompile_compute(ds_fminmax_launch_code.data(), ds_fminmax_launch_code.size(), nullptr,
+                                native_multiwave_ds_fminmax_config).empty(),
+          "GTA's lane-zero LDS initializer rejects an unproved multi-wave workgroup in both modes");
+
+    const std::vector<float> got32c_fmin = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u,
+        {0x7fc12345u, 0x40800000u, 0xc0600000u, 0x00000001u, 0x80000001u},
+        "recompiled GTA pc69 exact DS_MIN_F32 packet -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin, 0xc0600000u),
+          "GTA DS_MIN_F32 atomically reduces finite, NaN, and denormal operands");
+
+    const std::vector<float> got32c_fmin_zero = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x00000000u,
+        {0x00000000u, 0x80000000u, 0x7fc00001u},
+        "recompiled GTA DS_MIN_F32 signed-zero arm -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin_zero, 0x80000000u),
+          "GTA DS_MIN_F32 orders -0 below +0 and ignores a lone NaN");
+
+    const std::vector<float> got32c_fmax_zero = run_ds_fminmax(
+        0xd84c000cu, 0x00000600u, 0x80000000u,
+        {0x80000000u, 0x00000000u, 0xffc00001u},
+        "recompiled GTA pc75 adjacent DS_MAX_F32 packet -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmax_zero, 0x00000000u),
+          "GTA DS_MAX_F32 orders +0 above -0 and ignores a lone NaN");
+
+    const std::vector<float> got32c_fmin_denorm = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x00800000u, {0x00000001u, 0x00000002u},
+        "recompiled GTA DS_MIN_F32 denormal arm -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin_denorm, 0x00000001u),
+          "GTA DS_MIN_F32 retains binary32 denormal ordering independent of host float mode");
+
+    const std::vector<float> got32c_fmin_nan = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7fa12345u, {0x7fc22222u, 0xffc33333u},
+        "recompiled GTA DS_MIN_F32 all-NaN arm -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin_nan, 0x7fe12345u),
+          "GTA DS_MIN_F32 quiets and preserves the resident payload when both operands are NaN");
+
+    // GTA reaches this publication point after a completed two-edge loop. Prove the synthesized
+    // barrier remains top-level through that control-flow route as well as the straight-line
+    // execution arms above; neither edge crosses the initializer/atomic boundary.
+    const uint32_t pre_atomic_loop[] = {
+        0xb0020005u, 0xbe800380u, 0x7e020280u, 0xbf0a0200u,
+        0xbf840003u, 0x4a020200u, 0x81008100u, 0xbf82fffbu,
+    };
+    std::vector<uint32_t> looped_ds_fmin = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    looped_ds_fmin.insert(
+        looped_ds_fmin.begin(), std::begin(pre_atomic_loop), std::end(pre_atomic_loop));
+    const std::vector<uint32_t> looped_ds_fmin_spv = recompile_valu(
+        looped_ds_fmin.data(), looped_ds_fmin.size(), 2, 10);
+    CHECK(!looped_ds_fmin_spv.empty() && count_spirv_opcode(looped_ds_fmin_spv, 224) == 2,
+          "GTA-style completed pre-atomic loop retains a top-level LDS publication barrier");
+    std::vector<uint32_t> skipped_ds_fmin_barrier = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    const auto first_fmin = std::find(
+        skipped_ds_fmin_barrier.begin(), skipped_ds_fmin_barrier.end(), 0xd8480000u);
+    const uint32_t first_fmin_pc = static_cast<uint32_t>(
+        std::distance(skipped_ds_fmin_barrier.begin(), first_fmin));
+    skipped_ds_fmin_barrier.insert(
+        skipped_ds_fmin_barrier.begin(), 0xbf840000u | first_fmin_pc);
+    CHECK(recompile_valu(
+              skipped_ds_fmin_barrier.data(), skipped_ds_fmin_barrier.size(), 2, 10).empty(),
+          "branch that skips the LDS publication boundary remains rejected");
+    std::vector<uint32_t> skipped_ds_fmin_lane0 = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    const auto lane0_exec = std::find(
+        skipped_ds_fmin_lane0.begin(), skipped_ds_fmin_lane0.end(), 0xbefe0481u);
+    skipped_ds_fmin_lane0.insert(lane0_exec, 0xbf840001u); // branch over EXEC=1 only
+    CHECK(recompile_valu(
+              skipped_ds_fmin_lane0.data(), skipped_ds_fmin_lane0.size(), 2, 10).empty(),
+          "branch entering after GTA's lane-zero EXEC writer invalidates the single-writer proof");
+    std::vector<uint32_t> crossed_ds_fmin_completion = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    const auto completion_first_fmin = std::find(
+        crossed_ds_fmin_completion.begin(), crossed_ds_fmin_completion.end(), 0xd8480000u);
+    const auto completion_lane0 = std::find(
+        completion_first_fmin, crossed_ds_fmin_completion.end(), 0xbefe0481u);
+    const auto completion_read64 = std::find(
+        completion_lane0, crossed_ds_fmin_completion.end(), 0xd9d80010u);
+    CHECK(completion_first_fmin != crossed_ds_fmin_completion.end() &&
+              completion_lane0 != crossed_ds_fmin_completion.end() &&
+              completion_read64 != crossed_ds_fmin_completion.end(),
+          "GTA LDS completion regression contains the exact atomic/gather suffix");
+    if (completion_lane0 != crossed_ds_fmin_completion.end() &&
+        completion_read64 != crossed_ds_fmin_completion.end()) {
+        const uint32_t target_pc = static_cast<uint32_t>(
+            std::distance(crossed_ds_fmin_completion.begin(), completion_lane0));
+        const auto branch_at = completion_read64 + 2;
+        const uint32_t branch_pc = static_cast<uint32_t>(
+            std::distance(crossed_ds_fmin_completion.begin(), branch_at));
+        const int32_t simm = static_cast<int32_t>(target_pc) -
+                             static_cast<int32_t>(branch_pc + 1u);
+        crossed_ds_fmin_completion.insert(
+            branch_at, 0xbf820000u | static_cast<uint16_t>(simm));
+    }
+    CHECK(recompile_valu(crossed_ds_fmin_completion.data(),
+                         crossed_ds_fmin_completion.size(), 2, 10).empty(),
+          "back-edge after GTA's gather cannot cross the synthesized completion barrier");
+
+    // Encoding boundaries: the live opcode is LDS-only and has no DATA1/VDST operand. These two
+    // one-bit mutations perturb that exact production packet and must remain fail-visible.
+    const uint32_t bad_ds_fmin_gds[] = {
+        0xd84a0000u, 0x00000900u, 0xbf810000u,
+    };
+    const uint32_t bad_ds_fmin_data1[] = {
+        0xd8480000u, 0x00010900u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(bad_ds_fmin_gds, std::size(bad_ds_fmin_gds), 10, 0).empty(),
+          "GTA DS_MIN_F32 GDS mutation remains rejected");
+    CHECK(recompile_valu(bad_ds_fmin_data1, std::size(bad_ds_fmin_data1), 10, 0).empty(),
+          "GTA DS_MIN_F32 reserved DATA1 mutation remains rejected");
+    std::vector<uint32_t> bad_ds_fmin_restore = build_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u);
+    auto restore = std::find(
+        bad_ds_fmin_restore.begin(), bad_ds_fmin_restore.end(), 0xbefe04c1u);
+    CHECK(restore != bad_ds_fmin_restore.end(),
+          "GTA LDS initializer regression contains the exact full-EXEC restore");
+    if (restore != bad_ds_fmin_restore.end()) *restore ^= 1u;
+    CHECK(recompile_valu(bad_ds_fmin_restore.data(), bad_ds_fmin_restore.size(), 2, 10).empty(),
+          "GTA LDS initializer restore mutation cannot bypass the publication proof");
+    const uint32_t unproved_ds_fmin_store[] = {
+        0x7e000280u, 0x7e0402ffu, 0x7f800000u,
+        0xd8340000u, 0x00000200u,
+        0xd8480000u, 0x00000900u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(unproved_ds_fmin_store, std::size(unproved_ds_fmin_store), 10, 0).empty(),
+          "ordinary LDS store before DS_MIN_F32 stays rejected without a uniform publication proof");
+    const uint32_t unproved_ds_write2_b64_fmin[] = {
+        0x7e000280u,
+        0xd9380000u, 0x00030100u, // ds_write2_b64 v0, v[1:2], v[3:4]
+        0xd8480000u, 0x00000900u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(
+              unproved_ds_write2_b64_fmin, std::size(unproved_ds_write2_b64_fmin), 10, 0).empty(),
+          "DS_WRITE2_B64 before DS_MIN_F32 remains an inventoried unsynchronized store");
 
     // Plucky Squire's first-gameplay compute shaders use the non-returning DS_OR_B32 form. Seed an
     // LDS dword with 4, OR in 3 using the exact opcode-0x0a encoding, then read back 7.
@@ -5116,6 +5871,390 @@ int main() {
     printf("  kernel38 mismatches=%u (out[5]=%g expect=10)\n", bad38, got38.size()==N?got38[5]:-1);
     CHECK(got38.size()==N && bad38==0, "recompiled kernel 38 (s_cselect_b64 -> exec mask -> cndmask) computes 10");
 
+    // GTA V compute program 0x413cf9a00 exposes the other S_CSELECT_B64 domain: ordinary scalar
+    // pairs. Pin both selected dwords and both SCC outcomes before exercising its VCC destination.
+    // These kernels use no subgroup operation, so both portable and exact-native compilation must
+    // accept identical semantics; native execution is gated only because the standalone Vulkan
+    // runner cannot request the backend's promised subgroup size.
+    ShaderResourceTable cselect_pair_table;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      cselect_pair_table.resources.push_back(output); }
+    ComputeShaderConfig cselect_portable_config;
+    cselect_portable_config.local_x = 64;
+    cselect_portable_config.wave_size = 64;
+    ComputeShaderConfig cselect_native_config = cselect_portable_config;
+    cselect_native_config.native_subgroup_size = 64;
+
+    const uint32_t code38_pair_true[] = {
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbe820395u,              // s_mov_b32 s2,21
+        0xbe830396u,              // s_mov_b32 s3,22
+        0xbe860381u,              // s_mov_b32 s6,1
+        0xbf078006u,              // s_cmp_lg_u32 s6,0 -> SCC=true
+        0x85840200u,              // s_cselect_b64 s[4:5],s[0:1],s[2:3]
+        0x7e020204u,              // v_mov_b32 v1,s4 (selected low consumer)
+        0xe0702000u, 0x80020100u, // output[lane] = selected low
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e020205u,              // v_mov_b32 v1,s5 (selected high consumer)
+        0xe0702000u, 0x80020102u, // output[64+lane] = selected high
+        0xbf810000u,
+    };
+    std::vector<uint32_t> code38_pair_false(
+        std::begin(code38_pair_true), std::end(code38_pair_true));
+    code38_pair_false[4] = 0xbe860380u; // same select, SCC=false
+    auto compile_cselect_pair = [&](const auto& code, const ComputeShaderConfig& config) {
+        return recompile_compute(code.data(), code.size(), &cselect_pair_table, config);
+    };
+    const std::vector<uint32_t> pair_true_words(
+        std::begin(code38_pair_true), std::end(code38_pair_true));
+    const auto pair_true_portable = compile_cselect_pair(pair_true_words, cselect_portable_config);
+    const auto pair_false_portable = compile_cselect_pair(code38_pair_false, cselect_portable_config);
+    const auto pair_true_native = compile_cselect_pair(pair_true_words, cselect_native_config);
+    const auto pair_false_native = compile_cselect_pair(code38_pair_false, cselect_native_config);
+    CHECK(!pair_true_portable.empty() && !pair_false_portable.empty() &&
+              !pair_true_native.empty() && !pair_false_native.empty(),
+          "S_CSELECT_B64 scalar pairs compile in portable/native modes for both SCC outcomes");
+    std::vector<uint32_t> pair_exec_dst = pair_true_words;
+    pair_exec_dst[6] = 0x85fe0200u; // same data pair select into architectural EXEC
+    CHECK(compile_cselect_pair(pair_exec_dst, cselect_portable_config).empty() &&
+              compile_cselect_pair(pair_exec_dst, cselect_native_config).empty(),
+          "S_CSELECT_B64 scalar data rejects an EXEC destination in both modes");
+    auto run_cselect_pair = [&](const std::vector<uint32_t>& module) {
+        std::vector<uint32_t> output;
+        if (module.empty()) return output;
+        prosper::test::run_compute(module, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(128, 0), &output);
+        return output;
+    };
+    const auto pair_true_got = run_cselect_pair(pair_true_portable);
+    const auto pair_false_got = run_cselect_pair(pair_false_portable);
+    uint32_t pair_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && pair_true_got.size() == 128 &&
+         pair_false_got.size() == 128; ++lane) {
+        pair_bad += pair_true_got[lane] != 11u;
+        pair_bad += pair_true_got[64 + lane] != 12u;
+        pair_bad += pair_false_got[lane] != 21u;
+        pair_bad += pair_false_got[64 + lane] != 22u;
+    }
+    CHECK(pair_true_got.size() == 128 && pair_false_got.size() == 128 && pair_bad == 0,
+          "S_CSELECT_B64 selects both scalar dwords for SCC true and false");
+
+    // Select the pair inside a counted loop and consume both words only after its exit. Both
+    // destinations therefore need loop-header PHIs; carrying just the encoded low destination
+    // leaves the high-word definition inside the loop body without dominance at the postlude.
+    const uint32_t code38_pair_loop[] = {
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbe820395u,              // s_mov_b32 s2,21
+        0xbe830396u,              // s_mov_b32 s3,22
+        0xbe940380u,              // s_mov_b32 s20,0 (induction variable)
+        0xbe950382u,              // s_mov_b32 s21,2 (trip count)
+        0xbf0a1514u,              // loop: s_cmp_lt_u32 s20,s21
+        0xbf840005u,              // s_cbranch_scc0 +5 -> postlude
+        0xbe8c0381u,              // s_mov_b32 s12,1
+        0xbf07800cu,              // SCC=true for the pair select
+        0x85840200u,              // s_cselect_b64 s[4:5],s[0:1],s[2:3]
+        0x81148114u,              // s_add_i32 s20,s20,1
+        0xbf82fff9u,              // s_branch -7 -> loop header
+        0x7e020204u,              // v_mov_b32 v1,s4
+        0xe0702000u, 0x80020100u, // output[lane] = selected low
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e020205u,              // v_mov_b32 v1,s5
+        0xe0702000u, 0x80020102u, // output[64+lane] = selected high
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> pair_loop_words(
+        std::begin(code38_pair_loop), std::end(code38_pair_loop));
+    const auto pair_loop_portable = compile_cselect_pair(
+        pair_loop_words, cselect_portable_config);
+    const auto pair_loop_native = compile_cselect_pair(
+        pair_loop_words, cselect_native_config);
+    CHECK(!pair_loop_portable.empty() && !pair_loop_native.empty(),
+          "counted loop carries both S_CSELECT_B64 scalar destination words");
+    CHECK(count_spirv_opcode(pair_loop_portable, 245) == 6 &&
+              count_spirv_opcode(pair_loop_native, 245) == 6,
+          "counted loop emits separate PHIs for both selected destination dwords");
+    const auto pair_loop_got = run_cselect_pair(pair_loop_portable);
+    uint32_t pair_loop_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && pair_loop_got.size() == 128; ++lane) {
+        pair_loop_bad += pair_loop_got[lane] != 11u;
+        pair_loop_bad += pair_loop_got[64 + lane] != 12u;
+    }
+    CHECK(pair_loop_got.size() == 128 && pair_loop_bad == 0,
+          "counted-loop postlude observes both selected scalar dwords");
+
+    // Force the arbitrary-CFG dispatcher, select two ordinary scalar pairs in one case, then
+    // consume them with a second S_CSELECT_B64 after an explicit successor edge. The dispatcher's
+    // Bool backing variables exist because this opcode can also select masks, but mere variable
+    // existence must not reclassify these data lifetimes as masks when the successor reloads state.
+    const uint32_t code38_pair_dispatch[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0
+        0xbf860001u,              // s_cbranch_vccz +1
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7d840100u,              // fresh VCC for the loop exit
+        0xbf870001u,              // s_cbranch_vccnz +1
+        0xbf82fffdu,              // s_branch -3: forces generic dispatcher shape
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbe820395u,              // s_mov_b32 s2,21
+        0xbe830396u,              // s_mov_b32 s3,22
+        0xbe8c0381u,              // s_mov_b32 s12,1
+        0xbf07800cu,              // SCC=true
+        0x85840200u,              // s_cselect_b64 s[4:5],s[0:1],s[2:3] -> 11:12
+        0xbe8c0380u,              // s_mov_b32 s12,0
+        0xbf07800cu,              // SCC=false
+        0x85860200u,              // s_cselect_b64 s[6:7],s[0:1],s[2:3] -> 21:22
+        0xbf820001u,              // cross a dispatcher edge to pc19
+        0xbf800000u,
+        0xbe8c0381u,              // s_mov_b32 s12,1
+        0xbf07800cu,              // SCC=true
+        0x858e0604u,              // s_cselect_b64 s[14:15],s[4:5],s[6:7]
+        0x7e02020eu,              // v_mov_b32 v1,s14
+        0xe0702000u, 0x80020100u, // output[lane] = selected low
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e02020fu,              // v_mov_b32 v1,s15
+        0xe0702000u, 0x80020102u, // output[64+lane] = selected high
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> pair_dispatch_words(
+        std::begin(code38_pair_dispatch), std::end(code38_pair_dispatch));
+    const auto pair_dispatch_portable = compile_cselect_pair(
+        pair_dispatch_words, cselect_portable_config);
+    const auto pair_dispatch_native = compile_cselect_pair(
+        pair_dispatch_words, cselect_native_config);
+    CHECK(!pair_dispatch_portable.empty() && !pair_dispatch_native.empty(),
+          "dispatcher preserves S_CSELECT_B64 scalar-pair domain across a successor edge");
+    const auto pair_dispatch_got = run_cselect_pair(pair_dispatch_portable);
+    uint32_t pair_dispatch_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && pair_dispatch_got.size() == 128; ++lane) {
+        pair_dispatch_bad += pair_dispatch_got[lane] != 11u;
+        pair_dispatch_bad += pair_dispatch_got[64 + lane] != 12u;
+    }
+    CHECK(pair_dispatch_got.size() == 128 && pair_dispatch_bad == 0,
+          "dispatcher successor consumes both selected scalar dwords as data");
+
+    // The same physical pair cannot be reconstructed at a join when one predecessor owns a saved
+    // wave mask and the other owns ordinary scalar data. The dispatcher has separate Bool/u32
+    // backing variables but no runtime domain tag, so consuming s[4:5] at the join must reject in
+    // both portable and native paths instead of silently reading either variable's zero placeholder.
+    const uint32_t code38_pair_ambiguous_join[] = {
+        0x7e040280u,              // irreducible dispatcher prefix (same shape as kernel 17d)
+        0x7d840100u,
+        0xbf860001u,
+        0x7e040281u,
+        0x7d840100u,
+        0xbf870001u,
+        0xbf82fffdu,
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbf800000u,              // s12 remains a dynamic entry user SGPR
+        0xbf07800cu,              // SCC=(s12 != 0), so both CFG successors remain reachable
+        0xbf840002u,              // s_cbranch_scc0 +2 -> scalar-data predecessor
+        0xbe84046au,              // mask predecessor: s_mov_b64 s[4:5],vcc
+        0xbf820001u,              // -> join
+        0xbe840400u,              // data predecessor: s_mov_b64 s[4:5],s[0:1]
+        0xbf138004u,              // join consumer: s_cmp_lg_u64 s[4:5],0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> pair_ambiguous_join_words(
+        std::begin(code38_pair_ambiguous_join), std::end(code38_pair_ambiguous_join));
+    ComputeShaderConfig pair_ambiguous_portable_config = cselect_portable_config;
+    pair_ambiguous_portable_config.user_sgprs.resize(13);
+    ComputeShaderConfig pair_ambiguous_native_config = cselect_native_config;
+    pair_ambiguous_native_config.user_sgprs.resize(13);
+    const auto pair_ambiguous_portable = compile_cselect_pair(
+        pair_ambiguous_join_words, pair_ambiguous_portable_config);
+    const auto pair_ambiguous_native = compile_cselect_pair(
+        pair_ambiguous_join_words, pair_ambiguous_native_config);
+    CHECK(pair_ambiguous_portable.empty(),
+          "portable dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
+    CHECK(pair_ambiguous_native.empty(),
+          "native dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
+
+    auto rejects_ambiguous_pair = [&](const std::vector<uint32_t>& words) {
+        return compile_cselect_pair(words, pair_ambiguous_portable_config).empty() &&
+               compile_cselect_pair(words, pair_ambiguous_native_config).empty();
+    };
+    std::vector<uint32_t> pair_ambiguous_low_overwrite = pair_ambiguous_join_words;
+    pair_ambiguous_low_overwrite.insert(
+        pair_ambiguous_low_overwrite.begin() + 15,
+        0xbe840380u);              // overwrite only s4 after the join
+    pair_ambiguous_low_overwrite[16] =
+        0x7e020205u;               // read untouched ambiguous s5
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_low_overwrite),
+          "Wave64 pair ambiguity survives a low-half overwrite before a high-half read");
+
+    std::vector<uint32_t> pair_ambiguous_high_overwrite = pair_ambiguous_join_words;
+    pair_ambiguous_high_overwrite.insert(
+        pair_ambiguous_high_overwrite.begin() + 15,
+        0xbe850380u);              // overwrite only s5 after the join
+    pair_ambiguous_high_overwrite[16] =
+        0x7e020204u;               // read untouched ambiguous s4
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_high_overwrite),
+          "Wave64 pair ambiguity survives a high-half overwrite before a low-half read");
+
+    std::vector<uint32_t> pair_ambiguous_addk = pair_ambiguous_join_words;
+    pair_ambiguous_addk[15] =
+        0xb7840001u;               // s_addk_i32 s4,1 implicitly reads/writes SDST
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_addk),
+          "Wave64 pair ambiguity rejects an implicit SOPK read-modify-write");
+
+    std::vector<uint32_t> pair_ambiguous_cmpk = pair_ambiguous_join_words;
+    pair_ambiguous_cmpk[15] =
+        0xb2050000u;               // s_cmpk_lg_i32 s5,0 implicitly reads SDST
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_cmpk),
+          "Wave64 pair ambiguity rejects an implicit SOPK comparison read");
+
+    std::vector<uint32_t> pair_ambiguous_bitset = pair_ambiguous_join_words;
+    pair_ambiguous_bitset[15] =
+        0xbe841d81u;               // s_bitset1_b32 s4,1 reads old SDST and an explicit bit index
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_bitset),
+          "Wave64 pair ambiguity rejects an implicit SOP1 bitset destination read");
+
+    const uint32_t code38_vcc_true[] = {
+        0xbe8003ffu, 0x80000001u, // source0 low: lanes 0 and 31
+        0xbe8103ffu, 0x80000001u, // source0 high: lanes 32 and 63
+        0xbe8203ffu, 0x40000002u, // source1 low: lanes 1 and 30
+        0xbe8303ffu, 0x40000002u, // source1 high: lanes 33 and 62
+        0xbe860381u,              // s_mov_b32 s6,1
+        0xbf078006u,              // s_cmp_lg_u32 s6,0 -> SCC=true
+        0x85ea0200u,              // s_cselect_b64 vcc,s[0:1],s[2:3]
+        0x7e02028bu,              // v_mov_b32 v1,11
+        0x7e040296u,              // v_mov_b32 v2,22
+        0x02020501u,              // v_cndmask_b32 v1,v1,v2,vcc
+        0xe0702000u, 0x80020100u, // output[lane] = selected VCC bit ? 22 : 11
+        0xbf810000u,
+    };
+    std::vector<uint32_t> code38_vcc_false(
+        std::begin(code38_vcc_true), std::end(code38_vcc_true));
+    code38_vcc_false[8] = 0xbe860380u; // same complete pairs, SCC=false
+    const std::vector<uint32_t> vcc_true_words(
+        std::begin(code38_vcc_true), std::end(code38_vcc_true));
+    const auto vcc_true_portable = compile_cselect_pair(vcc_true_words, cselect_portable_config);
+    const auto vcc_false_portable = compile_cselect_pair(code38_vcc_false, cselect_portable_config);
+    const auto vcc_true_native = compile_cselect_pair(vcc_true_words, cselect_native_config);
+    const auto vcc_false_native = compile_cselect_pair(code38_vcc_false, cselect_native_config);
+    CHECK(!vcc_true_portable.empty() && !vcc_false_portable.empty() &&
+              !vcc_true_native.empty() && !vcc_false_native.empty(),
+          "complete scalar-pair selects into VCC compile in portable/native modes");
+    const auto vcc_true_got = run_cselect_pair(vcc_true_portable);
+    const auto vcc_false_got = run_cselect_pair(vcc_false_portable);
+    uint32_t vcc_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && vcc_true_got.size() == 128 &&
+         vcc_false_got.size() == 128; ++lane) {
+        const bool true_bit = lane == 0 || lane == 31 || lane == 32 || lane == 63;
+        const bool false_bit = lane == 1 || lane == 30 || lane == 33 || lane == 62;
+        vcc_bad += vcc_true_got[lane] != (true_bit ? 22u : 11u);
+        vcc_bad += vcc_false_got[lane] != (false_bit ? 22u : 11u);
+    }
+    CHECK(vcc_true_got.size() >= 64 && vcc_false_got.size() >= 64 && vcc_bad == 0,
+          "complete VCC pair select derives the correct predicate bit in both 32-lane halves");
+
+    // Exact GTA V pc57..62 packet. Source0 is a complete pair, while source1 intentionally has
+    // only s16: s17 is neither an entry SGPR nor written by this stream. VCC_HI is dead after pc60,
+    // and pc62 consumes VCC_LO as scalar data. The positive compiles in portable/native modes; a
+    // high-half consumer and a mutation of the production pc60 destination each close the proof.
+    auto gta_cselect_low_only = [](bool scc) {
+        std::vector<uint32_t> code(66, 0xbf800000u); // s_nop 0
+        code[0] = 0x7e040300u;                       // preserve local id: v_mov_b32 v2,v0
+        code[1] = 0xbe8003a1u;                       // s_mov_b32 s0,33
+        code[2] = 0xbe8103acu;                       // s_mov_b32 s1,44
+        code[3] = 0xbe9003b7u;                       // s_mov_b32 s16,55 (no s17 writer)
+        code[4] = scc ? 0xbe840381u : 0xbe840380u;  // seed pc57's SCC outcome
+        code[57] = 0xbf078004u;                      // exact pc57: s_cmp_lg_u32 s4,0
+        code[58] = 0x4a0620f9u;                      // exact pc58 VOP2 SDWA, preserves SCC
+        code[59] = 0x86860681u;
+        code[60] = 0x85ea1000u;                      // exact pc60: s_cselect_b64 vcc,s[0:1],s[16:17]
+        code[61] = 0x7e000210u;                      // exact pc61: v_mov_b32 v0,s16
+        code[62] = 0x7e10026au;                      // exact pc62: v_mov_b32 v8,vcc_lo
+        code[63] = 0xe0702000u;
+        code[64] = 0x80020802u;                      // output[v2] = v8
+        code[65] = 0xbf810000u;
+        return code;
+    };
+    const auto gta_low_true = gta_cselect_low_only(true);
+    const auto gta_low_false = gta_cselect_low_only(false);
+    const auto gta_low_true_portable = compile_cselect_pair(gta_low_true, cselect_portable_config);
+    const auto gta_low_false_portable = compile_cselect_pair(gta_low_false, cselect_portable_config);
+    const auto gta_low_true_native = compile_cselect_pair(gta_low_true, cselect_native_config);
+    const auto gta_low_false_native = compile_cselect_pair(gta_low_false, cselect_native_config);
+    CHECK(!gta_low_true_portable.empty() && !gta_low_false_portable.empty() &&
+              !gta_low_true_native.empty() && !gta_low_false_native.empty(),
+          "exact GTA pc60 low-only pair compiles in portable/native modes for both SCC outcomes");
+    const auto gta_low_true_got = run_cselect_pair(gta_low_true_portable);
+    const auto gta_low_false_got = run_cselect_pair(gta_low_false_portable);
+    uint32_t gta_low_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && gta_low_true_got.size() >= 64 &&
+         gta_low_false_got.size() >= 64; ++lane) {
+        gta_low_bad += gta_low_true_got[lane] != 33u;
+        gta_low_bad += gta_low_false_got[lane] != 55u;
+    }
+    CHECK(gta_low_true_got.size() >= 64 && gta_low_false_got.size() >= 64 &&
+              gta_low_bad == 0,
+          "exact GTA pc60 low-only pair selects VCC_LO for SCC true and false");
+    std::vector<uint32_t> gta_high_live = gta_low_true;
+    gta_high_live[62] = 0x7e10026bu; // v_mov_b32 v8,vcc_hi: high output is now live
+    std::vector<uint32_t> gta_site_mutation = gta_low_true;
+    gta_site_mutation[60] = 0x85861000u; // same pc60 select into ordinary s[6:7]
+    const auto gta_low_only_pcs = cselect_b64_low_only_pcs_for_test(
+        gta_low_true.data(), gta_low_true.size());
+    const auto gta_high_live_pcs = cselect_b64_low_only_pcs_for_test(
+        gta_high_live.data(), gta_high_live.size());
+    const auto gta_site_mutation_pcs = cselect_b64_low_only_pcs_for_test(
+        gta_site_mutation.data(), gta_site_mutation.size());
+    CHECK(std::find(gta_low_only_pcs.begin(), gta_low_only_pcs.end(), 60u) !=
+              gta_low_only_pcs.end() &&
+              gta_high_live_pcs.empty() && gta_site_mutation_pcs.empty(),
+          "GTA low-only liveness seam admits pc60 and rejects high-live/destination mutations there");
+    CHECK(compile_cselect_pair(gta_high_live, cselect_portable_config).empty() &&
+              compile_cselect_pair(gta_high_live, cselect_native_config).empty() &&
+              compile_cselect_pair(gta_site_mutation, cselect_portable_config).empty() &&
+              compile_cselect_pair(gta_site_mutation, cselect_native_config).empty(),
+          "GTA low-only negative streams remain fail-visible in portable/native modes");
+    const bool can_execute_cselect_native = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT);
+    if (can_execute_cselect_native) {
+        const auto pair_true_native_got = run_cselect_pair(pair_true_native);
+        const auto pair_false_native_got = run_cselect_pair(pair_false_native);
+        const auto pair_dispatch_native_got = run_cselect_pair(pair_dispatch_native);
+        const auto vcc_true_native_got = run_cselect_pair(vcc_true_native);
+        const auto vcc_false_native_got = run_cselect_pair(vcc_false_native);
+        const auto gta_low_true_native_got = run_cselect_pair(gta_low_true_native);
+        const auto gta_low_false_native_got = run_cselect_pair(gta_low_false_native);
+        uint32_t native_bad = 0;
+        for (uint32_t lane = 0; lane < 64 && pair_true_native_got.size() >= 128 &&
+             pair_false_native_got.size() >= 128 && pair_dispatch_native_got.size() >= 128 &&
+             vcc_true_native_got.size() >= 64 &&
+             vcc_false_native_got.size() >= 64 && gta_low_true_native_got.size() >= 64 &&
+             gta_low_false_native_got.size() >= 64; ++lane) {
+            native_bad += pair_true_native_got[lane] != 11u;
+            native_bad += pair_true_native_got[64 + lane] != 12u;
+            native_bad += pair_false_native_got[lane] != 21u;
+            native_bad += pair_false_native_got[64 + lane] != 22u;
+            native_bad += pair_dispatch_native_got[lane] != 11u;
+            native_bad += pair_dispatch_native_got[64 + lane] != 12u;
+            const bool true_bit = lane == 0 || lane == 31 || lane == 32 || lane == 63;
+            const bool false_bit = lane == 1 || lane == 30 || lane == 33 || lane == 62;
+            native_bad += vcc_true_native_got[lane] != (true_bit ? 22u : 11u);
+            native_bad += vcc_false_native_got[lane] != (false_bit ? 22u : 11u);
+            native_bad += gta_low_true_native_got[lane] != 33u;
+            native_bad += gta_low_false_native_got[lane] != 55u;
+        }
+        CHECK(pair_true_native_got.size() >= 128 && pair_false_native_got.size() >= 128 &&
+                  pair_dispatch_native_got.size() >= 128 &&
+                  vcc_true_native_got.size() >= 64 && vcc_false_native_got.size() >= 64 &&
+                  gta_low_true_native_got.size() >= 64 &&
+                  gta_low_false_native_got.size() >= 64 && native_bad == 0,
+              "native Wave64 executes scalar-pair, VCC-predicate, and GTA low-only selects");
+    } else {
+        std::printf("  [skip] native S_CSELECT_B64 execution: host subgroup is %u\n",
+                    exec_ballot_subgroup.size);
+    }
+
     // Kernel 39: trivial SDWA (all sels = DWORD) with SGPR operands — the form the game uses to give a
     //   VOP2 two scalar sources (e32 can't). s0=100, s1=23; v_add_nc_u32_sdwa v2, s0, s1 (all DWORD) = 123;
     //   v3=(float)123; out = a0 + 123. Verifies the decoder decodes SDWA operands + un-flags the no-op case.
@@ -6097,6 +7236,68 @@ int main() {
     CHECK(bfm_modifiers_reject,
           "GTA V v_bfm_b32 same-site modifier mutations remain fail-visible");
 
+    // Kernel 65c: GTA V exec_cs_205b658800 pc61 constructs one 64-bit bit per lane after MBCNT.
+    // Shift amounts are masked to six bits, and both destination halves remain live in the shader.
+    const uint32_t code65c[] = {
+        0xD6FF0018u, 0x00010304u, // v_lshlrev_b64 v[24:25], v4, 1
+        0xBF810000u,
+    };
+    const uint32_t shifts65c[] = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u};
+    const uint32_t expected65c_lo[] = {
+        1u, 2u, 0x80000000u, 0u, 0u, 0u, 1u, 2u,
+    };
+    const uint32_t expected65c_hi[] = {
+        0u, 0u, 0u, 1u, 2u, 0x80000000u, 0u, 0u,
+    };
+    std::vector<float> in65c(std::size(shifts65c) * 5u, 0.0f);
+    for (size_t i = 0; i < std::size(shifts65c); ++i)
+        in65c[i * 5u + 4u] = std::bit_cast<float>(shifts65c[i]);
+    const std::vector<uint32_t> spv65c_lo = recompile_valu(
+        code65c, std::size(code65c), 5, /*out_vgpr*/24);
+    const std::vector<uint32_t> spv65c_hi = recompile_valu(
+        code65c, std::size(code65c), 5, /*out_vgpr*/25);
+    const std::vector<float> got65c_lo = prosper::test::run_compute(
+        spv65c_lo, in65c, std::size(shifts65c), std::size(shifts65c));
+    const std::vector<float> got65c_hi = prosper::test::run_compute(
+        spv65c_hi, in65c, std::size(shifts65c), std::size(shifts65c));
+    uint32_t bad65c = 0;
+    for (size_t i = 0; i < std::size(shifts65c) &&
+                       got65c_lo.size() == std::size(shifts65c) &&
+                       got65c_hi.size() == std::size(shifts65c); ++i) {
+        if (bits_of(got65c_lo[i]) != expected65c_lo[i] ||
+            bits_of(got65c_hi[i]) != expected65c_hi[i])
+            ++bad65c;
+    }
+    CHECK(!spv65c_lo.empty() && !spv65c_hi.empty() &&
+          got65c_lo.size() == std::size(shifts65c) &&
+          got65c_hi.size() == std::size(shifts65c) && bad65c == 0,
+          "GTA V v_lshlrev_b64 writes both halves with six-bit shift semantics");
+
+    // Same-site modifier and destination-bound mutations remain fail-visible. These raw fields are
+    // reserved for this integer opcode; accepting them would silently discard architectural bits.
+    bool lshlrev_b64_mutants_reject = true;
+    for (uint32_t modifier : bfm_word0_modifiers) {
+        const uint32_t mutant[] = {
+            code65c[0] | modifier, code65c[1], 0xBF810000u,
+        };
+        lshlrev_b64_mutants_reject &= recompile_valu(
+            mutant, std::size(mutant), 5, 24).empty();
+    }
+    for (uint32_t modifier : bfm_word1_modifiers) {
+        const uint32_t mutant[] = {
+            code65c[0], code65c[1] | modifier, 0xBF810000u,
+        };
+        lshlrev_b64_mutants_reject &= recompile_valu(
+            mutant, std::size(mutant), 5, 24).empty();
+    }
+    const uint32_t lshlrev_b64_oob[] = {
+        0xD6FF00FFu, code65c[1], 0xBF810000u,
+    };
+    lshlrev_b64_mutants_reject &= recompile_valu(
+        lshlrev_b64_oob, std::size(lshlrev_b64_oob), 5, 24).empty();
+    CHECK(lshlrev_b64_mutants_reject,
+          "GTA V v_lshlrev_b64 same-site modifiers and v255 pair overflow reject");
+
     // Kernel 66: RAW MUBUF SRSRC RESOLUTION (#91). Same code as kernel 21 (buffer_load_dword v0, v0
     // offen, SRSRC s[8:11]) but WITH a resource table mapping s[8:11] -> binding 3. The load must
     // route to binding 3 (cbuf1), not the old hardcoded binding 2 — binding 2 (cbuf0) is bound with
@@ -6305,6 +7506,57 @@ int main() {
     CHECK(active68_zero_load > 0 && active68_zero_load < N &&
               got68_zero_load.size() == N && bad68_zero_load == 0,
           "zero-record raw load returns zero under EXEC and preserves masked VGPR lanes");
+
+    // GTA V 0x413d59600 pc67: exact buffer_load_format_xyz packet through a zero-record V#.
+    // Pad with real v_nop encodings so the exact-PC resource marker remains 67. The active lanes
+    // receive zero while masked lanes retain v17=7, and the module must add no storage-buffer access.
+    std::vector<uint32_t> code68_zero_format(72, 0x7e000000u);
+    code68_zero_format[0] = 0x7E000F00u; // v_cvt_u32_f32 v0, v0
+    code68_zero_format[1] = 0x7E020F01u; // v_cvt_u32_f32 v1, v1
+    code68_zero_format[2] = 0x7E220287u; // v_mov_b32 v17, 7
+    code68_zero_format[3] = 0x7DA80300u; // v_cmpx_gt_u32 vcc, v0, v1
+    code68_zero_format[67] = 0xE0082000u;
+    code68_zero_format[68] = 0x8000110Cu;
+    code68_zero_format[69] = 0xBEFE04C1u; // s_mov_b64 exec, -1
+    code68_zero_format[70] = 0x7E220D11u; // v_cvt_f32_u32 v17, v17
+    code68_zero_format[71] = 0xBF810000u;
+    ShaderResourceTable rt68_zero_format;
+    rt68_zero_format.resources.push_back(zero_record_resource(67));
+    const std::vector<uint32_t> spv68_zero_format = recompile_valu(
+        code68_zero_format.data(), code68_zero_format.size(), 2, 17,
+        &rt68_zero_format);
+    std::vector<uint32_t> code68_zero_format_control = code68_zero_format;
+    code68_zero_format_control[67] = 0x7E000000u;
+    code68_zero_format_control[68] = 0x7E000000u;
+    const std::vector<uint32_t> spv68_zero_format_control = recompile_valu(
+        code68_zero_format_control.data(), code68_zero_format_control.size(), 2, 17,
+        &rt68_zero_format);
+    CHECK(!spv68_zero_format.empty() && !spv68_zero_format_control.empty() &&
+              count_spirv_opcode(spv68_zero_format, 61) ==
+                  count_spirv_opcode(spv68_zero_format_control, 61) &&
+              count_spirv_opcode(spv68_zero_format, 62) ==
+                  count_spirv_opcode(spv68_zero_format_control, 62) &&
+              count_spirv_opcode(spv68_zero_format, 65) ==
+                  count_spirv_opcode(spv68_zero_format_control, 65),
+          "exact zero-record FORMAT load adds no storage-buffer access/load/store instructions");
+    const std::vector<float> got68_zero_format = spv68_zero_format.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv68_zero_format, in68_zero_load, N, N, {},
+                                     std::vector<uint32_t>(1, 0xDEADBEEFu));
+    uint32_t bad68_zero_format = 0;
+    for (uint32_t i = 0; i < N && got68_zero_format.size() == N; ++i)
+        if (got68_zero_format[i] != expected68_zero_load[i]) ++bad68_zero_format;
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_format.size() == N && bad68_zero_format == 0,
+          "exact zero-record FORMAT load preserves masked VGPR lanes");
+
+    ShaderResourceTable rt68_zero_format_one;
+    ShaderResource zero_record_format_one = zero_record_resource(67);
+    zero_record_format_one.swizzle[0] = 1u; // SQ_SEL_1: OOB result is one, never zero
+    rt68_zero_format_one.resources.push_back(zero_record_format_one);
+    CHECK(recompile_valu(code68_zero_format.data(), code68_zero_format.size(), 2, 17,
+                         &rt68_zero_format_one).empty(),
+          "zero-record FORMAT marker rejects SQ_SEL_1 instead of emitting a wrong zero");
 
     ShaderResourceTable rt68_zero_store;
     rt68_zero_store.resources.push_back(zero_record_resource(2));
@@ -7770,6 +9022,376 @@ int main() {
         std::printf("  [skip] T25b execution: host lacks compute subgroup shuffle support\n");
     }
 
+    // T25b-ror8 (#2481): GTA V's two screen-space compute programs use the exact full-mask,
+    // bounded V_MIN_F32 ROW_ROR:8 packets below. A rotate by eight exchanges the two halves of
+    // every DPP16 row, transforms SRC0 only, and leaves SRC1 in the destination lane.
+    const uint32_t codeT25bRor8[] = {
+        0x1e0000fau, 0xff092800u,             // exact live v_min_f32_dpp v0,v0,v0 row_ror:8 BC:1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8 = recompile_valu(
+        codeT25bRor8, std::size(codeT25bRor8), 1, 0);
+    CHECK(!spvT25bRor8.empty(),
+          "recompiled T25b-ror8 (GTA V exact V_MIN_F32 ROW_ROR:8) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT25bRor8) == 0 &&
+              count_spirv_opcode(spvT25bRor8, 345) == 0 &&
+              count_spirv_opcode(spvT25bRor8, 224) == 4,
+          "T25b-ror8: portable lowering uses scratch barriers without a subgroup contract");
+
+    const uint32_t codeT25bRor8Distinct[] = {
+        0x1e0402fau, 0xff092800u,             // v_min_f32_dpp v2,v0,v1 row_ror:8 BC:1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Distinct = recompile_valu(
+        codeT25bRor8Distinct, std::size(codeT25bRor8Distinct), 3, 2);
+    CHECK(!spvT25bRor8Distinct.empty(),
+          "T25b-ror8: distinct VDST/SRC0/SRC1 form recompiles");
+
+    // The second exact live packet executes under narrowed EXEC. Lanes 0..7 of each row are
+    // destinations whose rotated sources (lanes 8..15) are inactive. FI=0 makes those sources
+    // invalid and BOUND_CTRL=1 substitutes zero; inactive destinations independently preserve v2.
+    const uint32_t codeT25bRor8Exec[] = {
+        0x7da80300u,                         // v_cmpx_gt_u32 vcc,v0,v1
+        0x1e0404fau, 0xff092802u,            // exact live v_min_f32_dpp v2,v2,v2 row_ror:8 BC:1
+        0xbefe04c1u,                         // s_mov_b64 exec,-1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Exec = recompile_valu(
+        codeT25bRor8Exec, std::size(codeT25bRor8Exec), 3, 2);
+    CHECK(!spvT25bRor8Exec.empty(),
+          "T25b-ror8: exact live v2 packet recompiles with narrowed EXEC");
+
+    if (!spvT25bRor8.empty() && !spvT25bRor8Distinct.empty() &&
+        !spvT25bRor8Exec.empty()) {
+        std::vector<float> inRor8(128), expectedRor8(128);
+        std::vector<float> inRor8Distinct(128 * 3), expectedRor8Distinct(128);
+        std::vector<float> inRor8Exec(128 * 3), expectedRor8Exec(128);
+        for (uint32_t i = 0; i < 128; ++i) {
+            const uint32_t source = (i & ~15u) | ((i & 15u) ^ 8u);
+            inRor8[i] = static_cast<float>(100u + i);
+
+            inRor8Distinct[i * 3] = static_cast<float>(400u + i);
+            inRor8Distinct[i * 3 + 1] = (i & 1u) ? 50.0f : 1000.0f;
+
+            const uint32_t control = (i & 15u) < 8u ? 0xffffffffu : 0u;
+            const uint32_t threshold = 1u;
+            std::memcpy(&inRor8Exec[i * 3], &control, sizeof(control));
+            std::memcpy(&inRor8Exec[i * 3 + 1], &threshold, sizeof(threshold));
+            inRor8Exec[i * 3 + 2] = static_cast<float>(200u + i);
+
+            expectedRor8[i] = std::min(
+                static_cast<float>(100u + source), inRor8[i]);
+            expectedRor8Distinct[i] = std::min(
+                static_cast<float>(400u + source), inRor8Distinct[i * 3 + 1]);
+            expectedRor8Exec[i] = (i & 15u) < 8u ? 0.0f : inRor8Exec[i * 3 + 2];
+        }
+        const std::vector<float> gotRor8 = prosper::test::run_compute(
+            spvT25bRor8, inRor8, 128, 128);
+        const std::vector<float> gotRor8Distinct = prosper::test::run_compute(
+            spvT25bRor8Distinct, inRor8Distinct, 128, 128);
+        const std::vector<float> gotRor8Exec = prosper::test::run_compute(
+            spvT25bRor8Exec, inRor8Exec, 128, 128);
+        CHECK(gotRor8 == expectedRor8 && gotRor8.size() == 128 &&
+                  gotRor8[0] == expectedRor8[0] && gotRor8[64] == expectedRor8[64],
+              "T25b-ror8: portable CFG rotates two guest waves in linear-local DPP16 rows");
+        CHECK(gotRor8Distinct == expectedRor8Distinct,
+              "T25b-ror8: DPP transforms SRC0 while SRC1 stays in the current lane");
+        CHECK(gotRor8Exec == expectedRor8Exec,
+              "T25b-ror8: BC1 source invalidation and destination EXEC are independent");
+    } else {
+        std::printf("  [skip] T25b-ror8 execution: portable modules failed to compile\n");
+    }
+
+    // The live backend can still select the direct shuffle when it can require one exact Wave64
+    // subgroup. Use one resource-backed kernel for both modes: the portable module runs two guest
+    // waves through CFG scratch independent of host subgroup layout, while the native module must
+    // contain the two ROW_ROR shuffles (value + source EXEC) and no workgroup barrier.
+    const uint32_t codeT25bRor8Backend[] = {
+        0x7e020d00u,                         // v_cvt_f32_u32 v1,v0
+        0x1e0202fau, 0xff092801u,            // v_min_f32_dpp v1,v1,v1 row_ror:8 BC:1
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable ror8BackendTable;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      ror8BackendTable.resources.push_back(output); }
+    ComputeShaderConfig portableRor8Config;
+    portableRor8Config.local_x = 128;
+    portableRor8Config.wave_size = 64;
+    portableRor8Config.native_subgroup_size = 0;
+    const std::vector<uint32_t> portableRor8Spv = recompile_compute(
+        codeT25bRor8Backend, std::size(codeT25bRor8Backend),
+        &ror8BackendTable, portableRor8Config);
+    ComputeShaderConfig nativeRor8Config = portableRor8Config;
+    nativeRor8Config.native_subgroup_size = 64;
+    const std::vector<uint32_t> nativeRor8Spv = recompile_compute(
+        codeT25bRor8Backend, std::size(codeT25bRor8Backend),
+        &ror8BackendTable, nativeRor8Config);
+    CHECK(!portableRor8Spv.empty() &&
+              compute_spirv_min_subgroup_size(portableRor8Spv) == 0 &&
+              count_spirv_opcode(portableRor8Spv, 345) == 0 &&
+              count_spirv_opcode(portableRor8Spv, 224) == 4,
+          "T25b-ror8: explicit native-size-zero backend selects portable CFG scratch");
+    CHECK(!nativeRor8Spv.empty() &&
+              count_spirv_opcode(nativeRor8Spv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8Spv, 224) == 0,
+          "T25b-ror8: exact Wave64 backend selects two direct shuffles and no barrier");
+    std::vector<uint32_t> expectedRor8Backend(128);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const uint32_t source = (lane & ~15u) | ((lane & 15u) ^ 8u);
+        expectedRor8Backend[lane] = bits_of(
+            std::min(static_cast<float>(source), static_cast<float>(lane)));
+    }
+    std::vector<uint32_t> portableRor8Got;
+    if (!portableRor8Spv.empty())
+        prosper::test::run_compute(
+            portableRor8Spv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &portableRor8Got);
+    CHECK(portableRor8Got == expectedRor8Backend,
+          "T25b-ror8: explicit portable backend executes two Wave64 rows exactly");
+    ComputeShaderConfig partialRor8Config = portableRor8Config;
+    partialRor8Config.local_x = 73;
+    const std::vector<uint32_t> partialRor8Spv = recompile_compute(
+        codeT25bRor8Backend, std::size(codeT25bRor8Backend),
+        &ror8BackendTable, partialRor8Config);
+    std::vector<uint32_t> partialRor8Expected(73), partialRor8Got;
+    for (uint32_t lane = 0; lane < partialRor8Expected.size(); ++lane) {
+        const uint32_t source = (lane & ~15u) | ((lane & 15u) ^ 8u);
+        const float sourceValue = source < partialRor8Expected.size()
+            ? static_cast<float>(source) : 0.0f;
+        partialRor8Expected[lane] = bits_of(
+            std::min(sourceValue, static_cast<float>(lane)));
+    }
+    if (!partialRor8Spv.empty())
+        prosper::test::run_compute(
+            partialRor8Spv, std::vector<float>(73, 0.0f), 73, 73, {},
+            std::vector<uint32_t>(73, 0xdeadbeefu), &partialRor8Got);
+    CHECK(!partialRor8Spv.empty() && partialRor8Got == partialRor8Expected,
+          "T25b-ror8: FI0 zero-fills inactive sources in a partial final DPP16 row");
+    const bool canExecuteNativeRor8 = subgroupT25b.size == 64 &&
+        (subgroupT25b.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroupT25b.operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    if (canExecuteNativeRor8 && !nativeRor8Spv.empty()) {
+        std::vector<uint32_t> nativeRor8Got;
+        prosper::test::run_compute(
+            nativeRor8Spv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &nativeRor8Got);
+        CHECK(nativeRor8Got == expectedRor8Backend,
+              "T25b-ror8: exact Wave64 native backend executes both guest waves exactly");
+    } else {
+        std::printf("  [skip] T25b-ror8 native execution: host subgroup is %u or lacks shuffle\n",
+                    subgroupT25b.size);
+    }
+
+    // Keep the two portable DPP operation families in one module. They intentionally have separate
+    // pending state and barrier-bracketed scratch phases, plus one shared disjoint event namespace;
+    // the ROW_SHR phase must not consume ROW_ROR metadata (or vice versa) while scratch is reused.
+    const uint32_t codeT25bRor8ThenAdd[] = {
+        0x1e0000fau, 0xff092800u,            // v_min_f32_dpp v0,v0,v0 row_ror:8 BC:1
+        0x4a0000fau, 0xff011100u,            // v_add_nc_u32_dpp v0,v0,v0 row_shr:1 BC:0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> ror8ThenAddSpv = recompile_valu(
+        codeT25bRor8ThenAdd, std::size(codeT25bRor8ThenAdd), 1, 0);
+    CHECK(!ror8ThenAddSpv.empty() && count_spirv_opcode(ror8ThenAddSpv, 345) == 0 &&
+              count_spirv_opcode(ror8ThenAddSpv, 224) == 6,
+          "T25b-ror8: combined portable DPP families retain isolated scratch phases");
+    std::vector<float> ror8ThenAddInput(128), ror8ThenAddGot;
+    std::vector<uint32_t> ror8ThenAddExpected(128);
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8ThenAddInput[lane] = static_cast<float>(1000u + lane);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const uint32_t source = (lane & ~15u) | ((lane & 15u) ^ 8u);
+        const uint32_t rotatedMin = bits_of(std::min(
+            ror8ThenAddInput[source], ror8ThenAddInput[lane]));
+        if ((lane & 15u) == 0) {
+            ror8ThenAddExpected[lane] = rotatedMin;
+        } else {
+            const uint32_t priorSource = ((lane - 1u) & ~15u) |
+                (((lane - 1u) & 15u) ^ 8u);
+            const uint32_t priorMin = bits_of(std::min(
+                ror8ThenAddInput[priorSource], ror8ThenAddInput[lane - 1u]));
+            ror8ThenAddExpected[lane] = rotatedMin + priorMin;
+        }
+    }
+    if (!ror8ThenAddSpv.empty())
+        ror8ThenAddGot = prosper::test::run_compute(
+            ror8ThenAddSpv, ror8ThenAddInput, 128, 128);
+    uint32_t ror8ThenAddBad = 0;
+    for (uint32_t lane = 0; lane < 128 && ror8ThenAddGot.size() == 128; ++lane)
+        ror8ThenAddBad += bits_of(ror8ThenAddGot[lane]) != ror8ThenAddExpected[lane];
+    CHECK(ror8ThenAddGot.size() == 128 && ror8ThenAddBad == 0,
+          "T25b-ror8: combined rotate/add phases reuse scratch without cross-matching events");
+
+    // T25b-ror8-family (#2481): the first admitted V_MIN site exposes the next two exact GTA V
+    // packets in the same reduction family. DPP transforms SRC0 only: V_MAX combines the rotated
+    // v3 with lane-local v3, while V_MOV returns the rotated v17 bits unchanged. Keep the original
+    // register numbers so decode, dispatcher discovery, and the synchronized production sites are
+    // all exercised, with plain moves used only to seed/read those registers.
+    const uint32_t codeT25bRor8Max[] = {
+        0x200406fau, 0xff092803u,            // exact pc88: v_max_f32_dpp v2,v3,v3 row_ror:8 BC:1
+        0x7e000302u,                         // v_mov_b32 v0,v2
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Max = recompile_valu(
+        codeT25bRor8Max, std::size(codeT25bRor8Max), 4, 0);
+    std::vector<float> ror8MaxInput(128 * 4, 0.0f), ror8MaxExpected(128);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const float value = (lane & 8u) ? 1000.0f - static_cast<float>(lane)
+                                        : static_cast<float>(lane);
+        ror8MaxInput[lane * 4 + 3] = value;
+    }
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8MaxExpected[lane] = std::max(
+            ror8MaxInput[((lane ^ 8u) * 4) + 3], ror8MaxInput[lane * 4 + 3]);
+    std::vector<float> ror8MaxGot;
+    if (!spvT25bRor8Max.empty())
+        ror8MaxGot = prosper::test::run_compute(
+            spvT25bRor8Max, ror8MaxInput, 128, 128);
+    CHECK(!spvT25bRor8Max.empty() && ror8MaxGot == ror8MaxExpected,
+          "T25b-ror8-family: exact GTA V V_MAX rotates SRC0 and keeps SRC1 lane-local");
+
+    const uint32_t codeT25bRor8Mov[] = {
+        0x7e220303u,                         // v_mov_b32 v17,v3
+        0x7e2402fau, 0xff092811u,            // exact pc87: v_mov_b32_dpp v18,v17 row_ror:8 BC:1
+        0x7e000312u,                         // v_mov_b32 v0,v18
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Mov = recompile_valu(
+        codeT25bRor8Mov, std::size(codeT25bRor8Mov), 4, 0);
+    std::vector<float> ror8MovInput(128 * 4, 0.0f), ror8MovExpected(128);
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8MovInput[lane * 4 + 3] = static_cast<float>(lane) + 0.25f;
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8MovExpected[lane] = ror8MovInput[((lane ^ 8u) * 4) + 3];
+    std::vector<float> ror8MovGot;
+    if (!spvT25bRor8Mov.empty())
+        ror8MovGot = prosper::test::run_compute(
+            spvT25bRor8Mov, ror8MovInput, 128, 128);
+    CHECK(!spvT25bRor8Mov.empty() && ror8MovGot == ror8MovExpected,
+          "T25b-ror8-family: exact GTA V V_MOV returns the bounded rotated bits unchanged");
+
+    // The game selects the native path when the device exposes exact Wave64 subgroups. Exercise
+    // both new operation arms there too; the portable tests above cannot reach emit_alu's direct
+    // shuffle path. Local ID seeds v0, and the existing resource-backed output contract stores v1.
+    const uint32_t codeT25bRor8MaxNative[] = {
+        0x7e060d00u,                         // v_cvt_f32_u32 v3,v0
+        0x200406fau, 0xff092803u,            // exact V_MAX_F32 ROW_ROR:8
+        0x7e020302u,                         // v_mov_b32 v1,v2
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const uint32_t codeT25bRor8MovNative[] = {
+        0x7e220d00u,                         // v_cvt_f32_u32 v17,v0
+        0x7e2402fau, 0xff092811u,            // exact V_MOV_B32 ROW_ROR:8
+        0x7e020312u,                         // v_mov_b32 v1,v18
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> nativeRor8MaxSpv = recompile_compute(
+        codeT25bRor8MaxNative, std::size(codeT25bRor8MaxNative),
+        &ror8BackendTable, nativeRor8Config);
+    const std::vector<uint32_t> nativeRor8MovSpv = recompile_compute(
+        codeT25bRor8MovNative, std::size(codeT25bRor8MovNative),
+        &ror8BackendTable, nativeRor8Config);
+    CHECK(!nativeRor8MaxSpv.empty() && !nativeRor8MovSpv.empty() &&
+              count_spirv_opcode(nativeRor8MaxSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MovSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MaxSpv, 224) == 0 &&
+              count_spirv_opcode(nativeRor8MovSpv, 224) == 0,
+          "T25b-ror8-family: native Wave64 lowers exact V_MAX/V_MOV to direct shuffles");
+    if (canExecuteNativeRor8 && !nativeRor8MaxSpv.empty() && !nativeRor8MovSpv.empty()) {
+        std::vector<uint32_t> nativeMaxGot, nativeMovGot;
+        prosper::test::run_compute(
+            nativeRor8MaxSpv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &nativeMaxGot);
+        prosper::test::run_compute(
+            nativeRor8MovSpv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &nativeMovGot);
+        std::vector<uint32_t> nativeMaxExpected(128), nativeMovExpected(128);
+        for (uint32_t lane = 0; lane < 128; ++lane) {
+            nativeMaxExpected[lane] = bits_of(static_cast<float>(
+                std::max(lane, lane ^ 8u)));
+            nativeMovExpected[lane] = bits_of(static_cast<float>(lane ^ 8u));
+        }
+        CHECK(nativeMaxGot == nativeMaxExpected && nativeMovGot == nativeMovExpected,
+              "T25b-ror8-family: native Wave64 executes exact V_MAX/V_MOV semantics");
+    } else {
+        std::printf("  [skip] T25b-ror8-family native execution: host contract unavailable\n");
+    }
+
+    // The direct native kernels above exercise emit_alu. The generic CFG dispatcher has a separate
+    // native DPP site, so keep the established irreducible prefix from kernel 17d in front of each
+    // exact GTA packet. Both kernels execute the operation after leaving the loop and write its
+    // result to a real buffer. The expected values distinguish the dispatcher's NMax arm from NMin
+    // and its MOV arm from the lane-local SRC1 placeholder used by binary operations.
+    const uint32_t codeT25bRor8MaxNativeCfg[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e060d00u,                         // v_cvt_f32_u32 v3,v0
+        0x200406fau, 0xff092803u,            // exact V_MAX_F32 ROW_ROR:8
+        0x7e020302u,                         // v_mov_b32 v1,v2
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const uint32_t codeT25bRor8MovNativeCfg[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e220d00u,                         // v_cvt_f32_u32 v17,v0
+        0x7e2402fau, 0xff092811u,            // exact V_MOV_B32 ROW_ROR:8
+        0x7e020312u,                         // v_mov_b32 v1,v18
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> nativeRor8MaxCfgSpv = recompile_compute(
+        codeT25bRor8MaxNativeCfg, std::size(codeT25bRor8MaxNativeCfg),
+        &ror8BackendTable, nativeRor8Config);
+    const std::vector<uint32_t> nativeRor8MovCfgSpv = recompile_compute(
+        codeT25bRor8MovNativeCfg, std::size(codeT25bRor8MovNativeCfg),
+        &ror8BackendTable, nativeRor8Config);
+    CHECK(!nativeRor8MaxCfgSpv.empty() && !nativeRor8MovCfgSpv.empty() &&
+              count_spirv_opcode(nativeRor8MaxCfgSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MovCfgSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MaxCfgSpv, 224) == 0 &&
+              count_spirv_opcode(nativeRor8MovCfgSpv, 224) == 0,
+          "T25b-ror8-family: native CFG dispatcher lowers exact V_MAX/V_MOV to shuffles");
+    if (canExecuteNativeRor8 && !nativeRor8MaxCfgSpv.empty() &&
+        !nativeRor8MovCfgSpv.empty()) {
+        std::vector<uint32_t> nativeCfgMaxGot, nativeCfgMovGot;
+        prosper::test::run_compute(
+            nativeRor8MaxCfgSpv, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &nativeCfgMaxGot);
+        prosper::test::run_compute(
+            nativeRor8MovCfgSpv, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &nativeCfgMovGot);
+        std::vector<uint32_t> nativeCfgMaxExpected(64), nativeCfgMovExpected(64);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            nativeCfgMaxExpected[lane] = bits_of(static_cast<float>(
+                std::max(lane, lane ^ 8u)));
+            nativeCfgMovExpected[lane] = bits_of(static_cast<float>(lane ^ 8u));
+        }
+        CHECK(nativeCfgMaxGot == nativeCfgMaxExpected &&
+                  nativeCfgMovGot == nativeCfgMovExpected,
+              "T25b-ror8-family: native CFG dispatcher executes V_MAX/V_MOV semantics");
+    } else {
+        std::printf("  [skip] T25b-ror8-family native CFG execution: host contract unavailable\n");
+    }
+
+    const uint32_t unsupportedRor8[][2] = {
+        {0x1e0000fau, 0xff012800u},           // V_MIN_F32 BOUND_CTRL=0
+        {0x1e0000fau, 0xff092900u},           // V_MIN_F32 ROW_ROR:9
+        {0x1e0000fau, 0xef092800u},           // partial ROW_MASK
+        {0x1e0000fau, 0xff192800u},           // source modifier
+        {0x060000fau, 0xff092800u},           // V_ADD_F32 is outside the live family
+    };
+    for (const auto& unsupported : unsupportedRor8) {
+        const uint32_t code[] = {unsupported[0], unsupported[1], 0xbf810000u};
+        CHECK(recompile_valu(code, std::size(code), 1, 0).empty(),
+              "T25b-ror8: unsupported controls/opcodes remain fail-visible");
+    }
+
     // T25c (#1390): Plucky's second gameplay dispatch converts a permuted float after arbitrary
     // quad tables (not merely XOR swaps). Exercise its exact 0xee control: [2,3,2,3].
     const uint32_t codeT25c[] = {
@@ -8559,8 +10181,12 @@ int main() {
     CHECK(!spvA9b.empty(),
           "A9b: a real s_cmp between the mask op and the consumer re-arms SCC (recompiles)");
 
-    // A10 (#458): a fixed-offset compiler spill/fill preserves the exact per-invocation VGPR bits.
+    // A10 (#458/#2481): fixed-offset compiler spill/fill preserves exact per-invocation VGPR bits.
+    // GTA V installs both full FLAT_SCR base halves before using private scratch. Prosper's private
+    // Function-storage model absorbs that physical relocation without widening supported accesses.
     const uint32_t codeA10[] = {
+        0xb9e0f814u,              // s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s96
+        0xb9e1f815u,              // s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s97
         0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
         0x7e000280u,              // v_mov_b32 v0, 0
         0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
@@ -8574,6 +10200,28 @@ int main() {
         static_cast<uint32_t>(scratch_in.size()));
     CHECK(gotA10 == scratch_in,
           "A10: private dword spill/fill round-trips exact values for every invocation");
+    const RecompileCoverage coverageA10 = recompile_coverage(codeA10, std::size(codeA10));
+    CHECK(coverageA10.unsupported == 0,
+          "A10: full FLAT_SCR LO/HI base writes are handled by the private-scratch abstraction");
+
+    // Mutate the exact live SETREG site: another target, a 31-bit field, or a non-zero field offset
+    // must still reject. Keeping the positive HI packet also makes a LO-only admission fail the test.
+    const uint32_t flat_scr_mutated_words[] = {
+        0xb9e0f801u, // HW_REG_MODE instead of FLAT_SCR_LO
+        0xb9e0f014u, // FLAT_SCR_LO width 31 instead of 32
+        0xb9e0f854u, // FLAT_SCR_LO offset 1 instead of 0
+    };
+    bool flat_scr_mutants_reject = true;
+    for (uint32_t mutated_word : flat_scr_mutated_words) {
+        uint32_t mutant[std::size(codeA10)];
+        std::copy(std::begin(codeA10), std::end(codeA10), std::begin(mutant));
+        mutant[0] = mutated_word;
+        const RecompileCoverage coverage = recompile_coverage(mutant, std::size(mutant));
+        flat_scr_mutants_reject &= recompile_valu(
+            mutant, std::size(mutant), 1, 0).empty() && coverage.unsupported == 1;
+    }
+    CHECK(flat_scr_mutants_reject,
+          "A10: FLAT_SCR target, width, and offset same-site mutations remain fail-visible");
 
     // A11 (#458): vector forms use consecutive VGPRs while retaining one private offset range.
     const uint32_t codeA11[] = {
@@ -9117,6 +10765,43 @@ int main() {
     CHECK(phasedDppResult.size() == kPartialLaunch && phasedDppBad == 0,
           "#2481: later portable DPP phase produces exact rows and preserves padded canaries");
 
+    // The exact sibling regression for GTA V's V_MIN_F32 ROW_ROR:8. Whole-stream scratch sizing
+    // must see the later rotate even though the first phase itself needs only one plane. Convert
+    // local ID to f32 so the execution oracle is independent of subnormal flushing; in the partial
+    // final DPP16 row, FI=0 supplies zero when XOR 8 names an inactive padded invocation.
+    std::vector<uint32_t> phasedRorScratch(
+        std::begin(phasedDppScratch), std::end(phasedDppScratch));
+    phasedRorScratch[5] = 0x7E020D00u;        // v_cvt_f32_u32 v1,v0
+    phasedRorScratch[12] = 0x1E0202FAu;       // v_min_f32_dpp v1,v1,v1
+    phasedRorScratch[13] = 0xFF092801u;       //   row_ror:8 BC:1
+    const std::vector<uint32_t> phasedRorSpv = recompile_compute(
+        phasedRorScratch.data(), phasedRorScratch.size(), &partialBarrierTable,
+        partialBarrierConfig);
+    CHECK(!phasedRorSpv.empty() &&
+              spirv_has_array_length(phasedRorSpv, kPhasedDppScratchDwords),
+          "#2481: phased portable ROW_ROR pre-sizes both scratch planes");
+    std::vector<uint32_t> phasedRorInitial(kPartialLaunch, kPartialCanary), phasedRorResult;
+    if (!phasedRorSpv.empty())
+        prosper::test::run_compute(
+            phasedRorSpv, std::vector<float>(1, 0.0f), kPartialThreads, 1,
+            {}, phasedRorInitial, &phasedRorResult, 256);
+    uint32_t phasedRorBad = 0;
+    for (uint32_t lane = 0; lane < phasedRorResult.size(); ++lane) {
+        uint32_t expected = kPartialCanary;
+        if (lane < kPartialThreads) {
+            const uint32_t groupBase = lane & ~255u;
+            const uint32_t local = lane & 255u;
+            const uint32_t source = (local & ~15u) | ((local & 15u) ^ 8u);
+            const uint32_t activeInGroup = std::min(256u, kPartialThreads - groupBase);
+            const float result = source < activeInGroup
+                ? static_cast<float>(std::min(local, source)) : 0.0f;
+            expected = bits_of(result);
+        }
+        phasedRorBad += phasedRorResult[lane] != expected;
+    }
+    CHECK(phasedRorResult.size() == kPartialLaunch && phasedRorBad == 0,
+          "#2481: phased ROW_ROR executes full rows, BC1 partial rows, and padded canaries");
+
     // #2396: a CFG-dispatcher attempt that fails PART WAY THROUGH must not leave its half-written
     // dispatcher in the module. emit_cfg_state_machine writes the dispatcher loop's OpLoopMerge,
     // its OpSelectionMerge and the OpSwitch before it emits the per-case bodies, so a reject inside
@@ -9277,6 +10962,41 @@ int main() {
                 box_ok &= bits_of(output[lane]) == box_expect[component];
         }
         CHECK(box_ok, "IMAGE_BVH_INTERSECT_RAY returns the four unsorted FP32-box child hits");
+
+        // GTA V sets BOX_SORT_EN. Keep the same live instruction and node-production site, but make
+        // every child hit at a deliberately shuffled distance. The false arm proves physical order;
+        // toggling only descriptor semantics proves the production compare-swap path.
+        const float shuffled_near[4] = {4.0f, 1.0f, 3.0f, 2.0f};
+        for (uint32_t child = 0; child < 4; ++child) {
+            const uint32_t base = 4u + child * 6u;
+            box_words[base + 0] = bits_of(-1.0f);
+            box_words[base + 1] = bits_of(-1.0f);
+            box_words[base + 2] = bits_of(-5.0f + shuffled_near[child]);
+            box_words[base + 3] = bits_of(1.0f);
+            box_words[base + 4] = bits_of(1.0f);
+            box_words[base + 5] = bits_of(-4.5f + shuffled_near[child]);
+        }
+        const uint32_t physical_expect[4] = {0x100u, 0x200u, 0x300u, 0x400u};
+        const uint32_t sorted_expect[4] = {0x200u, 0x400u, 0x300u, 0x100u};
+        auto box_order_matches = [&](const uint32_t expected[4]) {
+            bool matches = true;
+            for (uint32_t component = 0; component < 4; ++component) {
+                const std::vector<uint32_t> module = recompile_valu(
+                    bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh_rt);
+                const std::vector<float> output = prosper::test::run_compute(
+                    module, bvh_inputs, lanes, lanes, box_words);
+                matches &= !module.empty() && output.size() == lanes;
+                for (uint32_t lane = 0; lane < output.size(); ++lane)
+                    matches &= bits_of(output[lane]) == expected[component];
+            }
+            return matches;
+        };
+        CHECK(box_order_matches(physical_expect),
+              "BOX_SORT_EN=0 preserves physical box-child order");
+        bvh_rt.resources[0].bvh_sort_enabled = true;
+        CHECK(box_order_matches(sorted_expect),
+              "BOX_SORT_EN=1 stably returns box children from nearest to furthest");
+        bvh_rt.resources[0].bvh_sort_enabled = false;
 
         // Make the X near edge one float ULP beyond the Y far edge. BOX_GROW=0 must miss;
         // BOX_GROW=6 expands the far edge by six 2^-24 increments and retains the child.

@@ -1205,6 +1205,85 @@ int main() {
               stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
           "compute cache separates image-atomic modules with different embedded extents");
 
+    // Qword-atomic code generation depends on the enabled device feature, exact linear descriptor
+    // proof, and dispatch-sized record count embedded in the OOB check. All three must partition the
+    // cache so one dispatch cannot lend its module or bound to a different/unproved sibling.
+    clear_shader_recompile_cache();
+    static const uint32_t kSwapX2Compute[] = {
+        0xe1402000u, 0x80000900u,
+        0xbf810000u,
+    };
+    alignas(8) uint32_t swap_x2_words[50] = {};
+    ShaderResource swap_x2_resource;
+    swap_x2_resource.cls = ResourceClass::ConstantBuffer;
+    swap_x2_resource.format = DataFormat::Uint32;
+    swap_x2_resource.num_components = 1;
+    swap_x2_resource.binding = 2;
+    swap_x2_resource.gpu_addr = reinterpret_cast<uint64_t>(swap_x2_words);
+    swap_x2_resource.size = 200;
+    swap_x2_resource.stride = 8;
+    swap_x2_resource.sgpr_base = 0;
+    swap_x2_resource.fetch_pc = 0;
+    swap_x2_resource.atomic_x2_record_count = 25;
+    ShaderResourceTable swap_x2_table;
+    swap_x2_table.resources.push_back(swap_x2_resource);
+    ComputeShaderConfig swap_x2_config;
+    swap_x2_config.local_x = 1;
+    swap_x2_config.storage_buffer_int64_atomics = true;
+    const auto swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute), &swap_x2_table, swap_x2_config);
+    ShaderResourceTable two_record_swap_x2_table = swap_x2_table;
+    two_record_swap_x2_table.resources[0].size = 16;
+    two_record_swap_x2_table.resources[0].atomic_x2_record_count = 2;
+    const auto two_record_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute),
+        &two_record_swap_x2_table, swap_x2_config);
+    ShaderResourceTable oversized_swap_x2_table = swap_x2_table;
+    oversized_swap_x2_table.resources[0].size = 0x10000008u;
+    oversized_swap_x2_table.resources[0].atomic_x2_record_count = 0x02000001u;
+    const auto oversized_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute),
+        &oversized_swap_x2_table, swap_x2_config);
+    // These retain the opaque marker but violate separate resource-side emitter gates. They run
+    // immediately after the valid warm entry: if the cache keys only the marker, each silently
+    // borrows that module without reaching the gate it mutated.
+    ShaderResourceTable wrong_size_swap_x2_table = swap_x2_table;
+    wrong_size_swap_x2_table.resources[0].size = 198;
+    const auto wrong_size_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute),
+        &wrong_size_swap_x2_table, swap_x2_config);
+    ShaderResourceTable misaligned_swap_x2_table = swap_x2_table;
+    misaligned_swap_x2_table.resources[0].gpu_addr += 4;
+    const auto misaligned_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute),
+        &misaligned_swap_x2_table, swap_x2_config);
+    ShaderResourceTable indexed_swap_x2_table = swap_x2_table;
+    indexed_swap_x2_table.resources[0].table_index_count = 1;
+    const auto indexed_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute),
+        &indexed_swap_x2_table, swap_x2_config);
+    ComputeShaderConfig no_int64_atomic = swap_x2_config;
+    no_int64_atomic.storage_buffer_int64_atomics = false;
+    const auto unsupported_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute), &swap_x2_table, no_int64_atomic);
+    ShaderResourceTable unproved_swap_x2_table = swap_x2_table;
+    unproved_swap_x2_table.resources[0].atomic_x2_record_count = 0;
+    const auto unproved_swap_x2 = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute), &unproved_swap_x2_table, swap_x2_config);
+    const auto swap_x2_again = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute), &swap_x2_table, swap_x2_config);
+    const auto two_record_swap_x2_again = recompile_compute_shader_cached(
+        kSwapX2Compute, std::size(kSwapX2Compute),
+        &two_record_swap_x2_table, swap_x2_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!swap_x2.empty() && !two_record_swap_x2.empty() && oversized_swap_x2.empty() &&
+              swap_x2 != two_record_swap_x2 && wrong_size_swap_x2.empty() &&
+              misaligned_swap_x2.empty() && indexed_swap_x2.empty() &&
+              unsupported_swap_x2.empty() && unproved_swap_x2.empty() &&
+              swap_x2_again == swap_x2 && two_record_swap_x2_again == two_record_swap_x2 &&
+              stats.misses == 4 && stats.hits == 6 && stats.entries == 4,
+          "swap_x2 cache separates record count, capability, and every admission gate");
+
     // BVH BOX_GROW is embedded as the slab-test far-edge multiplier. A descriptor change must
     // compile a distinct module even when the BVH allocation and instruction provenance match.
     clear_shader_recompile_cache();
@@ -1231,6 +1310,10 @@ int main() {
     bvh_table.resources[0].bvh_box_grow = 0;
     const auto bvh_grow_0_again = recompile_compute_shader_cached(
         kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    bvh_table.resources[0].bvh_sort_enabled = true;
+    const auto sorted_bvh = recompile_compute_shader_cached(
+        kBvhCompute, std::size(kBvhCompute), &bvh_table, bvh_config);
+    bvh_table.resources[0].bvh_sort_enabled = false;
     alignas(256) static uint32_t null_bvh_words[64] = {};
     bvh_table.resources[0].size = sizeof(null_bvh_words);
     bvh_table.resources[0].host_data = reinterpret_cast<uint8_t*>(null_bvh_words);
@@ -1245,10 +1328,11 @@ int main() {
     stats = shader_recompile_cache_stats();
     CHECK(!bvh_grow_0.empty() && !bvh_grow_6.empty() &&
               bvh_grow_0 != bvh_grow_6 && bvh_grow_0_again == bvh_grow_0 &&
+              !sorted_bvh.empty() && sorted_bvh != bvh_grow_0 &&
               !guarded_null_bvh.empty() && guarded_null_bvh != bvh_grow_0 &&
               bvh_grow_0_after_null == bvh_grow_0 &&
-              stats.misses == 3 && stats.hits == 2 && stats.entries == 3,
-          "compute cache separates BVH box growth and guarded-null lowering");
+              stats.misses == 4 && stats.hits == 2 && stats.entries == 4,
+          "compute cache separates BVH box growth, sorting, and guarded-null lowering");
 
     // Manual shadow comparison bakes the enable, compare op, filter mode, address modes, and border
     // color into SPIR-V. In particular depth_compare=false must not reuse a previously successful

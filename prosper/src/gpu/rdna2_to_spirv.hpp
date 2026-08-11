@@ -253,6 +253,10 @@ struct ComputeShaderConfig {
     // frontend. Offline callers default to the portable raw path; live execution supplies the exact
     // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
     uint32_t native_storage_format_support = 0;
+    // True only when the Vulkan device that will execute this module was created with shaderInt64
+    // and shaderBufferInt64Atomics enabled. The exact qword-atomic lowerings reject when false
+    // instead of emitting a module whose capability the device merely advertises.
+    bool storage_buffer_int64_atomics = false;
     // Use an exact typed R32_UINT storage image for R11G11B10 when the device cannot store that
     // packed float format natively. The generated shader packs/unpacks the guest word in SPIR-V,
     // avoiding the portable but much wider RGBA32_UINT CPU-conversion interchange format.
@@ -407,6 +411,12 @@ struct RecompileCoverage {
     uint32_t first_bad_pc  = 0xFFFFFFFFu; // dword offset of that instruction (-1 if none)
 };
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);
+
+// Test seam for the whole-stream liveness gate on GTA V's incomplete S_CSELECT_B64 source pair.
+// A returned PC is admitted at the select itself; later failure to materialize VCC_HI cannot make
+// this proof pass accidentally.
+std::vector<uint32_t> cselect_b64_low_only_pcs_for_test(
+    const uint32_t* code, size_t dwords);
 
 // A general (non-scratch) FLAT load resolved to a base user-SGPR pointer pair (#1171). The 64-bit
 // address VGPR pair of a `base + offset` flat access is `v[vaddr_lo_reg : vaddr_lo_reg+1]`, and the

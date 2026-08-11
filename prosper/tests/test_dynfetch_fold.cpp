@@ -1454,6 +1454,225 @@ int main() {
               built_bvh.type == 8u && built_bvh.triangle_return_mode,
           "Astro's carry/shift descriptor builder resolves the exact BVH binding");
 
+    // GTA V builds the same RTIP 1.1 descriptor from a pointer inside a mapped 16-dword object
+    // header. Both live programs enable BOX_SORT_EN. The second relocates the final descriptor from
+    // the loaded s8:s23 range into s44:s47, so a load-time snapshot alone cannot prove it.
+    astro_bvh_backing[22] = 63u; // descriptor stores count-minus-one: 64 * 64 = 4096 bytes
+    astro_bvh_backing[23] = 0u;
+    alignas(8) std::array<uint32_t, 16> gta_bvh_header{};
+    gta_bvh_header[12] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_bvh_header[13] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    const uint64_t gta_bvh_header_addr = reinterpret_cast<uint64_t>(gta_bvh_header.data());
+    auto put_words = [](std::vector<uint32_t>& code, uint32_t pc,
+                        std::initializer_list<uint32_t> words) {
+        std::copy(words.begin(), words.end(), code.begin() + pc);
+    };
+
+    std::vector<uint32_t> gta_bvh_pc1180(1186u, 0xbf800000u); // s_nop 0
+    put_words(gta_bvh_pc1180, 1107u, {0xf4100226u, 0xfa000000u});
+    put_words(gta_bvh_pc1180, 1158u, {
+        0x8715ff15u, 0x003fffffu,             // s_and_b32 s21,s21,0x003fffff
+        0x8f948314u,                          // s_lshl_b64 s[20:21],s[20:21],3
+        0xf408000au, 0xfa000058u,             // s_load_dwordx4 s[0:3],s[20:21],0x58
+        0x9490ff14u, 0x00280008u,             // s_bfe_u64 s[16:17],s[20:21],8:40
+        0xbf8cc07fu,                          // s_waitcnt
+        0x816a8100u,                          // s_add_i32 vcc_lo,s0,1
+        0x8801ff15u, 0x00080000u,             // unrelated header patch
+        0x80126ac1u,                          // s_add_u32 s18,-1,vcc_lo
+        0xbe800314u,                          // unrelated move
+        0x821380c1u,                          // s_addc_u32 s19,-1,0
+        0xbe8303ffu, 0x00016204u,             // unrelated move
+        0x876a13ffu, 0x000003ffu,             // s_and_b32 vcc_lo,0x3ff,s19
+        0xbe911d9fu,                          // s_bitset1_b32 s17,31
+        0x8813ff6au, 0x81000000u,             // s_or_b32 s19,vcc_lo,TYPE/mode
+        0xbf8c3f70u,
+        0xf1989f07u, 0x00040006u, 0x2726251cu, 0x2f2a2928u, 0x00002d2eu,
+        0xbf810000u,
+    });
+    std::array<uint32_t, 78> gta_pc1180_seed{};
+    gta_pc1180_seed[76] = static_cast<uint32_t>(gta_bvh_header_addr);
+    gta_pc1180_seed[77] = static_cast<uint32_t>(gta_bvh_header_addr >> 32);
+    std::vector<SrtUse> gta_pc1180_uses;
+    resolve_dynamic_fetch(gta_bvh_pc1180.data(), gta_bvh_pc1180.size(),
+                          gta_pc1180_seed.data(), gta_pc1180_seed.size(), 0,
+                          &gta_pc1180_uses);
+    CHECK(gta_pc1180_uses.size() == 1 && gta_pc1180_uses[0].kind == 2 &&
+              gta_pc1180_uses[0].use_pc == 1180u &&
+              decode_bvh_descriptor(gta_pc1180_uses[0].bvh4.data()).sort_enabled,
+          "GTA pc1180 publishes its exact sorted BVH descriptor");
+    ShaderResourceTable gta_pc1180_table;
+    add_compute_buffer_resources(gta_pc1180_table, gta_bvh_pc1180.data(),
+                                 gta_bvh_pc1180.size(), gta_pc1180_seed.data(),
+                                 gta_pc1180_seed.size());
+    CHECK(gta_pc1180_table.resources.size() == 1 &&
+              gta_pc1180_table.resources[0].fetch_pc == 1180u &&
+              gta_pc1180_table.resources[0].gpu_addr == astro_bvh_base &&
+              gta_pc1180_table.resources[0].size == sizeof(astro_bvh_backing) &&
+              gta_pc1180_table.resources[0].bvh_sort_enabled,
+          "GTA pc1180 materializes BOX_SORT_EN in its instruction-scoped BVH binding");
+
+    std::vector<uint32_t> gta_unproven_pc1180 = gta_bvh_pc1180;
+    gta_unproven_pc1180[1160] = 0x8f948318u; // same lshl site/value, but s24:s25 has no x16 origin
+    std::array<uint32_t, 78> gta_unproven_pc1180_seed = gta_pc1180_seed;
+    gta_unproven_pc1180_seed[24] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_unproven_pc1180_seed[25] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> gta_unproven_pc1180_uses;
+    resolve_dynamic_fetch(gta_unproven_pc1180.data(), gta_unproven_pc1180.size(),
+                          gta_unproven_pc1180_seed.data(), gta_unproven_pc1180_seed.size(), 0,
+                          &gta_unproven_pc1180_uses);
+    CHECK(gta_unproven_pc1180_uses.empty(),
+          "GTA pc1180 rejects byte-identical descriptor values from an unproven pointer origin");
+    ShaderResourceTable gta_unproven_pc1180_table;
+    add_compute_buffer_resources(gta_unproven_pc1180_table, gta_unproven_pc1180.data(),
+                                 gta_unproven_pc1180.size(),
+                                 gta_unproven_pc1180_seed.data(),
+                                 gta_unproven_pc1180_seed.size());
+    CHECK(gta_unproven_pc1180_table.resources.empty(),
+          "GTA pc1180 cannot materialize an ALU-modified historical x16 snapshot");
+
+    // The live pc1180 dispatch carries a null root in header qword s20:s21. Unlike the non-null
+    // positive above, its count dereference at pc1161 must fail; the exact scalar chain still proves
+    // that all four descriptor words derive from that one null qword. Keep the real EXEC writer and
+    // EXECZ branch, shortened only by replacing their distant merge body with NOPs.
+    alignas(8) std::array<uint32_t, 17> gta_null_bvh_header{};
+    const uint64_t gta_null_bvh_header_addr =
+        reinterpret_cast<uint64_t>(gta_null_bvh_header.data());
+    std::vector<uint32_t> gta_null_pc1180 = gta_bvh_pc1180;
+    gta_null_pc1180.resize(1489u, 0xbf800000u);
+    gta_null_pc1180[1099] = 0xbeca246au; // s_and_saveexec_b64 s[74:75],vcc
+    gta_null_pc1180[1100] = 0xbf880182u; // s_cbranch_execz pc1487
+    gta_null_pc1180[1185] = 0xbf800000u; // do not terminate before the guard merge
+    gta_null_pc1180[1487] = 0xbf800000u;
+    gta_null_pc1180[1488] = 0xbf810000u;
+    std::array<uint32_t, 78> gta_null_pc1180_seed{};
+    gta_null_pc1180_seed[76] = static_cast<uint32_t>(gta_null_bvh_header_addr);
+    gta_null_pc1180_seed[77] = static_cast<uint32_t>(gta_null_bvh_header_addr >> 32);
+    std::vector<SrtUse> gta_null_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_pc1180.data(), gta_null_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_pc1180_uses);
+    CHECK(gta_null_pc1180_uses.size() == 1 && gta_null_pc1180_uses[0].kind == 3 &&
+              gta_null_pc1180_uses[0].use_pc == 1180u,
+          "GTA pc1180 publishes its guarded x16-header null BVH use");
+    ShaderResourceTable gta_null_pc1180_table;
+    add_compute_buffer_resources(gta_null_pc1180_table, gta_null_pc1180.data(),
+                                 gta_null_pc1180.size(), gta_null_pc1180_seed.data(),
+                                 gta_null_pc1180_seed.size());
+    CHECK(gta_null_pc1180_table.resources.size() == 1 &&
+              gta_null_pc1180_table.resources[0].fetch_pc == 1180u &&
+              is_proven_null_bvh(gta_null_pc1180_table.resources[0]),
+          "GTA pc1180 materializes its guarded null root as a no-hit BVH marker");
+
+    std::vector<uint32_t> gta_null_offset_pc1180 = gta_null_pc1180;
+    gta_null_offset_pc1180[1108] = 0xfa000004u; // same x16 load, not the header-base site
+    std::vector<SrtUse> gta_null_offset_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_offset_pc1180.data(), gta_null_offset_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_offset_pc1180_uses);
+    CHECK(gta_null_offset_pc1180_uses.empty(),
+          "GTA pc1180 does not seed null provenance from a shifted x16 header load");
+
+    std::vector<uint32_t> gta_null_unproven_pc1180 = gta_null_pc1180;
+    gta_null_unproven_pc1180[1160] = 0x8f948318u; // s24:s25 is zero but not header-derived
+    std::vector<SrtUse> gta_null_unproven_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_unproven_pc1180.data(), gta_null_unproven_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_unproven_pc1180_uses);
+    CHECK(gta_null_unproven_pc1180_uses.empty(),
+          "GTA pc1180 rejects byte-identical nulls from an unproven qword");
+
+    // Each aligned zero qword receives a distinct origin. Copy one dword from each of two adjacent
+    // qwords into a nominal 64-bit operand: the shift must not collapse that splice onto one origin.
+    std::vector<uint32_t> gta_null_spliced_pc1180 = gta_null_pc1180;
+    gta_null_spliced_pc1180[1156] = 0xbe980314u; // s_mov_b32 s24,s20 (qword A low)
+    gta_null_spliced_pc1180[1157] = 0xbe990316u; // s_mov_b32 s25,s22 (qword B low)
+    gta_null_spliced_pc1180[1160] = 0x8f948318u; // consume spliced s24:s25 pair
+    std::vector<SrtUse> gta_null_spliced_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_spliced_pc1180.data(), gta_null_spliced_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_spliced_pc1180_uses);
+    CHECK(gta_null_spliced_pc1180_uses.empty(),
+          "GTA pc1180 rejects a 64-bit pair spliced from distinct header qwords");
+
+    // A conditional edge may not bypass the mapped x16 load and then enter its dependent builder.
+    // Seed the skipped path with a non-null root so accepting the linear walk as null would change
+    // guest-visible ray results, not merely attach an imprecise provenance label.
+    std::vector<uint32_t> gta_null_skipped_load_pc1180 = gta_null_pc1180;
+    gta_null_skipped_load_pc1180[1105] = 0xbf850003u; // s_cbranch_scc1 pc1109
+    std::array<uint32_t, 78> gta_null_skipped_load_seed = gta_null_pc1180_seed;
+    gta_null_skipped_load_seed[20] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_null_skipped_load_seed[21] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> gta_null_skipped_load_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_skipped_load_pc1180.data(),
+                          gta_null_skipped_load_pc1180.size(),
+                          gta_null_skipped_load_seed.data(),
+                          gta_null_skipped_load_seed.size(), 0,
+                          &gta_null_skipped_load_pc1180_uses);
+    CHECK(gta_null_skipped_load_pc1180_uses.empty(),
+          "GTA pc1180 rejects null provenance whose x16 seed does not dominate the use");
+
+    std::vector<uint32_t> gta_null_indirect_pc1180 = gta_null_pc1180;
+    gta_null_indirect_pc1180[1101] = 0xbe802000u; // s_setpc_b64 s[0:1]
+    std::vector<SrtUse> gta_null_indirect_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_indirect_pc1180.data(), gta_null_indirect_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_indirect_pc1180_uses);
+    CHECK(gta_null_indirect_pc1180_uses.empty(),
+          "GTA pc1180 rejects a null proof in a program with indirect control flow");
+
+    std::vector<uint32_t> gta_null_unguarded_pc1180 = gta_null_pc1180;
+    gta_null_unguarded_pc1180[1100] = 0xbf800000u; // remove exact EXECZ region proof
+    std::vector<SrtUse> gta_null_unguarded_pc1180_uses;
+    resolve_dynamic_fetch(gta_null_unguarded_pc1180.data(),
+                          gta_null_unguarded_pc1180.size(),
+                          gta_null_pc1180_seed.data(), gta_null_pc1180_seed.size(), 0,
+                          &gta_null_unguarded_pc1180_uses);
+    CHECK(gta_null_unguarded_pc1180_uses.empty(),
+          "GTA pc1180 keeps an unguarded x16-header null BVH fail-visible");
+
+    std::vector<uint32_t> gta_bvh_pc313(319u, 0xbf800000u); // s_nop 0
+    put_words(gta_bvh_pc313, 244u, {0xf4100203u, 0xfa000000u});
+    put_words(gta_bvh_pc313, 294u, {
+        0x8715ff15u, 0x003fffffu,             // s_and_b32 s21,s21,0x003fffff
+        0x8f888314u,                          // s_lshl_b64 s[8:9],s[20:21],3
+        0xf4080304u, 0xfa000058u,             // s_load_dwordx4 s[12:15],s[8:9],0x58
+        0xbf8cc07fu,
+        0x816a810cu,                          // s_add_i32 vcc_lo,s12,1
+        0x94acff08u, 0x00280008u,             // s_bfe_u64 s[44:45],s[8:9],8:40
+        0x802e6ac1u,                          // s_add_u32 s46,-1,vcc_lo
+        0xbe8a030eu,                          // unrelated move
+        0x822f80c1u,                          // s_addc_u32 s47,-1,0
+        0xbe891d93u,                          // unrelated bitset
+        0x876a2fffu, 0x000003ffu,             // s_and_b32 vcc_lo,0x3ff,s47
+        0xbead1d9fu,                          // s_bitset1_b32 s45,31
+        0x882fff6au, 0x81000000u,             // s_or_b32 s47,vcc_lo,TYPE/mode
+        0xbf8c3f70u,
+        0xf1989f07u, 0x000b0004u, 0x2322211bu, 0x2b262524u, 0x0000292au,
+        0xbf810000u,
+    });
+    std::array<uint32_t, 26> gta_pc313_seed{};
+    gta_pc313_seed[6] = static_cast<uint32_t>(gta_bvh_header_addr);
+    gta_pc313_seed[7] = static_cast<uint32_t>(gta_bvh_header_addr >> 32);
+    gta_pc313_seed[24] = static_cast<uint32_t>(astro_bvh_base8);
+    gta_pc313_seed[25] = static_cast<uint32_t>(astro_bvh_base8 >> 32);
+    std::vector<SrtUse> gta_pc313_uses;
+    resolve_dynamic_fetch(gta_bvh_pc313.data(), gta_bvh_pc313.size(),
+                          gta_pc313_seed.data(), gta_pc313_seed.size(), 0,
+                          &gta_pc313_uses);
+    CHECK(gta_pc313_uses.size() == 1 && gta_pc313_uses[0].kind == 2 &&
+              gta_pc313_uses[0].use_pc == 313u &&
+              decode_bvh_descriptor(gta_pc313_uses[0].bvh4.data()).sort_enabled,
+          "GTA pc313 proves the relocated sorted BVH descriptor builder");
+
+    std::vector<uint32_t> gta_unproven_pc313 = gta_bvh_pc313;
+    gta_unproven_pc313[296] = 0x8f888318u; // same lshl site, identical seed value, no x16 origin
+    std::vector<SrtUse> gta_unproven_pc313_uses;
+    resolve_dynamic_fetch(gta_unproven_pc313.data(), gta_unproven_pc313.size(),
+                          gta_pc313_seed.data(), gta_pc313_seed.size(), 0,
+                          &gta_unproven_pc313_uses);
+    CHECK(gta_unproven_pc313_uses.empty(),
+          "GTA pc313 rejects byte-identical descriptor values from an unproven pointer origin");
+
     // Astro Bot's live visibility packet consumes a direct R32_UINT T# in s[0:7]. Opcode 0x0f is
     // IMAGE_ATOMIC_SWAP, so its instruction-scoped resource must be materialized as a storage image
     // even though the packet's unused SSAMP field aliases s0.
@@ -2006,6 +2225,166 @@ int main() {
                                  &wave_offset_sbuffer_table, direct_sbuffer_config).empty(),
           "Astro wave-derived SOFFSET binds its descriptor range and recompiles dynamically");
 
+    // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
+    // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
+    // has NUM_RECORDS=0, while the positive immediate begins beyond its effective scalar bound: publish
+    // a marker for the scalar load itself, propagate four exact zero dwords, and let the exact raw-MUBUF
+    // consumer publish its own marker.
+    // These are the live scalar-load and first consumer packets (relocated to pc1/pc3 in the fixture).
+    const uint32_t zero_record_sbuffer_chain[] = {
+        0x7ed40500u,              // v_readfirstlane_b32 vcc_lo, v0 (runtime-uniform, fold-unknown)
+        0xf4280202u, 0xd4000008u, // s_buffer_load_dwordx4 s[8:11], s[4:7], vcc_lo offset:8
+        0xe0382000u, 0x80020006u, // buffer_load_dwordx4 v[0:3], v6, s[8:11], 0
+        0xbf810000u,
+    };
+    uint32_t zero_record_sbuffer_seed[8]{};
+    std::vector<SrtUse> zero_record_sbuffer_uses;
+    resolve_dynamic_fetch(zero_record_sbuffer_chain, std::size(zero_record_sbuffer_chain),
+                          zero_record_sbuffer_seed, std::size(zero_record_sbuffer_seed), 0,
+                          &zero_record_sbuffer_uses);
+    CHECK(zero_record_sbuffer_uses.size() == 2 &&
+              zero_record_sbuffer_uses[0].use_pc == 1 &&
+              zero_record_sbuffer_uses[0].zero_record_raw &&
+              zero_record_sbuffer_uses[1].use_pc == 3 &&
+              zero_record_sbuffer_uses[1].zero_record_raw &&
+              std::all_of(zero_record_sbuffer_uses[1].v4.begin(),
+                          zero_record_sbuffer_uses[1].v4.end(),
+                          [](uint32_t word) { return word == 0u; }),
+          "zero-record dynamic-SOFFSET S_BUFFER_LOAD produces an exact zero V# consumer");
+    ShaderResourceTable zero_record_sbuffer_table;
+    add_compute_buffer_resources(zero_record_sbuffer_table, zero_record_sbuffer_chain,
+                                 std::size(zero_record_sbuffer_chain), zero_record_sbuffer_seed,
+                                 std::size(zero_record_sbuffer_seed));
+    assign_convention_bindings(zero_record_sbuffer_table, 2);
+    ComputeShaderConfig zero_record_sbuffer_config;
+    zero_record_sbuffer_config.user_sgprs.assign(
+        zero_record_sbuffer_seed,
+        zero_record_sbuffer_seed + std::size(zero_record_sbuffer_seed));
+    zero_record_sbuffer_config.local_x = zero_record_sbuffer_config.local_y =
+        zero_record_sbuffer_config.local_z = 1;
+    const std::vector<uint32_t> zero_record_sbuffer_spirv = recompile_compute(
+        zero_record_sbuffer_chain, std::size(zero_record_sbuffer_chain),
+        &zero_record_sbuffer_table, zero_record_sbuffer_config);
+    const DescriptorValidationReport zero_record_sbuffer_report =
+        validate_spirv_descriptor_interface(zero_record_sbuffer_spirv,
+                                            &zero_record_sbuffer_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(zero_record_sbuffer_table.resources.size() == 2 &&
+              is_zero_record_raw_buffer(zero_record_sbuffer_table.resources[0]) &&
+              is_zero_record_raw_buffer(zero_record_sbuffer_table.resources[1]) &&
+              zero_record_sbuffer_table.by_fetch_pc(1) &&
+              zero_record_sbuffer_table.by_fetch_pc(3) &&
+              !zero_record_sbuffer_spirv.empty() && zero_record_sbuffer_report.ok() &&
+              zero_record_sbuffer_report.descriptors.empty(),
+          "production zero-record scalar-load chain recompiles without backing buffers");
+
+    // The sibling 0x413ce6d00 site uses the same shape at pc148 with different registers. Preserve
+    // its exact scalar packet and first raw consumer too, so register-specific decode drift cannot
+    // leave one program behind while the other fixture stays green.
+    const uint32_t zero_record_sbuffer_chain_6d[] = {
+        0x7ed40500u,
+        0xf4280508u, 0xd4000008u, // s_buffer_load_dwordx4 s[20:23], s[16:19], vcc_lo offset:8
+        0xe0382000u, 0x80050006u, // buffer_load_dwordx4 v[0:3], v6, s[20:23], 0
+        0xbf810000u,
+    };
+    uint32_t zero_record_sbuffer_seed_6d[20]{};
+    std::vector<SrtUse> zero_record_sbuffer_uses_6d;
+    resolve_dynamic_fetch(zero_record_sbuffer_chain_6d,
+                          std::size(zero_record_sbuffer_chain_6d),
+                          zero_record_sbuffer_seed_6d,
+                          std::size(zero_record_sbuffer_seed_6d), 0,
+                          &zero_record_sbuffer_uses_6d);
+    CHECK(zero_record_sbuffer_uses_6d.size() == 2 &&
+              zero_record_sbuffer_uses_6d[0].use_pc == 1 &&
+              zero_record_sbuffer_uses_6d[0].zero_record_raw &&
+              zero_record_sbuffer_uses_6d[1].use_pc == 3 &&
+              zero_record_sbuffer_uses_6d[1].zero_record_raw,
+          "second GTA V zero-record scalar packet reaches its exact raw consumer");
+
+    // 0x413d59600 consumes the same empty V# through x4, x1 and x16 scalar loads. These are its
+    // exact pc16/pc20/pc22 packets, relocated together after one fold-unknown VCC producer.
+    const uint32_t zero_record_sbuffer_widths[] = {
+        0x7ed40500u,
+        0xf4280b06u, 0xd4000004u, // x4  s[44:47], s[12:15], vcc_lo offset:4
+        0xf42000c6u, 0xd4000014u, // x1  s3,       s[12:15], vcc_lo offset:20
+        0xf4300706u, 0xd4000038u, // x16 s[28:43], s[12:15], vcc_lo offset:56
+        0xbf810000u,
+    };
+    uint32_t zero_record_sbuffer_width_seed[16]{};
+    ShaderResourceTable zero_record_sbuffer_width_table;
+    const std::vector<SrtUse> zero_record_sbuffer_width_uses = add_compute_buffer_resources(
+        zero_record_sbuffer_width_table, zero_record_sbuffer_widths,
+        std::size(zero_record_sbuffer_widths), zero_record_sbuffer_width_seed,
+        std::size(zero_record_sbuffer_width_seed));
+    assign_convention_bindings(zero_record_sbuffer_width_table, 2);
+    ComputeShaderConfig zero_record_sbuffer_width_config;
+    zero_record_sbuffer_width_config.user_sgprs.assign(
+        zero_record_sbuffer_width_seed,
+        zero_record_sbuffer_width_seed + std::size(zero_record_sbuffer_width_seed));
+    zero_record_sbuffer_width_config.local_x = zero_record_sbuffer_width_config.local_y =
+        zero_record_sbuffer_width_config.local_z = 1;
+    const std::vector<uint32_t> zero_record_sbuffer_width_spirv = recompile_compute(
+        zero_record_sbuffer_widths, std::size(zero_record_sbuffer_widths),
+        &zero_record_sbuffer_width_table, zero_record_sbuffer_width_config);
+    const DescriptorValidationReport zero_record_sbuffer_width_report =
+        validate_spirv_descriptor_interface(zero_record_sbuffer_width_spirv,
+                                            &zero_record_sbuffer_width_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(zero_record_sbuffer_width_uses.size() == 3 &&
+              zero_record_sbuffer_width_table.resources.size() == 3 &&
+              std::all_of(zero_record_sbuffer_width_uses.begin(),
+                          zero_record_sbuffer_width_uses.end(),
+                          [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              !zero_record_sbuffer_width_spirv.empty() &&
+              zero_record_sbuffer_width_report.ok() &&
+              zero_record_sbuffer_width_report.descriptors.empty(),
+          "GTA V zero-record x1/x4/x16 scalar loads compile to exact zeros without bindings");
+
+    // NUM_RECORDS is the production-site boundary. A null-base descriptor with one record does not
+    // make a runtime SOFFSET knowable and must not acquire either zero marker.
+    uint32_t one_record_sbuffer_seed[8]{};
+    one_record_sbuffer_seed[6] = 1u;
+    ShaderResourceTable one_record_sbuffer_table;
+    const std::vector<SrtUse> one_record_sbuffer_uses = add_compute_buffer_resources(
+        one_record_sbuffer_table, zero_record_sbuffer_chain,
+        std::size(zero_record_sbuffer_chain), one_record_sbuffer_seed,
+        std::size(one_record_sbuffer_seed));
+    ComputeShaderConfig one_record_sbuffer_config = zero_record_sbuffer_config;
+    one_record_sbuffer_config.user_sgprs.assign(
+        one_record_sbuffer_seed, one_record_sbuffer_seed + std::size(one_record_sbuffer_seed));
+    CHECK(one_record_sbuffer_table.resources.empty() &&
+              std::none_of(one_record_sbuffer_uses.begin(), one_record_sbuffer_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              recompile_compute(zero_record_sbuffer_chain,
+                                std::size(zero_record_sbuffer_chain),
+                                &one_record_sbuffer_table,
+                                one_record_sbuffer_config).empty(),
+          "base-zero one-record scalar-load chain stays unresolved");
+
+    // NUM_RECORDS=0 does not by itself make a stride-zero scalar descriptor empty: scalar SMEM uses
+    // an effective one-dword M_SIZE. With immediate zero the first dword remains in range, so the
+    // unknown SOFFSET prevents folding and neither the scalar load nor its consumer gets a marker.
+    const uint32_t zero_record_sbuffer_at_zero[] = {
+        0x7ed40500u,
+        0xf4280202u, 0xd4000000u,
+        0xe0382000u, 0x80020006u,
+        0xbf810000u,
+    };
+    ShaderResourceTable zero_record_sbuffer_at_zero_table;
+    const std::vector<SrtUse> zero_record_sbuffer_at_zero_uses = add_compute_buffer_resources(
+        zero_record_sbuffer_at_zero_table, zero_record_sbuffer_at_zero,
+        std::size(zero_record_sbuffer_at_zero), zero_record_sbuffer_seed,
+        std::size(zero_record_sbuffer_seed));
+    CHECK(zero_record_sbuffer_at_zero_table.resources.empty() &&
+              std::none_of(zero_record_sbuffer_at_zero_uses.begin(),
+                           zero_record_sbuffer_at_zero_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              recompile_compute(zero_record_sbuffer_at_zero,
+                                std::size(zero_record_sbuffer_at_zero),
+                                &zero_record_sbuffer_at_zero_table,
+                                zero_record_sbuffer_config).empty(),
+          "stride-zero zero-record scalar load at immediate zero stays unresolved");
+
     // Evergate's title PS uses a bounded PC-relative dispatch. An omitted alternative reloads the
     // same T# SGPRs that the selected arm consumes directly; a linear fold used to walk that reload
     // and attach the alternative texture to the selected image_sample's pc. Specialize the fold to
@@ -2169,6 +2548,60 @@ int main() {
                                  std::size(addr0_nonzero_record_seed));
     CHECK(addr0_nonzero_record_uses.empty() && addr0_nonzero_record_table.resources.empty(),
           "addr0 plus nonzero NUM_RECORDS stays rejected at the zero-record boundary");
+
+    // GTA V 0x413d59600 pc67 uses this exact FORMAT-load packet through the all-zero descriptor
+    // produced by its earlier zero-record scalar loads. Keep the exact pc because the marker is
+    // deliberately per-consumer; ordinary nonempty format loads remain on DynFetch's typed path.
+    std::vector<uint32_t> zero_record_format_load(70, 0x7e000000u); // v_nop padding
+    zero_record_format_load[67] = 0xe0082000u;
+    zero_record_format_load[68] = 0x8000110cu;
+    zero_record_format_load[69] = 0xbf810000u;
+    const uint32_t zero_record_format_seed[4]{};
+    ShaderResourceTable zero_record_format_table;
+    const std::vector<SrtUse> zero_record_format_uses = add_compute_buffer_resources(
+        zero_record_format_table, zero_record_format_load.data(), zero_record_format_load.size(),
+        zero_record_format_seed, std::size(zero_record_format_seed));
+    assign_convention_bindings(zero_record_format_table, 2);
+    ComputeShaderConfig zero_record_format_config;
+    zero_record_format_config.user_sgprs.assign(
+        zero_record_format_seed, zero_record_format_seed + std::size(zero_record_format_seed));
+    zero_record_format_config.local_x = zero_record_format_config.local_y =
+        zero_record_format_config.local_z = 1;
+    CHECK(zero_record_format_uses.size() == 1 &&
+              zero_record_format_uses[0].use_pc == 67 &&
+              zero_record_format_uses[0].zero_record_raw &&
+              zero_record_format_table.resources.size() == 1 &&
+              is_zero_record_raw_buffer(zero_record_format_table.resources[0]) &&
+              std::all_of(std::begin(zero_record_format_table.resources[0].swizzle),
+                          std::end(zero_record_format_table.resources[0].swizzle),
+                          [](uint32_t selector) { return selector == 0u; }) &&
+              zero_record_format_table.by_fetch_pc(67) &&
+              !recompile_compute(zero_record_format_load.data(), zero_record_format_load.size(),
+                                 &zero_record_format_table,
+                                 zero_record_format_config).empty(),
+          "exact GTA V pc67 zero-record FORMAT load lowers without a backing buffer");
+
+    uint32_t one_record_format_seed[4]{};
+    one_record_format_seed[2] = 1u;
+    ShaderResourceTable one_record_format_table;
+    const std::vector<SrtUse> one_record_format_uses = add_compute_buffer_resources(
+        one_record_format_table, zero_record_format_load.data(), zero_record_format_load.size(),
+        one_record_format_seed, std::size(one_record_format_seed));
+    CHECK(one_record_format_uses.empty() && one_record_format_table.resources.empty(),
+          "exact GTA V pc67 FORMAT load keeps base-zero one-record V# unresolved");
+
+    // SQ_SEL_1 is the other zero-record boundary: an OOB FORMAT component selected as constant one
+    // does not have an all-zero result. It must not acquire the no-backing zero marker.
+    uint32_t one_selector_format_seed[4]{};
+    one_selector_format_seed[3] = 1u; // DST_SEL_X = SQ_SEL_1
+    ShaderResourceTable one_selector_format_table;
+    const std::vector<SrtUse> one_selector_format_uses = add_compute_buffer_resources(
+        one_selector_format_table, zero_record_format_load.data(), zero_record_format_load.size(),
+        one_selector_format_seed, std::size(one_selector_format_seed));
+    CHECK(one_selector_format_table.resources.empty() &&
+              std::none_of(one_selector_format_uses.begin(), one_selector_format_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }),
+          "zero-record FORMAT load with SQ_SEL_1 stays unresolved");
 
     // Astro Bot's 7f5f world-map NGG shader patches only NUM_RECORDS in its direct s[16:19] V#
     // (`s_mov_b32 s18, 1`) before a raw buffer_load_dwordx4 at pc2761. The consumer is itself the
@@ -2862,15 +3295,173 @@ int main() {
               gta_413d884_report.descriptors.empty(),
           "GTA V 0x413d884 pc163 exact synthetic empty OR recompiles binding-free by PC");
 
-    // These encodings need distinct operands or semantics. In particular op 0x50 is GTA V's
-    // buffer_atomic_swap_x2, not a 32-bit atomic with a neighboring opcode. They must not acquire a
-    // resource merely because their descriptor is concrete; both discovery and emission stay loud.
+    // GTA V 0x413e154 pc154 rebuilds the exact BUFFER_ATOMIC_SWAP_X2 V# at pcs142-146.
+    // s13 is dispatch-dependent: the routed scene exercises 25, 2, 3, and 1 qword records.
+    alignas(8) uint32_t gta_swap_x2_backing[50] = {0x11223344u, 0x55667788u};
+    const uint64_t gta_swap_x2_base = reinterpret_cast<uint64_t>(gta_swap_x2_backing);
+    uint32_t gta_swap_x2_seed[15] = {};
+    gta_swap_x2_seed[8] = static_cast<uint32_t>(gta_swap_x2_base);
+    gta_swap_x2_seed[9] = static_cast<uint32_t>(gta_swap_x2_base >> 32);
+    gta_swap_x2_seed[13] = 25u;
+    std::vector<uint32_t> gta_swap_x2_site(154, 0xBF800000u);
+    gta_swap_x2_site[142] = 0x8801FF09u; // s_or_b32 s1, s9, 0x00080000
+    gta_swap_x2_site[143] = 0x00080000u;
+    gta_swap_x2_site[144] = 0xBE800308u; // s_mov_b32 s0, s8
+    gta_swap_x2_site[145] = 0xBE82030Du; // s_mov_b32 s2, s13
+    gta_swap_x2_site[146] = 0xBE8303FFu; // s_mov_b32 s3, 0x00016204
+    gta_swap_x2_site[147] = 0x00016204u;
+    gta_swap_x2_site.push_back(0xE1402000u);
+    gta_swap_x2_site.push_back(0x80000913u);
+    gta_swap_x2_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_swap_x2_table;
+    const std::vector<SrtUse> gta_swap_x2_uses = add_compute_buffer_resources(
+        gta_swap_x2_table, gta_swap_x2_site.data(), gta_swap_x2_site.size(),
+        gta_swap_x2_seed, std::size(gta_swap_x2_seed));
+    assign_convention_bindings(gta_swap_x2_table, 2);
+    ComputeShaderConfig gta_swap_x2_config;
+    gta_swap_x2_config.user_sgprs.assign(std::begin(gta_swap_x2_seed),
+                                          std::end(gta_swap_x2_seed));
+    gta_swap_x2_config.local_x = gta_swap_x2_config.local_y =
+        gta_swap_x2_config.local_z = 1;
+    gta_swap_x2_config.storage_buffer_int64_atomics = true;
+    const std::vector<uint32_t> gta_swap_x2_spirv = recompile_compute(
+        gta_swap_x2_site.data(), gta_swap_x2_site.size(), &gta_swap_x2_table,
+        gta_swap_x2_config);
+    const DescriptorValidationReport gta_swap_x2_report =
+        validate_spirv_descriptor_interface(gta_swap_x2_spirv, &gta_swap_x2_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(gta_swap_x2_uses.size() == 1 &&
+              gta_swap_x2_uses[0].use_pc == 154u &&
+              gta_swap_x2_uses[0].required_size == 0u &&
+              gta_swap_x2_uses[0].atomic_x2_record_count == 25u &&
+              gta_swap_x2_table.resources.size() == 1 &&
+              gta_swap_x2_table.resources[0].size == 200u &&
+              gta_swap_x2_table.resources[0].stride == 8u &&
+              gta_swap_x2_table.resources[0].fetch_pc == 154u &&
+              gta_swap_x2_table.resources[0].atomic_x2_record_count == 25u &&
+              !gta_swap_x2_spirv.empty() && gta_swap_x2_report.ok() &&
+              gta_swap_x2_report.descriptors.size() == 1 &&
+              gta_swap_x2_report.descriptors[0].required_bytes == 8u &&
+              gta_swap_x2_report.descriptors[0].readable &&
+              gta_swap_x2_report.descriptors[0].writable &&
+              gta_swap_x2_report.descriptors[0].atomic_access,
+          "GTA V 0x413e154 pc154 publishes one exact 25-record qword-atomic resource");
+    uint32_t live_sized_atomic_x2_arms = 0;
+    for (uint32_t record_count : {1u, 2u, 3u}) {
+        uint32_t live_seed[15] = {};
+        std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed), live_seed);
+        live_seed[13] = record_count;
+        ShaderResourceTable live_table;
+        const std::vector<SrtUse> live_uses = add_compute_buffer_resources(
+            live_table, gta_swap_x2_site.data(), gta_swap_x2_site.size(),
+            live_seed, std::size(live_seed));
+        live_sized_atomic_x2_arms += live_uses.size() == 1u &&
+            live_uses[0].atomic_x2_record_count == record_count &&
+            live_table.resources.size() == 1u &&
+            live_table.resources[0].atomic_x2_record_count == record_count &&
+            live_table.resources[0].size == record_count * 8u;
+    }
+    CHECK(live_sized_atomic_x2_arms == 3u,
+          "pc145 carries GTA V's live 1/2/3-record dispatch bounds into qword atomics");
+    ComputeShaderConfig gta_swap_x2_unsupported_config = gta_swap_x2_config;
+    gta_swap_x2_unsupported_config.storage_buffer_int64_atomics = false;
+    CHECK(recompile_compute(gta_swap_x2_site.data(), gta_swap_x2_site.size(),
+                            &gta_swap_x2_table, gta_swap_x2_unsupported_config).empty(),
+          "GTA V swap_x2 remains fail-visible without an enabled Vulkan int64-atomic contract");
+
+    // The same rebuilt V# reaches pc172's BUFFER_ATOMIC_OR_X2. It is the next chronological live
+    // rejection after pc154 and must publish the same semantic proof at its own consumer PC.
+    std::vector<uint32_t> gta_or_x2_site(172, 0xBF800000u);
+    std::copy_n(gta_swap_x2_site.begin(), 154, gta_or_x2_site.begin());
+    gta_or_x2_site[154] = 0xBF800000u;
+    gta_or_x2_site[155] = 0xBF800000u;
+    gta_or_x2_site.push_back(0xE1686000u);
+    gta_or_x2_site.push_back(0x80000913u);
+    gta_or_x2_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_or_x2_table;
+    const std::vector<SrtUse> gta_or_x2_uses = add_compute_buffer_resources(
+        gta_or_x2_table, gta_or_x2_site.data(), gta_or_x2_site.size(),
+        gta_swap_x2_seed, std::size(gta_swap_x2_seed));
+    CHECK(gta_or_x2_uses.size() == 1 && gta_or_x2_uses[0].use_pc == 172u &&
+              gta_or_x2_uses[0].atomic_x2_record_count == 25u &&
+              gta_or_x2_table.resources.size() == 1 &&
+              gta_or_x2_table.resources[0].size == 200u &&
+              gta_or_x2_table.resources[0].stride == 8u &&
+              gta_or_x2_table.resources[0].fetch_pc == 172u &&
+              gta_or_x2_table.resources[0].atomic_x2_record_count == 25u,
+          "GTA V 0x413e154 pc172 publishes the same exact proof for atomic_or_x2");
+
+    uint32_t rejected_atomic_x2_shapes = 0;
+    const auto atomic_x2_rejected = [&](const uint32_t user_sgprs[15], uint32_t word0,
+                                        uint32_t word1) {
+        std::vector<uint32_t> code = gta_swap_x2_site;
+        code[154] = word0;
+        code[155] = word1;
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(code.data(), code.size(), user_sgprs, 15, 0, &uses);
+        return uses.empty();
+    };
+    uint32_t mutated_swap_x2_seed[15];
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    mutated_swap_x2_seed[9] |= 4u << 16; // pc142 rebuilds stride 12 instead of 8
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        mutated_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    mutated_swap_x2_seed[13] = 0u;
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        mutated_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    gta_swap_x2_site[147] |= 1u << 28; // OOB_SELECT=1 at the exact descriptor-build site
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 28);
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402004u, 0x80000913u); // instruction offset 4
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1403000u, 0x80000913u); // OFFEN as well as IDXEN
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x00000913u); // register SOFFSET
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80400913u); // SLC
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE140A000u, 0x80000913u); // DLC
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1412000u, 0x80000913u); // LDS transfer
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    mutated_swap_x2_seed[9] |= 0x80000000u; // SWIZZLE_ENABLE
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        mutated_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] |= 1u << 23; // ADD_TID_ENABLE
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 23);
+    gta_swap_x2_site[147] |= 1u << 21; // INDEX_STRIDE
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 21);
+    gta_swap_x2_site[147] |= 1u << 24; // RESOURCE_LEVEL
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 24);
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1422000u, 0x80000913u); // reserved dword0 bit 17
+    // A separately dumped OR_X2 uses offset 24 without IDXEN; exact live proof must not spread to it.
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1680018u, 0x80000000u);
+    CHECK(rejected_atomic_x2_shapes == 15u,
+          "qword-atomic discovery rejects every unproved stride/count/OOB/address sibling shape");
+
+    // These neighboring encodings still need distinct operands or wrap/conditional semantics. They
+    // must not acquire a resource merely because their descriptor is concrete.
     const uint32_t unsupported_atomic_dw0[] = {
         0xE0C40000u, // cmp-swap
         0xE0D00000u, // csub
         0xE0F00000u, // inc
         0xE0F40000u, // dec
-        0xE1402000u, // swap_x2, exact GTA V dword 0
     };
     uint32_t unsupported_atomic_uses = 0;
     uint32_t unsupported_atomic_resources = 0;
@@ -2901,7 +3492,7 @@ int main() {
     CHECK(unsupported_atomic_uses == 0 && unsupported_atomic_resources == 0 &&
               unsupported_atomic_recompiles == 0 && unsupported_empty_atomic_uses == 0 &&
               unsupported_empty_atomic_resources == 0,
-          "unsupported cmp-swap/csub/inc/dec/x2 atomics remain fail-closed even when empty");
+          "unsupported cmp-swap/csub/inc/dec atomics remain fail-closed even when empty");
 
     // Terminator 2D supplies descriptor dwords separately, then reassembles its destination V# in
     // s[0:3] with four scalar moves immediately before format stores. This has no SRT-load tag and

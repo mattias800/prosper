@@ -816,6 +816,7 @@ struct RenderVkCtx {
     // note and not a correctness one here: our index is computed in scalar registers so it is
     // wave-uniform, and a driver waterfall over the distinct values present converges in one iteration.
     bool descriptor_indexing = false;
+    bool storage_buffer_int64_atomics = false;
     bool compute_full_subgroups = false;
     uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
     uint32_t max_compute_workgroup_subgroups = 0;
@@ -985,6 +986,8 @@ inline const RenderVkCtx& render_vk_ctx() {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
         VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+        VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
@@ -1050,6 +1053,22 @@ inline const RenderVkCtx& render_vk_ctx() {
                               (int)di_features.shaderStorageBufferArrayNonUniformIndexing,
                               (int)di_features.shaderSampledImageArrayNonUniformIndexing,
                               (int)di_features.shaderStorageImageArrayNonUniformIndexing);
+                  }
+              }
+              if (!strcmp(de[i].extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &atomic_int64_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (supported.shaderInt64 &&
+                      atomic_int64_features.shaderBufferInt64Atomics) {
+                      VkPhysicalDeviceShaderAtomicInt64Features want{
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+                      want.shaderBufferInt64Atomics = VK_TRUE;
+                      atomic_int64_features = want;
+                      atomic_int64_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &atomic_int64_features;
+                      dev_exts.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+                      r.storage_buffer_int64_atomics = true;
                   }
               }
               if (!strcmp(de[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
@@ -1153,6 +1172,8 @@ inline const RenderVkCtx& render_vk_ctx() {
             // above: `r.descriptor_indexing` is set only where the five features were actually requested at
             // device creation, never from `supported`.
             shared.descriptor_indexing = r.descriptor_indexing;
+            shared.storage_buffer_int64_atomics =
+                r.storage_buffer_int64_atomics && feats.shaderInt64;
             shared.min_compute_subgroup_size = r.min_subgroup_size;
             shared.max_compute_subgroup_size = r.max_subgroup_size;
             shared.max_compute_workgroup_subgroups = r.max_compute_workgroup_subgroups;

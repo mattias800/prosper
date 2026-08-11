@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdint>
+#include <utility>
 
 using namespace prosper::gpu;
 
@@ -123,6 +124,30 @@ int main() {
           gta_bfm.src[1].kind == OperandKind::InlineInt && gta_bfm.src[1].value == 0 &&
           gta_bfm.src[2].kind == OperandKind::None,
           "GTA V v_bfm_b32 decodes two sources and no phantom s0");
+    // GTA V exec_cs_205b658800 pc61: `v_lshlrev_b64 v[24:25], v4, 1`. The reserved SRC2 field
+    // must not surface as s0, and the shared writer inventory must retain both result halves.
+    const uint32_t gta_lshlrev_b64_words[] = {0xd6ff0018u, 0x00010304u};
+    const Rdna2Inst gta_lshlrev_b64 = rdna2_decode_one(gta_lshlrev_b64_words, 2);
+    CHECK(gta_lshlrev_b64.fmt == Rdna2Format::VOP3 &&
+          gta_lshlrev_b64.opcode == 0x2ffu && gta_lshlrev_b64.n_src == 2 &&
+          isV(gta_lshlrev_b64.dst, 24) && isV(gta_lshlrev_b64.src[0], 4) &&
+          gta_lshlrev_b64.src[1].kind == OperandKind::InlineInt &&
+          gta_lshlrev_b64.src[1].value == 1 &&
+          gta_lshlrev_b64.src[2].kind == OperandKind::None &&
+          rdna2_vgpr_write_count(gta_lshlrev_b64) == 2u &&
+          rdna2_vgpr_destination_span(gta_lshlrev_b64) == 2u,
+          "GTA V v_lshlrev_b64 decodes two sources and a two-VGPR destination");
+    // GTA V exec_cs_205b54f200 pc21, exact llvm-mc gfx1030 packet:
+    // `v_cvt_rpi_i32_f32_e32 v1, v1`. Keep the plain one-dword form distinct from the
+    // modifier encodings that the emitter intentionally leaves unsupported.
+    const uint32_t gta_cvt_rpi_words[] = {0x7e021901u};
+    const Rdna2Inst gta_cvt_rpi = rdna2_decode_one(gta_cvt_rpi_words, 1);
+    CHECK(gta_cvt_rpi.fmt == Rdna2Format::VOP1 && gta_cvt_rpi.len_dwords == 1u &&
+          gta_cvt_rpi.opcode == 0x0cu && isV(gta_cvt_rpi.dst, 1) &&
+          gta_cvt_rpi.n_src == 1u && isV(gta_cvt_rpi.src[0], 1) &&
+          !gta_cvt_rpi.has_literal && !gta_cvt_rpi.has_modifier &&
+          !gta_cvt_rpi.has_sdwa && !gta_cvt_rpi.has_dpp,
+          "GTA V v_cvt_rpi_i32_f32 decodes exact plain VOP1 operands");
     // inst7: s_load_dwordx4 s[0:3], s[4:5], 0x0 (SMEM) -> op 0x2, SDATA s0, SBASE s4 (pair), offset 0
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");
@@ -401,6 +426,69 @@ int main() {
           dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl &&
           dp.dpp_row_mask == 0xfu && dp.dpp_bank_mask == 0xfu,
           "VOP2 DPP16 ROW_SHR form retains its unbounded lane control");
+    const uint32_t gta_vmin_row_ror8[] = { 0x1e2024fau, 0xff092812u };
+    Rdna2Inst gvr = rdna2_decode_one(gta_vmin_row_ror8, 2);
+    CHECK(gvr.fmt == Rdna2Format::VOP2 && gvr.opcode == 0x0fu &&
+          gvr.len_dwords == 2u && !gvr.has_modifier && gvr.has_dpp &&
+          gvr.dpp_ctrl == 0x128u && gvr.dpp_bound_ctrl &&
+          gvr.dpp_row_mask == 0xfu && gvr.dpp_bank_mask == 0xfu &&
+          isV(gvr.dst, 16) && isV(gvr.src[0], 18) && isV(gvr.src[1], 18),
+          "GTA V V_MIN_F32 ROW_ROR:8 packet retains exact control and operands");
+    const uint32_t gta_vmin_row_ror8_v0[] = { 0x1e0000fau, 0xff092800u };
+    Rdna2Inst gvr0 = rdna2_decode_one(gta_vmin_row_ror8_v0, 2);
+    CHECK(gvr0.fmt == Rdna2Format::VOP2 && gvr0.opcode == 0x0fu &&
+          !gvr0.has_modifier && gvr0.has_dpp && gvr0.dpp_ctrl == 0x128u &&
+          gvr0.dpp_bound_ctrl && isV(gvr0.dst, 0) &&
+          isV(gvr0.src[0], 0) && isV(gvr0.src[1], 0),
+          "GTA V in-place V_MIN_F32 ROW_ROR:8 packet decodes its DPP SRC0");
+    const uint32_t gta_vmax_row_ror8[] = { 0x200406fau, 0xff092803u };
+    Rdna2Inst gvx = rdna2_decode_one(gta_vmax_row_ror8, 2);
+    CHECK(gvx.fmt == Rdna2Format::VOP2 && gvx.opcode == 0x10u &&
+          !gvx.has_modifier && gvx.has_dpp && gvx.dpp_ctrl == 0x128u &&
+          gvx.dpp_bound_ctrl && gvx.dpp_row_mask == 0xfu &&
+          gvx.dpp_bank_mask == 0xfu && isV(gvx.dst, 2) &&
+          isV(gvx.src[0], 3) && isV(gvx.src[1], 3),
+          "GTA V exact V_MAX_F32 ROW_ROR:8 packet decodes its permuted SRC0");
+    const uint32_t gta_vmov_row_ror8[] = { 0x7e2402fau, 0xff092811u };
+    Rdna2Inst gvm = rdna2_decode_one(gta_vmov_row_ror8, 2);
+    CHECK(gvm.fmt == Rdna2Format::VOP1 && gvm.opcode == 0x01u &&
+          !gvm.has_modifier && gvm.has_dpp && gvm.dpp_ctrl == 0x128u &&
+          gvm.dpp_bound_ctrl && gvm.dpp_row_mask == 0xfu &&
+          gvm.dpp_bank_mask == 0xfu && isV(gvm.dst, 18) &&
+          isV(gvm.src[0], 17) && gvm.n_src == 1u,
+          "GTA V exact V_MOV_B32 ROW_ROR:8 packet decodes its sole permuted source");
+    const std::pair<uint32_t, uint32_t> gta_vmin_row_ror8_mutants[] = {
+        {0x1c2024fau, 0xff092812u}, // different VOP2 opcode
+        {0x1e2024fau, 0xff012812u}, // BOUND_CTRL=0
+        {0x1e2024fau, 0xff092912u}, // ROW_ROR:9
+        {0x1e2024fau, 0xef092812u}, // partial ROW_MASK
+        {0x1e2024fau, 0xfe092812u}, // partial BANK_MASK
+        {0x1e2024fau, 0xff192812u}, // SRC0_NEG
+        {0x1e2024fau, 0xff0d2812u}, // FI=1
+    };
+    for (const auto& mutant : gta_vmin_row_ror8_mutants) {
+        const uint32_t words[] = {mutant.first, mutant.second};
+        Rdna2Inst rejected = rdna2_decode_one(words, 2);
+        CHECK(rejected.has_modifier && !rejected.has_dpp,
+              "GTA V ROW_ROR:8 admission rejects opcode/control/mask/modifier mutations");
+    }
+    const std::pair<uint32_t, uint32_t> gta_new_row_ror8_mutants[] = {
+        {0x200406fau, 0xff012803u}, // V_MAX_F32 BOUND_CTRL=0
+        {0x200406fau, 0xff092903u}, // V_MAX_F32 ROW_ROR:9
+        {0x200406fau, 0xef092803u}, // V_MAX_F32 partial ROW_MASK
+        {0x200406fau, 0xff192803u}, // V_MAX_F32 SRC0_NEG
+        {0x7e2402fau, 0xff012811u}, // V_MOV_B32 BOUND_CTRL=0
+        {0x7e2402fau, 0xff092911u}, // V_MOV_B32 ROW_ROR:9
+        {0x7e2402fau, 0xfe092811u}, // V_MOV_B32 partial BANK_MASK
+        {0x7e2402fau, 0xff192811u}, // V_MOV_B32 SRC0_NEG
+        {0x060406fau, 0xff092803u}, // V_ADD_F32 is outside the admitted live family
+    };
+    for (const auto& mutant : gta_new_row_ror8_mutants) {
+        const uint32_t words[] = {mutant.first, mutant.second};
+        Rdna2Inst rejected = rdna2_decode_one(words, 2);
+        CHECK(rejected.has_modifier && !rejected.has_dpp,
+              "GTA V new ROW_ROR:8 sites reject control, mask, modifier, and opcode mutations");
+    }
     const uint32_t gta_row_mask_add[] = { 0x4a2826fau, 0xaf00e414u };
     Rdna2Inst grm = rdna2_decode_one(gta_row_mask_add, 2);
     CHECK(grm.fmt == Rdna2Format::VOP2 && grm.opcode == 0x25u &&

@@ -125,8 +125,10 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             return 1;
         case Rdna2Format::VOP3:
             if (in.opcode == 0x360u) return 0; // v_readlane_b32 writes an SGPR.
-            // v_div_scale_f64 and the two integer MAD64 forms write a VGPR pair.
-            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ? 2u : 1u;
+            // v_div_scale_f64, the two integer MAD64 forms, and the 64-bit reversed left shift
+            // write a consecutive VGPR pair.
+            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ||
+                   in.opcode == 0x2ffu ? 2u : 1u;
         case Rdna2Format::DS:
             // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
             // encodings in that subset are stores or no-return atomics whose VDST field is a source.
@@ -634,11 +636,12 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
-            // V_LDEXP_F32 and V_BFM_B32 are two-source VOP3A instructions. Their reserved SRC2 bits
-            // are zero in GTA V's exact packets and therefore decode as s0 unless cleared here.
+            // V_LSHLREV_B64, V_LDEXP_F32, and V_BFM_B32 are two-source VOP3A instructions. Their
+            // reserved SRC2 bits are zero in GTA V's exact packets and therefore decode as s0 unless
+            // cleared here.
             // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
             // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (i.opcode == 0x362u || i.opcode == 0x363u) {
+            if (i.opcode == 0x2ffu || i.opcode == 0x362u || i.opcode == 0x363u) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
@@ -947,7 +950,19 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             if (src0 == 0xFAu && max_dwords >= 2 && vf != Rdna2Format::VOPC) {
                 const uint32_t d1 = code[1];
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
-                const bool modeled_ctrl = ctrl < 0x100u || (ctrl >= 0x111u && ctrl <= 0x11Fu);
+                // GTA V's screen-space compute passes use one additional exact DPP family:
+                // V_MOV_B32 / V_MIN_F32 / V_MAX_F32 ROW_ROR:8 with full masks and
+                // BOUND_CTRL=1. Keep the opcode and bound behavior in this admission predicate so
+                // other operations, rotate amounts, and BC0 remain fail-visible.
+                const uint32_t vop1_opcode = (w >> 9) & 0xffu;
+                const uint32_t vop2_opcode = (w >> 25) & 0x3fu;
+                const bool gta_row_ror8 =
+                    ctrl == 0x128u && ((d1 >> 19) & 1u) == 1u &&
+                    ((vf == Rdna2Format::VOP1 && vop1_opcode == 0x01u) ||
+                     (vf == Rdna2Format::VOP2 &&
+                      (vop2_opcode == 0x0fu || vop2_opcode == 0x10u)));
+                const bool modeled_ctrl = ctrl < 0x100u ||
+                    (ctrl >= 0x111u && ctrl <= 0x11Fu) || gta_row_ror8;
                 if (modeled_ctrl && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
                     ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;

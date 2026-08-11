@@ -55,6 +55,8 @@ inline bool recompile_captured_compute(
             replay_device->storage_image_write_without_format;
         config.native_storage_format_support = adoptable
             ? replay_device->native_storage_format_support : 0;
+        config.storage_buffer_int64_atomics = adoptable &&
+            replay_device->storage_buffer_int64_atomics;
         const bool native_multiwave = force_native_multiwave ||
             gpu::compute_shader_prefers_native_multiwave(
                 raw.words.data(), raw.words.size(), diagnostic);
