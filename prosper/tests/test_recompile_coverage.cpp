@@ -823,6 +823,43 @@ int main() {
                              compute_cfg_dispatch_ff1_b64.size(), &dispatch_rt,
                              wave64_dispatch_config).empty(),
           "the exact Wave64 dispatcher lowers GTA's saved-mask S_FF1_I32_B64 site");
+    // GTA V's exec_cs_413d88400 reaches the exact `beea147e` packet at PC336 after
+    // structured divergent loops.  Their EXEC restores are represented separately from the
+    // architectural EXEC mask, so loop-carried scalar placeholders for s126/s127 must not make
+    // the packet look like an ambiguous ordinary SGPR-pair read.
+    const uint32_t compute_structured_exec_ff1_b64[] = {
+        0x7E020283u,               //  0: v_mov_b32 v1, 3        (outer bound)
+        0x7E080284u,               //  1: v_mov_b32 v4, 4        (inner bound)
+        0xBE800380u,               //  2: s_mov_b32 s0, 0        (outer counter)
+        0x7E040280u,               //  3: v_mov_b32 v2, 0
+        0x7E060280u,               //  4: v_mov_b32 v3, 0
+        0xBE82047Eu,               //  5: s_mov_b64 s[2:3], exec (outer save)
+        0x7DA20200u,               //  6: OUTER_HDR: v_cmpx_lt_u32 s0, v1
+        0xBF88000Du,               //  7: s_cbranch_execz +13 -> 21
+        0xBE810380u,               //  8: s_mov_b32 s1, 0
+        0xBE84047Eu,               //  9: s_mov_b64 s[4:5], exec (inner save)
+        0x7DA20801u,               // 10: INNER_HDR: v_cmpx_lt_u32 s1, v4
+        0xBF880004u,               // 11: s_cbranch_execz +4 -> 16
+        0x060606FFu, 0x3D800000u,  // 12: v_add_f32 v3, 0.0625, v3
+        0x81018101u,               // 14: s_add_i32 s1, s1, 1
+        0xBF82FFFAu,               // 15: s_branch -6 -> 10
+        0xBEFE0404u,               // 16: s_mov_b64 exec, s[4:5]
+        0x060404FFu, 0x3E800000u,  // 17: v_add_f32 v2, 0.25, v2
+        0x81008100u,               // 19: s_add_i32 s0, s0, 1
+        0xBF82FFF1u,               // 20: s_branch -15 -> 6
+        0xBEFE0402u,               // 21: s_mov_b64 exec, s[2:3]
+        0xBEEA147Eu,               // 22: GTA PC336: s_ff1_i32_b64 vcc_lo, exec
+        0xBE86107Eu,               // 23: GTA PC337: s_bcnt1_i32_b64 s6, exec
+        0x8F04816Au,               // 24: s_lshl_b32 s4, vcc_lo, 1
+        0x80040604u,               // 25: s_add_u32 s4, s4, s6 (consume both results)
+        0x7E0C0204u,               // 26: v_mov_b32 v6, s4
+        0xBF8A0000u,               // 27: s_barrier forces the structured route
+        0xBF810000u,               // 28: s_endpgm
+    };
+    CHECK(!recompile_compute(compute_structured_exec_ff1_b64,
+                             std::size(compute_structured_exec_ff1_b64), nullptr,
+                             wave64_dispatch_config).empty(),
+          "GTA's exact EXEC S_FF1/S_BCNT packets survive structured loop state");
     std::vector<uint32_t> compute_cfg_dispatch_dynamic_writelane = {
         0x7E780300u,              // v_mov_b32 v60, v0
         0xBEEB0389u,              // s_mov_b32 vcc_hi, 9 (scalar data)
