@@ -423,6 +423,13 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x7e020f00u,0x34040282u,0x34060281u,0x4a060681u,0xd8340000u,0x00000302u,0xbf8a0000u,
                             0x4c0a02bfu,0x340c0a82u,0xd8d80000u,0x07000006u,0x7e000d07u,0xbf810000u};
       dump(dir, "compute_lds", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // GTA V exec_cs_413ced900 pc69: exact DS_MIN_F32 fields. Strictly validate the core-SPIR-V
+    // compare-exchange loop used in place of an unavailable portable float atomic min.
+    { const uint32_t c[] = {0x7e000280u, 0x7e120301u,
+                            0xd8340000u, 0x00000900u,
+                            0xd8480000u, 0x00000900u,
+                            0xd8d80000u, 0x00000000u, 0xbf810000u};
+      dump(dir, "compute_ds_min_f32", recompile_valu(c, std::size(c), 2, 0)); }
     // Compute MUBUF store (buffer_store_format_x).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0xe0102000u,0x80020302u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;

@@ -3631,6 +3631,99 @@ int main() {
     CHECK(got32c.size()==1 && std::fabs(got32c[0]-7.0f)<1e-3f,
           "kernel 32c LDS min/max atomics update shared memory exactly");
 
+    // GTA V exec_cs_413ced900 pc69 is the exact non-returning DS_MIN_F32 packet below. The shader
+    // initializes six LDS bounds to infinities, atomically reduces three minima and three maxima,
+    // then reads the completed box. SPIR-V 1.3 has no core float atomic min/max, so the lowering
+    // must use an integer compare-exchange loop while preserving AMD MINNUM/MAXNUM semantics.
+    auto run_ds_fminmax = [&](uint32_t atomic_word0, uint32_t atomic_word1,
+                              uint32_t initial_bits,
+                              const std::vector<uint32_t>& operand_bits,
+                              const char* compile_message) {
+        const uint32_t byte_offset = atomic_word0 & 0xffffu;
+        const uint32_t data_vgpr = (atomic_word1 >> 8u) & 0xffu;
+        std::vector<uint32_t> code = {
+            0x7e000301u | (data_vgpr << 17u),    // v_mov_b32 data0, v1 (per-lane operand)
+            0x7e000f00u,                         // v_cvt_u32_f32 v0, v0 (lane index)
+            0x7e0402ffu, initial_bits,           // v_mov_b32 v2, initial_bits
+            0x7da40080u,                         // v_cmpx_eq_u32 0, v0 (lane zero initializes)
+            0x7e000280u,                         // v_mov_b32 v0, 0
+            0xd8340000u | byte_offset, 0x00000200u, // ds_write_b32 v0, v2, matching offset
+            0xbefe04c1u,                         // s_mov_b64 exec, -1
+            0x7e000280u,                         // v_mov_b32 v0, 0 (live has no pre-atomic barrier)
+            atomic_word0, atomic_word1,          // exact live vaddr/data0 fields
+            0xbf8a0000u,                         // s_barrier
+            0xd8d80000u | byte_offset, 0x0a000000u, // ds_read_b32 v10, v0, matching offset
+            0xbf810000u,
+        };
+        std::vector<uint32_t> spv = recompile_valu(
+            code.data(), code.size(), 2, 10);
+        CHECK(!spv.empty(), compile_message);
+        CHECK(count_spirv_opcode(spv, 230) == 1 &&
+                  count_spirv_opcode(spv, 236) == 0 &&
+                  count_spirv_opcode(spv, 237) == 0,
+              "GTA DS_MIN/MAX_F32 uses one compare-exchange loop, not integer min");
+        if (spv.empty()) return std::vector<float>{};
+        std::vector<float> input(WG * 2u);
+        for (uint32_t lane = 0; lane < WG; ++lane) {
+            input[lane * 2u] = static_cast<float>(lane);
+            const uint32_t bits = operand_bits[lane % operand_bits.size()];
+            std::memcpy(&input[lane * 2u + 1u], &bits, sizeof(bits));
+        }
+        return prosper::test::run_compute(spv, input, WG, WG);
+    };
+    auto all_bits_are = [&](const std::vector<float>& values, uint32_t expected) {
+        if (values.size() != WG) return false;
+        return std::all_of(values.begin(), values.end(), [&](float value) {
+            return bits_of(value) == expected;
+        });
+    };
+
+    const std::vector<float> got32c_fmin = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7f800000u,
+        {0x7fc12345u, 0x40800000u, 0xc0600000u, 0x00000001u, 0x80000001u},
+        "recompiled GTA pc69 exact DS_MIN_F32 packet -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin, 0xc0600000u),
+          "GTA DS_MIN_F32 atomically reduces finite, NaN, and denormal operands");
+
+    const std::vector<float> got32c_fmin_zero = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x00000000u,
+        {0x00000000u, 0x80000000u, 0x7fc00001u},
+        "recompiled GTA DS_MIN_F32 signed-zero arm -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin_zero, 0x80000000u),
+          "GTA DS_MIN_F32 orders -0 below +0 and ignores a lone NaN");
+
+    const std::vector<float> got32c_fmax_zero = run_ds_fminmax(
+        0xd84c000cu, 0x00000600u, 0x80000000u,
+        {0x80000000u, 0x00000000u, 0xffc00001u},
+        "recompiled GTA pc75 adjacent DS_MAX_F32 packet -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmax_zero, 0x00000000u),
+          "GTA DS_MAX_F32 orders +0 above -0 and ignores a lone NaN");
+
+    const std::vector<float> got32c_fmin_denorm = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x00800000u, {0x00000001u, 0x00000002u},
+        "recompiled GTA DS_MIN_F32 denormal arm -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin_denorm, 0x00000001u),
+          "GTA DS_MIN_F32 retains binary32 denormal ordering independent of host float mode");
+
+    const std::vector<float> got32c_fmin_nan = run_ds_fminmax(
+        0xd8480000u, 0x00000900u, 0x7fa12345u, {0x7fc22222u, 0xffc33333u},
+        "recompiled GTA DS_MIN_F32 all-NaN arm -> SPIR-V");
+    CHECK(all_bits_are(got32c_fmin_nan, 0x7fe12345u),
+          "GTA DS_MIN_F32 quiets and preserves the resident payload when both operands are NaN");
+
+    // Encoding boundaries: the live opcode is LDS-only and has no DATA1/VDST operand. These two
+    // one-bit mutations perturb that exact production packet and must remain fail-visible.
+    const uint32_t bad_ds_fmin_gds[] = {
+        0xd84a0000u, 0x00000900u, 0xbf810000u,
+    };
+    const uint32_t bad_ds_fmin_data1[] = {
+        0xd8480000u, 0x00010900u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(bad_ds_fmin_gds, std::size(bad_ds_fmin_gds), 10, 0).empty(),
+          "GTA DS_MIN_F32 GDS mutation remains rejected");
+    CHECK(recompile_valu(bad_ds_fmin_data1, std::size(bad_ds_fmin_data1), 10, 0).empty(),
+          "GTA DS_MIN_F32 reserved DATA1 mutation remains rejected");
+
     // Plucky Squire's first-gameplay compute shaders use the non-returning DS_OR_B32 form. Seed an
     // LDS dword with 4, OR in 3 using the exact opcode-0x0a encoding, then read back 7.
     const uint32_t code32c_or[] = {
