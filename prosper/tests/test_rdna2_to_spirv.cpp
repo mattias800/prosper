@@ -7603,6 +7603,8 @@ int main() {
         codeT28d, std::size(codeT28d), 2, 1);
     CHECK(!spvT28d.empty(),
           "recompiled T28d (GTA V structured in-place DPP add) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT28d) == 16,
+          "T28d: structured row-shuffle ladder advertises its 16-lane host contract");
     std::vector<float> inT28d(128 * 2, 0.0f);
     std::vector<uint32_t> expT28d(128);
     for (uint32_t i = 0; i < 128; ++i) {
@@ -7612,13 +7614,18 @@ int main() {
         for (uint32_t lane = i & ~15u; lane <= i; ++lane)
             expT28d[i] += lane + 1u;
     }
-    const std::vector<float> gotT28d = spvT28d.empty() ? std::vector<float>{} :
-        prosper::test::run_compute(spvT28d, inT28d, 128, 128);
-    uint32_t badT28d = 0;
-    for (uint32_t i = 0; i < 128 && gotT28d.size() == 128; ++i)
-        badT28d += bits_of(gotT28d[i]) != expT28d[i];
-    CHECK(gotT28d.size() == 128 && badT28d == 0,
-          "T28d: structured {1,2,4,8} DPP ladder computes a per-row inclusive prefix sum");
+    if (can_shuffleT25b && subgroupT25b.size >= 16) {
+        const std::vector<float> gotT28d = prosper::test::run_compute(
+            spvT28d, inT28d, 128, 128);
+        uint32_t badT28d = 0;
+        for (uint32_t i = 0; i < 128 && gotT28d.size() == 128; ++i)
+            badT28d += bits_of(gotT28d[i]) != expT28d[i];
+        CHECK(gotT28d.size() == 128 && badT28d == 0,
+              "T28d: structured {1,2,4,8} DPP ladder computes a per-row inclusive prefix sum");
+    } else {
+        std::printf("  [skip] T28d architectural execution: host subgroup %u is narrower than 16\n",
+                    subgroupT25b.size);
+    }
 
     // T28e (#2481): the longer live shader carries the exact partial-row identity tail in the
     // same ordinary structured region as its ladder. Rows 1/3 add SRC1; rows 0/2 preserve VDST.
