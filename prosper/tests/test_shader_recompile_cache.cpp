@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/hle/dispatch.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -74,6 +75,14 @@ static std::filesystem::path next_stderr_capture_path() {
     return prosper_test::test_scratch_dir() /
         ("shader-recompile-stderr-" +
          std::to_string(capture_sequence.fetch_add(1, std::memory_order_relaxed)) + ".log");
+}
+
+static size_t count_occurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    for (size_t offset = 0; (offset = text.find(needle, offset)) != std::string::npos;
+         offset += needle.size())
+        ++count;
+    return count;
 }
 
 template <typename F>
@@ -685,6 +694,179 @@ int main() {
               " stage=compute program=none role=terminal\n") !=
               std::string::npos,
           "standalone compute recompilation uses an explicit neutral program identity");
+
+    // A nested guest-wave branch containing s_barrier cannot use either the compact structurizer or
+    // the synchronized CFG dispatcher. This is the exact GTA V route that used to return an empty
+    // module without a terminal line. Cache the rejection, then report two distinct live program
+    // addresses: the second compile must be a cache hit, while the final skip consequence remains
+    // attributable and once-per-address at the production reporting boundary.
+    static const uint32_t kExactWaveBarrierReject[] = {
+        0x7c020300u, // 0: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860001u, // 1: s_cbranch_vccz +1 -> pc3 (exact guest-wave branch)
+        0x7e040281u, // 2: v_mov_b32 v2, 1
+        0xbf060000u, // 3: s_cmp_eq_u32 s0, s0
+        0xbf840002u, // 4: s_cbranch_scc0 +2 -> pc7
+        0xbf8a0000u, // 5: s_barrier nested in the scalar arm
+        0x7e040282u, // 6: v_mov_b32 v2, 2
+        0xbf810000u, // 7: s_endpgm
+    };
+    static const uint32_t kPartialBarrierReject[] = {
+        0xbf8a0000u, // s_barrier
+        0xbf810000u, // s_endpgm
+    };
+    ComputeShaderConfig rejected_config;
+    rejected_config.local_x = 64;
+    rejected_config.wave_size = 64;
+    rejected_config.threads_x = 64;
+    rejected_config.threads_y = rejected_config.threads_z = 1;
+    rejected_config.exact_thread_extent = true;
+    ComputeShaderConfig partial_barrier_config = rejected_config;
+    partial_barrier_config.threads_x = 65;
+    const RecompileDiagnosticContext rejected_diagnostic_a{
+        RecompileDiagnosticStage::Compute, 0x1234567800004455ull};
+    const RecompileDiagnosticContext rejected_diagnostic_b{
+        RecompileDiagnosticStage::Compute, 0xabcdef120000dd55ull};
+    const RecompileDiagnosticContext partial_barrier_diagnostic{
+        RecompileDiagnosticStage::Compute, 0x135724680000aa55ull};
+    clear_shader_recompile_cache();
+    std::vector<uint32_t> rejected_first, rejected_cached, partial_barrier;
+    set_test_env("PROSPER_DBG", "1");
+    const CapturedStderr final_reject_capture = capture_stderr([&] {
+        rejected_first = recompile_compute_shader_cached(
+            kExactWaveBarrierReject, std::size(kExactWaveBarrierReject), nullptr,
+            rejected_config, nullptr, rejected_diagnostic_a);
+        if (rejected_first.empty())
+            (void)report_compute_recompile_skip_once(rejected_diagnostic_a);
+        rejected_cached = recompile_compute_shader_cached(
+            kExactWaveBarrierReject, std::size(kExactWaveBarrierReject), nullptr,
+            rejected_config, nullptr, rejected_diagnostic_b);
+        if (rejected_cached.empty()) {
+            (void)report_compute_recompile_skip_once(rejected_diagnostic_b);
+            (void)report_compute_recompile_skip_once(rejected_diagnostic_b);
+        }
+        partial_barrier = recompile_compute(
+            kPartialBarrierReject, std::size(kPartialBarrierReject), nullptr,
+            partial_barrier_config, partial_barrier_diagnostic);
+    });
+    set_test_env("PROSPER_DBG", nullptr);
+    stats = shader_recompile_cache_stats();
+    const std::string& final_reject_log = final_reject_capture.output;
+    std::error_code final_reject_capture_error;
+    CHECK(final_reject_capture.path.parent_path() == prosper_test::test_scratch_dir() &&
+              !std::filesystem::exists(final_reject_capture.path, final_reject_capture_error) &&
+              !final_reject_capture_error,
+          "final-reject capture uses and cleans the process-private test scratch directory");
+    CHECK(rejected_first.empty() && rejected_cached.empty() &&
+              stats.misses == 1 && stats.hits == 1,
+          "rejected compute modules retain empty results across the real shader cache boundary");
+    CHECK(count_occurrences(
+              final_reject_log,
+              "[compute-cfg-reject] reason=exact-wave-dispatcher-unsafe guest-barrier=1 "
+              "stage=compute program=0x1234567800004455 role=terminal\n") == 1 &&
+              final_reject_log.find(
+              "reason=exact-wave-dispatcher-unsafe guest-barrier=1 stage=compute "
+              "program=0xabcdef120000dd55 role=terminal") == std::string::npos,
+          "exact-wave guest-barrier rejection is terminal at the compiler site and not replayed by a cache hit");
+    CHECK(count_occurrences(
+              final_reject_log,
+              "[compute-recompile-reject] reason=empty-result dispatch-skipped") == 2 &&
+              count_occurrences(
+              final_reject_log,
+              "stage=compute program=0x1234567800004455 role=consequent\n") == 1 &&
+              count_occurrences(
+              final_reject_log,
+              "stage=compute program=0xabcdef120000dd55 role=consequent\n") == 1,
+          "live empty-result consequences cover compile misses and cache hits once per program address");
+    CHECK(partial_barrier.empty() && count_occurrences(
+              final_reject_log,
+              "[compute-recompile-reject] reason=partial-workgroup-barrier "
+              "threads=65x1x1 local=64x1x1 stage=compute "
+              "program=0x135724680000aa55 role=terminal\n") == 1,
+          "partial-workgroup barrier rejection reports its exact terminal cause and program identity");
+
+    const RecompileDiagnosticContext legacy_skip_diagnostic{
+        RecompileDiagnosticStage::Compute, 0x246813570000bb55ull};
+    const CapturedStderr legacy_skip_capture = capture_stderr([&] {
+        (void)report_compute_recompile_skip_once(legacy_skip_diagnostic);
+        (void)report_compute_recompile_skip_once(legacy_skip_diagnostic);
+    });
+    CHECK(count_occurrences(
+              legacy_skip_capture.output,
+              "[compute] skip unsupported program 0x246813570000bb55\n") == 1 &&
+              legacy_skip_capture.output.find("role=consequent") == std::string::npos,
+          "non-debug live skips preserve the legacy once-per-address diagnostic");
+
+    // The unit-level reporter checks above deliberately keep cache-hit and legacy behavior focused,
+    // but they cannot guard the executor's integration site: a live shader-recompile failure must
+    // actually call that reporter before it discards the dispatch. Register a rejected program and
+    // drive it through the complete realization boundary so deleting the production call loses this
+    // consequent even though the compiler's terminal diagnostic and the helper itself still work.
+    prosper::register_agc_hle();
+    auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+    alignas(256) static const uint32_t kLivePartialBarrierReject[] = {
+        0xbf8a0000u, // s_barrier
+        0xbf810000u, // s_endpgm
+    };
+    ShaderReg live_reject_registers[2] = {
+        {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
+        {prosper::agc::Pm4::COMPUTE_PGM_HI, 0},
+    };
+    AgcShaderHeader live_reject_header{};
+    live_reject_header.file_header = 0x34333231u;
+    live_reject_header.version = 0x18;
+    live_reject_header.sh_registers = live_reject_registers;
+    live_reject_header.shader_size = sizeof(kLivePartialBarrierReject);
+    live_reject_header.type = 0;
+    live_reject_header.num_sh_registers = 2;
+    void* registered_live_reject = nullptr;
+    const bool live_reject_registered = create_shader &&
+        create_shader(reinterpret_cast<uint64_t>(&registered_live_reject),
+                      reinterpret_cast<uint64_t>(&live_reject_header),
+                      reinterpret_cast<uint64_t>(kLivePartialBarrierReject), 0, 0, 0) == 0 &&
+        registered_live_reject == &live_reject_header;
+    CHECK(live_reject_registered,
+          "register a rejected compute program for the live realization boundary");
+
+    GpuState live_reject_state;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = live_reject_registers[0].value;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = live_reject_registers[1].value;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_X] = 64;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Y] = 1;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Z] = 1;
+    GpuState::Dispatch live_reject_dispatch;
+    live_reject_dispatch.threads_x = 65;
+    live_reject_dispatch.threads_y = live_reject_dispatch.threads_z = 1;
+    live_reject_dispatch.modifier =
+        1ull << prosper::agc::Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT;
+    live_reject_dispatch.command_order = 0x2481;
+    live_reject_dispatch.state = std::make_shared<GpuState>(live_reject_state);
+    live_reject_state.dispatches.push_back(live_reject_dispatch);
+
+    std::vector<ComputeItem> live_reject_items;
+    std::vector<OperationRealizationFailure> live_reject_failures;
+    set_test_env("PROSPER_DBG", "1");
+    const CapturedStderr live_reject_capture = capture_stderr([&] {
+        live_reject_items = realize_compute_dispatches(
+            live_reject_state, 0x2481, &live_reject_failures);
+    });
+    set_test_env("PROSPER_DBG", nullptr);
+    char live_reject_program[96];
+    std::snprintf(live_reject_program, sizeof(live_reject_program),
+                  "stage=compute program=0x%llx role=consequent\n",
+                  static_cast<unsigned long long>(
+                      reinterpret_cast<uint64_t>(kLivePartialBarrierReject)));
+    CHECK(live_reject_registered && live_reject_items.empty() &&
+              live_reject_failures.size() == 1 &&
+              live_reject_failures[0].reason == RealizationFailureReason::ShaderRecompile &&
+              live_reject_failures[0].stages.size() == 1 &&
+              live_reject_failures[0].stages[0].program_addr ==
+                  reinterpret_cast<uint64_t>(kLivePartialBarrierReject),
+          "registered rejected compute reaches the live shader-recompile failure boundary");
+    CHECK(count_occurrences(
+              live_reject_capture.output,
+              "[compute-recompile-reject] reason=empty-result dispatch-skipped") == 1 &&
+              count_occurrences(live_reject_capture.output, live_reject_program) == 1,
+          "live shader-recompile failure reports its final dispatch-skipped consequence");
 
     // A one-record 16-bit V# emits an explicit index guard and typed tail marker. Keep the cache
     // partition compact (none/u16/f16), while ensuring a wider range or the sibling conversion can

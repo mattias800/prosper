@@ -1533,6 +1533,21 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     return *spirv;
 }
 
+bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
+    static std::mutex mutex;
+    static std::set<uint64_t> logged;
+    {
+        std::lock_guard lock(mutex);
+        if (!logged.insert(diagnostic.program_address).second) return false;
+    }
+    if (std::getenv("PROSPER_DBG"))
+        log_compute_recompile_skip_diagnostic(diagnostic);
+    else
+        std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
+                     static_cast<unsigned long long>(diagnostic.program_address));
+    return true;
+}
+
 ShaderRecompileCacheStats shader_recompile_cache_stats() {
     auto& cache = shader_cache();
     std::lock_guard lock(cache.mutex);
@@ -5744,10 +5759,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                 }
             }
-            static std::set<uint64_t> logged;
-            if (logged.insert(code_addr).second) {
-                std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
-                             (unsigned long long)code_addr);
+            if (report_compute_recompile_skip_once(recompile_diagnostic)) {
                 // #2412: print the table this program was offered, next to the keys the shader looks
                 // up by. Every one of GTA V's 951 recompiler rejects is `mode=unresolved-operand`
                 // (#2416) — the lowering exists and the descriptor does not resolve — so the useful

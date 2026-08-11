@@ -445,6 +445,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
     const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr,
     RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Compute, 0});
+// Report the final live consequence once per guest program address. Returns true only for the first
+// report so the caller can keep its adjacent resource-table dump on the same distinct-address gate.
+bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic);
 SharedShaderWords recompile_vertex_chain_cached_shared(
     const uint32_t* prolog, size_t prolog_dwords,
     const uint32_t* main, size_t main_dwords,

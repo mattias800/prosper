@@ -73,6 +73,11 @@ void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
 
 } // namespace
 
+void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& diagnostic) {
+    log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "consequent",
+                             "reason=empty-result dispatch-skipped");
+}
+
 // #2319: render exactly the dwords the instruction HAS, not a fixed two.
 //
 // `words[]` is `uint32_t words[5] = {0,...}`, so a ONE-dword instruction printed as
@@ -16618,8 +16623,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // phases. Top-level wave branches use the compact structured reduction above even without
             // a guest barrier; nested wave branches still need this dispatcher. If a guest barrier
             // makes that transformation unsafe, reject rather than silently changing the branch domain.
-            if (!cfg_dispatch_safe ||
-                !emit_cfg_state_machine(b, rs, ins, safe, rt,
+            if (!cfg_dispatch_safe) {
+                log_recompile_diagnostic(
+                    b.diagnostic, "compute-cfg-reject", "terminal",
+                    "reason=exact-wave-dispatcher-unsafe guest-barrier=1");
+                return false;
+            }
+            if (!emit_cfg_state_machine(b, rs, ins, safe, rt,
                                         allow_exec_update, allow_smem, exp_fn, code, dwords))
                 return false;
             return true;
@@ -17268,7 +17278,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
     // recompiler synthesizes for wave operations. Reject this uncommon combination instead of emitting
     // a module that could deadlock or observe undefined workgroup-memory behavior.
-    if (has_partial_workgroup && b.uses_barrier) return {};
+    if (has_partial_workgroup && b.uses_barrier) {
+        log_recompile_diagnostic(
+            b.diagnostic, "compute-recompile-reject", "terminal",
+            "reason=partial-workgroup-barrier threads=%ux%ux%u local=%ux%ux%u",
+            config.threads_x, config.threads_y, config.threads_z,
+            local_x, local_y, local_z);
+        return {};
+    }
     return b.finish();
 }
 

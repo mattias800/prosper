@@ -39,6 +39,9 @@ struct RecompileDiagnosticContext {
     uint64_t program_address = 0;
 };
 
+// Emit the canonical final live compute-skip diagnostic through the recompiler's atomic formatter.
+void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& diagnostic);
+
 // A narrowly-proven compiler-generated scalar jump table. The shader loads a uniform selector from a
 // direct constant buffer, bounds it, scales it by the 64-bit table-entry size, loads a PC-relative
 // target, and reaches it with s_setpc_b64. Arbitrary indirect control flow remains unsupported: this
