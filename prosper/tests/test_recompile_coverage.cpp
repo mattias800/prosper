@@ -803,6 +803,26 @@ int main() {
                              compute_cfg_dispatch_ff1.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the complex dispatcher lowers exact Wave32 s_ff1 mask reduction to scalar data");
+    // GTA V reaches S_FF1_I32_B64 inside this same exact-wave dispatcher family.  Prefix the
+    // irreducible fixture with the live saved-VOPC packet and its scalar shift consumer: this
+    // prevents a straight-line-only implementation from claiming the terminal program fixed.
+    ComputeShaderConfig wave64_dispatch_config = wave32_dispatch_config;
+    wave64_dispatch_config.wave_size = 64;
+    wave64_dispatch_config.native_subgroup_size = 64;
+    std::vector<uint32_t> compute_cfg_dispatch_ff1_b64 = {
+        0x7E0202A8u,              // v_mov_b32 v1, 40
+        0x7D8402F9u, 0x06069000u, // v_cmp_eq_u32_sdwa s[16:17], v0, v1
+        0xBEEA1410u,              // GTA pc1486: s_ff1_i32_b64 vcc_lo, s[16:17]
+        0x8F04816Au,              // s_lshl_b32 s4, vcc_lo, 1 (scalar-data consumer)
+        0x7E040204u,              // v_mov_b32 v2, s4
+    };
+    compute_cfg_dispatch_ff1_b64.insert(
+        compute_cfg_dispatch_ff1_b64.end(), compute_cfg_dispatch,
+        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_ff1_b64.data(),
+                             compute_cfg_dispatch_ff1_b64.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "the exact Wave64 dispatcher lowers GTA's saved-mask S_FF1_I32_B64 site");
     std::vector<uint32_t> compute_cfg_dispatch_dynamic_writelane = {
         0x7E780300u,              // v_mov_b32 v60, v0
         0xBEEB0389u,              // s_mov_b32 vcc_hi, 9 (scalar data)
