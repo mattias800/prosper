@@ -1353,6 +1353,14 @@ int main() {
     CHECK(recompile_valu(inactive_read17d0.data(), inactive_read17d0.size(),
                          1, /*out_vgpr*/2).empty(),
           "EXEC-loop LDS reads reject when an intervening write can deactivate the lane");
+    std::vector<uint32_t> condition_read17d0(std::begin(code17d0), std::end(code17d0));
+    condition_read17d0[13] = 0xbefe0480u; // enter this loop with EXEC clear
+    condition_read17d0[14] = 0xd8d80000u; // move ds_read_b32 into the condition region
+    condition_read17d0[15] = 0x03000000u;
+    condition_read17d0[16] = 0xbf880002u; // s_cbranch_execz pc19 after the read
+    CHECK(recompile_valu(condition_read17d0.data(), condition_read17d0.size(),
+                         1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS reads reject before the active-lane header test");
     std::vector<uint32_t> stale17d0(std::begin(code17d0), std::end(code17d0));
     stale17d0[9] = 0x7e060280u; // v_mov_b32 v3,0: no fresh EXEC condition at the latch
     CHECK(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2).empty(),
