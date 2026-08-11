@@ -8207,13 +8207,109 @@ int main() {
     CHECK(ror8ThenAddGot.size() == 128 && ror8ThenAddBad == 0,
           "T25b-ror8: combined rotate/add phases reuse scratch without cross-matching events");
 
+    // T25b-ror8-family (#2481): the first admitted V_MIN site exposes the next two exact GTA V
+    // packets in the same reduction family. DPP transforms SRC0 only: V_MAX combines the rotated
+    // v3 with lane-local v3, while V_MOV returns the rotated v17 bits unchanged. Keep the original
+    // register numbers so decode, dispatcher discovery, and the synchronized production sites are
+    // all exercised, with plain moves used only to seed/read those registers.
+    const uint32_t codeT25bRor8Max[] = {
+        0x200406fau, 0xff092803u,            // exact pc88: v_max_f32_dpp v2,v3,v3 row_ror:8 BC:1
+        0x7e000302u,                         // v_mov_b32 v0,v2
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Max = recompile_valu(
+        codeT25bRor8Max, std::size(codeT25bRor8Max), 4, 0);
+    std::vector<float> ror8MaxInput(128 * 4, 0.0f), ror8MaxExpected(128);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const float value = (lane & 8u) ? 1000.0f - static_cast<float>(lane)
+                                        : static_cast<float>(lane);
+        ror8MaxInput[lane * 4 + 3] = value;
+    }
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8MaxExpected[lane] = std::max(
+            ror8MaxInput[((lane ^ 8u) * 4) + 3], ror8MaxInput[lane * 4 + 3]);
+    std::vector<float> ror8MaxGot;
+    if (!spvT25bRor8Max.empty())
+        ror8MaxGot = prosper::test::run_compute(
+            spvT25bRor8Max, ror8MaxInput, 128, 128);
+    CHECK(!spvT25bRor8Max.empty() && ror8MaxGot == ror8MaxExpected,
+          "T25b-ror8-family: exact GTA V V_MAX rotates SRC0 and keeps SRC1 lane-local");
+
+    const uint32_t codeT25bRor8Mov[] = {
+        0x7e220303u,                         // v_mov_b32 v17,v3
+        0x7e2402fau, 0xff092811u,            // exact pc87: v_mov_b32_dpp v18,v17 row_ror:8 BC:1
+        0x7e000312u,                         // v_mov_b32 v0,v18
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT25bRor8Mov = recompile_valu(
+        codeT25bRor8Mov, std::size(codeT25bRor8Mov), 4, 0);
+    std::vector<float> ror8MovInput(128 * 4, 0.0f), ror8MovExpected(128);
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8MovInput[lane * 4 + 3] = static_cast<float>(lane) + 0.25f;
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8MovExpected[lane] = ror8MovInput[((lane ^ 8u) * 4) + 3];
+    std::vector<float> ror8MovGot;
+    if (!spvT25bRor8Mov.empty())
+        ror8MovGot = prosper::test::run_compute(
+            spvT25bRor8Mov, ror8MovInput, 128, 128);
+    CHECK(!spvT25bRor8Mov.empty() && ror8MovGot == ror8MovExpected,
+          "T25b-ror8-family: exact GTA V V_MOV returns the bounded rotated bits unchanged");
+
+    // The game selects the native path when the device exposes exact Wave64 subgroups. Exercise
+    // both new operation arms there too; the portable tests above cannot reach emit_alu's direct
+    // shuffle path. Local ID seeds v0, and the existing resource-backed output contract stores v1.
+    const uint32_t codeT25bRor8MaxNative[] = {
+        0x7e060d00u,                         // v_cvt_f32_u32 v3,v0
+        0x200406fau, 0xff092803u,            // exact V_MAX_F32 ROW_ROR:8
+        0x7e020302u,                         // v_mov_b32 v1,v2
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const uint32_t codeT25bRor8MovNative[] = {
+        0x7e220d00u,                         // v_cvt_f32_u32 v17,v0
+        0x7e2402fau, 0xff092811u,            // exact V_MOV_B32 ROW_ROR:8
+        0x7e020312u,                         // v_mov_b32 v1,v18
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> nativeRor8MaxSpv = recompile_compute(
+        codeT25bRor8MaxNative, std::size(codeT25bRor8MaxNative),
+        &ror8BackendTable, nativeRor8Config);
+    const std::vector<uint32_t> nativeRor8MovSpv = recompile_compute(
+        codeT25bRor8MovNative, std::size(codeT25bRor8MovNative),
+        &ror8BackendTable, nativeRor8Config);
+    CHECK(!nativeRor8MaxSpv.empty() && !nativeRor8MovSpv.empty() &&
+              count_spirv_opcode(nativeRor8MaxSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MovSpv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8MaxSpv, 224) == 0 &&
+              count_spirv_opcode(nativeRor8MovSpv, 224) == 0,
+          "T25b-ror8-family: native Wave64 lowers exact V_MAX/V_MOV to direct shuffles");
+    if (canExecuteNativeRor8 && !nativeRor8MaxSpv.empty() && !nativeRor8MovSpv.empty()) {
+        std::vector<uint32_t> nativeMaxGot, nativeMovGot;
+        prosper::test::run_compute(
+            nativeRor8MaxSpv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &nativeMaxGot);
+        prosper::test::run_compute(
+            nativeRor8MovSpv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &nativeMovGot);
+        std::vector<uint32_t> nativeMaxExpected(128), nativeMovExpected(128);
+        for (uint32_t lane = 0; lane < 128; ++lane) {
+            nativeMaxExpected[lane] = bits_of(static_cast<float>(
+                std::max(lane, lane ^ 8u)));
+            nativeMovExpected[lane] = bits_of(static_cast<float>(lane ^ 8u));
+        }
+        CHECK(nativeMaxGot == nativeMaxExpected && nativeMovGot == nativeMovExpected,
+              "T25b-ror8-family: native Wave64 executes exact V_MAX/V_MOV semantics");
+    } else {
+        std::printf("  [skip] T25b-ror8-family native execution: host contract unavailable\n");
+    }
+
     const uint32_t unsupportedRor8[][2] = {
         {0x1e0000fau, 0xff012800u},           // V_MIN_F32 BOUND_CTRL=0
         {0x1e0000fau, 0xff092900u},           // V_MIN_F32 ROW_ROR:9
         {0x1e0000fau, 0xef092800u},           // partial ROW_MASK
         {0x1e0000fau, 0xff192800u},           // source modifier
-        {0x200000fau, 0xff092800u},           // V_MAX_F32
-        {0x7e0002fau, 0xff092800u},           // V_MOV_B32
+        {0x060000fau, 0xff092800u},           // V_ADD_F32 is outside the live family
     };
     for (const auto& unsupported : unsupportedRor8) {
         const uint32_t code[] = {unsupported[0], unsupported[1], 0xbf810000u};
