@@ -298,6 +298,193 @@ int main() {
                             &sampled_vcc_rt, sampled_vcc_config).empty(),
           "an MIMG sampler range overlapping VCC keeps the guarded scalar write live");
 
+    // GTA V's texture-transfer compute kernels load two adjacent eight-word T# descriptors with one
+    // immediate s_load_dwordx16. The load has one SRT offset but the halves are distinct resources,
+    // so only exact consuming-PC bindings are sound. Prove both bindings are emitted and the scalar
+    // load does not manufacture the legacy fallback constant buffer at binding 2.
+    auto x16_texture = [](uint32_t binding, uint32_t fetch_pc) {
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.format = DataFormat::Float32;
+        texture.num_components = 4;
+        texture.binding = binding;
+        texture.fetch_pc = fetch_pc;
+        texture.img_dim = 1;
+        texture.width = texture.height = 2;
+        return texture;
+    };
+    const uint32_t smem_x16_pair[] = {
+        0xf4100300u, 0xfa000000u,   // pc0: s_load_dwordx16 s[12:27], s[0:1], 0
+        0xf0800f08u, 0x01630000u,   // pc2: image_sample ..., s[12:19], s[44:47]
+        0xf0800f08u, 0x01850000u,   // pc4: image_sample ..., s[20:27], s[48:51]
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x16_pair_rt;
+    smem_x16_pair_rt.resources.push_back(x16_texture(4, 2));
+    smem_x16_pair_rt.resources.push_back(x16_texture(5, 4));
+    const std::vector<uint32_t> smem_x16_pair_spv = recompile_valu(
+        smem_x16_pair, std::size(smem_x16_pair), 2, 0, &smem_x16_pair_rt);
+    ShaderResourceTable smem_x16_pair_validation_rt = smem_x16_pair_rt;
+    for (uint32_t binding = 0; binding < 2; ++binding) {
+        ShaderResource io{};
+        io.cls = ResourceClass::VertexBuffer;
+        io.binding = binding;
+        smem_x16_pair_validation_rt.resources.push_back(io);
+    }
+    const DescriptorValidationReport smem_x16_pair_report =
+        validate_spirv_descriptor_interface(smem_x16_pair_spv,
+                                            &smem_x16_pair_validation_rt, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(!smem_x16_pair_spv.empty() && smem_x16_pair_report.ok() &&
+              find_spirv_descriptor_binding(smem_x16_pair_report, 0, 4) &&
+              find_spirv_descriptor_binding(smem_x16_pair_report, 0, 5) &&
+              !find_spirv_descriptor_binding(smem_x16_pair_report, 0, 2),
+          "x16 descriptor bundle routes its two T# halves by exact PC without fallback cbuf");
+
+    // Ordinary data use makes the x16 typeless again. Replacing that SGPR read with a descriptor-only
+    // admission would silently substitute zero for real scalar data.
+    const uint32_t smem_x16_data[] = {
+        0xf4100300u, 0xfa000000u,
+        0x7e04020cu,                 // v_mov_b32 v2, s12: ordinary data read of the loaded range
+        0xf0800f08u, 0x01630000u,
+        0xf0800f08u, 0x01850000u,
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x16_data_rt;
+    smem_x16_data_rt.resources.push_back(x16_texture(4, 3));
+    smem_x16_data_rt.resources.push_back(x16_texture(5, 5));
+    CHECK(recompile_valu(smem_x16_data, std::size(smem_x16_data), 2, 0,
+                         &smem_x16_data_rt).empty(),
+          "x16 load with an ordinary scalar/vector consumer remains fail-visible");
+
+    ShaderResourceTable smem_x16_missing_rt;
+    smem_x16_missing_rt.resources.push_back(x16_texture(4, 2));
+    CHECK(recompile_valu(smem_x16_pair, std::size(smem_x16_pair), 2, 0,
+                         &smem_x16_missing_rt).empty(),
+          "x16 bundle rejects when one MIMG consumer lacks an exact-PC resource");
+    ShaderResourceTable smem_x16_wrong_rt = smem_x16_pair_rt;
+    smem_x16_wrong_rt.resources[1].cls = ResourceClass::ConstantBuffer;
+    CHECK(recompile_valu(smem_x16_pair, std::size(smem_x16_pair), 2, 0,
+                         &smem_x16_wrong_rt).empty(),
+          "x16 bundle rejects an exact-PC resource of the wrong descriptor class");
+
+    // GTA V also issues two x16 loads, including a nonzero immediate, to form four independent T#s.
+    const uint32_t smem_x16_two_loads[] = {
+        0xf4100300u, 0xfa000040u,   // pc0: s[12:27], byte offset 0x40
+        0xf4100700u, 0xfa000000u,   // pc2: s[28:43], byte offset 0
+        0xf0800f08u, 0x01e30000u,   // pc4:  T# s[12:19], S# s[60:63]
+        0xf0800f08u, 0x01e50000u,   // pc6:  T# s[20:27]
+        0xf0800f08u, 0x01e70000u,   // pc8:  T# s[28:35]
+        0xf0800f08u, 0x01e90000u,   // pc10: T# s[36:43]
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x16_two_rt;
+    for (uint32_t i = 0; i < 4; ++i)
+        smem_x16_two_rt.resources.push_back(x16_texture(4 + i, 4 + i * 2));
+    const std::vector<uint32_t> smem_x16_two_spv = recompile_valu(
+        smem_x16_two_loads, std::size(smem_x16_two_loads), 2, 0, &smem_x16_two_rt);
+    ShaderResourceTable smem_x16_two_validation_rt = smem_x16_two_rt;
+    for (uint32_t binding = 0; binding < 2; ++binding) {
+        ShaderResource io{};
+        io.cls = ResourceClass::VertexBuffer;
+        io.binding = binding;
+        smem_x16_two_validation_rt.resources.push_back(io);
+    }
+    const DescriptorValidationReport smem_x16_two_report =
+        validate_spirv_descriptor_interface(smem_x16_two_spv,
+                                            &smem_x16_two_validation_rt, 0,
+                                            SpirvShaderStage::Compute, false);
+    bool smem_x16_four_bindings = !smem_x16_two_spv.empty() && smem_x16_two_report.ok();
+    for (uint32_t binding = 4; binding < 8; ++binding)
+        smem_x16_four_bindings &=
+            find_spirv_descriptor_binding(smem_x16_two_report, 0, binding) != nullptr;
+    CHECK(smem_x16_four_bindings &&
+              !find_spirv_descriptor_binding(smem_x16_two_report, 0, 2),
+          "nonzero-offset and two-x16 bundle routes four exact-PC textures without cbuf");
+
+    // The captured patched variant clears/replaces only T#.word3's type bits through a scalar
+    // temporary. Its first patch schedules one unrelated VOP between AND and OR; both exact
+    // resources must remain independently routed after their live descriptor words change.
+    const uint32_t smem_x16_patched[] = {
+        0xf4100300u, 0xfa000000u,
+        0x876aff17u, 0x0fffffffu,   // pc2:  s_and_b32 vcc_lo, s23, 0x0fffffff
+        0x4a080802u,                // pc4:  independent VOP scheduled inside the patch chain
+        0x8817ff6au, 0xd0000000u,   // pc5:  s_or_b32  s23, vcc_lo, 0xd0000000
+        0xf0800f08u, 0x01650000u,   // pc7:  sample T# s[20:27]
+        0x876aff0fu, 0x0fffffffu,   // pc9:  s_and_b32 vcc_lo, s15, 0x0fffffff
+        0x880fff6au, 0xd0000000u,   // pc11: s_or_b32  s15, vcc_lo, 0xd0000000
+        0xf0800f08u, 0x01830000u,   // pc13: sample T# s[12:19]
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x16_patched_rt;
+    smem_x16_patched_rt.resources.push_back(x16_texture(4, 7));
+    smem_x16_patched_rt.resources.push_back(x16_texture(5, 13));
+    const std::vector<uint32_t> smem_x16_patched_spv = recompile_valu(
+        smem_x16_patched, std::size(smem_x16_patched), 2, 0, &smem_x16_patched_rt);
+    CHECK(!smem_x16_patched_spv.empty(),
+          "x16 descriptor bundle admits the captured scheduled T#.word3 patch chain");
+
+    // The placeholder word3 makes the patch temporary provenance-only too. Any observation before
+    // that temporary is overwritten would consume zero-derived scalar data instead of guest data.
+    const uint32_t smem_x16_patched_temp_read[] = {
+        0xf4100300u, 0xfa000000u,
+        0x876aff17u, 0x0fffffffu,
+        0x4a080802u,
+        0x8817ff6au, 0xd0000000u,
+        0x7e04026au,                // pc7: v_mov_b32 v2, vcc_lo observes the patch temporary
+        0xf0800f08u, 0x01650000u,
+        0x876aff0fu, 0x0fffffffu,
+        0x880fff6au, 0xd0000000u,
+        0xf0800f08u, 0x01830000u,
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x16_patched_temp_rt;
+    smem_x16_patched_temp_rt.resources.push_back(x16_texture(4, 8));
+    smem_x16_patched_temp_rt.resources.push_back(x16_texture(5, 14));
+    CHECK(recompile_valu(smem_x16_patched_temp_read,
+                         std::size(smem_x16_patched_temp_read), 2, 0,
+                         &smem_x16_patched_temp_rt).empty(),
+          "x16 word3 patch rejects a post-join observation of its descriptor-derived temporary");
+
+    // Same gap site, two implicit data dependencies the decoded ordinary-source walk does not
+    // cover: Special253 observes the AND-produced SCC, and e32 cndmask observes VCC_LO implicitly.
+    uint32_t smem_x16_patched_scc_gap[std::size(smem_x16_patched)];
+    std::copy(std::begin(smem_x16_patched), std::end(smem_x16_patched),
+              std::begin(smem_x16_patched_scc_gap));
+    smem_x16_patched_scc_gap[4] = 0x7e0402fdu; // v_mov_b32 v2, scc
+    CHECK(recompile_valu(smem_x16_patched_scc_gap, std::size(smem_x16_patched_scc_gap),
+                         2, 0, &smem_x16_patched_rt).empty(),
+          "x16 word3 patch gap rejects an observation of the AND-produced SCC");
+    uint32_t smem_x16_patched_vcc_gap[std::size(smem_x16_patched)];
+    std::copy(std::begin(smem_x16_patched), std::end(smem_x16_patched),
+              std::begin(smem_x16_patched_vcc_gap));
+    smem_x16_patched_vcc_gap[4] = 0x02020100u; // v_cndmask_b32 v1,v0,v0,vcc (implicit VCC read)
+    CHECK(recompile_valu(smem_x16_patched_vcc_gap, std::size(smem_x16_patched_vcc_gap),
+                         2, 0, &smem_x16_patched_rt).empty(),
+          "x16 word3 patch gap rejects an implicit VCC observation of its temporary");
+
+    // M0 looks like another scalar temporary to the decoded operand walk, but DS append observes it
+    // implicitly. The admitted compiler shape uses VCC_LO exactly; broadening that register gate
+    // would therefore turn this into a silent placeholder-derived LDS allocator input.
+    const uint32_t smem_x16_patched_m0_ds[] = {
+        0xf4100300u, 0xfa000000u,
+        0x877cff17u, 0x0fffffffu,   // pc2:  s_and_b32 m0, s23, 0x0fffffff
+        0x4a080802u,
+        0x8817ff7cu, 0xd0000000u,   // pc5:  s_or_b32 s23, m0, 0xd0000000
+        0xd8f80008u, 0x03000000u,   // pc7:  ds_append v3 offset:8 implicitly observes m0
+        0xf0800f08u, 0x01650000u,   // pc9:  sample T# s[20:27]
+        0x876aff0fu, 0x0fffffffu,
+        0x880fff6au, 0xd0000000u,
+        0xf0800f08u, 0x01830000u,   // pc15: sample T# s[12:19]
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x16_patched_m0_rt;
+    smem_x16_patched_m0_rt.resources.push_back(x16_texture(4, 9));
+    smem_x16_patched_m0_rt.resources.push_back(x16_texture(5, 15));
+    CHECK(recompile_valu(smem_x16_patched_m0_ds, std::size(smem_x16_patched_m0_ds),
+                         2, 0, &smem_x16_patched_m0_rt).empty(),
+          "x16 word3 patch rejects M0 as a temporary before an implicit DS observation");
+
     // A post-merge B64 scalar write kills both VCC words before v_cndmask consumes the new mask. The
     // high-half proof must use the central scalar write-width inventory: checking only dst==R leaves
     // VCC_HI spuriously live and rejects this otherwise-structured EXECZ guard.

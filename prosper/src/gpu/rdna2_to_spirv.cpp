@@ -3417,6 +3417,12 @@ struct RegState {
     std::unordered_set<int> sreg_bool_b32;
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
+    // Immediate S_LOAD_DWORDX16 is typeless: it can be ordinary scalar data, or two adjacent
+    // eight-dword T# descriptors. The latter is admitted only after a whole-stream use proof (see
+    // proven_smem_x16_descriptor_loads). These are load PCs, not SRT keys: an x16 bundle contains
+    // two resources at one byte offset, so every consumer must retain exact-PC provenance.
+    std::unordered_set<uint32_t> smem_x16_descriptor_loads;
+    bool smem_x16_descriptor_analysis_done = false;
     uint32_t vcc = 0;
     uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
     // #2418: does this shader read SCC anywhere? A STATIC property of the decoded stream, computed
@@ -5156,6 +5162,230 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
         visit(in.sdst.value, wave32_one_word_masks &&
                               ((in.opcode >= 0x128 && in.opcode <= 0x12a) ||
                                vop3b_fresh_carry_output(in)) ? 1u : 2u);
+}
+
+// Prove the narrow S_LOAD_DWORDX16 descriptor-bundle shape used by GTA V compute kernels. A wide
+// scalar load is not intrinsically a descriptor fetch: accepting every x16 as two T#s would replace
+// real scalar data with zero placeholders. For each candidate, follow all sixteen loaded words to
+// overwrite/end and require BOTH aligned eight-word halves to be consumed as MIMG SRSRCs. Every such
+// consumer must have its own key-less exact-PC image resource; an SRT tag cannot name two descriptors
+// packed under the load's one immediate offset.
+//
+// The only scalar transformation admitted is the captured compiler's T#.word3 patch (with at most
+// one independent VOP scheduled between the two scalar operations):
+//
+//   s_and_b32 tmp, tword3, 0x0fffffff
+//   s_or_b32  tword3, tmp, 0xd0000000
+//
+// All ordinary scalar/vector reads, partial descriptor writes, samplers overlapping the bundle, and
+// scalar control flow reject the candidate. This is deliberately a use proof, not an opcode-wide
+// declaration that x16 loads are descriptors. CONFIDENCE: HIGH for the admitted shape: the front-half
+// snapshots both halves and publishes the live descriptor at each exact MIMG PC.
+bool smem_x16_patch_gap_reads_implicit_state(const Rdna2Inst& in, int temporary) {
+    // The AND's SCC is descriptor-derived until the matching OR overwrites it. Vector ALU can name
+    // SCC as the scalar source encoding even though it is outside the ordinary SGPR/special range.
+    for (uint32_t source = 0; source < in.n_src; ++source)
+        if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253)
+            return true;
+
+    // E32 cndmask and carry forms consume architectural VCC without exposing it in n_src. This is
+    // observable descriptor-derived data when the compiler chose VCC_LO as its word3 temporary.
+    return (temporary == 106 || temporary == 107) && in.fmt == Rdna2Format::VOP2 &&
+           (in.opcode == 0x01u || (in.opcode >= 0x28u && in.opcode <= 0x2au));
+}
+
+std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
+        const std::vector<Rdna2Inst>& ins, const ShaderResourceTable* rt) {
+    std::unordered_set<uint32_t> proven;
+    if (!rt || ins.empty()) return proven;
+
+    // Alternate entries would require path-sensitive lifetime/provenance joins. Keep this first
+    // admission linear: hints, waits and barriers are transparent; every real scalar branch or
+    // indirect PC transfer makes the whole candidate ineligible.
+    for (const Rdna2Inst& in : ins) {
+        if (in.is_end) continue;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
+            return proven;
+        if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) && in.opcode != 0x0au)
+            return proven;
+    }
+
+    auto scalar_operand = [](const Operand& operand) {
+        return operand.kind == OperandKind::SGPR ||
+               (operand.kind == OperandKind::Special &&
+                operand.value >= 106 && operand.value <= 124);
+    };
+    auto literal_is = [](const Rdna2Inst& in, const Operand& operand, uint32_t value) {
+        return operand.kind == OperandKind::Literal && in.literal == value;
+    };
+
+    for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
+        const Rdna2Inst& load = ins[load_index];
+        if (load.is_end || load.fmt != Rdna2Format::SMEM || load.opcode != 0x04u ||
+            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
+            load.dst.value + 15 > 105 ||
+            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
+            static_cast<int32_t>(load.literal) < 0)
+            continue;
+
+        const int base = load.dst.value;
+        uint16_t live = 0xffffu;
+        bool consumed[2] = {false, false};
+        bool valid = true;
+        auto live_overlap = [&](int first, uint32_t words) {
+            if (first < 0 || !words) return false;
+            for (uint32_t word = 0; word < words; ++word) {
+                const int relative = first + static_cast<int>(word) - base;
+                if (relative >= 0 && relative < 16 &&
+                    (live & static_cast<uint16_t>(1u << relative)))
+                    return true;
+            }
+            return false;
+        };
+        auto clear_written = [&](int first, uint32_t words) {
+            if (first < 0) return;
+            for (uint32_t word = 0; word < words; ++word) {
+                const int relative = first + static_cast<int>(word) - base;
+                if (relative >= 0 && relative < 16)
+                    live &= static_cast<uint16_t>(~(1u << relative));
+            }
+        };
+
+        for (size_t index = load_index + 1; valid && index < ins.size(); ++index) {
+            const Rdna2Inst& in = ins[index];
+            if (in.is_end) break;
+
+            // Recognize the complete word3 patch as one unit. One captured variant schedules an
+            // independent VOP between the two scalar instructions; admit that exact one-instruction
+            // gap only when it cannot observe or replace either the descriptor bundle or temporary.
+            bool patched = false;
+            if (index + 1 < ins.size() && in.fmt == Rdna2Format::SOP2 &&
+                in.opcode == 0x0eu && in.dst.kind == OperandKind::SGPR &&
+                in.src[0].kind == OperandKind::SGPR &&
+                literal_is(in, in.src[1], 0x0fffffffu)) {
+                const int descriptor_word = in.src[0].value;
+                const int half = descriptor_word == base + 3 ? 0
+                               : descriptor_word == base + 11 ? 1 : -1;
+                // The retained GTA V shape uses VCC_LO exactly. Do not generalize this to M0 or
+                // other architectural scalar registers: their implicit consumers are not all in the
+                // ordinary SGPR liveness inventory (DS observes M0 without a decoded scalar source).
+                const bool exact_patch_temporary = in.dst.value == 106;
+                size_t join_index = index + 1;
+                const Rdna2Inst& possible_gap = ins[join_index];
+                if (possible_gap.fmt != Rdna2Format::SOP2 || possible_gap.opcode != 0x10u) {
+                    bool transparent_gap = possible_gap.fmt == Rdna2Format::VOP1 ||
+                                           possible_gap.fmt == Rdna2Format::VOP2 ||
+                                           possible_gap.fmt == Rdna2Format::VOP3;
+                    if (transparent_gap &&
+                        smem_x16_patch_gap_reads_implicit_state(possible_gap, in.dst.value))
+                        transparent_gap = false;
+                    for (uint32_t source = 0;
+                         transparent_gap && source < possible_gap.n_src; ++source) {
+                        if (!scalar_operand(possible_gap.src[source])) continue;
+                        if (possible_gap.src[source].value == in.dst.value ||
+                            live_overlap(possible_gap.src[source].value, 2))
+                            transparent_gap = false;
+                    }
+                    for_each_scalar_write(possible_gap, [&](int first, uint32_t words) {
+                        if (live_overlap(first, words) ||
+                            (in.dst.value >= first &&
+                             in.dst.value < first + static_cast<int>(words)))
+                            transparent_gap = false;
+                    });
+                    if (transparent_gap) ++join_index;
+                }
+                const Rdna2Inst& join = join_index < ins.size() ? ins[join_index] : in;
+                const bool temporary_unobserved = join_index + 1 >= ins.size() ||
+                    sgpr_dead_at_merge(ins, ins[join_index + 1].pc, in.dst.value);
+                const bool exact_join = half >= 0 && exact_patch_temporary &&
+                    join_index < ins.size() && join.fmt == Rdna2Format::SOP2 &&
+                    join.opcode == 0x10u && join.dst.kind == OperandKind::SGPR &&
+                    join.dst.value == descriptor_word && scalar_operand(join.src[0]) &&
+                    join.src[0].value == in.dst.value &&
+                    literal_is(join, join.src[1], 0xd0000000u) && temporary_unobserved;
+                const uint16_t word_bit = half >= 0
+                    ? static_cast<uint16_t>(1u << (descriptor_word - base)) : 0u;
+                if (exact_join && (live & word_bit)) {
+                    patched = true;
+                    index = join_index;
+                }
+            }
+            if (patched) continue;
+
+            if (in.fmt == Rdna2Format::MIMG) {
+                const bool t_is_scalar = in.src[1].kind == OperandKind::SGPR;
+                const int half = t_is_scalar && in.src[1].value == base ? 0
+                               : t_is_scalar && in.src[1].value == base + 8 ? 1 : -1;
+                const bool touches_t = t_is_scalar && live_overlap(in.src[1].value, 8);
+                const bool touches_sampler = scalar_operand(in.src[2]) &&
+                                             live_overlap(in.src[2].value, 4);
+                if (touches_sampler) { valid = false; break; }
+                if (half >= 0) {
+                    const uint16_t half_mask = static_cast<uint16_t>(0xffu << (half * 8));
+                    const ShaderResource* resource = rt->by_fetch_pc(in.pc);
+                    const bool exact_image = resource && resource->fetch_pc == in.pc &&
+                        resource->srt_offset == 0xffffffffu &&
+                        resource->sgpr_base == 0xffffffffu &&
+                        (resource->cls == ResourceClass::Texture ||
+                         resource->cls == ResourceClass::StorageImage);
+                    if ((live & half_mask) != half_mask || !exact_image) {
+                        valid = false;
+                        break;
+                    }
+                    consumed[half] = true;
+                    continue;
+                }
+                if (touches_t) { valid = false; break; }
+            }
+
+            // Bound implicit descriptor/address reads before the generic decoded operands. These
+            // packet formats encode a base SGPR while consuming a wider range.
+            if (in.fmt == Rdna2Format::SMEM) {
+                const uint32_t base_words = in.opcode >= 0x08u ? 4u : 2u;
+                if (scalar_operand(in.src[0]) && live_overlap(in.src[0].value, base_words)) {
+                    valid = false;
+                    break;
+                }
+                if (scalar_operand(in.src[1]) && live_overlap(in.src[1].value, 1)) {
+                    valid = false;
+                    break;
+                }
+            } else if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
+                if ((in.src[1].kind == OperandKind::SGPR &&
+                     live_overlap(in.src[1].value, 4)) ||
+                    (scalar_operand(in.src[2]) && live_overlap(in.src[2].value, 1))) {
+                    valid = false;
+                    break;
+                }
+            } else {
+                for (uint32_t source = 0; source < in.n_src; ++source) {
+                    if (!scalar_operand(in.src[source])) continue;
+                    const uint32_t words =
+                        in.fmt == Rdna2Format::SOP1 ||
+                        in.fmt == Rdna2Format::SOP2 ||
+                        in.fmt == Rdna2Format::SOPC ||
+                        in.fmt == Rdna2Format::VOP3 ? 2u : 1u;
+                    if (live_overlap(in.src[source].value, words)) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) break;
+            }
+
+            // SOPK read/modify/write forms do not expose their implicit destination read through
+            // n_src. Treat every live overlap conservatively; the target descriptor bundles use no
+            // SOPK writes, so widening this is unnecessary.
+            if (in.fmt == Rdna2Format::SOPK && in.dst.kind == OperandKind::SGPR &&
+                live_overlap(in.dst.value, 1)) {
+                valid = false;
+                break;
+            }
+            for_each_scalar_write(in, clear_written);
+        }
+        if (valid && consumed[0] && consumed[1]) proven.insert(load.pc);
+    }
+    return proven;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -9884,6 +10114,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            // GTA V packs two adjacent T# descriptors into one immediate S_LOAD_DWORDX16. Admit
+            // only the load PCs certified by the whole-stream proof above. The values are resource
+            // provenance, not scalar data used by the emitted module, so placeholders are exact;
+            // unlike x4/x8, DO NOT attach the load's one SRT offset to either half. Both resources
+            // are key-less and every MIMG consumer resolves by its own fetch_pc.
+            if (rt && !cbuf_resolved && in.opcode == 0x04u &&
+                rs.smem_x16_descriptor_loads.contains(in.pc)) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0);
+                    rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                }
+                // A shared tag here aliases both halves. Keep the invariant executable so the
+                // paired-resource regression fails under a same-site tag mutation.
+                uint32_t accidental_tag = 0;
+                if (sreg_srt_range_tag(rs, in.dst.value, 8, accidental_tag) ||
+                    sreg_srt_range_tag(rs, in.dst.value + 8, 8, accidental_tag)) {
+                    ok = false;
+                }
+                return true;
+            }
             // A data load with a runtime table may retain the legacy binding-2 convention only when
             // that table actually binds a buffer there. VS/compute tables start at binding 2 and use
             // this path legitimately; PS tables start at 32, where keeping the fallback would emit an
@@ -14049,6 +14299,8 @@ bool emit_cfg_state_machine(
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
         state.sreg_input = initial.sreg_input;
+        state.smem_x16_descriptor_loads = initial.smem_x16_descriptor_loads;
+        state.smem_x16_descriptor_analysis_done = initial.smem_x16_descriptor_analysis_done;
         for (const auto& kv : vv) {
             if (dispatch != UINT32_MAX &&
                 !dispatch_vector_reads[dispatch].contains(kv.first)) continue;
@@ -15665,6 +15917,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
                // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
+    if (!rs.smem_x16_descriptor_analysis_done) {
+        rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
+        rs.smem_x16_descriptor_analysis_done = true;
+    }
     // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
     // SMEM/MUBUF/SOP1 handlers consult the proven table maps (#273/#1054).
     if (code) {

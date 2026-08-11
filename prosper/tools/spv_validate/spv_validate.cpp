@@ -317,6 +317,27 @@ int main(int argc, char** argv) {
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // Compute + immediate SMEM x16 descriptor bundle. Both eight-dword halves are independently
+    // resolved by their consuming MIMG PCs; the load's one immediate offset is not a shared key.
+    { const uint32_t c[] = {
+          0xf4100300u, 0xfa000000u,
+          0xf0800f08u, 0x01630000u,
+          0xf0800f08u, 0x01850000u,
+          0xbf810000u};
+      ShaderResourceTable rt;
+      for (uint32_t i = 0; i < 2; ++i) {
+          ShaderResource t{};
+          t.cls = ResourceClass::Texture;
+          t.format = DataFormat::Float32;
+          t.num_components = 4;
+          t.binding = 4 + i;
+          t.fetch_pc = 2 + i * 2;
+          t.img_dim = 1;
+          t.width = t.height = 2;
+          rt.resources.push_back(t);
+      }
+      dump(dir, "compute_smem_x16_descriptor_bundle",
+           recompile_valu(c, sizeof(c)/4, 2, 0, &rt)); }
     // Compute private spill/fill, including a signed short crossing a dword boundary.
     { const uint32_t c[] = {0x7e0002ffu,0x00008001u,0xdc684003u,0x00000000u,0x7e000280u,
                             0xdc2c4003u,0x00000000u,0x7e000b00u,0xBF810000u};
