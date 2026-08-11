@@ -37,13 +37,17 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   submits continuously on Windows after the `%fs`/`%gs` null-read fix (#2447).
 - **Current graphics frontier:** GTA V's six-stage runtime-selected descriptor-array lift is complete. Live
   post-lift evidence on Linux/RADV and Windows/NVIDIA shows that the missing 3D world is not waiting on that lift.
-  The first routed terminal-program census on Linux found 53 static compute failures; reviewed Wave32 carry,
-  zero-record RAW-buffer and DPP-row lowering advances every targeted site and reduces that set to 49, but gameplay
-  still presents the HUD/radar over a fully black 3D world (#2412/#2481). The earlier "about 57 CFG sites" framing
-  overstated the independent control-flow work: `structured emission stopped` is a consequent wrapper, and most
-  `backward else` reports precede a later instruction, mask-domain or resource failure. Native subgroup adoption is
-  also a per-dispatch contract, not merely a device width: a quarter of routed wave64 compute dispatches on a
-  64-wide RADV device decline it because of workgroup shape (#2429).
+  The first routed terminal-program census on Linux found 53 static compute failures. Reviewed Wave32 carry,
+  zero-record RAW-buffer, full DPP add, VCC-mask/deadness, VOP3B arity, guest-coherence, FFBH, V_ALIGNBYTE,
+  V_LDEXP_F32 and subword-BFREV work reduces the same routed set to 35. The latest four-program recovery is
+  nevertheless a byte-identical visual negative (`crc=16af853b`): gameplay still presents the HUD/radar over a
+  fully black 3D world (#2412/#2481). The earlier "about 57 CFG sites" framing overstated the independent
+  control-flow work: `structured emission stopped` is a consequent wrapper, and most `backward else` reports
+  precede a later instruction, mask-domain or resource failure. Bare recompiler diagnostics can interleave, so
+  attribute a terminal only when the packet is present in that program's retained binary or the diagnostic carries
+  the program address; log adjacency is not evidence. Native subgroup adoption is also a per-dispatch contract,
+  not merely a device width: a quarter of routed wave64 compute dispatches on a 64-wide RADV device decline it
+  because of workgroup shape (#2429).
 - **Current Windows frontier:** routed Dragon Quest VII progression can fail a fixed `sceKernelBatchMap` with
   ENOMEM. UE4 then deliberately enters `LowLevelFatalError`; the resulting exit 139 is not a wild-pointer crash.
   The high-volume memory logger suppresses the timing-sensitive failure, so diagnosis is being carried on the

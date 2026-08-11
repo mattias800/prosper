@@ -84,11 +84,15 @@ SPIR-V declaration/indexing, pool/layout/write arity and pipeline-cache identity
 
 The remaining work is data-driven rather than one old percentage: unsupported instructions and
 unprovable resource/operand paths fail visibly, and `recompile_coverage`, live reject diagnostics and
-`shader_inspect` identify the next exact program counter. GTA V is tracked by routed terminal program
-address + instruction PC with the real resource table, not by raw structurizer line counts: the
+resource-bearing live/replay captures identify the next exact program counter. A raw `shader_inspect`
+dump is useful for proving that an instruction packet exists, but table-dependent rejection remains
+unattributable without the real resource table. GTA V is tracked by routed terminal program address +
+instruction PC, not by raw structurizer line counts or adjacency in an interleaved stderr stream: the
 `structured emission stopped` family is consequent, and most `backward else` reports are secondary to
-later instruction, mask-domain or resource failures. Post-lift Wave32 carry, zero-record RAW-buffer and
-DPP-row fixes advance their exact targets while the gameplay 3D world remains black (#2481). See
+later instruction, mask-domain or resource failures. Post-lift Wave32 carry, zero-record RAW-buffer,
+full DPP add, VCC-mask/deadness, guest-coherence, FFBH, V_ALIGNBYTE, V_LDEXP_F32 and subword-BFREV
+fixes reduce the routed terminal-program set from 53 to 35 while the gameplay 3D world remains black
+(#2481). See
 `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md` and
 `docs/RECOMPILER_REMAINING.md`, including each document's `## Ruled out` section, before extending
 the translator.
