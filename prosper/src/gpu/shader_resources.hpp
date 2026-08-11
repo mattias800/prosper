@@ -375,6 +375,12 @@ struct ShaderResource {
     // later operation consumes the same version. Production tables leave both fields zero and use guest memory.
     uint8_t*       host_data        = nullptr;
     uint64_t       host_data_size   = 0;
+
+    // Instruction-scoped record-count proof for GTA V's exact linear stride-8 qword-atomic V#. Appended
+    // after the historical aggregate-initialized fields so positional test fixtures remain stable.
+    // OOB_SELECT is not otherwise retained by this normalized resource, so emission, cache identity,
+    // capture, and per-dispatch revalidation carry the proof explicitly.
+    uint32_t       atomic_x2_record_count = 0;
 };
 
 // A one-layer guest 2D-array descriptor is byte-identical to an ordinary 2D image, and some guest

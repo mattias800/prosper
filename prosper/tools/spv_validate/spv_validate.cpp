@@ -461,6 +461,23 @@ int main(int argc, char** argv) {
       ShaderResource poll=publish; poll.binding=6; poll.fetch_pc=6; rt.resources.push_back(poll);
       ComputeShaderConfig cfg; cfg.local_x=64; cfg.wave_size=64;
       dump(dir, "compute_coherent_alias", recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
+    // GTA V's exact qword-atomic resource uses same-binding u32/u64 aliased Block variables. Validate
+    // both RMW opcodes strictly: driver acceptance alone does not prove the duplicate binding, u64
+    // AccessChain, capability, or atomic result type is legal Vulkan SPIR-V.
+    { const uint32_t swap[] = {0xe0302000u,0x80000013u,
+                               0xe1402000u,0x80000913u,0xbf810000u};
+      const uint32_t bit_or[] = {0xe0302000u,0x80000013u,
+                                 0xe1686000u,0x80000913u,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource atomic{};
+      atomic.cls=ResourceClass::ConstantBuffer; atomic.format=DataFormat::Uint32;
+      atomic.num_components=1; atomic.binding=2; atomic.gpu_addr=0x2000;
+      atomic.size=200; atomic.stride=8; atomic.sgpr_base=0; atomic.fetch_pc=2;
+      atomic.atomic_x2_record_count=25; rt.resources.push_back(atomic);
+      ComputeShaderConfig cfg; cfg.local_x=1; cfg.storage_buffer_int64_atomics=true;
+      dump(dir, "compute_atomic_swap_x2",
+           recompile_compute(swap, std::size(swap), &rt, cfg));
+      dump(dir, "compute_atomic_or_x2",
+           recompile_compute(bit_or, std::size(bit_or), &rt, cfg)); }
     // Astro Bot exact raw buffer_store_dwordx3 packet.
     { const uint32_t c[] = {0x7e140f00u,0x7e060281u,0x7e080282u,0x7e0a0283u,
                             0xe07c2000u,0x8004030au,0xbf810000u};

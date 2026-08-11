@@ -288,6 +288,7 @@ struct ShaderResourceCompileKey {
     uint32_t binding = 0;
     uint32_t stride = 0;
     uint32_t one_record_tail_semantic = 0;
+    uint32_t atomic_x2_record_count = 0;
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
@@ -336,6 +337,7 @@ struct ShaderCompileKey {
     uint32_t compute_lds_bytes = 0;
     uint32_t compute_native_subgroup_size = 0;
     uint32_t compute_native_storage_format_support = 0;
+    bool compute_storage_buffer_int64_atomics = false;
     bool compute_packed_r11_storage = true;
     uint32_t vertex_lds_dwords = 0;
     uint32_t vertices_per_instance = 0;
@@ -386,6 +388,8 @@ struct ShaderCompileKey {
                compute_native_subgroup_size == other.compute_native_subgroup_size &&
                compute_native_storage_format_support ==
                    other.compute_native_storage_format_support &&
+               compute_storage_buffer_int64_atomics ==
+                   other.compute_storage_buffer_int64_atomics &&
                compute_packed_r11_storage == other.compute_packed_r11_storage &&
                vertex_lds_dwords == other.vertex_lds_dwords &&
                vertices_per_instance == other.vertices_per_instance &&
@@ -449,6 +453,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_lds_bytes);
             hash = hash_mix(hash, key.compute_native_subgroup_size);
             hash = hash_mix(hash, key.compute_native_storage_format_support);
+            hash = hash_mix(hash, key.compute_storage_buffer_int64_atomics);
             hash = hash_mix(hash, key.compute_packed_r11_storage);
         }
         hash = hash_mix(hash, key.vertex_lds_dwords);
@@ -474,6 +479,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.binding);
             hash = hash_mix(hash, resource.stride);
             hash = hash_mix(hash, resource.one_record_tail_semantic);
+            hash = hash_mix(hash, resource.atomic_x2_record_count);
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
@@ -1112,6 +1118,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_native_subgroup_size = compute_config->native_subgroup_size;
         key.compute_native_storage_format_support =
             compute_config->native_storage_format_support;
+        key.compute_storage_buffer_int64_atomics =
+            compute_config->storage_buffer_int64_atomics;
         key.compute_packed_r11_storage = compute_config->packed_r11_storage;
     }
     const std::shared_ptr<const ShaderCodeAnalysis> analysis =
@@ -1201,6 +1209,18 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                     : one_record_tail && resource.format == DataFormat::Float16
                         ? StorageBufferTailSemantic::Float16
                         : StorageBufferTailSemantic::None);
+            // A warm cache hit bypasses emitter-side resource revalidation. Partition on the
+            // complete resource-side admission result, not the serialized marker alone, so an
+            // opaque/corrupt marker cannot borrow a valid module across size, alignment, or array
+            // shape changes. Address identity remains intentionally absent; only alignment matters.
+            const bool atomic_x2_exact_admission =
+                resource.atomic_x2_record_count != 0u &&
+                resource.atomic_x2_record_count <= 0x02000000u &&
+                static_cast<uint64_t>(resource.atomic_x2_record_count) * 8u == resource.size &&
+                resource.stride == 8u &&
+                (resource.gpu_addr & 7u) == 0u && resource.table_index_count == 0u;
+            compiled.atomic_x2_record_count =
+                atomic_x2_exact_admission ? resource.atomic_x2_record_count : 0u;
             compiled.srt_offset = resource.srt_offset;
             compiled.sgpr_base = resource.sgpr_base;
             compiled.fetch_pc = resource.fetch_pc;
@@ -2065,6 +2085,36 @@ static bool zero_record_format_selectors_are_zero(const Rdna2Inst& in,
             return false;
     }
     return true;
+}
+
+// GTA V rebuilds the same linear qword-atomic V# shape with dispatch-sized record counts (the routed
+// scene exercises 25, 2, 3, and 1). RDNA2 range-checks INDEX against NUM_RECORDS and OFFSET against
+// STRIDE, so the exact concrete count can be compiled as the all-or-nothing qword bound. Keep every
+// other packet/descriptor control deliberately narrow; SLC/TFE/reserved dword1 variants have
+// different or invalid contracts and the decoder does not otherwise retain those bits.
+static uint32_t exact_atomic_x2_record_count(
+        const Rdna2Inst& in, const DecodedBufferDescriptor& descriptor,
+        const uint32_t descriptor_words[4]) {
+    const uint32_t offset = in.literal & 0xfffu;
+    const bool offen = ((in.literal >> 12u) & 1u) != 0;
+    const bool idxen = ((in.literal >> 13u) & 1u) != 0;
+    const bool zero_soffset =
+        (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+        (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+    const bool supported_opcode = in.opcode == 0x50u || in.opcode == 0x5au;
+    const bool exact = in.fmt == Rdna2Format::MUBUF && supported_opcode &&
+           idxen && !offen && offset == 0u && zero_soffset &&
+           !in.mubuf_dlc && !in.mubuf_lds && (in.words[0] & 0x00020000u) == 0u &&
+           (in.words[1] & 0x00e00000u) == 0u &&
+           in.src[0].kind == OperandKind::VGPR && descriptor.base > 0x10000u &&
+           (descriptor.base & 7u) == 0u && descriptor.stride == 8u &&
+           descriptor.num_records != 0u && descriptor.num_records <= 0x02000000u &&
+           descriptor.size_bytes == static_cast<uint64_t>(descriptor.num_records) * 8u &&
+           (descriptor_words[1] & 0xc0000000u) == 0u && // no swizzled addressing
+           // Exact observed upper controls: no INDEX_STRIDE/ADD_TID/RESOURCE_LEVEL/reserved bits,
+           // OOB_SELECT=0, and buffer TYPE=0. The normalized ShaderResource retains none of these.
+           (descriptor_words[3] & 0xfff80000u) == 0u;
+    return exact ? descriptor.num_records : 0u;
 }
 
 std::vector<DynFetch>
@@ -3846,15 +3896,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
                      (in.opcode >= 0x1C && in.opcode <= 0x1F));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
-                // Keep this exact set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
-                // The holes are not aliases: cmp-swap/csub/inc/dec and the x2 family need different
-                // operand/result semantics and must remain fail-closed until those are implemented.
-                const bool atomic_buffer_use =
+                // Keep the generic set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
+                // Opcodes 0x50/0x5a reach descriptor inspection separately: only GTA V's exact
+                // linear stride-8 qword proof below is published; every sibling x2 shape stays
+                // fail-closed rather than inheriting ordinary 32-bit bounds.
+                const bool atomic_buffer_use_32 =
                     !is_mtbuf &&
                     (in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
                      (in.opcode >= 0x35 && in.opcode <= 0x3B));
+                const bool atomic_x2_candidate =
+                    !is_mtbuf && (in.opcode == 0x50u || in.opcode == 0x5au);
                 if (srt_uses &&
-                    (format_load_use || format_store_use || raw_buffer_use || atomic_buffer_use)) {
+                    (format_load_use || format_store_use || raw_buffer_use ||
+                     atomic_buffer_use_32 || atomic_x2_candidate)) {
                     const int srsrc = in.src[1].value;
                     std::array<uint32_t, 4> current{};
                     bool current_known = true;
@@ -3921,6 +3975,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             if (have_common_key) u.key = common_key;
                         }
                         DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        const uint32_t atomic_x2_record_count = atomic_x2_candidate
+                            ? exact_atomic_x2_record_count(in, d, u.v4.data()) : 0u;
+                        if (atomic_x2_record_count)
+                            u.atomic_x2_record_count = atomic_x2_record_count;
                         DataFormat inst_format = DataFormat::Unknown;
                         uint32_t inst_components = 0;
                         if (is_mtbuf)
@@ -3946,11 +4004,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         const bool zero_record_format =
                             format_load_use && zero_record_format_selectors_are_zero(in, u.v4.data());
                         const bool zero_record_raw =
-                            (zero_record_format || raw_buffer_use || atomic_buffer_use) &&
+                            (zero_record_format || raw_buffer_use || atomic_buffer_use_32) &&
                             d.num_records == 0u && d.size_bytes == 0u;
                         if (zero_record_raw || (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
-                             d.size_bytes <= 0x10000000u && stride_supported && format_supported))) {
+                             d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
+                             (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
                             u.zero_record_raw = zero_record_raw;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
@@ -4463,7 +4522,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         } else if (scalar_size < u.required_size) {
             scalar_size = u.required_size;
         }
-        if (clash && !exact_mtbuf) {
+        if (clash && !exact_mtbuf && !u.atomic_x2_record_count) {
             bool piggybacked = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
@@ -4494,6 +4553,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         r.gpu_addr = d.base;
         r.size = scalar_size;
         r.stride = scalar_stride;
+        r.atomic_x2_record_count = u.atomic_x2_record_count;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
         r.fetch_pc = u.use_pc;
         table.resources.push_back(r);
@@ -6043,6 +6103,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             shared_vulkan.storage_image_write_without_format;
         config.native_storage_format_support = shared_compute_adoptable
             ? shared_vulkan.native_storage_format_support : 0;
+        config.storage_buffer_int64_atomics = shared_compute_adoptable &&
+            shared_vulkan.storage_buffer_int64_atomics;
         const uint32_t replay_native_storage_format_support =
             config.native_storage_format_support;
         config.packed_r11_storage =

@@ -1007,8 +1007,44 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
     }
     if (consumed_zero_pad_markers.size() != zero_pad_markers.size()) add_malformed(report);
     std::sort(report.descriptors.begin(), report.descriptors.end(), [](const auto& a, const auto& b) {
-        return a.set != b.set ? a.set < b.set : a.binding < b.binding;
+        if (a.set != b.set) return a.set < b.set;
+        if (a.binding != b.binding) return a.binding < b.binding;
+        return a.variable_id < b.variable_id;
     });
+    // Logical-addressing SPIR-V needs a separate runtime-u64 Block variable for a 64-bit atomic over
+    // the ordinary runtime-u32 storage-buffer ABI. Both variables deliberately name one Vulkan
+    // descriptor binding. Reflection is a binding contract, not a variable list: coalesce compatible
+    // storage-buffer aliases so the backend creates one VkDescriptorSetLayoutBinding, while retaining
+    // the strongest byte/access requirements from either view. Any incompatible duplicate remains a
+    // malformed module instead of being papered over here.
+    std::vector<SpirvDescriptorBinding> coalesced;
+    coalesced.reserve(report.descriptors.size());
+    for (const SpirvDescriptorBinding& descriptor : report.descriptors) {
+        if (coalesced.empty() || coalesced.back().set != descriptor.set ||
+            coalesced.back().binding != descriptor.binding) {
+            coalesced.push_back(descriptor);
+            continue;
+        }
+        SpirvDescriptorBinding& prior = coalesced.back();
+        const bool compatible =
+            prior.kind == SpirvDescriptorKind::StorageBuffer &&
+            descriptor.kind == SpirvDescriptorKind::StorageBuffer &&
+            prior.stage == descriptor.stage &&
+            prior.descriptor_count == descriptor.descriptor_count &&
+            prior.zero_pad_logical_bytes == descriptor.zero_pad_logical_bytes &&
+            prior.zero_pad_binding_bytes == descriptor.zero_pad_binding_bytes &&
+            prior.zero_pad_semantic == descriptor.zero_pad_semantic;
+        if (!compatible) {
+            add_malformed(report);
+            continue;
+        }
+        prior.required_bytes = std::max(prior.required_bytes, descriptor.required_bytes);
+        prior.dynamic_access |= descriptor.dynamic_access;
+        prior.readable |= descriptor.readable;
+        prior.writable |= descriptor.writable;
+        prior.atomic_access |= descriptor.atomic_access;
+    }
+    report.descriptors = std::move(coalesced);
 
     // Reflection depends only on immutable SPIR-V. Runtime addresses, sizes, metadata, and the
     // expected stage/set are validated below on every call. Keeping those out of this cache lets a

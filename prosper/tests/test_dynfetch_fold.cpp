@@ -3295,15 +3295,173 @@ int main() {
               gta_413d884_report.descriptors.empty(),
           "GTA V 0x413d884 pc163 exact synthetic empty OR recompiles binding-free by PC");
 
-    // These encodings need distinct operands or semantics. In particular op 0x50 is GTA V's
-    // buffer_atomic_swap_x2, not a 32-bit atomic with a neighboring opcode. They must not acquire a
-    // resource merely because their descriptor is concrete; both discovery and emission stay loud.
+    // GTA V 0x413e154 pc154 rebuilds the exact BUFFER_ATOMIC_SWAP_X2 V# at pcs142-146.
+    // s13 is dispatch-dependent: the routed scene exercises 25, 2, 3, and 1 qword records.
+    alignas(8) uint32_t gta_swap_x2_backing[50] = {0x11223344u, 0x55667788u};
+    const uint64_t gta_swap_x2_base = reinterpret_cast<uint64_t>(gta_swap_x2_backing);
+    uint32_t gta_swap_x2_seed[15] = {};
+    gta_swap_x2_seed[8] = static_cast<uint32_t>(gta_swap_x2_base);
+    gta_swap_x2_seed[9] = static_cast<uint32_t>(gta_swap_x2_base >> 32);
+    gta_swap_x2_seed[13] = 25u;
+    std::vector<uint32_t> gta_swap_x2_site(154, 0xBF800000u);
+    gta_swap_x2_site[142] = 0x8801FF09u; // s_or_b32 s1, s9, 0x00080000
+    gta_swap_x2_site[143] = 0x00080000u;
+    gta_swap_x2_site[144] = 0xBE800308u; // s_mov_b32 s0, s8
+    gta_swap_x2_site[145] = 0xBE82030Du; // s_mov_b32 s2, s13
+    gta_swap_x2_site[146] = 0xBE8303FFu; // s_mov_b32 s3, 0x00016204
+    gta_swap_x2_site[147] = 0x00016204u;
+    gta_swap_x2_site.push_back(0xE1402000u);
+    gta_swap_x2_site.push_back(0x80000913u);
+    gta_swap_x2_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_swap_x2_table;
+    const std::vector<SrtUse> gta_swap_x2_uses = add_compute_buffer_resources(
+        gta_swap_x2_table, gta_swap_x2_site.data(), gta_swap_x2_site.size(),
+        gta_swap_x2_seed, std::size(gta_swap_x2_seed));
+    assign_convention_bindings(gta_swap_x2_table, 2);
+    ComputeShaderConfig gta_swap_x2_config;
+    gta_swap_x2_config.user_sgprs.assign(std::begin(gta_swap_x2_seed),
+                                          std::end(gta_swap_x2_seed));
+    gta_swap_x2_config.local_x = gta_swap_x2_config.local_y =
+        gta_swap_x2_config.local_z = 1;
+    gta_swap_x2_config.storage_buffer_int64_atomics = true;
+    const std::vector<uint32_t> gta_swap_x2_spirv = recompile_compute(
+        gta_swap_x2_site.data(), gta_swap_x2_site.size(), &gta_swap_x2_table,
+        gta_swap_x2_config);
+    const DescriptorValidationReport gta_swap_x2_report =
+        validate_spirv_descriptor_interface(gta_swap_x2_spirv, &gta_swap_x2_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(gta_swap_x2_uses.size() == 1 &&
+              gta_swap_x2_uses[0].use_pc == 154u &&
+              gta_swap_x2_uses[0].required_size == 0u &&
+              gta_swap_x2_uses[0].atomic_x2_record_count == 25u &&
+              gta_swap_x2_table.resources.size() == 1 &&
+              gta_swap_x2_table.resources[0].size == 200u &&
+              gta_swap_x2_table.resources[0].stride == 8u &&
+              gta_swap_x2_table.resources[0].fetch_pc == 154u &&
+              gta_swap_x2_table.resources[0].atomic_x2_record_count == 25u &&
+              !gta_swap_x2_spirv.empty() && gta_swap_x2_report.ok() &&
+              gta_swap_x2_report.descriptors.size() == 1 &&
+              gta_swap_x2_report.descriptors[0].required_bytes == 8u &&
+              gta_swap_x2_report.descriptors[0].readable &&
+              gta_swap_x2_report.descriptors[0].writable &&
+              gta_swap_x2_report.descriptors[0].atomic_access,
+          "GTA V 0x413e154 pc154 publishes one exact 25-record qword-atomic resource");
+    uint32_t live_sized_atomic_x2_arms = 0;
+    for (uint32_t record_count : {1u, 2u, 3u}) {
+        uint32_t live_seed[15] = {};
+        std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed), live_seed);
+        live_seed[13] = record_count;
+        ShaderResourceTable live_table;
+        const std::vector<SrtUse> live_uses = add_compute_buffer_resources(
+            live_table, gta_swap_x2_site.data(), gta_swap_x2_site.size(),
+            live_seed, std::size(live_seed));
+        live_sized_atomic_x2_arms += live_uses.size() == 1u &&
+            live_uses[0].atomic_x2_record_count == record_count &&
+            live_table.resources.size() == 1u &&
+            live_table.resources[0].atomic_x2_record_count == record_count &&
+            live_table.resources[0].size == record_count * 8u;
+    }
+    CHECK(live_sized_atomic_x2_arms == 3u,
+          "pc145 carries GTA V's live 1/2/3-record dispatch bounds into qword atomics");
+    ComputeShaderConfig gta_swap_x2_unsupported_config = gta_swap_x2_config;
+    gta_swap_x2_unsupported_config.storage_buffer_int64_atomics = false;
+    CHECK(recompile_compute(gta_swap_x2_site.data(), gta_swap_x2_site.size(),
+                            &gta_swap_x2_table, gta_swap_x2_unsupported_config).empty(),
+          "GTA V swap_x2 remains fail-visible without an enabled Vulkan int64-atomic contract");
+
+    // The same rebuilt V# reaches pc172's BUFFER_ATOMIC_OR_X2. It is the next chronological live
+    // rejection after pc154 and must publish the same semantic proof at its own consumer PC.
+    std::vector<uint32_t> gta_or_x2_site(172, 0xBF800000u);
+    std::copy_n(gta_swap_x2_site.begin(), 154, gta_or_x2_site.begin());
+    gta_or_x2_site[154] = 0xBF800000u;
+    gta_or_x2_site[155] = 0xBF800000u;
+    gta_or_x2_site.push_back(0xE1686000u);
+    gta_or_x2_site.push_back(0x80000913u);
+    gta_or_x2_site.push_back(0xBF810000u);
+    ShaderResourceTable gta_or_x2_table;
+    const std::vector<SrtUse> gta_or_x2_uses = add_compute_buffer_resources(
+        gta_or_x2_table, gta_or_x2_site.data(), gta_or_x2_site.size(),
+        gta_swap_x2_seed, std::size(gta_swap_x2_seed));
+    CHECK(gta_or_x2_uses.size() == 1 && gta_or_x2_uses[0].use_pc == 172u &&
+              gta_or_x2_uses[0].atomic_x2_record_count == 25u &&
+              gta_or_x2_table.resources.size() == 1 &&
+              gta_or_x2_table.resources[0].size == 200u &&
+              gta_or_x2_table.resources[0].stride == 8u &&
+              gta_or_x2_table.resources[0].fetch_pc == 172u &&
+              gta_or_x2_table.resources[0].atomic_x2_record_count == 25u,
+          "GTA V 0x413e154 pc172 publishes the same exact proof for atomic_or_x2");
+
+    uint32_t rejected_atomic_x2_shapes = 0;
+    const auto atomic_x2_rejected = [&](const uint32_t user_sgprs[15], uint32_t word0,
+                                        uint32_t word1) {
+        std::vector<uint32_t> code = gta_swap_x2_site;
+        code[154] = word0;
+        code[155] = word1;
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(code.data(), code.size(), user_sgprs, 15, 0, &uses);
+        return uses.empty();
+    };
+    uint32_t mutated_swap_x2_seed[15];
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    mutated_swap_x2_seed[9] |= 4u << 16; // pc142 rebuilds stride 12 instead of 8
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        mutated_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    mutated_swap_x2_seed[13] = 0u;
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        mutated_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    gta_swap_x2_site[147] |= 1u << 28; // OOB_SELECT=1 at the exact descriptor-build site
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 28);
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402004u, 0x80000913u); // instruction offset 4
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1403000u, 0x80000913u); // OFFEN as well as IDXEN
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x00000913u); // register SOFFSET
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80400913u); // SLC
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE140A000u, 0x80000913u); // DLC
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1412000u, 0x80000913u); // LDS transfer
+    std::copy(std::begin(gta_swap_x2_seed), std::end(gta_swap_x2_seed),
+              mutated_swap_x2_seed);
+    mutated_swap_x2_seed[9] |= 0x80000000u; // SWIZZLE_ENABLE
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        mutated_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] |= 1u << 23; // ADD_TID_ENABLE
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 23);
+    gta_swap_x2_site[147] |= 1u << 21; // INDEX_STRIDE
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 21);
+    gta_swap_x2_site[147] |= 1u << 24; // RESOURCE_LEVEL
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1402000u, 0x80000913u);
+    gta_swap_x2_site[147] &= ~(1u << 24);
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1422000u, 0x80000913u); // reserved dword0 bit 17
+    // A separately dumped OR_X2 uses offset 24 without IDXEN; exact live proof must not spread to it.
+    rejected_atomic_x2_shapes += atomic_x2_rejected(
+        gta_swap_x2_seed, 0xE1680018u, 0x80000000u);
+    CHECK(rejected_atomic_x2_shapes == 15u,
+          "qword-atomic discovery rejects every unproved stride/count/OOB/address sibling shape");
+
+    // These neighboring encodings still need distinct operands or wrap/conditional semantics. They
+    // must not acquire a resource merely because their descriptor is concrete.
     const uint32_t unsupported_atomic_dw0[] = {
         0xE0C40000u, // cmp-swap
         0xE0D00000u, // csub
         0xE0F00000u, // inc
         0xE0F40000u, // dec
-        0xE1402000u, // swap_x2, exact GTA V dword 0
     };
     uint32_t unsupported_atomic_uses = 0;
     uint32_t unsupported_atomic_resources = 0;
@@ -3334,7 +3492,7 @@ int main() {
     CHECK(unsupported_atomic_uses == 0 && unsupported_atomic_resources == 0 &&
               unsupported_atomic_recompiles == 0 && unsupported_empty_atomic_uses == 0 &&
               unsupported_empty_atomic_resources == 0,
-          "unsupported cmp-swap/csub/inc/dec/x2 atomics remain fail-closed even when empty");
+          "unsupported cmp-swap/csub/inc/dec atomics remain fail-closed even when empty");
 
     // Terminator 2D supplies descriptor dwords separately, then reassembles its destination V# in
     // s[0:3] with four scalar moves immediately before format stores. This has no SRT-load tag and

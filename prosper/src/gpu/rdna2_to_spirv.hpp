@@ -253,6 +253,10 @@ struct ComputeShaderConfig {
     // frontend. Offline callers default to the portable raw path; live execution supplies the exact
     // physical-device mask so unsupported typed formats compile to the raw uvec4 fallback.
     uint32_t native_storage_format_support = 0;
+    // True only when the Vulkan device that will execute this module was created with shaderInt64
+    // and shaderBufferInt64Atomics enabled. The exact qword-atomic lowerings reject when false
+    // instead of emitting a module whose capability the device merely advertises.
+    bool storage_buffer_int64_atomics = false;
     // Use an exact typed R32_UINT storage image for R11G11B10 when the device cannot store that
     // packed float format natively. The generated shader packs/unpacks the guest word in SPIR-V,
     // avoiding the portable but much wider RGBA32_UINT CPU-conversion interchange format.

@@ -3000,6 +3000,139 @@ int main() {
     CHECK(!spv_atomic_or.empty() && or_buf_out.size() == 1 && or_buf_out[0] == 7u,
           "#590: buffer_atomic_or is idempotent (4 | 3 = 7), distinct from add/max/swap");
 
+    // GTA V rebuilds this exact stride-8 V# with a dispatch-sized record count. Use its live two-
+    // record arm: two valid lanes prove the dynamic qword index, and indices {0,2} prove the compiled
+    // count bound. Results are copied through binding 3 so both VDATA halves remain observable.
+    alignas(8) uint32_t swap_x2_backing[4] = {};
+    ShaderResourceTable rt_swap_x2;
+    { ShaderResource atomic{}; atomic.cls = ResourceClass::ConstantBuffer;
+      atomic.format = DataFormat::Uint32; atomic.num_components = 1;
+      atomic.binding = 2; atomic.gpu_addr = reinterpret_cast<uint64_t>(swap_x2_backing);
+      atomic.size = 16; atomic.stride = 8; atomic.sgpr_base = 0; atomic.fetch_pc = 3;
+      atomic.atomic_x2_record_count = 2;
+      rt_swap_x2.resources.push_back(atomic);
+      ShaderResource result{}; result.cls = ResourceClass::ConstantBuffer;
+      result.format = DataFormat::Uint32; result.num_components = 1;
+      result.binding = 3; result.size = 16; result.stride = 8;
+      result.sgpr_base = 4; result.fetch_pc = 5;
+      rt_swap_x2.resources.push_back(result); }
+    const uint32_t swap_x2_no_glc[] = {
+        0x7e260300u,               // v_mov_b32 v19, v0 (LocalInvocationId.x)
+        0x7e120291u,               // v_mov_b32 v9, 17
+        0x7e1402a2u,               // v_mov_b32 v10, 34
+        0xe1402000u, 0x80000913u,  // buffer_atomic_swap_x2 v[9:10], v19, s[0:3], idxen
+        0xe0742000u, 0x80010900u,  // buffer_store_dwordx2 v[9:10], v0, s[4:7], idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig swap_x2_config;
+    swap_x2_config.local_x = 2;
+    swap_x2_config.storage_buffer_int64_atomics = true;
+    const std::vector<uint32_t> swap_x2_no_glc_spv = recompile_compute(
+        swap_x2_no_glc, std::size(swap_x2_no_glc), &rt_swap_x2, swap_x2_config);
+    CHECK(!swap_x2_no_glc_spv.empty(),
+          "GTA V swap_x2 GLC=0 recompiles through the exact int64-atomic contract");
+
+    if (prosper::test::default_compute_buffer_int64_atomics_supported()) {
+        const std::vector<float> swap_x2_dummy(2, 0.0f);
+        std::vector<uint32_t> initial_qwords(4, 0u);
+        initial_qwords[0] = 0x11223344u;
+        initial_qwords[1] = 0x55667788u;
+        initial_qwords[2] = 0x99aabbccu;
+        initial_qwords[3] = 0xddeeff00u;
+        const std::vector<uint32_t> result_seed(4, 0xdeadbeefu);
+        std::vector<uint32_t> no_glc_results, no_glc_memory;
+        prosper::test::run_compute(swap_x2_no_glc_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &no_glc_results, 2,
+                                   &no_glc_memory);
+        std::vector<uint32_t> swapped_qwords = initial_qwords;
+        swapped_qwords[0] = swapped_qwords[2] = 17u;
+        swapped_qwords[1] = swapped_qwords[3] = 34u;
+        CHECK(no_glc_memory == swapped_qwords &&
+                  no_glc_results == std::vector<uint32_t>({17u, 34u, 17u, 34u}),
+              "swap_x2 GLC=0 indexes two qwords and preserves both lanes' VDATA pairs");
+
+        const uint32_t swap_x2_glc[] = {
+            0x7e260300u, 0x7e120291u, 0x7e1402a2u,
+            0xe1406000u, 0x80000913u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> swap_x2_glc_spv = recompile_compute(
+            swap_x2_glc, std::size(swap_x2_glc), &rt_swap_x2, swap_x2_config);
+        std::vector<uint32_t> glc_results, glc_memory;
+        prosper::test::run_compute(swap_x2_glc_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &glc_results, 2, &glc_memory);
+        CHECK(glc_memory == swapped_qwords &&
+                  glc_results ==
+                      std::vector<uint32_t>({0x11223344u, 0x55667788u,
+                                             0x99aabbccu, 0xddeeff00u}),
+              "swap_x2 GLC=1 returns each dynamically indexed pre-operation qword");
+
+        const uint32_t swap_x2_oob[] = {
+            0x34260081u,             // v_lshlrev_b32 v19, 1, v0 -> indices {0,2}
+            0x7e120291u, 0x7e1402a2u,
+            0xe1406000u, 0x80000913u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> swap_x2_oob_spv = recompile_compute(
+            swap_x2_oob, std::size(swap_x2_oob), &rt_swap_x2, swap_x2_config);
+        std::vector<uint32_t> oob_results, oob_memory;
+        prosper::test::run_compute(swap_x2_oob_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &oob_results, 2, &oob_memory);
+        std::vector<uint32_t> one_swapped_qword = initial_qwords;
+        one_swapped_qword[0] = 17u;
+        one_swapped_qword[1] = 34u;
+        CHECK(oob_memory == one_swapped_qword &&
+                  oob_results ==
+                      std::vector<uint32_t>({0x11223344u, 0x55667788u, 0u, 0u}),
+              "swap_x2 GLC=1 returns zero and drops the complete qword at index==record_count");
+
+        const uint32_t or_x2_glc[] = {
+            0x7e260300u, 0x7e120291u, 0x7e1402a2u,
+            0xe1686000u, 0x80000913u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> or_x2_glc_spv = recompile_compute(
+            or_x2_glc, std::size(or_x2_glc), &rt_swap_x2, swap_x2_config);
+        std::vector<uint32_t> initial_or_qwords(4, 0u);
+        initial_or_qwords[0] = 1u; initial_or_qwords[1] = 2u;
+        initial_or_qwords[2] = 4u; initial_or_qwords[3] = 8u;
+        std::vector<uint32_t> or_x2_results, or_x2_memory;
+        prosper::test::run_compute(or_x2_glc_spv, swap_x2_dummy, 2, 2,
+                                   initial_or_qwords, result_seed,
+                                   &or_x2_results, 2, &or_x2_memory);
+        std::vector<uint32_t> expected_or_qwords = initial_or_qwords;
+        expected_or_qwords[0] = 17u; expected_or_qwords[1] = 34u;
+        expected_or_qwords[2] = 21u; expected_or_qwords[3] = 42u;
+        CHECK(or_x2_memory == expected_or_qwords &&
+                  or_x2_results == std::vector<uint32_t>({1u, 2u, 4u, 8u}),
+              "or_x2 performs one u64 OR per record and returns both old dwords");
+
+        // Narrow EXEC to u0>u1 after mapping VADDR to {0,2}: lane 0 is inactive/in-bounds and lane
+        // 1 is active/OOB. Restoring EXEC before the result store exposes both fallback contracts.
+        ShaderResourceTable rt_swap_x2_exec = rt_swap_x2;
+        rt_swap_x2_exec.resources[0].fetch_pc = 5;
+        rt_swap_x2_exec.resources[1].fetch_pc = 8;
+        const uint32_t swap_x2_exec[] = {
+            0x34260081u, 0x7e020280u, 0x7e120291u, 0x7e1402a2u,
+            0x7da80300u,
+            0xe1406000u, 0x80000913u,
+            0xbefe04c1u,
+            0xe0742000u, 0x80010900u,
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> swap_x2_exec_spv = recompile_compute(
+            swap_x2_exec, std::size(swap_x2_exec), &rt_swap_x2_exec, swap_x2_config);
+        std::vector<uint32_t> exec_results, exec_memory;
+        prosper::test::run_compute(swap_x2_exec_spv, swap_x2_dummy, 2, 2,
+                                   initial_qwords, result_seed, &exec_results, 2, &exec_memory);
+        CHECK(exec_memory == initial_qwords &&
+                  exec_results == std::vector<uint32_t>({17u, 34u, 0u, 0u}),
+              "swap_x2 inactive in-bounds lane preserves VDATA and cannot exchange memory");
+    }
+
     // Kernel 24store (#590): integer sub-dword FORMAT store at a runtime byte address. Every lane stores
     // its gid as a Uint16 into element[gid] of a stride-2 buffer, so elements 2k and 2k+1 SHARE dword k.
     // A plain read-modify-write would race; the atomicAnd(clear field)+atomicOr(set field) of each lane's
