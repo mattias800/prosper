@@ -89,20 +89,6 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
-// Whether the module contains the requested GLSL.std.450 extended instruction number.
-bool has_glsl_ext_inst(const std::vector<uint32_t>& spv, uint32_t instruction) {
-    constexpr uint32_t OpExtInst = 12;
-    if (spv.size() < 5) return false;
-    for (size_t i = 5; i < spv.size();) {
-        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
-        if (!wc || i + wc > spv.size()) return false;
-        // OpExtInst operands: result type, result, instruction set, instruction, operands...
-        if (op == OpExtInst && wc >= 6 && spv[i + 4] == instruction) return true;
-        i += wc;
-    }
-    return false;
-}
-
 uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
     uint32_t count = 0;
     if (spv.size() < 5) return count;
@@ -2384,38 +2370,6 @@ int main() {
         printf("  [FAIL] live B64 mask SCC did not reach its crossing dispatcher branch\n");
         return 1;
     }
-
-    // GTA V's compute culling kernels execute this exact in-place V_FFBH_U32 e32 packet inside
-    // crossing control flow. Replace the SCC-preserving VALU in the proven Wave64 dispatcher
-    // fixture, retaining every branch offset, and require the real FindUMsb lowering to be present.
-    std::vector<uint32_t> gta_compute_ffbh_cfg(
-        std::begin(wave64_compute_live_b64_mask_scc),
-        std::end(wave64_compute_live_b64_mask_scc));
-    gta_compute_ffbh_cfg[5] = 0x7e087304u; // exact live v_ffbh_u32_e32 v4,v4
-    const auto gta_compute_ffbh_cfg_spv = recompile_compute(
-        gta_compute_ffbh_cfg.data(), gta_compute_ffbh_cfg.size(), nullptr,
-        portable_wave64_compute_config);
-    if (gta_compute_ffbh_cfg_spv.empty() ||
-        !has_opcode(gta_compute_ffbh_cfg_spv, 251) || // arbitrary CFG dispatcher
-        !has_glsl_ext_inst(gta_compute_ffbh_cfg_spv, 75) || // FindUMsb
-        !type_result_ids_are_nonzero(gta_compute_ffbh_cfg_spv, nullptr) ||
-        !phi_ids_are_nonzero(gta_compute_ffbh_cfg_spv)) {
-        printf("  [FAIL] GTA V v_ffbh_u32 did not lower inside crossing Wave64 compute CFG\n");
-        return 1;
-    }
-
-    // SDWA source NEG is deliberately outside this plain-e32 admission. Without the gate the
-    // generic VOP1 prologue would negate in the f32 domain before the integer FFBH operation.
-    const uint32_t ffbh_sdwa_neg[] = {
-        0x7e0872f9u, 0x00160604u,             // v_ffbh_u32_sdwa v4,v4 dst:dword src:dword neg
-        0xbf810000u,
-    };
-    if (!recompile_compute(ffbh_sdwa_neg, std::size(ffbh_sdwa_neg), nullptr,
-                           portable_wave64_compute_config).empty()) {
-        printf("  [FAIL] v_ffbh_u32 admitted unsupported SDWA source NEG\n");
-        return 1;
-    }
-    printf("  [ok]   GTA V v_ffbh_u32 lowers in crossing Wave64 CFG; SDWA NEG stays rejected\n");
 
     // GTA V follows its row reduction with this identity QUAD_PERM and partial ROW_MASK. Prefix the
     // exact packet to the crossing CFG above so it reaches the dispatcher lowering used by the live

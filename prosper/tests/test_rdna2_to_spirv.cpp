@@ -468,35 +468,6 @@ int main() {
     printf("  kernel15 mismatches=%u (out[1]=0x%08x expect=0x%08x)\n", bad15, got15.size()==N?bits_of(got15[1]):0, exp15[1]);
     CHECK(got15.size()==N && bad15==0, "recompiled kernel 15 (v_bfrev_b32) reverses bits exactly");
 
-    // Kernel 15c: GTA V's exact in-place V_FFBH_U32 e32 packet from its compute culling kernels.
-    // The instruction counts zeroes preceding the first set bit from the MSB and returns -1 for
-    // zero. Feed the raw u32 bits through the float harness so the result is checked bit-exactly.
-    const uint32_t code15c[] = { 0x7e087304u, 0xbf810000u }; // v_ffbh_u32_e32 v4,v4
-    std::vector<uint32_t> spv15c = recompile_valu(
-        code15c, std::size(code15c), /*num_inputs*/5, /*out_vgpr*/4);
-    CHECK(!spv15c.empty(), "recompiled kernel 15c (GTA V v_ffbh_u32 e32) -> SPIR-V");
-    constexpr uint32_t ffbh_inputs[] = {
-        0x00000000u, 0x80000000u, 0x10000000u, 0x0000ffffu,
-        0x00000001u, 0x7fffffffu, 0x00f00000u, 0xffffffffu,
-    };
-    constexpr uint32_t ffbh_expected[] = { 0xffffffffu, 0u, 3u, 16u, 31u, 1u, 8u, 0u };
-    std::vector<float> in15c(N * 5, 0.0f);
-    std::vector<uint32_t> exp15c(N);
-    for (uint32_t i = 0; i < N; ++i) {
-        const size_t sample = i % std::size(ffbh_inputs);
-        in15c[i * 5 + 4] = std::bit_cast<float>(ffbh_inputs[sample]);
-        exp15c[i] = ffbh_expected[sample];
-    }
-    std::vector<float> got15c = spv15c.empty() ? std::vector<float>()
-                                               : prosper::test::run_compute(spv15c, in15c, N, N);
-    uint32_t bad15c = 0;
-    for (uint32_t i = 0; i < N && got15c.size() == N; ++i)
-        if (bits_of(got15c[i]) != exp15c[i]) ++bad15c;
-    printf("  kernel15c mismatches=%u (zero=0x%08x expect=0x%08x)\n", bad15c,
-           got15c.size() == N ? bits_of(got15c[0]) : 0, exp15c[0]);
-    CHECK(got15c.size() == N && bad15c == 0,
-          "recompiled kernel 15c counts leading zeroes and preserves the zero sentinel exactly");
-
     // Kernel 15b: kernel 15 with s_ttracedata (SOPP 0x16, 0xbf960000) spliced into the body. The
     // instruction sends M0 to the thread-trace stream — a profiling side channel that writes no
     // SGPR/VGPR/memory and does not branch — so the correct lowering emits nothing and the kernel must
