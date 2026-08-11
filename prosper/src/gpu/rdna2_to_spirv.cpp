@@ -7586,6 +7586,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); scc_nz(d); break;   // s_and_b32
                 case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); scc_nz(d); break;   // s_or_b32
                 case 0x12: d = b.ibin(Op_BitwiseXor, a, c); scc_nz(d); break;   // s_xor_b32
+                case 0x14: d = b.ibin(Op_BitwiseAnd, a, b.iun(Op_Not, c));       // s_andn2_b32
+                           scc_nz(d); break;
+                case 0x16: d = b.ibin(Op_BitwiseOr, a, b.iun(Op_Not, c));        // s_orn2_b32
+                           scc_nz(d); break;
+                case 0x18: d = b.iun(Op_Not, b.ibin(Op_BitwiseAnd, a, c));       // s_nand_b32
+                           scc_nz(d); break;
+                case 0x1A: d = b.iun(Op_Not, b.ibin(Op_BitwiseOr, a, c));        // s_nor_b32
+                           scc_nz(d); break;
+                case 0x1C: d = b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c));       // s_xnor_b32
+                           scc_nz(d); break;
                 case 0x1E: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshl_b32
                              d = b.ibin(Op_ShiftLeftLogical, a, sh); scc_nz(d); break; }  // dst = src0 << (src1 & 31)
                 case 0x24: { uint32_t w  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x1f));   // s_bfm_b32: bitfield mask

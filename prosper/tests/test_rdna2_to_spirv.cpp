@@ -445,6 +445,58 @@ int main() {
     printf("  kernel9 mismatches=%u (out[5]=%g expect=%g)\n", bad9, got9.size()==N?got9[5]:-1, exp9[5]);
     CHECK(got9.size()==N && bad9==0, "recompiled kernel 9 (scalar s_mov/s_add/s_lshl) computes a0+30");
 
+    // GTA V compute program 0x413cee500 first rejects on the exact pc46 S_ANDN2_B32 packet below.
+    // Exercise the complete complementary B32 logical family numerically and fold SCC into bit 31
+    // of the observed result so both the data operation and SCC=(D!=0) are checked by execution.
+    auto run_sop2_complement = [&](uint32_t opcode_word, uint32_t a, uint32_t c) {
+        const uint32_t code[] = {
+            0xbe8003ffu, a,       // s_mov_b32 s0,a
+            0xbe8103ffu, c,       // s_mov_b32 s1,c
+            opcode_word,          // s_*_b32 s2,s0,s1
+            0x85038081u,          // s_cselect_b32 s3,1,0
+            0x8f039f03u,          // s_lshl_b32 s3,s3,31
+            0x89020302u,          // s_xor_b32 s2,s2,s3
+            0x7e000202u,          // v_mov_b32 v0,s2
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> spv = recompile_valu(code, std::size(code), 1, 0);
+        const std::vector<float> got = spv.empty()
+            ? std::vector<float>{}
+            : prosper::test::run_compute(spv, {0.0f}, 1, 1);
+        return got.size() == 1 ? bits_of(got[0]) : UINT32_MAX;
+    };
+    constexpr uint32_t logical_a = 0x0f0ff00fu;
+    constexpr uint32_t logical_c = 0x00ff00ffu;
+    auto with_scc = [](uint32_t result) {
+        return result ^ (result != 0 ? 0x80000000u : 0u);
+    };
+    CHECK(run_sop2_complement(0x8a020100u, logical_a, logical_c) ==
+              with_scc(logical_a & ~logical_c),
+          "s_andn2_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8b020100u, logical_a, logical_c) ==
+              with_scc(logical_a | ~logical_c),
+          "s_orn2_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8c020100u, logical_a, logical_c) ==
+              with_scc(~(logical_a & logical_c)),
+          "s_nand_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8d020100u, logical_a, logical_c) ==
+              with_scc(~(logical_a | logical_c)),
+          "s_nor_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8e020100u, logical_a, logical_c) ==
+              with_scc(~(logical_a ^ logical_c)),
+          "s_xnor_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8a020100u, UINT32_MAX, UINT32_MAX) == 0,
+          "s_andn2_b32 clears SCC when its scalar result is zero");
+
+    const uint32_t gta_s_andn2_b32[] = {
+        0xbe8703ffu, 0x12345678u, // establish the live s7 input
+        0x8a07f507u,              // exact GTA pc46: s_andn2_b32 s7,s7,inline-float:245
+        0x7e000207u,              // v_mov_b32 v0,s7
+        0xbf810000u,
+    };
+    CHECK(!recompile_valu(gta_s_andn2_b32, std::size(gta_s_andn2_b32), 1, 0).empty(),
+          "GTA V exact scalar s_andn2_b32 packet recompiles");
+
     // GTA V kernel 0x205b5e8600 uses s_sub_u32/s_subb_u32 as a 64-bit subtraction pair while
     // negating EXEC. Pin both halves of S_SUBB's contract independently: the incoming low-word
     // borrow changes the high-word data result, and the high-word underflow becomes its outgoing SCC.
