@@ -6008,7 +6008,7 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
         case OperandKind::Literal:     return b.uconst(in.literal);
-        case OperandKind::Special:
+        case OperandKind::Special: {
             if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
             if (o.value == 253) {                     // SCC scalar source
                 // rs.scc == 0 marks SCC poisoned by a 64-bit mask op (its SCC is a cross-lane
@@ -6033,11 +6033,10 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             // is zero. Compute/fragment keep their real multi-lane masks and must not take this path.
             if (!b.is_compute && !b.is_fragment && (o.value == 106 || o.value == 107))
                 return o.value == 106 ? b.sel(rs.vcc, b.uconst(1), b.uconst(0)) : b.uconst(0);
-            // VCC read as scalar DATA, materialised exactly (#2420). GTA V computes a descriptor-table
-            // pointer from the compare mask -- `s_add_u32 s60, s36, vcc_lo` -- and a per-invocation
-            // bool has no 32-bit value to add, so s60 became unknown, its s_load's base was unknown,
-            // the MUBUF reading that SRSRC could not fold, and the shader rejected. 23,166 draws of
-            // that title die this way (#2412).
+            // VCC/EXEC read as scalar DATA, materialised exactly (#2420/#2481). GTA V computes a
+            // descriptor-table pointer from VCC_LO in graphics shaders, and a Wave64 compute kernel
+            // negates EXEC as an integer pair (`s_sub_u32 ...,exec_lo`; `s_subb_u32 ...,exec_hi`). A
+            // per-invocation bool has no complete 32-bit value for either sequence.
             //
             // `subgroupBallot` supplies those bits EXACTLY, and only under one condition: its .x/.y
             // are lanes 0..31 / 32..63 of THIS SUBGROUP, so it equals the guest wave mask only when
@@ -6045,12 +6044,15 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             // were whole -- a wrong descriptor address, i.e. silent wrong rendering. So the exact-size
             // contract is required, and anything else keeps rejecting exactly as before.
             //
-            // Reached only on the path that already sets ok=false, so this can only turn a reject into
-            // working code; no shader that compiles today changes.
-            if ((o.value == 106 || o.value == 107) && rs.vcc &&
-                b.native_subgroup_size && b.native_subgroup_size == b.wave_size) {
+            // This is the final path before the operand is rejected, so it can only turn a previous
+            // reject into working code; no shader that already compiled changes.
+            const bool reads_vcc = o.value == 106 || o.value == 107;
+            const bool reads_exec = o.value == 126 || o.value == 127;
+            const uint32_t mask = reads_vcc ? rs.vcc : reads_exec ? rs.exec : 0;
+            if (mask && b.native_subgroup_size && b.native_subgroup_size == b.wave_size) {
                 const uint32_t half =
-                    b.native_wave_ballot_half(rs.vcc, o.value == 106 ? 0u : 1u);
+                    b.native_wave_ballot_half(mask,
+                        (o.value == 106 || o.value == 126) ? 0u : 1u);
                 if (half) return half;
             }
             if (ok) *ok = false;
@@ -6060,6 +6062,7 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
                              in.pc, o.value, rs.sreg.contains(o.value),
                              rs.sreg_bool.contains(o.value));
             return b.uconst(0);
+        }
         default:
             if (ok) *ok = false;
             return b.uconst(0);
@@ -7555,6 +7558,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     d = b.ibin(Op_IAdd, s1, cin);
                     uint32_t k2 = b.ucmp(Op_ULessThan, d, s1);        // wrap in +cin
                     rs.scc = b.bsel(k1, b.btrue(), k2); break;
+                }
+                case 0x05: {   // s_subb_u32: dst = src0 - src1 - SCC(borrow-in); SCC = borrow-out.
+                    if (!rs.scc) { ok = false; break; }   // SCC poisoned by a mask op: borrow-in unknown
+                    const uint32_t bin = b.sel(rs.scc, b.uconst(1), b.uconst(0));
+                    const uint32_t difference = b.ibin(Op_ISub, a, c);
+                    const uint32_t first_borrow = b.ucmp(Op_ULessThan, a, c);
+                    d = b.ibin(Op_ISub, difference, bin);
+                    const uint32_t second_borrow = b.ucmp(Op_ULessThan, difference, bin);
+                    rs.scc = b.bsel(first_borrow, b.btrue(), second_borrow); break;
                 }
                 // s_min/max (0x06 min_i32, 0x07 min_u32, 0x08 max_i32, 0x09 max_u32): SCC = "src0 was
                 // selected", STRICT in both directions per the ISA pseudocode (S_MIN: SCC = S0 < S1;

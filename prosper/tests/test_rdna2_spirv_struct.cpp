@@ -1880,6 +1880,45 @@ int main() {
     }
     printf("  [ok]   implicit VOPC preserves VCC_HI scalar data only in Wave32\n");
 
+    // GTA V's Wave64 compute kernel 0x205b5e8600 negates the current EXEC mask as a scalar integer
+    // pair. The subtraction words below are its exact pc1310/1312 packets: subtract EXEC_LO from
+    // zero, then subtract EXEC_HI and the low-word borrow from zero. An exact 64-lane subgroup can
+    // materialise each EXEC half with subgroupBallot; a portable or mismatched subgroup must keep
+    // rejecting rather than silently treating the architectural mask as zero.
+    const uint32_t gta_wave64_exec_integer_negate[] = {
+        0xbefe04c1u,                         // establish a complete live EXEC mask
+        0x80907e80u,                         // pc1310: s_sub_u32 s16, 0, exec_lo
+        0x82917f80u,                         // pc1312: s_subb_u32 s17, 0, exec_hi
+        0x7e040210u,                         // v_mov_b32 v2, s16 (keep the result live)
+        0x7e060211u,                         // v_mov_b32 v3, s17
+        0xbf810000u,
+    };
+    ComputeShaderConfig gta_wave64_exec_config = wave64_compute_config;
+    const std::vector<uint32_t> gta_wave64_exec_spv = recompile_compute(
+        gta_wave64_exec_integer_negate, std::size(gta_wave64_exec_integer_negate), nullptr,
+        gta_wave64_exec_config);
+    if (gta_wave64_exec_spv.empty() || !has_opcode(gta_wave64_exec_spv, 339)) {
+        printf("  [FAIL] GTA Wave64 EXEC integer negation did not materialise the mask via subgroupBallot\n");
+        return 1;
+    }
+    ComputeShaderConfig gta_portable_exec_config = gta_wave64_exec_config;
+    gta_portable_exec_config.native_subgroup_size = 0;
+    if (!recompile_compute(gta_wave64_exec_integer_negate,
+                           std::size(gta_wave64_exec_integer_negate), nullptr,
+                           gta_portable_exec_config).empty()) {
+        printf("  [FAIL] portable GTA EXEC integer negation compiled without an exact subgroup\n");
+        return 1;
+    }
+    ComputeShaderConfig gta_mismatched_exec_config = gta_wave64_exec_config;
+    gta_mismatched_exec_config.native_subgroup_size = 32;
+    if (!recompile_compute(gta_wave64_exec_integer_negate,
+                           std::size(gta_wave64_exec_integer_negate), nullptr,
+                           gta_mismatched_exec_config).empty()) {
+        printf("  [FAIL] GTA EXEC integer negation compiled for a mismatched subgroup\n");
+        return 1;
+    }
+    printf("  [ok]   GTA Wave64 EXEC integer negation requires and uses an exact-wave ballot\n");
+
     // Astro's exact PC458 packet explicitly selects physical VCC_HI in Wave32. A typed B32 mask in
     // that word must drive the select independently of VCC_LO; absent or path-dependent HI mask
     // lifetimes must remain fail-visible instead of falling back to the implicit VCC predicate.

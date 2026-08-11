@@ -445,6 +445,117 @@ int main() {
     printf("  kernel9 mismatches=%u (out[5]=%g expect=%g)\n", bad9, got9.size()==N?got9[5]:-1, exp9[5]);
     CHECK(got9.size()==N && bad9==0, "recompiled kernel 9 (scalar s_mov/s_add/s_lshl) computes a0+30");
 
+    // GTA V kernel 0x205b5e8600 uses s_sub_u32/s_subb_u32 as a 64-bit subtraction pair while
+    // negating EXEC. Pin both halves of S_SUBB's contract independently: the incoming low-word
+    // borrow changes the high-word data result, and the high-word underflow becomes its outgoing SCC.
+    const uint32_t code9_subb_data[] = {
+        0xbe800380u,              // s_mov_b32 s0,0
+        0xbe820385u,              // s_mov_b32 s2,5
+        0xbe830383u,              // s_mov_b32 s3,3
+        0x80818100u,              // s_sub_u32 s1,s0,1 -> borrow-in=1
+        0x82840302u,              // s_subb_u32 s4,s2,s3 -> 5-3-1 = 1, borrow-out=0
+        0x7e000204u,              // v_mov_b32 v0,s4
+        0x7e000d00u,              // v_cvt_f32_u32 v0,v0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_subb_data = recompile_valu(
+        code9_subb_data, std::size(code9_subb_data), 1, 0);
+    const std::vector<float> got9_subb_data = spv9_subb_data.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv9_subb_data, {0.0f}, 1, 1);
+    CHECK(!spv9_subb_data.empty() && got9_subb_data.size() == 1 &&
+              got9_subb_data[0] == 1.0f,
+          "s_subb_u32 subtracts the incoming low-word borrow from its data result");
+
+    const uint32_t code9_subb_borrow[] = {
+        0xbe800380u,              // s_mov_b32 s0,0
+        0x80818100u,              // s_sub_u32 s1,s0,1 -> borrow-in=1
+        0x82828000u,              // s_subb_u32 s2,s0,0 -> UINT_MAX, borrow-out=1
+        0x85038081u,              // s_cselect_b32 s3,1,0
+        0x7e000203u,              // v_mov_b32 v0,s3
+        0x7e000d00u,              // v_cvt_f32_u32 v0,v0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_subb_borrow = recompile_valu(
+        code9_subb_borrow, std::size(code9_subb_borrow), 1, 0);
+    const std::vector<float> got9_subb_borrow = spv9_subb_borrow.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv9_subb_borrow, {0.0f}, 1, 1);
+    CHECK(!spv9_subb_borrow.empty() && got9_subb_borrow.size() == 1 &&
+              got9_subb_borrow[0] == 1.0f,
+          "s_subb_u32 publishes its high-word borrow through SCC");
+
+    const uint32_t code9_subb_primary_borrow[] = {
+        0xbe800381u,              // s_mov_b32 s0,1
+        0xbe810380u,              // s_mov_b32 s1,0
+        0x80838000u,              // s_sub_u32 s3,s0,0 -> borrow-in=0
+        0x82820001u,              // s_subb_u32 s2,s1,s0 -> UINT_MAX, primary borrow-out=1
+        0x85038081u,              // s_cselect_b32 s3,1,0
+        0x7e000203u,              // v_mov_b32 v0,s3
+        0x7e000d00u,              // v_cvt_f32_u32 v0,v0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_subb_primary_borrow = recompile_valu(
+        code9_subb_primary_borrow, std::size(code9_subb_primary_borrow), 1, 0);
+    const std::vector<float> got9_subb_primary_borrow = spv9_subb_primary_borrow.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv9_subb_primary_borrow, {0.0f}, 1, 1);
+    CHECK(!spv9_subb_primary_borrow.empty() && got9_subb_primary_borrow.size() == 1 &&
+              got9_subb_primary_borrow[0] == 1.0f,
+          "s_subb_u32 publishes a primary src0<src1 borrow through SCC");
+
+    // Execute an asymmetric exact-wave mask when the host can require Wave64. Lanes 0..32 are set,
+    // so ballot(EXEC).x=0xffffffff and .y=1. The exact GTA subtraction pair therefore produces
+    // low=1 and high=0xfffffffe. Store both halves after restoring EXEC; swapping the ballot halves,
+    // extracting .x twice, or omitting either extraction changes at least one complete output range.
+    const uint32_t code9_exec_ballot_halves[] = {
+        0x7d8800a1u,              // v_cmp_gt_u32 vcc, 33, v0 -> lanes 0..32
+        0xbefe046au,              // s_mov_b64 exec,vcc
+        0x80907e80u,              // GTA pc1310: s_sub_u32 s16,0,exec_lo
+        0x82917f80u,              // GTA pc1312: s_subb_u32 s17,0,exec_hi
+        0xbefe04c1u,              // restore EXEC before the stores
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e020210u,              // v_mov_b32 v1,s16
+        0xe0702000u, 0x80020100u, // store low result at output[v0]
+        0x7e020211u,              // v_mov_b32 v1,s17
+        0xe0702000u, 0x80020102u, // store high result at output[v2]
+        0xbf810000u,
+    };
+    ShaderResourceTable exec_ballot_table;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      exec_ballot_table.resources.push_back(output); }
+    ComputeShaderConfig exec_ballot_config;
+    exec_ballot_config.local_x = 64;
+    exec_ballot_config.wave_size = 64;
+    exec_ballot_config.native_subgroup_size = 64;
+    const std::vector<uint32_t> exec_ballot_spv = recompile_compute(
+        code9_exec_ballot_halves, std::size(code9_exec_ballot_halves),
+        &exec_ballot_table, exec_ballot_config);
+    CHECK(!exec_ballot_spv.empty() && count_spirv_opcode(exec_ballot_spv, 339) == 2,
+          "GTA EXEC integer pair materializes exactly two subgroup ballot halves");
+    const auto exec_ballot_subgroup = prosper::test::default_compute_subgroup_properties();
+    const bool can_execute_exec_ballot = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    if (can_execute_exec_ballot && !exec_ballot_spv.empty()) {
+        std::vector<uint32_t> exec_ballot_got;
+        prosper::test::run_compute(exec_ballot_spv, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(128, 0),
+                                   &exec_ballot_got);
+        uint32_t exec_ballot_bad = 0;
+        for (uint32_t lane = 0; lane < 64 && exec_ballot_got.size() == 128; ++lane) {
+            exec_ballot_bad += exec_ballot_got[lane] != 1u;
+            exec_ballot_bad += exec_ballot_got[lane + 64] != 0xfffffffeu;
+        }
+        CHECK(exec_ballot_got.size() == 128 && exec_ballot_bad == 0,
+              "GTA EXEC ballot maps low/high mask halves to .x/.y exactly");
+    } else {
+        std::printf("  [skip] GTA EXEC ballot execution: host subgroup is %u or lacks ballot\n",
+                    exec_ballot_subgroup.size);
+    }
+
     // Plucky Squire's post-Desk transition shader clears the top bit of a scalar-data VCC_HI
     // lifetime before combining the two VCC dwords into a buffer address. This is the exact
     // gfx1030 s_bitset0_b32 packet retained by the failed-dispatch capsule for #1554.
