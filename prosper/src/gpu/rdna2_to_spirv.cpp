@@ -3497,17 +3497,21 @@ bool sopp_is_noop(const Rdna2Inst& in) {
 
 // Is SGPR `R` provably DEAD at pc `target` — i.e. redefined before any read on the fall-through, so a
 // write to it inside a divergent (execz) block linearized before `target` cannot be observed by later
-// code? Sound/conservative: we only reason across the simple wave-uniform ALU formats whose SGPR source
-// operands we can fully enumerate (at most a single reg or a 64-bit pair). At the first memory / control-
-// flow / interp / export / unknown instruction (whose reads of R we can't bound — e.g. a wide T#/V#
-// descriptor source) we give up and report NOT-dead. Checking value ∈ {R, R-1} covers both a 32-bit read
-// of R and a 64-bit pair whose low half is R-1. (RE-TAG: divergent-block scalar liveness.)
+// code? Sound/conservative: we only scan formats whose complete scalar read/write ranges are decoded,
+// including bounded SMEM/MUBUF/MTBUF/MIMG packets. At the first unsupported memory, control-flow,
+// interpolation, or unknown instruction we give up and report NOT-dead. Checking value ∈ {R, R-1}
+// covers both a 32-bit read of R and a 64-bit pair whose low half is R-1.
+// (RE-TAG: divergent-block scalar liveness.)
 inline bool sopk_writes_scalar_data(uint32_t opcode) {
     // GFX10 SOPK encodes both read-only compares/waits/register-mode operations and genuine SGPR
     // destinations in the same SDST field. Keep the distinction central so CFG/provenance scans do
     // not mistake s_cmpk's source register for a redefinition.
     return opcode == 0x00 || opcode == 0x02 || opcode == 0x0F ||
            opcode == 0x10 || opcode == 0x12;
+}
+
+namespace {
+uint32_t scalar_write_width(const Rdna2Inst& in);
 }
 
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
@@ -3582,7 +3586,7 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPC:
             case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
             case Rdna2Format::DS:    // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
-            case Rdna2Format::EXP:   // EXP data sources are all VGPRs — it can never read an SGPR
+            case Rdna2Format::EXP: { // EXP data sources are all VGPRs — it can never read an SGPR
                 // s_bitset{0,1}_b32 reads its destination before replacing that same word; the
                 // decoded source is only the bit index, so the generic operand walk cannot see it.
                 if (in.fmt == Rdna2Format::SOP1 &&
@@ -3615,13 +3619,27 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                     (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
                     continue;
-                // A redefinition kills R for a plain numbered SGPR dst (s0..s105) — and now also for
-                // VCC_LO/HI (106/107), whose implicit readers are enumerated above. EXEC/M0
-                // (124/126/127) still can't be proven dead (implicit reads everywhere). A cmpx
-                // SDWAB's decoded SGPR dst is excluded for the same reason as above (EXEC only).
-                if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 107 &&
+                // A scalar redefinition kills every word covered by its opcode's write width. Keep
+                // this after the explicit/implicit read checks above: B64 read-modify-write forms
+                // must observe the old pair before replacing it. EXEC/M0 (124/126/127) still cannot
+                // be proven dead (implicit reads everywhere), and cmpx writes EXEC rather than its
+                // decoded SGPR destination.
+                const uint32_t dst_width = scalar_write_width(in);
+                if (dst_width && in.dst.kind == OperandKind::SGPR && R <= 107 &&
+                    R >= in.dst.value && R < in.dst.value + static_cast<int>(dst_width) &&
                     !(in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)))
                     continue;
+                break;
+            }
+            case Rdna2Format::MIMG:
+                // Image packets fully decode both scalar descriptor operands: the eight-dword T#/U#
+                // at src[1] and the four-dword S# at src[2]. Some opcodes do not consume the sampler,
+                // but accounting for both ranges is deliberately conservative and lets the proof scan
+                // through every MIMG without needing a second opcode inventory.
+                if (in.src[1].kind != OperandKind::SGPR ||
+                    in.src[2].kind != OperandKind::SGPR) return false;
+                if (R >= in.src[1].value && R < in.src[1].value + 8) return false;
+                if (R >= in.src[2].value && R < in.src[2].value + 4) return false;
                 break;
             case Rdna2Format::MUBUF:
             case Rdna2Format::MTBUF:
@@ -3805,7 +3823,6 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
 }
 
 namespace {
-uint32_t scalar_write_width(const Rdna2Inst& in);
 // Defined after the scalar-writer inventory it depends on; used by detect_forward_ifs above it.
 bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc);
 }
@@ -16970,6 +16987,19 @@ std::vector<uint32_t> safe_execz_branches_for_test(const uint32_t* code, size_t 
     rdna2_walk(code, dwords, ins);
     const std::unordered_set<uint32_t> s = safe_execz_branches(ins);
     return std::vector<uint32_t>(s.begin(), s.end());
+}
+
+std::vector<uint32_t> structured_execz_branches_for_test(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    const std::unordered_set<uint32_t> safe = safe_execz_branches(ins);
+    bool rejected = false;
+    const auto branches = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords, &safe,
+                                             nullptr, &rejected,
+                                             /*compute_wave_branches*/true);
+    std::vector<uint32_t> pcs;
+    if (!rejected) for (const auto& branch : branches) pcs.push_back(branch.branch_pc);
+    return pcs;
 }
 
 std::vector<uint32_t> mask_test_branches_for_test(const uint32_t* code, size_t dwords,

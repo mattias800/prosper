@@ -118,6 +118,7 @@ static const std::vector<KnownGap> kKnownGaps = {};
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
     {"safe_execz_branches_for_test", "returns a transformed RDNA2 instruction stream, not SPIR-V"},
+    {"structured_execz_branches_for_test", "returns analyzed RDNA2 branch PCs, not SPIR-V"},
     {"mask_test_branches_for_test",  "returns a transformed RDNA2 instruction stream, not SPIR-V"},
     {"recompile_graphics_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "

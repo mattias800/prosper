@@ -413,6 +413,10 @@ FlatLoadAnalysis analyze_flat_loads(const uint32_t* code, size_t dwords, uint32_
 // backward branch that jumps to at-or-before it — must NOT appear here, so detect_divergent_loops claims
 // it and emit_divloop reconstructs the structured loop; a plain guard-to-end/if execz still does.
 std::vector<uint32_t> safe_execz_branches_for_test(const uint32_t* code, size_t dwords);
+// Test hook: EXECZ branch pcs admitted by the compute structured-if analysis after safe
+// linearizations are removed. This distinguishes the narrow structurizer path from the generic CFG
+// fallback when an end-to-end shader happens to be supported by both.
+std::vector<uint32_t> structured_execz_branches_for_test(const uint32_t* code, size_t dwords);
 std::vector<uint32_t> mask_test_branches_for_test(const uint32_t* code, size_t dwords,
                                                   bool wave32);
 

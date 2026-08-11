@@ -190,6 +190,114 @@ int main() {
                                              std::size(live_vcc_hi_guard)), 1u),
           "a real VCC_HI vector read keeps the guarded scalar write non-linearizable");
 
+    // GTA V uses a scalar load into VCC_LO as temporary data inside an EXECZ guard, then crosses an
+    // image access before the temporary dies. MIMG's decoded T# and S# ranges are the complete scalar
+    // read set, so an unrelated resource must not stop the merge-liveness proof. Exercise the actual
+    // compute structurizer/emitter path rather than only its liveness helper.
+    const uint32_t mimg_vcc_scratch_guard[] = {
+        0x7E080300u,                 // 0: v_mov_b32 v4, v0 (1D image coordinate)
+        0x7C220080u,                 // 1: v_cmpx_neq_f32 exec, 0, v0
+        0xBF880002u,                 // 2: s_cbranch_execz -> pc=5
+        0xF4201A84u, 0xFA000000u,   // 3: s_buffer_load_dword vcc_lo, s[8:11], 0
+        0xF0000F00u, 0x00000004u,   // 5: image_load v[0:3], v4, s[0:7], dmask:0xf dim:1D
+        0xBF810000u,
+    };
+    ShaderResourceTable mimg_guard_rt;
+    { ShaderResource image{}; image.cls = ResourceClass::StorageImage; image.binding = 4;
+      image.img_dim = 0; image.sgpr_base = 0; mimg_guard_rt.resources.push_back(image); }
+    { ShaderResource constants{}; constants.cls = ResourceClass::ConstantBuffer;
+      constants.binding = 5; constants.sgpr_base = 8; constants.size = 64;
+      mimg_guard_rt.resources.push_back(constants); }
+    ComputeShaderConfig mimg_guard_config;
+    mimg_guard_config.user_sgprs.resize(16);
+    CHECK(!recompile_compute(mimg_vcc_scratch_guard, std::size(mimg_vcc_scratch_guard),
+                             &mimg_guard_rt, mimg_guard_config).empty(),
+          "an unrelated MIMG T# range is transparent to post-merge VCC liveness");
+
+    // Same-site mutation: move the image's decoded eight-word SRSRC range to s[104:111], which
+    // overlaps VCC_LO/HI. The image now observes the guarded scalar write and must stay fail-visible.
+    uint32_t mimg_vcc_resource[std::size(mimg_vcc_scratch_guard)];
+    std::copy(std::begin(mimg_vcc_scratch_guard), std::end(mimg_vcc_scratch_guard),
+              std::begin(mimg_vcc_resource));
+    mimg_vcc_resource[6] = 0x001A0004u; // image_load ..., s[104:111]
+    ShaderResourceTable mimg_vcc_rt = mimg_guard_rt;
+    mimg_vcc_rt.resources[0].sgpr_base = 104;
+    ComputeShaderConfig mimg_vcc_config = mimg_guard_config;
+    mimg_vcc_config.user_sgprs.resize(112);
+    CHECK(!has(safe_execz_branches_for_test(mimg_vcc_resource,
+                                             std::size(mimg_vcc_resource)), 2u),
+          "an MIMG SRSRC overlap specifically blocks the dead-scalar linearization proof");
+    CHECK(recompile_compute(mimg_vcc_resource, std::size(mimg_vcc_resource),
+                            &mimg_vcc_rt, mimg_vcc_config).empty(),
+          "an MIMG SRSRC range overlapping VCC keeps the guarded scalar write live");
+
+    // Sampled images add a separately decoded four-word sampler source. Prove that the liveness scan
+    // crosses an unrelated S# as well, while a same-site S# mutation onto VCC remains conservative.
+    uint32_t sampled_mimg_guard[std::size(mimg_vcc_scratch_guard)];
+    std::copy(std::begin(mimg_vcc_scratch_guard), std::end(mimg_vcc_scratch_guard),
+              std::begin(sampled_mimg_guard));
+    sampled_mimg_guard[5] = 0xF0800F08u; // image_sample v[0:3], v[0:1], s[0:7], s[16:19]
+    sampled_mimg_guard[6] = 0x00800000u;
+    ShaderResourceTable sampled_guard_rt;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture; texture.binding = 4;
+      texture.img_dim = 1; texture.width = 4; texture.height = 4; texture.sgpr_base = 0;
+      texture.sampler_sgpr_base = 16; sampled_guard_rt.resources.push_back(texture); }
+    sampled_guard_rt.resources.push_back(mimg_guard_rt.resources[1]);
+    ComputeShaderConfig sampled_guard_config = mimg_guard_config;
+    sampled_guard_config.user_sgprs.resize(20);
+    CHECK(!recompile_compute(sampled_mimg_guard, std::size(sampled_mimg_guard),
+                             &sampled_guard_rt, sampled_guard_config).empty(),
+          "unrelated MIMG T# and S# ranges are transparent to post-merge VCC liveness");
+    uint32_t sampled_vcc_sampler[std::size(sampled_mimg_guard)];
+    std::copy(std::begin(sampled_mimg_guard), std::end(sampled_mimg_guard),
+              std::begin(sampled_vcc_sampler));
+    sampled_vcc_sampler[6] = 0x03400000u; // image_sample ..., s[0:7], s[104:107]
+    ShaderResourceTable sampled_vcc_rt = sampled_guard_rt;
+    sampled_vcc_rt.resources[0].sampler_sgpr_base = 104;
+    ComputeShaderConfig sampled_vcc_config = sampled_guard_config;
+    sampled_vcc_config.user_sgprs.resize(108);
+    CHECK(!has(safe_execz_branches_for_test(sampled_vcc_sampler,
+                                             std::size(sampled_vcc_sampler)), 2u),
+          "an MIMG sampler overlap specifically blocks the dead-scalar linearization proof");
+    CHECK(recompile_compute(sampled_vcc_sampler, std::size(sampled_vcc_sampler),
+                            &sampled_vcc_rt, sampled_vcc_config).empty(),
+          "an MIMG sampler range overlapping VCC keeps the guarded scalar write live");
+
+    // A post-merge B64 scalar write kills both VCC words before v_cndmask consumes the new mask. The
+    // high-half proof must use the central scalar write-width inventory: checking only dst==R leaves
+    // VCC_HI spuriously live and rejects this otherwise-structured EXECZ guard.
+    const uint32_t b64_vcc_kill_guard[] = {
+        0x7E080300u,                 // 0: v_mov_b32 v4, v0 (1D image coordinate)
+        0x7D840100u,                 // 1: v_cmp_eq_u32 vcc, v0, v0
+        0xBF880001u,                 // 2: s_cbranch_execz -> pc=4
+        0xBEEA047Eu,                 // 3: s_mov_b64 vcc, exec (guarded write)
+        0xBEEA047Eu,                 // 4: s_mov_b64 vcc, exec (kills both words after merge)
+        0xF0000F00u, 0x00000004u,   // 5: unrelated image_load through s[0:7]
+        0x02020100u,                 // 7: v_cndmask_b32 v1, v0, v0, vcc
+        0xBF810000u,
+    };
+    ComputeShaderConfig b64_kill_config;
+    b64_kill_config.user_sgprs.resize(8);
+    CHECK(has(structured_execz_branches_for_test(b64_vcc_kill_guard,
+                                                  std::size(b64_vcc_kill_guard)), 2u),
+          "the B64 pair kill admits the guarded write through the structured compute CFG");
+    CHECK(!recompile_compute(b64_vcc_kill_guard, std::size(b64_vcc_kill_guard), &mimg_guard_rt,
+                             b64_kill_config).empty(),
+          "a post-merge B64 write kills both VCC halves before their next consumer");
+
+    // Same-site mutation: a B32 low-half write cannot kill the guarded high half. The following
+    // whole-VCC consumer makes that surviving value observable, so structurization must reject.
+    uint32_t b32_vcc_lo_kill[std::size(b64_vcc_kill_guard)];
+    std::copy(std::begin(b64_vcc_kill_guard), std::end(b64_vcc_kill_guard),
+              std::begin(b32_vcc_lo_kill));
+    b32_vcc_lo_kill[4] = 0xBEEA037Eu; // s_mov_b32 vcc_lo, exec_lo
+    CHECK(!has(structured_execz_branches_for_test(b32_vcc_lo_kill,
+                                                   std::size(b32_vcc_lo_kill)), 2u),
+          "the B32 low-half mutation is rejected by the structured compute CFG proof");
+    CHECK(recompile_compute(b32_vcc_lo_kill, std::size(b32_vcc_lo_kill), &mimg_guard_rt,
+                            b64_kill_config).empty(),
+          "a low-half-only B32 write does not kill live VCC_HI at the merge");
+
     // Wave32 kernels use one-word mask instructions around EXEC: compare into VCC_LO, invert that
     // mask, copy it to EXEC_LO, then restore EXEC_LO. These are mask-domain operations, not scalar
     // reads of an unrepresentable VCC dword.
