@@ -1697,6 +1697,45 @@ int main() {
               count_spirv_composite_extract_index(spv17d1_mask_half_alias_mutated, 1) ==
                   count_spirv_composite_extract_index(native_linear_spv17d, 1) + 2,
           "same-site alias mutation selects EXEC_HI instead of the proved EXEC_LO half");
+
+    // A restored half is scalar data plus a dedicated re-spill Bool, never a complete B64 mask.
+    // Make s7 differ from the original EXEC_HI, cross a dispatcher edge, then consume s[6:7] as a
+    // pair. Publishing the half through ordinary sreg_bool would silently restore the original
+    // EXEC predicate and ignore s7; until the scalar EXEC move supports this pair, reject visibly.
+    std::vector<uint32_t> code17d1_mask_half_b64_consumer = {
+        0x7d8800a1u,              // EXEC source: low=ffffffff, high=1
+        0xbefe046au,              // s_mov_b64 exec,vcc
+        0xd761001fu, 0x00010a7eu, // spill EXEC_LO through v31 lane 5
+        0xbefe04c1u,              // restore full EXEC for the dispatcher
+        0xbe870380u,              // s_mov_b32 s7,0 (different from original EXEC_HI)
+        0xd7600006u, 0x00010b1fu, // restore only the low half into s6
+        0xbf880000u,              // same target/fallthrough forces alias persistence
+        0xbefe0406u,              // s_mov_b64 exec,s[6:7] must not treat s6 as a full mask
+    };
+    code17d1_mask_half_b64_consumer.insert(
+        code17d1_mask_half_b64_consumer.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(code17d1_mask_half_b64_consumer.data(),
+                            code17d1_mask_half_b64_consumer.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "Wave64 mask-half alias cannot masquerade as a complete B64 predicate");
+
+    // V_MOVRELD writes VGPR[VDST+M0], not merely its encoded VDST. Overwrite the exact v31 spill
+    // array through v0+31, cross a dispatcher edge, then attempt the original lane read. Both the
+    // half-identity proof and spill-validity analysis must cover the emitter's full dynamic range;
+    // otherwise a persisted false Bool placeholder is silently materialized as scalar zero.
+    std::vector<uint32_t> code17d1_mask_half_movreld_overwrite = {
+        0xd761001fu, 0x00010a7eu, // spill EXEC_LO through v31 lane 5
+        0xbefc039fu,              // s_mov_b32 m0,31
+        0x7e008500u,              // v_movreld_b32 v0,v0 writes ordinary data to v31
+        0xbf880000u,              // force a dispatcher edge after the dynamic overwrite
+        0xd7600006u, 0x00010b1fu, // stale v31 lane 5 must remain invalid
+    };
+    code17d1_mask_half_movreld_overwrite.insert(
+        code17d1_mask_half_movreld_overwrite.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(code17d1_mask_half_movreld_overwrite.data(),
+                            code17d1_mask_half_movreld_overwrite.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "Wave64 mask-half spill rejects a dynamic V_MOVRELD overwrite of its VGPR");
     CHECK(recompile_compute(code17d1_mask_half_spill.data(),
                             code17d1_mask_half_spill.size(), &rt17d1,
                             portable_cfg17d1_mask_half).empty(),
