@@ -13304,9 +13304,12 @@ bool emit_cfg_state_machine(
     // Wave64 dispatcher Bool variables hold values, not lifetime tags. A scalar overwrite stores
     // false for a dead mask, and an unfiltered load at a later case can therefore make mere map
     // membership look like a valid saved mask. Prove the B64 mask domain separately at every
-    // Wave64 whole-mask comparisons (EXEC-vs-saved or saved-vs-saved): mask producers generate the
-    // fact, every overlapping half/pair scalar write kills it, and joins retain it only when all
-    // reachable predecessors agree.
+    // Wave64 whole-mask comparisons (mask-vs-zero, EXEC-vs-saved or saved-vs-saved): mask producers
+    // generate the fact, every overlapping half/pair scalar write kills it, and joins retain it only
+    // when all reachable predecessors agree. Architectural VCC lives in `state.vcc`, not in the
+    // saved-mask map, so this proof is also the lifetime tag that lets the dispatcher distinguish a
+    // live VCC mask from a physical VCC pair that has been recycled as scalar data.
+    std::unordered_set<uint32_t> proven_wave64_mask_zero_compare_pcs;
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
         std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
@@ -13319,6 +13322,10 @@ bool emit_cfg_state_machine(
 
         auto advance_wave64_b64_masks = [&](std::set<int>& masks, const Rdna2Inst& in,
                                             bool record_compare) {
+            const int zero_compare_source = mask_zero_compare_candidate_source(in);
+            if (record_compare && zero_compare_source >= 0 &&
+                masks.contains(zero_compare_source))
+                proven_wave64_mask_zero_compare_pcs.insert(in.pc);
             const int compare_source = exec_saved_mask_compare_source(in);
             if (record_compare && compare_source >= 0 && masks.contains(compare_source))
                 proven_exec_saved_mask_compare_pcs.insert(in.pc);
@@ -13420,6 +13427,19 @@ bool emit_cfg_state_machine(
             }
         }
     }
+
+    auto mask_zero_compare_is_proven = [&](const Rdna2Inst& in) {
+        // Wave32 has its own one-word MUST-domain filtering in load_state. Wave64 needs the
+        // pair-width analysis above because a persisted Bool value is not itself a lifetime tag.
+        return b.wave_size != 64 || proven_wave64_mask_zero_compare_pcs.contains(in.pc);
+    };
+    auto mask_zero_compare_value = [&](const RegState& state, int source) -> uint32_t {
+        // The current GTA V sites name canonical VCC_LO as the low word of a B64 source. Its exact
+        // per-lane value is stored separately from ordinary saved SGPR masks.
+        if (b.wave_size == 64 && source == 106) return state.vcc;
+        const auto found = state.sreg_bool.find(source);
+        return found == state.sreg_bool.end() ? 0 : found->second;
+    };
 
     // Fragment scalar PCs are lane-local in the dispatcher.  A saved-mask pair comparison must
     // nevertheless vote over every lane in the guest wave, including lanes currently executing a
@@ -14027,7 +14047,8 @@ bool emit_cfg_state_machine(
                 const int mask_compare_source =
                     mask_zero_compare_candidate_source(in);
                 if (mask_compare_source >= 0 &&
-                    state.sreg_bool.contains(mask_compare_source)) {
+                    mask_zero_compare_is_proven(in) &&
+                    mask_zero_compare_value(state, mask_compare_source)) {
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr,
                                      "[compute-mask-compare] pc=%u source=s%d op=0x%x\n",
@@ -14334,19 +14355,19 @@ bool emit_cfg_state_machine(
                 return false;
             }
             const int source = mask_zero_compare_candidate_source(*mask_compare);
-            const auto value = state.sreg_bool.find(source);
-            if (value == state.sreg_bool.end())
+            const uint32_t value = mask_zero_compare_value(state, source);
+            if (!mask_zero_compare_is_proven(*mask_compare) || !value)
                 return reject_cfg(mask_compare->pc, "missing-mask-compare-source");
             if (b.native_subgroup_size || b.is_fragment) {
                 const uint32_t wave_any = b.is_fragment
-                    ? b.fragment_wave_any(value->second)
-                    : b.native_wave_any(value->second);
+                    ? b.fragment_wave_any(value)
+                    : b.native_wave_any(value);
                 if (!wave_any) return reject_cfg(mask_compare->pc, "mask-vote");
                 state.scc = mask_zero_compare_inverts(*mask_compare)
                     ? b.logical_not(wave_any) : wave_any;
             } else {
                 b.store_function(vote_pending_var, yes);
-                b.store_function(vote_value_var, value->second);
+                b.store_function(vote_value_var, value);
                 b.store_function(vote_invert_var,
                     mask_zero_compare_inverts(*mask_compare) ? yes : no);
                 b.store_function(vote_to_scc_var, yes);

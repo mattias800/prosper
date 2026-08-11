@@ -853,6 +853,149 @@ int main() {
     CHECK(got17d2.size() == N && bad17d2 == 0,
           "#825: dispatcher reduces mask==0 across the full emulated wave64");
 
+    // GTA V's two current terminal compute shaders compare architectural Wave64 VCC directly with
+    // zero (`bf13806a`) after a VOPC producer. VCC is not an ordinary saved-mask SGPR map entry: the
+    // dispatcher persists it in its dedicated predicate state. Keep an SCC/VCC-preserving VOP1
+    // between producer and consumer, as in the longer sibling. Wave 0 has an empty mask; wave 1 has
+    // one set bit at guest lane 63, outside a narrow host subgroup. The SCC branch must therefore
+    // select 1 for every lane of wave 0 and 7 for every lane of wave 1.
+    const uint32_t code17d2v[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1 (fresh Wave64 VCC mask)
+        0x7e060280u,              // SCC/VCC-preserving gap: v_mov_b32 v3, 0
+        0xbf13806au,              // s_cmp_lg_u64 vcc, 0 (exact GTA V terminal packet)
+        0xbf840001u,              // s_cbranch_scc0 +1 (empty mask keeps 1)
+        0x7e040287u,              // nonempty mask -> v_mov_b32 v2, 7
+        0x7e040d02u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> portable_spv17d2v = recompile_valu(
+        code17d2v, std::size(code17d2v), 2, /*out_vgpr*/2);
+    CHECK(!portable_spv17d2v.empty() && count_spirv_opcode(portable_spv17d2v, 224) > 0,
+          "GTA V Wave64 VCC-vs-zero uses the portable dispatcher vote");
+    const std::vector<float> got17d2v = portable_spv17d2v.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(portable_spv17d2v, in17d, N, N);
+    uint32_t bad17d2v = 0;
+    for (uint32_t i = 0; i < N && got17d2v.size() == N; ++i) {
+        const float expected = i < 64 ? 1.0f : 7.0f;
+        bad17d2v += got17d2v[i] != expected;
+    }
+    CHECK(got17d2v.size() == N && bad17d2v == 0,
+          "portable VCC-vs-zero vote sees the sole set guest lane 63");
+
+    const std::vector<uint32_t> native_spv17d2v = recompile_compute(
+        code17d2v, std::size(code17d2v), nullptr, native_cfg17d);
+    CHECK(!native_spv17d2v.empty() &&
+              count_spirv_opcode(native_spv17d2v, 335) ==
+                  count_spirv_opcode(native_spv17d, 335) + 1 &&
+              count_spirv_opcode(native_spv17d2v, 224) == 0,
+          "exact Wave64 VCC-vs-zero adds one native vote and no barrier");
+    // recompile_compute exposes only guest memory effects, so use the same VCC/SOPC/branch shape
+    // with a real resource-backed store for native execution. Local id 63 is the sole matching lane;
+    // its VCC bit must make the uniform SCC branch select 7 for the complete native guest wave.
+    const uint32_t code17d2v_native_exec[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7e0202bfu,              // v_mov_b32 v1, 63
+        0x7d840300u,              // v_cmp_eq_u32 vcc, v0, v1
+        0x7e060280u,              // SCC/VCC-preserving gap: v_mov_b32 v3, 0
+        0xbf13806au,              // s_cmp_lg_u64 vcc, 0
+        0xbf840001u,              // s_cbranch_scc0 +1
+        0x7e040287u,              // nonempty mask -> v_mov_b32 v2, 7
+        0xe0702000u, 0x80020200u, // buffer_store_dword v2, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt17d2v_native;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
+      rt17d2v_native.resources.push_back(dst); }
+    ComputeShaderConfig native_exec_cfg17d2v = native_cfg17d;
+    native_exec_cfg17d2v.local_x = 64;
+    native_exec_cfg17d2v.local_y = 1;
+    const std::vector<uint32_t> native_exec_spv17d2v = recompile_compute(
+        code17d2v_native_exec, std::size(code17d2v_native_exec),
+        &rt17d2v_native, native_exec_cfg17d2v);
+    CHECK(!native_exec_spv17d2v.empty() &&
+              count_spirv_opcode(native_exec_spv17d2v, 335) ==
+                  count_spirv_opcode(native_spv17d, 335) + 1 &&
+              count_spirv_opcode(native_exec_spv17d2v, 224) == 0,
+          "native VCC-vs-zero execution kernel preserves the exact vote contract");
+    const auto subgroup17d2v = prosper::test::default_compute_subgroup_properties();
+    const bool can_execute17d2v = subgroup17d2v.size == 64 &&
+        (subgroup17d2v.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup17d2v.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute17d2v && !native_exec_spv17d2v.empty()) {
+        std::vector<uint32_t> native_initial17d2v(64, 0u), native_got17d2v;
+        prosper::test::run_compute(native_exec_spv17d2v, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, native_initial17d2v,
+                                   &native_got17d2v);
+        uint32_t native_bad17d2v = 0;
+        for (uint32_t i = 0; i < 64 && native_got17d2v.size() == 64; ++i)
+            native_bad17d2v += native_got17d2v[i] != 7u;
+        std::printf("  native VCC-zero out[0/62/63]=%u/%u/%u mismatches=%u\n",
+                    native_got17d2v.size() == 64 ? native_got17d2v[0] : UINT32_MAX,
+                    native_got17d2v.size() == 64 ? native_got17d2v[62] : UINT32_MAX,
+                    native_got17d2v.size() == 64 ? native_got17d2v[63] : UINT32_MAX,
+                    native_bad17d2v);
+        CHECK(native_got17d2v.size() == 64 && native_bad17d2v == 0,
+              "native VCC-vs-zero vote sees the sole set lane 63");
+    } else {
+        std::printf("  [skip] native VCC-vs-zero execution: host subgroup is %u or lacks vote\n",
+                    subgroup17d2v.size);
+    }
+
+    // A dedicated VCC Bool variable is a value, not proof that both physical VCC words still hold
+    // that mask. A scalar write to VCC_HI kills the pair lifetime, and a path that may bypass that
+    // write leaves the join ambiguous. Both shapes must stay out of the mask-vote specialization
+    // instead of voting stale predicate state. These negatives exercise the same Wave64 MUST-domain
+    // proof as the admission.
+    std::vector<uint32_t> code17d2v_high_overwrite(
+        std::begin(code17d2v), std::end(code17d2v));
+    code17d2v_high_overwrite.insert(
+        code17d2v_high_overwrite.begin() + 9,
+        0xbeeb0380u);             // s_mov_b32 vcc_hi, 0 destroys the B64 mask lifetime
+    const auto portable_high_overwrite = recompile_valu(
+        code17d2v_high_overwrite.data(), code17d2v_high_overwrite.size(), 2, 2);
+    const auto native_high_overwrite = recompile_compute(
+        code17d2v_high_overwrite.data(), code17d2v_high_overwrite.size(), nullptr,
+        native_cfg17d);
+    CHECK(!portable_high_overwrite.empty() &&
+              count_spirv_opcode(portable_high_overwrite, 224) ==
+                  count_spirv_opcode(spv17d, 224),
+          "portable VCC-vs-zero does not vote stale VCC after a scalar high-half overwrite");
+    CHECK(!native_high_overwrite.empty() &&
+              count_spirv_opcode(native_high_overwrite, 335) ==
+                  count_spirv_opcode(native_spv17d, 335),
+          "native VCC-vs-zero does not vote stale VCC after a scalar high-half overwrite");
+
+    std::vector<uint32_t> code17d2v_ambiguous_join(
+        std::begin(code17d2v), std::end(code17d2v));
+    code17d2v_ambiguous_join.insert(
+        code17d2v_ambiguous_join.begin() + 9,
+        {0xbf840001u,             // one SCC predecessor skips the scalar overwrite
+         0xbeeb0380u});           // the other recycles VCC_HI as scalar data
+    const auto portable_ambiguous_join = recompile_valu(
+        code17d2v_ambiguous_join.data(), code17d2v_ambiguous_join.size(), 2, 2);
+    const auto native_ambiguous_join = recompile_compute(
+        code17d2v_ambiguous_join.data(), code17d2v_ambiguous_join.size(), nullptr,
+        native_cfg17d);
+    std::printf("  VCC-zero votes baseline/accepted/native-ambiguous=%zu/%zu/%zu\n",
+                count_spirv_opcode(native_spv17d, 335),
+                count_spirv_opcode(native_spv17d2v, 335),
+                count_spirv_opcode(native_ambiguous_join, 335));
+    CHECK(!portable_ambiguous_join.empty() &&
+              count_spirv_opcode(portable_ambiguous_join, 224) ==
+                  count_spirv_opcode(spv17d, 224),
+          "portable VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
+    CHECK(!native_ambiguous_join.empty() &&
+              count_spirv_opcode(native_ambiguous_join, 335) ==
+                  count_spirv_opcode(native_spv17d, 335),
+          "native VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
+
     // Kernel 17d2x: Syberia's fullscreen compute pass compares current EXEC with a mask written
     // directly to s[16:17] by VOPC.  Keep the irreducible prefix so the comparison must use the
     // generic dispatcher's synchronized guest-wave vote.  Wave 0's saved mask equals EXEC; wave 1
