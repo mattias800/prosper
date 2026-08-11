@@ -125,8 +125,10 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             return 1;
         case Rdna2Format::VOP3:
             if (in.opcode == 0x360u) return 0; // v_readlane_b32 writes an SGPR.
-            // v_div_scale_f64 and the two integer MAD64 forms write a VGPR pair.
-            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ? 2u : 1u;
+            // v_div_scale_f64, the two integer MAD64 forms, and the 64-bit reversed left shift
+            // write a consecutive VGPR pair.
+            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ||
+                   in.opcode == 0x2ffu ? 2u : 1u;
         case Rdna2Format::DS:
             // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
             // encodings in that subset are stores or no-return atomics whose VDST field is a source.
@@ -634,11 +636,12 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
-            // V_LDEXP_F32 and V_BFM_B32 are two-source VOP3A instructions. Their reserved SRC2 bits
-            // are zero in GTA V's exact packets and therefore decode as s0 unless cleared here.
+            // V_LSHLREV_B64, V_LDEXP_F32, and V_BFM_B32 are two-source VOP3A instructions. Their
+            // reserved SRC2 bits are zero in GTA V's exact packets and therefore decode as s0 unless
+            // cleared here.
             // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
             // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (i.opcode == 0x362u || i.opcode == 0x363u) {
+            if (i.opcode == 0x2ffu || i.opcode == 0x362u || i.opcode == 0x363u) {
                 i.src[2] = {};
                 i.n_src = 2;
             }

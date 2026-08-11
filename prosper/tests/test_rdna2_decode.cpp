@@ -123,6 +123,19 @@ int main() {
           gta_bfm.src[1].kind == OperandKind::InlineInt && gta_bfm.src[1].value == 0 &&
           gta_bfm.src[2].kind == OperandKind::None,
           "GTA V v_bfm_b32 decodes two sources and no phantom s0");
+    // GTA V exec_cs_205b658800 pc61: `v_lshlrev_b64 v[24:25], v4, 1`. The reserved SRC2 field
+    // must not surface as s0, and the shared writer inventory must retain both result halves.
+    const uint32_t gta_lshlrev_b64_words[] = {0xd6ff0018u, 0x00010304u};
+    const Rdna2Inst gta_lshlrev_b64 = rdna2_decode_one(gta_lshlrev_b64_words, 2);
+    CHECK(gta_lshlrev_b64.fmt == Rdna2Format::VOP3 &&
+          gta_lshlrev_b64.opcode == 0x2ffu && gta_lshlrev_b64.n_src == 2 &&
+          isV(gta_lshlrev_b64.dst, 24) && isV(gta_lshlrev_b64.src[0], 4) &&
+          gta_lshlrev_b64.src[1].kind == OperandKind::InlineInt &&
+          gta_lshlrev_b64.src[1].value == 1 &&
+          gta_lshlrev_b64.src[2].kind == OperandKind::None &&
+          rdna2_vgpr_write_count(gta_lshlrev_b64) == 2u &&
+          rdna2_vgpr_destination_span(gta_lshlrev_b64) == 2u,
+          "GTA V v_lshlrev_b64 decodes two sources and a two-VGPR destination");
     // inst7: s_load_dwordx4 s[0:3], s[4:5], 0x0 (SMEM) -> op 0x2, SDATA s0, SBASE s4 (pair), offset 0
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");

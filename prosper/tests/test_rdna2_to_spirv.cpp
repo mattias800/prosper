@@ -6097,6 +6097,68 @@ int main() {
     CHECK(bfm_modifiers_reject,
           "GTA V v_bfm_b32 same-site modifier mutations remain fail-visible");
 
+    // Kernel 65c: GTA V exec_cs_205b658800 pc61 constructs one 64-bit bit per lane after MBCNT.
+    // Shift amounts are masked to six bits, and both destination halves remain live in the shader.
+    const uint32_t code65c[] = {
+        0xD6FF0018u, 0x00010304u, // v_lshlrev_b64 v[24:25], v4, 1
+        0xBF810000u,
+    };
+    const uint32_t shifts65c[] = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u};
+    const uint32_t expected65c_lo[] = {
+        1u, 2u, 0x80000000u, 0u, 0u, 0u, 1u, 2u,
+    };
+    const uint32_t expected65c_hi[] = {
+        0u, 0u, 0u, 1u, 2u, 0x80000000u, 0u, 0u,
+    };
+    std::vector<float> in65c(std::size(shifts65c) * 5u, 0.0f);
+    for (size_t i = 0; i < std::size(shifts65c); ++i)
+        in65c[i * 5u + 4u] = std::bit_cast<float>(shifts65c[i]);
+    const std::vector<uint32_t> spv65c_lo = recompile_valu(
+        code65c, std::size(code65c), 5, /*out_vgpr*/24);
+    const std::vector<uint32_t> spv65c_hi = recompile_valu(
+        code65c, std::size(code65c), 5, /*out_vgpr*/25);
+    const std::vector<float> got65c_lo = prosper::test::run_compute(
+        spv65c_lo, in65c, std::size(shifts65c), std::size(shifts65c));
+    const std::vector<float> got65c_hi = prosper::test::run_compute(
+        spv65c_hi, in65c, std::size(shifts65c), std::size(shifts65c));
+    uint32_t bad65c = 0;
+    for (size_t i = 0; i < std::size(shifts65c) &&
+                       got65c_lo.size() == std::size(shifts65c) &&
+                       got65c_hi.size() == std::size(shifts65c); ++i) {
+        if (bits_of(got65c_lo[i]) != expected65c_lo[i] ||
+            bits_of(got65c_hi[i]) != expected65c_hi[i])
+            ++bad65c;
+    }
+    CHECK(!spv65c_lo.empty() && !spv65c_hi.empty() &&
+          got65c_lo.size() == std::size(shifts65c) &&
+          got65c_hi.size() == std::size(shifts65c) && bad65c == 0,
+          "GTA V v_lshlrev_b64 writes both halves with six-bit shift semantics");
+
+    // Same-site modifier and destination-bound mutations remain fail-visible. These raw fields are
+    // reserved for this integer opcode; accepting them would silently discard architectural bits.
+    bool lshlrev_b64_mutants_reject = true;
+    for (uint32_t modifier : bfm_word0_modifiers) {
+        const uint32_t mutant[] = {
+            code65c[0] | modifier, code65c[1], 0xBF810000u,
+        };
+        lshlrev_b64_mutants_reject &= recompile_valu(
+            mutant, std::size(mutant), 5, 24).empty();
+    }
+    for (uint32_t modifier : bfm_word1_modifiers) {
+        const uint32_t mutant[] = {
+            code65c[0], code65c[1] | modifier, 0xBF810000u,
+        };
+        lshlrev_b64_mutants_reject &= recompile_valu(
+            mutant, std::size(mutant), 5, 24).empty();
+    }
+    const uint32_t lshlrev_b64_oob[] = {
+        0xD6FF00FFu, code65c[1], 0xBF810000u,
+    };
+    lshlrev_b64_mutants_reject &= recompile_valu(
+        lshlrev_b64_oob, std::size(lshlrev_b64_oob), 5, 24).empty();
+    CHECK(lshlrev_b64_mutants_reject,
+          "GTA V v_lshlrev_b64 same-site modifiers and v255 pair overflow reject");
+
     // Kernel 66: RAW MUBUF SRSRC RESOLUTION (#91). Same code as kernel 21 (buffer_load_dword v0, v0
     // offen, SRSRC s[8:11]) but WITH a resource table mapping s[8:11] -> binding 3. The load must
     // route to binding 3 (cbuf1), not the old hardcoded binding 2 — binding 2 (cbuf0) is bound with
@@ -8559,8 +8621,12 @@ int main() {
     CHECK(!spvA9b.empty(),
           "A9b: a real s_cmp between the mask op and the consumer re-arms SCC (recompiles)");
 
-    // A10 (#458): a fixed-offset compiler spill/fill preserves the exact per-invocation VGPR bits.
+    // A10 (#458/#2481): fixed-offset compiler spill/fill preserves exact per-invocation VGPR bits.
+    // GTA V installs both full FLAT_SCR base halves before using private scratch. Prosper's private
+    // Function-storage model absorbs that physical relocation without widening supported accesses.
     const uint32_t codeA10[] = {
+        0xb9e0f814u,              // s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s96
+        0xb9e1f815u,              // s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s97
         0xdc704010u, 0x00000000u, // scratch_store_dword off, v0, s0 offset:16
         0x7e000280u,              // v_mov_b32 v0, 0
         0xdc304010u, 0x00000000u, // scratch_load_dword v0, off, s0 offset:16
@@ -8574,6 +8640,28 @@ int main() {
         static_cast<uint32_t>(scratch_in.size()));
     CHECK(gotA10 == scratch_in,
           "A10: private dword spill/fill round-trips exact values for every invocation");
+    const RecompileCoverage coverageA10 = recompile_coverage(codeA10, std::size(codeA10));
+    CHECK(coverageA10.unsupported == 0,
+          "A10: full FLAT_SCR LO/HI base writes are handled by the private-scratch abstraction");
+
+    // Mutate the exact live SETREG site: another target, a 31-bit field, or a non-zero field offset
+    // must still reject. Keeping the positive HI packet also makes a LO-only admission fail the test.
+    const uint32_t flat_scr_mutated_words[] = {
+        0xb9e0f801u, // HW_REG_MODE instead of FLAT_SCR_LO
+        0xb9e0f014u, // FLAT_SCR_LO width 31 instead of 32
+        0xb9e0f854u, // FLAT_SCR_LO offset 1 instead of 0
+    };
+    bool flat_scr_mutants_reject = true;
+    for (uint32_t mutated_word : flat_scr_mutated_words) {
+        uint32_t mutant[std::size(codeA10)];
+        std::copy(std::begin(codeA10), std::end(codeA10), std::begin(mutant));
+        mutant[0] = mutated_word;
+        const RecompileCoverage coverage = recompile_coverage(mutant, std::size(mutant));
+        flat_scr_mutants_reject &= recompile_valu(
+            mutant, std::size(mutant), 1, 0).empty() && coverage.unsupported == 1;
+    }
+    CHECK(flat_scr_mutants_reject,
+          "A10: FLAT_SCR target, width, and offset same-site mutations remain fail-visible");
 
     // A11 (#458): vector forms use consecutive VGPRs while retaining one private offset range.
     const uint32_t codeA11[] = {
