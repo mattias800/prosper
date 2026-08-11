@@ -5435,6 +5435,46 @@ int main() {
     CHECK(pair_ambiguous_native.empty(),
           "native dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
 
+    auto rejects_ambiguous_pair = [&](const std::vector<uint32_t>& words) {
+        return compile_cselect_pair(words, pair_ambiguous_portable_config).empty() &&
+               compile_cselect_pair(words, pair_ambiguous_native_config).empty();
+    };
+    std::vector<uint32_t> pair_ambiguous_low_overwrite = pair_ambiguous_join_words;
+    pair_ambiguous_low_overwrite.insert(
+        pair_ambiguous_low_overwrite.begin() + 15,
+        0xbe840380u);              // overwrite only s4 after the join
+    pair_ambiguous_low_overwrite[16] =
+        0x7e020205u;               // read untouched ambiguous s5
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_low_overwrite),
+          "Wave64 pair ambiguity survives a low-half overwrite before a high-half read");
+
+    std::vector<uint32_t> pair_ambiguous_high_overwrite = pair_ambiguous_join_words;
+    pair_ambiguous_high_overwrite.insert(
+        pair_ambiguous_high_overwrite.begin() + 15,
+        0xbe850380u);              // overwrite only s5 after the join
+    pair_ambiguous_high_overwrite[16] =
+        0x7e020204u;               // read untouched ambiguous s4
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_high_overwrite),
+          "Wave64 pair ambiguity survives a high-half overwrite before a low-half read");
+
+    std::vector<uint32_t> pair_ambiguous_addk = pair_ambiguous_join_words;
+    pair_ambiguous_addk[15] =
+        0xb7840001u;               // s_addk_i32 s4,1 implicitly reads/writes SDST
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_addk),
+          "Wave64 pair ambiguity rejects an implicit SOPK read-modify-write");
+
+    std::vector<uint32_t> pair_ambiguous_cmpk = pair_ambiguous_join_words;
+    pair_ambiguous_cmpk[15] =
+        0xb2050000u;               // s_cmpk_lg_i32 s5,0 implicitly reads SDST
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_cmpk),
+          "Wave64 pair ambiguity rejects an implicit SOPK comparison read");
+
+    std::vector<uint32_t> pair_ambiguous_bitset = pair_ambiguous_join_words;
+    pair_ambiguous_bitset[15] =
+        0xbe841d81u;               // s_bitset1_b32 s4,1 reads old SDST and an explicit bit index
+    CHECK(rejects_ambiguous_pair(pair_ambiguous_bitset),
+          "Wave64 pair ambiguity rejects an implicit SOP1 bitset destination read");
+
     const uint32_t code38_vcc_true[] = {
         0xbe8003ffu, 0x80000001u, // source0 low: lanes 0 and 31
         0xbe8103ffu, 0x80000001u, // source0 high: lanes 32 and 63
