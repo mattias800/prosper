@@ -6038,9 +6038,10 @@ int main() {
           "dispatcher successor consumes both selected scalar dwords as data");
 
     // The same physical pair cannot be reconstructed at a join when one predecessor owns a saved
-    // wave mask and the other owns ordinary scalar data. The dispatcher has separate Bool/u32
-    // backing variables but no runtime domain tag, so consuming s[4:5] at the join must reject in
-    // both portable and native paths instead of silently reading either variable's zero placeholder.
+    // wave mask and the other owns ordinary scalar data. Portable dispatch has separate Bool/u32
+    // backing variables but no runtime domain tag, so consuming s[4:5] at the join must reject
+    // instead of silently reading either variable's zero placeholder. Exact native Wave64 can
+    // materialize VCC as ballot low/high words, so both predecessors also define scalar data there.
     const uint32_t code38_pair_ambiguous_join[] = {
         0x7e040280u,              // irreducible dispatcher prefix (same shape as kernel 17d)
         0x7d840100u,
@@ -6070,14 +6071,12 @@ int main() {
         pair_ambiguous_join_words, pair_ambiguous_portable_config);
     const auto pair_ambiguous_native = compile_cselect_pair(
         pair_ambiguous_join_words, pair_ambiguous_native_config);
-    CHECK(pair_ambiguous_portable.empty(),
-          "portable dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
-    CHECK(pair_ambiguous_native.empty(),
-          "native dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
+    CHECK(pair_ambiguous_portable.empty() && !pair_ambiguous_native.empty(),
+          "portable rejects an untagged pair while native Wave64 materializes its ballot words");
 
-    auto rejects_ambiguous_pair = [&](const std::vector<uint32_t>& words) {
+    auto portable_rejects_native_materializes = [&](const std::vector<uint32_t>& words) {
         return compile_cselect_pair(words, pair_ambiguous_portable_config).empty() &&
-               compile_cselect_pair(words, pair_ambiguous_native_config).empty();
+               !compile_cselect_pair(words, pair_ambiguous_native_config).empty();
     };
     std::vector<uint32_t> pair_ambiguous_low_overwrite = pair_ambiguous_join_words;
     pair_ambiguous_low_overwrite.insert(
@@ -6085,8 +6084,8 @@ int main() {
         0xbe840380u);              // overwrite only s4 after the join
     pair_ambiguous_low_overwrite[16] =
         0x7e020205u;               // read untouched ambiguous s5
-    CHECK(rejects_ambiguous_pair(pair_ambiguous_low_overwrite),
-          "Wave64 pair ambiguity survives a low-half overwrite before a high-half read");
+    CHECK(portable_rejects_native_materializes(pair_ambiguous_low_overwrite),
+          "portable ambiguity survives a low overwrite; native retains the ballot high word");
 
     std::vector<uint32_t> pair_ambiguous_high_overwrite = pair_ambiguous_join_words;
     pair_ambiguous_high_overwrite.insert(
@@ -6094,26 +6093,26 @@ int main() {
         0xbe850380u);              // overwrite only s5 after the join
     pair_ambiguous_high_overwrite[16] =
         0x7e020204u;               // read untouched ambiguous s4
-    CHECK(rejects_ambiguous_pair(pair_ambiguous_high_overwrite),
-          "Wave64 pair ambiguity survives a high-half overwrite before a low-half read");
+    CHECK(portable_rejects_native_materializes(pair_ambiguous_high_overwrite),
+          "portable ambiguity survives a high overwrite; native retains the ballot low word");
 
     std::vector<uint32_t> pair_ambiguous_addk = pair_ambiguous_join_words;
     pair_ambiguous_addk[15] =
         0xb7840001u;               // s_addk_i32 s4,1 implicitly reads/writes SDST
-    CHECK(rejects_ambiguous_pair(pair_ambiguous_addk),
-          "Wave64 pair ambiguity rejects an implicit SOPK read-modify-write");
+    CHECK(portable_rejects_native_materializes(pair_ambiguous_addk),
+          "portable ambiguity rejects an implicit SOPK read while native has ballot words");
 
     std::vector<uint32_t> pair_ambiguous_cmpk = pair_ambiguous_join_words;
     pair_ambiguous_cmpk[15] =
         0xb2050000u;               // s_cmpk_lg_i32 s5,0 implicitly reads SDST
-    CHECK(rejects_ambiguous_pair(pair_ambiguous_cmpk),
-          "Wave64 pair ambiguity rejects an implicit SOPK comparison read");
+    CHECK(portable_rejects_native_materializes(pair_ambiguous_cmpk),
+          "portable ambiguity rejects a SOPK compare while native has ballot words");
 
     std::vector<uint32_t> pair_ambiguous_bitset = pair_ambiguous_join_words;
     pair_ambiguous_bitset[15] =
         0xbe841d81u;               // s_bitset1_b32 s4,1 reads old SDST and an explicit bit index
-    CHECK(rejects_ambiguous_pair(pair_ambiguous_bitset),
-          "Wave64 pair ambiguity rejects an implicit SOP1 bitset destination read");
+    CHECK(portable_rejects_native_materializes(pair_ambiguous_bitset),
+          "portable ambiguity rejects a SOP1 bitset while native has ballot words");
 
     const uint32_t code38_vcc_true[] = {
         0xbe8003ffu, 0x80000001u, // source0 low: lanes 0 and 31
@@ -10168,11 +10167,13 @@ int main() {
     CHECK(spvA9.empty(),
           "A9: a non-adjacent SCC consumer after a 64-bit mask op is REJECTED (SCC poison)");
 
-    // A9b: the SAME consumer after a real s_cmp (which re-arms SCC) still recompiles — the poison
-    // only rejects when the last SCC writer was an unrepresentable mask op, not in general.
+    // A9b: the SAME consumer after a real s_cmp on independently defined scalar data (which
+    // re-arms SCC) still recompiles. Reading s0 here would instead be a valid fail-closed rejection:
+    // the preceding mask-only S_AND_B64 does not materialize scalar low/high words.
     const uint32_t codeA9b[] = {
         0x87806a6au,   // s_and_b64 s[0:1], vcc, vcc  (poisons SCC)
-        0xbf068000u,   // s_cmp_eq_u32 s0, 0          (re-arms SCC with a representable value)
+        0xbe820380u,   // s_mov_b32 s2, 0             (independent scalar data; preserves SCC)
+        0xbf068002u,   // s_cmp_eq_u32 s2, 0          (re-arms SCC with a representable value)
         0x8503848bu,   // s_cselect_b32 s3, 11, 4     (reads the fresh SCC -> OK)
         0x4a020203u,   // v_add_nc_u32 v1, s3, v1
         0xBF810000u,

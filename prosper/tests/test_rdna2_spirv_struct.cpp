@@ -2009,7 +2009,7 @@ int main() {
     // that diagnosed the production kernel at this site.
     const uint32_t wave32_compute_vop3b_two_source_join[] = {
         0x7d8a06f9u, 0x06868080u,            // pc0: exact VOPC SDWA packet -> s0 mask
-        0xbf060000u,                         // pc2: scalar branch condition
+        0xbf068008u,                         // pc2: independent scalar branch condition
         0xbf840001u,                         // pc3: one edge retains the s0 mask
         0xbe800380u,                         // pc4: other edge replaces s0 with scalar data
         0xd70f0016u, 0x00021f1bu,            // pc5: exact v_add_co_u32 v22,s0,v27,v15
