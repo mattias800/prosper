@@ -124,6 +124,16 @@ int main() {
           gta_bfm.src[1].kind == OperandKind::InlineInt && gta_bfm.src[1].value == 0 &&
           gta_bfm.src[2].kind == OperandKind::None,
           "GTA V v_bfm_b32 decodes two sources and no phantom s0");
+    // GTA V exec_cs_205b658800 pc2546: `v_mac_f32_e64 v15, -s31, v2`. V_MAC reads
+    // SRC0/SRC1 and its old VDST; the encoded SRC2 field is reserved and must not invent s0.
+    const uint32_t gta_vmac_words[] = {0xd51f000fu, 0x2002041fu};
+    const Rdna2Inst gta_vmac = rdna2_decode_one(gta_vmac_words, 2);
+    CHECK(gta_vmac.fmt == Rdna2Format::VOP3 && gta_vmac.opcode == 0x11fu &&
+          gta_vmac.n_src == 2 && isV(gta_vmac.dst, 15) &&
+          isS(gta_vmac.src[0], 31) && isV(gta_vmac.src[1], 2) &&
+          gta_vmac.src[2].kind == OperandKind::None && gta_vmac.src_neg[0] &&
+          !gta_vmac.src_neg[1],
+          "GTA V v_mac_f32 decodes two sources and no phantom s0");
     // GTA V exec_cs_205b658800 pc61: `v_lshlrev_b64 v[24:25], v4, 1`. The reserved SRC2 field
     // must not surface as s0, and the shared writer inventory must retain both result halves.
     const uint32_t gta_lshlrev_b64_words[] = {0xd6ff0018u, 0x00010304u};
