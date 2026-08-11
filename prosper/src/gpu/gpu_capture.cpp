@@ -111,7 +111,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // PM4 last-write provenance. Replay decodes this input independently and compares it with the v45
 // normalized descriptor; unsupported/ambiguous paths are recorded as explicitly unavailable.
 // v47 (#2481): retain each realized/failed-stage image resource's instruction-scoped zero-mip proof.
-constexpr uint32_t kVersion = 47;
+// v48 (#2481): retain BVH BOX_SORT_EN for raw replay. Sorting changes generated SPIR-V, so replay
+// must not silently compile a sorted guest descriptor with the historical physical-child order.
+constexpr uint32_t kVersion = 48;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -2702,6 +2704,22 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             write_zero_mip_state(stage.resource_table);
+    // v48 preserves the BVH sort semantic separately from the v40 BOX_GROW tail so every older
+    // capture prefix remains byte-exact. Non-BVH resources carry false in the same deterministic
+    // complete-resource enumeration used by v44/v47.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_bvh_sort_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources)
+            w.u8(captured.resource.bvh_sort_enabled ? 1u : 0u);
+    };
+    for (const auto& draw : c.draws) {
+        write_bvh_sort_state(draw.vrt);
+        write_bvh_sort_state(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_bvh_sort_state(compute.resources);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            write_bvh_sort_state(stage.resource_table);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3846,6 +3864,45 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             for (auto& stage : diagnostic.stages)
                 if (!read_zero_mip_state(stage.resource_table)) {
                     error = "invalid resource zero-mip state";
+                    return false;
+                }
+    }
+    if (version >= 48) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid BVH sort-state count";
+            return false;
+        }
+        auto read_bvh_sort_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint8_t enabled = 0;
+                if (!r.u8(enabled) || enabled > 1u) return false;
+                captured.resource.bvh_sort_enabled = enabled != 0;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_bvh_sort_state(draw.vrt) || !read_bvh_sort_state(draw.prt)) {
+                error = "invalid BVH sort state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_bvh_sort_state(compute.resources)) {
+                error = "invalid BVH sort state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_bvh_sort_state(stage.resource_table)) {
+                    error = "invalid BVH sort state";
                     return false;
                 }
     }
