@@ -1753,6 +1753,71 @@ int main() {
     }
     printf("  [ok]   full Wave32 scalar VCC_LO write feeds its implicit mask consumer\n");
 
+    // GTA V's exact PC1309/PC1311 producer-consumer packets occupy one dispatcher case, matching the
+    // production basic block. PC1310 stays between them. The crossing tail forces the arbitrary-CFG
+    // switch, so its discovery/dataflow scan must advertise the scalar cselect's new mask lifetime
+    // before that case is emitted; this does not claim a cross-case producer/consumer transfer.
+    const uint32_t wave32_compute_scalar_cselect_cfg[] = {
+        0xbe8403ffu, 0x80000009u,            // pc0: s_mov_b32 s4, lane-bit mask
+        0xbf060000u,                         // pc2: SCC=1
+        0x7e020287u,                         // pc3: v_mov_b32 v1, 7
+        0x856a8004u,                         // pc4: exact s_cselect_b32 vcc_lo,s4,0
+        0x061212f2u,                         // pc5: exact intervening GTA V vector packet
+        0x02020290u,                         // pc6: exact implicit VCC consumer
+        0x7da40100u,                         // pc7: CMPX changes EXEC only
+        0xbf880003u,                         // pc8: execz -> pc12
+        0x7d840100u,                         // pc9: fresh VCC mask in one arm
+        0x02020100u,                         // pc10: consume the arm-local mask
+        0xbf880002u,                         // pc11: execz -> pc14 (crossing region)
+        0xbf060000u,                         // pc12: scalar compare at rejoin
+        0xbf850001u,                         // pc13: third branch -> pc15
+        0x7e040280u,                         // pc14: no mask read before termination
+        0xbf810000u,
+    };
+    const auto scalar_cselect_cfg_spv = recompile_compute(
+        wave32_compute_scalar_cselect_cfg,
+        std::size(wave32_compute_scalar_cselect_cfg), nullptr,
+        wave32_compute_config);
+    if (scalar_cselect_cfg_spv.empty() || !has_opcode(scalar_cselect_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(scalar_cselect_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(scalar_cselect_cfg_spv)) {
+        printf("  [FAIL] Wave32 CFG did not discover GTA V's scalar-cselect VCC lifetime\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG discovers and emits GTA V's scalar-cselect VCC lifetime\n");
+
+    // The scalar-data bridge is deliberately compute-only. In a Wave32 graphics shader, the exact
+    // packet remains an ordinary scalar write to physical VCC_LO and therefore invalidates an older
+    // predicate lifetime. The crossing tail routes this through the graphics dispatcher too: if
+    // either its static inventory/dataflow or record_scalar_write applies the compute-only bridge to
+    // graphics, the stale all-true compare reaches PC6 and this shader is incorrectly accepted.
+    const uint32_t wave32_fragment_scalar_cselect_data_cfg[] = {
+        0x7e000280u,                         // pc0: v_mov_b32 v0, 0
+        0x7d840000u,                         // pc1: all-true VCC predicate
+        0xbe840381u,                         // pc2: s_mov_b32 s4, 1 (ordinary scalar data)
+        0xbf060000u,                         // pc3: SCC=1
+        0x856a8004u,                         // pc4: exact scalar cselect to VCC_LO
+        0x061212f2u,                         // pc5: exact intervening GTA V packet
+        0x02020290u,                         // pc6: stale implicit VCC read must reject
+        0x7da40100u,                         // pc7: crossing CFG tail begins
+        0xbf880003u,                         // pc8: execz -> pc12
+        0x7d840100u,                         // pc9: fresh VCC mask in one arm
+        0x02020100u,                         // pc10: consume the arm-local mask
+        0xbf880002u,                         // pc11: execz -> pc14
+        0xbf060000u,                         // pc12: scalar compare at rejoin
+        0xbf850001u,                         // pc13: third branch -> pc15
+        0x7e040280u,                         // pc14: no mask read before export
+        0xf800000fu, 0x03020100u,            // pc15: export MRT0
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_fragment_scalar_cselect_data_cfg,
+            std::size(wave32_fragment_scalar_cselect_data_cfg)).empty()) {
+        printf("  [FAIL] graphics CFG retained compute-only scalar-cselect VCC semantics\n");
+        return 1;
+    }
+    printf("  [ok]   scalar-cselect VCC bridge remains compute-only in graphics CFGs\n");
+
     // Astro's larger world-map sibling keeps an ordinary scalar in VCC_HI while an implicit VOPC
     // compare replaces the complete Wave32 predicate in VCC_LO. The unused high word must retain
     // its data lifetime; the same sequence is intentionally invalid in Wave64, where VCC_HI is the

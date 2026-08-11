@@ -5346,7 +5346,23 @@ bool scalar_write_is_b64_mask(const Rdna2Inst& in, int base) {
            in.sdst.value == base;
 }
 
-void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
+// GTA V's Wave32 post-process kernel selects one scalar dword directly into VCC_LO, then uses
+// that same physical word as the implicit predicate of v_cndmask.  The selected dword remains
+// ordinary scalar data, but in Wave32 it also contains the complete architectural VCC mask.  Keep
+// the admitted packet deliberately exact; the caller still has to prove Wave32 before bridging it.
+bool is_scalar_cselect_b32_to_vcc_lo(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0a &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
+        in.src[0].kind == OperandKind::SGPR &&
+        in.src[1].kind == OperandKind::InlineInt && in.src[1].value == 0;
+}
+
+bool allows_compute_scalar_vcc_bridge(const SpirvCompute& b) {
+    return b.is_compute && b.allow_b32_masks && b.wave_size == 32;
+}
+
+void record_scalar_write(RegState& rs, const Rdna2Inst& in,
+                         bool allow_compute_scalar_vcc_bridge) {
     // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
     // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
     // keeping either would let a later descriptor use observe the pre-overwrite value.
@@ -5399,13 +5415,18 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
         const bool vopc_b32_mask = vopc_b32_write && base == in.dst.value;
         const bool vop3_b32_mask_write = vop3_b32_mask && base == in.sdst.value;
         const uint32_t effective_width = (vopc_b32_mask || vop3_b32_mask_write) ? 1u : width;
+        const bool scalar_cselect_vcc_bridge =
+            allow_compute_scalar_vcc_bridge && base == 106 &&
+            is_scalar_cselect_b32_to_vcc_lo(in) &&
+            rs.sreg.contains(106) && rs.sreg_bool_b32.contains(106);
         const bool writes_b32_mask = (effective_width == 1 || vopc_b32_mask) &&
-            !rs.sreg.contains(base) &&
             rs.sreg_bool_b32.contains(base) &&
-            ((in.fmt == Rdna2Format::SOP1 &&
-              (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-               in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) ||
-             sop2_b32_mask_domain || vopc_b32_mask || vop3_b32_mask_write);
+            (scalar_cselect_vcc_bridge ||
+             (!rs.sreg.contains(base) &&
+              ((in.fmt == Rdna2Format::SOP1 &&
+                (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
+                 in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) ||
+               sop2_b32_mask_domain || vopc_b32_mask || vop3_b32_mask_write)));
         const bool writes_b64_mask = effective_width == 2 && !vopc_b32_mask &&
             scalar_write_is_b64_mask(in, base);
         for (uint32_t word = 0; word < effective_width; ++word) {
@@ -6623,6 +6644,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg_srt.erase(in.dst.value);
                     if (in.dst.value == 106) rs.vcc = result;
                 }
+                return true;
+            }
+            if (b.is_compute && is_scalar_cselect_b32_to_vcc_lo(in)) {
+                // The mask-domain cselect above remains first: this bridge is only for the distinct
+                // scalar-data lifetime seen in GTA V. Preserve the full selected dword in `sreg`,
+                // publish its bit for this guest lane as VCC, and leave SCC unchanged as required by
+                // S_CSELECT_B32. Wave64 cannot represent both dwords this way and stays rejected.
+                if (!allows_compute_scalar_vcc_bridge(b)) { ok = false; return true; }
+                if (!rs.scc) { ok = false; return true; }
+                const uint32_t selected = b.sel(rs.scc, val(in.src[0]), val(in.src[1]));
+                if (!ok) return true;
+                rs.sreg[106] = selected;
+                rs.sreg_srt.erase(106);
+                const uint32_t lane = b.ibin(
+                    Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
+                const uint32_t bit = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, selected, lane), b.uconst(1));
+                rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                rs.sreg_bool[106] = rs.vcc;
+                rs.sreg_bool_narrowed[106] = true;
+                rs.sreg_bool_b32.insert(106);
                 return true;
             }
             if (b.allow_b32_masks &&
@@ -12502,6 +12545,7 @@ bool emit_cfg_state_machine(
     const bool direct_dispatch = graphics || b.native_subgroup_size;
     const bool proven_wave32_masks = b.allow_b32_masks &&
         (b.is_fragment || (b.is_compute && b.wave_size == 32));
+    const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
     const uint32_t wave_count = b.is_compute
         ? (b.local_count + b.wave_size - 1) / b.wave_size : 0;
     const uint32_t padded_lanes = wave_count * b.wave_size;
@@ -12518,7 +12562,9 @@ bool emit_cfg_state_machine(
                 ((in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
                  (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 &&
                   in.opcode <= 0x12a && base == in.sdst.value) ||
-                 (vop3b_fresh_carry_output(in) && base == in.sdst.value));
+                 (vop3b_fresh_carry_output(in) && base == in.sdst.value) ||
+                 (compute_scalar_vcc_bridge &&
+                  is_scalar_cselect_b32_to_vcc_lo(in) && base == 106));
             if (wave32_one_word_mask)
                 static_mask_keys.insert(base);
             else if (base <= 105 && scalar_write_is_b64_mask(in, base))
@@ -13142,6 +13188,8 @@ bool emit_cfg_state_machine(
                 if (in.fmt == Rdna2Format::SOP2 &&
                     (in.opcode == 0x0a || (in.opcode >= 0x0e &&
                                            in.opcode <= 0x1c && (in.opcode & 1u) == 0))) {
+                    const bool scalar_vcc_bridge = compute_scalar_vcc_bridge &&
+                        is_scalar_cselect_b32_to_vcc_lo(in);
                     const bool mask_domain = in.dst.value == 126 || in.src[0].value == 126 ||
                         in.src[1].value == 126 ||
                         (((in.src[0].kind == OperandKind::SGPR ||
@@ -13150,8 +13198,9 @@ bool emit_cfg_state_machine(
                         (((in.src[1].kind == OperandKind::SGPR ||
                            in.src[1].kind == OperandKind::Special) &&
                           masks.contains(in.src[1].value)));
-                    writes_b32_mask = mask_domain && source_mask(in.src[0]) &&
-                        source_mask(in.src[1]) && in.dst.value != 127;
+                    writes_b32_mask = scalar_vcc_bridge ||
+                        (mask_domain && source_mask(in.src[0]) &&
+                         source_mask(in.src[1]) && in.dst.value != 127);
                 }
 
                 int b32_write_reg = writes_b32_mask ? in.dst.value : -1;
@@ -14105,7 +14154,10 @@ bool emit_cfg_state_machine(
                 bool ok = true;
                 const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
                                               allow_smem, rt, /*allow_wave*/false);
-                if (handled && ok) record_scalar_write(state, in);
+                if (handled && ok)
+                    record_scalar_write(
+                        state, in,
+                        allows_compute_scalar_vcc_bridge(b));
                 if (!handled || !ok) {
                     if (getenv("PROSPER_DBG"))
                         // The raw INSTRUCTION WORDS, because without them this line cannot be acted
@@ -15481,7 +15533,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             bool ok = true;
             const bool handled = emit_alu(
                 b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
-            if (handled && ok) record_scalar_write(rs, in);
+            if (handled && ok)
+                record_scalar_write(
+                    rs, in,
+                    allows_compute_scalar_vcc_bridge(b));
             // Shader I/O tap: snapshot this instruction's destination VGPR (+3) if it is the tapped PC.
             if (handled && ok && in.pc == b.tap_pc && in.dst.kind == OperandKind::VGPR) {
                 auto tv = [&](int r) { auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
@@ -16925,7 +16980,10 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         const bool emitted = emit_alu(
             b, rs, in, ok, /*allow_exec_update*/true, &safe_branches,
             /*allow_smem*/true, /*rt*/nullptr, /*allow_wave*/true);
-        if (emitted && ok) record_scalar_write(rs, in);
+        if (emitted && ok)
+            record_scalar_write(
+                rs, in,
+                allows_compute_scalar_vcc_bridge(b));
         bool handled = cf_reconstructed(in) || (emitted && ok);
         // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
         // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass

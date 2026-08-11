@@ -789,6 +789,43 @@ int main() {
     CHECK(got17d1m.size() == 64 && bad17d1m == 0,
           "Wave32 scalar mask activates only its selected guest lanes");
 
+    // Kernel 17d1c: GTA V's exact PC1309 packet selects scalar s4 into VCC_LO, preserves the
+    // selected dword as scalar data, and exposes each bit as this lane's implicit cndmask predicate.
+    // PC1310 is retained between producer and consumer. A second scalar cselect pins SCC preservation;
+    // the final XOR pins the simultaneous scalar-data lifetime instead of testing only the mask view.
+    const uint32_t code17d1c[] = {
+        0xbe8403ffu, 0x80000009u, // s_mov_b32 s4, 0x80000009
+        0xbf060000u,              // s_cmp_eq_u32 s0, s0 (SCC=1)
+        0x7e020287u,              // v_mov_b32 v1, 7
+        0x856a8004u,              // s_cselect_b32 vcc_lo, s4, 0 (exact GTA V packet)
+        0x061212f2u,              // PC1310 packet between the cselect and implicit consumer
+        0x02020290u,              // v_cndmask_b32 v1, 16, v1, vcc (exact PC1311 packet)
+        0x85058281u,              // s_cselect_b32 s5, 1, 2 (SCC must still be one)
+        0x4a020205u,              // v_add_nc_u32 v1, s5, v1
+        0x3a02026au,              // v_xor_b32 v1, vcc_lo, v1 (full scalar dword)
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> portable_spv17d1c = recompile_compute(
+        code17d1c, std::size(code17d1c), &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1c.empty(),
+          "GTA V Wave32 scalar cselect publishes a VCC_LO predicate");
+    std::vector<uint32_t> initial17d1c(64, 0u), got17d1c;
+    prosper::test::run_compute(portable_spv17d1c, std::vector<float>(64, 0.0f),
+                               64, 64, {}, initial17d1c, &got17d1c);
+    constexpr uint32_t scalar_mask17d1c = 0x80000009u;
+    uint32_t bad17d1c = 0;
+    for (uint32_t lane = 0; lane < 64 && got17d1c.size() == 64; ++lane) {
+        const bool selected = ((scalar_mask17d1c >> (lane & 31u)) & 1u) != 0;
+        const uint32_t expected = scalar_mask17d1c ^ (selected ? 8u : 17u);
+        bad17d1c += got17d1c[lane] != expected;
+    }
+    CHECK(got17d1c.size() == 64 && bad17d1c == 0,
+          "scalar cselect selects lane bits, retains its dword, and preserves SCC");
+    CHECK(recompile_compute(code17d1c, std::size(code17d1c), &rt17d1,
+                            native_cfg17d).empty(),
+          "scalar-data cselect into VCC_LO remains rejected for Wave64");
+
     // Kernel 17d1w: the next Astro traversal instruction writes a scalar-data VCC_HI value to the
     // VGPR lane selected by s45. Preserve v1's local-id value in every other lane so execution tests
     // both halves of V_WRITELANE's read/modify/write behavior. These are the exact GFX10 packets for
