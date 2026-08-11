@@ -7913,8 +7913,10 @@ int main() {
         codeT25bRor8, std::size(codeT25bRor8), 1, 0);
     CHECK(!spvT25bRor8.empty(),
           "recompiled T25b-ror8 (GTA V exact V_MIN_F32 ROW_ROR:8) -> SPIR-V");
-    CHECK(compute_spirv_min_subgroup_size(spvT25bRor8) == 16,
-          "T25b-ror8: row rotate advertises its 16-lane host contract");
+    CHECK(compute_spirv_min_subgroup_size(spvT25bRor8) == 0 &&
+              count_spirv_opcode(spvT25bRor8, 345) == 0 &&
+              count_spirv_opcode(spvT25bRor8, 224) == 4,
+          "T25b-ror8: portable lowering uses scratch barriers without a subgroup contract");
 
     const uint32_t codeT25bRor8Distinct[] = {
         0x1e0402fau, 0xff092800u,             // v_min_f32_dpp v2,v0,v1 row_ror:8 BC:1
@@ -7939,8 +7941,7 @@ int main() {
     CHECK(!spvT25bRor8Exec.empty(),
           "T25b-ror8: exact live v2 packet recompiles with narrowed EXEC");
 
-    if (can_shuffleT25b && subgroupT25b.size >= 16 &&
-        !spvT25bRor8.empty() && !spvT25bRor8Distinct.empty() &&
+    if (!spvT25bRor8.empty() && !spvT25bRor8Distinct.empty() &&
         !spvT25bRor8Exec.empty()) {
         std::vector<float> inRor8(128), expectedRor8(128);
         std::vector<float> inRor8Distinct(128 * 3), expectedRor8Distinct(128);
@@ -7970,16 +7971,139 @@ int main() {
             spvT25bRor8Distinct, inRor8Distinct, 128, 128);
         const std::vector<float> gotRor8Exec = prosper::test::run_compute(
             spvT25bRor8Exec, inRor8Exec, 128, 128);
-        CHECK(gotRor8 == expectedRor8,
-              "T25b-ror8: exact packet rotates within each DPP16 row before V_MIN_F32");
+        CHECK(gotRor8 == expectedRor8 && gotRor8.size() == 128 &&
+                  gotRor8[0] == expectedRor8[0] && gotRor8[64] == expectedRor8[64],
+              "T25b-ror8: portable CFG rotates two guest waves in linear-local DPP16 rows");
         CHECK(gotRor8Distinct == expectedRor8Distinct,
               "T25b-ror8: DPP transforms SRC0 while SRC1 stays in the current lane");
         CHECK(gotRor8Exec == expectedRor8Exec,
               "T25b-ror8: BC1 source invalidation and destination EXEC are independent");
     } else {
-        std::printf("  [skip] T25b-ror8 execution: host subgroup %u is narrower than 16\n",
+        std::printf("  [skip] T25b-ror8 execution: portable modules failed to compile\n");
+    }
+
+    // The live backend can still select the direct shuffle when it can require one exact Wave64
+    // subgroup. Use one resource-backed kernel for both modes: the portable module runs two guest
+    // waves through CFG scratch independent of host subgroup layout, while the native module must
+    // contain the two ROW_ROR shuffles (value + source EXEC) and no workgroup barrier.
+    const uint32_t codeT25bRor8Backend[] = {
+        0x7e020d00u,                         // v_cvt_f32_u32 v1,v0
+        0x1e0202fau, 0xff092801u,            // v_min_f32_dpp v1,v1,v1 row_ror:8 BC:1
+        0xe0702000u, 0x80020100u,            // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable ror8BackendTable;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      ror8BackendTable.resources.push_back(output); }
+    ComputeShaderConfig portableRor8Config;
+    portableRor8Config.local_x = 128;
+    portableRor8Config.wave_size = 64;
+    portableRor8Config.native_subgroup_size = 0;
+    const std::vector<uint32_t> portableRor8Spv = recompile_compute(
+        codeT25bRor8Backend, std::size(codeT25bRor8Backend),
+        &ror8BackendTable, portableRor8Config);
+    ComputeShaderConfig nativeRor8Config = portableRor8Config;
+    nativeRor8Config.native_subgroup_size = 64;
+    const std::vector<uint32_t> nativeRor8Spv = recompile_compute(
+        codeT25bRor8Backend, std::size(codeT25bRor8Backend),
+        &ror8BackendTable, nativeRor8Config);
+    CHECK(!portableRor8Spv.empty() &&
+              compute_spirv_min_subgroup_size(portableRor8Spv) == 0 &&
+              count_spirv_opcode(portableRor8Spv, 345) == 0 &&
+              count_spirv_opcode(portableRor8Spv, 224) == 4,
+          "T25b-ror8: explicit native-size-zero backend selects portable CFG scratch");
+    CHECK(!nativeRor8Spv.empty() &&
+              count_spirv_opcode(nativeRor8Spv, 345) == 2 &&
+              count_spirv_opcode(nativeRor8Spv, 224) == 0,
+          "T25b-ror8: exact Wave64 backend selects two direct shuffles and no barrier");
+    std::vector<uint32_t> expectedRor8Backend(128);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const uint32_t source = (lane & ~15u) | ((lane & 15u) ^ 8u);
+        expectedRor8Backend[lane] = bits_of(
+            std::min(static_cast<float>(source), static_cast<float>(lane)));
+    }
+    std::vector<uint32_t> portableRor8Got;
+    if (!portableRor8Spv.empty())
+        prosper::test::run_compute(
+            portableRor8Spv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &portableRor8Got);
+    CHECK(portableRor8Got == expectedRor8Backend,
+          "T25b-ror8: explicit portable backend executes two Wave64 rows exactly");
+    ComputeShaderConfig partialRor8Config = portableRor8Config;
+    partialRor8Config.local_x = 73;
+    const std::vector<uint32_t> partialRor8Spv = recompile_compute(
+        codeT25bRor8Backend, std::size(codeT25bRor8Backend),
+        &ror8BackendTable, partialRor8Config);
+    std::vector<uint32_t> partialRor8Expected(73), partialRor8Got;
+    for (uint32_t lane = 0; lane < partialRor8Expected.size(); ++lane) {
+        const uint32_t source = (lane & ~15u) | ((lane & 15u) ^ 8u);
+        const float sourceValue = source < partialRor8Expected.size()
+            ? static_cast<float>(source) : 0.0f;
+        partialRor8Expected[lane] = bits_of(
+            std::min(sourceValue, static_cast<float>(lane)));
+    }
+    if (!partialRor8Spv.empty())
+        prosper::test::run_compute(
+            partialRor8Spv, std::vector<float>(73, 0.0f), 73, 73, {},
+            std::vector<uint32_t>(73, 0xdeadbeefu), &partialRor8Got);
+    CHECK(!partialRor8Spv.empty() && partialRor8Got == partialRor8Expected,
+          "T25b-ror8: BC1 zero-fills missing sources in a partial final DPP16 row");
+    const bool canExecuteNativeRor8 = subgroupT25b.size == 64 &&
+        (subgroupT25b.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroupT25b.operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    if (canExecuteNativeRor8 && !nativeRor8Spv.empty()) {
+        std::vector<uint32_t> nativeRor8Got;
+        prosper::test::run_compute(
+            nativeRor8Spv, std::vector<float>(128, 0.0f), 128, 128, {},
+            std::vector<uint32_t>(128, 0xdeadbeefu), &nativeRor8Got);
+        CHECK(nativeRor8Got == expectedRor8Backend,
+              "T25b-ror8: exact Wave64 native backend executes both guest waves exactly");
+    } else {
+        std::printf("  [skip] T25b-ror8 native execution: host subgroup is %u or lacks shuffle\n",
                     subgroupT25b.size);
     }
+
+    // Keep the two portable DPP operation families in one module. They intentionally have separate
+    // pending state and barrier-bracketed scratch phases, plus one shared disjoint event namespace;
+    // the ROW_SHR phase must not consume ROW_ROR metadata (or vice versa) while scratch is reused.
+    const uint32_t codeT25bRor8ThenAdd[] = {
+        0x1e0000fau, 0xff092800u,            // v_min_f32_dpp v0,v0,v0 row_ror:8 BC:1
+        0x4a0000fau, 0xff011100u,            // v_add_nc_u32_dpp v0,v0,v0 row_shr:1 BC:0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> ror8ThenAddSpv = recompile_valu(
+        codeT25bRor8ThenAdd, std::size(codeT25bRor8ThenAdd), 1, 0);
+    CHECK(!ror8ThenAddSpv.empty() && count_spirv_opcode(ror8ThenAddSpv, 345) == 0 &&
+              count_spirv_opcode(ror8ThenAddSpv, 224) == 6,
+          "T25b-ror8: combined portable DPP families retain isolated scratch phases");
+    std::vector<float> ror8ThenAddInput(128), ror8ThenAddGot;
+    std::vector<uint32_t> ror8ThenAddExpected(128);
+    for (uint32_t lane = 0; lane < 128; ++lane)
+        ror8ThenAddInput[lane] = static_cast<float>(1000u + lane);
+    for (uint32_t lane = 0; lane < 128; ++lane) {
+        const uint32_t source = (lane & ~15u) | ((lane & 15u) ^ 8u);
+        const uint32_t rotatedMin = bits_of(std::min(
+            ror8ThenAddInput[source], ror8ThenAddInput[lane]));
+        if ((lane & 15u) == 0) {
+            ror8ThenAddExpected[lane] = rotatedMin;
+        } else {
+            const uint32_t priorSource = ((lane - 1u) & ~15u) |
+                (((lane - 1u) & 15u) ^ 8u);
+            const uint32_t priorMin = bits_of(std::min(
+                ror8ThenAddInput[priorSource], ror8ThenAddInput[lane - 1u]));
+            ror8ThenAddExpected[lane] = rotatedMin + priorMin;
+        }
+    }
+    if (!ror8ThenAddSpv.empty())
+        ror8ThenAddGot = prosper::test::run_compute(
+            ror8ThenAddSpv, ror8ThenAddInput, 128, 128);
+    uint32_t ror8ThenAddBad = 0;
+    for (uint32_t lane = 0; lane < 128 && ror8ThenAddGot.size() == 128; ++lane)
+        ror8ThenAddBad += bits_of(ror8ThenAddGot[lane]) != ror8ThenAddExpected[lane];
+    CHECK(ror8ThenAddGot.size() == 128 && ror8ThenAddBad == 0,
+          "T25b-ror8: combined rotate/add phases reuse scratch without cross-matching events");
 
     const uint32_t unsupportedRor8[][2] = {
         {0x1e0000fau, 0xff012800u},           // V_MIN_F32 BOUND_CTRL=0
