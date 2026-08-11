@@ -1327,6 +1327,7 @@ int main() {
             resource.img_dim = 1;
             resource.proven_zero_mip = true;
         } else if (resource.binding == 5) {
+            resource.img_dim = 1; // exact destination IMAGE_STORE has DIM=2D
             resource.gpu_addr = reinterpret_cast<uint64_t>(mip2d_dst.data());
             resource.size = static_cast<uint32_t>(mip2d_dst.size());
         }
@@ -1383,6 +1384,7 @@ int main() {
             resource.layer_mip_offset_bytes = 0;
             resource.proven_zero_mip = true;
         } else if (resource.binding == 5) {
+            resource.img_dim = 1; // exact destination IMAGE_STORE has DIM=2D
             resource.format = DataFormat::Uint32;
             resource.num_components = 1;
             resource.gpu_addr = reinterpret_cast<uint64_t>(mip_array_dst.data());
