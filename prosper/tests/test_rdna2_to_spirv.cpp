@@ -1671,6 +1671,57 @@ int main() {
                     subgroup17d1.size);
     }
 
+    // Kernel 17d1w64: GTA V's Wave64 BVH traversal repeatedly writes the scalar result of a mask
+    // scan into an ordinary VGPR at a dynamic scalar lane. Keep the exact first live packet after
+    // the established irreducible dispatcher prefix. Selector 127 must wrap to lane 63,
+    // distinguishing the full Wave64 selector from the established Wave32 form above.
+    const uint32_t code17d1w64[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7c020300u,              // v_cmp_lt_u32 vcc, v0, v1
+        0xbf860001u,              // s_cbranch_vccz pc4
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0
+        0xbf870001u,              // s_cbranch_vccnz pc7
+        0xbf82fffdu,              // s_branch pc4 (irreducible dispatcher back-edge)
+        0x7e3c0300u,              // v_mov_b32 v30, v0
+        0xbe9003ffu, 0x0000007bu, // s_mov_b32 s16, 123
+        0xbed603ffu, 0x0000007fu, // s_mov_b32 s86, 127
+        0xd761001eu, 0x0000ac10u, // GTA pc12: v_writelane_b32 v30, s16, s86
+        0xe0702000u, 0x80021e00u, // buffer_store_dword v30, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ComputeShaderConfig native_cfg17d1w64 = native_cfg17d;
+    native_cfg17d1w64.local_x = 64;
+    native_cfg17d1w64.local_y = 1;
+    const std::vector<uint32_t> native_spv17d1w64 = recompile_compute(
+        code17d1w64, std::size(code17d1w64), &rt17d1, native_cfg17d1w64);
+    CHECK(!native_spv17d1w64.empty(),
+          "GTA Wave64 dynamic v_writelane lowers inside the exact native CFG dispatcher");
+    ComputeShaderConfig portable_cfg17d1w64 = native_cfg17d1w64;
+    portable_cfg17d1w64.native_subgroup_size = 0;
+    ComputeShaderConfig mismatched_cfg17d1w64 = native_cfg17d1w64;
+    mismatched_cfg17d1w64.native_subgroup_size = 32;
+    CHECK(recompile_compute(code17d1w64, std::size(code17d1w64), &rt17d1,
+                            portable_cfg17d1w64).empty() &&
+              recompile_compute(code17d1w64, std::size(code17d1w64), &rt17d1,
+                                mismatched_cfg17d1w64).empty(),
+          "Wave64 dynamic v_writelane rejects portable and mismatched subgroup contracts");
+    if (can_execute17d1b && !native_spv17d1w64.empty()) {
+        std::vector<uint32_t> initial17d1w64(64, 0u), got17d1w64;
+        prosper::test::run_compute(native_spv17d1w64, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, initial17d1w64, &got17d1w64);
+        uint32_t bad17d1w64 = 0;
+        for (uint32_t lane = 0; lane < 64 && got17d1w64.size() == 64; ++lane) {
+            const uint32_t expected = lane == 63u ? 123u : lane;
+            bad17d1w64 += got17d1w64[lane] != expected;
+        }
+        CHECK(got17d1w64.size() == 64 && bad17d1w64 == 0,
+              "Wave64 dynamic writelane masks its selector to six bits and updates only lane 63");
+    } else {
+        std::printf("  [skip] Wave64 dynamic writelane execution: host default subgroup is %u\n",
+                    subgroup17d1.size);
+    }
+
     // Kernel 17d2: Astro's mask-priority sequence compares a VOPC-produced SGPR pair against zero,
     // then uses that wave-uniform SCC in s_cselect_b64.  Keep the irreducible prefix so this exercises
     // the generic dispatcher.  Wave 0's mask is empty and selects all lanes; wave 1 has one set bit in
