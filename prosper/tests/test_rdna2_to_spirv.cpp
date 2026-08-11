@@ -1884,14 +1884,8 @@ int main() {
                 count_spirv_opcode(native_spv17d, 335),
                 count_spirv_opcode(native_spv17d2v, 335),
                 count_spirv_opcode(native_ambiguous_join, 335));
-    CHECK(!portable_ambiguous_join.empty() &&
-              count_spirv_opcode(portable_ambiguous_join, 224) ==
-                  count_spirv_opcode(spv17d, 224),
-          "portable VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
-    CHECK(!native_ambiguous_join.empty() &&
-              count_spirv_opcode(native_ambiguous_join, 335) ==
-                  count_spirv_opcode(native_spv17d, 335),
-          "native VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
+    CHECK(portable_ambiguous_join.empty() && native_ambiguous_join.empty(),
+          "Wave64 VCC mask/scalar lifetime join rejects before its u64 consumer");
 
     // Kernel 17d2x: Syberia's fullscreen compute pass compares current EXEC with a mask written
     // directly to s[16:17] by VOPC.  Keep the irreducible prefix so the comparison must use the
@@ -5308,6 +5302,50 @@ int main() {
     CHECK(pair_true_got.size() == 128 && pair_false_got.size() == 128 && pair_bad == 0,
           "S_CSELECT_B64 selects both scalar dwords for SCC true and false");
 
+    // Select the pair inside a counted loop and consume both words only after its exit. Both
+    // destinations therefore need loop-header PHIs; carrying just the encoded low destination
+    // leaves the high-word definition inside the loop body without dominance at the postlude.
+    const uint32_t code38_pair_loop[] = {
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbe820395u,              // s_mov_b32 s2,21
+        0xbe830396u,              // s_mov_b32 s3,22
+        0xbe940380u,              // s_mov_b32 s20,0 (induction variable)
+        0xbe950382u,              // s_mov_b32 s21,2 (trip count)
+        0xbf0a1514u,              // loop: s_cmp_lt_u32 s20,s21
+        0xbf840005u,              // s_cbranch_scc0 +5 -> postlude
+        0xbe8c0381u,              // s_mov_b32 s12,1
+        0xbf07800cu,              // SCC=true for the pair select
+        0x85840200u,              // s_cselect_b64 s[4:5],s[0:1],s[2:3]
+        0x81148114u,              // s_add_i32 s20,s20,1
+        0xbf82fff9u,              // s_branch -7 -> loop header
+        0x7e020204u,              // v_mov_b32 v1,s4
+        0xe0702000u, 0x80020100u, // output[lane] = selected low
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e020205u,              // v_mov_b32 v1,s5
+        0xe0702000u, 0x80020102u, // output[64+lane] = selected high
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> pair_loop_words(
+        std::begin(code38_pair_loop), std::end(code38_pair_loop));
+    const auto pair_loop_portable = compile_cselect_pair(
+        pair_loop_words, cselect_portable_config);
+    const auto pair_loop_native = compile_cselect_pair(
+        pair_loop_words, cselect_native_config);
+    CHECK(!pair_loop_portable.empty() && !pair_loop_native.empty(),
+          "counted loop carries both S_CSELECT_B64 scalar destination words");
+    CHECK(count_spirv_opcode(pair_loop_portable, 245) == 6 &&
+              count_spirv_opcode(pair_loop_native, 245) == 6,
+          "counted loop emits separate PHIs for both selected destination dwords");
+    const auto pair_loop_got = run_cselect_pair(pair_loop_portable);
+    uint32_t pair_loop_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && pair_loop_got.size() == 128; ++lane) {
+        pair_loop_bad += pair_loop_got[lane] != 11u;
+        pair_loop_bad += pair_loop_got[64 + lane] != 12u;
+    }
+    CHECK(pair_loop_got.size() == 128 && pair_loop_bad == 0,
+          "counted-loop postlude observes both selected scalar dwords");
+
     // Force the arbitrary-CFG dispatcher, select two ordinary scalar pairs in one case, then
     // consume them with a second S_CSELECT_B64 after an explicit successor edge. The dispatcher's
     // Bool backing variables exist because this opcode can also select masks, but mere variable
@@ -5332,8 +5370,6 @@ int main() {
         0x85860200u,              // s_cselect_b64 s[6:7],s[0:1],s[2:3] -> 21:22
         0xbf820001u,              // cross a dispatcher edge to pc19
         0xbf800000u,
-        0xbe85038cu,              // replace s5 after reload; isolate low-root domain persistence
-        0xbe870396u,              // replace s7 after reload
         0xbe8c0381u,              // s_mov_b32 s12,1
         0xbf07800cu,              // SCC=true
         0x858e0604u,              // s_cselect_b64 s[14:15],s[4:5],s[6:7]
@@ -5360,6 +5396,44 @@ int main() {
     }
     CHECK(pair_dispatch_got.size() == 128 && pair_dispatch_bad == 0,
           "dispatcher successor consumes both selected scalar dwords as data");
+
+    // The same physical pair cannot be reconstructed at a join when one predecessor owns a saved
+    // wave mask and the other owns ordinary scalar data. The dispatcher has separate Bool/u32
+    // backing variables but no runtime domain tag, so consuming s[4:5] at the join must reject in
+    // both portable and native paths instead of silently reading either variable's zero placeholder.
+    const uint32_t code38_pair_ambiguous_join[] = {
+        0x7e040280u,              // irreducible dispatcher prefix (same shape as kernel 17d)
+        0x7d840100u,
+        0xbf860001u,
+        0x7e040281u,
+        0x7d840100u,
+        0xbf870001u,
+        0xbf82fffdu,
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbf800000u,              // s12 remains a dynamic entry user SGPR
+        0xbf07800cu,              // SCC=(s12 != 0), so both CFG successors remain reachable
+        0xbf840002u,              // s_cbranch_scc0 +2 -> scalar-data predecessor
+        0xbe84046au,              // mask predecessor: s_mov_b64 s[4:5],vcc
+        0xbf820001u,              // -> join
+        0xbe840400u,              // data predecessor: s_mov_b64 s[4:5],s[0:1]
+        0xbf138004u,              // join consumer: s_cmp_lg_u64 s[4:5],0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> pair_ambiguous_join_words(
+        std::begin(code38_pair_ambiguous_join), std::end(code38_pair_ambiguous_join));
+    ComputeShaderConfig pair_ambiguous_portable_config = cselect_portable_config;
+    pair_ambiguous_portable_config.user_sgprs.resize(13);
+    ComputeShaderConfig pair_ambiguous_native_config = cselect_native_config;
+    pair_ambiguous_native_config.user_sgprs.resize(13);
+    const auto pair_ambiguous_portable = compile_cselect_pair(
+        pair_ambiguous_join_words, pair_ambiguous_portable_config);
+    const auto pair_ambiguous_native = compile_cselect_pair(
+        pair_ambiguous_join_words, pair_ambiguous_native_config);
+    CHECK(pair_ambiguous_portable.empty(),
+          "portable dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
+    CHECK(pair_ambiguous_native.empty(),
+          "native dispatcher rejects a Wave64 mask/scalar pair join at its u64 consumer");
 
     const uint32_t code38_vcc_true[] = {
         0xbe8003ffu, 0x80000001u, // source0 low: lanes 0 and 31
