@@ -1860,6 +1860,45 @@ int main() {
     }
     printf("  [ok]   explicit Wave32 VCC_HI cndmask requires its own unambiguous mask\n");
 
+    // GTA V's live Wave32 kernel reaches the exact v_add_co_u32 packet below after joining a path
+    // where s0 is a VOPC mask with one where it is scalar data. The instruction has no carry-in:
+    // dword1's zero SRC2 field is reserved/non-operand bits, not an architectural read of s0. It
+    // replaces that ambiguous lifetime with a fresh carry in s0, which the exact later _co_ci_
+    // packet legitimately consumes. The irreducible tail forces the same portable CFG dispatcher
+    // that diagnosed the production kernel at this site.
+    const uint32_t wave32_compute_vop3b_two_source_join[] = {
+        0x7d8a06f9u, 0x06868080u,            // pc0: exact VOPC SDWA packet -> s0 mask
+        0xbf060000u,                         // pc2: scalar branch condition
+        0xbf840001u,                         // pc3: one edge retains the s0 mask
+        0xbe800380u,                         // pc4: other edge replaces s0 with scalar data
+        0xd70f0016u, 0x00021f1bu,            // pc5: exact v_add_co_u32 v22,s0,v27,v15
+        0xd5286a17u, 0x00024080u,            // pc7: exact v_add_co_ci_u32 consumes s0
+        0x7e040280u,                         // pc9: irreducible crossing-CFG tail
+        0x7c020300u,                         // pc10: v_cmp_lt_u32_e32 vcc, v0, v1
+        0xbf860001u,                         // pc11: s_cbranch_vccz -> pc13
+        0x7e040281u,                         // pc12: v_mov_b32_e32 v2, 1
+        0x7d840100u,                         // pc13: v_cmp_eq_u32_e32 vcc, v0, v0
+        0xbf870001u,                         // pc14: s_cbranch_vccnz -> pc16
+        0xbf82fffdu,                         // pc15: s_branch -> pc13
+        0x7e040d02u,                         // pc16: v_mov_b32_e32 v2, v2
+        0xbf810000u,
+    };
+    ComputeShaderConfig wave32_vop3b_two_source_config;
+    wave32_vop3b_two_source_config.wave_size = 32;
+    wave32_vop3b_two_source_config.local_x = 64;
+    wave32_vop3b_two_source_config.native_subgroup_size = 0;
+    const auto vop3b_two_source_join_spv = recompile_compute(
+        wave32_compute_vop3b_two_source_join,
+        std::size(wave32_compute_vop3b_two_source_join), nullptr,
+        wave32_vop3b_two_source_config);
+    if (vop3b_two_source_join_spv.empty() || !has_opcode(vop3b_two_source_join_spv, 251) ||
+        !type_result_ids_are_nonzero(vop3b_two_source_join_spv, nullptr) ||
+        !phi_ids_are_nonzero(vop3b_two_source_join_spv)) {
+        printf("  [FAIL] Wave32 CFG treated two-source VOP3B carry output as reading SRC2\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG admits exact two-source VOP3B carry packet at an s0 join\n");
+
     // GTA V's rejected Wave32 compute siblings produce a fresh VCC_LO carry at PC79 with the
     // no-carry-in VOP3B family, then consume it at PC83 through implicit VCC. A later crossing CFG
     // forces the portable arbitrary-CFG dispatcher, which must carry that one-word mask lifetime

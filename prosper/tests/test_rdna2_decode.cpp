@@ -576,8 +576,33 @@ int main() {
     Rdna2Inst ac = rdna2_decode_one(addco, 2);
     CHECK(ac.fmt == Rdna2Format::VOP3 && ac.opcode == 0x30Fu &&
           ac.sdst.kind == OperandKind::SGPR && ac.sdst.value == 4 &&
+          ac.n_src == 2 && ac.src[2].kind == OperandKind::None &&
           !ac.src_abs[0] && !ac.src_abs[1] && !ac.src_abs[2],
-          "VOP3B v_add_co_u32 (0x30F) decodes SDST s4 and clears the mis-read abs bits");
+          "VOP3B v_add_co_u32 (0x30F) decodes two sources, SDST s4, and no phantom SRC2");
+    // Exact GTA V packets at the reported join and its later carry consumer. The producer's zero
+    // reserved field must not decode as s0; the _co_ci_ consumer's identically valued SRC2 is real.
+    const uint32_t live_addco[] = { 0xd70f0016u, 0x00021f1bu };
+    const uint32_t live_addcoci[] = { 0xd5286a17u, 0x00024080u };
+    const Rdna2Inst lac = rdna2_decode_one(live_addco, 2);
+    const Rdna2Inst laci = rdna2_decode_one(live_addcoci, 2);
+    CHECK(lac.opcode == 0x30Fu && lac.dst.kind == OperandKind::VGPR && lac.dst.value == 22 &&
+          lac.sdst.kind == OperandKind::SGPR && lac.sdst.value == 0 && lac.n_src == 2 &&
+          lac.src[0].kind == OperandKind::VGPR && lac.src[0].value == 27 &&
+          lac.src[1].kind == OperandKind::VGPR && lac.src[1].value == 15 &&
+          lac.src[2].kind == OperandKind::None &&
+          laci.opcode == 0x128u && laci.sdst.value == 106 && laci.n_src == 3 &&
+          laci.src[2].kind == OperandKind::SGPR && laci.src[2].value == 0,
+          "exact GTA V VOP3B producer has two sources while its carry consumer has three");
+    // The no-carry-in subtract forms have the same two-source VOP3B layout. Keep their decoded
+    // source inventory aligned with emission as well; only the 0x128..0x12A _co_ci_ family has an
+    // architectural carry-in in SRC2.
+    const uint32_t subco[] = { 0xd7100000u | (4u << 8), 0x00020501u };
+    const uint32_t subrevco[] = { 0xd7190000u | (4u << 8), 0x00020501u };
+    const Rdna2Inst sc = rdna2_decode_one(subco, 2);
+    const Rdna2Inst src = rdna2_decode_one(subrevco, 2);
+    CHECK(sc.opcode == 0x310u && sc.n_src == 2 && sc.src[2].kind == OperandKind::None &&
+          src.opcode == 0x319u && src.n_src == 2 && src.src[2].kind == OperandKind::None,
+          "VOP3B v_sub/subrev_co_u32 decode two sources and no phantom SRC2");
     // DS GDS flag is dword0 bit 17 (llvm-mc gfx1030: ds_add_u32 gds = 0xd8020000 vs 0xd8000000;
     // ds_append gds = 0xd8fa0000 vs plain 0xd8f80000).
     const uint32_t ds_plain[] = { 0xd8000000u, 0x00000201u };

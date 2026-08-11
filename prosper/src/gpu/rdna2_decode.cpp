@@ -464,6 +464,14 @@ void decode_operands(Rdna2Inst& i) {
                     break;
                 default: break;
             }
+            // The 0x30F/0x310/0x319 _co_ forms produce carry/borrow in SDST but do not consume a
+            // carry-in. Their reserved SRC2 field commonly decodes as s0; exposing that phantom
+            // operand makes CFG provenance reject a valid instruction when s0 differs across a
+            // join, before the instruction can replace it with its fresh carry result.
+            if (i.opcode == 0x30Fu || i.opcode == 0x310u || i.opcode == 0x319u) {
+                i.src[2] = {};
+                i.n_src = 2;
+            }
             // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
             // VERIFIED(llvm-mc gfx1030): 0x351/0x354/0x357 are v_min3_f16/v_max3_f16/v_med3_f16
