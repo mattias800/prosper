@@ -118,6 +118,7 @@ static const std::vector<KnownGap> kKnownGaps = {};
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
     {"safe_execz_branches_for_test", "returns a transformed RDNA2 instruction stream, not SPIR-V"},
+    {"structured_execz_branches_for_test", "returns analyzed RDNA2 branch PCs, not SPIR-V"},
     {"mask_test_branches_for_test",  "returns a transformed RDNA2 instruction stream, not SPIR-V"},
     {"recompile_graphics_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
@@ -304,9 +305,39 @@ int main(int argc, char** argv) {
     // Compute ALU (float chain).
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
+    // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
+    // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
+    { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};
+      dump(dir, "compute_alignbyte", recompile_valu(c, std::size(c), 6, 6), "recompile_valu"); }
+    // GTA V exec_cs_413d1bf00 pc458: exact V_LDEXP_F32 production packet. This exercises the
+    // integer-domain edge lowering under the strict Vulkan SPIR-V validator, not merely the generic
+    // recompile_valu entry point above.
+    { const uint32_t c[] = {0xd7620000u, 0x0002030du, 0xbf810000u};
+      dump(dir, "compute_ldexp", recompile_valu(c, sizeof(c) / sizeof(c[0]), 14, 0)); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // Compute + immediate SMEM x16 descriptor bundle. Both eight-dword halves are independently
+    // resolved by their consuming MIMG PCs; the load's one immediate offset is not a shared key.
+    { const uint32_t c[] = {
+          0xf4100300u, 0xfa000000u,
+          0xf0800f08u, 0x01630000u,
+          0xf0800f08u, 0x01850000u,
+          0xbf810000u};
+      ShaderResourceTable rt;
+      for (uint32_t i = 0; i < 2; ++i) {
+          ShaderResource t{};
+          t.cls = ResourceClass::Texture;
+          t.format = DataFormat::Float32;
+          t.num_components = 4;
+          t.binding = 4 + i;
+          t.fetch_pc = 2 + i * 2;
+          t.img_dim = 1;
+          t.width = t.height = 2;
+          rt.resources.push_back(t);
+      }
+      dump(dir, "compute_smem_x16_descriptor_bundle",
+           recompile_valu(c, sizeof(c)/4, 2, 0, &rt)); }
     // Compute private spill/fill, including a signed short crossing a dword boundary.
     { const uint32_t c[] = {0x7e0002ffu,0x00008001u,0xdc684003u,0x00000000u,0x7e000280u,
                             0xdc2c4003u,0x00000000u,0x7e000b00u,0xBF810000u};
@@ -396,6 +427,21 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
       vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "compute_store", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
+    // GTA V's cross-workgroup scan publication shape: distinct descriptor variables alias one guest
+    // allocation, a GLC store is released by vscnt(0), and a GLC+DLC load polls through the alias.
+    // This representative module strictly validates Aliased/Coherent decorations, per-access
+    // Volatile operands, and Device-scope UniformMemory release under SPIR-V 1.3 + Vulkan 1.1.
+    { const uint32_t c[] = {0xe0744008u,0x80001100u,0xbf8c3f70u,0xbbfd0000u,
+                            0xe0706010u,0x80001211u,0xe030e010u,0x80001e1du,
+                            0xbf810000u};
+      ShaderResourceTable rt;
+      ShaderResource publish{}; publish.cls=ResourceClass::ConstantBuffer;
+      publish.format=DataFormat::Uint32; publish.binding=4; publish.gpu_addr=0x1000;
+      publish.size=180; publish.stride=20; publish.fetch_pc=0; rt.resources.push_back(publish);
+      ShaderResource flag=publish; flag.binding=5; flag.fetch_pc=4; rt.resources.push_back(flag);
+      ShaderResource poll=publish; poll.binding=6; poll.fetch_pc=6; rt.resources.push_back(poll);
+      ComputeShaderConfig cfg; cfg.local_x=64; cfg.wave_size=64;
+      dump(dir, "compute_coherent_alias", recompile_compute(c, sizeof(c)/4, &rt, cfg)); }
     // Astro Bot exact raw buffer_store_dwordx3 packet.
     { const uint32_t c[] = {0x7e140f00u,0x7e060281u,0x7e080282u,0x7e0a0283u,
                             0xe07c2000u,0x8004030au,0xbf810000u};
@@ -413,6 +459,18 @@ int main(int argc, char** argv) {
       ComputeShaderConfig cfg; cfg.local_x=1;
       dump(dir, "compute_bvh_intersect", recompile_compute(c, sizeof(c)/4, &rt, cfg),
            "recompile_compute"); }
+    // GTA V's exact program 0x205b5e8600 pc1476 packet uses a 64-byte BVH. This separately covers
+    // the constant-false 128-byte-node bound that triangle and FP16-box allocations require.
+    { constexpr uint32_t pc = 1476u;
+      std::vector<uint32_t> c(pc, 0xbf800000u); // s_nop 0
+      const uint32_t tail[] = {0xf1989f07u,0x00060202u,0x28292c23u,0x22262725u,0x00002a24u,
+                               0xbf810000u};
+      c.insert(c.end(), tail, tail + sizeof(tail)/sizeof(tail[0]));
+      ShaderResourceTable rt; ShaderResource bvh{}; bvh.cls=ResourceClass::ConstantBuffer;
+      bvh.format=DataFormat::Uint32; bvh.num_components=1; bvh.binding=4;
+      bvh.size=64; bvh.fetch_pc=pc; rt.resources.push_back(bvh);
+      ComputeShaderConfig cfg; cfg.local_x=1;
+      dump(dir, "compute_bvh_intersect_64", recompile_compute(c.data(), c.size(), &rt, cfg)); }
     // Compute EXEC-predicated store (v_cmpx + guard execz + store).
     { const uint32_t c[] = {0x7e040f00u,0x06060100u,0x7e0a0284u,0x7da20b02u,0xbf880002u,0xe0102000u,0x80020302u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
@@ -435,6 +493,31 @@ int main(int argc, char** argv) {
       // image_load 2D_MSAA_ARRAY (dim 7): coords (x,y,layer) + sample — needs Arrayed+MS + ImageMSArray cap.
       const uint32_t cmsa[] = {0xF0000F3Au,0x00000000u,0x00030201u,0xBF8C3F70u,0xBF810000u};
       dump(dir, "storage_msaa_array_2d", recompile_valu(cmsa, sizeof(cmsa)/4, 1, 0, &rt)); }
+    // GTA V's audited one-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. Validate both sampled
+    // image shapes (including the retained array layer) and the NSA storage write strictly.
+    { ShaderResourceTable rt;
+      ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Uint32;
+      t.num_components=1; t.binding=4; t.fetch_pc=1; t.img_dim=1;
+      t.width=4; t.height=4; t.depth=1; t.size=64; t.proven_zero_mip=true;
+      rt.resources.push_back(t);
+      const uint32_t c[] = {0x7e040207u,0xf0043f08u,0x00050000u,0xbf810000u};
+      dump(dir, "compute_load_mip_zero_2d", recompile_valu(c, sizeof(c)/4, 1, 0, &rt));
+      rt.resources[0].img_dim=5; rt.resources[0].depth=2; rt.resources[0].size=128;
+      const uint32_t ca[] = {0x7e060206u,0xf0043128u,0x00050000u,0xbf810000u};
+      dump(dir, "compute_load_mip_zero_array", recompile_valu(ca, sizeof(ca)/4, 1, 0, &rt)); }
+    { ShaderResourceTable rt;
+      ShaderResource s{}; s.cls=ResourceClass::StorageImage; s.format=DataFormat::Uint32;
+      s.num_components=1; s.binding=4; s.fetch_pc=1; s.img_dim=1;
+      s.width=4; s.height=4; s.depth=1; s.size=64; s.proven_zero_mip=true;
+      rt.resources.push_back(s);
+      const uint32_t c[] = {
+          0x7e0a0206u,0xf024310au,0x00030004u,0x00000503u,0xbf810000u};
+      dump(dir, "compute_store_mip_zero_2d", recompile_valu(c, sizeof(c)/4, 1, 0, &rt));
+      rt.resources[0].format=DataFormat::Uint8; rt.resources[0].num_components=4;
+      const uint32_t cf[] = {
+          0x7e0c0206u,0xf0243f0au,0x00030005u,0x00000604u,0xbf810000u};
+      dump(dir, "compute_store_mip_zero_xyzw_2d",
+           recompile_valu(cf, sizeof(cf)/4, 1, 0, &rt)); }
     // Compute that SAMPLES a texture and STORES to a storage image (the bloom/downsample shape, shader 006):
     // exercises the sampled-texture path inside a compute shell (needs vec4<float> declared there).
     { ShaderResourceTable rt;

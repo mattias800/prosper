@@ -21,6 +21,8 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <tuple>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -73,6 +75,139 @@ static bool has_spirv_local_size(const std::vector<uint32_t>& spv,
         if ((spv[word] & 0xFFFFu) == OpExecutionMode && count == 6 &&
             spv[word + 2] == ExecutionModeLocalSize && spv[word + 3] == x &&
             spv[word + 4] == y && spv[word + 5] == z)
+            return true;
+        word += count;
+    }
+    return false;
+}
+
+static bool spirv_has_array_length(const std::vector<uint32_t>& spv,
+                                   uint32_t expected_length) {
+    constexpr uint16_t OpTypeArray = 28, OpConstant = 43;
+    std::map<uint32_t, uint32_t> constants;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpConstant && count == 4)
+            constants[spv[word + 2]] = spv[word + 3];
+        word += count;
+    }
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpTypeArray && count == 4) {
+            const auto length = constants.find(spv[word + 3]);
+            if (length != constants.end() && length->second == expected_length)
+                return true;
+        }
+        word += count;
+    }
+    return false;
+}
+
+struct SpirvBufferAccessSummary {
+    uint32_t variable = 0;
+    bool aliased = false;
+    bool coherent = false;
+    size_t loads = 0;
+    size_t volatile_loads = 0;
+    size_t stores = 0;
+    size_t volatile_stores = 0;
+};
+
+static SpirvBufferAccessSummary spirv_buffer_access_summary(
+        const std::vector<uint32_t>& spv, uint32_t binding) {
+    constexpr uint16_t OpVariable = 59, OpLoad = 61, OpStore = 62;
+    constexpr uint16_t OpAccessChain = 65, OpDecorate = 71;
+    constexpr uint32_t StorageBuffer = 12, DecorationAliased = 20;
+    constexpr uint32_t DecorationCoherent = 23, DecorationBinding = 33;
+    constexpr uint32_t MemoryAccessVolatile = 1;
+    SpirvBufferAccessSummary out;
+    std::map<uint32_t, uint32_t> pointer_base;
+    std::set<uint32_t> storage_variables;
+    std::set<uint32_t> aliased, coherent;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return {};
+        if (opcode == OpVariable && count == 4 && spv[word + 3] == StorageBuffer)
+            storage_variables.insert(spv[word + 2]);
+        if (opcode == OpDecorate && count >= 3) {
+            if (spv[word + 2] == DecorationBinding && count >= 4 &&
+                spv[word + 3] == binding)
+                out.variable = spv[word + 1];
+            if (spv[word + 2] == DecorationAliased) aliased.insert(spv[word + 1]);
+            if (spv[word + 2] == DecorationCoherent) coherent.insert(spv[word + 1]);
+        }
+        if (opcode == OpAccessChain && count >= 4)
+            pointer_base[spv[word + 2]] = spv[word + 3];
+        word += count;
+    }
+    if (!storage_variables.count(out.variable)) out.variable = 0;
+    out.aliased = aliased.count(out.variable) != 0;
+    out.coherent = coherent.count(out.variable) != 0;
+    auto root = [&](uint32_t pointer) {
+        std::set<uint32_t> seen;
+        while (pointer_base.count(pointer) && seen.insert(pointer).second)
+            pointer = pointer_base[pointer];
+        return pointer;
+    };
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return {};
+        if (opcode == OpLoad && count >= 4 && root(spv[word + 3]) == out.variable) {
+            ++out.loads;
+            if (count >= 5 && (spv[word + 4] & MemoryAccessVolatile))
+                ++out.volatile_loads;
+        }
+        if (opcode == OpStore && count >= 3 && root(spv[word + 1]) == out.variable) {
+            ++out.stores;
+            if (count >= 4 && (spv[word + 3] & MemoryAccessVolatile))
+                ++out.volatile_stores;
+        }
+        word += count;
+    }
+    return out;
+}
+
+static bool spirv_storage_buffer_has_decoration(const std::vector<uint32_t>& spv,
+                                                uint32_t binding,
+                                                uint32_t decoration) {
+    const SpirvBufferAccessSummary summary = spirv_buffer_access_summary(spv, binding);
+    if (!summary.variable) return false;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        if (!count || word + count > spv.size()) return false;
+        if ((spv[word] & 0xffffu) == 71u && count >= 3 &&
+            spv[word + 1] == summary.variable && spv[word + 2] == decoration)
+            return true;
+        word += count;
+    }
+    return false;
+}
+
+static bool spirv_has_device_uniform_release_barrier(const std::vector<uint32_t>& spv) {
+    constexpr uint16_t OpConstant = 43, OpMemoryBarrier = 225;
+    constexpr uint32_t ScopeDevice = 1, MemorySemanticsUniformRelease = 0x44;
+    std::map<uint32_t, uint32_t> constants;
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpConstant && count == 4)
+            constants[spv[word + 2]] = spv[word + 3];
+        word += count;
+    }
+    for (size_t word = 5; word < spv.size();) {
+        const uint32_t count = spv[word] >> 16;
+        const uint16_t opcode = static_cast<uint16_t>(spv[word]);
+        if (!count || word + count > spv.size()) return false;
+        if (opcode == OpMemoryBarrier && count == 3 &&
+            constants[spv[word + 1]] == ScopeDevice &&
+            constants[spv[word + 2]] == MemorySemanticsUniformRelease)
             return true;
         word += count;
     }
@@ -337,6 +472,169 @@ int main() {
     printf("  kernel9 mismatches=%u (out[5]=%g expect=%g)\n", bad9, got9.size()==N?got9[5]:-1, exp9[5]);
     CHECK(got9.size()==N && bad9==0, "recompiled kernel 9 (scalar s_mov/s_add/s_lshl) computes a0+30");
 
+    // GTA V compute program 0x413cee500 first rejects on the exact pc46 S_ANDN2_B32 packet below.
+    // Exercise the complete complementary B32 logical family numerically and fold SCC into bit 31
+    // of the observed result so both the data operation and SCC=(D!=0) are checked by execution.
+    auto run_sop2_complement = [&](uint32_t opcode_word, uint32_t a, uint32_t c) {
+        const uint32_t code[] = {
+            0xbe8003ffu, a,       // s_mov_b32 s0,a
+            0xbe8103ffu, c,       // s_mov_b32 s1,c
+            opcode_word,          // s_*_b32 s2,s0,s1
+            0x85038081u,          // s_cselect_b32 s3,1,0
+            0x8f039f03u,          // s_lshl_b32 s3,s3,31
+            0x89020302u,          // s_xor_b32 s2,s2,s3
+            0x7e000202u,          // v_mov_b32 v0,s2
+            0xbf810000u,
+        };
+        const std::vector<uint32_t> spv = recompile_valu(code, std::size(code), 1, 0);
+        const std::vector<float> got = spv.empty()
+            ? std::vector<float>{}
+            : prosper::test::run_compute(spv, {0.0f}, 1, 1);
+        return got.size() == 1 ? bits_of(got[0]) : UINT32_MAX;
+    };
+    constexpr uint32_t logical_a = 0x0f0ff00fu;
+    constexpr uint32_t logical_c = 0x00ff00ffu;
+    auto with_scc = [](uint32_t result) {
+        return result ^ (result != 0 ? 0x80000000u : 0u);
+    };
+    CHECK(run_sop2_complement(0x8a020100u, logical_a, logical_c) ==
+              with_scc(logical_a & ~logical_c),
+          "s_andn2_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8b020100u, logical_a, logical_c) ==
+              with_scc(logical_a | ~logical_c),
+          "s_orn2_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8c020100u, logical_a, logical_c) ==
+              with_scc(~(logical_a & logical_c)),
+          "s_nand_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8d020100u, logical_a, logical_c) ==
+              with_scc(~(logical_a | logical_c)),
+          "s_nor_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8e020100u, logical_a, logical_c) ==
+              with_scc(~(logical_a ^ logical_c)),
+          "s_xnor_b32 computes scalar data and SCC exactly");
+    CHECK(run_sop2_complement(0x8a020100u, UINT32_MAX, UINT32_MAX) == 0,
+          "s_andn2_b32 clears SCC when its scalar result is zero");
+
+    const uint32_t gta_s_andn2_b32[] = {
+        0xbe8703ffu, 0x12345678u, // establish the live s7 input
+        0x8a07f507u,              // exact GTA pc46: s_andn2_b32 s7,s7,inline-float:245
+        0x7e000207u,              // v_mov_b32 v0,s7
+        0xbf810000u,
+    };
+    CHECK(!recompile_valu(gta_s_andn2_b32, std::size(gta_s_andn2_b32), 1, 0).empty(),
+          "GTA V exact scalar s_andn2_b32 packet recompiles");
+
+    // GTA V kernel 0x205b5e8600 uses s_sub_u32/s_subb_u32 as a 64-bit subtraction pair while
+    // negating EXEC. Pin both halves of S_SUBB's contract independently: the incoming low-word
+    // borrow changes the high-word data result, and the high-word underflow becomes its outgoing SCC.
+    const uint32_t code9_subb_data[] = {
+        0xbe800380u,              // s_mov_b32 s0,0
+        0xbe820385u,              // s_mov_b32 s2,5
+        0xbe830383u,              // s_mov_b32 s3,3
+        0x80818100u,              // s_sub_u32 s1,s0,1 -> borrow-in=1
+        0x82840302u,              // s_subb_u32 s4,s2,s3 -> 5-3-1 = 1, borrow-out=0
+        0x7e000204u,              // v_mov_b32 v0,s4
+        0x7e000d00u,              // v_cvt_f32_u32 v0,v0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_subb_data = recompile_valu(
+        code9_subb_data, std::size(code9_subb_data), 1, 0);
+    const std::vector<float> got9_subb_data = spv9_subb_data.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv9_subb_data, {0.0f}, 1, 1);
+    CHECK(!spv9_subb_data.empty() && got9_subb_data.size() == 1 &&
+              got9_subb_data[0] == 1.0f,
+          "s_subb_u32 subtracts the incoming low-word borrow from its data result");
+
+    const uint32_t code9_subb_borrow[] = {
+        0xbe800380u,              // s_mov_b32 s0,0
+        0x80818100u,              // s_sub_u32 s1,s0,1 -> borrow-in=1
+        0x82828000u,              // s_subb_u32 s2,s0,0 -> UINT_MAX, borrow-out=1
+        0x85038081u,              // s_cselect_b32 s3,1,0
+        0x7e000203u,              // v_mov_b32 v0,s3
+        0x7e000d00u,              // v_cvt_f32_u32 v0,v0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_subb_borrow = recompile_valu(
+        code9_subb_borrow, std::size(code9_subb_borrow), 1, 0);
+    const std::vector<float> got9_subb_borrow = spv9_subb_borrow.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv9_subb_borrow, {0.0f}, 1, 1);
+    CHECK(!spv9_subb_borrow.empty() && got9_subb_borrow.size() == 1 &&
+              got9_subb_borrow[0] == 1.0f,
+          "s_subb_u32 publishes its high-word borrow through SCC");
+
+    const uint32_t code9_subb_primary_borrow[] = {
+        0xbe800381u,              // s_mov_b32 s0,1
+        0xbe810380u,              // s_mov_b32 s1,0
+        0x80838000u,              // s_sub_u32 s3,s0,0 -> borrow-in=0
+        0x82820001u,              // s_subb_u32 s2,s1,s0 -> UINT_MAX, primary borrow-out=1
+        0x85038081u,              // s_cselect_b32 s3,1,0
+        0x7e000203u,              // v_mov_b32 v0,s3
+        0x7e000d00u,              // v_cvt_f32_u32 v0,v0
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv9_subb_primary_borrow = recompile_valu(
+        code9_subb_primary_borrow, std::size(code9_subb_primary_borrow), 1, 0);
+    const std::vector<float> got9_subb_primary_borrow = spv9_subb_primary_borrow.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv9_subb_primary_borrow, {0.0f}, 1, 1);
+    CHECK(!spv9_subb_primary_borrow.empty() && got9_subb_primary_borrow.size() == 1 &&
+              got9_subb_primary_borrow[0] == 1.0f,
+          "s_subb_u32 publishes a primary src0<src1 borrow through SCC");
+
+    // Execute an asymmetric exact-wave mask when the host can require Wave64. Lanes 0..32 are set,
+    // so ballot(EXEC).x=0xffffffff and .y=1. The exact GTA subtraction pair therefore produces
+    // low=1 and high=0xfffffffe. Store both halves after restoring EXEC; swapping the ballot halves,
+    // extracting .x twice, or omitting either extraction changes at least one complete output range.
+    const uint32_t code9_exec_ballot_halves[] = {
+        0x7d8800a1u,              // v_cmp_gt_u32 vcc, 33, v0 -> lanes 0..32
+        0xbefe046au,              // s_mov_b64 exec,vcc
+        0x80907e80u,              // GTA pc1310: s_sub_u32 s16,0,exec_lo
+        0x82917f80u,              // GTA pc1312: s_subb_u32 s17,0,exec_hi
+        0xbefe04c1u,              // restore EXEC before the stores
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e020210u,              // v_mov_b32 v1,s16
+        0xe0702000u, 0x80020100u, // store low result at output[v0]
+        0x7e020211u,              // v_mov_b32 v1,s17
+        0xe0702000u, 0x80020102u, // store high result at output[v2]
+        0xbf810000u,
+    };
+    ShaderResourceTable exec_ballot_table;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      exec_ballot_table.resources.push_back(output); }
+    ComputeShaderConfig exec_ballot_config;
+    exec_ballot_config.local_x = 64;
+    exec_ballot_config.wave_size = 64;
+    exec_ballot_config.native_subgroup_size = 64;
+    const std::vector<uint32_t> exec_ballot_spv = recompile_compute(
+        code9_exec_ballot_halves, std::size(code9_exec_ballot_halves),
+        &exec_ballot_table, exec_ballot_config);
+    CHECK(!exec_ballot_spv.empty() && count_spirv_opcode(exec_ballot_spv, 339) == 2,
+          "GTA EXEC integer pair materializes exactly two subgroup ballot halves");
+    const auto exec_ballot_subgroup = prosper::test::default_compute_subgroup_properties();
+    const bool can_execute_exec_ballot = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    if (can_execute_exec_ballot && !exec_ballot_spv.empty()) {
+        std::vector<uint32_t> exec_ballot_got;
+        prosper::test::run_compute(exec_ballot_spv, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(128, 0),
+                                   &exec_ballot_got);
+        uint32_t exec_ballot_bad = 0;
+        for (uint32_t lane = 0; lane < 64 && exec_ballot_got.size() == 128; ++lane) {
+            exec_ballot_bad += exec_ballot_got[lane] != 1u;
+            exec_ballot_bad += exec_ballot_got[lane + 64] != 0xfffffffeu;
+        }
+        CHECK(exec_ballot_got.size() == 128 && exec_ballot_bad == 0,
+              "GTA EXEC ballot maps low/high mask halves to .x/.y exactly");
+    } else {
+        std::printf("  [skip] GTA EXEC ballot execution: host subgroup is %u or lacks ballot\n",
+                    exec_ballot_subgroup.size);
+    }
+
     // Plucky Squire's post-Desk transition shader clears the top bit of a scalar-data VCC_HI
     // lifetime before combining the two VCC dwords into a buffer address. This is the exact
     // gfx1030 s_bitset0_b32 packet retained by the failed-dispatch capsule for #1554.
@@ -467,6 +765,156 @@ int main() {
     uint32_t bad15 = 0; for (uint32_t i=0;i<N&&got15.size()==N;i++) if (bits_of(got15[i]) != exp15[i]) bad15++;
     printf("  kernel15 mismatches=%u (out[1]=0x%08x expect=0x%08x)\n", bad15, got15.size()==N?bits_of(got15[1]):0, exp15[1]);
     CHECK(got15.size()==N && bad15==0, "recompiled kernel 15 (v_bfrev_b32) reverses bits exactly");
+
+    // Kernel 15a: GTA V's exact v0 packet and the complete admitted SDWA byte/word-select family.
+    // SDWA zero-extends the selected field BEFORE BREV, so a selected low word produces reversed
+    // bits in the high destination word and zero in the low word. Exercise all six selectors with
+    // raw bit patterns; this catches both a missing extraction and a wrong byte/word offset.
+    constexpr uint32_t bfrev_sdwa_inputs[] = {
+        0x00000000u, 0x00000001u, 0x80000000u, 0x01234567u,
+        0x89abcdefu, 0xffff0001u, 0x55aa33ccu, 0xffffffffu,
+    };
+    for (uint32_t sel = 0; sel <= 5; ++sel) {
+        const uint32_t code15a[] = {
+            0x7e0070f9u, (sel << 16) | 0x00000600u, // v_bfrev_b32_sdwa v0,v0, BYTE_n/WORD_n
+            0xbf810000u,
+        };
+        std::vector<uint32_t> spv15a = recompile_valu(
+            code15a, std::size(code15a), /*num_inputs*/1, /*out_vgpr*/0);
+        CHECK(!spv15a.empty(), "recompiled kernel 15a v_bfrev_b32_sdwa selector -> SPIR-V");
+        std::vector<float> in15a(N);
+        std::vector<uint32_t> exp15a(N);
+        const uint32_t width = sel <= 3 ? 8u : 16u;
+        const uint32_t offset = sel <= 3 ? 8u * sel : 16u * (sel - 4u);
+        const uint32_t mask = width == 8u ? 0xffu : 0xffffu;
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t raw = bfrev_sdwa_inputs[i % std::size(bfrev_sdwa_inputs)];
+            in15a[i] = std::bit_cast<float>(raw);
+            exp15a[i] = bitrev32((raw >> offset) & mask);
+        }
+        std::vector<float> got15a = spv15a.empty() ? std::vector<float>()
+                                                   : prosper::test::run_compute(spv15a, in15a, N, N);
+        uint32_t bad15a = 0;
+        for (uint32_t i = 0; i < N && got15a.size() == N; ++i)
+            if (bits_of(got15a[i]) != exp15a[i]) ++bad15a;
+        printf("  kernel15a selector=%u mismatches=%u\n", sel, bad15a);
+        CHECK(got15a.size() == N && bad15a == 0,
+              "recompiled kernel 15a selects then reverses byte/word bits exactly");
+    }
+    // These nearby encodings are different operations, not permissive aliases for the live shape.
+    const uint32_t code15a_sext[] = { 0x7e0070f9u, 0x000c0600u, 0xbf810000u };
+    const uint32_t code15a_neg[] = { 0x7e0070f9u, 0x00140600u, 0xbf810000u };
+    const uint32_t code15a_partial[] = { 0x7e0070f9u, 0x00040400u, 0xbf810000u };
+    const uint32_t code15a_reserved[] = { 0x7e0070f9u, 0x01040600u, 0xbf810000u };
+    const uint32_t code15a_dword[] = { 0x7e0070f9u, 0x00060600u, 0xbf810000u };
+    const uint32_t code15a_dword_neg[] = { 0x7e0070f9u, 0x00160600u, 0xbf810000u };
+    const uint32_t code15a_dword_abs[] = { 0x7e0070f9u, 0x00260600u, 0xbf810000u };
+    CHECK(recompile_valu(code15a_sext, std::size(code15a_sext), 1, 0).empty() &&
+          recompile_valu(code15a_neg, std::size(code15a_neg), 1, 0).empty() &&
+          recompile_valu(code15a_partial, std::size(code15a_partial), 1, 0).empty() &&
+          recompile_valu(code15a_reserved, std::size(code15a_reserved), 1, 0).empty() &&
+          recompile_valu(code15a_dword, std::size(code15a_dword), 1, 0).empty() &&
+          recompile_valu(code15a_dword_neg, std::size(code15a_dword_neg), 1, 0).empty() &&
+          recompile_valu(code15a_dword_abs, std::size(code15a_dword_abs), 1, 0).empty(),
+          "v_bfrev_b32 SDWA modifier, reserved, DWORD-source, and partial-dst forms reject visibly");
+
+    // Kernel 15c: GTA V's exact in-place V_FFBH_U32 e32 packet from its compute culling kernels.
+    // The instruction counts zeroes preceding the first set bit from the MSB and returns -1 for
+    // zero. Feed the raw u32 bits through the float harness so the result is checked bit-exactly.
+    const uint32_t code15c[] = { 0x7e087304u, 0xbf810000u }; // v_ffbh_u32_e32 v4,v4
+    std::vector<uint32_t> spv15c = recompile_valu(
+        code15c, std::size(code15c), /*num_inputs*/5, /*out_vgpr*/4);
+    CHECK(!spv15c.empty(), "recompiled kernel 15c (GTA V v_ffbh_u32 e32) -> SPIR-V");
+    constexpr uint32_t ffbh_inputs[] = {
+        0x00000000u, 0x80000000u, 0x10000000u, 0x0000ffffu,
+        0x00000001u, 0x7fffffffu, 0x00f00000u, 0xffffffffu,
+    };
+    constexpr uint32_t ffbh_expected[] = { 0xffffffffu, 0u, 3u, 16u, 31u, 1u, 8u, 0u };
+    std::vector<float> in15c(N * 5, 0.0f);
+    std::vector<uint32_t> exp15c(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const size_t sample = i % std::size(ffbh_inputs);
+        in15c[i * 5 + 4] = std::bit_cast<float>(ffbh_inputs[sample]);
+        exp15c[i] = ffbh_expected[sample];
+    }
+    std::vector<float> got15c = spv15c.empty() ? std::vector<float>()
+                                               : prosper::test::run_compute(spv15c, in15c, N, N);
+    uint32_t bad15c = 0;
+    for (uint32_t i = 0; i < N && got15c.size() == N; ++i)
+        if (bits_of(got15c[i]) != exp15c[i]) ++bad15c;
+    printf("  kernel15c mismatches=%u (zero=0x%08x expect=0x%08x)\n", bad15c,
+           got15c.size() == N ? bits_of(got15c[0]) : 0, exp15c[0]);
+    CHECK(got15c.size() == N && bad15c == 0,
+          "recompiled kernel 15c counts leading zeroes and preserves the zero sentinel exactly");
+
+    // Kernel 15d: V_ALIGNBYTE_B32 (VOP3 0x14f).  Exercise every masked byte offset, including
+    // the 4..7 high-dword tail and 8..31 zero region.  Raw input bits avoid float conversion;
+    // src0 is the high dword and src1 the low dword in the ISA's {S0,S1} concatenation.
+    const uint32_t code15d[] = {
+        0xd54f0000u, 0x040a0300u, // v_alignbyte_b32 v0, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv15d = recompile_valu(
+        code15d, std::size(code15d), /*num_inputs*/3, /*out_vgpr*/0);
+    CHECK(!spv15d.empty(), "recompiled kernel 15d (v_alignbyte_b32) -> SPIR-V");
+    std::vector<float> in15d(N * 3);
+    std::vector<uint32_t> exp15d(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t s0 = 0xa1b2c3d4u ^ (i * 0x01010101u);
+        const uint32_t s1 = 0x11223344u ^ (i * 0x00010001u);
+        const uint32_t byte = i & 31u;
+        in15d[i * 3 + 0] = std::bit_cast<float>(s0);
+        in15d[i * 3 + 1] = std::bit_cast<float>(s1);
+        in15d[i * 3 + 2] = std::bit_cast<float>(byte);
+        if (byte < 4u) {
+            exp15d[i] = byte == 0u ? s1
+                                   : (s1 >> (byte * 8u)) | (s0 << ((4u - byte) * 8u));
+        } else if (byte < 8u) {
+            exp15d[i] = s0 >> ((byte - 4u) * 8u);
+        } else {
+            exp15d[i] = 0u;
+        }
+    }
+    const std::vector<float> got15d = spv15d.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spv15d, in15d, N, N);
+    uint32_t bad15d = 0;
+    for (uint32_t i = 0; i < N && got15d.size() == N; ++i)
+        if (bits_of(got15d[i]) != exp15d[i]) ++bad15d;
+    printf("  kernel15d mismatches=%u (offset7=0x%08x expect=0x%08x, offset8=0x%08x)\n",
+           bad15d, got15d.size() == N ? bits_of(got15d[7]) : 0u, exp15d[7],
+           got15d.size() == N ? bits_of(got15d[8]) : 0u);
+    CHECK(got15d.size() == N && bad15d == 0,
+          "recompiled kernel 15d aligns all byte offsets with zero fill bit-exactly");
+
+    // Kernel 15e: exact first GTA V packet, including literal placement and v5 byte offset.
+    // The captured src0 is zero, so offsets 0..3 select successive bytes of 0x3024240c and
+    // offsets >=4 are zero.  This pins the decoder/emitter path used by programs 0x413ce6000
+    // and 0x413ce6d00, in addition to the general register-source differential above.
+    const uint32_t code15e[] = {
+        0xd54f0006u, 0x0415fe80u, 0x3024240cu,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv15e = recompile_valu(
+        code15e, std::size(code15e), /*num_inputs*/6, /*out_vgpr*/6);
+    CHECK(!spv15e.empty(), "recompiled kernel 15e (GTA V exact v_alignbyte_b32) -> SPIR-V");
+    std::vector<float> in15e(N * 6, 0.0f);
+    std::vector<uint32_t> exp15e(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t byte = i & 31u;
+        in15e[i * 6 + 5] = std::bit_cast<float>(byte);
+        exp15e[i] = byte < 4u ? (0x3024240cu >> (byte * 8u)) : 0u;
+    }
+    const std::vector<float> got15e = spv15e.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spv15e, in15e, N, N);
+    uint32_t bad15e = 0;
+    for (uint32_t i = 0; i < N && got15e.size() == N; ++i)
+        if (bits_of(got15e[i]) != exp15e[i]) ++bad15e;
+    printf("  kernel15e mismatches=%u (offset0=0x%08x offset3=0x%08x offset4=0x%08x)\n",
+           bad15e, got15e.size() == N ? bits_of(got15e[0]) : 0u,
+           got15e.size() == N ? bits_of(got15e[3]) : 0u,
+           got15e.size() == N ? bits_of(got15e[4]) : 0u);
+    CHECK(got15e.size() == N && bad15e == 0,
+          "recompiled kernel 15e matches GTA V's exact literal packet bit-exactly");
 
     // Kernel 15b: kernel 15 with s_ttracedata (SOPP 0x16, 0xbf960000) spliced into the body. The
     // instruction sends M0 to the thread-trace stream — a profiling side channel that writes no
@@ -789,6 +1237,43 @@ int main() {
     CHECK(got17d1m.size() == 64 && bad17d1m == 0,
           "Wave32 scalar mask activates only its selected guest lanes");
 
+    // Kernel 17d1c: GTA V's exact PC1309 packet selects scalar s4 into VCC_LO, preserves the
+    // selected dword as scalar data, and exposes each bit as this lane's implicit cndmask predicate.
+    // PC1310 is retained between producer and consumer. A second scalar cselect pins SCC preservation;
+    // the final XOR pins the simultaneous scalar-data lifetime instead of testing only the mask view.
+    const uint32_t code17d1c[] = {
+        0xbe8403ffu, 0x80000009u, // s_mov_b32 s4, 0x80000009
+        0xbf060000u,              // s_cmp_eq_u32 s0, s0 (SCC=1)
+        0x7e020287u,              // v_mov_b32 v1, 7
+        0x856a8004u,              // s_cselect_b32 vcc_lo, s4, 0 (exact GTA V packet)
+        0x061212f2u,              // PC1310 packet between the cselect and implicit consumer
+        0x02020290u,              // v_cndmask_b32 v1, 16, v1, vcc (exact PC1311 packet)
+        0x85058281u,              // s_cselect_b32 s5, 1, 2 (SCC must still be one)
+        0x4a020205u,              // v_add_nc_u32 v1, s5, v1
+        0x3a02026au,              // v_xor_b32 v1, vcc_lo, v1 (full scalar dword)
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> portable_spv17d1c = recompile_compute(
+        code17d1c, std::size(code17d1c), &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1c.empty(),
+          "GTA V Wave32 scalar cselect publishes a VCC_LO predicate");
+    std::vector<uint32_t> initial17d1c(64, 0u), got17d1c;
+    prosper::test::run_compute(portable_spv17d1c, std::vector<float>(64, 0.0f),
+                               64, 64, {}, initial17d1c, &got17d1c);
+    constexpr uint32_t scalar_mask17d1c = 0x80000009u;
+    uint32_t bad17d1c = 0;
+    for (uint32_t lane = 0; lane < 64 && got17d1c.size() == 64; ++lane) {
+        const bool selected = ((scalar_mask17d1c >> (lane & 31u)) & 1u) != 0;
+        const uint32_t expected = scalar_mask17d1c ^ (selected ? 8u : 17u);
+        bad17d1c += got17d1c[lane] != expected;
+    }
+    CHECK(got17d1c.size() == 64 && bad17d1c == 0,
+          "scalar cselect selects lane bits, retains its dword, and preserves SCC");
+    CHECK(recompile_compute(code17d1c, std::size(code17d1c), &rt17d1,
+                            native_cfg17d).empty(),
+          "scalar-data cselect into VCC_LO remains rejected for Wave64");
+
     // Kernel 17d1w: the next Astro traversal instruction writes a scalar-data VCC_HI value to the
     // VGPR lane selected by s45. Preserve v1's local-id value in every other lane so execution tests
     // both halves of V_WRITELANE's read/modify/write behavior. These are the exact GFX10 packets for
@@ -852,6 +1337,149 @@ int main() {
     }
     CHECK(got17d2.size() == N && bad17d2 == 0,
           "#825: dispatcher reduces mask==0 across the full emulated wave64");
+
+    // GTA V's two current terminal compute shaders compare architectural Wave64 VCC directly with
+    // zero (`bf13806a`) after a VOPC producer. VCC is not an ordinary saved-mask SGPR map entry: the
+    // dispatcher persists it in its dedicated predicate state. Keep an SCC/VCC-preserving VOP1
+    // between producer and consumer, as in the longer sibling. Wave 0 has an empty mask; wave 1 has
+    // one set bit at guest lane 63, outside a narrow host subgroup. The SCC branch must therefore
+    // select 1 for every lane of wave 0 and 7 for every lane of wave 1.
+    const uint32_t code17d2v[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1 (fresh Wave64 VCC mask)
+        0x7e060280u,              // SCC/VCC-preserving gap: v_mov_b32 v3, 0
+        0xbf13806au,              // s_cmp_lg_u64 vcc, 0 (exact GTA V terminal packet)
+        0xbf840001u,              // s_cbranch_scc0 +1 (empty mask keeps 1)
+        0x7e040287u,              // nonempty mask -> v_mov_b32 v2, 7
+        0x7e040d02u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> portable_spv17d2v = recompile_valu(
+        code17d2v, std::size(code17d2v), 2, /*out_vgpr*/2);
+    CHECK(!portable_spv17d2v.empty() && count_spirv_opcode(portable_spv17d2v, 224) > 0,
+          "GTA V Wave64 VCC-vs-zero uses the portable dispatcher vote");
+    const std::vector<float> got17d2v = portable_spv17d2v.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(portable_spv17d2v, in17d, N, N);
+    uint32_t bad17d2v = 0;
+    for (uint32_t i = 0; i < N && got17d2v.size() == N; ++i) {
+        const float expected = i < 64 ? 1.0f : 7.0f;
+        bad17d2v += got17d2v[i] != expected;
+    }
+    CHECK(got17d2v.size() == N && bad17d2v == 0,
+          "portable VCC-vs-zero vote sees the sole set guest lane 63");
+
+    const std::vector<uint32_t> native_spv17d2v = recompile_compute(
+        code17d2v, std::size(code17d2v), nullptr, native_cfg17d);
+    CHECK(!native_spv17d2v.empty() &&
+              count_spirv_opcode(native_spv17d2v, 335) ==
+                  count_spirv_opcode(native_spv17d, 335) + 1 &&
+              count_spirv_opcode(native_spv17d2v, 224) == 0,
+          "exact Wave64 VCC-vs-zero adds one native vote and no barrier");
+    // recompile_compute exposes only guest memory effects, so use the same VCC/SOPC/branch shape
+    // with a real resource-backed store for native execution. Local id 63 is the sole matching lane;
+    // its VCC bit must make the uniform SCC branch select 7 for the complete native guest wave.
+    const uint32_t code17d2v_native_exec[] = {
+        0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u,
+        0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7e0202bfu,              // v_mov_b32 v1, 63
+        0x7d840300u,              // v_cmp_eq_u32 vcc, v0, v1
+        0x7e060280u,              // SCC/VCC-preserving gap: v_mov_b32 v3, 0
+        0xbf13806au,              // s_cmp_lg_u64 vcc, 0
+        0xbf840001u,              // s_cbranch_scc0 +1
+        0x7e040287u,              // nonempty mask -> v_mov_b32 v2, 7
+        0xe0702000u, 0x80020200u, // buffer_store_dword v2, v0, s[8:11] idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt17d2v_native;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
+      rt17d2v_native.resources.push_back(dst); }
+    ComputeShaderConfig native_exec_cfg17d2v = native_cfg17d;
+    native_exec_cfg17d2v.local_x = 64;
+    native_exec_cfg17d2v.local_y = 1;
+    const std::vector<uint32_t> native_exec_spv17d2v = recompile_compute(
+        code17d2v_native_exec, std::size(code17d2v_native_exec),
+        &rt17d2v_native, native_exec_cfg17d2v);
+    CHECK(!native_exec_spv17d2v.empty() &&
+              count_spirv_opcode(native_exec_spv17d2v, 335) ==
+                  count_spirv_opcode(native_spv17d, 335) + 1 &&
+              count_spirv_opcode(native_exec_spv17d2v, 224) == 0,
+          "native VCC-vs-zero execution kernel preserves the exact vote contract");
+    const auto subgroup17d2v = prosper::test::default_compute_subgroup_properties();
+    const bool can_execute17d2v = subgroup17d2v.size == 64 &&
+        (subgroup17d2v.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup17d2v.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute17d2v && !native_exec_spv17d2v.empty()) {
+        std::vector<uint32_t> native_initial17d2v(64, 0u), native_got17d2v;
+        prosper::test::run_compute(native_exec_spv17d2v, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, native_initial17d2v,
+                                   &native_got17d2v);
+        uint32_t native_bad17d2v = 0;
+        for (uint32_t i = 0; i < 64 && native_got17d2v.size() == 64; ++i)
+            native_bad17d2v += native_got17d2v[i] != 7u;
+        std::printf("  native VCC-zero out[0/62/63]=%u/%u/%u mismatches=%u\n",
+                    native_got17d2v.size() == 64 ? native_got17d2v[0] : UINT32_MAX,
+                    native_got17d2v.size() == 64 ? native_got17d2v[62] : UINT32_MAX,
+                    native_got17d2v.size() == 64 ? native_got17d2v[63] : UINT32_MAX,
+                    native_bad17d2v);
+        CHECK(native_got17d2v.size() == 64 && native_bad17d2v == 0,
+              "native VCC-vs-zero vote sees the sole set lane 63");
+    } else {
+        std::printf("  [skip] native VCC-vs-zero execution: host subgroup is %u or lacks vote\n",
+                    subgroup17d2v.size);
+    }
+
+    // A dedicated VCC Bool variable is a value, not proof that both physical VCC words still hold
+    // that mask. A scalar write to VCC_HI kills the pair lifetime, and a path that may bypass that
+    // write leaves the join ambiguous. Both shapes must stay out of the mask-vote specialization
+    // instead of voting stale predicate state. These negatives exercise the same Wave64 MUST-domain
+    // proof as the admission.
+    std::vector<uint32_t> code17d2v_high_overwrite(
+        std::begin(code17d2v), std::end(code17d2v));
+    code17d2v_high_overwrite.insert(
+        code17d2v_high_overwrite.begin() + 9,
+        0xbeeb0380u);             // s_mov_b32 vcc_hi, 0 destroys the B64 mask lifetime
+    const auto portable_high_overwrite = recompile_valu(
+        code17d2v_high_overwrite.data(), code17d2v_high_overwrite.size(), 2, 2);
+    const auto native_high_overwrite = recompile_compute(
+        code17d2v_high_overwrite.data(), code17d2v_high_overwrite.size(), nullptr,
+        native_cfg17d);
+    CHECK(!portable_high_overwrite.empty() &&
+              count_spirv_opcode(portable_high_overwrite, 224) ==
+                  count_spirv_opcode(spv17d, 224),
+          "portable VCC-vs-zero does not vote stale VCC after a scalar high-half overwrite");
+    CHECK(!native_high_overwrite.empty() &&
+              count_spirv_opcode(native_high_overwrite, 335) ==
+                  count_spirv_opcode(native_spv17d, 335),
+          "native VCC-vs-zero does not vote stale VCC after a scalar high-half overwrite");
+
+    std::vector<uint32_t> code17d2v_ambiguous_join(
+        std::begin(code17d2v), std::end(code17d2v));
+    code17d2v_ambiguous_join.insert(
+        code17d2v_ambiguous_join.begin() + 9,
+        {0xbf840001u,             // one SCC predecessor skips the scalar overwrite
+         0xbeeb0380u});           // the other recycles VCC_HI as scalar data
+    const auto portable_ambiguous_join = recompile_valu(
+        code17d2v_ambiguous_join.data(), code17d2v_ambiguous_join.size(), 2, 2);
+    const auto native_ambiguous_join = recompile_compute(
+        code17d2v_ambiguous_join.data(), code17d2v_ambiguous_join.size(), nullptr,
+        native_cfg17d);
+    std::printf("  VCC-zero votes baseline/accepted/native-ambiguous=%zu/%zu/%zu\n",
+                count_spirv_opcode(native_spv17d, 335),
+                count_spirv_opcode(native_spv17d2v, 335),
+                count_spirv_opcode(native_ambiguous_join, 335));
+    CHECK(!portable_ambiguous_join.empty() &&
+              count_spirv_opcode(portable_ambiguous_join, 224) ==
+                  count_spirv_opcode(spv17d, 224),
+          "portable VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
+    CHECK(!native_ambiguous_join.empty() &&
+              count_spirv_opcode(native_ambiguous_join, 335) ==
+                  count_spirv_opcode(native_spv17d, 335),
+          "native VCC-vs-zero does not vote an ambiguous mask/scalar lifetime join");
 
     // Kernel 17d2x: Syberia's fullscreen compute pass compares current EXEC with a mask written
     // directly to s[16:17] by VOPC.  Keep the irreducible prefix so the comparison must use the
@@ -1125,6 +1753,220 @@ int main() {
     uint32_t bad21 = 0; for (uint32_t i=0;i<N&&got21.size()==N;i++) if (std::fabs(got21[i]-(float)(100u+i))>1e-3f) bad21++;
     printf("  kernel21 mismatches=%u (out[7]=%g expect=107)\n", bad21, got21.size()==N?got21[7]:-1);
     CHECK(got21.size()==N && bad21==0, "recompiled kernel 21 (MUBUF per-lane buffer_load -> cbuf[gid]) correct");
+
+    // GTA V's decoupled-lookback scan publishes a record through one V# and polls the same backing
+    // through another. These are the exact pc199 data store, pc201 vmcnt(0), pc202 vscnt(0), pc207
+    // flag store, and pc224 polling-load packet words from exec_cs_413e16400, kept in their original
+    // publication order. Distinct bindings 4/5/6 deliberately carry the same guest address: emitted
+    // variables must permit aliasing, the requested accesses must be individually volatile/coherent,
+    // and the store-completion wait must publish prior UniformMemory writes at Device scope.
+    const uint32_t coherent_publish_poll[] = {
+        0xe0744008u, 0x80001100u, // pc199: buffer_store_dwordx2 ... glc
+        0xbf8c3f70u,              // pc201: s_waitcnt vmcnt(0)
+        0xbbfd0000u,              // pc202: s_waitcnt_vscnt null, 0
+        0xe0706010u, 0x80001211u, // pc207: buffer_store_dword ... glc (ready flag)
+        0xe030e010u, 0x80001e1du, // pc224: buffer_load_dword ... glc dlc (poll)
+        0xbf810000u,
+    };
+    ShaderResourceTable coherent_rt;
+    { ShaderResource publish{}; publish.cls = ResourceClass::ConstantBuffer;
+      publish.format = DataFormat::Uint32; publish.binding = 4; publish.gpu_addr = 0x1000;
+      publish.size = 180; publish.stride = 20; publish.fetch_pc = 0;
+      coherent_rt.resources.push_back(publish); }
+    { ShaderResource flag{}; flag.cls = ResourceClass::ConstantBuffer;
+      flag.format = DataFormat::Uint32; flag.binding = 5; flag.gpu_addr = 0x1000;
+      flag.size = 180; flag.stride = 20; flag.fetch_pc = 4;
+      coherent_rt.resources.push_back(flag); }
+    { ShaderResource poll{}; poll.cls = ResourceClass::ConstantBuffer;
+      poll.format = DataFormat::Uint32; poll.binding = 6; poll.gpu_addr = 0x1000;
+      poll.size = 180; poll.stride = 20; poll.fetch_pc = 6;
+      coherent_rt.resources.push_back(poll); }
+    ComputeShaderConfig coherent_cfg;
+    coherent_cfg.local_x = 64;
+    coherent_cfg.wave_size = 64;
+    const std::vector<uint32_t> coherent_spv = recompile_compute(
+        coherent_publish_poll, std::size(coherent_publish_poll), &coherent_rt, coherent_cfg);
+    const SpirvBufferAccessSummary publish_access =
+        spirv_buffer_access_summary(coherent_spv, 4);
+    const SpirvBufferAccessSummary flag_access =
+        spirv_buffer_access_summary(coherent_spv, 5);
+    const SpirvBufferAccessSummary poll_access =
+        spirv_buffer_access_summary(coherent_spv, 6);
+    CHECK(!coherent_spv.empty() && publish_access.stores == 2 &&
+              publish_access.volatile_stores == 2 && publish_access.coherent &&
+              flag_access.stores == 1 && flag_access.volatile_stores == 1 &&
+              flag_access.coherent &&
+              poll_access.loads == 1 && poll_access.volatile_loads == 1 &&
+              poll_access.coherent,
+          "GLC store and GLC+DLC polling load lower to exact Volatile accesses on Coherent roots");
+    bool every_external_root_aliased = true;
+    for (uint32_t binding : {0u, 1u, 2u, 3u, 4u, 5u, 6u})
+        every_external_root_aliased &=
+            spirv_storage_buffer_has_decoration(coherent_spv, binding, 20u);
+    CHECK(every_external_root_aliased && publish_access.aliased && flag_access.aliased &&
+              poll_access.aliased,
+          "every external StorageBuffer root is Aliased, including aliased views of one guest allocation");
+    CHECK(count_spirv_opcode(coherent_spv, 225) == 1 &&
+              spirv_has_device_uniform_release_barrier(coherent_spv),
+          "exact s_waitcnt_vscnt null,0 emits one Device UniformMemory Release barrier");
+
+    // Negative arms at the same packet sites: clear GLC/DLC without changing either access, then
+    // replace only vscnt with vmcnt. The ordinary accesses remain present but gain no Volatile or
+    // Coherent semantics; vmcnt remains a synchronous-SSA no-op rather than publishing stores.
+    const uint32_t ordinary_publish_poll[] = {
+        0xe0740008u, 0x80001100u,
+        0xbf8c3f70u,
+        0xbbfd0000u,
+        0xe0702010u, 0x80001211u,
+        0xe0302010u, 0x80001e1du,
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> ordinary_spv = recompile_compute(
+        ordinary_publish_poll, std::size(ordinary_publish_poll), &coherent_rt, coherent_cfg);
+    const SpirvBufferAccessSummary ordinary_publish =
+        spirv_buffer_access_summary(ordinary_spv, 4);
+    const SpirvBufferAccessSummary ordinary_flag =
+        spirv_buffer_access_summary(ordinary_spv, 5);
+    const SpirvBufferAccessSummary ordinary_poll =
+        spirv_buffer_access_summary(ordinary_spv, 6);
+    CHECK(!ordinary_spv.empty() && ordinary_publish.stores == 2 &&
+              ordinary_publish.volatile_stores == 0 && !ordinary_publish.coherent &&
+              ordinary_flag.stores == 1 && ordinary_flag.volatile_stores == 0 &&
+              !ordinary_flag.coherent &&
+              ordinary_poll.loads == 1 && ordinary_poll.volatile_loads == 0 &&
+              !ordinary_poll.coherent && ordinary_publish.aliased && ordinary_flag.aliased &&
+              ordinary_poll.aliased,
+          "unmarked ordinary packets keep their accesses non-Volatile/non-Coherent but still Aliased");
+
+    // Each load flag independently requests the same conservative SPIR-V coherence contract. The
+    // combined GTA packet alone cannot distinguish an accidental `GLC && DLC` gate from the required
+    // `GLC || DLC` gate. Conversely DLC alone is not the ordinary-store publication request: only
+    // GLC marks a store coherent/volatile.
+    ShaderResourceTable cache_flag_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.binding = 4; buffer.size = 180;
+      buffer.stride = 20; buffer.fetch_pc = 0; cache_flag_rt.resources.push_back(buffer); }
+    const uint32_t glc_only_load[] = {0xe0306010u, 0x80001e1du, 0xbf810000u};
+    const uint32_t dlc_only_load[] = {0xe030a010u, 0x80001e1du, 0xbf810000u};
+    const uint32_t dlc_only_store[] = {0xe070a010u, 0x80001211u, 0xbf810000u};
+    const SpirvBufferAccessSummary glc_only_access = spirv_buffer_access_summary(
+        recompile_compute(glc_only_load, std::size(glc_only_load), &cache_flag_rt, coherent_cfg), 4);
+    const SpirvBufferAccessSummary dlc_only_access = spirv_buffer_access_summary(
+        recompile_compute(dlc_only_load, std::size(dlc_only_load), &cache_flag_rt, coherent_cfg), 4);
+    const SpirvBufferAccessSummary dlc_store_access = spirv_buffer_access_summary(
+        recompile_compute(dlc_only_store, std::size(dlc_only_store), &cache_flag_rt, coherent_cfg), 4);
+    CHECK(glc_only_access.loads == 1 && glc_only_access.volatile_loads == 1 &&
+              glc_only_access.coherent && dlc_only_access.loads == 1 &&
+              dlc_only_access.volatile_loads == 1 && dlc_only_access.coherent,
+          "GLC-only and DLC-only ordinary loads each emit Volatile access on a Coherent root");
+    CHECK(dlc_store_access.stores == 1 && dlc_store_access.volatile_stores == 0 &&
+              !dlc_store_access.coherent,
+          "DLC alone does not broaden ordinary-store semantics reserved for GLC");
+
+    // Representative non-dword branches still route through the single instruction-policy wrapper.
+    // Keep separate assertions so a future raw-subword or packed-format bypass is mutation-visible.
+    ShaderResourceTable coherent_raw_rt;
+    { ShaderResource raw{}; raw.cls = ResourceClass::ConstantBuffer;
+      raw.format = DataFormat::Uint32; raw.num_components = 1; raw.binding = 4;
+      raw.size = 16; raw.sgpr_base = 8; raw.fetch_pc = 0;
+      coherent_raw_rt.resources.push_back(raw); }
+    const uint32_t glc_raw_ubyte_load[] = {
+        0xe0205000u, 0x80020000u, 0xbf810000u,
+    };
+    const SpirvBufferAccessSummary glc_raw_ubyte_access = spirv_buffer_access_summary(
+        recompile_compute(glc_raw_ubyte_load, std::size(glc_raw_ubyte_load),
+                          &coherent_raw_rt, coherent_cfg), 4);
+    CHECK(glc_raw_ubyte_access.loads == 1 &&
+              glc_raw_ubyte_access.volatile_loads == 1 && glc_raw_ubyte_access.coherent,
+          "raw ubyte GLC load uses the shared Volatile/Coherent dword policy");
+
+    ShaderResourceTable coherent_packed_rt;
+    { ShaderResource packed{}; packed.cls = ResourceClass::ConstantBuffer;
+      packed.format = DataFormat::Uint2_10_10_10; packed.num_components = 4;
+      packed.binding = 5; packed.size = 16; packed.stride = 4;
+      packed.sgpr_base = 8; packed.fetch_pc = 0;
+      coherent_packed_rt.resources.push_back(packed); }
+    const uint32_t dlc_packed_load[] = {
+        0xe000a000u, 0x80020000u, 0xbf810000u,
+    };
+    const SpirvBufferAccessSummary dlc_packed_access = spirv_buffer_access_summary(
+        recompile_compute(dlc_packed_load, std::size(dlc_packed_load),
+                          &coherent_packed_rt, coherent_cfg), 5);
+    CHECK(dlc_packed_access.loads == 1 && dlc_packed_access.volatile_loads == 1 &&
+              dlc_packed_access.coherent,
+          "packed Uint2_10_10_10 DLC load uses the shared Volatile/Coherent dword policy");
+
+    // Dynamic integer subword stores deliberately bypass ordinary OpStore: atomic clear+set keeps
+    // adjacent Uint16 elements in one dword race-free. GLC must still decorate that root Coherent,
+    // while changing neither the atomic pair nor the ISA atomic-return behavior tested by T32/T32b.
+    ShaderResourceTable coherent_subword_store_rt;
+    { ShaderResource subword{}; subword.cls = ResourceClass::ConstantBuffer;
+      subword.format = DataFormat::Uint16; subword.num_components = 1;
+      subword.binding = 4; subword.size = 64; subword.stride = 2;
+      subword.sgpr_base = 8; subword.fetch_pc = 0;
+      coherent_subword_store_rt.resources.push_back(subword); }
+    const uint32_t glc_subword_store[] = {
+        0xe0106000u, 0x80020100u, 0xbf810000u,
+    };
+    const uint32_t ordinary_subword_store[] = {
+        0xe0102000u, 0x80020100u, 0xbf810000u,
+    };
+    const std::vector<uint32_t> glc_subword_spv = recompile_compute(
+        glc_subword_store, std::size(glc_subword_store),
+        &coherent_subword_store_rt, coherent_cfg);
+    const std::vector<uint32_t> ordinary_subword_spv = recompile_compute(
+        ordinary_subword_store, std::size(ordinary_subword_store),
+        &coherent_subword_store_rt, coherent_cfg);
+    const SpirvBufferAccessSummary glc_subword_access =
+        spirv_buffer_access_summary(glc_subword_spv, 4);
+    const SpirvBufferAccessSummary ordinary_subword_access =
+        spirv_buffer_access_summary(ordinary_subword_spv, 4);
+    CHECK(!glc_subword_spv.empty() &&
+              spirv_storage_buffer_has_decoration(glc_subword_spv, 4, 23u) &&
+              count_spirv_opcode(glc_subword_spv, 240u) == 1 &&
+              count_spirv_opcode(glc_subword_spv, 241u) == 1 &&
+              glc_subword_access.stores == 0,
+          "dynamic Uint16 GLC store keeps atomic clear/set lowering on a Coherent root");
+    CHECK(!ordinary_subword_spv.empty() &&
+              !spirv_storage_buffer_has_decoration(ordinary_subword_spv, 4, 23u) &&
+              count_spirv_opcode(ordinary_subword_spv, 240u) == 1 &&
+              count_spirv_opcode(ordinary_subword_spv, 241u) == 1 &&
+              ordinary_subword_access.stores == 0,
+          "dynamic Uint16 store without GLC keeps the same atomic pair without Coherent");
+
+    // The one-record 16-bit zero-pad contract uses a dedicated load helper rather than the shared
+    // raw/packed dword wrapper. Exercise that propagation site directly: the packet pair differs only
+    // by GLC, while both retain the same exact format_x access and two-byte descriptor shape.
+    ShaderResourceTable coherent_tail_rt;
+    { ShaderResource tail{}; tail.cls = ResourceClass::ConstantBuffer;
+      tail.format = DataFormat::Uint16; tail.num_components = 1; tail.binding = 4;
+      tail.size = 2; tail.stride = 2; tail.sgpr_base = 8; tail.fetch_pc = 1;
+      coherent_tail_rt.resources.push_back(tail); }
+    const uint32_t glc_tail_load[] = {
+        0x7e020f00u, 0xe0006000u, 0x80020101u, 0xbf810000u,
+    };
+    const uint32_t ordinary_tail_load[] = {
+        0x7e020f00u, 0xe0002000u, 0x80020101u, 0xbf810000u,
+    };
+    const SpirvBufferAccessSummary glc_tail_access = spirv_buffer_access_summary(
+        recompile_compute(glc_tail_load, std::size(glc_tail_load),
+                          &coherent_tail_rt, coherent_cfg), 4);
+    const SpirvBufferAccessSummary ordinary_tail_access = spirv_buffer_access_summary(
+        recompile_compute(ordinary_tail_load, std::size(ordinary_tail_load),
+                          &coherent_tail_rt, coherent_cfg), 4);
+    CHECK(glc_tail_access.loads == 1 && glc_tail_access.volatile_loads == 1 &&
+              glc_tail_access.coherent && ordinary_tail_access.loads == 1 &&
+              ordinary_tail_access.volatile_loads == 0 && !ordinary_tail_access.coherent,
+          "one-record Uint16 tail load preserves GLC Volatile/Coherent policy at its dedicated site");
+
+    uint32_t vmcnt_publish_poll[std::size(coherent_publish_poll)];
+    std::copy(std::begin(coherent_publish_poll), std::end(coherent_publish_poll),
+              std::begin(vmcnt_publish_poll));
+    vmcnt_publish_poll[3] = 0xbc7d0000u; // same wait site, vmcnt(0) instead of vscnt(0)
+    const std::vector<uint32_t> vmcnt_spv = recompile_compute(
+        vmcnt_publish_poll, std::size(vmcnt_publish_poll), &coherent_rt, coherent_cfg);
+    CHECK(!vmcnt_spv.empty() && count_spirv_opcode(vmcnt_spv, 225) == 0,
+          "same-site vmcnt mutation does not emit the vscnt publication barrier");
 
     // Kernel 22: MULTI-buffer SMEM via descriptor provenance (the resource-binding contract). Two V#
     // descriptors loaded from SRT offsets 0x20 and 0x40; a ShaderResourceTable maps them to distinct
@@ -2118,6 +2960,11 @@ int main() {
               compute_gds_binding->kind == SpirvDescriptorKind::StorageBuffer &&
               compute_gds_binding->writable,
           "compute GDS module reflects its writable persistent storage-buffer binding");
+    const SpirvBufferAccessSummary internal_gds_access = spirv_buffer_access_summary(
+        compute_gds_spv, kComputeInternalGdsBinding);
+    CHECK(internal_gds_access.variable && internal_gds_access.stores == 1 &&
+              !internal_gds_access.aliased,
+          "backend-owned internal GDS stays outside the external-buffer Aliased policy");
 
     // Astro Bot's indirect-argument producer uses device-global append counters. Routing this exact
     // GDS form through workgroup LDS made every dispatch begin with undefined counter values and
@@ -3517,6 +4364,71 @@ int main() {
     CHECK(recompile_valu(code32r19b, std::size(code32r19b), 0, 2).empty(),
           "kernel 32r19b REJECTS a VCC predicate read after s_flbit overwrote the pair with data");
 
+    // Kernel 32r19c (LIVE, exec_cs_413d1bf00 pc458): exact production packet
+    // `v_ldexp_f32 v0,v13,v1`. Exercise it as raw bits because the guest exponent is i32, not f32,
+    // and because signed zero, NaN payloads, and subnormal rounding are observable contracts. The
+    // expected values cover both RNE tie directions and the exponent extremes that make the standard
+    // GLSL Ldexp instruction undefined; the emitter uses only defined integer SPIR-V for this reason.
+    const uint32_t code32r19c[] = {
+        0xd7620000u, 0x0002030du,
+        0xbf810000u,
+    };
+    struct LdexpVector { uint32_t x; int32_t exponent; uint32_t expected; };
+    const LdexpVector ldexp_vectors[] = {
+        {0x00000000u, INT32_MAX, 0x00000000u}, // +0 retains sign at arbitrarily large exponent
+        {0x80000000u, INT32_MIN, 0x80000000u}, // -0 retains sign at arbitrarily small exponent
+        {0x3fc00000u,          2, 0x40c00000u}, // 1.5 * 4 = 6
+        {0xbfc00000u,         -1, 0xbf400000u}, // -1.5 / 2 = -0.75
+        {0x00800000u,         -1, 0x00400000u}, // minimum normal -> exact subnormal
+        {0x00800001u,         -1, 0x00400000u}, // halfway, even truncated significand: round down
+        {0x00800003u,         -1, 0x00400002u}, // halfway, odd truncated significand: round up
+        {0x00ffffffu,         -1, 0x00800000u}, // subnormal rounding carries into minimum normal
+        {0x00800000u,        -24, 0x00000000u}, // exact half-min-subnormal tie rounds to even zero
+        {0x00800001u,        -24, 0x00000001u}, // just over the tie rounds to min subnormal
+        {0x00000001u,          0, 0x00000001u}, // minimum subnormal survives identity
+        {0x00000001u,          1, 0x00000002u}, // subnormal input is normalized before scaling
+        {0x007fffffu,          1, 0x00fffffeu}, // maximum subnormal crosses into normal range
+        {0x7f7fffffu,          1, 0x7f800000u}, // positive overflow
+        {0xff7fffffu,          1, 0xff800000u}, // negative overflow retains sign
+        {0x7f800000u, INT32_MIN, 0x7f800000u}, // +Inf is exponent-independent
+        {0xff800000u, INT32_MAX, 0xff800000u}, // -Inf is exponent-independent
+        {0x7fc12345u,        100, 0x7fc12345u}, // quiet NaN payload is retained bit-exactly
+        {0xffc12345u,       -100, 0xffc12345u}, // negative quiet NaN sign/payload retained
+        {0x3f800000u, INT32_MAX, 0x7f800000u}, // arbitrary positive i32 exponent is defined
+        {0xbf800000u, INT32_MIN, 0x80000000u}, // arbitrary negative i32 exponent -> signed zero
+        {0x3f000000u,        128, 0x7f000000u}, // exp=128 can still produce a finite result
+        {0x3f800000u,       -149, 0x00000001u}, // exact minimum subnormal
+        {0x3f800000u,       -150, 0x00000000u}, // halfway underflow tie -> zero
+        {0x3f800001u,       -150, 0x00000001u}, // just above halfway -> minimum subnormal
+        {0xbf800000u,       -150, 0x80000000u}, // underflow preserves negative-zero sign
+    };
+    const std::vector<uint32_t> spv32r19c = recompile_valu(
+        code32r19c, std::size(code32r19c), 14, 0);
+    CHECK(!spv32r19c.empty(),
+          "recompiled kernel 32r19c (exact GTA V v_ldexp_f32 packet) -> SPIR-V");
+    std::vector<float> in32r19c(std::size(ldexp_vectors) * 14, 0.0f);
+    for (size_t i = 0; i < std::size(ldexp_vectors); ++i) {
+        in32r19c[i * 14 + 13] = std::bit_cast<float>(ldexp_vectors[i].x);
+        in32r19c[i * 14 + 1] =
+            std::bit_cast<float>(static_cast<uint32_t>(ldexp_vectors[i].exponent));
+    }
+    const std::vector<float> got32r19c = spv32r19c.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(spv32r19c, in32r19c,
+                                     std::size(ldexp_vectors), std::size(ldexp_vectors));
+    uint32_t bad32r19c = 0;
+    for (size_t i = 0; i < std::size(ldexp_vectors) && got32r19c.size() == std::size(ldexp_vectors); ++i) {
+        const uint32_t got_bits = bits_of(got32r19c[i]);
+        if (got_bits != ldexp_vectors[i].expected) {
+            ++bad32r19c;
+            printf("  ldexp[%zu] x=%08x exp=%d got=%08x expect=%08x\n", i,
+                   ldexp_vectors[i].x, ldexp_vectors[i].exponent,
+                   got_bits, ldexp_vectors[i].expected);
+        }
+    }
+    CHECK(got32r19c.size() == std::size(ldexp_vectors) && bad32r19c == 0,
+          "kernel 32r19c preserves ldexp zero/normal/subnormal/overflow/Inf/NaN contracts");
+
     // Kernel 32r20 (LIVE encoding, exec_cs_290000eb00 pc=34; raised in review): the **SDWA** form of
     // the 16-bit compare. 32r16 covers the plain e32 encodings, so nothing executed the composition
     // of the SDWA source select with the 16-bit narrowing until this kernel.
@@ -4885,6 +5797,97 @@ int main() {
     { float f6 = 0; if (stored68_out.size()==N) std::memcpy(&f6, &stored68_out[6], 4);
       printf("  kernel68 mismatches=%u (buf[6]=%g expect=12)\n", bad68, f6); }
     CHECK(stored68_out.size() == N && bad68 == 0, "recompiled kernel 68 (raw store routes to binding 3 via SRSRC) correct");
+
+    // GTA V gameplay-entry compute programs consume fully-known RAW V#s with NUM_RECORDS=0. The
+    // production front half represents each use with this exact-PC marker. Loads must produce zero
+    // only for active EXEC lanes; stores must emit no memory write at all (a shared dummy would let
+    // one null store leak into a later null load).
+    auto zero_record_resource = [](uint32_t fetch_pc) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Unknown;
+        resource.num_components = 0;
+        resource.binding = 3;
+        resource.gpu_addr = 0;
+        resource.size = 0;
+        resource.stride = 0;
+        resource.srt_offset = 0xFFFFFFFFu;
+        resource.sgpr_base = 0xFFFFFFFFu;
+        resource.fetch_pc = fetch_pc;
+        return resource;
+    };
+
+    // v2=7; narrow EXEC to u0>u1; zero-record raw load into v2; restore EXEC; convert/output v2.
+    // Active lanes observe zero, while masked lanes retain the old 7 through predicate_write.
+    const uint32_t code68_zero_load[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040287u, 0x7DA80300u,
+        0xE0300000u, 0x80000200u,
+        0xBEFE04C1u, 0x7E040D02u, 0xBF810000u,
+    };
+    ShaderResourceTable rt68_zero_load;
+    rt68_zero_load.resources.push_back(zero_record_resource(4));
+    CHECK(is_zero_record_raw_buffer(rt68_zero_load.resources[0]),
+          "zero-record RAW test uses the explicit production marker shape");
+    const std::vector<uint32_t> spv68_zero_load = recompile_valu(
+        code68_zero_load, std::size(code68_zero_load), 2, 2, &rt68_zero_load);
+    const uint32_t code68_zero_load_control[] = {
+        0x7E000F00u, 0x7E020F01u, 0x7E040287u, 0x7DA80300u,
+        0x7E040280u,
+        0xBEFE04C1u, 0x7E040D02u, 0xBF810000u,
+    };
+    const std::vector<uint32_t> spv68_zero_load_control = recompile_valu(
+        code68_zero_load_control, std::size(code68_zero_load_control), 2, 2,
+        &rt68_zero_load);
+    CHECK(!spv68_zero_load.empty() && !spv68_zero_load_control.empty() &&
+              count_spirv_opcode(spv68_zero_load, 61) ==
+                  count_spirv_opcode(spv68_zero_load_control, 61) &&
+              count_spirv_opcode(spv68_zero_load, 62) ==
+                  count_spirv_opcode(spv68_zero_load_control, 62) &&
+              count_spirv_opcode(spv68_zero_load, 65) ==
+                  count_spirv_opcode(spv68_zero_load_control, 65),
+          "zero-record raw load adds no storage-buffer access/load/store instructions");
+    std::vector<float> in68_zero_load(N * 2), expected68_zero_load(N);
+    uint32_t active68_zero_load = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t u0 = i % 17u, u1 = i % 13u;
+        in68_zero_load[i * 2] = static_cast<float>(u0);
+        in68_zero_load[i * 2 + 1] = static_cast<float>(u1);
+        expected68_zero_load[i] = u0 > u1 ? 0.0f : 7.0f;
+        active68_zero_load += u0 > u1;
+    }
+    const std::vector<float> got68_zero_load = prosper::test::run_compute(
+        spv68_zero_load, in68_zero_load, N, N, {}, std::vector<uint32_t>(1, 0xDEADBEEFu));
+    uint32_t bad68_zero_load = 0;
+    for (uint32_t i = 0; i < N && got68_zero_load.size() == N; ++i)
+        if (got68_zero_load[i] != expected68_zero_load[i]) ++bad68_zero_load;
+    CHECK(active68_zero_load > 0 && active68_zero_load < N &&
+              got68_zero_load.size() == N && bad68_zero_load == 0,
+          "zero-record raw load returns zero under EXEC and preserves masked VGPR lanes");
+
+    ShaderResourceTable rt68_zero_store;
+    rt68_zero_store.resources.push_back(zero_record_resource(2));
+    const std::vector<uint32_t> spv68_zero_store = recompile_valu(
+        code68, std::size(code68), 1, 0, &rt68_zero_store);
+    const uint32_t code68_zero_store_control[] = {
+        0x7E040F00u, 0x06060100u, 0x7E000000u, 0x7E000000u, 0xBF810000u,
+    };
+    const std::vector<uint32_t> spv68_zero_store_control = recompile_valu(
+        code68_zero_store_control, std::size(code68_zero_store_control), 1, 0,
+        &rt68_zero_store);
+    CHECK(!spv68_zero_store.empty() && !spv68_zero_store_control.empty() &&
+              count_spirv_opcode(spv68_zero_store, 61) ==
+                  count_spirv_opcode(spv68_zero_store_control, 61) &&
+              count_spirv_opcode(spv68_zero_store, 62) ==
+                  count_spirv_opcode(spv68_zero_store_control, 62) &&
+              count_spirv_opcode(spv68_zero_store, 65) ==
+                  count_spirv_opcode(spv68_zero_store_control, 65),
+          "zero-record raw store adds no storage-buffer access/load/store instructions");
+    const std::vector<uint32_t> zero_store_sentinel = {0xDEADBEEFu};
+    std::vector<uint32_t> zero_store_after;
+    prosper::test::run_compute(spv68_zero_store, std::vector<float>{3.0f}, 1, 1, {},
+                               zero_store_sentinel, &zero_store_after);
+    CHECK(zero_store_after == zero_store_sentinel,
+          "zero-record raw store is a no-op and cannot mutate a shared dummy backing");
 
     // Kernel N: v_nop (VOP1 op 0x00) between real ALU ops must be a transparent no-op. This was the
     // #121 blocker — PPSA02664's vertex shaders contain v_nop (a common scheduling/hazard filler), and
@@ -6509,6 +7512,151 @@ int main() {
     CHECK(gotT28.size() == 128 && badT28 == 0,
           "T28: VOP2 DPP permutes only src0 and adds current-lane src1");
 
+    // T28b (#2481): GTA V's reduction follows its row-shift ladder with this exact in-place
+    // V_ADD_NC_U32 identity QUAD_PERM. ROW_MASK=0xa enables rows 1 and 3; BC0 keeps the old VDST
+    // in rows 0 and 2. The crossing tail forces the same portable CFG dispatcher as the live shader.
+    const uint32_t codeT28b[] = {
+        0x7e280300u,                         // v_mov_b32 v20,v0
+        0x7e260301u,                         // v_mov_b32 v19,v1
+        0x4a2826fau, 0xaf00e414u,            // exact GTA V partial-row DPP add
+        0x7d840000u,
+        0xd4e4006au, 0x0001006au,
+        0xbea0047eu,
+        0x87ea6a20u,
+        0x7e000280u,
+        0xbf840003u,
+        0x7d840100u,
+        0x02020100u,
+        0xbf860002u,
+        0xbf060000u,
+        0xbf850001u,
+        0x7e020280u,
+        0x7e000314u,                         // v_mov_b32 v0,v20
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT28b = recompile_valu(
+        codeT28b, std::size(codeT28b), 2, 0);
+    CHECK(!spvT28b.empty(),
+          "recompiled T28b (GTA V partial-row DPP add) -> SPIR-V");
+    std::vector<float> inT28b(128 * 2), expT28b(128);
+    constexpr uint32_t one_bitsT28b = 0x3f800000u;
+    constexpr uint32_t addend_bitsT28b = 0x00800000u;
+    for (uint32_t i = 0; i < 128; ++i) {
+        std::memcpy(&inT28b[i * 2], &one_bitsT28b, sizeof(uint32_t));
+        std::memcpy(&inT28b[i * 2 + 1], &addend_bitsT28b, sizeof(uint32_t));
+        expT28b[i] = (((i % 64u) / 16u) & 1u) ? 2.0f : 1.0f;
+    }
+    std::vector<float> gotT28b = spvT28b.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28b, inT28b, 128, 128);
+    CHECK(gotT28b == expT28b,
+          "T28b: ROW_MASK=0xa adds rows 1/3 and BC0 preserves rows 0/2 per wave64");
+
+    // T28c (#2481): the terminal GTA V compute cohort uses this exact in-place ROW_SHR:1 packet
+    // outside the CFG dispatcher. Narrow EXEC in a 0,1,1,0 pattern: lane 1 must preserve VDST
+    // because its source lane is inactive, lane 2 must add its active predecessor, and lane 3 must
+    // preserve VDST because the destination itself is inactive. Restoring EXEC exposes every result.
+    const uint32_t codeT28c[] = {
+        0x7da80300u,                         // v_cmpx_gt_u32 vcc,v0,v1
+        0x4a0e0efau, 0xff011107u,            // exact live v_add_nc_u32_dpp v7,v7,v7 row_shr:1
+        0xbefe04c1u,                         // s_mov_b64 exec,-1
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT28c = recompile_valu(
+        codeT28c, std::size(codeT28c), 8, 7);
+    CHECK(!spvT28c.empty(),
+          "recompiled T28c (GTA V ordinary in-place DPP add) -> SPIR-V");
+    std::vector<float> inT28c(128 * 8, 0.0f);
+    std::vector<uint32_t> expT28c(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        const bool activeT28c = (i & 3u) == 1u || (i & 3u) == 2u;
+        const uint32_t maskT28c = activeT28c ? 0xffffffffu : 0u;
+        const uint32_t thresholdT28c = 1u;
+        const uint32_t valueT28c = i + 1u;
+        std::memcpy(&inT28c[i * 8], &maskT28c, sizeof(uint32_t));
+        std::memcpy(&inT28c[i * 8 + 1], &thresholdT28c, sizeof(uint32_t));
+        std::memcpy(&inT28c[i * 8 + 7], &valueT28c, sizeof(uint32_t));
+        expT28c[i] = (i & 3u) == 2u ? valueT28c + i : valueT28c;
+    }
+    const std::vector<float> gotT28c = spvT28c.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28c, inT28c, 128, 128);
+    uint32_t badT28c = 0;
+    for (uint32_t i = 0; i < 128 && gotT28c.size() == 128; ++i)
+        badT28c += bits_of(gotT28c[i]) != expT28c[i];
+    CHECK(gotT28c.size() == 128 && badT28c == 0,
+          "T28c: ordinary DPP add honors arithmetic, BC0, source EXEC, and destination EXEC");
+
+    // The other two live programs carry the v1 form inside ordinary scalar structured control.
+    // SCC is true, so the forward SCC0 branch does not skip the exact {1,2,4,8} ladder. Together
+    // the four packets compute an inclusive prefix sum within every DPP16 row; every amount is
+    // needed to reach the row's last lane, while row-leading lanes exercise BC0 at every packet.
+    const uint32_t codeT28d[] = {
+        0xbe800380u,                         // s_mov_b32 s0,0
+        0xbf060000u,                         // s_cmp_eq_u32 s0,s0
+        0xbf840008u,                         // s_cbranch_scc0 -> end
+        0x4a0202fau, 0xff011101u,            // exact live v_add_nc_u32_dpp v1,v1,v1 row_shr:1
+        0x4a0202fau, 0xff011201u,            // row_shr:2
+        0x4a0202fau, 0xff011401u,            // row_shr:4
+        0x4a0202fau, 0xff011801u,            // row_shr:8
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT28d = recompile_valu(
+        codeT28d, std::size(codeT28d), 2, 1);
+    CHECK(!spvT28d.empty(),
+          "recompiled T28d (GTA V structured in-place DPP add) -> SPIR-V");
+    CHECK(compute_spirv_min_subgroup_size(spvT28d) == 16,
+          "T28d: structured row-shuffle ladder advertises its 16-lane host contract");
+    std::vector<float> inT28d(128 * 2, 0.0f);
+    std::vector<uint32_t> expT28d(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        const uint32_t valueT28d = i + 1u;
+        std::memcpy(&inT28d[i * 2 + 1], &valueT28d, sizeof(uint32_t));
+        expT28d[i] = 0;
+        for (uint32_t lane = i & ~15u; lane <= i; ++lane)
+            expT28d[i] += lane + 1u;
+    }
+    if (can_shuffleT25b && subgroupT25b.size >= 16) {
+        const std::vector<float> gotT28d = prosper::test::run_compute(
+            spvT28d, inT28d, 128, 128);
+        uint32_t badT28d = 0;
+        for (uint32_t i = 0; i < 128 && gotT28d.size() == 128; ++i)
+            badT28d += bits_of(gotT28d[i]) != expT28d[i];
+        CHECK(gotT28d.size() == 128 && badT28d == 0,
+              "T28d: structured {1,2,4,8} DPP ladder computes a per-row inclusive prefix sum");
+    } else {
+        std::printf("  [skip] T28d architectural execution: host subgroup %u is narrower than 16\n",
+                    subgroupT25b.size);
+    }
+
+    // T28e (#2481): the longer live shader carries the exact partial-row identity tail in the
+    // same ordinary structured region as its ladder. Rows 1/3 add SRC1; rows 0/2 preserve VDST.
+    const uint32_t codeT28e[] = {
+        0xbe800380u,                         // s_mov_b32 s0,0
+        0xbf060000u,                         // s_cmp_eq_u32 s0,s0
+        0xbf840002u,                         // s_cbranch_scc0 -> end
+        0x4a0e0cfau, 0xaf00e407u,            // exact live v_add_nc_u32_dpp v7,v7,v6
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spvT28e = recompile_valu(
+        codeT28e, std::size(codeT28e), 8, 7);
+    CHECK(!spvT28e.empty(),
+          "recompiled T28e (GTA V structured partial-row DPP add) -> SPIR-V");
+    std::vector<float> inT28e(128 * 8, 0.0f);
+    std::vector<uint32_t> expT28e(128);
+    for (uint32_t i = 0; i < 128; ++i) {
+        const uint32_t valueT28e = i + 1u;
+        const uint32_t addendT28e = 7u;
+        std::memcpy(&inT28e[i * 8 + 6], &addendT28e, sizeof(uint32_t));
+        std::memcpy(&inT28e[i * 8 + 7], &valueT28e, sizeof(uint32_t));
+        expT28e[i] = (((i % 64u) / 16u) & 1u) ? valueT28e + addendT28e : valueT28e;
+    }
+    const std::vector<float> gotT28e = spvT28e.empty() ? std::vector<float>{} :
+        prosper::test::run_compute(spvT28e, inT28e, 128, 128);
+    uint32_t badT28e = 0;
+    for (uint32_t i = 0; i < 128 && gotT28e.size() == 128; ++i)
+        badT28e += bits_of(gotT28e[i]) != expT28e[i];
+    CHECK(gotT28e.size() == 128 && badT28e == 0,
+          "T28e: structured partial-row DPP add updates only rows 1/3 per wave64");
+
     // T29: exact S_BFM_B64 word from Astro's title reduction shader.  It creates VCC with the low
     // 32 lanes set, then saveexec predicates a write.  The operation repeats independently in each
     // architectural wave64 even when the Vulkan workgroup contains two waves.
@@ -7233,6 +8381,227 @@ int main() {
               "#590: partially-overlapping loops remain REJECTED (unstructured region)");
     }
 
+    // #2481: GTA V's three exact-wave barrier rejects do not branch through a guest barrier. Their
+    // large CFGs are three concrete sequences of barrier-free phases, so compile each phase through
+    // the arbitrary-CFG dispatcher and reconverge before emitting the guest barrier. Preserve the
+    // capture PCs in these reduced streams: mutation must perturb the same boundary proof as the fix.
+    auto barrier_phase_skeleton = [](uint32_t end_pc,
+                                     std::initializer_list<uint32_t> barriers,
+                                     std::initializer_list<std::tuple<uint32_t, uint32_t, uint32_t>>
+                                         branches) {
+        std::vector<uint32_t> code(end_pc + 1, 0xBF800000u); // s_nop 0
+        for (uint32_t pc : barriers) code[pc] = 0xBF8A0000u;
+        for (const auto& [pc, target, opcode] : branches) {
+            const int32_t delta = static_cast<int32_t>(target) -
+                static_cast<int32_t>(pc + 1);
+            code[pc] = opcode | static_cast<uint16_t>(delta);
+        }
+        code[end_pc] = 0xBF810000u;
+        return code;
+    };
+    std::vector<uint32_t> gta205BarrierPhases = barrier_phase_skeleton(
+        155, {153}, {{30, 56, 0xBF880000u}, {66, 96, 0xBF860000u},
+                     {97, 108, 0xBF880000u}});
+    std::vector<uint32_t> gta413c340BarrierPhases = barrier_phase_skeleton(
+        65, {51, 64}, {{11, 38, 0xBF880000u}, {25, 33, 0xBF880000u},
+                       {32, 23, 0xBF820000u}, {45, 49, 0xBF840000u},
+                       {53, 62, 0xBF880000u}});
+    std::vector<uint32_t> gta413c670BarrierPhases = barrier_phase_skeleton(
+        130, {116, 129}, {{40, 73, 0xBF880000u}, {49, 55, 0xBF860000u},
+                          {60, 67, 0xBF870000u}, {75, 103, 0xBF880000u},
+                          {90, 98, 0xBF880000u}, {97, 88, 0xBF820000u},
+                          {110, 114, 0xBF840000u}, {118, 127, 0xBF880000u}});
+    ComputeShaderConfig gtaBarrierPhaseConfig;
+    gtaBarrierPhaseConfig.local_x = 256;
+    gtaBarrierPhaseConfig.wave_size = 64;
+    gtaBarrierPhaseConfig.exact_thread_extent = true;
+    gtaBarrierPhaseConfig.threads_x = 256;
+    gtaBarrierPhaseConfig.threads_y = gtaBarrierPhaseConfig.threads_z = 1;
+    ComputeShaderConfig gtaPartialPhaseConfig = gtaBarrierPhaseConfig;
+    gtaPartialPhaseConfig.threads_x = 255; // force synchronized partial-workgroup phases
+    const std::vector<uint32_t> gta205BarrierSpv = recompile_compute(
+        gta205BarrierPhases.data(), gta205BarrierPhases.size(), nullptr,
+        gtaBarrierPhaseConfig);
+    const std::vector<uint32_t> gta413c340BarrierSpv = recompile_compute(
+        gta413c340BarrierPhases.data(), gta413c340BarrierPhases.size(), nullptr,
+        gtaBarrierPhaseConfig);
+    const std::vector<uint32_t> gta413c670BarrierSpv = recompile_compute(
+        gta413c670BarrierPhases.data(), gta413c670BarrierPhases.size(), nullptr,
+        gtaBarrierPhaseConfig);
+    CHECK(!gta205BarrierSpv.empty() && !gta413c340BarrierSpv.empty() &&
+              !gta413c670BarrierSpv.empty(),
+          "#2481: all three captured top-level barrier phase layouts recompile");
+
+    // An unconditional branch to the real S_ENDPGM is otherwise a legal proven exit from the
+    // synthetic first-phase dispatcher. This makes the assertion specifically sensitive to the
+    // production phase-boundary proof, rather than to a downstream CFG rejection.
+    std::vector<uint32_t> gtaForwardBarrierCrossing = gta413c340BarrierPhases;
+    gtaForwardBarrierCrossing[45] =
+        0xBF820000u | static_cast<uint16_t>(65 - 46);
+    CHECK(recompile_compute(gtaForwardBarrierCrossing.data(),
+                            gtaForwardBarrierCrossing.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: unconditional pc45 exit across pc51/64 rejects at the phase proof");
+    std::vector<uint32_t> gtaBackwardBarrierCrossing = gta413c340BarrierPhases;
+    gtaBackwardBarrierCrossing[53] =
+        0xBF820000u | static_cast<uint16_t>(50 - 54);
+    CHECK(recompile_compute(gtaBackwardBarrierCrossing.data(),
+                            gtaBackwardBarrierCrossing.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: backward pc53 edge across pc51 rejects at the phase proof");
+    std::vector<uint32_t> gtaIndirectBarrierCrossing = gta413c340BarrierPhases;
+    gtaIndirectBarrierCrossing[40] = 0xBE802000u; // s_setpc_b64 s[0:1]
+    CHECK(recompile_compute(gtaIndirectBarrierCrossing.data(),
+                            gtaIndirectBarrierCrossing.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: indirect PC changes remain incompatible with barrier phase splitting");
+    std::vector<uint32_t> gtaConditionalBarrier = gta205BarrierPhases;
+    gtaConditionalBarrier[97] = 0xBF880000u | static_cast<uint16_t>(154 - 98);
+    CHECK(recompile_compute(gtaConditionalBarrier.data(), gtaConditionalBarrier.size(), nullptr,
+                            gtaBarrierPhaseConfig).empty(),
+          "#2481: mutating the captured pc97 edge around pc153 keeps a conditional barrier rejected");
+    std::vector<uint32_t> gtaTrapBeforeBarrier = gta205BarrierPhases;
+    gtaTrapBeforeBarrier[120] = 0xBF920000u; // s_trap 0
+    CHECK(recompile_compute(gtaTrapBeforeBarrier.data(), gtaTrapBeforeBarrier.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: a wave-terminating trap before a later workgroup barrier rejects");
+
+    // The two 0x413d... programs launch 2063 real threads in nine 256-wide Vulkan workgroups. The
+    // final 241 padded invocations must remain in every dispatcher/common/barrier block but execute
+    // no guest instruction. Store a canary-indexed result after two phase boundaries: successful
+    // completion proves the complete host workgroup reaches the barriers, while the untouched tail
+    // proves padded lanes never acquire a guest PC even though guest code may rewrite EXEC.
+    const uint32_t partialBarrierPhases[] = {
+        0xBE810380u,              //  0: s_mov_b32 s1, 0
+        0xBF0A8101u,              //  1: loop: s_cmp_lt_u32 s1, 1
+        0xBF840002u,              //  2: s_cbranch_scc0 +2 -> 5
+        0x81018101u,              //  3: s_add_i32 s1, s1, 1
+        0xBF82FFFCu,              //  4: s_branch -4 -> 1
+        0xBF800000u,              //  5: s_nop 0
+        0xBF8A0000u,              //  6: s_barrier
+        0x7D840100u,              //  7: v_cmp_eq_u32 vcc, v0, v0
+        0xBF860001u,              //  8: s_cbranch_vccz +1 -> 10
+        0xBE820381u,              //  9: s_mov_b32 s2, 1
+        0xBEFE04C1u,              // 10: s_mov_b64 exec, -1 (must not reactivate padding)
+        0xBF8A0000u,              // 11: s_barrier
+        0x8F008800u,              // 12: s_lshl_b32 s0, s0, 8 (group index * 256)
+        0x4A000000u,              // 13: v_add_nc_u32 v0, s0, v0
+        0x7E020287u,              // 14: v_mov_b32 v1, 7
+        0xE0702000u, 0x80020100u, // 15: buffer_store_dword v1, v0, s[8:11] idxen
+        0xBF810000u,              // 17: s_endpgm
+    };
+    ShaderResourceTable partialBarrierTable;
+    { ShaderResource dst{}; dst.cls = ResourceClass::ConstantBuffer;
+      dst.format = DataFormat::Uint32; dst.num_components = 1;
+      dst.binding = 3; dst.stride = 4; dst.sgpr_base = 8;
+      partialBarrierTable.resources.push_back(dst); }
+
+    // DIRECT descriptors are valid only while none of their four entry SGPR words was overwritten.
+    // The first phase writes s8; the tail must see that provenance even though its persistent scalar
+    // value is otherwise independently reconstructed by a new dispatcher.
+    std::vector<uint32_t> phaseDescriptorOverwrite = barrier_phase_skeleton(
+        68, {51, 64}, {{11, 38, 0xBF880000u}, {25, 33, 0xBF880000u},
+                       {32, 23, 0xBF820000u}, {45, 49, 0xBF840000u},
+                       {53, 62, 0xBF880000u}});
+    phaseDescriptorOverwrite[0] = 0xBE880380u;       // s_mov_b32 s8, 0
+    phaseDescriptorOverwrite[65] = 0xE0301000u;      // buffer_load_dword v0, v0,
+    phaseDescriptorOverwrite[66] = 0x80020000u;      //   s[8:11], 0 offen
+    CHECK(recompile_compute(phaseDescriptorOverwrite.data(),
+                            phaseDescriptorOverwrite.size(), &partialBarrierTable,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: a pre-barrier DIRECT descriptor-word overwrite invalidates its tail use");
+
+    // An ordinary write to a VGPR ends a v_writelane scalar-spill lifetime. The tombstone is
+    // compile-time metadata, so it must cross a phase separately from the persisted slot value.
+    std::vector<uint32_t> phaseInvalidatedSpill = barrier_phase_skeleton(
+        68, {51, 64}, {{11, 38, 0xBF880000u}, {25, 33, 0xBF880000u},
+                       {32, 23, 0xBF820000u}, {45, 49, 0xBF840000u},
+                       {53, 62, 0xBF880000u}});
+    phaseInvalidatedSpill[0] = 0xBE800381u; // s_mov_b32 s0, 1
+    phaseInvalidatedSpill[1] = 0xD7610001u; // v_writelane_b32 v1, s0, 0
+    phaseInvalidatedSpill[2] = 0x00010000u;
+    phaseInvalidatedSpill[3] = 0x7E020285u; // ordinary v_mov_b32 v1, 5
+    phaseInvalidatedSpill[65] = 0xD7600002u; // invalid v_readlane_b32 s2, v1, 0
+    phaseInvalidatedSpill[66] = 0x00010101u;
+    CHECK(recompile_compute(phaseInvalidatedSpill.data(), phaseInvalidatedSpill.size(), nullptr,
+                            gtaPartialPhaseConfig).empty(),
+          "#2481: a pre-barrier ordinary VGPR write keeps its spill tombstone in the tail");
+
+    ComputeShaderConfig partialBarrierConfig;
+    partialBarrierConfig.local_x = 256;
+    partialBarrierConfig.wave_size = 64;
+    partialBarrierConfig.native_subgroup_size = 64; // safe route must force portable for padding
+    partialBarrierConfig.exact_thread_extent = true;
+    partialBarrierConfig.threads_x = 2063;
+    partialBarrierConfig.threads_y = partialBarrierConfig.threads_z = 1;
+    partialBarrierConfig.tgid_x_en = true;
+    const std::vector<uint32_t> partialBarrierSpv = recompile_compute(
+        partialBarrierPhases, std::size(partialBarrierPhases), &partialBarrierTable,
+        partialBarrierConfig);
+    CHECK(!partialBarrierSpv.empty() && has_spirv_local_size(partialBarrierSpv, 256, 1, 1),
+          "#2481: 2063/256 partial workgroup barrier phases recompile through portable CFG");
+    constexpr uint32_t kPartialThreads = 2063;
+    constexpr uint32_t kPartialLaunch = 9 * 256;
+    constexpr uint32_t kPartialCanary = 0xccccccccu;
+    std::vector<uint32_t> partialInitial(kPartialLaunch, kPartialCanary), partialResult;
+    prosper::test::run_compute(
+        partialBarrierSpv, std::vector<float>(1, 0.0f), kPartialThreads, 1,
+        {}, partialInitial, &partialResult, 256);
+    uint32_t partialBad = 0;
+    for (uint32_t lane = 0; lane < partialResult.size(); ++lane) {
+        const uint32_t expected = lane < kPartialThreads ? 7u : kPartialCanary;
+        partialBad += partialResult[lane] != expected;
+    }
+    CHECK(partialResult.size() == kPartialLaunch && partialBad == 0,
+          "#2481: padded invocations reach both barriers but produce no guest buffer effects");
+
+    // The first phase has no DPP event and therefore asks for only the ordinary vote/liveness
+    // layout. The second phase's portable ROW_SHR add needs a second complete lane plane. Execute
+    // the partial final workgroup and inspect OpTypeArray so both the allocation and all dynamic
+    // accesses are covered by the same regression.
+    const uint32_t phasedDppScratch[] = {
+        0xBE810380u,              //  0: s_mov_b32 s1, 0
+        0xBF0A8101u,              //  1: loop: s_cmp_lt_u32 s1, 1
+        0xBF840002u,              //  2: s_cbranch_scc0 +2 -> 5
+        0x81018101u,              //  3: s_add_i32 s1, s1, 1
+        0xBF82FFFCu,              //  4: s_branch -4 -> 1
+        0x7E020300u,              //  5: v_mov_b32 v1, v0 (local invocation index)
+        0xBF8A0000u,              //  6: s_barrier
+        0x7D840100u,              //  7: v_cmp_eq_u32 vcc, v0, v0
+        0xBF860001u,              //  8: s_cbranch_vccz +1 -> 10
+        0xBE820381u,              //  9: s_mov_b32 s2, 1
+        0xBEFE04C1u,              // 10: s_mov_b64 exec, -1
+        0xBF8A0000u,              // 11: s_barrier
+        0x4A0202FAu, 0xFF011101u, // 12: v_add_nc_u32_dpp v1,v1,v1 row_shr:1
+        0x8F008800u,              // 14: s_lshl_b32 s0, s0, 8 (group index * 256)
+        0x4A000000u,              // 15: v_add_nc_u32 v0, s0, v0
+        0xE0702000u, 0x80020100u, // 16: buffer_store_dword v1, v0, s[8:11] idxen
+        0xBF810000u,              // 18: s_endpgm
+    };
+    const std::vector<uint32_t> phasedDppSpv = recompile_compute(
+        phasedDppScratch, std::size(phasedDppScratch), &partialBarrierTable,
+        partialBarrierConfig);
+    constexpr uint32_t kPhasedDppScratchDwords = 256 * 2 + 4 + 1;
+    CHECK(!phasedDppSpv.empty() &&
+              spirv_has_array_length(phasedDppSpv, kPhasedDppScratchDwords),
+          "#2481: whole phased stream pre-sizes portable DPP scratch to 517 dwords");
+    std::vector<uint32_t> phasedDppInitial(kPartialLaunch, kPartialCanary), phasedDppResult;
+    if (!phasedDppSpv.empty())
+        prosper::test::run_compute(
+            phasedDppSpv, std::vector<float>(1, 0.0f), kPartialThreads, 1,
+            {}, phasedDppInitial, &phasedDppResult, 256);
+    uint32_t phasedDppBad = 0;
+    for (uint32_t lane = 0; lane < phasedDppResult.size(); ++lane) {
+        uint32_t expected = kPartialCanary;
+        if (lane < kPartialThreads) {
+            const uint32_t local = lane & 255u;
+            expected = (local & 15u) ? 2u * local - 1u : local;
+        }
+        phasedDppBad += phasedDppResult[lane] != expected;
+    }
+    CHECK(phasedDppResult.size() == kPartialLaunch && phasedDppBad == 0,
+          "#2481: later portable DPP phase produces exact rows and preserves padded canaries");
+
     // #2396: a CFG-dispatcher attempt that fails PART WAY THROUGH must not leave its half-written
     // dispatcher in the module. emit_cfg_state_machine writes the dispatcher loop's OpLoopMerge,
     // its OpSelectionMerge and the OpSwitch before it emits the per-case bodies, so a reject inside
@@ -7428,7 +8797,36 @@ int main() {
         CHECK(edge_grown_ok,
               "IMAGE_BVH_INTERSECT_RAY applies descriptor-selected box growth");
 
-        std::vector<uint32_t> tri_words(32, 0u);
+        ShaderResourceTable bvh64_rt = bvh_rt;
+        bvh64_rt.resources[0].size = 64u;
+        bvh64_rt.resources[0].bvh_box_grow = 0u;
+
+        // A 64-byte allocation cannot contain a complete FP32 box node. It must therefore return
+        // no-hit even though the first child's ID and six bounds fit in the allocation and describe
+        // a hit. This catches unsigned underflow in the 128-byte node bound: (64-128)/8 would make
+        // every node offset appear valid while the individually-clamped loads conceal the OOB read.
+        std::vector<uint32_t> short_box_words(16, 0u);
+        short_box_words[0] = 0x100u;
+        short_box_words[4] = bits_of(-1.0f); short_box_words[5] = bits_of(-1.0f);
+        short_box_words[6] = bits_of(-1.0f); short_box_words[7] = bits_of( 1.0f);
+        short_box_words[8] = bits_of( 1.0f); short_box_words[9] = bits_of( 1.0f);
+        for (uint32_t lane = 0; lane < lanes; ++lane)
+            set_ray(lane, 5u, 0.0f, 0.0f, -5.0f);
+        bool short_box_ok = true;
+        for (uint32_t component = 0; component < 4; ++component) {
+            const std::vector<uint32_t> module = recompile_valu(
+                bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh64_rt);
+            const std::vector<float> output = module.empty() ? std::vector<float>{} :
+                prosper::test::run_compute(
+                    module, bvh_inputs, lanes, lanes, short_box_words);
+            short_box_ok &= !module.empty() && output.size() == lanes;
+            for (uint32_t lane = 0; lane < output.size(); ++lane)
+                short_box_ok &= bits_of(output[lane]) == 0xffffffffu;
+        }
+        CHECK(short_box_ok,
+              "64-byte IMAGE_BVH_INTERSECT_RAY rejects an incomplete FP32 box node");
+
+        std::vector<uint32_t> tri_words(16, 0u);
         tri_words[0] = bits_of(9.0f); tri_words[1] = bits_of(9.0f); tri_words[2] = bits_of(9.0f);
         tri_words[3] = bits_of(0.0f); tri_words[4] = bits_of(0.0f); tri_words[5] = bits_of(0.0f); // V1
         tri_words[6] = bits_of(0.0f); tri_words[7] = bits_of(1.0f); tri_words[8] = bits_of(0.0f); // V2
@@ -7436,13 +8834,15 @@ int main() {
         tri_words[15] = 0x00000900u; // type-1 I=vertex1, J=vertex2
         for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 1u, 0.25f, 0.25f, -1.0f);
         const std::vector<uint32_t> tri_module = recompile_valu(
-            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
-        const std::vector<float> tri_output = prosper::test::run_compute(
-            tri_module, bvh_inputs, lanes, lanes, tri_words);
+            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh64_rt);
+        const std::vector<float> tri_output = tri_module.empty() ? std::vector<float>{} :
+            prosper::test::run_compute(
+                tri_module, bvh_inputs, lanes, lanes, tri_words);
         bool tri_ok = tri_output.size() == lanes;
         for (uint32_t lane = 0; lane < tri_output.size(); ++lane)
             tri_ok &= bits_of(tri_output[lane]) == bits_of(-1.0f);
-        CHECK(tri_ok, "IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
+        CHECK(!tri_module.empty() && tri_ok,
+              "64-byte IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

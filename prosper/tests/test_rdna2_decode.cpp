@@ -92,6 +92,27 @@ int main() {
     // inst6: v_fma_f32 v0, v1, v2, v3 (VOP3) -> dst VGPR0, srcs VGPR1/2/3
     CHECK(isV(ins[6].dst, 0) && ins[6].n_src == 3 && isV(ins[6].src[0], 1) &&
           isV(ins[6].src[1], 2) && isV(ins[6].src[2], 3), "v_fma_f32 VOP3 operands");
+    // GTA V exec_cs_413d1bf00 pc458, exact llvm-mc gfx1010 packet:
+    // `v_ldexp_f32 v0, v13, v1`. It is a two-source VOP3A op; the zeroed reserved SRC2 field must
+    // not escape as a phantom s0 dependency. Keep modifier decoding visible so the bounded emitter
+    // can reject unproved forms instead of silently dropping them.
+    const uint32_t gta_ldexp_words[] = {0xd7620000u, 0x0002030du};
+    const Rdna2Inst gta_ldexp = rdna2_decode_one(gta_ldexp_words, 2);
+    CHECK(gta_ldexp.fmt == Rdna2Format::VOP3 && gta_ldexp.opcode == 0x362u &&
+          gta_ldexp.n_src == 2 && isV(gta_ldexp.dst, 0) &&
+          isV(gta_ldexp.src[0], 13) && isV(gta_ldexp.src[1], 1) &&
+          gta_ldexp.src[2].kind == OperandKind::None &&
+          !gta_ldexp.clamp && gta_ldexp.omod == 0 &&
+          !gta_ldexp.src_abs[0] && !gta_ldexp.src_abs[1] &&
+          !gta_ldexp.src_neg[0] && !gta_ldexp.src_neg[1],
+          "GTA V v_ldexp_f32 decodes two sources and no phantom s0/modifiers");
+    const uint32_t gta_ldexp_modifier_words[] = {
+        0xd7628100u, 0x2802030du, // src0 ABS, CLAMP, src0 NEG, OMOD x2
+    };
+    const Rdna2Inst gta_ldexp_modifier = rdna2_decode_one(gta_ldexp_modifier_words, 2);
+    CHECK(gta_ldexp_modifier.src_abs[0] && gta_ldexp_modifier.src_neg[0] &&
+          gta_ldexp_modifier.clamp && gta_ldexp_modifier.omod == 1,
+          "v_ldexp_f32 modifier bits remain visible to the fail-closed emitter");
     // inst7: s_load_dwordx4 s[0:3], s[4:5], 0x0 (SMEM) -> op 0x2, SDATA s0, SBASE s4 (pair), offset 0
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");
@@ -241,6 +262,36 @@ int main() {
     CHECK(mz.fmt == Rdna2Format::VOP1 && mz.opcode == 0x01u && !mz.has_modifier &&
           mz.sdwa_src0_sel == 4u && !mz.sdwa_src0_sext,
           "the same encoding without bit 19 decodes as the zero-extending form");
+    // GTA V compute compaction: reverse the selected low word into a full dword. Both retained
+    // kernels use the same WORD_0 + zero-extension shape, differing only in their VGPR number.
+    const uint32_t bfrev6[] = { 0x7e0c70f9u, 0x00040606u };
+    Rdna2Inst br6 = rdna2_decode_one(bfrev6, 2);
+    CHECK(br6.fmt == Rdna2Format::VOP1 && br6.opcode == 0x38u && !br6.has_modifier &&
+          br6.has_sdwa && isV(br6.dst, 6) && isV(br6.src[0], 6) &&
+          br6.sdwa_dst_sel == 6u && br6.sdwa_dst_unused == 0u &&
+          br6.sdwa_src0_sel == 4u,
+          "GTA V v_bfrev_b32_sdwa v6 WORD_0 packet is admitted exactly");
+    const uint32_t bfrev0[] = { 0x7e0070f9u, 0x00040600u };
+    Rdna2Inst br0 = rdna2_decode_one(bfrev0, 2);
+    CHECK(br0.fmt == Rdna2Format::VOP1 && br0.opcode == 0x38u && !br0.has_modifier &&
+          br0.has_sdwa && isV(br0.dst, 0) && isV(br0.src[0], 0) &&
+          br0.sdwa_src0_sel == 4u,
+          "GTA V v_bfrev_b32_sdwa v0 WORD_0 packet is admitted exactly");
+    const uint32_t bfrev_sext[] = { 0x7e0070f9u, 0x000c0600u };
+    const uint32_t bfrev_neg[] = { 0x7e0070f9u, 0x00140600u };
+    const uint32_t bfrev_partial_dst[] = { 0x7e0070f9u, 0x00040400u };
+    const uint32_t bfrev_reserved_high[] = { 0x7e0070f9u, 0x01040600u };
+    const uint32_t bfrev_dword[] = { 0x7e0070f9u, 0x00060600u };
+    const uint32_t bfrev_dword_neg[] = { 0x7e0070f9u, 0x00160600u };
+    const uint32_t bfrev_dword_abs[] = { 0x7e0070f9u, 0x00260600u };
+    CHECK(rdna2_decode_one(bfrev_sext, 2).has_modifier &&
+          rdna2_decode_one(bfrev_neg, 2).has_modifier &&
+          rdna2_decode_one(bfrev_partial_dst, 2).has_modifier &&
+          rdna2_decode_one(bfrev_reserved_high, 2).has_modifier &&
+          rdna2_decode_one(bfrev_dword, 2).has_modifier &&
+          rdna2_decode_one(bfrev_dword_neg, 2).has_modifier &&
+          rdna2_decode_one(bfrev_dword_abs, 2).has_modifier,
+          "v_bfrev_b32 SDWA SEXT, modifiers, reserved fields, DWORD source, and partial dst reject");
     // `v_add_nc_u32_sdwa v4, 8, sext(v5) src0_sel:DWORD src1_sel:WORD_0`: SEXT on the SECOND source
     // only, which is the field the two per-source flags exist to keep apart.
     const uint32_t add_s1_sext[] = { 0x4a080af9u, 0x0c860688u };
@@ -337,8 +388,23 @@ int main() {
     const uint32_t dpp16[] = { 0x4a0e0cfau, 0xff011106u };   // v_add_nc_u32_dpp v7, v6, v6 row_shr:1
     Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
     CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && !dp.has_modifier && dp.has_dpp &&
-          dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl,
+          dp.dpp_ctrl == 0x111u && !dp.dpp_bound_ctrl &&
+          dp.dpp_row_mask == 0xfu && dp.dpp_bank_mask == 0xfu,
           "VOP2 DPP16 ROW_SHR form retains its unbounded lane control");
+    const uint32_t gta_row_mask_add[] = { 0x4a2826fau, 0xaf00e414u };
+    Rdna2Inst grm = rdna2_decode_one(gta_row_mask_add, 2);
+    CHECK(grm.fmt == Rdna2Format::VOP2 && grm.opcode == 0x25u &&
+          !grm.has_modifier && grm.has_dpp && grm.dpp_ctrl == 0xe4u &&
+          !grm.dpp_bound_ctrl && grm.dpp_row_mask == 0xau &&
+          grm.dpp_bank_mask == 0xfu && isV(grm.dst, 20) &&
+          isV(grm.src[0], 20) && isV(grm.src[1], 19),
+          "GTA V identity DPP add retains exact partial row mask and operands");
+    for (uint32_t mutant : {0x9f00e414u, 0xae00e414u, 0xaf08e414u, 0xaf00e514u}) {
+        const uint32_t words[] = {0x4a2826fau, mutant};
+        Rdna2Inst rejected = rdna2_decode_one(words, 2);
+        CHECK(rejected.has_modifier && !rejected.has_dpp,
+              "GTA V partial DPP admission rejects row/bank/BC/control mutations");
+    }
     const uint32_t ngg_row_shift[] = { 0x4a1e1efau, 0xff09110fu };
     Rdna2Inst nrs = rdna2_decode_one(ngg_row_shift, 2);
     CHECK(nrs.fmt == Rdna2Format::VOP2 && nrs.opcode == 0x25u && !nrs.has_modifier &&
@@ -417,6 +483,110 @@ int main() {
           n3.mimg_nsa == 1u && n3.mimg_dim == 2u &&
           (n3.words[1] & 0xFFu) == 0u && (n3.words[2] & 0xFFu) == 7u && ((n3.words[2] >> 8) & 0xFFu) == 3u,
           "NSA MIMG 3D captures the extra address dword; coords decode to v0,v7,v3");
+    // GTA V gameplay compute packets. The helper identifies only the audited zero-specializable
+    // IMAGE_*_MIP shapes and returns the dimension-specific mip VGPR; it does not prove its value.
+    const uint32_t gta_load_mip_2d_words[] = {0xf0043108u, 0x00050000u};
+    const uint32_t gta_load_mip_2d_xyzw_words[] = {0xf0043f08u, 0x00050000u};
+    const uint32_t gta_load_mip_2da_words[] = {0xf0043128u, 0x00050000u};
+    const uint32_t gta_store_mip_2d_words[] = {
+        0xf024310au, 0x00030004u, 0x00000503u,
+    };
+    const uint32_t gta_store_mip_2d_xyzw_words[] = {
+        0xf0243f0au, 0x00030005u, 0x00000604u,
+    };
+    const Rdna2Inst gta_load_mip_2d = rdna2_decode_one(gta_load_mip_2d_words, 2);
+    const Rdna2Inst gta_load_mip_2d_xyzw =
+        rdna2_decode_one(gta_load_mip_2d_xyzw_words, 2);
+    const Rdna2Inst gta_load_mip_2da = rdna2_decode_one(gta_load_mip_2da_words, 2);
+    const Rdna2Inst gta_store_mip_2d = rdna2_decode_one(gta_store_mip_2d_words, 3);
+    const Rdna2Inst gta_store_mip_2d_xyzw =
+        rdna2_decode_one(gta_store_mip_2d_xyzw_words, 3);
+    uint32_t mip_vgpr = UINT32_MAX;
+    CHECK(gta_load_mip_2d.opcode == 0x01u && gta_load_mip_2d.mimg_dim == 1u &&
+              rdna2_mimg_zero_mip_shape(gta_load_mip_2d, &mip_vgpr) && mip_vgpr == 2u,
+          "GTA V IMAGE_LOAD_MIP 2D identifies v2 as its mip operand");
+    CHECK(gta_load_mip_2d_xyzw.mimg_dmask == 0xfu &&
+              rdna2_mimg_zero_mip_shape(gta_load_mip_2d_xyzw, &mip_vgpr) &&
+              mip_vgpr == 2u,
+          "GTA V 0x2042f49800 IMAGE_LOAD_MIP accepts its exact xyzw result mask");
+    CHECK(gta_load_mip_2da.opcode == 0x01u && gta_load_mip_2da.mimg_dim == 5u &&
+              rdna2_mimg_zero_mip_shape(gta_load_mip_2da, &mip_vgpr) && mip_vgpr == 3u,
+          "GTA V IMAGE_LOAD_MIP 2D_ARRAY identifies v3 after the preserved slice");
+    CHECK(gta_store_mip_2d.opcode == 0x09u && gta_store_mip_2d.mimg_dim == 1u &&
+              gta_store_mip_2d.mimg_nsa == 1u &&
+              rdna2_mimg_zero_mip_shape(gta_store_mip_2d, &mip_vgpr) && mip_vgpr == 5u,
+          "GTA V IMAGE_STORE_MIP NSA 2D identifies its explicit v5 mip operand");
+    CHECK(gta_store_mip_2d_xyzw.mimg_dmask == 0xfu &&
+              gta_store_mip_2d_xyzw.dst.kind == OperandKind::VGPR &&
+              gta_store_mip_2d_xyzw.dst.value == 0 &&
+              gta_store_mip_2d_xyzw.src[0].kind == OperandKind::VGPR &&
+              gta_store_mip_2d_xyzw.src[0].value == 5 &&
+              rdna2_mimg_zero_mip_shape(gta_store_mip_2d_xyzw, &mip_vgpr) &&
+              mip_vgpr == 6u,
+          "GTA V 0x2042f49800 IMAGE_STORE_MIP keeps v[0:3], (v5,v4), and v6 mip exact");
+    const uint32_t gta_pc10_vop2_word[] = {0x4a000804u};
+    const uint32_t wide_vop3_words[] = {0xd5761e01u, 0x040a0100u};
+    const uint32_t wide_mimg_words[] = {0xf0003f08u, 0x00050000u};
+    const uint32_t mimg_tfe_words[] = {0xf0010308u, 0x00050000u};
+    const uint32_t mimg_store_tfe_words[] = {0xf0210308u, 0x00050000u};
+    const uint32_t mimg_store_mip_tfe_words[] = {0xf0250308u, 0x00050003u};
+    const uint32_t mtbuf_store_tfe_words[] = {0xe9e72000u, 0x80882008u};
+    const uint32_t wide_mubuf_words[] = {0xe0382020u, 0x80020000u};
+    const Rdna2Inst gta_pc10_vop2 = rdna2_decode_one(gta_pc10_vop2_word, 1);
+    const Rdna2Inst wide_vop3 = rdna2_decode_one(wide_vop3_words, 2);
+    const Rdna2Inst wide_mimg = rdna2_decode_one(wide_mimg_words, 2);
+    const Rdna2Inst mimg_tfe = rdna2_decode_one(mimg_tfe_words, 2);
+    const Rdna2Inst mimg_store_tfe = rdna2_decode_one(mimg_store_tfe_words, 2);
+    const Rdna2Inst mimg_store_mip_tfe = rdna2_decode_one(mimg_store_mip_tfe_words, 2);
+    const Rdna2Inst mtbuf_store_tfe = rdna2_decode_one(mtbuf_store_tfe_words, 2);
+    const Rdna2Inst wide_mubuf = rdna2_decode_one(wide_mubuf_words, 2);
+    CHECK(gta_pc10_vop2.fmt == Rdna2Format::VOP2 && gta_pc10_vop2.dst.value == 0 &&
+              rdna2_vgpr_write_count(gta_pc10_vop2) == 1u &&
+              wide_vop3.fmt == Rdna2Format::VOP3 && wide_vop3.dst.value == 1 &&
+              rdna2_vgpr_write_count(wide_vop3) == 2u &&
+              rdna2_vgpr_write_count(wide_mimg) == 4u &&
+              mimg_tfe.mimg_tfe && mimg_tfe.mimg_dmask == 3u &&
+              rdna2_vgpr_write_count(mimg_tfe) == 2u &&
+              rdna2_tfe_status_vgpr(mimg_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mimg_tfe) == 3u &&
+              rdna2_vgpr_write_count(wide_mubuf) == 4u &&
+              rdna2_vgpr_write_count(mt_tfe) == 1u &&
+              rdna2_tfe_status_vgpr(mt_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mt_tfe) == 2u &&
+              rdna2_vgpr_write_count(gta_store_mip_2d_xyzw) == 0u &&
+              rdna2_vgpr_destination_span(gta_store_mip_2d_xyzw) == 4u,
+          "shared VGPR writer inventory distinguishes scalar, pair, wide memory, and store packets");
+    CHECK(mimg_store_tfe.fmt == Rdna2Format::MIMG &&
+              mimg_store_tfe.opcode == 0x08u && mimg_store_tfe.mimg_tfe &&
+              mimg_store_tfe.mimg_dmask == 3u &&
+              rdna2_vgpr_write_count(mimg_store_tfe) == 0u &&
+              rdna2_tfe_status_vgpr(mimg_store_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mimg_store_tfe) == 3u &&
+              mimg_store_mip_tfe.opcode == 0x09u && mimg_store_mip_tfe.mimg_tfe &&
+              rdna2_vgpr_write_count(mimg_store_mip_tfe) == 0u &&
+              rdna2_tfe_status_vgpr(mimg_store_mip_tfe) == 2 &&
+              rdna2_vgpr_destination_span(mimg_store_mip_tfe) == 3u &&
+              mtbuf_store_tfe.fmt == Rdna2Format::MTBUF &&
+              mtbuf_store_tfe.opcode == 7u && mtbuf_store_tfe.mtbuf_tfe &&
+              rdna2_vgpr_write_count(mtbuf_store_tfe) == 0u &&
+              rdna2_tfe_status_vgpr(mtbuf_store_tfe) == 36 &&
+              rdna2_vgpr_destination_span(mtbuf_store_tfe) == 5u,
+          "store TFE keeps its VDATA source prefix separate from the trailing status write");
+    const uint32_t ordinary_load_words[] = {0xf0003108u, 0x00050000u};
+    const uint32_t load_without_glc_words[] = {0xf0041108u, 0x00050000u};
+    const uint32_t load_partial_mask_words[] = {0xf0043308u, 0x00050000u};
+    const uint32_t store_extra_address_words[] = {
+        0xf024310au, 0x00030004u, 0x00010503u,
+    };
+    const uint32_t store_partial_mask_words[] = {
+        0xf024330au, 0x00030004u, 0x00000503u,
+    };
+    CHECK(!rdna2_mimg_zero_mip_shape(rdna2_decode_one(ordinary_load_words, 2)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(load_without_glc_words, 2)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(load_partial_mask_words, 2)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(store_extra_address_words, 3)) &&
+              !rdna2_mimg_zero_mip_shape(rdna2_decode_one(store_partial_mask_words, 3)),
+          "zero-mip shape rejects opcode, control, and unused-address mutations at the packet gate");
     // Astro Bot's world-map ray traversal uses the maximum three NSA dwords to name eleven input
     // VGPRs. Retaining dword4 is required for ray_inv_dir.y/z (v71/v72).
     const uint32_t mimg_bvh[] = {
@@ -529,6 +699,20 @@ int main() {
     const uint32_t mubuf_noglc[] = { 0xe0e00004u, 0x80000000u };
     CHECK(rdna2_decode_one(mubuf_glc, 2).mubuf_glc && !rdna2_decode_one(mubuf_noglc, 2).mubuf_glc,
           "MUBUF GLC bit 14 decodes (atomics: return pre-op value)");
+    // GTA V pc224: buffer_load_dword ... glc dlc. Clearing only bit 15 is the mutation arm: GLC
+    // remains set while DLC must disappear, so this checks the production decoder field itself.
+    const uint32_t mubuf_glc_dlc[] = { 0xe030e010u, 0x80001e1du };
+    const uint32_t mubuf_glc_only[] = { 0xe0306010u, 0x80001e1du };
+    const Rdna2Inst mubuf_both = rdna2_decode_one(mubuf_glc_dlc, 2);
+    const Rdna2Inst mubuf_without_dlc = rdna2_decode_one(mubuf_glc_only, 2);
+    CHECK(mubuf_both.mubuf_glc && mubuf_both.mubuf_dlc &&
+              mubuf_without_dlc.mubuf_glc && !mubuf_without_dlc.mubuf_dlc,
+          "MUBUF DLC bit 15 decodes independently from GLC on GTA V's exact polling load");
+    const uint32_t mtbuf_dlc[] = { 0xe8b0a000u, 0x80020100u };
+    const uint32_t mtbuf_nodlc[] = { 0xe8b02000u, 0x80020100u };
+    CHECK(rdna2_decode_one(mtbuf_dlc, 2).mubuf_dlc &&
+              !rdna2_decode_one(mtbuf_nodlc, 2).mubuf_dlc,
+          "MTBUF shares the decoded DLC bit 15 cache-policy field");
     // MUBUF LDS (bit 16): hand-set on the plain dword load (llvm-mc gfx1030 rejects the syntax,
     // but the field is architectural — Table 98).
     const uint32_t mubuf_lds[] = { 0xe0310000u, 0x80000000u };
@@ -561,8 +745,33 @@ int main() {
     Rdna2Inst ac = rdna2_decode_one(addco, 2);
     CHECK(ac.fmt == Rdna2Format::VOP3 && ac.opcode == 0x30Fu &&
           ac.sdst.kind == OperandKind::SGPR && ac.sdst.value == 4 &&
+          ac.n_src == 2 && ac.src[2].kind == OperandKind::None &&
           !ac.src_abs[0] && !ac.src_abs[1] && !ac.src_abs[2],
-          "VOP3B v_add_co_u32 (0x30F) decodes SDST s4 and clears the mis-read abs bits");
+          "VOP3B v_add_co_u32 (0x30F) decodes two sources, SDST s4, and no phantom SRC2");
+    // Exact GTA V packets at the reported join and its later carry consumer. The producer's zero
+    // reserved field must not decode as s0; the _co_ci_ consumer's identically valued SRC2 is real.
+    const uint32_t live_addco[] = { 0xd70f0016u, 0x00021f1bu };
+    const uint32_t live_addcoci[] = { 0xd5286a17u, 0x00024080u };
+    const Rdna2Inst lac = rdna2_decode_one(live_addco, 2);
+    const Rdna2Inst laci = rdna2_decode_one(live_addcoci, 2);
+    CHECK(lac.opcode == 0x30Fu && lac.dst.kind == OperandKind::VGPR && lac.dst.value == 22 &&
+          lac.sdst.kind == OperandKind::SGPR && lac.sdst.value == 0 && lac.n_src == 2 &&
+          lac.src[0].kind == OperandKind::VGPR && lac.src[0].value == 27 &&
+          lac.src[1].kind == OperandKind::VGPR && lac.src[1].value == 15 &&
+          lac.src[2].kind == OperandKind::None &&
+          laci.opcode == 0x128u && laci.sdst.value == 106 && laci.n_src == 3 &&
+          laci.src[2].kind == OperandKind::SGPR && laci.src[2].value == 0,
+          "exact GTA V VOP3B producer has two sources while its carry consumer has three");
+    // The no-carry-in subtract forms have the same two-source VOP3B layout. Keep their decoded
+    // source inventory aligned with emission as well; only the 0x128..0x12A _co_ci_ family has an
+    // architectural carry-in in SRC2.
+    const uint32_t subco[] = { 0xd7100000u | (4u << 8), 0x00020501u };
+    const uint32_t subrevco[] = { 0xd7190000u | (4u << 8), 0x00020501u };
+    const Rdna2Inst sc = rdna2_decode_one(subco, 2);
+    const Rdna2Inst src = rdna2_decode_one(subrevco, 2);
+    CHECK(sc.opcode == 0x310u && sc.n_src == 2 && sc.src[2].kind == OperandKind::None &&
+          src.opcode == 0x319u && src.n_src == 2 && src.src[2].kind == OperandKind::None,
+          "VOP3B v_sub/subrev_co_u32 decode two sources and no phantom SRC2");
     // DS GDS flag is dword0 bit 17 (llvm-mc gfx1030: ds_add_u32 gds = 0xd8020000 vs 0xd8000000;
     // ds_append gds = 0xd8fa0000 vs plain 0xd8f80000).
     const uint32_t ds_plain[] = { 0xd8000000u, 0x00000201u };

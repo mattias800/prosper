@@ -82,6 +82,148 @@ bool vopc_is_cmpx(uint32_t opcode) {
            (opcode >= 0xF0u && opcode <= 0xFFu);     // u64 / f16
 }
 
+bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
+    // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
+    if (in.fmt == Rdna2Format::SOP1 &&
+        ((in.opcode >= 0x24u && in.opcode <= 0x2bu) ||
+         in.opcode == 0x37u || in.opcode == 0x38u ||
+         in.opcode == 0x3cu || in.opcode == 0x40u || in.opcode == 0x44u))
+        return true;
+    auto is_exec = [](const Operand& operand) {
+        return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
+               (operand.value == 126 || operand.value == 127);
+    };
+    return is_exec(in.dst) || is_exec(in.sdst);
+}
+
+static uint32_t mtbuf_vdata_dwords(const Rdna2Inst& in) {
+    if (in.opcode > 15u) return 0;
+    const uint32_t components = (in.opcode & 3u) + 1u;
+    return in.opcode >= 8u ? (components + 1u) / 2u : components;
+}
+
+static uint32_t mimg_vdata_dwords(const Rdna2Inst& in) {
+    uint32_t components = 0;
+    if (in.opcode == 0x47u || in.opcode == 0x57u) {
+        components = 4u; // gather4
+    } else {
+        for (uint32_t component = 0; component < 4; ++component)
+            components += (in.mimg_dmask >> component) & 1u;
+        if (!components) components = 4u; // unknown/empty mask: account conservatively.
+    }
+    return in.mimg_d16 ? (components + 1u) / 2u : components;
+}
+
+uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
+    if (in.dst.kind != OperandKind::VGPR) return 0;
+    switch (in.fmt) {
+        case Rdna2Format::VOP1:
+            return in.opcode == 0x02u ? 0u : 1u; // v_readfirstlane writes the decoded SGPR.
+        case Rdna2Format::VOP2:
+        case Rdna2Format::VOP3P:
+            return 1;
+        case Rdna2Format::VOP3:
+            if (in.opcode == 0x360u) return 0; // v_readlane_b32 writes an SGPR.
+            // v_div_scale_f64 and the two integer MAD64 forms write a VGPR pair.
+            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ? 2u : 1u;
+        case Rdna2Format::DS:
+            // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
+            // encodings in that subset are stores or no-return atomics whose VDST field is a source.
+            if (in.opcode == 0x35u || in.opcode == 0x36u || in.opcode == 0x3du ||
+                in.opcode == 0x3eu || in.opcode == 0xb1u || in.opcode == 0x20u ||
+                in.opcode == 0x2du)
+                return 1;
+            if (in.opcode == 0x37u || in.opcode == 0x76u) return 2;
+            if (in.opcode == 0xfeu) return 3;
+            if (in.opcode == 0x77u || in.opcode == 0xffu) return 4;
+            return 0;
+        case Rdna2Format::MUBUF:
+            // Format and raw stores read VDATA. Loads use the gfx10 ordering where x3 follows x4.
+            if ((in.opcode >= 0x04u && in.opcode <= 0x07u) ||
+                (in.opcode >= 0x1cu && in.opcode <= 0x1fu))
+                return 0;
+            if (in.opcode <= 0x03u) return in.opcode + 1u;
+            if (in.opcode >= 0x08u && in.opcode <= 0x0cu) return 1;
+            if (in.opcode == 0x0du) return 2;
+            if (in.opcode == 0x0eu) return 4;
+            if (in.opcode == 0x0fu) return 3;
+            // Supported return-value atomics are one dword. Unknown buffer operations remain a
+            // conservative one-register clobber, matching the prior analysis contract.
+            return 1;
+        case Rdna2Format::MTBUF:
+            if (in.opcode <= 3u || (in.opcode >= 8u && in.opcode <= 11u))
+                return mtbuf_vdata_dwords(in); // ordinary and packed-D16 typed loads
+            return 0; // typed stores read VDATA; TFE's trailing status is handled separately.
+        case Rdna2Format::FLAT:
+            switch (in.opcode) {
+                case 0x08u: case 0x09u: case 0x0au: case 0x0bu: case 0x0cu: return 1;
+                case 0x0du: return 2;
+                case 0x0eu: return 4;
+                case 0x0fu: return 3;
+                default: return 0; // audited store/deferred forms do not produce a VGPR result.
+            }
+        case Rdna2Format::MIMG: {
+            if (in.opcode == 0x08u || in.opcode == 0x09u) return 0; // IMAGE_STORE[_MIP]
+            return mimg_vdata_dwords(in);
+        }
+        case Rdna2Format::VINTRP:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int rdna2_tfe_status_vgpr(const Rdna2Inst& in) {
+    if (in.dst.kind != OperandKind::VGPR || in.dst.value < 0) return -1;
+    if (in.fmt == Rdna2Format::MIMG && in.mimg_tfe)
+        return in.dst.value + static_cast<int>(mimg_vdata_dwords(in));
+    if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) {
+        const uint32_t data_dwords = mtbuf_vdata_dwords(in);
+        if (data_dwords) return in.dst.value + static_cast<int>(data_dwords);
+    }
+    return -1;
+}
+
+uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in) {
+    const uint32_t writes = rdna2_vgpr_write_count(in);
+    if (in.dst.kind != OperandKind::VGPR || in.dst.value < 0) return 0;
+    uint32_t span = writes;
+
+    if (!span) switch (in.fmt) {
+        case Rdna2Format::MUBUF:
+            if (in.opcode >= 0x04u && in.opcode <= 0x07u) span = in.opcode - 3u;
+            else if (in.opcode == 0x1cu) span = 1;
+            else if (in.opcode == 0x1du) span = 2;
+            else if (in.opcode == 0x1eu) span = 4;
+            else if (in.opcode == 0x1fu) span = 3;
+            break;
+        case Rdna2Format::MTBUF:
+            span = mtbuf_vdata_dwords(in);
+            break;
+        case Rdna2Format::FLAT:
+            switch (in.opcode) {
+                case 0x18u: case 0x1au: case 0x1cu: span = 1; break;
+                case 0x1du: span = 2; break;
+                case 0x1eu: span = 4; break;
+                case 0x1fu: span = 3; break;
+                default: break;
+            }
+            break;
+        case Rdna2Format::MIMG: {
+            if (in.opcode == 0x08u || in.opcode == 0x09u)
+                span = mimg_vdata_dwords(in);
+            break;
+        }
+        default:
+            break;
+    }
+    const int status_vgpr = rdna2_tfe_status_vgpr(in);
+    if (status_vgpr >= in.dst.value)
+        span = std::max(span, static_cast<uint32_t>(status_vgpr - in.dst.value + 1));
+    return span;
+}
+
 // VERIFIED(round-trip llvm-mc gfx1030, VOP1): 0x54 v_rcp_f16, 0x55 v_sqrt_f16, 0x56 v_rsq_f16,
 // 0x57 v_log_f16, 0x58 v_exp_f16, 0x59 v_frexp_mant_f16, 0x5A v_frexp_exp_i16_f16, 0x5B v_floor_f16,
 // 0x5C v_ceil_f16, 0x5D v_trunc_f16, 0x5E v_rndne_f16, 0x5F v_fract_f16, 0x60 v_sin_f16,
@@ -111,7 +253,8 @@ void decode_operands(Rdna2Inst& i) {
                 // or sext keeps has_modifier and is rejected.
                 i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
                 i.clamp = ((sd >> 13) & 1u) != 0; i.omod = (uint8_t)((sd >> 14) & 3u);
-                if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
+                if (((w >> 9) & 0xFFu) != 0x38u &&
+                    ((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u)) i.has_modifier = false;
                 // WORD-select v_mov_b32_sdwa (#273 — the f16 half-move idiom): dst WORD_0/1 with
                 // UNUSED_PRESERVE, src0 WORD_0/WORD_1/DWORD, no sext/neg/abs/clamp/omod. The
@@ -142,6 +285,25 @@ void decode_operands(Rdna2Inst& i) {
                         i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
                         i.sdwa_src0_sel = (uint8_t)s0sel;
                         i.sdwa_src0_sext = ((sd >> 19) & 1u) != 0;
+                        i.has_modifier = false;
+                    }
+                }
+                // GTA V's compute compaction kernels reverse a selected source word into a full
+                // dword: `v_bfrev_b32_sdwa v6, v6 dst_sel:DWORD dst_unused:UNUSED_PAD
+                // src0_sel:WORD_0` (7e0c70f9 00040606). SDWA selects and zero-extends the word
+                // before BREV, so its bits land in D[31:16] in reversed order. Admit byte/word
+                // selects only for the exact full-dword, zero-extending, unmodified shape; SEXT,
+                // source/output modifiers, partial destinations, and reserved fields remain
+                // fail-visible rather than being interpreted as this narrower operation.
+                else if (((w >> 9) & 0xFFu) == 0x38u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if (dsel == 6u && dun == 0u && s0sel <= 5u &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0] && !(sd & 0xff000000u)) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
                         i.has_modifier = false;
                     }
                 }
@@ -464,6 +626,22 @@ void decode_operands(Rdna2Inst& i) {
                     break;
                 default: break;
             }
+            // The 0x30F/0x310/0x319 _co_ forms produce carry/borrow in SDST but do not consume a
+            // carry-in. Their reserved SRC2 field commonly decodes as s0; exposing that phantom
+            // operand makes CFG provenance reject a valid instruction when s0 differs across a
+            // join, before the instruction can replace it with its fresh carry result.
+            if (i.opcode == 0x30Fu || i.opcode == 0x310u || i.opcode == 0x319u) {
+                i.src[2] = {};
+                i.n_src = 2;
+            }
+            // V_LDEXP_F32 is likewise a two-source VOP3A instruction. Its reserved SRC2 bits are
+            // zero in GTA V's exact packet and therefore decode as s0 unless cleared here. Exposing
+            // that phantom scalar read can make CFG/provenance analysis reject an otherwise valid
+            // instruction when s0 differs across a merge, before the opcode emitter is reached.
+            if (i.opcode == 0x362u) {
+                i.src[2] = {};
+                i.n_src = 2;
+            }
             // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
             // VERIFIED(llvm-mc gfx1030): 0x351/0x354/0x357 are v_min3_f16/v_max3_f16/v_med3_f16
@@ -597,6 +775,7 @@ void decode_operands(Rdna2Inst& i) {
             const uint32_t d1 = i.words[1];
             i.opcode = (w >> 18) & 0xFFu;
             i.mubuf_glc = ((w >> 14) & 1u) != 0;   // atomics: return pre-op value to VGPR
+            i.mubuf_dlc = ((w >> 15) & 1u) != 0;   // ordinary loads: bypass device-level cache
             i.mubuf_lds = ((w >> 16) & 1u) != 0;   // buffer<->LDS transfer (rejected in stage 2)
             i.dst    = vgpr(d1 >> 8);                          // VDATA
             i.src[0] = vgpr(d1);                              // VADDR
@@ -619,6 +798,7 @@ void decode_operands(Rdna2Inst& i) {
             i.mtbuf_format = (w >> 19) & 0x7Fu;
             i.mtbuf_tfe = ((d1 >> 23) & 1u) != 0;
             i.mubuf_glc = ((w >> 14) & 1u) != 0;
+            i.mubuf_dlc = ((w >> 15) & 1u) != 0;
             i.dst    = vgpr(d1 >> 8);
             i.src[0] = vgpr(d1);
             i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);
@@ -793,6 +973,24 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                          ((d1 >> 18) & 1u) == 0u) {
                     i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
                 }
+                // GTA V selects alternate 16-lane rows after its in-row reduction. QUAD_PERM
+                // identity keeps SRC0 in the current lane; ROW_MASK=0xa executes rows 1/3 while
+                // rows 0/2 preserve VDST. Admit only the exact live integer-add control form:
+                // BC=0, BANK_MASK=0xf, no FI/source modifiers, and retain both masks explicitly.
+                else if (vf == Rdna2Format::VOP2 && ((w >> 25) & 0x3Fu) == 0x25u &&
+                         ctrl == 0xe4u &&
+                         ((d1 >> 28) & 0xFu) == 0xau &&
+                         ((d1 >> 24) & 0xFu) == 0xfu &&
+                         ((d1 >> 20) & 0xFu) == 0u &&
+                         ((d1 >> 19) & 1u) == 0u &&
+                         ((d1 >> 18) & 1u) == 0u) {
+                    i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                }
+                if (i.has_dpp) {
+                    i.dpp_bound_ctrl = ((d1 >> 19) & 1u) != 0u;
+                    i.dpp_bank_mask = static_cast<uint8_t>((d1 >> 24) & 0xfu);
+                    i.dpp_row_mask = static_cast<uint8_t>((d1 >> 28) & 0xfu);
+                }
             }
         } else {
             // The six K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K: v_madmk_f32 (0x20),
@@ -896,6 +1094,34 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
         if (i.is_end || i.fmt == Rdna2Format::Unknown) break;
     }
     return pc;
+}
+
+bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
+    if (in.fmt != Rdna2Format::MIMG || !in.mimg_unorm || !in.mimg_glc ||
+        in.mimg_dlc || in.mimg_r128 ||
+        in.mimg_tfe || in.mimg_lwe || in.mimg_slc || in.mimg_a16 || in.mimg_d16 ||
+        in.mimg_reserved || in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0)
+        return false;
+
+    uint32_t reg = 0;
+    if (in.opcode == 0x01u && (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
+        (in.mimg_dim == 1u || in.mimg_dim == 5u) &&
+        in.mimg_nsa == 0u && in.len_dwords == 2u) {
+        // IMAGE_LOAD_MIP: 2D=[x,y,mip], 2D_ARRAY=[x,y,slice,mip].
+        reg = static_cast<uint32_t>(in.src[0].value) +
+              (in.mimg_dim == 5u ? 3u : 2u);
+    } else if (in.opcode == 0x09u && (in.mimg_dmask == 1u || in.mimg_dmask == 0xfu) &&
+               in.mimg_dim == 1u &&
+               in.mimg_nsa == 1u && in.len_dwords == 3u &&
+               (in.words[2] & 0xffff0000u) == 0u) {
+        // IMAGE_STORE_MIP NSA 2D: coord0 is VADDR, then word2 bytes name y and mip.
+        reg = (in.words[2] >> 8) & 0xffu;
+    } else {
+        return false;
+    }
+    if (reg >= 256u) return false;
+    if (mip_vgpr) *mip_vgpr = reg;
+    return true;
 }
 
 uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_t sgpr_base) {

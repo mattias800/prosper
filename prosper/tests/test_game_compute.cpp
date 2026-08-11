@@ -1,5 +1,6 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "../src/gpu/tile.hpp"
 #include "../src/host/guest_write_watch.hpp"
@@ -640,6 +641,79 @@ int main() {
     item.command_order = 70;
     item.recompile_config = config;
     item.recompile_config_available = true;
+
+    // GTA V reaches two compute programs whose only external operations use fully-known RAW V#s
+    // with NUM_RECORDS=0. Production discovery materializes an exact-PC marker and recompilation
+    // removes the buffer access entirely, so reflection correctly reports no descriptor. The live
+    // backend must recognize only that complete proof as successful without submitting empty work.
+    const uint32_t zero_record_code[] = {
+        0xE0300000u, 0x80000000u, // buffer_load_dword v0, off, s[0:3]
+        0xBF810000u,
+    };
+    const uint32_t zero_record_seed[4] = {
+        0x00000000u, 0x00100000u, 0x00000000u, 0x00016204u,
+    };
+    ShaderResourceTable zero_record_rt;
+    const std::vector<SrtUse> zero_record_uses = add_compute_buffer_resources(
+        zero_record_rt, zero_record_code, std::size(zero_record_code), zero_record_seed,
+        std::size(zero_record_seed));
+    assign_convention_bindings(zero_record_rt, 2);
+    ComputeShaderConfig zero_record_config;
+    zero_record_config.user_sgprs.assign(zero_record_seed,
+                                         zero_record_seed + std::size(zero_record_seed));
+    zero_record_config.local_x = zero_record_config.local_y = zero_record_config.local_z = 1;
+    const std::vector<uint32_t> zero_record_spirv = recompile_compute(
+        zero_record_code, std::size(zero_record_code), &zero_record_rt,
+        zero_record_config);
+    const DescriptorValidationReport zero_record_report = validate_spirv_descriptor_interface(
+        zero_record_spirv, &zero_record_rt, 0, SpirvShaderStage::Compute, false);
+    CHECK(zero_record_uses.size() == 1 && zero_record_rt.resources.size() == 1 &&
+              is_zero_record_raw_buffer(zero_record_rt.resources[0]) &&
+              !zero_record_spirv.empty() && zero_record_report.ok() &&
+              zero_record_report.descriptors.empty(),
+          "production zero-record RAW program recompiles with an exact marker and no descriptors");
+
+    ComputeItem zero_record_item;
+    zero_record_item.spirv = zero_record_spirv;
+    zero_record_item.user_sgprs = zero_record_config.user_sgprs;
+    zero_record_item.resources = std::make_shared<ShaderResourceTable>(zero_record_rt);
+    zero_record_item.launch.threads_x = zero_record_item.launch.threads_y =
+        zero_record_item.launch.threads_z = 1;
+    zero_record_item.launch.local_x = zero_record_item.launch.local_y =
+        zero_record_item.launch.local_z = 1;
+    zero_record_item.launch.groups_x = zero_record_item.launch.groups_y =
+        zero_record_item.launch.groups_z = 1;
+    zero_record_item.code_addr = 0x413cf4900ull;
+    zero_record_item.dispatch_index = 6;
+    zero_record_item.submit_no = 11;
+    zero_record_item.command_order = 69;
+    zero_record_item.recompile_config = zero_record_config;
+    zero_record_item.recompile_config_available = true;
+
+    const uint64_t zero_record_submits_before =
+        prosper::frontend::live_compute_queue_submit_attempts();
+    CHECK(prosper::frontend::execute_live_compute_items({zero_record_item}),
+          "all-marker descriptorless compute completes as a proven live-backend no-op");
+    ComputeItem empty_zero_record_item = zero_record_item;
+    empty_zero_record_item.resources = std::make_shared<ShaderResourceTable>();
+    CHECK(!prosper::frontend::execute_live_compute_items({empty_zero_record_item}),
+          "descriptorless compute with an empty runtime table remains fail-visible");
+    ComputeItem ordinary_zero_record_item = zero_record_item;
+    ordinary_zero_record_item.resources = std::make_shared<ShaderResourceTable>();
+    ShaderResource unused_ordinary_resource;
+    unused_ordinary_resource.cls = ResourceClass::ConstantBuffer;
+    unused_ordinary_resource.format = DataFormat::Uint32;
+    unused_ordinary_resource.num_components = 1;
+    unused_ordinary_resource.binding = 2;
+    unused_ordinary_resource.gpu_addr = reinterpret_cast<uint64_t>(result.data());
+    unused_ordinary_resource.size = sizeof(uint32_t);
+    ordinary_zero_record_item.resources->resources.push_back(unused_ordinary_resource);
+    CHECK(!prosper::frontend::execute_live_compute_items({ordinary_zero_record_item}),
+          "descriptorless compute with an unused ordinary resource remains fail-visible");
+    CHECK(prosper::frontend::live_compute_queue_submit_attempts() ==
+              zero_record_submits_before,
+          "proven and rejected descriptorless programs never attempt a Vulkan queue submit");
+
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend executes the game kernel");
     CHECK(result.size() == launched_records * 4, "compute resource retains its padded declared size");
@@ -1227,6 +1301,214 @@ int main() {
         if (bad) std::printf("  image copy mismatched bytes = %u/%u (b0 src=%02x dst=%02x)\n",
                              bad, W * 4, img_src[0], img_dst[0]);
         CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
+    }
+
+    // GTA V gameplay's exact IMAGE_LOAD_MIP / IMAGE_STORE_MIP packets. The live backend has one
+    // materialized level for these audited descriptors; the shader marker proves only the mip
+    // operand is zero. Exercise all four VDATA components of 0x2042f49800's dmask-f load, preserve a
+    // distinct 2D-array slice, and execute the NSA dmask-x store through its StorageImage contract.
+    const uint32_t gta_load_mip_copy_2d[] = {
+        0x7e080300u,                         // v4 = x (save shell input v0)
+        0x7e020280u,                         // v1 = y = 0
+        0x7e040207u,                         // v2 = mip = s7 = 0
+        0x7e0a0280u,                         // v5 = destination y = 0
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP v[0:3], [v0,v1,v2], s[20:27]
+        0xbf8c3f70u,
+        0xf0200f08u, 0x00020004u,            // IMAGE_STORE v[0:3], [v4,v5], s[8:15]
+        0xbf810000u,
+    };
+    std::vector<uint8_t> mip2d_dst(W * 4, 0x6b);
+    ShaderResourceTable mip2d_rt = irt;
+    for (ShaderResource& resource : mip2d_rt.resources) {
+        if (resource.binding == 4) {
+            resource.cls = ResourceClass::Texture;
+            resource.sgpr_base = 20;
+            resource.fetch_pc = 4;
+            resource.img_dim = 1;
+            resource.proven_zero_mip = true;
+        } else if (resource.binding == 5) {
+            resource.img_dim = 1; // exact destination IMAGE_STORE has DIM=2D
+            resource.gpu_addr = reinterpret_cast<uint64_t>(mip2d_dst.data());
+            resource.size = static_cast<uint32_t>(mip2d_dst.size());
+        }
+    }
+    const std::vector<uint32_t> gta_load_mip_2d_spirv = recompile_valu(
+        gta_load_mip_copy_2d, std::size(gta_load_mip_copy_2d), 1, 0, &mip2d_rt);
+    CHECK(!gta_load_mip_2d_spirv.empty(),
+          "GTA V dmask-xyzw IMAGE_LOAD_MIP 2D recompiles for live execution");
+    if (!gta_load_mip_2d_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = gta_load_mip_2d_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(mip2d_rt);
+        item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x248149800ull;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "live backend executes GTA V's dmask-xyzw IMAGE_LOAD_MIP 2D");
+        CHECK(mip2d_dst == img_src,
+              "IMAGE_LOAD_MIP 2D preserves all four returned channels at level zero");
+    }
+
+    const uint32_t gta_load_mip_copy_2da[] = {
+        0x7e080300u,                         // v4 = x
+        0x7e020280u,                         // v1 = y = 0
+        0x7e040281u,                         // v2 = array slice 1
+        0x7e060206u,                         // v3 = mip = s6 = 0
+        0x7e0a0280u,                         // v5 = destination y = 0
+        0xf0043128u, 0x00050000u,            // IMAGE_LOAD_MIP 2D_ARRAY dmask:x
+        0xbf8c3f70u,
+        0xf0200108u, 0x00020004u,            // IMAGE_STORE x channel
+        0xbf810000u,
+    };
+    std::vector<uint32_t> mip_array_src(W * 2u);
+    std::vector<uint32_t> mip_array_dst(W, 0x6d6d6d6du);
+    for (uint32_t i = 0; i < W; ++i) {
+        mip_array_src[i] = i * 13u + 7u;
+        mip_array_src[W + i] = i * 65537u + 0x120034u;
+    }
+    ShaderResourceTable mip_array_rt = irt;
+    for (ShaderResource& resource : mip_array_rt.resources) {
+        if (resource.binding == 4) {
+            resource.cls = ResourceClass::Texture;
+            resource.sgpr_base = 20;
+            resource.fetch_pc = 5;
+            resource.img_dim = 5;
+            resource.depth = 2;
+            resource.format = DataFormat::Uint32;
+            resource.num_components = 1;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(mip_array_src.data());
+            resource.size = static_cast<uint32_t>(
+                mip_array_src.size() * sizeof(uint32_t));
+            resource.layer_stride_bytes = W * 4u;
+            resource.layer_mip_offset_bytes = 0;
+            resource.proven_zero_mip = true;
+        } else if (resource.binding == 5) {
+            resource.img_dim = 1; // exact destination IMAGE_STORE has DIM=2D
+            resource.format = DataFormat::Uint32;
+            resource.num_components = 1;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(mip_array_dst.data());
+            resource.size = static_cast<uint32_t>(
+                mip_array_dst.size() * sizeof(uint32_t));
+        }
+    }
+    const std::vector<uint32_t> gta_load_mip_array_spirv = recompile_valu(
+        gta_load_mip_copy_2da, std::size(gta_load_mip_copy_2da), 1, 0, &mip_array_rt);
+    CHECK(!gta_load_mip_array_spirv.empty(),
+          "GTA V IMAGE_LOAD_MIP 2D_ARRAY recompiles with its proven level-zero marker");
+    if (!gta_load_mip_array_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = gta_load_mip_array_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(mip_array_rt);
+        item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x24814a600ull;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "live backend executes GTA V's IMAGE_LOAD_MIP 2D_ARRAY");
+        CHECK(std::equal(mip_array_dst.begin(), mip_array_dst.end(),
+                         mip_array_src.begin() + W),
+              "IMAGE_LOAD_MIP 2D_ARRAY fetches distinct slice one instead of dropping the layer");
+    }
+
+    const uint32_t gta_store_mip_2d[] = {
+        0x7e080300u,                         // v4 = x, while v0 remains stored data
+        0x7e060280u,                         // v3 = y = 0
+        0x7e0a0206u,                         // v5 = mip = s6 = 0
+        0xf024310au, 0x00030004u, 0x00000503u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> store_mip_dst(W, 0xdeadbeefu);
+    ShaderResourceTable store_mip_rt = irt;
+    store_mip_rt.resources.erase(
+        std::remove_if(store_mip_rt.resources.begin(), store_mip_rt.resources.end(),
+                       [](const ShaderResource& resource) {
+                           return resource.cls == ResourceClass::StorageImage;
+                       }),
+        store_mip_rt.resources.end());
+    ShaderResource store_mip_image{};
+    store_mip_image.cls = ResourceClass::StorageImage;
+    store_mip_image.binding = 4; store_mip_image.fetch_pc = 3;
+    store_mip_image.sgpr_base = 12; store_mip_image.img_dim = 1;
+    store_mip_image.format = DataFormat::Uint32; store_mip_image.num_components = 1;
+    store_mip_image.width = W; store_mip_image.height = store_mip_image.depth = 1;
+    store_mip_image.gpu_addr = reinterpret_cast<uint64_t>(store_mip_dst.data());
+    store_mip_image.size = static_cast<uint32_t>(store_mip_dst.size() * sizeof(uint32_t));
+    store_mip_image.proven_zero_mip = true;
+    store_mip_rt.resources.push_back(store_mip_image);
+    const std::vector<uint32_t> gta_store_mip_spirv = recompile_valu(
+        gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0, &store_mip_rt);
+    CHECK(!gta_store_mip_spirv.empty(),
+          "GTA V IMAGE_STORE_MIP 2D recompiles with StorageImage classification");
+    if (!gta_store_mip_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = gta_store_mip_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(store_mip_rt);
+        item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x248149a00ull;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "live backend executes GTA V's IMAGE_STORE_MIP 2D");
+        CHECK(store_mip_dst == lane_index,
+              "IMAGE_STORE_MIP writes every lane's dword to level zero");
+    }
+
+    const uint32_t gta_store_mip_xyzw_2d[] = {
+        0x7e0a0300u,                         // v5 = x, while v0 remains channel X data
+        0x7e080280u,                         // v4 = y = 0
+        0x7e020281u,                         // v1 = channel Y = 1
+        0x7e040282u,                         // v2 = channel Z = 2
+        0x7e060283u,                         // v3 = channel W = 3
+        0x7e0c0206u,                         // v6 = mip = s6 = 0
+        0xf0243f0au, 0x00030005u, 0x00000604u, // live 0x2042f49800 packet
+        0xbf810000u,
+    };
+    std::vector<uint8_t> store_mip_rgba_dst(W * 4u, 0xcdu);
+    ShaderResourceTable store_mip_rgba_rt = irt;
+    store_mip_rgba_rt.resources.erase(
+        std::remove_if(store_mip_rgba_rt.resources.begin(),
+                       store_mip_rgba_rt.resources.end(),
+                       [](const ShaderResource& resource) {
+                           return resource.cls == ResourceClass::StorageImage;
+                       }),
+        store_mip_rgba_rt.resources.end());
+    ShaderResource store_mip_rgba_image{};
+    store_mip_rgba_image.cls = ResourceClass::StorageImage;
+    store_mip_rgba_image.binding = 4; store_mip_rgba_image.fetch_pc = 6;
+    store_mip_rgba_image.sgpr_base = 12; store_mip_rgba_image.img_dim = 1;
+    store_mip_rgba_image.format = DataFormat::Uint8; store_mip_rgba_image.num_components = 4;
+    store_mip_rgba_image.width = W;
+    store_mip_rgba_image.height = store_mip_rgba_image.depth = 1;
+    store_mip_rgba_image.gpu_addr =
+        reinterpret_cast<uint64_t>(store_mip_rgba_dst.data());
+    store_mip_rgba_image.size = static_cast<uint32_t>(store_mip_rgba_dst.size());
+    store_mip_rgba_image.proven_zero_mip = true;
+    store_mip_rgba_rt.resources.push_back(store_mip_rgba_image);
+    const std::vector<uint32_t> gta_store_mip_rgba_spirv = recompile_valu(
+        gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+        &store_mip_rgba_rt);
+    CHECK(!gta_store_mip_rgba_spirv.empty(),
+          "GTA V's live dmask-xyzw IMAGE_STORE_MIP packet recompiles exactly");
+    if (!gta_store_mip_rgba_spirv.empty()) {
+        ComputeItem item;
+        item.spirv = gta_store_mip_rgba_spirv;
+        item.resources = std::make_shared<ShaderResourceTable>(store_mip_rgba_rt);
+        item.launch.threads_x = W; item.launch.local_x = 64; item.launch.groups_x = 1;
+        item.launch.local_y = item.launch.local_z = 1;
+        item.launch.groups_y = item.launch.groups_z = 1;
+        item.code_addr = 0x2042f49800ull;
+        CHECK(prosper::frontend::execute_live_compute_items({item}),
+              "live backend executes 0x2042f49800's dmask-xyzw IMAGE_STORE_MIP");
+        bool exact_rgba = true;
+        for (uint32_t x = 0; x < W; ++x) {
+            exact_rgba &= store_mip_rgba_dst[x * 4u + 0u] == static_cast<uint8_t>(x) &&
+                          store_mip_rgba_dst[x * 4u + 1u] == 1u &&
+                          store_mip_rgba_dst[x * 4u + 2u] == 2u &&
+                          store_mip_rgba_dst[x * 4u + 3u] == 3u;
+        }
+        CHECK(exact_rgba,
+              "dmask-xyzw IMAGE_STORE_MIP writes all four live Uint8 channels at mip zero");
     }
 
     // --- #590: the same production storage-image copy across the INTEGER and packed formats DOLL's

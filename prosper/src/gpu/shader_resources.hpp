@@ -291,6 +291,11 @@ struct ShaderResource {
     // levels instead use mip_tail_x/y within each slice base.
     uint32_t      layer_stride_bytes = 0;
     uint32_t      layer_mip_offset_bytes = 0;
+    // Instruction-scoped proof for IMAGE_LOAD_MIP / IMAGE_STORE_MIP. This is compile semantics,
+    // not descriptor metadata: only the exact fetch_pc whose dimension-specific mip VGPR has a
+    // same-block plain-v_mov zero proof may set it. Cache/capture identity must preserve the marker
+    // so a zero-specialized module can never be reused for a dynamic or nonzero mip.
+    bool          proven_zero_mip   = false;
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 
@@ -443,6 +448,19 @@ inline bool is_proven_null_bvh(const ShaderResource& resource) {
            resource.gpu_addr == 0 && resource.size == 256u && resource.stride == 0u &&
            resource.fetch_pc != 0xFFFFFFFFu && resource.host_data != nullptr &&
            resource.host_data_size >= resource.size;
+}
+
+// Exact-PC marker for a fully-known RAW MUBUF descriptor with NUM_RECORDS=0. Such a descriptor has
+// architectural zero-read/drop-write behavior regardless of its base, so it deliberately has no
+// guest or host backing. The unusual Unknown/zero-component shape keeps it distinct from an ordinary
+// explicit null buffer and survives capture/replay without adding a serialized descriptor field.
+inline bool is_zero_record_raw_buffer(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+           resource.format == DataFormat::Unknown && resource.num_components == 0u &&
+           resource.gpu_addr == 0 && resource.size == 0u && resource.stride == 0u &&
+           resource.srt_offset == 0xFFFFFFFFu && resource.sgpr_base == 0xFFFFFFFFu &&
+           resource.fetch_pc != 0xFFFFFFFFu && resource.host_data == nullptr &&
+           resource.host_data_size == 0u;
 }
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the

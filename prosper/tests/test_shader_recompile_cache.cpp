@@ -1,10 +1,19 @@
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/hle/dispatch.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <iterator>
+#include <string>
+#include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include "test_scratch.h"
 
 using namespace prosper::gpu;
@@ -31,6 +40,92 @@ static size_t count_extension(const std::filesystem::path& directory, const char
         if (it->is_regular_file(ec) && it->path().extension() == extension) ++count;
     }
     return ec ? 0 : count;
+}
+
+struct CapturedStderr {
+    std::filesystem::path path;
+    std::string output;
+};
+
+struct ScratchCaptureFile {
+    std::filesystem::path path;
+    FILE* stream = nullptr;
+
+    explicit ScratchCaptureFile(std::filesystem::path capture_path)
+        : path(std::move(capture_path)) {
+#ifdef _WIN32
+        stream = _wfopen(path.c_str(), L"w+b");
+#else
+        stream = std::fopen(path.c_str(), "w+b");
+#endif
+    }
+
+    ~ScratchCaptureFile() {
+        if (stream) std::fclose(stream);
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+
+    ScratchCaptureFile(const ScratchCaptureFile&) = delete;
+    ScratchCaptureFile& operator=(const ScratchCaptureFile&) = delete;
+};
+
+static std::filesystem::path next_stderr_capture_path() {
+    static std::atomic<uint64_t> capture_sequence{0};
+    return prosper_test::test_scratch_dir() /
+        ("shader-recompile-stderr-" +
+         std::to_string(capture_sequence.fetch_add(1, std::memory_order_relaxed)) + ".log");
+}
+
+static size_t count_occurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    for (size_t offset = 0; (offset = text.find(needle, offset)) != std::string::npos;
+         offset += needle.size())
+        ++count;
+    return count;
+}
+
+template <typename F>
+static CapturedStderr capture_stderr(F&& body) {
+    CapturedStderr result;
+    result.path = next_stderr_capture_path();
+    ScratchCaptureFile capture(result.path);
+    if (!capture.stream || std::fflush(stderr) != 0) return result;
+#ifdef _WIN32
+    const int stderr_fd = _fileno(stderr);
+    const int saved = _dup(stderr_fd);
+    const bool redirected = saved >= 0 && _dup2(_fileno(capture.stream), stderr_fd) == 0;
+#else
+    const int stderr_fd = fileno(stderr);
+    const int saved = dup(stderr_fd);
+    const bool redirected = saved >= 0 && dup2(fileno(capture.stream), stderr_fd) >= 0;
+#endif
+    if (!redirected) {
+        if (saved >= 0) {
+#ifdef _WIN32
+            _close(saved);
+#else
+            close(saved);
+#endif
+        }
+        return result;
+    }
+
+    body();
+    std::fflush(stderr);
+#ifdef _WIN32
+    const bool restored = _dup2(saved, stderr_fd) == 0;
+    _close(saved);
+#else
+    const bool restored = dup2(saved, stderr_fd) >= 0;
+    close(saved);
+#endif
+    if (!restored) return result;
+    std::rewind(capture.stream);
+    char bytes[4096];
+    for (size_t count; (count = std::fread(bytes, 1, sizeof bytes, capture.stream)) != 0;)
+        result.output.append(bytes, count);
+    return result;
 }
 
 // Fullscreen triangle and solid green shaders assembled for gfx1030. These are also used by the
@@ -516,23 +611,345 @@ int main() {
     compute_config.threads_x = 130;
     compute_config.threads_y = compute_config.threads_z = 1;
     compute_config.tgid_x_en = true;
+    const RecompileDiagnosticContext diagnostic_a{
+        RecompileDiagnosticStage::Compute, 0x1111222233334444ull};
+    const RecompileDiagnosticContext diagnostic_b{
+        RecompileDiagnosticStage::Compute, 0xaaaabbbbccccddddull};
     const auto direct_compute = recompile_compute(
         kCompute, std::size(kCompute), &compute_table, compute_config);
+    uint64_t cached_compute_identity = 0, relocated_diagnostic_identity = 0,
+             push_constant_identity = 0;
     const auto cached_compute = recompile_compute_shader_cached(
-        kCompute, std::size(kCompute), &compute_table, compute_config);
+        kCompute, std::size(kCompute), &compute_table, compute_config,
+        &cached_compute_identity, diagnostic_a);
+    const auto relocated_diagnostic_compute = recompile_compute_shader_cached(
+        kCompute, std::size(kCompute), &compute_table, compute_config,
+        &relocated_diagnostic_identity, diagnostic_b);
     ComputeShaderConfig new_push_constants = compute_config;
     new_push_constants.user_sgprs[4] = 0x12345678;
     const auto repeated_compute = recompile_compute_shader_cached(
-        kCompute, std::size(kCompute), &compute_table, new_push_constants);
+        kCompute, std::size(kCompute), &compute_table, new_push_constants,
+        &push_constant_identity, diagnostic_b);
     ComputeShaderConfig changed_launch = compute_config;
     changed_launch.local_x = 32;
     const auto changed_compute = recompile_compute_shader_cached(
         kCompute, std::size(kCompute), &compute_table, changed_launch);
     stats = shader_recompile_cache_stats();
     CHECK(!direct_compute.empty() && cached_compute == direct_compute &&
-              repeated_compute == direct_compute && !changed_compute.empty() &&
-              changed_compute != direct_compute && stats.misses == 2 && stats.hits == 1,
+              relocated_diagnostic_compute == direct_compute && repeated_compute == direct_compute &&
+              !changed_compute.empty() && changed_compute != direct_compute &&
+              stats.misses == 2 && stats.hits == 2,
           "compute cache reuses push-constant variants and separates launch-specialized modules");
+    CHECK(cached_compute_identity != 0 &&
+              relocated_diagnostic_identity == cached_compute_identity &&
+              push_constant_identity == cached_compute_identity,
+          "diagnostic provenance stays outside compute shader cache identity");
+
+    // Diagnostic provenance is not shader semantics. Force two recompiles of one rejected site so
+    // each call must carry its own immutable program identity through the cache wrapper, builder and
+    // structurizer, while a direct standalone call must remain explicitly neutral.
+    static const uint32_t kRejectedCompute[] = {
+        0xbf890000u, // s_cbranch_execnz with target pc1: unclaimed outside a recognized loop
+        0xbf810000u, // s_endpgm
+    };
+    set_test_env("PROSPER_DBG", "1");
+    set_test_env("PROSPER_NO_SHADER_CACHE", "1");
+    const CapturedStderr diagnostic_capture = capture_stderr([&] {
+        (void)recompile_compute_shader_cached(
+            kRejectedCompute, std::size(kRejectedCompute), nullptr, compute_config,
+            nullptr, diagnostic_a);
+        (void)recompile_compute_shader_cached(
+            kRejectedCompute, std::size(kRejectedCompute), nullptr, compute_config,
+            nullptr, diagnostic_b);
+        (void)recompile_compute(kRejectedCompute, std::size(kRejectedCompute), nullptr,
+                                compute_config);
+    });
+    const std::string& diagnostic_log = diagnostic_capture.output;
+    set_test_env("PROSPER_NO_SHADER_CACHE", nullptr);
+    set_test_env("PROSPER_DBG", nullptr);
+    std::error_code diagnostic_capture_error;
+    CHECK(diagnostic_capture.path.parent_path() == prosper_test::test_scratch_dir() &&
+              !std::filesystem::exists(diagnostic_capture.path, diagnostic_capture_error) &&
+              !diagnostic_capture_error,
+          "diagnostic capture uses and cleans the process-private test scratch directory");
+    CHECK(diagnostic_log.find(
+              "[compute-struct-reject] unclaimed execnz pc=0 stage=compute "
+              "program=0x1111222233334444 role=route-decline\n") != std::string::npos &&
+              diagnostic_log.find(
+              "[compute-struct-reject] unclaimed execnz pc=0 stage=compute "
+              "program=0xaaaabbbbccccdddd role=route-decline\n") != std::string::npos,
+          "distinct compute calls retain their own program identity at the structurizer site");
+    CHECK(diagnostic_log.find(
+              " stage=compute program=0x1111222233334444 role=terminal\n") !=
+              std::string::npos &&
+              diagnostic_log.find(
+              " stage=compute program=0xaaaabbbbccccdddd role=terminal\n") !=
+              std::string::npos,
+          "terminal instruction rejects retain the same per-call diagnostic identity");
+    CHECK(diagnostic_log.find(
+              "[compute-struct-reject] unclaimed execnz pc=0 stage=compute "
+              "program=none role=route-decline\n") !=
+              std::string::npos &&
+              diagnostic_log.find(
+              " stage=compute program=none role=terminal\n") !=
+              std::string::npos,
+          "standalone compute recompilation uses an explicit neutral program identity");
+
+    // A nested guest-wave branch containing s_barrier cannot use either the compact structurizer or
+    // the synchronized CFG dispatcher. This is the exact GTA V route that used to return an empty
+    // module without a terminal line. Cache the rejection, then report two distinct live program
+    // addresses: the second compile must be a cache hit, while the final skip consequence remains
+    // attributable and once-per-address at the production reporting boundary.
+    static const uint32_t kExactWaveBarrierReject[] = {
+        0x7c020300u, // 0: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860001u, // 1: s_cbranch_vccz +1 -> pc3 (exact guest-wave branch)
+        0x7e040281u, // 2: v_mov_b32 v2, 1
+        0xbf060000u, // 3: s_cmp_eq_u32 s0, s0
+        0xbf840002u, // 4: s_cbranch_scc0 +2 -> pc7
+        0xbf8a0000u, // 5: s_barrier nested in the scalar arm
+        0x7e040282u, // 6: v_mov_b32 v2, 2
+        0xbf810000u, // 7: s_endpgm
+    };
+    static const uint32_t kPartialBarrierReject[] = {
+        0xbf8a0000u, // s_barrier
+        0xbf810000u, // s_endpgm
+    };
+    ComputeShaderConfig rejected_config;
+    rejected_config.local_x = 64;
+    rejected_config.wave_size = 64;
+    rejected_config.threads_x = 64;
+    rejected_config.threads_y = rejected_config.threads_z = 1;
+    rejected_config.exact_thread_extent = true;
+    ComputeShaderConfig partial_barrier_config = rejected_config;
+    partial_barrier_config.threads_x = 65;
+    const RecompileDiagnosticContext rejected_diagnostic_a{
+        RecompileDiagnosticStage::Compute, 0x1234567800004455ull};
+    const RecompileDiagnosticContext rejected_diagnostic_b{
+        RecompileDiagnosticStage::Compute, 0xabcdef120000dd55ull};
+    const RecompileDiagnosticContext partial_barrier_diagnostic{
+        RecompileDiagnosticStage::Compute, 0x135724680000aa55ull};
+    clear_shader_recompile_cache();
+    std::vector<uint32_t> rejected_first, rejected_cached, partial_barrier;
+    set_test_env("PROSPER_DBG", "1");
+    const CapturedStderr final_reject_capture = capture_stderr([&] {
+        rejected_first = recompile_compute_shader_cached(
+            kExactWaveBarrierReject, std::size(kExactWaveBarrierReject), nullptr,
+            rejected_config, nullptr, rejected_diagnostic_a);
+        if (rejected_first.empty())
+            (void)report_compute_recompile_skip_once(rejected_diagnostic_a);
+        rejected_cached = recompile_compute_shader_cached(
+            kExactWaveBarrierReject, std::size(kExactWaveBarrierReject), nullptr,
+            rejected_config, nullptr, rejected_diagnostic_b);
+        if (rejected_cached.empty()) {
+            (void)report_compute_recompile_skip_once(rejected_diagnostic_b);
+            (void)report_compute_recompile_skip_once(rejected_diagnostic_b);
+        }
+        partial_barrier = recompile_compute(
+            kPartialBarrierReject, std::size(kPartialBarrierReject), nullptr,
+            partial_barrier_config, partial_barrier_diagnostic);
+    });
+    set_test_env("PROSPER_DBG", nullptr);
+    stats = shader_recompile_cache_stats();
+    const std::string& final_reject_log = final_reject_capture.output;
+    std::error_code final_reject_capture_error;
+    CHECK(final_reject_capture.path.parent_path() == prosper_test::test_scratch_dir() &&
+              !std::filesystem::exists(final_reject_capture.path, final_reject_capture_error) &&
+              !final_reject_capture_error,
+          "final-reject capture uses and cleans the process-private test scratch directory");
+    CHECK(rejected_first.empty() && rejected_cached.empty() &&
+              stats.misses == 1 && stats.hits == 1,
+          "rejected compute modules retain empty results across the real shader cache boundary");
+    CHECK(count_occurrences(
+              final_reject_log,
+              "[compute-cfg-reject] reason=exact-wave-dispatcher-unsafe guest-barrier=1 "
+              "stage=compute program=0x1234567800004455 role=terminal\n") == 1 &&
+              final_reject_log.find(
+              "reason=exact-wave-dispatcher-unsafe guest-barrier=1 stage=compute "
+              "program=0xabcdef120000dd55 role=terminal") == std::string::npos,
+          "exact-wave guest-barrier rejection is terminal at the compiler site and not replayed by a cache hit");
+    CHECK(count_occurrences(
+              final_reject_log,
+              "[compute-recompile-reject] reason=empty-result dispatch-skipped") == 2 &&
+              count_occurrences(
+              final_reject_log,
+              "stage=compute program=0x1234567800004455 role=consequent\n") == 1 &&
+              count_occurrences(
+              final_reject_log,
+              "stage=compute program=0xabcdef120000dd55 role=consequent\n") == 1,
+          "live empty-result consequences cover compile misses and cache hits once per program address");
+    CHECK(partial_barrier.empty() && count_occurrences(
+              final_reject_log,
+              "[compute-recompile-reject] reason=partial-workgroup-barrier "
+              "threads=65x1x1 local=64x1x1 stage=compute "
+              "program=0x135724680000aa55 role=terminal\n") == 1,
+          "partial-workgroup barrier rejection reports its exact terminal cause and program identity");
+
+    const RecompileDiagnosticContext legacy_skip_diagnostic{
+        RecompileDiagnosticStage::Compute, 0x246813570000bb55ull};
+    const CapturedStderr legacy_skip_capture = capture_stderr([&] {
+        (void)report_compute_recompile_skip_once(legacy_skip_diagnostic);
+        (void)report_compute_recompile_skip_once(legacy_skip_diagnostic);
+    });
+    CHECK(count_occurrences(
+              legacy_skip_capture.output,
+              "[compute] skip unsupported program 0x246813570000bb55\n") == 1 &&
+              legacy_skip_capture.output.find("role=consequent") == std::string::npos,
+          "non-debug live skips preserve the legacy once-per-address diagnostic");
+
+    // The unit-level reporter checks above deliberately keep cache-hit and legacy behavior focused,
+    // but they cannot guard the executor's integration site: a live shader-recompile failure must
+    // actually call that reporter before it discards the dispatch. Register a rejected program and
+    // drive it through the complete realization boundary so deleting the production call loses this
+    // consequent even though the compiler's terminal diagnostic and the helper itself still work.
+    prosper::register_agc_hle();
+    auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
+    alignas(256) static const uint32_t kLivePartialBarrierReject[] = {
+        0xbf8a0000u, // s_barrier
+        0xbf810000u, // s_endpgm
+    };
+    ShaderReg live_reject_registers[2] = {
+        {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
+        {prosper::agc::Pm4::COMPUTE_PGM_HI, 0},
+    };
+    AgcShaderHeader live_reject_header{};
+    live_reject_header.file_header = 0x34333231u;
+    live_reject_header.version = 0x18;
+    live_reject_header.sh_registers = live_reject_registers;
+    live_reject_header.shader_size = sizeof(kLivePartialBarrierReject);
+    live_reject_header.type = 0;
+    live_reject_header.num_sh_registers = 2;
+    void* registered_live_reject = nullptr;
+    const bool live_reject_registered = create_shader &&
+        create_shader(reinterpret_cast<uint64_t>(&registered_live_reject),
+                      reinterpret_cast<uint64_t>(&live_reject_header),
+                      reinterpret_cast<uint64_t>(kLivePartialBarrierReject), 0, 0, 0) == 0 &&
+        registered_live_reject == &live_reject_header;
+    CHECK(live_reject_registered,
+          "register a rejected compute program for the live realization boundary");
+
+    GpuState live_reject_state;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = live_reject_registers[0].value;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = live_reject_registers[1].value;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_X] = 64;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Y] = 1;
+    live_reject_state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Z] = 1;
+    GpuState::Dispatch live_reject_dispatch;
+    live_reject_dispatch.threads_x = 65;
+    live_reject_dispatch.threads_y = live_reject_dispatch.threads_z = 1;
+    live_reject_dispatch.modifier =
+        1ull << prosper::agc::Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT;
+    live_reject_dispatch.command_order = 0x2481;
+    live_reject_dispatch.state = std::make_shared<GpuState>(live_reject_state);
+    live_reject_state.dispatches.push_back(live_reject_dispatch);
+
+    std::vector<ComputeItem> live_reject_items;
+    std::vector<OperationRealizationFailure> live_reject_failures;
+    set_test_env("PROSPER_DBG", "1");
+    const CapturedStderr live_reject_capture = capture_stderr([&] {
+        live_reject_items = realize_compute_dispatches(
+            live_reject_state, 0x2481, &live_reject_failures);
+    });
+    set_test_env("PROSPER_DBG", nullptr);
+    char live_reject_program[96];
+    std::snprintf(live_reject_program, sizeof(live_reject_program),
+                  "stage=compute program=0x%llx role=consequent\n",
+                  static_cast<unsigned long long>(
+                      reinterpret_cast<uint64_t>(kLivePartialBarrierReject)));
+    CHECK(live_reject_registered && live_reject_items.empty() &&
+              live_reject_failures.size() == 1 &&
+              live_reject_failures[0].reason == RealizationFailureReason::ShaderRecompile &&
+              live_reject_failures[0].stages.size() == 1 &&
+              live_reject_failures[0].stages[0].program_addr ==
+                  reinterpret_cast<uint64_t>(kLivePartialBarrierReject),
+          "registered rejected compute reaches the live shader-recompile failure boundary");
+    CHECK(count_occurrences(
+              live_reject_capture.output,
+              "[compute-recompile-reject] reason=empty-result dispatch-skipped") == 1 &&
+              count_occurrences(live_reject_capture.output, live_reject_program) == 1,
+          "live shader-recompile failure reports its final dispatch-skipped consequence");
+
+    // IMAGE_LOAD_MIP level-zero lowering is compiled semantics, not runtime descriptor data. A
+    // captured or later dispatch without the instruction-scoped proof must miss and reject rather
+    // than reuse the specialized module; restoring the proof should hit the original entry.
+    clear_shader_recompile_cache();
+    static const uint32_t kZeroMipCompute[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP xyzw 2D, T# s[20:27]
+        0xbf810000u,
+    };
+    ShaderResource zero_mip_texture;
+    zero_mip_texture.cls = ResourceClass::Texture;
+    zero_mip_texture.format = DataFormat::Uint32;
+    zero_mip_texture.num_components = 1;
+    zero_mip_texture.binding = 4;
+    zero_mip_texture.fetch_pc = 1;
+    zero_mip_texture.img_dim = 1;
+    zero_mip_texture.width = zero_mip_texture.height = 4;
+    zero_mip_texture.depth = 1;
+    zero_mip_texture.size = 64;
+    zero_mip_texture.proven_zero_mip = true;
+    ShaderResourceTable zero_mip_table;
+    zero_mip_table.resources.push_back(zero_mip_texture);
+    ComputeShaderConfig zero_mip_config;
+    zero_mip_config.user_sgprs.resize(28);
+    zero_mip_config.local_x = 1;
+    const auto cached_proven_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].proven_zero_mip = false;
+    const auto cached_unproven_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].proven_zero_mip = true;
+    const auto repeated_proven_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].declared_mip_levels = 2;
+    const auto cached_multilevel_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].declared_mip_levels = 1;
+    zero_mip_table.resources[0].compression_enabled = true;
+    const auto cached_dcc_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    zero_mip_table.resources[0].compression_enabled = false;
+    zero_mip_table.resources[0].in_mip_tail = true;
+    const auto cached_tail_zero_mip = recompile_compute_shader_cached(
+        kZeroMipCompute, std::size(kZeroMipCompute), &zero_mip_table, zero_mip_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!cached_proven_zero_mip.empty() && cached_unproven_zero_mip.empty() &&
+              repeated_proven_zero_mip == cached_proven_zero_mip &&
+              cached_multilevel_zero_mip.empty() && cached_dcc_zero_mip.empty() &&
+              cached_tail_zero_mip.empty() &&
+              stats.misses == 5 && stats.hits == 1 && stats.entries == 5,
+          "compute cache partitions zero-mip proof, levels, DCC, and texture-tail safety");
+
+    clear_shader_recompile_cache();
+    static const uint32_t kZeroStoreMipCompute[] = {
+        0x7e0a0206u,
+        0xf024310au, 0x00030004u, 0x00000503u,
+        0xbf810000u,
+    };
+    ShaderResource zero_store_mip_image;
+    zero_store_mip_image.cls = ResourceClass::StorageImage;
+    zero_store_mip_image.format = DataFormat::Uint32;
+    zero_store_mip_image.num_components = 1;
+    zero_store_mip_image.binding = 4;
+    zero_store_mip_image.fetch_pc = 1;
+    zero_store_mip_image.img_dim = 1;
+    zero_store_mip_image.width = zero_store_mip_image.height = 4;
+    zero_store_mip_image.depth = 1;
+    zero_store_mip_image.size = 64;
+    zero_store_mip_image.proven_zero_mip = true;
+    ShaderResourceTable zero_store_mip_table;
+    zero_store_mip_table.resources.push_back(zero_store_mip_image);
+    const auto cached_zero_store_mip = recompile_compute_shader_cached(
+        kZeroStoreMipCompute, std::size(kZeroStoreMipCompute),
+        &zero_store_mip_table, zero_mip_config);
+    zero_store_mip_table.resources[0].declared_mip_levels = 2;
+    const auto cached_multilevel_store_mip = recompile_compute_shader_cached(
+        kZeroStoreMipCompute, std::size(kZeroStoreMipCompute),
+        &zero_store_mip_table, zero_mip_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!cached_zero_store_mip.empty() && cached_multilevel_store_mip.empty() &&
+              stats.misses == 2 && stats.hits == 0 && stats.entries == 2,
+          "compute cache keys storage-image declared mip levels inspected by the emitter");
 
     // A one-record 16-bit V# emits an explicit index guard and typed tail marker. Keep the cache
     // partition compact (none/u16/f16), while ensuring a wider range or the sibling conversion can
@@ -573,6 +990,51 @@ int main() {
               cached_u16_tail != cached_wide_tail && cached_u16_tail != cached_f16_tail &&
               repeated_u16_tail == cached_u16_tail && stats.misses == 3 && stats.hits == 1,
           "compute cache partitions ordinary/u16/f16 one-record tail semantics exactly");
+
+    // A zero-record RAW V# is compiled into constants/no-ops, while a later nonzero descriptor at
+    // the same instruction emits a real buffer access. Addresses and ordinary sizes intentionally
+    // stay out of the module key, so partition only this exact semantic marker.
+    clear_shader_recompile_cache();
+    static const uint32_t kZeroRecordRawCompute[] = {
+        0xe0300000u, 0x80000000u, // buffer_load_dword v0, off, s[0:3]
+        0xbf810000u,
+    };
+    ShaderResource zero_record_raw;
+    zero_record_raw.cls = ResourceClass::ConstantBuffer;
+    zero_record_raw.format = DataFormat::Unknown;
+    zero_record_raw.num_components = 0;
+    zero_record_raw.binding = 3;
+    zero_record_raw.gpu_addr = 0;
+    zero_record_raw.size = 0;
+    zero_record_raw.stride = 0;
+    zero_record_raw.srt_offset = 0xFFFFFFFFu;
+    zero_record_raw.sgpr_base = 0xFFFFFFFFu;
+    zero_record_raw.fetch_pc = 0;
+    ShaderResourceTable zero_record_raw_table;
+    zero_record_raw_table.resources.push_back(zero_record_raw);
+    ComputeShaderConfig zero_record_raw_config;
+    zero_record_raw_config.user_sgprs.resize(4);
+    zero_record_raw_config.local_x = 64;
+    const auto cached_zero_record_raw = recompile_compute_shader_cached(
+        kZeroRecordRawCompute, std::size(kZeroRecordRawCompute), &zero_record_raw_table,
+        zero_record_raw_config);
+    zero_record_raw_table.resources[0].gpu_addr = 0x20000u;
+    zero_record_raw_table.resources[0].size = 4;
+    const auto cached_nonzero_raw = recompile_compute_shader_cached(
+        kZeroRecordRawCompute, std::size(kZeroRecordRawCompute), &zero_record_raw_table,
+        zero_record_raw_config);
+    zero_record_raw_table.resources[0].gpu_addr = 0;
+    zero_record_raw_table.resources[0].size = 0;
+    const auto repeated_zero_record_raw = recompile_compute_shader_cached(
+        kZeroRecordRawCompute, std::size(kZeroRecordRawCompute), &zero_record_raw_table,
+        zero_record_raw_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(is_zero_record_raw_buffer(zero_record_raw_table.resources[0]) &&
+              !cached_zero_record_raw.empty() && !cached_nonzero_raw.empty() &&
+              cached_zero_record_raw != cached_nonzero_raw &&
+              repeated_zero_record_raw == cached_zero_record_raw && stats.misses == 2 &&
+              stats.hits == 1 && stats.entries == 2,
+          "compute cache separates exact zero-record RAW lowering from nonzero buffers");
 
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw

@@ -1,5 +1,12 @@
 # RDNA2→SPIR-V recompiler — remaining work
 
+> **Current note (2026-08-11): this is a historical 41-shader bring-up corpus, not the current GTA V
+> coverage boundary.** Later routed gameplay exercises a much larger dynamic compute set and still
+> exposes fail-visible instruction, resource and control-flow gaps. The program-tagged terminal census
+> and current fixes live in #2481; do not reuse this document's old conclusion that the recompiler was
+> "done for this title." The 2026-08-11 gameplay-entry sample contains 29 recompile-empty programs and
+> 6 invalid-descriptor programs (35 unique); those route-specific live counts supersede this corpus.
+
 **Date:** 2026-07-06. **Status: ~93.7% instruction coverage in-context; 38 of 41 shaders fully recompile.**
 (The earlier "34/41" was a coverage-tool undercount — it ran a per-instruction check that didn't credit
 `emit_body`'s loop/if reconstruction, so the MSAA-resolve loop shaders 031-034 were mis-flagged as blocked
@@ -59,8 +66,8 @@ in priority: (1) structured s_cbranch_scc0 → +4 shaders (biggest); (2) LDS wav
 (3) v_add_co_ci_u32 → correctness/coverage for address math (0 completions here). Coverage now 93.2%
 in-context (unsupported 107), 34/41 shaders.
 
-**The recompiler is DONE for this title.** Reaching the game's actual pixels is now gated on the GPU-
-execution / render-loop frontier (see `RENDER_LOOP.md`), not the recompiler.
+**Historical conclusion (superseded):** this corpus once suggested that the recompiler was done for
+the title. Routed gameplay later falsified that generalisation; see #2481 for the current dynamic set.
 
 ## How to eventually add the cross-lane wave ops (design note, 2026-07-06)
 The remaining shaders (030/037/038) need `v_mbcnt_lo/hi` (this lane's index among active lanes) and

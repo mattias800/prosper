@@ -63,6 +63,17 @@ static_assert(offsetof(Shader, user_data) == 0x08 && offsetof(Shader, code) == 0
               offsetof(Shader, specials) == 0x28 && offsetof(Shader, type) == 0x5a &&
               offsetof(Shader, num_sh_registers) == 0x5c, "test Shader layout must mirror hle_agc");
 
+static void make_test_tsharp(uint32_t t[8], uint64_t base, uint32_t width,
+                             uint32_t height, uint32_t format) {
+    std::memset(t, 0, 8u * sizeof(uint32_t));
+    const uint64_t encoded_base = base >> 8;
+    t[0] = static_cast<uint32_t>(encoded_base);
+    t[1] = static_cast<uint32_t>((encoded_base >> 32) & 0xffu) |
+           ((format & 0x1ffu) << 20) | (((width - 1u) & 0x3u) << 30);
+    t[2] = (((width - 1u) >> 2) & 0xfffu) | (((height - 1u) & 0x3fffu) << 14);
+    t[3] = (9u << 28) | 0xfacu;               // 2D, linear, identity component selection
+}
+
 int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
@@ -311,6 +322,75 @@ int main() {
           pixel_buffer->direct_vsharp_sh_register_base ==
               prosper::gpu::ShaderResource::kDirectVSharpOriginAmbiguous,
           "shader-constructed pixel V# keeps its resource but no fabricated raw SH origin");
+
+    // The instruction proof is not complete until the real graphics resource builder has paired it
+    // with this exact one-level uncompressed descriptor. Exercise build_stage_table itself so
+    // deleting its marker assignment cannot be hidden by helper-only tests.
+    alignas(256) static uint8_t zero_mip_texture_bytes[8192]{};
+    alignas(256) static uint8_t zero_mip_metadata_bytes[256]{};
+    const uint32_t zero_mip_texture_shader[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP v[0:3], [v0,v1,v2], s[20:27]
+        0xbf810000u,
+    };
+    Shader zero_mip_pixel{};
+    zero_mip_pixel.file_header = 0x34333231u;
+    zero_mip_pixel.version = 0x18u;
+    zero_mip_pixel.shader_size = sizeof(zero_mip_texture_shader);
+    zero_mip_pixel.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&zero_mip_pixel),
+                       reinterpret_cast<uint64_t>(zero_mip_texture_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &zero_mip_pixel,
+          "zero-mip pixel shader enters the AGC registry");
+    prosper::gpu::GpuState zero_mip_pixel_state;
+    constexpr uint32_t kZeroMipPsUser = prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0;
+    uint32_t zero_mip_tsharp[8];
+    make_test_tsharp(zero_mip_tsharp,
+                     reinterpret_cast<uint64_t>(zero_mip_texture_bytes),
+                     4, 4, 60);               // Uint8x4, one declared level
+    zero_mip_pixel_state.sh[kZeroMipPsUser + 7] = 0;
+    for (uint32_t i = 0; i < 8; ++i)
+        zero_mip_pixel_state.sh[kZeroMipPsUser + 20 + i] = zero_mip_tsharp[i];
+    auto realized_zero_mip_pixel = prosper::gpu::build_stage_table(
+        zero_mip_pixel_state, reinterpret_cast<uint64_t>(zero_mip_texture_shader), true, 3);
+    const prosper::gpu::ShaderResource* realized_zero_mip_texture =
+        realized_zero_mip_pixel ? realized_zero_mip_pixel->by_fetch_pc(1) : nullptr;
+    CHECK(realized_zero_mip_texture && realized_zero_mip_texture->proven_zero_mip &&
+              realized_zero_mip_texture->declared_mip_levels == 1 &&
+              !realized_zero_mip_texture->compression_enabled,
+          "build_stage_table materializes the exact safe zero-mip proof on its texture");
+
+    prosper::gpu::GpuState multilevel_zero_mip_pixel_state = zero_mip_pixel_state;
+    multilevel_zero_mip_pixel_state.sh[kZeroMipPsUser + 23] |= 1u << 16;
+    multilevel_zero_mip_pixel_state.sh[kZeroMipPsUser + 25] |= 1u << 4;
+    auto realized_multilevel_zero_mip = prosper::gpu::build_stage_table(
+        multilevel_zero_mip_pixel_state,
+        reinterpret_cast<uint64_t>(zero_mip_texture_shader), true, 3);
+    const prosper::gpu::ShaderResource* multilevel_zero_mip_texture =
+        realized_multilevel_zero_mip
+            ? realized_multilevel_zero_mip->by_fetch_pc(1) : nullptr;
+    CHECK(multilevel_zero_mip_texture &&
+              multilevel_zero_mip_texture->declared_mip_levels == 2 &&
+              !multilevel_zero_mip_texture->proven_zero_mip,
+          "build_stage_table leaves a multilevel IMAGE_LOAD_MIP resource unspecialized");
+
+    prosper::gpu::GpuState dcc_zero_mip_pixel_state = zero_mip_pixel_state;
+    const uint64_t metadata_field =
+        reinterpret_cast<uint64_t>(zero_mip_metadata_bytes) >> 8;
+    dcc_zero_mip_pixel_state.sh[kZeroMipPsUser + 26] =
+        0x00280000u | (static_cast<uint32_t>(metadata_field) << 24);
+    dcc_zero_mip_pixel_state.sh[kZeroMipPsUser + 27] =
+        static_cast<uint32_t>(metadata_field >> 8);
+    auto realized_dcc_zero_mip = prosper::gpu::build_stage_table(
+        dcc_zero_mip_pixel_state,
+        reinterpret_cast<uint64_t>(zero_mip_texture_shader), true, 3);
+    const prosper::gpu::ShaderResource* dcc_zero_mip_texture =
+        realized_dcc_zero_mip ? realized_dcc_zero_mip->by_fetch_pc(1) : nullptr;
+    CHECK(dcc_zero_mip_texture && dcc_zero_mip_texture->compression_enabled &&
+              !dcc_zero_mip_texture->proven_zero_mip,
+          "build_stage_table leaves DCC-backed IMAGE_LOAD_MIP fail-visible");
 
     const uint32_t direct_seed_fetch[] = {
         0xE0002000u, 0x80020100u,   // pc=0: buffer_load_format_x v1, v0, s[8:11], 0 idxen

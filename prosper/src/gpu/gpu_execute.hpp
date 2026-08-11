@@ -210,6 +210,11 @@ struct SrtUse {
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     std::array<uint32_t, 4> bvh4{};  // BVH descriptor dwords live at IMAGE_BVH_INTERSECT_RAY (kind 2)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
+    // Fully-known RAW MUBUF V# whose NUM_RECORDS is zero. This is distinct from the scalar-SMEM
+    // raw-pointer convention, where a zero decoded size means "unbounded" and required_size supplies
+    // the proven access span. Only resolve_dynamic_fetch may set this after decoding all four live
+    // descriptor words at the exact consuming instruction.
+    bool zero_record_raw = false;
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
     // Minimum byte span needed by this scalar-buffer consumer, measured from V#.Base. Some PS5
@@ -222,13 +227,25 @@ struct SrtUse {
     // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
     // the same per-instruction provenance the vertex fetches use) is unambiguous.
     uint32_t use_pc = 0xFFFFFFFFu;   // exact consuming pc for key-less texture/buffer uses
-    // The consuming image op requires a STORAGE image (image_store 0x08 or an image atomic such as
-    // IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for kind 0.
+    // The consuming image op requires a STORAGE image (image_store 0x08, image_store_mip 0x09, or
+    // an image atomic such as IMAGE_ATOMIC_SWAP 0x0f), not a sampled texture. Only meaningful for
+    // kind 0.
     bool is_storage_image = false;
+    // IMAGE_LOAD_MIP / IMAGE_STORE_MIP have one more address operand than their base-level
+    // siblings. The current Vulkan compute backend materializes one mip only, so the fold may
+    // specialize that operand away only after proving its exact VGPR was written in the same basic
+    // block by a plain v_mov_b32 from a known-zero wave-uniform SGPR.
+    bool proven_zero_mip = false;
     // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
     // property of the use, not merely the S# compare function: NEVER is a valid compare op.
     bool is_depth_compare = false;
 };
+
+// Materialization half of the IMAGE_*_MIP specialization contract. Kept observable so regression
+// tests can mutate the exact DCC/single-level gate used by live resource construction.
+bool shader_resource_allows_zero_mip_specialization(
+    const SrtUse& use, const DecodedImageDescriptor& descriptor,
+    const DecodedImageView& view);
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
                                             uint32_t user_sgpr_base,
@@ -438,7 +455,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
 // generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
 std::vector<uint32_t> recompile_compute_shader_cached(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
-    const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr);
+    const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr,
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Compute, 0});
+// Report the final live consequence once per guest program address. Returns true only for the first
+// report so the caller can keep its adjacent resource-table dump on the same distinct-address gate.
+bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic);
 SharedShaderWords recompile_vertex_chain_cached_shared(
     const uint32_t* prolog, size_t prolog_dwords,
     const uint32_t* main, size_t main_dwords,

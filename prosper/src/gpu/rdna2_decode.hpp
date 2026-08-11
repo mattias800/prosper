@@ -42,12 +42,32 @@ struct Operand {
 Operand decode_src_field(uint32_t field);
 // The float value an InlineFloat operand encodes (0.5, 1.0, ... , 1/(2*pi)); 0 for non-float codes.
 float inline_float_value(uint32_t code);
+struct Rdna2Inst;
 // True when a VOPC opcode is the `v_cmpx_*` form, which writes EXEC instead of a VCC/SGPR mask.
 // Every one sits at its `v_cmp_*` counterpart + 0x10, so `opcode - 0x10` recovers the base compare.
 // The six windows and the two invalid holes are enumerated (and sourced) at the definition in
 // rdna2_decode.cpp. This is a property of the ENCODING, so it is shared: the decoder's SDWA
 // admission and the recompiler's EXEC/mask bookkeeping must not carry separate copies (#2120).
 bool vopc_is_cmpx(uint32_t opcode);
+// True for every decoded instruction that can explicitly or implicitly write EXEC. This is shared
+// by control-flow analysis and instruction-scoped value proofs: overlooking a mask mutation can
+// turn a predicated VALU definition into a false all-lanes fact.
+bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
+// Number of consecutive data VGPRs an instruction writes from its decoded destination. This
+// inventory is shared by control-flow analyses and instruction-scoped value proofs so scalar VALU
+// results are not mistaken for four-register memory payloads, while actual wide results still
+// invalidate every register they define. Known store encodings return zero because their VDATA
+// field is a source. Appended TFE status and dynamic destinations such as v_movreld_b32 are separate:
+// consumers must also use `rdna2_tfe_status_vgpr` and handle dynamic destinations fail-closed.
+uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in);
+// Appended TFE status destination, or -1 when the instruction has none. Unlike the consecutive data
+// result above, a store's decoded VDATA is a source prefix and only the trailing status is written.
+// This remains exact for decoded MTBUF forms that emission rejects, including packed-D16 forms.
+int rdna2_tfe_status_vgpr(const Rdna2Inst& in);
+// Width of the complete consecutive VGPR field rooted at `dst`, including VDATA sources on stores
+// and an appended TFE status destination. Register-file sizing needs this broader footprint even
+// though dataflow invalidation must distinguish sources from writes.
+uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in);
 // True for the VOP1 f16 unary family: one f16 operand in, one f16 result out, no side effects —
 // 0x54-0x58 (rcp/sqrt/rsq/log/exp) and 0x5B-0x61 (floor/ceil/trunc/rndne/fract/sin/cos). The two
 // FREXP opcodes 0x59/0x5A sit inside that numeric span and are deliberately excluded: 0x59 returns a
@@ -74,13 +94,15 @@ struct Rdna2Inst {
     // (dst_sel defaults to DWORD=6, hardware PRESERVES the unwritten f16 half) from the SDWA
     // DWORD+UNUSED_PAD form (same field values, hardware ZERO-fills) — ISA Table 88 DST_U.
     bool        has_sdwa = false;
-    // DPP16 QUAD_PERM/ROW_SHR (#273/#1390): a full-mask operation with no neg/abs/FI.  The
-    // recompiler lowers quad permutations through stage-appropriate lane operations and bounded row
-    // shifts in the portable one-live-lane vertex shell.  src[0] holds the REAL source VGPR
-    // (dword1[7:0]); dpp_ctrl and dpp_bound_ctrl retain the architectural control fields.
+    // DPP16 QUAD_PERM/ROW_SHR (#273/#1390): an admitted operation with no neg/abs/FI. The
+    // recompiler lowers full-mask permutations through stage-appropriate lane operations; exact
+    // partial-mask shapes keep their row/bank fields so a narrow stage model can preserve masked
+    // destinations. src[0] holds the REAL source VGPR (dword1[7:0]).
     bool        has_dpp = false;
     uint16_t    dpp_ctrl = 0;
     bool        dpp_bound_ctrl = false;
+    uint8_t     dpp_bank_mask = 0;
+    uint8_t     dpp_row_mask = 0;
     // V_PERMLANE16_B32 / V_PERMLANEX16_B32 overload OPSEL[0:1] as Fetch-Inactive and
     // BOUND_CTRL. Keep these separate from DPP's control word: permlane is a native VOP3 op whose
     // 64-bit selector comes from SRC1:SRC2.
@@ -130,9 +152,11 @@ struct Rdna2Inst {
     uint32_t exp_en = 0;
     bool     exp_compr = false;     // COMPR: the 4 channels are two f16x2 pairs in src[0] (r,g) / src[1] (b,a)
 
-    // MUBUF-only flags (ISA Table 98): GLC (bit 14) — for atomics, "return pre-op value to VGPR";
-    // LDS (bit 16) — transfer between LDS and memory instead of VGPRs (rejected until modeled).
+    // MUBUF/MTBUF flags (ISA Table 98): GLC (bit 14) — for atomics, "return pre-op value to VGPR";
+    // DLC (bit 15) — device-level cache policy for ordinary loads; LDS (bit 16, MUBUF only) —
+    // transfer between LDS and memory instead of VGPRs (rejected until modeled).
     bool     mubuf_glc = false;
+    bool     mubuf_dlc = false;
     bool     mubuf_lds = false;
     // MTBUF carries the GFX10 combined 7-bit BUF_FMT at dword0[25:19], just like a Gen5 V#.
     // Interpreting these bits as the older PS4 DFMT/NFMT split maps valid gfx1030 formats to the
@@ -196,6 +220,12 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords);
 // Walk from code[0], appending each decoded instruction to `out`, until S_ENDPGM, an Unknown
 // encoding, or the end of the buffer. Returns the number of dwords consumed.
 size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& out);
+
+// Exact IMAGE_LOAD_MIP / IMAGE_STORE_MIP packet subset whose mip operand may be specialized after
+// an independent value proof. Returns the dimension-specific mip VGPR when requested. This checks
+// only packet shape; callers must still prove that VGPR is zero and that the resource has one
+// materialized, uncompressed mip.
+bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers

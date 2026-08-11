@@ -21,8 +21,9 @@ user-supplied and gitignored.
   **through** IL2CPP and Unity's GfxDevice into the running frame loop.
 - ✅ **M4 — Graphics (AGC → Vulkan).** AGC frontend (CreateShader + submit; PM4 decode → command
   processor → register-state fold; EOP/DMA/fence writes on the guest timeline). **RDNA2→SPIR-V
-  recompiler:** full ALU + `SCC`; divergent control flow (EXEC predication, saveexec/restore, `execz`
-  if-then + loop exits); `SMEM`, `MUBUF` vertex-fetch/load/store, `MIMG` sample/load, `LDS`+barriers,
+  recompiler:** broad scalar/vector ALU coverage + `SCC`; divergent control flow (EXEC predication,
+  saveexec/restore, `execz` if-then + loop exits); `SMEM`, `MUBUF` vertex-fetch/load/store, `MIMG`
+  sample/load, `LDS` + fail-closed barrier lowering,
   `EXP`/`VINTRP`; EUD-resident descriptor resolution; every SPIR-V emitter `spirv-val`-gated in CI
   (`tools/spv_validate`). Texture decode:
   GFX10 `SW_4KB_S`/`SW_64KB_S` de-swizzle for all element sizes + BC1–7/BC6H, T# format + `DST_SEL`
@@ -76,11 +77,15 @@ user-supplied and gitignored.
   over an otherwise valid world (#654). A 420-frame sampled-render native capture confirms the complete first
   playable room, and screenshot manifests distinguish new publications from actual pixel progress (#648).
   The route and capture recipe are in `scripts/blasphemous2/README.md`.
-- 🚧 **Active frontiers (2026-08-10):** GTA V reaches its title/menu and routed gameplay entry, where
-  the HUD renders over an absent 3D world. The six-stage runtime-selected descriptor-array lift is
-  complete; post-lift Linux and Windows evidence moves the current blocker to about 57 distinct compute
-  control-flow structurization sites (#2412/#2481), with subgroup-contract limits tracked separately
-  in #2429. Dragon Quest VII now boots and submits continuously on Windows (#2447), but routed
+- 🚧 **Active frontiers (2026-08-11):** GTA V reaches its title/menu and routed gameplay entry, where
+  the HUD, radar and tutorial text render over an absent 3D world. The six-stage runtime-selected
+  descriptor-array lift is complete. Program-tagged live evidence proved that the earlier "about 57 CFG
+  sites" count mixed consequent structurizer messages with independent terminal failures; reviewed work
+  now advances the exact failing programs one instruction or resource contract at a time. The current
+  routed sample has 29 recompile-empty programs plus 6 invalid-descriptor programs, a 35-program union
+  with no new failures versus the preceding sample (#2412/#2481). Subgroup-contract limits are tracked
+  separately in #2429. Dragon Quest VII now boots and submits
+  continuously on Windows (#2447), but routed
   progression can hit a fixed `sceKernelBatchMap` ENOMEM whose high-volume memory logger suppresses the
   repro (#2448/#2450). Sonic Racing: CrossWorlds has advanced to rung 2: pulsed input reaches its full
   4K title screen, while the later profile panel and terminal white state remain open (#2358/#2360).

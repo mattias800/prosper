@@ -89,6 +89,20 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+// Whether the module contains the requested GLSL.std.450 extended instruction number.
+bool has_glsl_ext_inst(const std::vector<uint32_t>& spv, uint32_t instruction) {
+    constexpr uint32_t OpExtInst = 12;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        // OpExtInst operands: result type, result, instruction set, instruction, operands...
+        if (op == OpExtInst && wc >= 6 && spv[i + 4] == instruction) return true;
+        i += wc;
+    }
+    return false;
+}
+
 uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
     uint32_t count = 0;
     if (spv.size() < 5) return count;
@@ -455,6 +469,652 @@ bool dpp_min_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& spv) {
     }
     return exact_amount && pending_and_exec_gate && event_match &&
         shuffle_lanes.size() == 1 && min_reaches_store;
+}
+
+// Prove GTA V's portable compute DPP add lowering rather than merely finding an OpIAdd. The two
+// guest waves publish separate value/metadata scratch planes, address SRC0 with linear_id-amount
+// inside a DPP16 row, require the source's static event to match, and select the add over the old
+// persistent VGPR only on that guarded path. Instruction positions additionally prove that two
+// uniform workgroup barriers bracket the scratch exchange and its later reuse.
+bool compute_dpp_add_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& spv,
+                                                   uint32_t lanes,
+                                                   uint32_t expected_dst) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpAccessChain = 65, OpIAdd = 128, OpISub = 130,
+                       OpShiftRightLogical = 194, OpLogicalAnd = 167,
+                       OpSelect = 169, OpIEqual = 170, OpINotEqual = 171,
+                       OpUGreaterThanEqual = 174, OpShiftLeftLogical = 196,
+                       OpBitwiseOr = 197, OpBitwiseAnd = 199,
+                       OpControlBarrier = 224;
+    struct Binary { uint32_t first = 0, second = 0; };
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    struct Access { uint32_t base = 0, index = 0; };
+    struct Store { uint32_t pointer = 0, value = 0; size_t position = 0; };
+    struct Load { uint32_t pointer = 0; size_t position = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants;
+    std::unordered_map<uint32_t, Binary> iadds, isubs, shifts, shift_lefts,
+                                                logical_ands, equals, not_equals,
+                                                greater_equals, bitwise_ors,
+                                                bitwise_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::unordered_map<uint32_t, Access> accesses;
+    std::unordered_map<uint32_t, Load> loads;
+    std::vector<Store> stores;
+    std::vector<size_t> barriers;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            loads[spv[i + 2]] = {spv[i + 3], i};
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2], i});
+        else if (op == OpAccessChain && wc == 5)
+            accesses[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpIAdd && wc == 5)
+            iadds[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpISub && wc == 5)
+            isubs[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftRightLogical && wc == 5)
+            shifts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftLeftLogical && wc == 5)
+            shift_lefts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpIEqual && wc == 5)
+            equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpINotEqual && wc == 5)
+            not_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpUGreaterThanEqual && wc == 5)
+            greater_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseOr && wc == 5)
+            bitwise_ors[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseAnd && wc == 5)
+            bitwise_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        else if (op == OpControlBarrier)
+            barriers.push_back(i);
+        i += wc;
+    }
+
+    auto literal_other = [&](const Binary& binary, uint32_t literal,
+                             uint32_t* other) {
+        const auto first = constants.find(binary.first);
+        const auto second = constants.find(binary.second);
+        if (first != constants.end() && first->second == literal) {
+            if (other) *other = binary.second;
+            return true;
+        }
+        if (second != constants.end() && second->second == literal) {
+            if (other) *other = binary.first;
+            return true;
+        }
+        return false;
+    };
+    auto pointer_store = [&](uint32_t pointer, uint32_t value, size_t* position) {
+        const auto found = std::find_if(stores.begin(), stores.end(), [&](const Store& store) {
+            return store.pointer == pointer && (!value || store.value == value);
+        });
+        if (found == stores.end()) return false;
+        if (position) *position = found->position;
+        return true;
+    };
+
+    // Locate the loaded source event: scratch metadata >> 1 == the destination's event mailbox.
+    for (const auto& shifted_event : shifts) {
+        const auto one = constants.find(shifted_event.second.second);
+        const auto metadata_load = loads.find(shifted_event.second.first);
+        if (one == constants.end() || one->second != 1 || metadata_load == loads.end()) continue;
+        const auto metadata_access = accesses.find(metadata_load->second.pointer);
+        if (metadata_access == accesses.end()) continue;
+        const auto metadata_index_add = iadds.find(metadata_access->second.index);
+        uint32_t source_index = 0;
+        if (metadata_index_add == iadds.end() ||
+            !literal_other(metadata_index_add->second, lanes, &source_index))
+            continue;
+
+        uint32_t event_match = 0, event_load = 0;
+        for (const auto& equal : equals) {
+            if (equal.second.first == shifted_event.first && loads.contains(equal.second.second)) {
+                event_match = equal.first;
+                event_load = equal.second.second;
+                break;
+            }
+            if (equal.second.second == shifted_event.first && loads.contains(equal.second.first)) {
+                event_match = equal.first;
+                event_load = equal.second.first;
+                break;
+            }
+        }
+        if (!event_match) continue;
+
+        std::unordered_set<uint32_t> event_tags;
+        const uint32_t event_pointer = loads.at(event_load).pointer;
+        for (const auto& store : stores) {
+            if (store.pointer != event_pointer) continue;
+            const auto constant = constants.find(store.value);
+            if (constant != constants.end()) event_tags.insert(constant->second);
+        }
+        uint32_t nonzero_events = 0;
+        for (uint32_t event : event_tags) nonzero_events += event != 0;
+        if (!event_tags.contains(0) || nonzero_events < 2) continue;
+
+        const auto source_select = selects.find(source_index);
+        if (source_select == selects.end()) continue;
+        const auto source_subtract = isubs.find(source_select->second.yes);
+        const auto row_bound = greater_equals.find(source_select->second.condition);
+        uint32_t linear_lane = 0;
+        const auto row_lane = row_bound == greater_equals.end()
+            ? bitwise_ands.end() : bitwise_ands.find(row_bound->second.first);
+        if (source_subtract == isubs.end() || row_bound == greater_equals.end() ||
+            row_lane == bitwise_ands.end() ||
+            !literal_other(row_lane->second, 15, &linear_lane) ||
+            source_subtract->second.first != linear_lane ||
+            source_select->second.no != linear_lane ||
+            source_subtract->second.second != row_bound->second.second)
+            continue;
+        const uint32_t amount = source_subtract->second.second;
+        const auto amount_load = loads.find(amount);
+        if (amount_load == loads.end()) continue;
+        std::unordered_set<uint32_t> amounts;
+        for (const auto& store : stores) {
+            if (store.pointer != amount_load->second.pointer) continue;
+            const auto constant = constants.find(store.value);
+            if (constant != constants.end()) amounts.insert(constant->second);
+        }
+        if (!amounts.contains(1) || !amounts.contains(2) ||
+            !amounts.contains(4) || !amounts.contains(8))
+            continue;
+
+        // The value plane uses the identical dynamic source index and the same scratch variable.
+        uint32_t shifted_value = 0;
+        for (const auto& load : loads) {
+            const auto access = accesses.find(load.second.pointer);
+            if (access == accesses.end() ||
+                access->second.base != metadata_access->second.base)
+                continue;
+            const auto index_add = iadds.find(access->second.index);
+            uint32_t index = 0;
+            if (index_add != iadds.end() &&
+                literal_other(index_add->second, 0, &index) && index == source_index) {
+                shifted_value = load.first;
+                break;
+            }
+        }
+        if (!shifted_value) continue;
+
+        uint32_t add_result = 0, local_value = 0;
+        for (const auto& add : iadds) {
+            if (add.second.first == shifted_value || add.second.second == shifted_value) {
+                const uint32_t local = add.second.first == shifted_value
+                    ? add.second.second : add.second.first;
+                if (loads.contains(local)) {
+                    add_result = add.first;
+                    local_value = local;
+                    break;
+                }
+            }
+        }
+        if (!add_result) continue;
+
+        // Find both plane publications by their common destination invocation index.
+        size_t value_publish = 0, metadata_publish = 0;
+        uint32_t metadata_value = 0;
+        for (const auto& value_store : stores) {
+            const auto value_access = accesses.find(value_store.pointer);
+            if (value_access == accesses.end() ||
+                value_access->second.base != metadata_access->second.base ||
+                value_store.value != local_value)
+                continue;
+            const auto value_index = iadds.find(value_access->second.index);
+            uint32_t lane = 0;
+            if (value_index == iadds.end() ||
+                !literal_other(value_index->second, 0, &lane))
+                continue;
+            for (const auto& metadata_store : stores) {
+                const auto metadata_publish_access = accesses.find(metadata_store.pointer);
+                if (metadata_publish_access == accesses.end() ||
+                    metadata_publish_access->second.base != metadata_access->second.base)
+                    continue;
+                const auto metadata_publish_index =
+                    iadds.find(metadata_publish_access->second.index);
+                uint32_t metadata_lane = 0;
+                if (metadata_publish_index != iadds.end() &&
+                    literal_other(metadata_publish_index->second, lanes, &metadata_lane) &&
+                    metadata_lane == lane) {
+                    value_publish = value_store.position;
+                    metadata_publish = metadata_store.position;
+                    metadata_value = metadata_store.value;
+                    break;
+                }
+            }
+            if (value_publish && metadata_publish) break;
+        }
+        if (!value_publish || !metadata_publish || !metadata_value) continue;
+
+        // Recover the destination pending and EXEC mailboxes from the publication expression:
+        // pending ? ((event << 1) | (active ? 1 : 0)) : 0.
+        const auto metadata_select = selects.find(metadata_value);
+        if (metadata_select == selects.end() ||
+            !loads.contains(metadata_select->second.condition))
+            continue;
+        const auto metadata_zero = constants.find(metadata_select->second.no);
+        const auto encoded = bitwise_ors.find(metadata_select->second.yes);
+        if (metadata_zero == constants.end() || metadata_zero->second != 0 ||
+            encoded == bitwise_ors.end())
+            continue;
+        const uint32_t pending = metadata_select->second.condition;
+        uint32_t active = 0;
+        bool encodes_event = false;
+        for (uint32_t encoded_part : {encoded->second.first, encoded->second.second}) {
+            const auto event_shift = shift_lefts.find(encoded_part);
+            const auto active_select = selects.find(encoded_part);
+            if (event_shift != shift_lefts.end()) {
+                const auto one = constants.find(event_shift->second.second);
+                encodes_event = encodes_event ||
+                    (event_shift->second.first == event_load &&
+                     one != constants.end() && one->second == 1);
+            }
+            if (active_select != selects.end()) {
+                const auto one = constants.find(active_select->second.yes);
+                const auto zero = constants.find(active_select->second.no);
+                if (loads.contains(active_select->second.condition) &&
+                    one != constants.end() && one->second == 1 &&
+                    zero != constants.end() && zero->second == 0)
+                    active = active_select->second.condition;
+            }
+        }
+        if (!encodes_event || !active || active == pending) continue;
+
+        // The selected source lane contributes an independent EXEC predicate.
+        uint32_t source_active = 0;
+        for (const auto& masked : bitwise_ands) {
+            uint32_t metadata = 0;
+            if (!literal_other(masked.second, 1, &metadata) ||
+                metadata != shifted_event.second.first)
+                continue;
+            for (const auto& comparison : not_equals) {
+                uint32_t compared = 0;
+                if (literal_other(comparison.second, 0, &compared) &&
+                    compared == masked.first) {
+                    source_active = comparison.first;
+                    break;
+                }
+            }
+            if (source_active) break;
+        }
+        if (!source_active) continue;
+
+        // The final condition must select the mailbox's physical destination as well.
+        uint32_t destination_match = 0;
+        for (const auto& equal : equals) {
+            uint32_t mailbox = 0;
+            if (!literal_other(equal.second, expected_dst, &mailbox) ||
+                !loads.contains(mailbox))
+                continue;
+            const uint32_t pointer = loads.at(mailbox).pointer;
+            const bool initialized_for_dst = std::any_of(
+                stores.begin(), stores.end(), [&](const Store& store) {
+                    const auto value = constants.find(store.value);
+                    return store.pointer == pointer && value != constants.end() &&
+                        value->second == expected_dst;
+                });
+            if (initialized_for_dst) {
+                destination_match = equal.first;
+                break;
+            }
+        }
+        if (!destination_match) continue;
+
+        auto guard_contains = [&](auto&& self, uint32_t root, uint32_t leaf) -> bool {
+            if (root == leaf) return true;
+            const auto logical_and = logical_ands.find(root);
+            return logical_and != logical_ands.end() &&
+                (self(self, logical_and->second.first, leaf) ||
+                 self(self, logical_and->second.second, leaf));
+        };
+        size_t persistent_store_position = 0;
+        bool preserves_old_vgpr = false;
+        for (const auto& selected : selects) {
+            if (selected.second.yes != add_result ||
+                !loads.contains(selected.second.no) ||
+                !guard_contains(guard_contains, selected.second.condition, pending) ||
+                !guard_contains(guard_contains, selected.second.condition, active) ||
+                !guard_contains(guard_contains, selected.second.condition,
+                                source_select->second.condition) ||
+                !guard_contains(guard_contains, selected.second.condition, source_active) ||
+                !guard_contains(guard_contains, selected.second.condition, event_match) ||
+                !guard_contains(guard_contains, selected.second.condition, destination_match))
+                continue;
+            const uint32_t old_pointer = loads.at(selected.second.no).pointer;
+            const uint32_t source_mailbox_pointer = loads.at(local_value).pointer;
+            const bool old_reaches_source_mailbox = std::any_of(
+                stores.begin(), stores.end(), [&](const Store& store) {
+                    const auto source = loads.find(store.value);
+                    return store.pointer == source_mailbox_pointer &&
+                        source != loads.end() && source->second.pointer == old_pointer;
+                });
+            if (old_reaches_source_mailbox &&
+                pointer_store(old_pointer, selected.first, &persistent_store_position)) {
+                preserves_old_vgpr = true;
+                break;
+            }
+        }
+        if (!preserves_old_vgpr) continue;
+
+        const size_t publish_end = std::max(value_publish, metadata_publish);
+        const auto first_barrier = std::find_if(
+            barriers.begin(), barriers.end(), [&](size_t position) {
+                return position > publish_end && position < metadata_load->second.position;
+            });
+        const auto second_barrier = std::find_if(
+            barriers.begin(), barriers.end(), [&](size_t position) {
+                return position > persistent_store_position;
+            });
+        if (first_barrier != barriers.end() && second_barrier != barriers.end()) return true;
+    }
+    return false;
+}
+
+// Trace the native exact-wave form independently of the portable scratch path. Each live ladder
+// amount must select lane-amount inside a DPP16 row, shuffle both the value and its EXEC bit, add
+// only for EXEC-active destinations with an in-bounds active source, and otherwise keep the old
+// in-place VGPR before that value is persisted by the dispatcher.
+bool compute_dpp_add_native_row_shr_updates_dispatch_vgpr(
+    const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpIAdd = 128, OpISub = 130, OpLogicalAnd = 167,
+                       OpSelect = 169, OpINotEqual = 171,
+                       OpUGreaterThanEqual = 174, OpBitwiseAnd = 199,
+                       OpGroupNonUniformShuffle = 345;
+    struct Binary { uint32_t first = 0, second = 0; };
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    struct Shuffle { uint32_t value = 0, lane = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, load_pointers;
+    std::unordered_map<uint32_t, Binary> iadds, isubs, logical_ands,
+                                                not_equals, greater_equals,
+                                                bitwise_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::unordered_map<uint32_t, Shuffle> shuffles;
+    std::vector<std::array<uint32_t, 2>> stores;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            load_pointers[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpIAdd && wc == 5)
+            iadds[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpISub && wc == 5)
+            isubs[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpINotEqual && wc == 5)
+            not_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpUGreaterThanEqual && wc == 5)
+            greater_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseAnd && wc == 5)
+            bitwise_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        else if (op == OpGroupNonUniformShuffle && wc == 6)
+            shuffles[spv[i + 2]] = {spv[i + 4], spv[i + 5]};
+        i += wc;
+    }
+
+    auto literal_other = [&](const Binary& binary, uint32_t literal,
+                             uint32_t* other) {
+        const auto first = constants.find(binary.first);
+        const auto second = constants.find(binary.second);
+        if (first != constants.end() && first->second == literal) {
+            if (other) *other = binary.second;
+            return true;
+        }
+        if (second != constants.end() && second->second == literal) {
+            if (other) *other = binary.first;
+            return true;
+        }
+        return false;
+    };
+    auto exact_and = [&](const Binary& binary, uint32_t first, uint32_t second) {
+        return (binary.first == first && binary.second == second) ||
+               (binary.first == second && binary.second == first);
+    };
+
+    std::unordered_set<uint32_t> proven_amounts;
+    for (const auto& value_shuffle : shuffles) {
+        const uint32_t source_value = value_shuffle.second.value;
+        if (!load_pointers.contains(source_value)) continue;
+        const auto source_lane = selects.find(value_shuffle.second.lane);
+        if (source_lane == selects.end()) continue;
+        const auto source_subtract = isubs.find(source_lane->second.yes);
+        const auto in_bounds = greater_equals.find(source_lane->second.condition);
+        if (source_subtract == isubs.end() || in_bounds == greater_equals.end() ||
+            source_lane->second.no != source_subtract->second.first ||
+            source_subtract->second.second != in_bounds->second.second)
+            continue;
+        const uint32_t lane = source_subtract->second.first;
+        const uint32_t amount_id = source_subtract->second.second;
+        const auto amount = constants.find(amount_id);
+        if (amount == constants.end() ||
+            (amount->second != 1 && amount->second != 2 &&
+             amount->second != 4 && amount->second != 8))
+            continue;
+        const auto row_lane = bitwise_ands.find(in_bounds->second.first);
+        uint32_t row_lane_source = 0;
+        if (row_lane == bitwise_ands.end() ||
+            !literal_other(row_lane->second, 15, &row_lane_source) ||
+            row_lane_source != lane)
+            continue;
+
+        uint32_t destination_active = 0, source_active = 0;
+        for (const auto& active_shuffle : shuffles) {
+            if (active_shuffle.second.lane != value_shuffle.second.lane) continue;
+            const auto active_encoding = selects.find(active_shuffle.second.value);
+            if (active_encoding == selects.end() ||
+                !load_pointers.contains(active_encoding->second.condition))
+                continue;
+            const auto one = constants.find(active_encoding->second.yes);
+            const auto zero = constants.find(active_encoding->second.no);
+            if (one == constants.end() || one->second != 1 ||
+                zero == constants.end() || zero->second != 0)
+                continue;
+            for (const auto& comparison : not_equals) {
+                uint32_t compared = 0;
+                if (literal_other(comparison.second, 0, &compared) &&
+                    compared == active_shuffle.first) {
+                    destination_active = active_encoding->second.condition;
+                    source_active = comparison.first;
+                    break;
+                }
+            }
+            if (source_active) break;
+        }
+        if (!destination_active || !source_active) continue;
+
+        uint32_t valid_source = 0;
+        for (const auto& logical_and : logical_ands) {
+            if (exact_and(logical_and.second, source_lane->second.condition, source_active)) {
+                valid_source = logical_and.first;
+                break;
+            }
+        }
+        if (!valid_source) continue;
+        uint32_t shifted_or_old = 0;
+        for (const auto& selected : selects) {
+            if (selected.second.condition == valid_source &&
+                selected.second.yes == value_shuffle.first &&
+                selected.second.no == source_value) {
+                shifted_or_old = selected.first;
+                break;
+            }
+        }
+        if (!shifted_or_old) continue;
+        uint32_t add_result = 0;
+        for (const auto& add : iadds) {
+            if (exact_and(add.second, source_value, shifted_or_old)) {
+                add_result = add.first;
+                break;
+            }
+        }
+        if (!add_result) continue;
+        uint32_t write = 0;
+        for (const auto& logical_and : logical_ands) {
+            if (exact_and(logical_and.second, destination_active, valid_source)) {
+                write = logical_and.first;
+                break;
+            }
+        }
+        if (!write) continue;
+        for (const auto& selected : selects) {
+            if (selected.second.condition != write || selected.second.yes != add_result ||
+                selected.second.no != source_value)
+                continue;
+            const uint32_t pointer = load_pointers.at(source_value);
+            if (std::any_of(stores.begin(), stores.end(), [&](const auto& store) {
+                    return store[0] == pointer && store[1] == selected.first;
+                })) {
+                proven_amounts.insert(amount->second);
+                break;
+            }
+        }
+    }
+    return proven_amounts == std::unordered_set<uint32_t>({1, 2, 4, 8});
+}
+
+// Prove the exact GTA V identity-QUAD_PERM lowering with ROW_MASK=0xa. The selected rows must
+// integer-add two distinct persistent VGPRs, while the other rows keep the old destination. This
+// traces the emitted values to their persistent store so mutations of the production row selector,
+// add operands, or BC0 fallback cannot be hidden by unrelated SPIR-V instructions.
+bool compute_dpp_add_partial_rows_updates_dispatch_vgpr(
+    const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
+                       OpIAdd = 128, OpLogicalAnd = 167, OpSelect = 169,
+                       OpINotEqual = 171, OpShiftRightLogical = 194,
+                       OpShiftLeftLogical = 196, OpBitwiseAnd = 199;
+    struct Binary { uint32_t first = 0, second = 0; };
+    struct Select { uint32_t condition = 0, yes = 0, no = 0; };
+    std::unordered_map<uint32_t, uint32_t> constants, load_pointers;
+    std::unordered_map<uint32_t, Binary> iadds, logical_ands, not_equals,
+                                                shift_rights, shift_lefts, bitwise_ands;
+    std::unordered_map<uint32_t, Select> selects;
+    std::vector<std::array<uint32_t, 2>> stores;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4)
+            constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpLoad && wc == 4)
+            load_pointers[spv[i + 2]] = spv[i + 3];
+        else if (op == OpStore && wc == 3)
+            stores.push_back({spv[i + 1], spv[i + 2]});
+        else if (op == OpIAdd && wc == 5)
+            iadds[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpLogicalAnd && wc == 5)
+            logical_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpINotEqual && wc == 5)
+            not_equals[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftRightLogical && wc == 5)
+            shift_rights[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpShiftLeftLogical && wc == 5)
+            shift_lefts[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpBitwiseAnd && wc == 5)
+            bitwise_ands[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpSelect && wc == 6)
+            selects[spv[i + 2]] = {spv[i + 3], spv[i + 4], spv[i + 5]};
+        i += wc;
+    }
+
+    auto literal_other = [&](const Binary& binary, uint32_t literal,
+                             uint32_t* other) {
+        const auto first = constants.find(binary.first);
+        const auto second = constants.find(binary.second);
+        if (first != constants.end() && first->second == literal) {
+            if (other) *other = binary.second;
+            return true;
+        }
+        if (second != constants.end() && second->second == literal) {
+            if (other) *other = binary.first;
+            return true;
+        }
+        return false;
+    };
+
+    for (const auto& shift : shift_rights) {
+        const auto four = constants.find(shift.second.second);
+        if (four == constants.end() || four->second != 4) continue;
+        const auto lane_mask = bitwise_ands.find(shift.second.first);
+        if (lane_mask == bitwise_ands.end() ||
+            !literal_other(lane_mask->second, 63, nullptr))
+            continue;
+
+        uint32_t row_bit = 0;
+        for (const auto& left : shift_lefts) {
+            const auto one = constants.find(left.second.first);
+            if (one != constants.end() && one->second == 1 &&
+                left.second.second == shift.first) {
+                row_bit = left.first;
+                break;
+            }
+        }
+        if (!row_bit) continue;
+
+        uint32_t masked_rows = 0;
+        for (const auto& masked : bitwise_ands) {
+            uint32_t other = 0;
+            if (literal_other(masked.second, 0xa, &other) && other == row_bit) {
+                masked_rows = masked.first;
+                break;
+            }
+        }
+        if (!masked_rows) continue;
+
+        uint32_t row_selected = 0;
+        for (const auto& comparison : not_equals) {
+            uint32_t other = 0;
+            if (literal_other(comparison.second, 0, &other) && other == masked_rows) {
+                row_selected = comparison.first;
+                break;
+            }
+        }
+        if (!row_selected) continue;
+
+        std::unordered_set<uint32_t> row_guarded{row_selected};
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& logical_and : logical_ands) {
+                if ((row_guarded.contains(logical_and.second.first) ||
+                     row_guarded.contains(logical_and.second.second)) &&
+                    row_guarded.insert(logical_and.first).second)
+                    changed = true;
+            }
+        }
+
+        for (const auto& selected : selects) {
+            if (!row_guarded.contains(selected.second.condition)) continue;
+            const auto add = iadds.find(selected.second.yes);
+            if (add == iadds.end() || selected.second.no != add->second.first) continue;
+            const auto old_load = load_pointers.find(add->second.first);
+            const auto addend_load = load_pointers.find(add->second.second);
+            if (old_load == load_pointers.end() || addend_load == load_pointers.end() ||
+                old_load->second == addend_load->second)
+                continue;
+            if (std::any_of(stores.begin(), stores.end(), [&](const auto& store) {
+                    return store[0] == old_load->second && store[1] == selected.first;
+                }))
+                return true;
+        }
+    }
+    return false;
 }
 
 // Trace IMAGE_GET_LOD all the way from two known VGPR bit patterns to the fragment output. This is
@@ -1107,6 +1767,71 @@ int main() {
     }
     printf("  [ok]   full Wave32 scalar VCC_LO write feeds its implicit mask consumer\n");
 
+    // GTA V's exact PC1309/PC1311 producer-consumer packets occupy one dispatcher case, matching the
+    // production basic block. PC1310 stays between them. The crossing tail forces the arbitrary-CFG
+    // switch, so its discovery/dataflow scan must advertise the scalar cselect's new mask lifetime
+    // before that case is emitted; this does not claim a cross-case producer/consumer transfer.
+    const uint32_t wave32_compute_scalar_cselect_cfg[] = {
+        0xbe8403ffu, 0x80000009u,            // pc0: s_mov_b32 s4, lane-bit mask
+        0xbf060000u,                         // pc2: SCC=1
+        0x7e020287u,                         // pc3: v_mov_b32 v1, 7
+        0x856a8004u,                         // pc4: exact s_cselect_b32 vcc_lo,s4,0
+        0x061212f2u,                         // pc5: exact intervening GTA V vector packet
+        0x02020290u,                         // pc6: exact implicit VCC consumer
+        0x7da40100u,                         // pc7: CMPX changes EXEC only
+        0xbf880003u,                         // pc8: execz -> pc12
+        0x7d840100u,                         // pc9: fresh VCC mask in one arm
+        0x02020100u,                         // pc10: consume the arm-local mask
+        0xbf880002u,                         // pc11: execz -> pc14 (crossing region)
+        0xbf060000u,                         // pc12: scalar compare at rejoin
+        0xbf850001u,                         // pc13: third branch -> pc15
+        0x7e040280u,                         // pc14: no mask read before termination
+        0xbf810000u,
+    };
+    const auto scalar_cselect_cfg_spv = recompile_compute(
+        wave32_compute_scalar_cselect_cfg,
+        std::size(wave32_compute_scalar_cselect_cfg), nullptr,
+        wave32_compute_config);
+    if (scalar_cselect_cfg_spv.empty() || !has_opcode(scalar_cselect_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(scalar_cselect_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(scalar_cselect_cfg_spv)) {
+        printf("  [FAIL] Wave32 CFG did not discover GTA V's scalar-cselect VCC lifetime\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG discovers and emits GTA V's scalar-cselect VCC lifetime\n");
+
+    // The scalar-data bridge is deliberately compute-only. In a Wave32 graphics shader, the exact
+    // packet remains an ordinary scalar write to physical VCC_LO and therefore invalidates an older
+    // predicate lifetime. The crossing tail routes this through the graphics dispatcher too: if
+    // either its static inventory/dataflow or record_scalar_write applies the compute-only bridge to
+    // graphics, the stale all-true compare reaches PC6 and this shader is incorrectly accepted.
+    const uint32_t wave32_fragment_scalar_cselect_data_cfg[] = {
+        0x7e000280u,                         // pc0: v_mov_b32 v0, 0
+        0x7d840000u,                         // pc1: all-true VCC predicate
+        0xbe840381u,                         // pc2: s_mov_b32 s4, 1 (ordinary scalar data)
+        0xbf060000u,                         // pc3: SCC=1
+        0x856a8004u,                         // pc4: exact scalar cselect to VCC_LO
+        0x061212f2u,                         // pc5: exact intervening GTA V packet
+        0x02020290u,                         // pc6: stale implicit VCC read must reject
+        0x7da40100u,                         // pc7: crossing CFG tail begins
+        0xbf880003u,                         // pc8: execz -> pc12
+        0x7d840100u,                         // pc9: fresh VCC mask in one arm
+        0x02020100u,                         // pc10: consume the arm-local mask
+        0xbf880002u,                         // pc11: execz -> pc14
+        0xbf060000u,                         // pc12: scalar compare at rejoin
+        0xbf850001u,                         // pc13: third branch -> pc15
+        0x7e040280u,                         // pc14: no mask read before export
+        0xf800000fu, 0x03020100u,            // pc15: export MRT0
+        0xbf810000u,
+    };
+    if (!recompile_fragment_wave32_for_test(
+            wave32_fragment_scalar_cselect_data_cfg,
+            std::size(wave32_fragment_scalar_cselect_data_cfg)).empty()) {
+        printf("  [FAIL] graphics CFG retained compute-only scalar-cselect VCC semantics\n");
+        return 1;
+    }
+    printf("  [ok]   scalar-cselect VCC bridge remains compute-only in graphics CFGs\n");
+
     // Astro's larger world-map sibling keeps an ordinary scalar in VCC_HI while an implicit VOPC
     // compare replaces the complete Wave32 predicate in VCC_LO. The unused high word must retain
     // its data lifetime; the same sequence is intentionally invalid in Wave64, where VCC_HI is the
@@ -1155,6 +1880,45 @@ int main() {
     }
     printf("  [ok]   implicit VOPC preserves VCC_HI scalar data only in Wave32\n");
 
+    // GTA V's Wave64 compute kernel 0x205b5e8600 negates the current EXEC mask as a scalar integer
+    // pair. The subtraction words below are its exact pc1310/1312 packets: subtract EXEC_LO from
+    // zero, then subtract EXEC_HI and the low-word borrow from zero. An exact 64-lane subgroup can
+    // materialise each EXEC half with subgroupBallot; a portable or mismatched subgroup must keep
+    // rejecting rather than silently treating the architectural mask as zero.
+    const uint32_t gta_wave64_exec_integer_negate[] = {
+        0xbefe04c1u,                         // establish a complete live EXEC mask
+        0x80907e80u,                         // pc1310: s_sub_u32 s16, 0, exec_lo
+        0x82917f80u,                         // pc1312: s_subb_u32 s17, 0, exec_hi
+        0x7e040210u,                         // v_mov_b32 v2, s16 (keep the result live)
+        0x7e060211u,                         // v_mov_b32 v3, s17
+        0xbf810000u,
+    };
+    ComputeShaderConfig gta_wave64_exec_config = wave64_compute_config;
+    const std::vector<uint32_t> gta_wave64_exec_spv = recompile_compute(
+        gta_wave64_exec_integer_negate, std::size(gta_wave64_exec_integer_negate), nullptr,
+        gta_wave64_exec_config);
+    if (gta_wave64_exec_spv.empty() || !has_opcode(gta_wave64_exec_spv, 339)) {
+        printf("  [FAIL] GTA Wave64 EXEC integer negation did not materialise the mask via subgroupBallot\n");
+        return 1;
+    }
+    ComputeShaderConfig gta_portable_exec_config = gta_wave64_exec_config;
+    gta_portable_exec_config.native_subgroup_size = 0;
+    if (!recompile_compute(gta_wave64_exec_integer_negate,
+                           std::size(gta_wave64_exec_integer_negate), nullptr,
+                           gta_portable_exec_config).empty()) {
+        printf("  [FAIL] portable GTA EXEC integer negation compiled without an exact subgroup\n");
+        return 1;
+    }
+    ComputeShaderConfig gta_mismatched_exec_config = gta_wave64_exec_config;
+    gta_mismatched_exec_config.native_subgroup_size = 32;
+    if (!recompile_compute(gta_wave64_exec_integer_negate,
+                           std::size(gta_wave64_exec_integer_negate), nullptr,
+                           gta_mismatched_exec_config).empty()) {
+        printf("  [FAIL] GTA EXEC integer negation compiled for a mismatched subgroup\n");
+        return 1;
+    }
+    printf("  [ok]   GTA Wave64 EXEC integer negation requires and uses an exact-wave ballot\n");
+
     // Astro's exact PC458 packet explicitly selects physical VCC_HI in Wave32. A typed B32 mask in
     // that word must drive the select independently of VCC_LO; absent or path-dependent HI mask
     // lifetimes must remain fail-visible instead of falling back to the implicit VCC predicate.
@@ -1199,6 +1963,110 @@ int main() {
         return 1;
     }
     printf("  [ok]   explicit Wave32 VCC_HI cndmask requires its own unambiguous mask\n");
+
+    // GTA V's live Wave32 kernel reaches the exact v_add_co_u32 packet below after joining a path
+    // where s0 is a VOPC mask with one where it is scalar data. The instruction has no carry-in:
+    // dword1's zero SRC2 field is reserved/non-operand bits, not an architectural read of s0. It
+    // replaces that ambiguous lifetime with a fresh carry in s0, which the exact later _co_ci_
+    // packet legitimately consumes. The irreducible tail forces the same portable CFG dispatcher
+    // that diagnosed the production kernel at this site.
+    const uint32_t wave32_compute_vop3b_two_source_join[] = {
+        0x7d8a06f9u, 0x06868080u,            // pc0: exact VOPC SDWA packet -> s0 mask
+        0xbf060000u,                         // pc2: scalar branch condition
+        0xbf840001u,                         // pc3: one edge retains the s0 mask
+        0xbe800380u,                         // pc4: other edge replaces s0 with scalar data
+        0xd70f0016u, 0x00021f1bu,            // pc5: exact v_add_co_u32 v22,s0,v27,v15
+        0xd5286a17u, 0x00024080u,            // pc7: exact v_add_co_ci_u32 consumes s0
+        0x7e040280u,                         // pc9: irreducible crossing-CFG tail
+        0x7c020300u,                         // pc10: v_cmp_lt_u32_e32 vcc, v0, v1
+        0xbf860001u,                         // pc11: s_cbranch_vccz -> pc13
+        0x7e040281u,                         // pc12: v_mov_b32_e32 v2, 1
+        0x7d840100u,                         // pc13: v_cmp_eq_u32_e32 vcc, v0, v0
+        0xbf870001u,                         // pc14: s_cbranch_vccnz -> pc16
+        0xbf82fffdu,                         // pc15: s_branch -> pc13
+        0x7e040d02u,                         // pc16: v_mov_b32_e32 v2, v2
+        0xbf810000u,
+    };
+    ComputeShaderConfig wave32_vop3b_two_source_config;
+    wave32_vop3b_two_source_config.wave_size = 32;
+    wave32_vop3b_two_source_config.local_x = 64;
+    wave32_vop3b_two_source_config.native_subgroup_size = 0;
+    const auto vop3b_two_source_join_spv = recompile_compute(
+        wave32_compute_vop3b_two_source_join,
+        std::size(wave32_compute_vop3b_two_source_join), nullptr,
+        wave32_vop3b_two_source_config);
+    if (vop3b_two_source_join_spv.empty() || !has_opcode(vop3b_two_source_join_spv, 251) ||
+        !type_result_ids_are_nonzero(vop3b_two_source_join_spv, nullptr) ||
+        !phi_ids_are_nonzero(vop3b_two_source_join_spv)) {
+        printf("  [FAIL] Wave32 CFG treated two-source VOP3B carry output as reading SRC2\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG admits exact two-source VOP3B carry packet at an s0 join\n");
+
+    // GTA V's rejected Wave32 compute siblings produce a fresh VCC_LO carry at PC79 with the
+    // no-carry-in VOP3B family, then consume it at PC83 through implicit VCC. A later crossing CFG
+    // forces the portable arbitrary-CFG dispatcher, which must carry that one-word mask lifetime
+    // through its production dataflow instead of classifying the VOP3B SDST as a two-word mask.
+    // A second fresh carry targets ordinary s4 and narrows/restores EXEC through the explicit B32
+    // saveexec domain before another implicit consumer. That operation pins the emitter's runtime
+    // `sreg_bool_b32` state: merely updating static dispatcher provenance or the legacy `rs.vcc`
+    // shortcut cannot pass it.
+    const uint32_t wave32_compute_fresh_carry_cfg[] = {
+        0x7d840000u,                         // pc0: one incoming VCC mask lifetime
+        0xbf060000u,                         // pc1: scalar branch condition
+        0xbf840001u,                         // pc2: one edge skips the scalar-data lifetime
+        0xbeea0385u,                         // pc3: other edge recycles vcc_lo as scalar data
+        0x7e0202c1u,                         // pc4: v_mov_b32_e32 v1, -1
+        0xd70f6a02u, 0x00020300u,            // pc5: v_add_co_u32 v2,vcc_lo,v0,v1
+        0x50060080u,                         // pc7: v_add_co_ci_u32 v3,vcc_lo,0,v0,vcc_lo
+        0xd70f0402u, 0x00020300u,            // pc8: fresh carry -> ordinary s4 B32 mask
+        0xbe863c04u,                         // pc10: s_and_saveexec_b32 s6, s4
+        0xbefe0306u,                         // pc11: s_mov_b32 exec_lo, s6 (restore)
+        0xbeea0304u,                         // pc12: s_mov_b32 vcc_lo, s4 (explicit mask copy)
+        0x50060080u,                         // pc13: consume the copied mask through implicit VCC
+        0x7e040280u,                         // pc14: v_mov_b32_e32 v2, 0
+        0x7c020300u,                         // pc15: v_cmp_lt_u32_e32 vcc, v0, v1
+        0xbf860001u,                         // pc16: s_cbranch_vccz -> pc18
+        0x7e040281u,                         // pc17: v_mov_b32_e32 v2, 1
+        0x7d840100u,                         // pc18: v_cmp_eq_u32_e32 vcc, v0, v0
+        0xbf870001u,                         // pc19: s_cbranch_vccnz -> pc21
+        0xbf82fffdu,                         // pc20: s_branch -> pc18
+        0x7e040d02u,                         // pc21: v_mov_b32_e32 v2, v2
+        0xbf810000u,
+    };
+    ComputeShaderConfig wave32_carry_cfg_config;
+    wave32_carry_cfg_config.wave_size = 32;
+    wave32_carry_cfg_config.local_x = 64;
+    wave32_carry_cfg_config.native_subgroup_size = 0;
+    const auto fresh_carry_cfg_spv = recompile_compute(
+        wave32_compute_fresh_carry_cfg, std::size(wave32_compute_fresh_carry_cfg), nullptr,
+        wave32_carry_cfg_config);
+    if (fresh_carry_cfg_spv.empty() || !has_opcode(fresh_carry_cfg_spv, 251) ||
+        !type_result_ids_are_nonzero(fresh_carry_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(fresh_carry_cfg_spv)) {
+        printf("  [FAIL] Wave32 CFG lost a fresh VOP3B carry before its implicit VCC consumer\n");
+        return 1;
+    }
+    std::vector<uint32_t> fresh_carry_wrong_sdst(
+        std::begin(wave32_compute_fresh_carry_cfg),
+        std::end(wave32_compute_fresh_carry_cfg));
+    fresh_carry_wrong_sdst[5] = 0xd70f0402u; // same producer writes s4, not consumed VCC_LO
+    if (!recompile_compute(fresh_carry_wrong_sdst.data(), fresh_carry_wrong_sdst.size(), nullptr,
+                           wave32_carry_cfg_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted an implicit VCC consumer without its carry producer\n");
+        return 1;
+    }
+    std::vector<uint32_t> fresh_carry_tracked_wrong_sdst(
+        std::begin(wave32_compute_fresh_carry_cfg),
+        std::end(wave32_compute_fresh_carry_cfg));
+    fresh_carry_tracked_wrong_sdst[8] = 0xd70f0602u; // producer writes s6; copy still reads s4
+    if (!recompile_compute(fresh_carry_tracked_wrong_sdst.data(),
+                           fresh_carry_tracked_wrong_sdst.size(), nullptr,
+                           wave32_carry_cfg_config).empty()) {
+        printf("  [FAIL] Wave32 CFG accepted an explicit B32 copy from the wrong carry SDST\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 CFG tracks fresh VOP3B carry output at its exact SDST\n");
 
     // Exact control/data lifetime from Astro Bot's world-map phase, reduced only to its register-
     // independent instructions: a scalar-data VCC_LO lifetime feeds CMPX (which changes EXEC but
@@ -1469,6 +2337,87 @@ int main() {
     portable_wave64_compute_config.local_x = 128;
     portable_wave64_compute_config.wave_size = 64;
 
+    // GTA V's two live compute failures use this exact in-place V_ADD_NC_U32 DPP row ladder. Two
+    // alternate copies let separate guest waves park at different static events, while the appended
+    // nested/backward CFG forces the portable dispatcher. The host-independent lowering must use
+    // workgroup scratch rather than assuming a Wave64-capable host subgroup.
+    std::vector<uint32_t> gta_compute_dpp_add_cfg = {
+        0x7e280281u,                         // pc0:  v_mov_b32 v20,1
+        0x7d840100u,                         // pc1:  v_cmp_eq_u32 vcc,v0,v0
+        0xbf860009u,                         // pc2:  alternate ladder -> pc12
+        0x4a2828fau, 0xff011114u,            // pc3:  event 1 row_shr:1
+        0x4a2828fau, 0xff011214u,            // pc5:  event 2 row_shr:2
+        0x4a2828fau, 0xff011414u,            // pc7:  event 3 row_shr:4
+        0x4a2828fau, 0xff011814u,            // pc9:  event 4 row_shr:8
+        0xbf820008u,                         // pc11: join -> pc20
+        0x4a2828fau, 0xff011114u,            // pc12: event 5 row_shr:1
+        0x4a2828fau, 0xff011214u,            // pc14: event 6 row_shr:2
+        0x4a2828fau, 0xff011414u,            // pc16: event 7 row_shr:4
+        0x4a2828fau, 0xff011814u,            // pc18: event 8 row_shr:8
+        // Reduced nested/backward compute CFG from the existing dispatcher coverage fixture.
+        0xbe800380u, 0x7e000280u, 0x7e020300u,
+        0xd7610013u, 0x00014a7eu, 0xd7610013u, 0x0001507fu,
+        0xd760000eu, 0x00014b13u, 0xd760000fu, 0x00015113u, 0xbefe040eu,
+        0xe00c2000u, 0x80020400u, 0x7db900f9u, 0x86050007u,
+        0x7d020200u, 0xbf860006u, 0xbf0a8204u, 0x360000fdu, 0xbf840001u,
+        0x81008100u, 0x81008100u, 0xbf82fff4u, 0xbf810000u,
+    };
+    ShaderResourceTable gta_compute_dpp_table;
+    ShaderResource gta_compute_dpp_vb{};
+    gta_compute_dpp_vb.cls = ResourceClass::VertexBuffer;
+    gta_compute_dpp_vb.binding = 3;
+    gta_compute_dpp_vb.sgpr_base = 8;
+    gta_compute_dpp_vb.stride = 16;
+    gta_compute_dpp_vb.format = DataFormat::Float32;
+    gta_compute_dpp_vb.num_components = 4;
+    gta_compute_dpp_table.resources.push_back(gta_compute_dpp_vb);
+    const auto gta_compute_dpp_spv = recompile_compute(
+        gta_compute_dpp_add_cfg.data(), gta_compute_dpp_add_cfg.size(),
+        &gta_compute_dpp_table, portable_wave64_compute_config);
+    if (gta_compute_dpp_spv.empty() || !has_opcode(gta_compute_dpp_spv, 251) ||
+        !compute_dpp_add_row_shr_updates_dispatch_vgpr(gta_compute_dpp_spv, 128, 20) ||
+        !type_result_ids_are_nonzero(gta_compute_dpp_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_compute_dpp_spv)) {
+        printf("  [FAIL] portable Wave64 CFG did not event-isolate GTA V DPP add ladders\n");
+        return 1;
+    }
+
+    ComputeShaderConfig native_gta_compute_dpp_config = portable_wave64_compute_config;
+    native_gta_compute_dpp_config.local_x = 64;
+    native_gta_compute_dpp_config.native_subgroup_size = 64;
+    const auto native_gta_compute_dpp_spv = recompile_compute(
+        gta_compute_dpp_add_cfg.data(), gta_compute_dpp_add_cfg.size(),
+        &gta_compute_dpp_table, native_gta_compute_dpp_config);
+    if (native_gta_compute_dpp_spv.empty() ||
+        !has_opcode(native_gta_compute_dpp_spv, 345) ||
+        !compute_dpp_add_native_row_shr_updates_dispatch_vgpr(
+            native_gta_compute_dpp_spv) ||
+        !type_result_ids_are_nonzero(native_gta_compute_dpp_spv, nullptr) ||
+        !phi_ids_are_nonzero(native_gta_compute_dpp_spv)) {
+        printf("  [FAIL] native Wave64 CFG rejected GTA V DPP add ladders\n");
+        return 1;
+    }
+
+    std::vector<uint32_t> gta_compute_dpp_distinct_source = gta_compute_dpp_add_cfg;
+    std::vector<uint32_t> gta_compute_dpp_bound_ctrl = gta_compute_dpp_add_cfg;
+    for (size_t word : {4u, 6u, 8u, 10u, 13u, 15u, 17u, 19u}) {
+        gta_compute_dpp_distinct_source[word] =
+            (gta_compute_dpp_distinct_source[word] & ~0xffu) | 0x15u; // SRC0=v21
+        gta_compute_dpp_bound_ctrl[word] |= 1u << 19u;
+    }
+    if (!recompile_compute(gta_compute_dpp_distinct_source.data(),
+                           gta_compute_dpp_distinct_source.size(),
+                           &gta_compute_dpp_table,
+                           portable_wave64_compute_config).empty() ||
+        !recompile_compute(gta_compute_dpp_bound_ctrl.data(),
+                           gta_compute_dpp_bound_ctrl.size(),
+                           &gta_compute_dpp_table,
+                           portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] GTA V DPP add contract admitted distinct-source or BC1 mutations\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V compute DPP add ladders preserve row direction, events, and BC0 VDST\n");
+
     // Syberia source 87 is a real 960x544 dispatch whose only generic-coverage rejects are eight
     // v_max3_f16 instructions. Keep the first exact low/high pair: OPSEL chooses different source
     // halves for each result and the second instruction writes the high destination half. The decode
@@ -1539,6 +2488,106 @@ int main() {
         printf("  [FAIL] live B64 mask SCC did not reach its crossing dispatcher branch\n");
         return 1;
     }
+
+    // GTA V's compute culling kernels execute this exact in-place V_FFBH_U32 e32 packet inside
+    // crossing control flow. Replace the SCC-preserving VALU in the proven Wave64 dispatcher
+    // fixture, retaining every branch offset, and require the real FindUMsb lowering to be present.
+    std::vector<uint32_t> gta_compute_ffbh_cfg(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    gta_compute_ffbh_cfg[5] = 0x7e087304u; // exact live v_ffbh_u32_e32 v4,v4
+    const auto gta_compute_ffbh_cfg_spv = recompile_compute(
+        gta_compute_ffbh_cfg.data(), gta_compute_ffbh_cfg.size(), nullptr,
+        portable_wave64_compute_config);
+    if (gta_compute_ffbh_cfg_spv.empty() ||
+        !has_opcode(gta_compute_ffbh_cfg_spv, 251) || // arbitrary CFG dispatcher
+        !has_glsl_ext_inst(gta_compute_ffbh_cfg_spv, 75) || // FindUMsb
+        !type_result_ids_are_nonzero(gta_compute_ffbh_cfg_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_compute_ffbh_cfg_spv)) {
+        printf("  [FAIL] GTA V v_ffbh_u32 did not lower inside crossing Wave64 compute CFG\n");
+        return 1;
+    }
+
+    // SDWA source NEG is deliberately outside this plain-e32 admission. Without the gate the
+    // generic VOP1 prologue would negate in the f32 domain before the integer FFBH operation.
+    const uint32_t ffbh_sdwa_neg[] = {
+        0x7e0872f9u, 0x00160604u,             // v_ffbh_u32_sdwa v4,v4 dst:dword src:dword neg
+        0xbf810000u,
+    };
+    if (!recompile_compute(ffbh_sdwa_neg, std::size(ffbh_sdwa_neg), nullptr,
+                           portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] v_ffbh_u32 admitted unsupported SDWA source NEG\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V v_ffbh_u32 lowers in crossing Wave64 CFG; SDWA NEG stays rejected\n");
+
+    // GTA V exec_cs_413d1bf00 stops at pc458 on this exact packet. Require the production words,
+    // the two-source decode, and the portable integer-domain lowering. GLSL.std.450 Ldexp (53) is
+    // deliberately forbidden here because its overflow/large-exponent result is undefined; the
+    // FindUMsb used to normalize a nonzero subnormal input is guarded inside the builder helper.
+    const uint32_t gta_ldexp_f32[] = {
+        0xd7620000u, 0x0002030du,             // v_ldexp_f32 v0,v13,v1
+        0xbf810000u,
+    };
+    const auto gta_ldexp_f32_spv = recompile_valu(
+        gta_ldexp_f32, std::size(gta_ldexp_f32), 14, 0);
+    if (gta_ldexp_f32_spv.empty() || has_glsl_ext_inst(gta_ldexp_f32_spv, 53) ||
+        !has_glsl_ext_inst(gta_ldexp_f32_spv, 75) ||
+        !has_signed_i32_type(gta_ldexp_f32_spv) ||
+        !type_result_ids_are_nonzero(gta_ldexp_f32_spv, nullptr)) {
+        printf("  [FAIL] GTA V v_ldexp_f32 did not emit its defined integer-domain SPIR-V\n");
+        return 1;
+    }
+    // Same-site modifier mutations remain outside this bounded admission. These exact bits exercise
+    // each generic VOP3 modifier field; accepting one would mean the opcode case silently lost it.
+    const uint32_t ldexp_abs0[]  = {0xd7620100u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_abs1[]  = {0xd7620200u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_abs2[]  = {0xd7620400u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_neg0[]  = {0xd7620000u, 0x2002030du, 0xbf810000u};
+    const uint32_t ldexp_neg1[]  = {0xd7620000u, 0x4002030du, 0xbf810000u};
+    const uint32_t ldexp_neg2[]  = {0xd7620000u, 0x8002030du, 0xbf810000u};
+    const uint32_t ldexp_clamp[] = {0xd7628000u, 0x0002030du, 0xbf810000u};
+    const uint32_t ldexp_omod[]  = {0xd7620000u, 0x0802030du, 0xbf810000u};
+    if (!recompile_valu(ldexp_abs0, std::size(ldexp_abs0), 14, 0).empty() ||
+        !recompile_valu(ldexp_abs1, std::size(ldexp_abs1), 14, 0).empty() ||
+        !recompile_valu(ldexp_abs2, std::size(ldexp_abs2), 14, 0).empty() ||
+        !recompile_valu(ldexp_neg0, std::size(ldexp_neg0), 14, 0).empty() ||
+        !recompile_valu(ldexp_neg1, std::size(ldexp_neg1), 14, 0).empty() ||
+        !recompile_valu(ldexp_neg2, std::size(ldexp_neg2), 14, 0).empty() ||
+        !recompile_valu(ldexp_clamp, std::size(ldexp_clamp), 14, 0).empty() ||
+        !recompile_valu(ldexp_omod, std::size(ldexp_omod), 14, 0).empty()) {
+        printf("  [FAIL] v_ldexp_f32 admitted an unsupported VOP3 modifier mutation\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V v_ldexp_f32 emits defined SPIR-V; modifier mutations reject\n");
+
+    // GTA V follows its row reduction with this identity QUAD_PERM and partial ROW_MASK. Prefix the
+    // exact packet to the crossing CFG above so it reaches the dispatcher lowering used by the live
+    // shader. Rows 1/3 add distinct v19, rows 0/2 keep the old in-place v20 because BC is zero.
+    std::vector<uint32_t> gta_compute_dpp_partial_rows = {
+        0x7e280300u,                         // pc0: v_mov_b32 v20,v0
+        0x7e260301u,                         // pc1: v_mov_b32 v19,v1
+        0x4a2826fau, 0xaf00e414u,            // pc2: exact live identity DPP add, ROW_MASK=0xa
+    };
+    gta_compute_dpp_partial_rows.insert(
+        gta_compute_dpp_partial_rows.end(),
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    gta_compute_dpp_partial_rows.back() = 0x7e000314u; // expose v20 through v0
+    gta_compute_dpp_partial_rows.push_back(0xbf810000u);
+    const auto gta_compute_dpp_partial_rows_spv = recompile_compute(
+        gta_compute_dpp_partial_rows.data(), gta_compute_dpp_partial_rows.size(), nullptr,
+        portable_wave64_compute_config);
+    if (gta_compute_dpp_partial_rows_spv.empty() ||
+        !has_opcode(gta_compute_dpp_partial_rows_spv, 251) ||
+        !compute_dpp_add_partial_rows_updates_dispatch_vgpr(
+            gta_compute_dpp_partial_rows_spv) ||
+        !type_result_ids_are_nonzero(gta_compute_dpp_partial_rows_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_compute_dpp_partial_rows_spv)) {
+        printf("  [FAIL] GTA V partial-row DPP add did not preserve masked dispatcher rows\n");
+        return 1;
+    }
+    printf("  [ok]   GTA V partial-row DPP add selects rows 1/3 and preserves BC0 VDST\n");
 
     // A later SOPC owns SCC, so the old mask producer must not be selected speculatively. The
     // crossing graph remains valid and branches on the ordinary scalar comparison.
@@ -3377,6 +4426,137 @@ int main() {
     }
     printf("  [ok]   compute-shell image_sample lowers to OpImageSampleExplicitLod (LOD 0)\n");
 
+    // GTA V gameplay's exact single-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. The resource
+    // marker is the independent materialization proof; removing it, changing the descriptor to DCC,
+    // or changing the storage classification must reject instead of silently treating mip as zero.
+    constexpr uint32_t OpImageFetch = 95, OpImageWrite = 99;
+    const uint32_t gta_load_mip_2d[] = {
+        0x7e040207u,                         // v_mov_b32 v2, s7 (production fold proves zero)
+        0xf0043f08u, 0x00050000u,            // IMAGE_LOAD_MIP xyzw 2D, T# s[20:27]
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_mip_2d;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Uint32; texture.num_components = 1;
+      texture.binding = 4; texture.fetch_pc = 1; texture.img_dim = 1;
+      texture.width = 4; texture.height = 4; texture.depth = 1; texture.size = 64;
+      texture.proven_zero_mip = true; rt_zero_mip_2d.resources.push_back(texture); }
+    const std::vector<uint32_t> gta_load_mip_spv = recompile_valu(
+        gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0, &rt_zero_mip_2d);
+    if (gta_load_mip_spv.empty() || !has_opcode(gta_load_mip_spv, OpImageFetch)) {
+        printf("  [FAIL] proven GTA V IMAGE_LOAD_MIP 2D did not lower to OpImageFetch\n");
+        return 1;
+    }
+    ShaderResourceTable unproven_load_mip = rt_zero_mip_2d;
+    unproven_load_mip.resources[0].proven_zero_mip = false;
+    ShaderResourceTable compressed_load_mip = rt_zero_mip_2d;
+    compressed_load_mip.resources[0].compression_enabled = true;
+    ShaderResourceTable multilevel_load_mip = rt_zero_mip_2d;
+    multilevel_load_mip.resources[0].declared_mip_levels = 2;
+    if (!recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &unproven_load_mip).empty() ||
+        !recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &compressed_load_mip).empty() ||
+        !recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &multilevel_load_mip).empty()) {
+        printf("  [FAIL] IMAGE_LOAD_MIP accepted an unproven, DCC, or multilevel resource\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_LOAD_MIP 2D requires the exact one-level uncompressed proof\n");
+
+    const uint32_t gta_load_mip_2da[] = {
+        0x7e060206u,                         // v_mov_b32 v3, s6; v2 remains the slice
+        0xf0043128u, 0x00050000u,            // IMAGE_LOAD_MIP 2D_ARRAY
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_mip_2da = rt_zero_mip_2d;
+    rt_zero_mip_2da.resources[0].img_dim = 5;
+    rt_zero_mip_2da.resources[0].depth = 2;
+    rt_zero_mip_2da.resources[0].size = 128;
+    const std::vector<uint32_t> gta_load_mip_array_spv = recompile_valu(
+        gta_load_mip_2da, std::size(gta_load_mip_2da), 1, 0, &rt_zero_mip_2da);
+    const DescriptorValidationReport gta_load_mip_array_report =
+        validate_spirv_descriptor_interface(
+            gta_load_mip_array_spv, &rt_zero_mip_2da, 0, SpirvShaderStage::Compute);
+    const SpirvDescriptorBinding* gta_load_mip_array_descriptor = nullptr;
+    for (const auto& descriptor : gta_load_mip_array_report.descriptors)
+        if (descriptor.binding == 4u) gta_load_mip_array_descriptor = &descriptor;
+    if (gta_load_mip_array_spv.empty() || !has_opcode(gta_load_mip_array_spv, OpImageFetch) ||
+        !gta_load_mip_array_descriptor || !gta_load_mip_array_descriptor->image_arrayed) {
+        printf("  [FAIL] IMAGE_LOAD_MIP 2D_ARRAY dropped its slice/view contract\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_LOAD_MIP 2D_ARRAY preserves its slice in an arrayed OpImageFetch\n");
+
+    const uint32_t gta_store_mip_2d[] = {
+        0x7e0a0206u,                         // v_mov_b32 v5, s6 (production fold proves zero)
+        0xf024310au, 0x00030004u, 0x00000503u,
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_store_mip;
+    { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+      image.format = DataFormat::Uint32; image.num_components = 1;
+      image.binding = 4; image.fetch_pc = 1; image.img_dim = 1;
+      image.width = 4; image.height = 4; image.depth = 1; image.size = 64;
+      image.proven_zero_mip = true; rt_zero_store_mip.resources.push_back(image); }
+    const std::vector<uint32_t> gta_store_mip_spv = recompile_valu(
+        gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0, &rt_zero_store_mip);
+    ShaderResourceTable misclassified_store_mip = rt_zero_store_mip;
+    misclassified_store_mip.resources[0].cls = ResourceClass::Texture;
+    ShaderResourceTable unproven_store_mip = rt_zero_store_mip;
+    unproven_store_mip.resources[0].proven_zero_mip = false;
+    std::array<uint32_t, std::size(gta_store_mip_2d)> changed_store_packet{};
+    std::copy(std::begin(gta_store_mip_2d), std::end(gta_store_mip_2d),
+              changed_store_packet.begin());
+    changed_store_packet[1] &= ~0x2000u;     // same instruction loses GLC: no longer audited shape
+    if (gta_store_mip_spv.empty() || !has_opcode(gta_store_mip_spv, OpImageWrite) ||
+        !recompile_valu(gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0,
+                        &misclassified_store_mip).empty() ||
+        !recompile_valu(gta_store_mip_2d, std::size(gta_store_mip_2d), 1, 0,
+                        &unproven_store_mip).empty() ||
+        !recompile_valu(changed_store_packet.data(), changed_store_packet.size(), 1, 0,
+                        &rt_zero_store_mip).empty()) {
+        printf("  [FAIL] IMAGE_STORE_MIP lowering/classification/packet gate drifted\n");
+        return 1;
+    }
+    printf("  [ok]   IMAGE_STORE_MIP requires storage classification and its exact proven packet\n");
+
+    const uint32_t gta_store_mip_xyzw_2d[] = {
+        0x7e0c0206u,                         // v_mov_b32 v6, s6
+        0xf0243f0au, 0x00030005u, 0x00000604u, // live pc17: v[0:3], (v5,v4), mip v6
+        0xbf810000u,
+    };
+    ShaderResourceTable rt_zero_store_mip_xyzw = rt_zero_store_mip;
+    rt_zero_store_mip_xyzw.resources[0].format = DataFormat::Uint8;
+    rt_zero_store_mip_xyzw.resources[0].num_components = 4;
+    const std::vector<uint32_t> gta_store_mip_xyzw_spv = recompile_valu(
+        gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+        &rt_zero_store_mip_xyzw);
+    ShaderResourceTable wrong_format_store_mip = rt_zero_store_mip_xyzw;
+    wrong_format_store_mip.resources[0].format = DataFormat::Uint32;
+    ShaderResourceTable compressed_store_mip = rt_zero_store_mip_xyzw;
+    compressed_store_mip.resources[0].compression_enabled = true;
+    ShaderResourceTable multilevel_store_mip = rt_zero_store_mip_xyzw;
+    multilevel_store_mip.resources[0].declared_mip_levels = 2;
+    std::array<uint32_t, std::size(gta_store_mip_xyzw_2d)> partial_store_packet{};
+    std::copy(std::begin(gta_store_mip_xyzw_2d), std::end(gta_store_mip_xyzw_2d),
+              partial_store_packet.begin());
+    partial_store_packet[1] = (partial_store_packet[1] & ~0xf00u) | 0x300u;
+    if (gta_store_mip_xyzw_spv.empty() ||
+        !has_opcode(gta_store_mip_xyzw_spv, OpImageWrite) ||
+        !recompile_valu(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+                        &wrong_format_store_mip).empty() ||
+        !recompile_valu(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+                        &compressed_store_mip).empty() ||
+        !recompile_valu(gta_store_mip_xyzw_2d, std::size(gta_store_mip_xyzw_2d), 1, 0,
+                        &multilevel_store_mip).empty() ||
+        !recompile_valu(partial_store_packet.data(), partial_store_packet.size(), 1, 0,
+                        &rt_zero_store_mip_xyzw).empty()) {
+        printf("  [FAIL] live dmask-xyzw IMAGE_STORE_MIP widened past its exact format/safety gate\n");
+        return 1;
+    }
+    printf("  [ok]   live dmask-xyzw IMAGE_STORE_MIP keeps exact format/DCC/mip/dmask gates\n");
+
     // Vertex shell: image_sample then export the result as the position.
     const uint32_t vs_sample[] = { 0xf0800f08u, 0x00820000u, 0xf80008cfu, 0x03020100u, 0xbf810000u };
     std::vector<uint32_t> vsspv = recompile_vertex(vs_sample, sizeof(vs_sample)/sizeof(vs_sample[0]), &rt_tex);
@@ -3726,48 +4906,73 @@ int main() {
     }
     printf("  [ok]   compute atomic-buffer view rejects compressed and mip-tail images\n");
 
-    // Astro Bot's world-map traversal kernel uses the RTIP 1.1 BVH instruction with eleven NSA
-    // address operands. It is lowered to ordinary SSBO loads and scalar ALU, so this remains usable
-    // on Vulkan devices without a ray-query feature. Keep the gate exact: accepting a nearby MIMG
-    // flag combination would silently assign the wrong hardware intersection contract.
-    const uint32_t cs_bvh_intersect[] = {
-        0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
+    // GTA V's program 0x205b5e8600 uses the supported RTIP 1.1 BVH instruction at exact pc 1476
+    // with eleven NSA address operands and a 64-byte descriptor. It is lowered to ordinary SSBO
+    // loads and scalar ALU, so this remains usable on Vulkan devices without a ray-query feature.
+    // Keep the gate exact: accepting a nearby MIMG flag combination would silently assign the wrong
+    // hardware intersection contract.
+    constexpr uint32_t gta_bvh_pc = 1476u;
+    std::vector<uint32_t> cs_bvh_intersect(gta_bvh_pc, 0xbf800000u); // s_nop 0
+    const uint32_t gta_bvh_packet[] = {
+        0xf1989f07u, 0x00060202u, 0x28292c23u, 0x22262725u, 0x00002a24u,
         0xbf810000u,
     };
-    uint32_t bvh_node_words[32]{};
+    cs_bvh_intersect.insert(cs_bvh_intersect.end(), std::begin(gta_bvh_packet),
+                            std::end(gta_bvh_packet));
+    uint32_t bvh_node_words[16]{};
     ShaderResourceTable rt_bvh;
     { ShaderResource bvh{}; bvh.cls = ResourceClass::ConstantBuffer;
       bvh.format = DataFormat::Uint32; bvh.num_components = 1;
-      bvh.binding = 4; bvh.size = sizeof(bvh_node_words); bvh.fetch_pc = 0;
+      bvh.binding = 4; bvh.size = sizeof(bvh_node_words); bvh.fetch_pc = gta_bvh_pc;
       bvh.host_data = reinterpret_cast<uint8_t*>(bvh_node_words);
       bvh.host_data_size = sizeof(bvh_node_words); rt_bvh.resources.push_back(bvh); }
     ComputeShaderConfig bvh_config;
     bvh_config.local_x = 1;
     const std::vector<uint32_t> bvh_spv = recompile_compute(
-        cs_bvh_intersect, std::size(cs_bvh_intersect), &rt_bvh, bvh_config);
+        cs_bvh_intersect.data(), cs_bvh_intersect.size(), &rt_bvh, bvh_config);
     const DescriptorValidationReport bvh_report = validate_spirv_descriptor_interface(
         bvh_spv, &rt_bvh, 0, SpirvShaderStage::Compute, false);
     if (bvh_spv.empty() || !bvh_report.ok() || bvh_report.descriptors.size() != 1 ||
         bvh_report.descriptors[0].kind != SpirvDescriptorKind::StorageBuffer ||
         !has_opcode(bvh_spv, 61u) || !has_opcode(bvh_spv, 129u) ||
         !has_opcode(bvh_spv, 133u) || !has_opcode(bvh_spv, 169u)) {
-        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY lacks its SSBO/ALU lowering\n");
+        printf("  [FAIL] GTA's 64-byte IMAGE_BVH_INTERSECT_RAY lacks its SSBO/ALU lowering\n");
         return 1;
     }
-    if (!recompile_compute(cs_bvh_intersect, std::size(cs_bvh_intersect),
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
                            nullptr, bvh_config).empty()) {
         printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY was accepted without its BVH bytes\n");
         return 1;
     }
-    uint32_t unsupported_bvh[std::size(cs_bvh_intersect)];
-    std::copy(std::begin(cs_bvh_intersect), std::end(cs_bvh_intersect), unsupported_bvh);
-    unsupported_bvh[0] &= ~(1u << 15); // R128=0 has a different destination contract.
-    if (!recompile_compute(unsupported_bvh, std::size(unsupported_bvh),
+    std::vector<uint32_t> unsupported_bvh = cs_bvh_intersect;
+    unsupported_bvh[gta_bvh_pc] &= ~(1u << 15); // R128=0 has a different destination contract.
+    if (!recompile_compute(unsupported_bvh.data(), unsupported_bvh.size(),
                            &rt_bvh, bvh_config).empty()) {
         printf("  [FAIL] unverified IMAGE_BVH_INTERSECT_RAY flags were accepted\n");
         return 1;
     }
-    printf("  [ok]   Astro IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
+    ShaderResourceTable short_bvh = rt_bvh;
+    short_bvh.resources[0].size = 60u;
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
+                           &short_bvh, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a sub-64-byte BVH\n");
+        return 1;
+    }
+    ShaderResourceTable misaligned_bvh = rt_bvh;
+    misaligned_bvh.resources[0].size = 66u;
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
+                           &misaligned_bvh, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a non-dword-aligned BVH\n");
+        return 1;
+    }
+    ShaderResourceTable wrong_class_bvh = rt_bvh;
+    wrong_class_bvh.resources[0].cls = ResourceClass::VertexBuffer;
+    if (!recompile_compute(cs_bvh_intersect.data(), cs_bvh_intersect.size(),
+                           &wrong_class_bvh, bvh_config).empty()) {
+        printf("  [FAIL] IMAGE_BVH_INTERSECT_RAY accepted a non-constant-buffer resource\n");
+        return 1;
+    }
+    printf("  [ok]   GTA's exact-pc 64-byte IMAGE_BVH_INTERSECT_RAY lowers through a bounded BVH SSBO\n");
 
     // Astro Bot's visibility kernel sanitizes a generated coordinate with an explicit-SDST
     // v_cmp_class_f32 SDWA (mask 3 = sNaN|qNaN), followed by v_cndmask reading s[8:9]. Rejecting
