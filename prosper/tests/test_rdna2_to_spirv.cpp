@@ -1286,6 +1286,44 @@ int main() {
     CHECK(has_spirv_local_size(native_spv17d, 64, 1, 1),
           "multidimensional guest wave flattens Vulkan LocalSize X for full subgroups");
 
+    // Kernel 17d0: GTA V's pc160..184 region is a bottom-tested EXEC loop whose body contains an
+    // ordinary nested EXEC loop. The old detector required the execz header form, discarded every
+    // loop when it saw the bottom `s_cbranch_execnz`, then misread the inner back-edge as a backward
+    // else. Keep a workgroup barrier immediately AFTER the outer loop: it makes the generic CFG
+    // dispatcher unavailable, while every invocation has reconverged and may legally reach it.
+    // The inner loop executes once, clears EXEC, and exits on its second header check; the outer
+    // body restores EXEC, writes 7, clears EXEC again, and falls through its bottom test.
+    const uint32_t code17d0[] = {
+        0xbe82047eu,              // s_mov_b64 s[2:3],exec
+        0x7e040280u,              // v_mov_b32 v2,0
+        0x7e060280u,              // OUTER: v_mov_b32 v3,0
+        0xbf880003u,              // INNER: s_cbranch_execz pc7
+        0x7e040281u,              // v_mov_b32 v2,1
+        0xbefe0480u,              // s_mov_b64 exec,0
+        0xbf82fffcu,              // s_branch pc3
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0x7e040287u,              // v_mov_b32 v2,7
+        0xbefe0480u,              // s_mov_b64 exec,0 (bottom condition writer)
+        0xbf89fff7u,              // s_cbranch_execnz pc2
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbf8a0000u,              // s_barrier after reconvergence
+        0x7e040d02u,              // v_cvt_f32_u32 v2,v2
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d0 = recompile_valu(
+        code17d0, std::size(code17d0), 1, /*out_vgpr*/2);
+    CHECK(!spv17d0.empty(),
+          "GTA bottom-tested EXEC loop nests structurally before a top-level barrier");
+    const std::vector<float> got17d0 = spv17d0.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(spv17d0, std::vector<float>(N, 0.0f), N, N);
+    CHECK(got17d0 == std::vector<float>(N, 7.0f),
+          "bottom-tested EXEC loop preserves its exit-iteration value and reconverges");
+    std::vector<uint32_t> stale17d0(std::begin(code17d0), std::end(code17d0));
+    stale17d0[9] = 0x7e060280u; // v_mov_b32 v3,0: no fresh EXEC condition at the latch
+    CHECK(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2).empty(),
+          "bottom-tested EXEC loop rejects a stale entry mask at its back-edge");
+
     // Kernel 17d1: Astro's Wave32 BVH traversal turns a VOPC predicate into the first matching
     // lane with s_ff1_i32_b32, then immediately uses VCC_LO as ordinary scalar data. The first
     // subgroup has one match at lane 5; the second subgroup is empty and must return -1. Store the
