@@ -5749,6 +5749,17 @@ bool is_scalar_cselect_b32_to_vcc_lo(const Rdna2Inst& in) {
         in.src[1].kind == OperandKind::InlineInt && in.src[1].value == 0;
 }
 
+// GTA V's Wave32 terrain kernel deliberately uses VCC_HI as an ordinary scalar word. Keep the
+// syntactic exception in one place so the dispatcher and emitter cannot disagree about whether the
+// physical register starts a mask or scalar-data lifetime. Callers must separately prove an exact
+// native Wave32 subgroup before materializing EXEC_LO as a complete scalar dword.
+bool is_gtav_wave32_vcchi_scalar_packet(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0e &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value == 107 &&
+        in.src[0].kind == OperandKind::Special && in.src[0].value == 126 &&
+        in.src[1].kind == OperandKind::Literal && in.literal == 0x0fffffffu;
+}
+
 bool allows_compute_scalar_vcc_bridge(const SpirvCompute& b) {
     return b.is_compute && b.allow_b32_masks && b.wave_size == 32;
 }
@@ -7119,6 +7130,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::SOP2: {
+            const bool gtav_wave32_vcchi_scalar_packet =
+                allows_compute_scalar_vcc_bridge(b) && b.native_subgroup_size == 32 &&
+                is_gtav_wave32_vcchi_scalar_packet(in);
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
                 in.opcode == 0x0a &&
@@ -7193,6 +7207,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
+                !gtav_wave32_vcchi_scalar_packet &&
                 (in.opcode == 0x0e || in.opcode == 0x10 || in.opcode == 0x12 ||
                  in.opcode == 0x14 || in.opcode == 0x16 || in.opcode == 0x18 ||
                  in.opcode == 0x1a || in.opcode == 0x1c) &&
@@ -7223,6 +7238,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     if (o.kind == OperandKind::InlineInt)
                         return inline_int_mask_bit(b, o.value);
+                    if (o.kind == OperandKind::Literal)
+                        return inline_int_mask_bit(
+                            b, static_cast<int32_t>(in.literal));
                     return 0;
                 };
                 const uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
@@ -7546,14 +7564,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             return false;
                     }
                 };
-                if ((!b.is_fragment && !b.is_compute) ||
+                if ((!b.is_fragment && !b.is_compute) || gtav_wave32_vcchi_scalar_packet ||
                     (has_scalar_data(in.src[0]) && has_scalar_data(in.src[1]))) {
                     // The vertex shell is a complete one-lane virtual wave, so its scalar VCC
                     // dwords are representable: LO starts as {bit0=vcc}, HI as zero, and later B32
-                    // operations may use either as ordinary scratch. Fragment/compute shaders also
-                    // use VCC_LO/HI as ordinary scalar scratch; when BOTH inputs have complete
-                    // scalar-data representations, retain that full dword rather than collapsing it
-                    // into a per-lane mask. The captured Plucky Squire tonemap shader, for example,
+                    // operations may use either as ordinary scratch. In Wave32 compute, VCC_HI is
+                    // entirely outside the architectural mask and is therefore always scalar
+                    // scratch; an exact 32-lane subgroup also lets operand_bits materialize an
+                    // EXEC_LO/VCC_LO source through one complete ballot. Other fragment/compute
+                    // forms retain a full dword only when BOTH inputs already have scalar-data
+                    // representations. The captured Plucky Squire tonemap shader, for example,
                     // computes `s_and_b32 vcc_lo, loop_index, 3` and immediately compares VCC_LO as
                     // a uint. True VOPC/mask inputs have no scalar representation and continue into
                     // the wave-mask path below.
@@ -14070,7 +14090,8 @@ bool emit_cfg_state_machine(
                           b64_masks.contains(source.value)));
                 };
                 auto source_mask = [&](const Operand& source) {
-                    return register_mask(source) || source.kind == OperandKind::InlineInt;
+                    return register_mask(source) || source.kind == OperandKind::InlineInt ||
+                        source.kind == OperandKind::Literal;
                 };
                 if (in.fmt == Rdna2Format::SOP1 &&
                     (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
@@ -14086,6 +14107,9 @@ bool emit_cfg_state_machine(
                                            in.opcode <= 0x1c && (in.opcode & 1u) == 0))) {
                     const bool scalar_vcc_bridge = compute_scalar_vcc_bridge &&
                         is_scalar_cselect_b32_to_vcc_lo(in);
+                    const bool scalar_vcchi_packet = compute_scalar_vcc_bridge &&
+                        b.native_subgroup_size == 32 &&
+                        is_gtav_wave32_vcchi_scalar_packet(in);
                     const bool mask_domain = in.dst.value == 126 || in.src[0].value == 126 ||
                         in.src[1].value == 126 ||
                         (((in.src[0].kind == OperandKind::SGPR ||
@@ -14094,9 +14118,10 @@ bool emit_cfg_state_machine(
                         (((in.src[1].kind == OperandKind::SGPR ||
                            in.src[1].kind == OperandKind::Special) &&
                           masks.contains(in.src[1].value)));
-                    writes_b32_mask = scalar_vcc_bridge ||
-                        (mask_domain && source_mask(in.src[0]) &&
-                         source_mask(in.src[1]) && in.dst.value != 127);
+                    writes_b32_mask = !scalar_vcchi_packet &&
+                        (scalar_vcc_bridge ||
+                         (mask_domain && source_mask(in.src[0]) &&
+                          source_mask(in.src[1]) && in.dst.value != 127));
                 }
 
                 int b32_write_reg = writes_b32_mask ? in.dst.value : -1;
