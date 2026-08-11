@@ -1522,70 +1522,153 @@ int main() {
                                 native_cfg17d).empty(),
           "Wave64 VCC_LO scalar exception rejects packet drift and a live high-half mask");
 
+    ComputeShaderConfig native_linear_cfg17d = native_cfg17d;
+    native_linear_cfg17d.local_x = 64;
+    native_linear_cfg17d.local_y = 1;
+    const std::vector<uint32_t> native_linear_spv17d = recompile_compute(
+        code17d, std::size(code17d), nullptr, native_linear_cfg17d);
+
     // GTA 0x205b5e8600 pc238/242 first defines scalar VCC_HI, then computes scalar VCC_LO from it.
     // The irreducible tail forces a dispatcher reload, so map presence alone cannot make this pass:
     // the Wave64 MUST analysis has to prove the sibling word before rebuilding the complete mask.
     std::vector<uint32_t> code17d1_vcc_scalar_pair = {
-        0xbe8f0380u, 0xbf08800fu,
+        0xbe8f0380u, 0xbf060000u, // s_cmp_eq_u32 s0,s0: select a nonzero high word
         0x856b8081u,              // exact pc238: s_cselect_b32 vcc_hi,1,0
-        0xbf08800fu,              // exact pc240 role: re-arm SCC
+        0xbf060000u,              // pc240 role: re-arm SCC with a representable true value
         0x876a6bfdu,              // exact pc242: s_and_b32 vcc_lo,scc,vcc_hi
-        0x7e02026au,              // scalar-data consumer of the new low word
+        0x7e06026au,              // scalar-data consumer of the new low word
+        0x7e020280u,              // v_mov_b32 v1,0
+        0x7e040281u,              // v_mov_b32 v2,1
+        0x02020501u,              // v_cndmask_b32 v1,v1,v2,vcc: observe rebuilt pair
+        0xe0702000u, 0x80020100u, // store the predicate bit at output[v0]
         0x7d840100u,              // complete VCC replacement
     };
     code17d1_vcc_scalar_pair.insert(
         code17d1_vcc_scalar_pair.end(), std::begin(code17d), std::end(code17d));
     const std::vector<uint32_t> spv17d1_vcc_scalar_pair = recompile_compute(
-        code17d1_vcc_scalar_pair.data(), code17d1_vcc_scalar_pair.size(), nullptr,
-        native_cfg17d);
+        code17d1_vcc_scalar_pair.data(), code17d1_vcc_scalar_pair.size(), &rt17d1,
+        native_linear_cfg17d);
     CHECK(!spv17d1_vcc_scalar_pair.empty(),
           "Wave64 dispatcher rebuilds VCC from a proved complete scalar pair");
+    const bool can_execute_vcc_scalar_pair = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute_vcc_scalar_pair && !spv17d1_vcc_scalar_pair.empty()) {
+        std::vector<uint32_t> got17d1_vcc_scalar_pair;
+        prosper::test::run_compute(
+            spv17d1_vcc_scalar_pair, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0u), &got17d1_vcc_scalar_pair);
+        uint32_t bad17d1_vcc_scalar_pair = 0;
+        for (uint32_t lane = 0;
+             lane < 64 && got17d1_vcc_scalar_pair.size() == 64; ++lane)
+            bad17d1_vcc_scalar_pair +=
+                got17d1_vcc_scalar_pair[lane] != (lane == 0 || lane == 32 ? 1u : 0u);
+        std::printf("  scalar-pair out[0/1/31/32/33]=%u/%u/%u/%u/%u mismatches=%u\n",
+                    got17d1_vcc_scalar_pair.size() == 64 ? got17d1_vcc_scalar_pair[0] : ~0u,
+                    got17d1_vcc_scalar_pair.size() == 64 ? got17d1_vcc_scalar_pair[1] : ~0u,
+                    got17d1_vcc_scalar_pair.size() == 64 ? got17d1_vcc_scalar_pair[31] : ~0u,
+                    got17d1_vcc_scalar_pair.size() == 64 ? got17d1_vcc_scalar_pair[32] : ~0u,
+                    got17d1_vcc_scalar_pair.size() == 64 ? got17d1_vcc_scalar_pair[33] : ~0u,
+                    bad17d1_vcc_scalar_pair);
+        CHECK(got17d1_vcc_scalar_pair.size() == 64 &&
+                  bad17d1_vcc_scalar_pair == 0,
+              "Wave64 scalar VCC pair reconstructs the exact low/high predicate bits");
+    } else {
+        std::printf("  [skip] scalar VCC pair execution: host subgroup is %u or lacks vote\n",
+                    exec_ballot_subgroup.size);
+    }
     std::vector<uint32_t> code17d1_vcc_scalar_pair_mutated =
         code17d1_vcc_scalar_pair;
     code17d1_vcc_scalar_pair_mutated[4] =
-        0x877e6bfdu;              // same-site mutation: destination VCC_LO -> EXEC_LO
+        0x876a6b6au;              // same-site mutation: scalar sources -> VCC mask halves
     CHECK(recompile_compute(code17d1_vcc_scalar_pair_mutated.data(),
-                            code17d1_vcc_scalar_pair_mutated.size(), nullptr,
-                            native_cfg17d).empty(),
-          "Wave64 complete-pair bridge rejects a same-site destination mutation");
+                            code17d1_vcc_scalar_pair_mutated.size(), &rt17d1,
+                            native_linear_cfg17d).empty(),
+          "Wave64 complete-pair bridge rejects a same-site scalar-domain mutation");
 
     // GTA 0x205b658800 spills EXEC_LO/HI through v31 lanes 5/6, then restores each as ordinary
     // scalar data for V_AND_B32. The dispatcher Bool slots retain the mask value but not its physical
     // half, so a separate MUST proof has to select ballot .x/.y at the exact readlane PCs.
     std::vector<uint32_t> code17d1_mask_half_spill = {
+        0x7d8800a1u,              // VCC/EXEC contain lanes 0..32: low=ffffffff, high=1
+        0xbefe046au,              // s_mov_b64 exec,vcc
         0xd761001fu, 0x00010c7fu, // exact pc95:  v_writelane v31,exec_hi,6
         0xd761001fu, 0x00010a7eu, // exact pc106: v_writelane v31,exec_lo,5
+        0xbefe04c1u,              // restore EXEC before scalar consumers and stores
+        0x7e3002c1u,              // v_mov_b32 v24,-1
+        0x7e3202c1u,              // v_mov_b32 v25,-1
         0xd7600006u, 0x00010b1fu, // exact pc261: v_readlane s6,v31,5
         0x36023006u,              // exact pc263: v_and_b32 v1,s6,v24
         0xd7600006u, 0x00010d1fu, // exact pc264: v_readlane s6,v31,6
         0x36043206u,              // exact pc266: v_and_b32 v2,s6,v25
+        0x4a0600c0u,              // v_add_nc_u32 v3,64,v0
+        0xe0702000u, 0x80020100u, // store low half at output[v0]
+        0xe0702000u, 0x80020203u, // store high half at output[v3]
     };
     code17d1_mask_half_spill.insert(
         code17d1_mask_half_spill.end(), std::begin(code17d), std::end(code17d));
     const std::vector<uint32_t> spv17d1_mask_half_spill = recompile_compute(
-        code17d1_mask_half_spill.data(), code17d1_mask_half_spill.size(), nullptr,
-        native_cfg17d);
+        code17d1_mask_half_spill.data(), code17d1_mask_half_spill.size(), &rt17d1,
+        native_linear_cfg17d);
     CHECK(!spv17d1_mask_half_spill.empty() &&
               count_spirv_opcode(spv17d1_mask_half_spill, 339) ==
-                  count_spirv_opcode(native_spv17d, 339) + 2 &&
+                  count_spirv_opcode(native_linear_spv17d, 339) + 2 &&
               count_spirv_composite_extract_index(spv17d1_mask_half_spill, 0) ==
-                  count_spirv_composite_extract_index(native_spv17d, 0) + 1 &&
+                  count_spirv_composite_extract_index(native_linear_spv17d, 0) + 1 &&
               count_spirv_composite_extract_index(spv17d1_mask_half_spill, 1) ==
-                  count_spirv_composite_extract_index(native_spv17d, 1) + 1,
+                  count_spirv_composite_extract_index(native_linear_spv17d, 1) + 1,
           "Wave64 readlane spills materialize exact low and high ballot dwords");
-    ComputeShaderConfig portable_cfg17d1_mask_half = native_cfg17d;
+    const bool can_execute_mask_half_spill = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute_mask_half_spill && !spv17d1_mask_half_spill.empty()) {
+        std::vector<uint32_t> got17d1_mask_half_spill;
+        prosper::test::run_compute(
+            spv17d1_mask_half_spill, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(128, 0u), &got17d1_mask_half_spill);
+        uint32_t bad17d1_mask_half_spill = 0;
+        for (uint32_t lane = 0;
+             lane < 64 && got17d1_mask_half_spill.size() == 128; ++lane) {
+            bad17d1_mask_half_spill +=
+                got17d1_mask_half_spill[lane] != 0xffffffffu;
+            bad17d1_mask_half_spill += got17d1_mask_half_spill[lane + 64] != 1u;
+        }
+        std::printf("  mask-half low[0/32/63]=%08x/%08x/%08x high[0/32/63]=%08x/%08x/%08x mismatches=%u\n",
+                    got17d1_mask_half_spill.size() == 128 ? got17d1_mask_half_spill[0] : ~0u,
+                    got17d1_mask_half_spill.size() == 128 ? got17d1_mask_half_spill[32] : ~0u,
+                    got17d1_mask_half_spill.size() == 128 ? got17d1_mask_half_spill[63] : ~0u,
+                    got17d1_mask_half_spill.size() == 128 ? got17d1_mask_half_spill[64] : ~0u,
+                    got17d1_mask_half_spill.size() == 128 ? got17d1_mask_half_spill[96] : ~0u,
+                    got17d1_mask_half_spill.size() == 128 ? got17d1_mask_half_spill[127] : ~0u,
+                    bad17d1_mask_half_spill);
+        CHECK(got17d1_mask_half_spill.size() == 128 &&
+                  bad17d1_mask_half_spill == 0,
+              "Wave64 mask spill preserves EXEC_LO=.x and EXEC_HI=.y semantically");
+    } else {
+        std::printf("  [skip] mask-half spill execution: host subgroup is %u or lacks ballot/vote\n",
+                    exec_ballot_subgroup.size);
+    }
+    ComputeShaderConfig portable_cfg17d1_mask_half = native_linear_cfg17d;
     portable_cfg17d1_mask_half.native_subgroup_size = 0;
     std::vector<uint32_t> code17d1_mask_half_spill_mutated =
         code17d1_mask_half_spill;
-    code17d1_mask_half_spill_mutated[5] =
+    code17d1_mask_half_spill_mutated[10] =
         0x0001051fu;              // same-site mutation: read unwritten v31 lane 2
+    std::vector<uint32_t> code17d1_mask_half_vcc_mutated =
+        code17d1_mask_half_spill;
+    code17d1_mask_half_vcc_mutated[5] =
+        0x00010a6au;              // same-site mutation: spill unproved VCC_LO, not EXEC_LO
     CHECK(recompile_compute(code17d1_mask_half_spill.data(),
-                            code17d1_mask_half_spill.size(), nullptr,
+                            code17d1_mask_half_spill.size(), &rt17d1,
                             portable_cfg17d1_mask_half).empty() &&
               recompile_compute(code17d1_mask_half_spill_mutated.data(),
-                                code17d1_mask_half_spill_mutated.size(), nullptr,
-                                native_cfg17d).empty(),
-          "Wave64 mask-half spills reject portable execution and an unwritten-lane mutation");
+                                code17d1_mask_half_spill_mutated.size(), &rt17d1,
+                                native_linear_cfg17d).empty() &&
+              recompile_compute(code17d1_mask_half_vcc_mutated.data(),
+                                code17d1_mask_half_vcc_mutated.size(), &rt17d1,
+                                native_linear_cfg17d).empty(),
+          "Wave64 mask-half spills reject portable, unknown-lane, and unproved-VCC forms");
     ComputeShaderConfig native_cfg17d1;
     native_cfg17d1.local_x = 64;
     native_cfg17d1.wave_size = 32;
