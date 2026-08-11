@@ -262,6 +262,36 @@ int main() {
     CHECK(mz.fmt == Rdna2Format::VOP1 && mz.opcode == 0x01u && !mz.has_modifier &&
           mz.sdwa_src0_sel == 4u && !mz.sdwa_src0_sext,
           "the same encoding without bit 19 decodes as the zero-extending form");
+    // GTA V compute compaction: reverse the selected low word into a full dword. Both retained
+    // kernels use the same WORD_0 + zero-extension shape, differing only in their VGPR number.
+    const uint32_t bfrev6[] = { 0x7e0c70f9u, 0x00040606u };
+    Rdna2Inst br6 = rdna2_decode_one(bfrev6, 2);
+    CHECK(br6.fmt == Rdna2Format::VOP1 && br6.opcode == 0x38u && !br6.has_modifier &&
+          br6.has_sdwa && isV(br6.dst, 6) && isV(br6.src[0], 6) &&
+          br6.sdwa_dst_sel == 6u && br6.sdwa_dst_unused == 0u &&
+          br6.sdwa_src0_sel == 4u,
+          "GTA V v_bfrev_b32_sdwa v6 WORD_0 packet is admitted exactly");
+    const uint32_t bfrev0[] = { 0x7e0070f9u, 0x00040600u };
+    Rdna2Inst br0 = rdna2_decode_one(bfrev0, 2);
+    CHECK(br0.fmt == Rdna2Format::VOP1 && br0.opcode == 0x38u && !br0.has_modifier &&
+          br0.has_sdwa && isV(br0.dst, 0) && isV(br0.src[0], 0) &&
+          br0.sdwa_src0_sel == 4u,
+          "GTA V v_bfrev_b32_sdwa v0 WORD_0 packet is admitted exactly");
+    const uint32_t bfrev_sext[] = { 0x7e0070f9u, 0x000c0600u };
+    const uint32_t bfrev_neg[] = { 0x7e0070f9u, 0x00140600u };
+    const uint32_t bfrev_partial_dst[] = { 0x7e0070f9u, 0x00040400u };
+    const uint32_t bfrev_reserved_high[] = { 0x7e0070f9u, 0x01040600u };
+    const uint32_t bfrev_dword[] = { 0x7e0070f9u, 0x00060600u };
+    const uint32_t bfrev_dword_neg[] = { 0x7e0070f9u, 0x00160600u };
+    const uint32_t bfrev_dword_abs[] = { 0x7e0070f9u, 0x00260600u };
+    CHECK(rdna2_decode_one(bfrev_sext, 2).has_modifier &&
+          rdna2_decode_one(bfrev_neg, 2).has_modifier &&
+          rdna2_decode_one(bfrev_partial_dst, 2).has_modifier &&
+          rdna2_decode_one(bfrev_reserved_high, 2).has_modifier &&
+          rdna2_decode_one(bfrev_dword, 2).has_modifier &&
+          rdna2_decode_one(bfrev_dword_neg, 2).has_modifier &&
+          rdna2_decode_one(bfrev_dword_abs, 2).has_modifier,
+          "v_bfrev_b32 SDWA SEXT, modifiers, reserved fields, DWORD source, and partial dst reject");
     // `v_add_nc_u32_sdwa v4, 8, sext(v5) src0_sel:DWORD src1_sel:WORD_0`: SEXT on the SECOND source
     // only, which is the field the two per-source flags exist to keep apart.
     const uint32_t add_s1_sext[] = { 0x4a080af9u, 0x0c860688u };

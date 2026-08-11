@@ -576,6 +576,58 @@ int main() {
     printf("  kernel15 mismatches=%u (out[1]=0x%08x expect=0x%08x)\n", bad15, got15.size()==N?bits_of(got15[1]):0, exp15[1]);
     CHECK(got15.size()==N && bad15==0, "recompiled kernel 15 (v_bfrev_b32) reverses bits exactly");
 
+    // Kernel 15a: GTA V's exact v0 packet and the complete admitted SDWA byte/word-select family.
+    // SDWA zero-extends the selected field BEFORE BREV, so a selected low word produces reversed
+    // bits in the high destination word and zero in the low word. Exercise all six selectors with
+    // raw bit patterns; this catches both a missing extraction and a wrong byte/word offset.
+    constexpr uint32_t bfrev_sdwa_inputs[] = {
+        0x00000000u, 0x00000001u, 0x80000000u, 0x01234567u,
+        0x89abcdefu, 0xffff0001u, 0x55aa33ccu, 0xffffffffu,
+    };
+    for (uint32_t sel = 0; sel <= 5; ++sel) {
+        const uint32_t code15a[] = {
+            0x7e0070f9u, (sel << 16) | 0x00000600u, // v_bfrev_b32_sdwa v0,v0, BYTE_n/WORD_n
+            0xbf810000u,
+        };
+        std::vector<uint32_t> spv15a = recompile_valu(
+            code15a, std::size(code15a), /*num_inputs*/1, /*out_vgpr*/0);
+        CHECK(!spv15a.empty(), "recompiled kernel 15a v_bfrev_b32_sdwa selector -> SPIR-V");
+        std::vector<float> in15a(N);
+        std::vector<uint32_t> exp15a(N);
+        const uint32_t width = sel <= 3 ? 8u : 16u;
+        const uint32_t offset = sel <= 3 ? 8u * sel : 16u * (sel - 4u);
+        const uint32_t mask = width == 8u ? 0xffu : 0xffffu;
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t raw = bfrev_sdwa_inputs[i % std::size(bfrev_sdwa_inputs)];
+            in15a[i] = std::bit_cast<float>(raw);
+            exp15a[i] = bitrev32((raw >> offset) & mask);
+        }
+        std::vector<float> got15a = spv15a.empty() ? std::vector<float>()
+                                                   : prosper::test::run_compute(spv15a, in15a, N, N);
+        uint32_t bad15a = 0;
+        for (uint32_t i = 0; i < N && got15a.size() == N; ++i)
+            if (bits_of(got15a[i]) != exp15a[i]) ++bad15a;
+        printf("  kernel15a selector=%u mismatches=%u\n", sel, bad15a);
+        CHECK(got15a.size() == N && bad15a == 0,
+              "recompiled kernel 15a selects then reverses byte/word bits exactly");
+    }
+    // These nearby encodings are different operations, not permissive aliases for the live shape.
+    const uint32_t code15a_sext[] = { 0x7e0070f9u, 0x000c0600u, 0xbf810000u };
+    const uint32_t code15a_neg[] = { 0x7e0070f9u, 0x00140600u, 0xbf810000u };
+    const uint32_t code15a_partial[] = { 0x7e0070f9u, 0x00040400u, 0xbf810000u };
+    const uint32_t code15a_reserved[] = { 0x7e0070f9u, 0x01040600u, 0xbf810000u };
+    const uint32_t code15a_dword[] = { 0x7e0070f9u, 0x00060600u, 0xbf810000u };
+    const uint32_t code15a_dword_neg[] = { 0x7e0070f9u, 0x00160600u, 0xbf810000u };
+    const uint32_t code15a_dword_abs[] = { 0x7e0070f9u, 0x00260600u, 0xbf810000u };
+    CHECK(recompile_valu(code15a_sext, std::size(code15a_sext), 1, 0).empty() &&
+          recompile_valu(code15a_neg, std::size(code15a_neg), 1, 0).empty() &&
+          recompile_valu(code15a_partial, std::size(code15a_partial), 1, 0).empty() &&
+          recompile_valu(code15a_reserved, std::size(code15a_reserved), 1, 0).empty() &&
+          recompile_valu(code15a_dword, std::size(code15a_dword), 1, 0).empty() &&
+          recompile_valu(code15a_dword_neg, std::size(code15a_dword_neg), 1, 0).empty() &&
+          recompile_valu(code15a_dword_abs, std::size(code15a_dword_abs), 1, 0).empty(),
+          "v_bfrev_b32 SDWA modifier, reserved, DWORD-source, and partial-dst forms reject visibly");
+
     // Kernel 15c: GTA V's exact in-place V_FFBH_U32 e32 packet from its compute culling kernels.
     // The instruction counts zeroes preceding the first set bit from the MSB and returns -1 for
     // zero. Feed the raw u32 bits through the float harness so the result is checked bit-exactly.

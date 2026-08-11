@@ -111,7 +111,8 @@ void decode_operands(Rdna2Inst& i) {
                 // or sext keeps has_modifier and is rejected.
                 i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
                 i.clamp = ((sd >> 13) & 1u) != 0; i.omod = (uint8_t)((sd >> 14) & 3u);
-                if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
+                if (((w >> 9) & 0xFFu) != 0x38u &&
+                    ((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u)) i.has_modifier = false;
                 // WORD-select v_mov_b32_sdwa (#273 — the f16 half-move idiom): dst WORD_0/1 with
                 // UNUSED_PRESERVE, src0 WORD_0/WORD_1/DWORD, no sext/neg/abs/clamp/omod. The
@@ -142,6 +143,25 @@ void decode_operands(Rdna2Inst& i) {
                         i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
                         i.sdwa_src0_sel = (uint8_t)s0sel;
                         i.sdwa_src0_sext = ((sd >> 19) & 1u) != 0;
+                        i.has_modifier = false;
+                    }
+                }
+                // GTA V's compute compaction kernels reverse a selected source word into a full
+                // dword: `v_bfrev_b32_sdwa v6, v6 dst_sel:DWORD dst_unused:UNUSED_PAD
+                // src0_sel:WORD_0` (7e0c70f9 00040606). SDWA selects and zero-extends the word
+                // before BREV, so its bits land in D[31:16] in reversed order. Admit byte/word
+                // selects only for the exact full-dword, zero-extending, unmodified shape; SEXT,
+                // source/output modifiers, partial destinations, and reserved fields remain
+                // fail-visible rather than being interpreted as this narrower operation.
+                else if (((w >> 9) & 0xFFu) == 0x38u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if (dsel == 6u && dun == 0u && s0sel <= 5u &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0] && !(sd & 0xff000000u)) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
                         i.has_modifier = false;
                     }
                 }

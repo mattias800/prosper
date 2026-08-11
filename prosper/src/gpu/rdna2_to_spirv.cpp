@@ -7795,6 +7795,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ? b.bfe_s(a, b.uconst(offset), b.uconst(bits))
                     : b.bfe_u(a, b.uconst(offset), b.uconst(bits));
             }
+            // SDWA BREV selects and zero-extends its byte/word before reversing the resulting
+            // dword. The decoder admits only this unmodified full-destination subset, so neither
+            // sign extension nor destination preservation can reach this path.
+            if (in.opcode == 0x38 && in.has_sdwa && in.sdwa_src0_sel <= 5) {
+                const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
+                const uint32_t offset = in.sdwa_src0_sel <= 3
+                    ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
+                a = b.bfe_u(a, b.uconst(offset), b.uconst(bits));
+            }
             if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
                 // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
                 // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
