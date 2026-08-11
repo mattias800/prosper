@@ -5237,6 +5237,202 @@ int main() {
     printf("  kernel38 mismatches=%u (out[5]=%g expect=10)\n", bad38, got38.size()==N?got38[5]:-1);
     CHECK(got38.size()==N && bad38==0, "recompiled kernel 38 (s_cselect_b64 -> exec mask -> cndmask) computes 10");
 
+    // GTA V compute program 0x413cf9a00 exposes the other S_CSELECT_B64 domain: ordinary scalar
+    // pairs. Pin both selected dwords and both SCC outcomes before exercising its VCC destination.
+    // These kernels use no subgroup operation, so both portable and exact-native compilation must
+    // accept identical semantics; native execution is gated only because the standalone Vulkan
+    // runner cannot request the backend's promised subgroup size.
+    ShaderResourceTable cselect_pair_table;
+    { ShaderResource output{}; output.cls = ResourceClass::ConstantBuffer;
+      output.format = DataFormat::Uint32; output.num_components = 1;
+      output.binding = 3; output.stride = 4; output.sgpr_base = 8;
+      cselect_pair_table.resources.push_back(output); }
+    ComputeShaderConfig cselect_portable_config;
+    cselect_portable_config.local_x = 64;
+    cselect_portable_config.wave_size = 64;
+    ComputeShaderConfig cselect_native_config = cselect_portable_config;
+    cselect_native_config.native_subgroup_size = 64;
+
+    const uint32_t code38_pair_true[] = {
+        0xbe80038bu,              // s_mov_b32 s0,11
+        0xbe81038cu,              // s_mov_b32 s1,12
+        0xbe820395u,              // s_mov_b32 s2,21
+        0xbe830396u,              // s_mov_b32 s3,22
+        0xbe860381u,              // s_mov_b32 s6,1
+        0xbf078006u,              // s_cmp_lg_u32 s6,0 -> SCC=true
+        0x85840200u,              // s_cselect_b64 s[4:5],s[0:1],s[2:3]
+        0x7e020204u,              // v_mov_b32 v1,s4 (selected low consumer)
+        0xe0702000u, 0x80020100u, // output[lane] = selected low
+        0x4a0400c0u,              // v_add_nc_u32 v2,64,v0
+        0x7e020205u,              // v_mov_b32 v1,s5 (selected high consumer)
+        0xe0702000u, 0x80020102u, // output[64+lane] = selected high
+        0xbf810000u,
+    };
+    std::vector<uint32_t> code38_pair_false(
+        std::begin(code38_pair_true), std::end(code38_pair_true));
+    code38_pair_false[4] = 0xbe860380u; // same select, SCC=false
+    auto compile_cselect_pair = [&](const auto& code, const ComputeShaderConfig& config) {
+        return recompile_compute(code.data(), code.size(), &cselect_pair_table, config);
+    };
+    const std::vector<uint32_t> pair_true_words(
+        std::begin(code38_pair_true), std::end(code38_pair_true));
+    const auto pair_true_portable = compile_cselect_pair(pair_true_words, cselect_portable_config);
+    const auto pair_false_portable = compile_cselect_pair(code38_pair_false, cselect_portable_config);
+    const auto pair_true_native = compile_cselect_pair(pair_true_words, cselect_native_config);
+    const auto pair_false_native = compile_cselect_pair(code38_pair_false, cselect_native_config);
+    CHECK(!pair_true_portable.empty() && !pair_false_portable.empty() &&
+              !pair_true_native.empty() && !pair_false_native.empty(),
+          "S_CSELECT_B64 scalar pairs compile in portable/native modes for both SCC outcomes");
+    std::vector<uint32_t> pair_exec_dst = pair_true_words;
+    pair_exec_dst[6] = 0x85fe0200u; // same data pair select into architectural EXEC
+    CHECK(compile_cselect_pair(pair_exec_dst, cselect_portable_config).empty() &&
+              compile_cselect_pair(pair_exec_dst, cselect_native_config).empty(),
+          "S_CSELECT_B64 scalar data rejects an EXEC destination in both modes");
+    auto run_cselect_pair = [&](const std::vector<uint32_t>& module) {
+        std::vector<uint32_t> output;
+        if (module.empty()) return output;
+        prosper::test::run_compute(module, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(128, 0), &output);
+        return output;
+    };
+    const auto pair_true_got = run_cselect_pair(pair_true_portable);
+    const auto pair_false_got = run_cselect_pair(pair_false_portable);
+    uint32_t pair_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && pair_true_got.size() == 128 &&
+         pair_false_got.size() == 128; ++lane) {
+        pair_bad += pair_true_got[lane] != 11u;
+        pair_bad += pair_true_got[64 + lane] != 12u;
+        pair_bad += pair_false_got[lane] != 21u;
+        pair_bad += pair_false_got[64 + lane] != 22u;
+    }
+    CHECK(pair_true_got.size() == 128 && pair_false_got.size() == 128 && pair_bad == 0,
+          "S_CSELECT_B64 selects both scalar dwords for SCC true and false");
+
+    const uint32_t code38_vcc_true[] = {
+        0xbe8003ffu, 0x80000001u, // source0 low: lanes 0 and 31
+        0xbe8103ffu, 0x80000001u, // source0 high: lanes 32 and 63
+        0xbe8203ffu, 0x40000002u, // source1 low: lanes 1 and 30
+        0xbe8303ffu, 0x40000002u, // source1 high: lanes 33 and 62
+        0xbe860381u,              // s_mov_b32 s6,1
+        0xbf078006u,              // s_cmp_lg_u32 s6,0 -> SCC=true
+        0x85ea0200u,              // s_cselect_b64 vcc,s[0:1],s[2:3]
+        0x7e02028bu,              // v_mov_b32 v1,11
+        0x7e040296u,              // v_mov_b32 v2,22
+        0x02020501u,              // v_cndmask_b32 v1,v1,v2,vcc
+        0xe0702000u, 0x80020100u, // output[lane] = selected VCC bit ? 22 : 11
+        0xbf810000u,
+    };
+    std::vector<uint32_t> code38_vcc_false(
+        std::begin(code38_vcc_true), std::end(code38_vcc_true));
+    code38_vcc_false[8] = 0xbe860380u; // same complete pairs, SCC=false
+    const std::vector<uint32_t> vcc_true_words(
+        std::begin(code38_vcc_true), std::end(code38_vcc_true));
+    const auto vcc_true_portable = compile_cselect_pair(vcc_true_words, cselect_portable_config);
+    const auto vcc_false_portable = compile_cselect_pair(code38_vcc_false, cselect_portable_config);
+    const auto vcc_true_native = compile_cselect_pair(vcc_true_words, cselect_native_config);
+    const auto vcc_false_native = compile_cselect_pair(code38_vcc_false, cselect_native_config);
+    CHECK(!vcc_true_portable.empty() && !vcc_false_portable.empty() &&
+              !vcc_true_native.empty() && !vcc_false_native.empty(),
+          "complete scalar-pair selects into VCC compile in portable/native modes");
+    const auto vcc_true_got = run_cselect_pair(vcc_true_portable);
+    const auto vcc_false_got = run_cselect_pair(vcc_false_portable);
+    uint32_t vcc_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && vcc_true_got.size() == 128 &&
+         vcc_false_got.size() == 128; ++lane) {
+        const bool true_bit = lane == 0 || lane == 31 || lane == 32 || lane == 63;
+        const bool false_bit = lane == 1 || lane == 30 || lane == 33 || lane == 62;
+        vcc_bad += vcc_true_got[lane] != (true_bit ? 22u : 11u);
+        vcc_bad += vcc_false_got[lane] != (false_bit ? 22u : 11u);
+    }
+    CHECK(vcc_true_got.size() >= 64 && vcc_false_got.size() >= 64 && vcc_bad == 0,
+          "complete VCC pair select derives the correct predicate bit in both 32-lane halves");
+
+    // Exact GTA V pc57..62 packet. Source0 is a complete pair, while source1 intentionally has
+    // only s16: s17 is neither an entry SGPR nor written by this stream. VCC_HI is dead after pc60,
+    // and pc62 consumes VCC_LO as scalar data. The positive compiles in portable/native modes; a
+    // high-half consumer and a mutation of the production pc60 destination each close the proof.
+    auto gta_cselect_low_only = [](bool scc) {
+        std::vector<uint32_t> code(66, 0xbf800000u); // s_nop 0
+        code[0] = 0x7e040300u;                       // preserve local id: v_mov_b32 v2,v0
+        code[1] = 0xbe8003a1u;                       // s_mov_b32 s0,33
+        code[2] = 0xbe8103acu;                       // s_mov_b32 s1,44
+        code[3] = 0xbe9003b7u;                       // s_mov_b32 s16,55 (no s17 writer)
+        code[4] = scc ? 0xbe840381u : 0xbe840380u;  // seed pc57's SCC outcome
+        code[57] = 0xbf078004u;                      // exact pc57: s_cmp_lg_u32 s4,0
+        code[58] = 0x4a0620f9u;                      // exact pc58 VOP2 SDWA, preserves SCC
+        code[59] = 0x86860681u;
+        code[60] = 0x85ea1000u;                      // exact pc60: s_cselect_b64 vcc,s[0:1],s[16:17]
+        code[61] = 0x7e000210u;                      // exact pc61: v_mov_b32 v0,s16
+        code[62] = 0x7e10026au;                      // exact pc62: v_mov_b32 v8,vcc_lo
+        code[63] = 0xe0702000u;
+        code[64] = 0x80020802u;                      // output[v2] = v8
+        code[65] = 0xbf810000u;
+        return code;
+    };
+    const auto gta_low_true = gta_cselect_low_only(true);
+    const auto gta_low_false = gta_cselect_low_only(false);
+    const auto gta_low_true_portable = compile_cselect_pair(gta_low_true, cselect_portable_config);
+    const auto gta_low_false_portable = compile_cselect_pair(gta_low_false, cselect_portable_config);
+    const auto gta_low_true_native = compile_cselect_pair(gta_low_true, cselect_native_config);
+    const auto gta_low_false_native = compile_cselect_pair(gta_low_false, cselect_native_config);
+    CHECK(!gta_low_true_portable.empty() && !gta_low_false_portable.empty() &&
+              !gta_low_true_native.empty() && !gta_low_false_native.empty(),
+          "exact GTA pc60 low-only pair compiles in portable/native modes for both SCC outcomes");
+    const auto gta_low_true_got = run_cselect_pair(gta_low_true_portable);
+    const auto gta_low_false_got = run_cselect_pair(gta_low_false_portable);
+    uint32_t gta_low_bad = 0;
+    for (uint32_t lane = 0; lane < 64 && gta_low_true_got.size() >= 64 &&
+         gta_low_false_got.size() >= 64; ++lane) {
+        gta_low_bad += gta_low_true_got[lane] != 33u;
+        gta_low_bad += gta_low_false_got[lane] != 55u;
+    }
+    CHECK(gta_low_true_got.size() >= 64 && gta_low_false_got.size() >= 64 &&
+              gta_low_bad == 0,
+          "exact GTA pc60 low-only pair selects VCC_LO for SCC true and false");
+    std::vector<uint32_t> gta_high_live = gta_low_true;
+    gta_high_live[62] = 0x7e10026bu; // v_mov_b32 v8,vcc_hi: high output is now live
+    std::vector<uint32_t> gta_site_mutation = gta_low_true;
+    gta_site_mutation[60] = 0x85861000u; // same pc60 select into ordinary s[6:7]
+    CHECK(compile_cselect_pair(gta_high_live, cselect_portable_config).empty() &&
+              compile_cselect_pair(gta_high_live, cselect_native_config).empty() &&
+              compile_cselect_pair(gta_site_mutation, cselect_portable_config).empty() &&
+              compile_cselect_pair(gta_site_mutation, cselect_native_config).empty(),
+          "GTA low-only admission rejects a live high half and a pc60 destination mutation");
+    const bool can_execute_cselect_native = exec_ballot_subgroup.size == 64 &&
+        (exec_ballot_subgroup.stages & VK_SHADER_STAGE_COMPUTE_BIT);
+    if (can_execute_cselect_native) {
+        const auto pair_true_native_got = run_cselect_pair(pair_true_native);
+        const auto pair_false_native_got = run_cselect_pair(pair_false_native);
+        const auto vcc_true_native_got = run_cselect_pair(vcc_true_native);
+        const auto vcc_false_native_got = run_cselect_pair(vcc_false_native);
+        const auto gta_low_true_native_got = run_cselect_pair(gta_low_true_native);
+        const auto gta_low_false_native_got = run_cselect_pair(gta_low_false_native);
+        uint32_t native_bad = 0;
+        for (uint32_t lane = 0; lane < 64 && pair_true_native_got.size() >= 128 &&
+             pair_false_native_got.size() >= 128 && vcc_true_native_got.size() >= 64 &&
+             vcc_false_native_got.size() >= 64 && gta_low_true_native_got.size() >= 64 &&
+             gta_low_false_native_got.size() >= 64; ++lane) {
+            native_bad += pair_true_native_got[lane] != 11u;
+            native_bad += pair_true_native_got[64 + lane] != 12u;
+            native_bad += pair_false_native_got[lane] != 21u;
+            native_bad += pair_false_native_got[64 + lane] != 22u;
+            const bool true_bit = lane == 0 || lane == 31 || lane == 32 || lane == 63;
+            const bool false_bit = lane == 1 || lane == 30 || lane == 33 || lane == 62;
+            native_bad += vcc_true_native_got[lane] != (true_bit ? 22u : 11u);
+            native_bad += vcc_false_native_got[lane] != (false_bit ? 22u : 11u);
+            native_bad += gta_low_true_native_got[lane] != 33u;
+            native_bad += gta_low_false_native_got[lane] != 55u;
+        }
+        CHECK(pair_true_native_got.size() >= 128 && pair_false_native_got.size() >= 128 &&
+                  vcc_true_native_got.size() >= 64 && vcc_false_native_got.size() >= 64 &&
+                  gta_low_true_native_got.size() >= 64 &&
+                  gta_low_false_native_got.size() >= 64 && native_bad == 0,
+              "native Wave64 executes scalar-pair, VCC-predicate, and GTA low-only selects");
+    } else {
+        std::printf("  [skip] native S_CSELECT_B64 execution: host subgroup is %u\n",
+                    exec_ballot_subgroup.size);
+    }
+
     // Kernel 39: trivial SDWA (all sels = DWORD) with SGPR operands — the form the game uses to give a
     //   VOP2 two scalar sources (e32 can't). s0=100, s1=23; v_add_nc_u32_sdwa v2, s0, s1 (all DWORD) = 123;
     //   v3=(float)123; out = a0 + 123. Verifies the decoder decodes SDWA operands + un-flags the no-op case.
