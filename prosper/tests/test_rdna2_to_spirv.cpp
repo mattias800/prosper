@@ -1291,8 +1291,11 @@ int main() {
     // loop when it saw the bottom `s_cbranch_execnz`, then misread the inner back-edge as a backward
     // else. Keep a workgroup barrier immediately AFTER the outer loop: it makes the generic CFG
     // dispatcher unavailable, while every invocation has reconverged and may legally reach it.
-    // The inner loop executes once, clears EXEC, and exits on its second header check; the outer
-    // body restores EXEC, writes 7, clears EXEC again, and falls through its bottom test.
+    // The two read-only LDS loops after that barrier reproduce the surrounding captured context:
+    // the old all-or-nothing compute guard discarded EVERY recognized loop when it found either
+    // DS_READ_B32, then misclassified the earlier inner back-edge as a backward else. The inner loop
+    // executes once, clears EXEC, and exits on its second header check; the outer body restores EXEC,
+    // writes 7, clears EXEC again, and falls through its bottom test.
     const uint32_t code17d0[] = {
         0xbe82047eu,              // s_mov_b64 s[2:3],exec
         0x7e040280u,              // v_mov_b32 v2,0
@@ -1307,6 +1310,18 @@ int main() {
         0xbf89fff7u,              // s_cbranch_execnz pc2
         0xbefe0402u,              // s_mov_b64 exec,s[2:3]
         0xbf8a0000u,              // s_barrier after reconvergence
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbf880004u,              // READ0: s_cbranch_execz pc19
+        0xd8d80000u, 0x03000000u, // ds_read_b32 v3,v0
+        0xbefe0480u,              // s_mov_b64 exec,0
+        0xbf82fffbu,              // s_branch READ0
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
+        0xbf880004u,              // READ1: s_cbranch_execz pc26
+        0xd8d80000u, 0x04000000u, // ds_read_b32 v4,v0
+        0xbefe0480u,              // s_mov_b64 exec,0
+        0xbf82fffbu,              // s_branch READ1
+        0xbefe0402u,              // s_mov_b64 exec,s[2:3]
         0x7e040d02u,              // v_cvt_f32_u32 v2,v2
         0xbf810000u,
     };
@@ -1319,6 +1334,17 @@ int main() {
         : prosper::test::run_compute(spv17d0, std::vector<float>(N, 0.0f), N, N);
     CHECK(got17d0 == std::vector<float>(N, 7.0f),
           "bottom-tested EXEC loop preserves its exit-iteration value and reconverges");
+    std::vector<uint32_t> late_barrier17d0(std::begin(code17d0), std::end(code17d0));
+    late_barrier17d0[12] = 0xbf800000u; // s_nop 0: reads no longer have a preceding phase boundary
+    late_barrier17d0.insert(late_barrier17d0.end() - 2, 0xbf8a0000u);
+    CHECK(recompile_valu(late_barrier17d0.data(), late_barrier17d0.size(),
+                         1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS reads reject when the proved barrier follows their phase");
+    std::vector<uint32_t> write17d0(std::begin(code17d0), std::end(code17d0));
+    write17d0[15] = 0xd8340000u; // ds_write_b32 v0,v3 in the post-barrier loop
+    write17d0[16] = 0x00000300u;
+    CHECK(recompile_valu(write17d0.data(), write17d0.size(), 1, /*out_vgpr*/2).empty(),
+          "EXEC-loop LDS writes remain rejected even after a proved barrier");
     std::vector<uint32_t> stale17d0(std::begin(code17d0), std::end(code17d0));
     stale17d0[9] = 0x7e060280u; // v_mov_b32 v3,0: no fresh EXEC condition at the latch
     CHECK(recompile_valu(stale17d0.data(), stale17d0.size(), 1, /*out_vgpr*/2).empty(),
