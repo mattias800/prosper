@@ -13,6 +13,7 @@
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
+#include "gta5_compute_cfg_fixture.hpp"
 #include <algorithm>
 #include <bit>
 #include <set>
@@ -1568,8 +1569,10 @@ int main() {
     // GTA V 0x413ce6d00 pc232 selects an inline float bit-pattern into VCC_LO and consumes that
     // ordinary scalar dword through V_ADD3_U32 at pc240. V_ADD3's scalar operands are B32; treating
     // src0 as the low word of a pair falsely makes the untouched VCC_HI lifetime look observable.
-    const uint32_t code17d1_vcc_low_add3[] = {
-        0xbf068008u,                         // SCC = 1
+    std::vector<uint32_t> code17d1_vcc_low_add3 = {
+        0xbe8a0381u,                         // live entry s10=1 fixture
+        0x906a9e0au,                         // exact pc227: lshr vcc_lo,s10,30
+        0xbf066a81u,                         // exact pc230: cmp_eq_u32 1,vcc_lo
         0x856af6f4u,                         // exact pc232: cselect vcc_lo, inline 244, inline 246
         0xbf0bff0au, 0x3fffffffu,            // exact pc233: scalar compare
         0xbe8303ffu, 0x00016204u,            // exact pc235: scalar descriptor word
@@ -1583,41 +1586,128 @@ int main() {
         0x7daa0880u,                         // exact pc277 CMPX writes EXEC, not VCC
         0xb00803fbu,                         // exact pc282: s_movk_i32 s8,1019
         0xbeea047eu,                         // exact pc284 complete VCC replacement
-        0xbf810000u,
     };
-    CHECK(!recompile_compute(code17d1_vcc_low_add3,
-                             std::size(code17d1_vcc_low_add3), nullptr,
+    code17d1_vcc_low_add3.insert(
+        code17d1_vcc_low_add3.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_vcc_low_add3.data(),
+                             code17d1_vcc_low_add3.size(), nullptr,
                              native_cfg17d).empty(),
-          "Wave64 VCC_LO scalar scratch reaches GTA's B32 V_ADD3 consumer");
-    std::vector<uint32_t> code17d1_vcc_low_add3_pair_read(
-        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
-    code17d1_vcc_low_add3_pair_read[9] = 0xd5010004u;
-    code17d1_vcc_low_add3_pair_read[10] = 0x01a9826au; // same site: cndmask reads full VCC pair
+          "Wave64 dispatcher preserves GTA's scalar SCC into the VCC_LO select");
+    std::vector<uint32_t> code17d1_vcc_low_add3_pair_read =
+        code17d1_vcc_low_add3;
+    code17d1_vcc_low_add3_pair_read[11] = 0xd5010004u;
+    code17d1_vcc_low_add3_pair_read[12] = 0x01a9826au; // same site: cndmask reads full VCC pair
     CHECK(recompile_compute(code17d1_vcc_low_add3_pair_read.data(),
                             code17d1_vcc_low_add3_pair_read.size(), nullptr,
                             native_cfg17d).empty(),
           "same-site pair-reading mutation keeps a live VCC_HI fail-visible");
-    std::vector<uint32_t> code17d1_vcc_low_cselect_pair_read(
-        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
-    code17d1_vcc_low_cselect_pair_read[6] = 0x858a6af2u; // same pc237 site: CSELECT_B64
+    std::vector<uint32_t> code17d1_vcc_low_cselect_pair_read =
+        code17d1_vcc_low_add3;
+    code17d1_vcc_low_cselect_pair_read[8] = 0x858a6af2u; // same pc237 site: CSELECT_B64
     CHECK(recompile_compute(code17d1_vcc_low_cselect_pair_read.data(),
                             code17d1_vcc_low_cselect_pair_read.size(), nullptr,
                             native_cfg17d).empty(),
           "same-site B64 CSELECT mutation observes VCC_HI and remains fail-visible");
-    std::vector<uint32_t> code17d1_vcc_low_sopk_write(
-        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
-    code17d1_vcc_low_sopk_write[13] = 0xbbeb0000u; // same opcode: VCC_HI replaces NULL source
+    std::vector<uint32_t> code17d1_vcc_low_sopk_write = code17d1_vcc_low_add3;
+    code17d1_vcc_low_sopk_write[15] = 0xbbeb0000u; // same opcode: VCC_HI replaces NULL source
     CHECK(recompile_compute(code17d1_vcc_low_sopk_write.data(),
                             code17d1_vcc_low_sopk_write.size(), nullptr,
                             native_cfg17d).empty(),
           "same-site non-null WAIT source observes VCC_HI and remains fail-visible");
-    std::vector<uint32_t> code17d1_vcc_low_sopk_rmw(
-        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
-    code17d1_vcc_low_sopk_rmw[15] = 0xb70803fbu; // same pc282 site: s_addk_i32 is RMW
+    std::vector<uint32_t> code17d1_vcc_low_sopk_rmw = code17d1_vcc_low_add3;
+    code17d1_vcc_low_sopk_rmw[17] = 0xb70803fbu; // same pc282 site: s_addk_i32 is RMW
     CHECK(recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
                             code17d1_vcc_low_sopk_rmw.size(), nullptr,
                             native_cfg17d).empty(),
           "same-site SOPK RMW mutation remains conservative in the death proof");
+
+    // The complete captured CFG is essential here. Its pc213 VOPC replaces both physical VCC
+    // words with a wave mask, then pc227 starts a fresh scalar lifetime in VCC_LO only. A stale
+    // scalar-pair fact at the dispatcher boundary makes pc232 incorrectly demand the unavailable
+    // high word even though the exact later walk proves that word stays dead through pc284.
+    ComputeShaderConfig gta_pc232_config;
+    gta_pc232_config.user_sgprs.resize(11);
+    gta_pc232_config.local_x = 64;
+    gta_pc232_config.exact_thread_extent = true;
+    gta_pc232_config.threads_x = 4152;
+    gta_pc232_config.wave_size = 64;
+    gta_pc232_config.native_subgroup_size = 64;
+    gta_pc232_config.tgid_x_en = true;
+    gta_pc232_config.tg_size_en = true;
+    gta_pc232_config.tidig_comp_cnt = 2;
+
+    ShaderResourceTable gta_pc232_table;
+    auto add_gta_pc232_resource = [&](uint32_t binding, uint32_t pc,
+                                      uint32_t size, uint32_t stride) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Uint32;
+        resource.num_components = 1;
+        resource.binding = binding;
+        resource.gpu_addr = 0x100000u + binding * 0x100000u;
+        resource.size = size;
+        resource.stride = stride;
+        resource.fetch_pc = pc;
+        gta_pc232_table.resources.push_back(resource);
+    };
+    auto add_gta_pc232_zero_record = [&](uint32_t binding, uint32_t pc) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Unknown;
+        resource.num_components = 0;
+        resource.binding = binding;
+        resource.fetch_pc = pc;
+        gta_pc232_table.resources.push_back(resource);
+    };
+    add_gta_pc232_resource(2, 4, 124, 0);
+    add_gta_pc232_zero_record(3, 16);
+    add_gta_pc232_resource(4, 29, 116256, 28);
+    add_gta_pc232_resource(5, 31, 116256, 28);
+    add_gta_pc232_resource(6, 49, 116256, 28);
+    add_gta_pc232_zero_record(7, 60);
+    add_gta_pc232_resource(8, 74, 128, 0);
+    add_gta_pc232_zero_record(9, 94);
+    add_gta_pc232_zero_record(10, 98);
+    add_gta_pc232_zero_record(11, 102);
+    add_gta_pc232_zero_record(12, 148);
+    add_gta_pc232_zero_record(13, 151);
+    add_gta_pc232_zero_record(14, 153);
+    add_gta_pc232_zero_record(15, 248);
+    add_gta_pc232_zero_record(16, 264);
+    add_gta_pc232_zero_record(17, 266);
+    add_gta_pc232_resource(18, 269, 33208, 8);
+    add_gta_pc232_zero_record(19, 273);
+    add_gta_pc232_zero_record(20, 279);
+    add_gta_pc232_zero_record(21, 309);
+    add_gta_pc232_zero_record(22, 311);
+    add_gta_pc232_zero_record(23, 313);
+    add_gta_pc232_zero_record(24, 315);
+    add_gta_pc232_resource(25, 318, 33208, 8);
+    add_gta_pc232_zero_record(26, 342);
+
+    const auto& gta_pc232_code = test_fixture::kGta5Pc232Compute;
+    CHECK(!recompile_compute(gta_pc232_code.data(), gta_pc232_code.size(),
+                             &gta_pc232_table, gta_pc232_config).empty(),
+          "full GTA pc232 CFG discards stale scalar-pair facts after VOPC");
+    std::vector<uint32_t> gta_pc232_pair_read(
+        gta_pc232_code.begin(), gta_pc232_code.end());
+    gta_pc232_pair_read[240] = 0xd5010004u;
+    gta_pc232_pair_read[241] = 0x01a9826au; // same pc240 consumer reads the complete VCC pair
+    CHECK(recompile_compute(gta_pc232_pair_read.data(), gta_pc232_pair_read.size(),
+                            &gta_pc232_table, gta_pc232_config).empty(),
+          "full GTA CFG keeps the killed VCC_HI scalar lifetime fail-visible");
+    std::vector<uint32_t> gta_pc232_same_site = gta_pc232_pair_read;
+    gta_pc232_same_site[213] = 0x7daa1a80u; // same pc213 site: CMPX writes EXEC, not VCC
+    CHECK(!recompile_compute(gta_pc232_same_site.data(), gta_pc232_same_site.size(),
+                             &gta_pc232_table, gta_pc232_config).empty(),
+          "same-site pc213 mutation preserves the old complete scalar VCC pair");
+    std::vector<uint32_t> gta_pc232_packet_mutation(
+        gta_pc232_code.begin(), gta_pc232_code.end());
+    gta_pc232_packet_mutation[232] = 0x856a6bf4u; // same pc232 site reads VCC_HI
+    CHECK(recompile_compute(gta_pc232_packet_mutation.data(),
+                            gta_pc232_packet_mutation.size(),
+                            &gta_pc232_table, gta_pc232_config).empty(),
+          "full GTA CFG rejects pc232 packet drift into the killed VCC_HI word");
 
     ComputeShaderConfig native_linear_cfg17d = native_cfg17d;
     native_linear_cfg17d.local_x = 64;
