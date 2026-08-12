@@ -14,6 +14,7 @@
 #include "gpu/bc_decode.hpp"
 #include "gpu/gpu_capture.hpp"
 #include "gpu/gpu_execute.hpp"
+#include "gpu/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/shader_resources.hpp"
 #include "gpu/spirv_builder.hpp"
 #include "gpu/tile.hpp"
@@ -4225,6 +4226,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          return is_nullable_raw_buffer_marker_candidate(resource) &&
                                 !is_proven_null_nullable_raw_buffer(resource);
                      }))) return false;
+    const bool has_cf9200_no_backing = item.resources &&
+        std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+                    is_gta5_cf9200_no_backing_marker_candidate);
+    if (has_cf9200_no_backing &&
+        (!item.gta5_cf9200_no_backing_validated ||
+         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+                     [](const ShaderResource& resource) {
+                         return is_gta5_cf9200_no_backing_marker_candidate(resource) &&
+                                !is_proven_gta5_cf9200_no_backing(resource);
+                     }))) return false;
     double setup_validate_ms = std::chrono::duration<double, std::milli>(
         ComputeClock::now() - setup_validate_start).count();
     double setup_buffers_ms = 0.0;
@@ -4258,7 +4269,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     [](const ShaderResource& resource) {
                         return is_zero_record_raw_buffer(resource) ||
                                is_proven_null_guarded_raw_store(resource) ||
-                               is_proven_null_nullable_raw_buffer(resource);
+                               is_proven_null_nullable_raw_buffer(resource) ||
+                               is_proven_gta5_cf9200_no_backing(resource);
                     });
     if (descriptors.empty() && image_descriptors.empty() && !all_proven_no_backing_noop)
         return false;

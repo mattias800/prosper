@@ -12,6 +12,7 @@
 #include "build_revision.hpp"
 #include "guest_texture_layout.hpp"
 #include "rdna2_decode.hpp"
+#include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
 #include "rdna2_to_spirv.hpp"
@@ -1522,6 +1523,62 @@ bool validate_captured_nullable_output_raw_buffer(
     return true;
 }
 
+bool captured_compute_has_gta5_cf9200_no_backing(
+        const GpuCapturedCompute& compute) {
+    return compute.resources.present &&
+        std::any_of(compute.resources.resources.begin(),
+                    compute.resources.resources.end(),
+                    [](const GpuCapturedResource& captured) {
+                        return is_gta5_cf9200_no_backing_marker_candidate(captured.resource);
+                    });
+}
+
+bool validate_captured_gta5_cf9200_no_backing(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!captured_compute_has_gta5_cf9200_no_backing(compute)) return true;
+    if (!compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size() ||
+        compute.launch.groups_x != 1u || compute.launch.groups_y != 1u ||
+        compute.launch.groups_z != 1u) {
+        error = "GTA root-record marker lacks exact shader or launch provenance";
+        return false;
+    }
+
+    ShaderResourceTable validated_resources;
+    validated_resources.resources.reserve(compute.resources.resources.size());
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        ShaderResource resource = captured.resource;
+        const bool relevant = resource.fetch_pc == kGtaCf9200RootPc ||
+                              is_gta5_cf9200_no_backing_marker_candidate(resource);
+        if (is_gta5_cf9200_no_backing_marker_candidate(resource) &&
+            !is_proven_gta5_cf9200_no_backing(resource)) {
+            error = "GTA root-record marker has malformed sentinel metadata";
+            return false;
+        }
+        if (relevant) {
+            if (captured.blob_index >= capture.blobs.size() ||
+                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
+                kGtaCf9200RootBytes >
+                    capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset) {
+                error = "GTA root-record marker lacks its 224-byte witness";
+                return false;
+            }
+            resource.host_data = const_cast<uint8_t*>(
+                capture.blobs[captured.blob_index].bytes.data() + captured.blob_offset);
+            resource.host_data_size = kGtaCf9200RootBytes;
+        }
+        validated_resources.resources.push_back(resource);
+    }
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    if (!rdna2_gta5_cf9200_no_backing_dispatch(
+            raw.data(), raw.size(), compute.recompile_config, validated_resources)) {
+        error = "GTA root-record marker has stale shader, launch, root, or site provenance";
+        return false;
+    }
+    return true;
+}
+
 bool captured_resource_has_packed_pointer_state(const GpuCapturedResource& captured) {
     return !captured.internal_bytes.empty() &&
            !is_compute_internal_gds(captured.resource);
@@ -1635,6 +1692,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
         if (!validate_captured_null_guarded_raw_store(capture, compute, error))
             return false;
         if (!validate_captured_nullable_output_raw_buffer(capture, compute, error))
+            return false;
+        if (!validate_captured_gta5_cf9200_no_backing(capture, compute, error))
             return false;
         if (!validate_captured_gta5_packed_pointer(capture, compute, error))
             return false;
@@ -4482,6 +4541,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     for (const auto& x : c.computes) {
         if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
         if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
+        if (!validate_captured_gta5_cf9200_no_backing(c, x, error)) return false;
         ComputeItem compute;
         compute.spirv = x.spirv;
         compute.launch = x.launch;
@@ -4497,6 +4557,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             captured_compute_has_null_guarded_raw_store(x);
         compute.nullable_output_raw_buffer_validated =
             captured_compute_has_nullable_output_raw_buffer(x);
+        compute.gta5_cf9200_no_backing_validated = false;
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
         const bool has_packed_pointer_state = c.format_version >= 51u &&
@@ -4507,6 +4568,14 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                     resource.internal_bytes.size());
             });
         if (!table(x.resources, true, compute.resources)) return false;
+        const bool has_cf9200_no_backing =
+            captured_compute_has_gta5_cf9200_no_backing(x);
+        if (has_cf9200_no_backing &&
+            (!compute.resources || !compute.recompile_config_available ||
+             compute.raw_shader_index >= c.raw_shader_versions.size())) {
+            error = "GTA root-record replay lacks exact raw shader or launch state";
+            return false;
+        }
         // The selected-SBUFFER marker is deliberately derived rather than serialized. A raw replay
         // with complete captured backing can reconstruct it from the exact shader/launch/source
         // domain; metadata-only captures retain their already-compiled SPIR-V and remain materializable.
@@ -4519,6 +4588,15 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         if (compute.resources && compute.recompile_config_available &&
             compute.raw_shader_index < c.raw_shader_versions.size()) {
             const auto& raw = c.raw_shader_versions[compute.raw_shader_index].words;
+            if (has_cf9200_no_backing) {
+                if (!rdna2_gta5_cf9200_no_backing_dispatch(
+                        raw.data(), raw.size(), compute.recompile_config,
+                        *compute.resources)) {
+                    error = "GTA root-record replay failed exact dispatch validation";
+                    return false;
+                }
+                compute.gta5_cf9200_no_backing_validated = true;
+            }
             if (rdna2_gta5_selected_sbuffer_shader(raw.data(), raw.size()))
                 (void)discover_rdna2_gta5_selected_sbuffer(
                     raw.data(), raw.size(), compute.recompile_config, *compute.resources);

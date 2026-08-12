@@ -12,6 +12,7 @@
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
+#include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
 #include "rdna2_to_spirv.hpp"     // recompile_compute
@@ -303,6 +304,7 @@ struct ShaderResourceCompileKey {
     bool optional_null_raw_load = false;
     bool proven_null_guarded_raw_store = false;
     bool proven_null_nullable_raw_buffer = false;
+    bool gta5_cf9200_no_backing = false;
     uint32_t selected_sbuffer_soffset = UINT32_MAX;
     std::array<uint32_t, 4> selected_sbuffer_words{};
     uint32_t indirect_buffer_contract_tag = 0;
@@ -507,6 +509,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.optional_null_raw_load);
             hash = hash_mix(hash, resource.proven_null_guarded_raw_store);
             hash = hash_mix(hash, resource.proven_null_nullable_raw_buffer);
+            hash = hash_mix(hash, resource.gta5_cf9200_no_backing);
             hash = hash_mix(hash, resource.selected_sbuffer_soffset);
             for (const uint32_t word : resource.selected_sbuffer_words)
                 hash = hash_mix(hash, word);
@@ -1268,6 +1271,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 is_proven_null_guarded_raw_store(resource);
             compiled.proven_null_nullable_raw_buffer =
                 is_proven_null_nullable_raw_buffer(resource);
+            compiled.gta5_cf9200_no_backing =
+                is_proven_gta5_cf9200_no_backing(resource);
             if (is_gta5_selected_sbuffer_descriptor(resource)) {
                 compiled.selected_sbuffer_soffset = resource.selected_sbuffer_soffset;
                 compiled.selected_sbuffer_words = resource.selected_sbuffer_words;
@@ -1585,6 +1590,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const bool has_gta5_packed_pointer = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_packed_pointer_marker_candidate);
+    const bool has_gta5_cf9200_no_backing = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_gta5_cf9200_no_backing_marker_candidate);
     // Push-constant values intentionally stay out of the general compute cache key. Conditional
     // store elision is the exception: validate its raw shader and exact dispatch before even looking
     // in the cache, so a warm null-dispatch module cannot be returned for changed s2:s3.
@@ -1600,6 +1608,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         return {};
     if (has_gta5_packed_pointer &&
         !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *resources))
+        return {};
+    if (has_gta5_cf9200_no_backing &&
+        !rdna2_gta5_cf9200_no_backing_dispatch(code, dwords, config, *resources))
         return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
@@ -6718,6 +6729,21 @@ std::vector<ComputeItem> realize_compute_dispatches(
                          static_cast<unsigned long long>(source ? source->host_data_size : 0u),
                          source ? source->indirect_buffer_slot_count : 0u);
         }
+
+        // GTA V 0x413cf9200 overlays descriptor-shaped root fields with application records for
+        // inactive source/output variants. Inspect the current root only here, after preceding GPU
+        // producers have completed, and retain that same 224-byte root as every marker's witness.
+        const bool cf9200_candidate = rdna2_gta5_cf9200_shader(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords);
+        const bool cf9200_valid = discover_rdna2_gta5_cf9200_no_backing(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords, config, *table);
+        if (cf9200_candidate && std::getenv("PROSPER_DBG"))
+            std::fprintf(stderr,
+                         "[gta-cf9200-no-backing] code=0x%llx valid=%d resources=%zu\n",
+                         static_cast<unsigned long long>(code_addr),
+                         static_cast<int>(cf9200_valid), table->resources.size());
         assign_convention_bindings(*table, 2);
 
         ComputeItem item;
@@ -6744,6 +6770,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
             table && std::any_of(table->resources.begin(), table->resources.end(),
                                  is_proven_null_nullable_raw_buffer) &&
             rdna2_gta5_nullable_output_dispatch(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, config, *table);
+        item.gta5_cf9200_no_backing_validated = item.spirv.size() &&
+            table && std::any_of(table->resources.begin(), table->resources.end(),
+                                 is_proven_gta5_cf9200_no_backing) &&
+            rdna2_gta5_cf9200_no_backing_dispatch(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords, config, *table);
         item.resources = std::move(table);

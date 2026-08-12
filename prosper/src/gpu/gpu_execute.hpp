@@ -434,6 +434,9 @@ struct ComputeItem {
     // Separate authority token for the +0x20 nullable raw-buffer family. It cannot authorize the
     // guarded-store marker above: the two conventions have different witnesses and load semantics.
     bool nullable_output_raw_buffer_validated = false;
+    // Exact 0x413cf9200 authority token. The serialized impossible-stride marker and its root bytes
+    // remain data until live realization or replay repeats the complete program/launch/root proof.
+    bool gta5_cf9200_no_backing_validated = false;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };
