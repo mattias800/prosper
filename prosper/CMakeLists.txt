@@ -15,6 +15,11 @@ if(MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+# --- Diagnostics (optional observer-only instrumentation) -----------------
+# Boot timeline capture, event bus, JSON export. OFF by default: zero cost when
+# disabled (stubs compile to no-ops). ON adds ~300 lines of optional code.
+option(PROSPER_DIAGNOSTICS "Enable diagnostics instrumentation (boot timeline, event bus)" OFF)
+
 # --- macOS Vulkan (MoltenVK) override ------------------------------------
 # prosper on macOS is built x86_64 (to run the guest under Rosetta), but Homebrew's MoltenVK/loader
 # are arm64-only, so find_package(Vulkan) would hand back an unlinkable arm64 lib. Point the build at
@@ -64,11 +69,20 @@ include(cmake/ProsperBuildRevision.cmake)
 prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOURCE_DIR}/..")
 
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
+# Exclude diagnostics sources when feature is disabled (default).
+# When enabled, PROSPER_DIAGNOSTICS define activates the real implementation;
+# the headers always compile (stubs when disabled).
+if(NOT PROSPER_DIAGNOSTICS)
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/diagnostics/")
+endif()
 if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
   target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  if(PROSPER_DIAGNOSTICS)
+    target_compile_definitions(prosper_core PRIVATE PROSPER_DIAGNOSTICS)
+  endif()
   find_package(Threads REQUIRED)
   target_link_libraries(prosper_core PUBLIC Threads::Threads)
   # Windows: the guest futex HLE (sceKernelWaitOnAddress/WakeByAddress) is backed by the native Win32
@@ -783,6 +797,24 @@ if(TARGET prosper_core)
   add_executable(test_module_path_case tests/test_module_path_case.cpp)
   target_link_libraries(test_module_path_case PRIVATE prosper_core)
   add_test(NAME module_path_case COMMAND test_module_path_case)
+
+  # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
+  add_executable(test_diagnostics_disabled tests/test_diagnostics_disabled.cpp)
+  target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)
+  add_test(NAME diagnostics_disabled_stubs COMMAND test_diagnostics_disabled)
+
+  # Diagnostics: enabled-path and JSON tests (only when feature is built).
+  if(PROSPER_DIAGNOSTICS)
+    add_executable(test_diagnostics_enabled tests/test_diagnostics_enabled.cpp)
+    target_link_libraries(test_diagnostics_enabled PRIVATE prosper_core)
+    target_compile_definitions(test_diagnostics_enabled PRIVATE PROSPER_DIAGNOSTICS)
+    add_test(NAME diagnostics_enabled_capture COMMAND test_diagnostics_enabled)
+
+    add_executable(test_diagnostics_json tests/test_diagnostics_json.cpp)
+    target_link_libraries(test_diagnostics_json PRIVATE prosper_core)
+    target_compile_definitions(test_diagnostics_json PRIVATE PROSPER_DIAGNOSTICS)
+    add_test(NAME diagnostics_json_format COMMAND test_diagnostics_json)
+  endif()
 
   # Unity native-plugin auto-link (#1609): a title's own Media/Plugins/*.prx that the fixed preload
   # list never named must still be linked, or its first P/Invoke raises a DllNotFoundException that

@@ -9,6 +9,9 @@
 #include <system_error>
 #include <vector>
 
+// Optional diagnostics (zero-cost when disabled — stubs inline to no-ops).
+#include "diagnostics/diagnostics.hpp"
+
 namespace prosper {
 
 // See boot_program.hpp. The fixed preload list names each module with ONE hard-coded casing, but
@@ -226,6 +229,9 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
                   const std::function<void()>& after_hle_registered) {
     auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
 
+    // Diagnostics: record boot start.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::PROCESS_START);
+
     // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
     std::vector<LinkInput> in = boot_link_inputs(d);
 
@@ -257,6 +263,9 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(),
            p.init_fns.size(), p.aliased_exports.size());
 
+    // Diagnostics: linking complete.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::LINKING);
+
     // sceKernelDlsym resolves exports by name against all loaded modules.
     set_module_exports(&p.exports);
     // Per-module tables (#147): LoadStartModule hands out real handles for linked-module paths and
@@ -268,8 +277,14 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     register_builtin_hle();
     if (after_hle_registered) after_hle_registered();   // caller installs host frontends here
 
+    // Diagnostics: HLE handlers registered.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::HLE_REGISTERED);
+
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) return fail("map failed: " + e);
+
+    // Diagnostics: all modules mapped.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::MODULES_MAPPED);
     {
         // General-dynamic and initial-exec TLS consume the same descriptors and module-id order.
         set_tls_modules(p.tls_templates.data(), p.tls_templates.size());
@@ -299,6 +314,9 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     p.slots.reserve(p.slots.size() + 1024);
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) return fail("stubs failed: " + e);
     install_trap_handler();
+
+    // Diagnostics: stubs and trap handler installed.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::STUBS_INSTALLED);
     // Enable real runtime PRX loading now that the fixed set is linked, mapped and stubbed (#639).
     runtime_module_loader_init(&p);
 
@@ -309,7 +327,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         set_module_start_param_ranges({ { BOOT_PSN, BOOT_SAVEDATA }, { BOOT_SAVEDATA, BOOT_LIBC },
                                         { BOOT_PSNCORE, 0x490000000ull }, { BOOT_PSNCOMMON, 0x4b0000000ull } });
 
+    // Diagnostics: guest initialization running.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::GUEST_INITS_RUNNING);
     run_guest_inits(p.init_fns);
+
+    // Diagnostics: boot complete.
+    diagnostics::record_boot_phase(diagnostics::BootPhase::BOOT_COMPLETE);
     return true;
 }
 
