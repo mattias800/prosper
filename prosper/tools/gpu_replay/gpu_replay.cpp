@@ -364,9 +364,40 @@ std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
 
 const char* class_name(prosper::gpu::ResourceClass c);
 
-void print_graph(const prosper::gpu::GpuDependencyGraph& graph) {
-    std::printf("dependency-graph operations=%zu edges=%zu external-leaves=%zu\n",
-                graph.nodes.size(), graph.edges.size(), graph.external_leaves.size());
+// Map a graph operation index to the compute program it runs, so producer/consumer questions can be
+// answered without guessing. The graph identifies operations by INDEX only; asking "which shader is
+// writer 1453" previously meant correlating by hand against a separate inspect dump, and getting it
+// wrong is the adjacency-attribution mistake #2481 records twice.
+//
+// `command_order` is the join key rather than `source_index`: both the node and the captured compute
+// carry it, it is a single global ordering, and it does not depend on the two containers agreeing on
+// what their own indices mean. Draws resolve to 0 and print as `-`.
+std::unordered_map<uint32_t, uint64_t> graph_operation_programs(
+        const prosper::gpu::GpuReplayFrame& replay,
+        const prosper::gpu::GpuDependencyGraph& graph) {
+    std::unordered_map<uint64_t, uint64_t> program_by_order;
+    for (const auto& compute : replay.computes)
+        program_by_order.emplace(compute.command_order, compute.code_addr);
+    std::unordered_map<uint32_t, uint64_t> program_by_operation;
+    for (const auto& node : graph.nodes) {
+        const auto it = program_by_order.find(node.command_order);
+        if (it != program_by_order.end()) program_by_operation.emplace(node.operation_index, it->second);
+    }
+    return program_by_operation;
+}
+
+void print_graph(const prosper::gpu::GpuDependencyGraph& graph,
+                 const prosper::gpu::GpuReplayFrame& replay) {
+    const auto programs = graph_operation_programs(replay, graph);
+    const auto program_of = [&](uint32_t operation) -> std::string {
+        const auto it = programs.find(operation);
+        if (it == programs.end()) return "-";
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(it->second));
+        return buf;
+    };
+    std::printf("dependency-graph operations=%zu edges=%zu external-leaves=%zu programs-resolved=%zu\n",
+                graph.nodes.size(), graph.edges.size(), graph.external_leaves.size(), programs.size());
     for (const auto& node : graph.nodes)
         if (!node.realized)
             std::printf("missing operation=%u kind=%s source=%llu order=%llu\n",
@@ -375,15 +406,21 @@ void print_graph(const prosper::gpu::GpuDependencyGraph& graph) {
                         static_cast<unsigned long long>(node.source_index),
                         static_cast<unsigned long long>(node.command_order));
     for (const auto& edge : graph.edges)
-        std::printf("edge producer=%u consumer=%u stage=%s binding=%u addr=%016llx bytes=%llu dims=%ux%u\n",
-                    edge.producer_operation, edge.consumer_operation, edge.access.stage.c_str(),
+        std::printf("edge producer=%u producer-program=%s consumer=%u consumer-program=%s "
+                    "stage=%s binding=%u addr=%016llx bytes=%llu dims=%ux%u\n",
+                    edge.producer_operation, program_of(edge.producer_operation).c_str(),
+                    edge.consumer_operation, program_of(edge.consumer_operation).c_str(),
+                    edge.access.stage.c_str(),
                     edge.access.binding, static_cast<unsigned long long>(edge.access.addr),
                     static_cast<unsigned long long>(edge.access.size), edge.access.width, edge.access.height);
     for (const auto& leaf : graph.external_leaves)
-        std::printf("external consumers=%zu first=%u future-writer=%lld stage=%s binding=%u class=%s "
+        std::printf("external consumers=%zu first=%u first-program=%s future-writer=%lld "
+                    "writer-program=%s stage=%s binding=%u class=%s "
                     "addr=%016llx bytes=%llu dims=%ux%u\n",
                     leaf.consumer_operations.size(), leaf.consumer_operations.front(),
+                    program_of(leaf.consumer_operations.front()).c_str(),
                     leaf.first_future_writer == UINT32_MAX ? -1ll : static_cast<long long>(leaf.first_future_writer),
+                    leaf.first_future_writer == UINT32_MAX ? "-" : program_of(leaf.first_future_writer).c_str(),
                     leaf.access.stage.c_str(), leaf.access.binding,
                     class_name(leaf.access.resource_class),
                     static_cast<unsigned long long>(leaf.access.addr),
@@ -2539,7 +2576,7 @@ int main(int argc, char** argv) {
         if (!prosper::gpu::build_gpu_dependency_graph(replay, graph, error)) {
             std::fprintf(stderr, "gpu_replay: cannot build dependency graph: %s\n", error.c_str()); return 2;
         }
-        if (graph_json_path.empty()) print_graph(graph);
+        if (graph_json_path.empty()) print_graph(graph, replay);
         else if (!write_graph_json(graph_json_path, graph)) {
             std::fprintf(stderr, "gpu_replay: cannot write graph JSON %s\n", graph_json_path.c_str()); return 2;
         }
