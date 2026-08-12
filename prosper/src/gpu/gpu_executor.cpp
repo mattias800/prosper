@@ -13,6 +13,7 @@
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "rdna2_gta5_compute_contracts.hpp"
+#include "rdna2_gta5_packed_pointer.hpp"
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
 #include "../host/guest_memory_map.hpp"
@@ -304,6 +305,11 @@ struct ShaderResourceCompileKey {
     bool proven_null_nullable_raw_buffer = false;
     uint32_t selected_sbuffer_soffset = UINT32_MAX;
     std::array<uint32_t, 4> selected_sbuffer_words{};
+    uint32_t indirect_buffer_contract_tag = 0;
+    uint32_t indirect_buffer_binding_bytes = 0;
+    uint32_t indirect_buffer_slot_count = 0;
+    uint32_t indirect_buffer_header_bytes = 0;
+    uint32_t indirect_buffer_slot_bytes = 0;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -504,6 +510,11 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.selected_sbuffer_soffset);
             for (const uint32_t word : resource.selected_sbuffer_words)
                 hash = hash_mix(hash, word);
+            hash = hash_mix(hash, resource.indirect_buffer_contract_tag);
+            hash = hash_mix(hash, resource.indirect_buffer_binding_bytes);
+            hash = hash_mix(hash, resource.indirect_buffer_slot_count);
+            hash = hash_mix(hash, resource.indirect_buffer_header_bytes);
+            hash = hash_mix(hash, resource.indirect_buffer_slot_bytes);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1261,6 +1272,15 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 compiled.selected_sbuffer_soffset = resource.selected_sbuffer_soffset;
                 compiled.selected_sbuffer_words = resource.selected_sbuffer_words;
             }
+            if (is_gta5_packed_pointer_resource(resource)) {
+                compiled.indirect_buffer_contract_tag =
+                    resource.indirect_buffer_contract_tag;
+                compiled.indirect_buffer_binding_bytes =
+                    resource.indirect_buffer_binding_bytes;
+                compiled.indirect_buffer_slot_count = resource.indirect_buffer_slot_count;
+                compiled.indirect_buffer_header_bytes = resource.indirect_buffer_header_bytes;
+                compiled.indirect_buffer_slot_bytes = resource.indirect_buffer_slot_bytes;
+            }
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1562,6 +1582,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const bool has_selected_sbuffer_descriptor = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_selected_sbuffer_marker_candidate);
+    const bool has_gta5_packed_pointer = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_gta5_packed_pointer_marker_candidate);
     // Push-constant values intentionally stay out of the general compute cache key. Conditional
     // store elision is the exception: validate its raw shader and exact dispatch before even looking
     // in the cache, so a warm null-dispatch module cannot be returned for changed s2:s3.
@@ -1574,6 +1597,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         return {};
     if (has_selected_sbuffer_descriptor &&
         !rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, *resources))
+        return {};
+    if (has_gta5_packed_pointer &&
+        !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *resources))
         return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
@@ -5002,6 +5028,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         r.gpu_addr = d.base;
         r.size = scalar_size;
         r.stride = scalar_stride;
+        if (d.size_bytes == 0u && u.key == UINT32_MAX)
+            r.scalar_raw_pointer_word_hi = u.v4[1];
         r.atomic_x2_record_count = u.atomic_x2_record_count;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
         r.fetch_pc = u.use_pc;
@@ -6667,6 +6695,29 @@ std::vector<ComputeItem> realize_compute_dispatches(
                          "[gta-selected-sbuffer] code=0x%llx valid=%d resources=%zu\n",
                          static_cast<unsigned long long>(code_addr),
                          static_cast<int>(selected_sbuffer_valid), table->resources.size());
+
+        // GTA V 0x413cf9d00 loads one lane-zero pointer per dispatched workgroup through pc26, then
+        // dereferences only a bounded 368-byte footprint at 17 exact GLOBAL sites. Snapshot the table and
+        // pointees at this command-ordered realization point; preceding dispatches in the submit
+        // have already completed, so the owned shadow cannot observe a stale producer epoch.
+        const bool packed_pointer_candidate = rdna2_gta5_packed_pointer_shader(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords);
+        const bool packed_pointer_valid = discover_rdna2_gta5_packed_pointer(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords, config, *table);
+        if (packed_pointer_candidate && std::getenv("PROSPER_DBG")) {
+            const ShaderResource* source = table->by_fetch_pc(kGta5PackedPointerSourcePc);
+            std::fprintf(stderr,
+                         "[gta-packed-pointer] code=0x%llx valid=%d resources=%zu "
+                         "threads=%u source-bytes=%llu shadow-bytes=%llu slots=%u\n",
+                         static_cast<unsigned long long>(code_addr),
+                         static_cast<int>(packed_pointer_valid),
+                         table->resources.size(), config.threads_x,
+                         static_cast<unsigned long long>(source ? source->size : 0u),
+                         static_cast<unsigned long long>(source ? source->host_data_size : 0u),
+                         source ? source->indirect_buffer_slot_count : 0u);
+        }
         assign_convention_bindings(*table, 2);
 
         ComputeItem item;

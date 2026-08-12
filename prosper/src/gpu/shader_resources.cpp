@@ -1,5 +1,6 @@
 // shader_resources.cpp — see shader_resources.hpp. Pure lookups + format sizing; no Vulkan, no state.
 #include "shader_resources.hpp"
+#include "rdna2_gta5_packed_pointer.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -541,6 +542,17 @@ StorageBufferMaterializationPlan plan_storage_buffer_materialization(
     StorageBufferMaterializationPlan plan;
     plan.logical_bytes = resource.size;
     plan.binding_bytes = resource.size;
+
+    if (is_gta5_packed_pointer_marker_candidate(resource)) {
+        if (!is_gta5_packed_pointer_resource(resource) ||
+            descriptor.kind != SpirvDescriptorKind::StorageBuffer ||
+            !descriptor.readable || descriptor.writable || descriptor.atomic_access ||
+            descriptor.required_bytes > resource.indirect_buffer_binding_bytes)
+            return plan;
+        plan.binding_bytes = resource.indirect_buffer_binding_bytes;
+        plan.valid = true;
+        return plan;
+    }
 
     const bool has_logical = descriptor.zero_pad_logical_bytes != 0;
     const bool has_binding = descriptor.zero_pad_binding_bytes != 0;
@@ -1185,7 +1197,7 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             const uint64_t minimum = materialization.zero_padded_tail
                 ? materialization.logical_bytes
                 : std::max<uint64_t>(d.required_bytes, 4);
-            uint64_t available = r.size;
+            uint64_t available = materialization.binding_bytes;
             if (r.host_data) available = std::min<uint64_t>(available, r.host_data_size);
             if (!null_descriptor && available < minimum)
                 report.issues.push_back({DescriptorIssueCode::UndersizedBuffer, true, d.set, d.binding,

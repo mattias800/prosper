@@ -1,4 +1,5 @@
 #include "gpu_dependency_graph.hpp"
+#include "rdna2_gta5_packed_pointer.hpp"
 #include "vk_translate.hpp"
 
 #include <algorithm>
@@ -68,6 +69,9 @@ bool writer_matches(const GpuDependencyAccess& access, const Writer& writer) {
 }
 
 uint64_t resource_size(const ShaderResource& resource) {
+    // The appended packed slots are a dispatch-owned representation of lane-zero pointers, not guest
+    // bytes following the source table's address. Dependency closure remains on the logical table.
+    if (is_gta5_packed_pointer_resource(resource)) return resource.size;
     if (resource.host_data_size) return resource.host_data_size;
     if (resource.size) return resource.size;
     if (resource.width && resource.height)
