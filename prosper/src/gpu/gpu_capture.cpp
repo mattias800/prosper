@@ -1304,6 +1304,50 @@ bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
                                    "invalid compute recompile state", error);
 }
 
+bool captured_compute_has_null_guarded_raw_store(
+        const GpuCapturedCompute& compute) {
+    return compute.resources.present &&
+        std::any_of(compute.resources.resources.begin(),
+                    compute.resources.resources.end(),
+                    [](const GpuCapturedResource& captured) {
+                        return is_proven_null_guarded_raw_store(captured.resource);
+                    });
+}
+
+bool validate_captured_null_guarded_raw_store(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!captured_compute_has_null_guarded_raw_store(compute)) return true;
+    if (!compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        error = "guarded-null store marker lacks raw recompile provenance";
+        return false;
+    }
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    const auto& user = compute.recompile_config.user_sgprs;
+    if (!rdna2_gta5_null_guarded_raw_store_dispatch(
+            raw.data(), raw.size(), user.data(), user.size())) {
+        error = "guarded-null store marker has stale shader or dispatch provenance";
+        return false;
+    }
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        const ShaderResource& marker = captured.resource;
+        if (!is_proven_null_guarded_raw_store(marker)) continue;
+        if (marker.fetch_pc >= raw.size()) {
+            error = "guarded-null store marker has stale shader or dispatch provenance";
+            return false;
+        }
+        Rdna2Inst site = rdna2_decode_one(raw.data() + marker.fetch_pc,
+                                         raw.size() - marker.fetch_pc);
+        site.pc = marker.fetch_pc;
+        if (!rdna2_gta5_null_guarded_raw_store_site(site)) {
+            error = "guarded-null store marker has stale shader or dispatch provenance";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
     if (capture.raw_shader_versions.size() > kMaxResources ||
         capture.failure_diagnostics.size() > kMaxOperations) {
@@ -1339,12 +1383,15 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
     }
     for (const auto& compute : capture.computes) {
         if (!validate_compute_recompile_state(compute, error)) return false;
-        if (compute.raw_shader_index == 0xFFFFFFFFu) continue;
-        if (compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        if (compute.raw_shader_index != 0xFFFFFFFFu &&
+            compute.raw_shader_index >= capture.raw_shader_versions.size()) {
             error = "realized compute references an invalid raw shader";
             return false;
         }
-        raw_referenced[compute.raw_shader_index] = true;
+        if (!validate_captured_null_guarded_raw_store(capture, compute, error))
+            return false;
+        if (compute.raw_shader_index != 0xFFFFFFFFu)
+            raw_referenced[compute.raw_shader_index] = true;
     }
     for (const auto& diagnostic : capture.failure_diagnostics) {
         if (diagnostic.kind > SubmitOperationKind::Dispatch ||
@@ -4142,6 +4189,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     }
     out.computes.reserve(c.computes.size());
     for (const auto& x : c.computes) {
+        if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
         ComputeItem compute;
         compute.spirv = x.spirv;
         compute.launch = x.launch;
@@ -4153,6 +4201,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.raw_shader_index = x.raw_shader_index;
         compute.recompile_config = x.recompile_config;
         compute.recompile_config_available = x.recompile_config_available;
+        compute.null_guarded_raw_store_validated =
+            captured_compute_has_null_guarded_raw_store(x);
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
         if (!table(x.resources, compute.resources)) return false;

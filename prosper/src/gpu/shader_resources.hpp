@@ -501,6 +501,21 @@ inline bool is_optional_null_raw_load_buffer(const ShaderResource& resource) {
            resource.host_data_size == 0u;
 }
 
+// Exact-PC no-backing marker for GTA V's proven-null output-store region. UINT32_MAX is outside the
+// V#'s 14-bit STRIDE domain and is serialized by every capture version, keeping this semantic
+// distinct from both an ordinary base-zero descriptor and the NUM_RECORDS=0 marker without a format
+// bump. Only the front half may manufacture this shape after proving the complete EXEC guard.
+inline constexpr uint32_t kProvenNullGuardedRawStoreStride = UINT32_MAX;
+inline bool is_proven_null_guarded_raw_store(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+           resource.format == DataFormat::Unknown && resource.num_components == 0u &&
+           resource.gpu_addr == 0 && resource.size == 0u &&
+           resource.stride == kProvenNullGuardedRawStoreStride &&
+           resource.srt_offset == 0xFFFFFFFFu && resource.sgpr_base == 0xFFFFFFFFu &&
+           resource.fetch_pc != 0xFFFFFFFFu && resource.host_data == nullptr &&
+           resource.host_data_size == 0u;
+}
+
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {

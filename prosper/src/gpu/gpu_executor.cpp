@@ -299,6 +299,7 @@ struct ShaderResourceCompileKey {
     bool null_bvh = false;
     bool zero_record_raw = false;
     bool optional_null_raw_load = false;
+    bool proven_null_guarded_raw_store = false;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -494,6 +495,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.null_bvh);
             hash = hash_mix(hash, resource.zero_record_raw);
             hash = hash_mix(hash, resource.optional_null_raw_load);
+            hash = hash_mix(hash, resource.proven_null_guarded_raw_store);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1240,6 +1242,11 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             // later nonzero descriptor at the same pc cannot reuse the specialized module.
             compiled.zero_record_raw = is_zero_record_raw_buffer(resource);
             compiled.optional_null_raw_load = is_optional_null_raw_load_buffer(resource);
+            // This marker elides a real one-record store, unlike NUM_RECORDS=0. Keep the admission
+            // result explicit even though its impossible V# stride also differs, so cache identity
+            // documents and enforces the semantic boundary directly.
+            compiled.proven_null_guarded_raw_store =
+                is_proven_null_guarded_raw_store(resource);
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1532,6 +1539,16 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         const ComputeShaderConfig& config, uint64_t* cache_identity,
         RecompileDiagnosticContext diagnostic) {
     if (cache_identity) *cache_identity = 0;
+    const bool has_null_guarded_raw_store = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_proven_null_guarded_raw_store);
+    // Push-constant values intentionally stay out of the general compute cache key. Conditional
+    // store elision is the exception: validate its raw shader and exact dispatch before even looking
+    // in the cache, so a warm null-dispatch module cannot be returned for changed s2:s3.
+    if (has_null_guarded_raw_store &&
+        !rdna2_gta5_null_guarded_raw_store_dispatch(
+            code, dwords, config.user_sgprs.data(), config.user_sgprs.size()))
+        return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
         nullptr, 0, 0, &config);
@@ -2031,6 +2048,14 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
     return false;
 }
 
+bool gta5_null_raw_store_descriptor(const std::array<uint32_t, 4>& descriptor) {
+    // Exact live null V#: base=0, stride=56, one record, 56 bytes, OOB_SELECT=0, TYPE=0 and no
+    // swizzled-address controls. A non-null dispatch changes the base words and stays on the ordinary
+    // materialized-buffer path.
+    return descriptor == std::array<uint32_t, 4>{
+        0x00000000u, 0x00380000u, 0x00000001u, 0x00016204u};
+}
+
 // The x16-header null proof deliberately accepts one observed straight-line descriptor builder, not
 // a general scalar phi analysis. Every instruction that carries the root from its mapped load to the
 // ray must therefore execute whenever the ray does. Reject a branch inside that interval, or any
@@ -2170,6 +2195,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
         fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
+    const bool gta5_null_raw_store_guard = pcrel_dispatch_target == UINT32_MAX &&
+        rdna2_gta5_null_guarded_raw_store_shader(code, dwords);
 
     auto readable = [&](uint64_t addr, uint32_t bytes) {
         if (!profile_fold) return guest_readable(addr, bytes);
@@ -2279,6 +2306,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         vector_index_mode[8] = VertexFetchIndexMode::Instance;
     }
     int scc = -1;   // tracked SCC (-1 unknown): set by s_cmp_*, consumed by s_cselect (the format patch's tail)
+    bool gta5_null_pointer_at_guard = false;
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
     auto valid_reg = [](int r) { return r >= 0 && r < (int)kFoldSgprs; };
@@ -2755,6 +2783,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 saved_at_branch[slot->second].first = true;
                 saved_at_branch[slot->second].second = capture_fold_state();
             }
+        }
+        if (gta5_null_raw_store_guard && in.pc == 42u) {
+            uint32_t pointer_lo = 0, pointer_hi = 0;
+            gta5_null_pointer_at_guard = known(2, pointer_lo) && known(3, pointer_hi) &&
+                                         pointer_lo == 0u && pointer_hi == 0u;
         }
         const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
                                   (in.opcode == 0x360 || in.opcode == 0x361);
@@ -3982,7 +4015,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 const bool format_load_use = !is_mtbuf && in.opcode <= 0x03;
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
-                     (in.opcode >= 0x1C && in.opcode <= 0x1F));
+                     (in.opcode >= kMubufOpcodeStoreDword &&
+                      in.opcode <= kMubufOpcodeStoreDwordX3));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
                 // Keep the generic set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
                 // Opcodes 0x50/0x5a reach descriptor inspection separately: only GTA V's exact
@@ -4135,18 +4169,27 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                     (unsigned)optional_null_role[(size_t)(srsrc + 3)],
                                     (int)rdna2_optional_null_raw_load_shape(in),
                                     (int)gta_optional_null_descriptor_shape(d, u.v4.data()));
-                        if (zero_record_raw || optional_null_raw_load || (!format_load_use &&
+                        const bool proven_null_guarded_raw_store =
+                            gta5_null_pointer_at_guard &&
+                            gta5_null_raw_store_descriptor(u.v4) &&
+                            rdna2_gta5_null_guarded_raw_store_site(in);
+                        if (proven_null_guarded_raw_store || zero_record_raw ||
+                            optional_null_raw_load || (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
                              d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
                              (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
                             u.zero_record_raw = zero_record_raw;
                             u.optional_null_raw_load = optional_null_raw_load;
+                            u.proven_null_guarded_raw_store =
+                                proven_null_guarded_raw_store;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
-                                             "stride=%u size=%u zero-record=%d optional-null=%d\n",
+                                             "stride=%u size=%u zero-record=%d optional-null=%d "
+                                             "null-guarded-store=%d\n",
                                              in.pc, srsrc, (unsigned long long)d.base,
                                              d.stride, d.size_bytes, (int)zero_record_raw,
-                                             (int)optional_null_raw_load);
+                                             (int)optional_null_raw_load,
+                                             (int)proven_null_guarded_raw_store);
                             srt_uses->push_back(u);
                         }
                     }
@@ -4608,6 +4651,15 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         }
     }
 
+    bool null_guarded_store_shape = false;
+    if (std::any_of(srt_uses.begin(), srt_uses.end(), [](const SrtUse& use) {
+            return use.proven_null_guarded_raw_store;
+        })) {
+        null_guarded_store_shape =
+            rdna2_gta5_null_guarded_raw_store_dispatch(
+                code, dwords, user_sgprs, nsgpr);
+    }
+
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
         if (u.kind == 3) {
@@ -4695,6 +4747,33 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             // is otherwise inert, so capture/replay preserves the load-only marker without a
             // format extension.
             r.sampler_sgpr_base = kOptionalNullRawLoadMarkerSamplerBase;
+            r.fetch_pc = u.use_pc;
+            table.resources.push_back(r);
+            continue;
+        }
+        if (u.proven_null_guarded_raw_store) {
+            // Re-check every retained part of the dispatch proof at materialization. In particular,
+            // this is not a base-zero shortcut: the observed descriptor has one in-bounds record and
+            // becomes an ordinary writable resource when the entry pointer is non-null.
+            if (u.zero_record_raw || u.instruction_format != UINT32_MAX ||
+                !null_guarded_store_shape ||
+                !gta5_null_raw_store_descriptor(u.v4) || u.use_pc >= dwords)
+                continue;
+            Rdna2Inst marker_consumer =
+                rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
+            marker_consumer.pc = u.use_pc;
+            if (!rdna2_gta5_null_guarded_raw_store_site(marker_consumer)) continue;
+            const uint64_t marker_key = 0x8000000400000000ull | u.use_pc;
+            if (!seen.insert(marker_key).second) continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Unknown;
+            r.num_components = 0;
+            r.gpu_addr = 0;
+            r.size = 0;
+            r.stride = kProvenNullGuardedRawStoreStride;
+            r.srt_offset = 0xFFFFFFFFu;
+            r.sgpr_base = 0xFFFFFFFFu;
             r.fetch_pc = u.use_pc;
             table.resources.push_back(r);
             continue;
@@ -6428,6 +6507,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
         item.recompile_config.native_storage_format_support =
             replay_native_storage_format_support;
         item.recompile_config_available = true;
+        item.null_guarded_raw_store_validated = item.spirv.size() &&
+            table && std::any_of(table->resources.begin(), table->resources.end(),
+                                 is_proven_null_guarded_raw_store) &&
+            rdna2_gta5_null_guarded_raw_store_dispatch(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, config.user_sgprs.data(), config.user_sgprs.size());
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;

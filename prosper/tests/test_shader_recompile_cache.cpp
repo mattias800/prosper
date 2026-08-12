@@ -1,5 +1,6 @@
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/hle/dispatch.hpp"
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -1165,6 +1166,69 @@ int main() {
               repeated_optional_null_raw == cached_optional_null_raw &&
               stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
           "compute cache separates optional-null load lowering from ordinary null resources");
+    // Guarded-null stores compile to no memory operation too, but for a different reason: their V#
+    // has one record and only the exact dispatch CFG proves the store unreachable. Partition that
+    // marker explicitly from an ordinary writable resource at the same fetch pc.
+    clear_shader_recompile_cache();
+    std::array<uint32_t, 81> guarded_null_store_compute;
+    guarded_null_store_compute.fill(0xbf800000u); // s_nop 0
+    guarded_null_store_compute[22] = 0xbe92047eu; // s_mov_b64 s[18:19], exec
+    guarded_null_store_compute[41] = 0xbefe0412u; // s_mov_b64 exec, s[18:19]
+    guarded_null_store_compute[42] = 0xbf128002u;
+    guarded_null_store_compute[43] = 0x7d8a00f9u;
+    guarded_null_store_compute[44] = 0x06868080u;
+    guarded_null_store_compute[45] = 0x85ea8012u;
+    guarded_null_store_compute[46] = 0x8dea006au;
+    guarded_null_store_compute[47] = 0x87fe126au;
+    guarded_null_store_compute[48] = 0xbf88001fu;
+    guarded_null_store_compute[74] = 0xe0740030u;
+    guarded_null_store_compute[75] = 0x80000700u;
+    guarded_null_store_compute[80] = 0xbf810000u;
+    ShaderResource guarded_null_store = zero_record_raw;
+    guarded_null_store.fetch_pc = 74u;
+    guarded_null_store.stride = kProvenNullGuardedRawStoreStride;
+    ShaderResourceTable guarded_null_store_table;
+    guarded_null_store_table.resources.push_back(guarded_null_store);
+    ComputeShaderConfig stale_guarded_store_config = zero_record_raw_config;
+    stale_guarded_store_config.user_sgprs[2] = 1u;
+    // Exercise both sides of the cache boundary: invalid conditional metadata must fail before a
+    // cold lookup and must still fail after the valid null-dispatch module has warmed the cache.
+    const auto cold_stale_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, stale_guarded_store_config);
+    const auto cached_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    const auto warm_stale_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, stale_guarded_store_config);
+    std::array<uint32_t, 81> overwritten_guarded_null_store_compute =
+        guarded_null_store_compute;
+    overwritten_guarded_null_store_compute[40] = 0xbe820381u; // s_mov_b32 s2, 1
+    const auto overwritten_guarded_null_store = recompile_compute_shader_cached(
+        overwritten_guarded_null_store_compute.data(),
+        overwritten_guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    guarded_null_store_table.resources[0].gpu_addr = 0x20000u;
+    guarded_null_store_table.resources[0].size = 4u;
+    guarded_null_store_table.resources[0].stride = 4u;
+    const auto cached_ordinary_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    guarded_null_store_table.resources[0] = guarded_null_store;
+    const auto repeated_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(is_proven_null_guarded_raw_store(guarded_null_store_table.resources[0]) &&
+              cold_stale_guarded_null_store.empty() &&
+              warm_stale_guarded_null_store.empty() &&
+              overwritten_guarded_null_store.empty() &&
+              !cached_guarded_null_store.empty() && !cached_ordinary_store.empty() &&
+              cached_guarded_null_store != cached_ordinary_store &&
+              repeated_guarded_null_store == cached_guarded_null_store &&
+              stats.misses == 2u && stats.hits == 1u && stats.entries == 2u,
+          "compute cache separates guarded-null store elision from ordinary writable buffers");
 
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw

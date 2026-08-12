@@ -1,4 +1,5 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/shader_resources.hpp"
@@ -694,6 +695,58 @@ int main() {
         prosper::frontend::live_compute_queue_submit_attempts();
     CHECK(prosper::frontend::execute_live_compute_items({zero_record_item}),
           "all-marker descriptorless compute completes as a proven live-backend no-op");
+    ComputeItem forged_guarded_store_item = zero_record_item;
+    forged_guarded_store_item.resources = std::make_shared<ShaderResourceTable>();
+    ShaderResource guarded_store_resource = zero_record_rt.resources[0];
+    guarded_store_resource.stride = kProvenNullGuardedRawStoreStride;
+    guarded_store_resource.fetch_pc = 74u;
+    forged_guarded_store_item.resources->resources.push_back(guarded_store_resource);
+    CHECK(is_proven_null_guarded_raw_store(
+              forged_guarded_store_item.resources->resources.front()) &&
+              !prosper::frontend::execute_live_compute_items({forged_guarded_store_item}),
+          "a forged guarded-null-store marker has no live-backend proof token");
+
+    std::array<uint32_t, 81> guarded_store_code;
+    guarded_store_code.fill(0xbf800000u); // s_nop 0
+    guarded_store_code[22] = 0xbe92047eu; // s_mov_b64 s[18:19], exec
+    guarded_store_code[41] = 0xbefe0412u; // s_mov_b64 exec, s[18:19]
+    guarded_store_code[42] = 0xbf128002u;
+    guarded_store_code[43] = 0x7d8a00f9u;
+    guarded_store_code[44] = 0x06868080u;
+    guarded_store_code[45] = 0x85ea8012u;
+    guarded_store_code[46] = 0x8dea006au;
+    guarded_store_code[47] = 0x87fe126au;
+    guarded_store_code[48] = 0xbf88001fu;
+    guarded_store_code[74] = 0xe0740030u;
+    guarded_store_code[75] = 0x80000700u;
+    guarded_store_code[80] = 0xbf810000u;
+    ComputeShaderConfig guarded_store_config;
+    guarded_store_config.user_sgprs.resize(4u);
+    guarded_store_config.local_x = 64u;
+    ShaderResourceTable guarded_store_table;
+    guarded_store_table.resources.push_back(guarded_store_resource);
+    ComputeItem guarded_store_item = zero_record_item;
+    guarded_store_item.spirv = recompile_compute(
+        guarded_store_code.data(), guarded_store_code.size(),
+        &guarded_store_table, guarded_store_config);
+    guarded_store_item.user_sgprs = guarded_store_config.user_sgprs;
+    guarded_store_item.recompile_config = guarded_store_config;
+    guarded_store_item.resources =
+        std::make_shared<ShaderResourceTable>(guarded_store_table);
+    guarded_store_item.null_guarded_raw_store_validated =
+        !guarded_store_item.spirv.empty() &&
+        rdna2_gta5_null_guarded_raw_store_dispatch(
+            guarded_store_code.data(), guarded_store_code.size(),
+            guarded_store_config.user_sgprs.data(),
+            guarded_store_config.user_sgprs.size());
+    CHECK(guarded_store_item.null_guarded_raw_store_validated &&
+              prosper::frontend::execute_live_compute_items({guarded_store_item}),
+          "validated guarded-null stores complete as a live-backend no-op");
+    ComputeItem mixed_marker_item = guarded_store_item;
+    mixed_marker_item.resources = std::make_shared<ShaderResourceTable>(zero_record_rt);
+    mixed_marker_item.resources->resources.push_back(guarded_store_resource);
+    CHECK(prosper::frontend::execute_live_compute_items({mixed_marker_item}),
+          "mixed zero-record and validated guarded-store markers retain descriptorless success");
     ComputeItem empty_zero_record_item = zero_record_item;
     empty_zero_record_item.resources = std::make_shared<ShaderResourceTable>();
     CHECK(!prosper::frontend::execute_live_compute_items({empty_zero_record_item}),

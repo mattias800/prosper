@@ -52,13 +52,20 @@ inline constexpr uint32_t kSop1OpcodeAndn1SaveexecB64 = 0x37;
 inline constexpr uint32_t kSop1OpcodeOrn1SaveexecB64 = 0x38;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
 inline constexpr uint32_t kSop2OpcodeAddI32 = 0x02;
+inline constexpr uint32_t kSop1OpcodeMovreldB32 = 0x30;
+inline constexpr uint32_t kSop1OpcodeMovreldB64 = 0x31;
+inline constexpr uint32_t kSop1OpcodeMovrelsd2B32 = 0x49;
+inline constexpr uint32_t kSop2OpcodeCselectB64 = 0x0b;
 inline constexpr uint32_t kSop2OpcodeAndB32 = 0x0e;
+inline constexpr uint32_t kSop2OpcodeAndB64 = 0x0f;
 inline constexpr uint32_t kSop2OpcodeOrB32 = 0x10;
+inline constexpr uint32_t kSop2OpcodeOrB64 = 0x11;
 inline constexpr uint32_t kSop2OpcodeXorB32 = 0x12;
 inline constexpr uint32_t kSop2OpcodeAndn2B32 = 0x14;
 inline constexpr uint32_t kSop2OpcodeOrn2B32 = 0x16;
 inline constexpr uint32_t kSop2OpcodeNandB32 = 0x18;
 inline constexpr uint32_t kSop2OpcodeNorB32 = 0x1a;
+inline constexpr uint32_t kSop2OpcodeNorB64 = 0x1b;
 inline constexpr uint32_t kSop2OpcodeXnorB32 = 0x1c;
 inline constexpr uint32_t kSop2OpcodeBfmB32 = 0x24;
 inline constexpr uint32_t kSop2OpcodeBfmB64 = 0x25;
@@ -72,10 +79,19 @@ inline constexpr uint32_t kSopkOpcodeMulkI32 = 0x10;
 inline constexpr uint32_t kSopkOpcodeSetregB32 = 0x13;
 inline constexpr uint32_t kSopkOpcodeWaitcntVscnt = 0x17;
 inline constexpr uint32_t kSopkOpcodeWaitcntLgkmcnt = 0x1a;
+inline constexpr uint32_t kSopkOpcodeCallB64 = 0x16;
+inline constexpr uint32_t kSopkOpcodeSubvectorLoopBegin = 0x1b;
+inline constexpr uint32_t kSopkOpcodeSubvectorLoopEnd = 0x1c;
 inline constexpr uint32_t kSoppOpcodeBranch = 0x02;
 inline constexpr uint32_t kSoppOpcodeCbranchScc0 = 0x04;
+inline constexpr uint32_t kSoppOpcodeCbranchExecz = 0x08;
 inline constexpr uint32_t kSoppOpcodeCbranchExecnz = 0x09;
 inline constexpr uint32_t kSoppOpcodeBarrier = 0x0a;
+inline constexpr uint32_t kSoppOpcodeTrap = 0x12;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbgsys = 0x17;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbguser = 0x18;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbgsysOrUser = 0x19;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbgsysAndUser = 0x1a;
 
 inline constexpr bool sopp_opcode_is_direct_branch(uint32_t opcode) {
     return opcode == kSoppOpcodeBranch ||
@@ -126,9 +142,17 @@ inline constexpr uint32_t kDsOpcodeBpermuteB32 = 0xb3;
 inline constexpr uint32_t kDsOpcodeMinF32 = 0x12;
 inline constexpr uint32_t kDsOpcodeMaxF32 = 0x13;
 
-// GFX10.3 MUBUF opcodes (ISA Table 99). Keep these names at the decode boundary so resource
-// discovery and SPIR-V emission do not maintain separate, opaque hexadecimal inventories. These are
-// compile-time constants: using them in comparisons and switch labels adds no runtime indirection.
+// GFX10.3 MUBUF opcodes shared by descriptor discovery and emission. These inline constants compile
+// to the same immediate comparisons as the old literals.
+inline constexpr uint32_t kMubufOpcodeStoreDword   = 0x1c;
+inline constexpr uint32_t kMubufOpcodeStoreDwordX2 = 0x1d;
+inline constexpr uint32_t kMubufOpcodeStoreDwordX4 = 0x1e;
+inline constexpr uint32_t kMubufOpcodeStoreDwordX3 = 0x1f;
+
+// GFX10.3 unsigned 64-bit scalar equality compare. Kept with the other scalar opcodes because the
+// guarded-null resource proof and scalar emission must identify the same instruction.
+inline constexpr uint32_t kSopcOpcodeCmpEqU64 = 0x12;
+
 inline constexpr uint32_t kMubufOpcodeLoadDword         = 0x0c;
 inline constexpr uint32_t kMubufOpcodeAtomicSwap        = 0x30;
 inline constexpr uint32_t kMubufOpcodeAtomicCompareSwap = 0x31;
@@ -353,6 +377,22 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
 // only packet shape; callers must still prove that VGPR is zero and that the resource has one
 // materialized, uncompressed mip.
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
+
+// Exact raw-store consumers in GTA V 0x413cf9a00's null-output region. This is packet identity only;
+// callers must independently prove the pc42..48 EXEC guard and the dispatch's null pointer.
+bool rdna2_gta5_null_guarded_raw_store_site(const Rdna2Inst& in);
+
+// Complete byte and direct-CFG identity for GTA V 0x413cf9a00's pc42..80 nullable-output guard.
+// This proves only the static program shape; callers must independently prove that entry user SGPRs
+// s2:s3 are zero for the dispatch before treating the exact pc74/76/78 stores as no-ops.
+bool rdna2_gta5_null_guarded_raw_store_shader(const uint32_t* code, size_t dwords);
+
+// Complete dispatch proof for the same conditional stores. In addition to the static shader shape,
+// entry s2:s3 must be null and no decoded scalar destination may overlap either word before pc42.
+// This is the transferable trust-boundary check used by cached compilation and capture replay.
+bool rdna2_gta5_null_guarded_raw_store_dispatch(
+    const uint32_t* code, size_t dwords,
+    const uint32_t* user_sgprs, size_t user_sgpr_count);
 
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers

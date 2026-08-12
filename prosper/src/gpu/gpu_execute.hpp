@@ -223,6 +223,11 @@ struct SrtUse {
     // scalar provenance connects that mapped qword to the exact linear RAW load; materialization
     // separately checks the launch/index contract before creating a load-only zero marker.
     bool optional_null_raw_load = false;
+    // GTA V 0x413cf9a00's exact null-output dispatch proves that its three raw stores are behind an
+    // EXECZ exit whose preceding mask algebra makes EXEC empty. This is deliberately distinct from
+    // NUM_RECORDS=0: the descriptor has one valid record and must remain a real buffer when the
+    // dispatch supplies a non-null output pointer.
+    bool proven_null_guarded_raw_store = false;
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
     // Minimum byte span needed by this scalar-buffer consumer, measured from V#.Base. Some PS5
@@ -407,6 +412,9 @@ struct ComputeItem {
     uint32_t raw_shader_index = 0xFFFFFFFFu;
     ComputeShaderConfig recompile_config{};
     bool recompile_config_available = false;
+    // Internal, non-serialized token: the final compiler/capture materializer re-established the
+    // complete raw-shader, pc42 scalar-dataflow, and null-dispatch proof for conditional no-op stores.
+    bool null_guarded_raw_store_validated = false;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };
@@ -465,7 +473,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     uint32_t vertex_lds_dwords = 0,
     bool vertex_capture_position = false);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
-// generated SPIR-V participates in the key; per-dispatch push-constant values deliberately do not.
+// generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
+// Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
 std::vector<uint32_t> recompile_compute_shader_cached(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
     const ComputeShaderConfig& config, uint64_t* cache_identity = nullptr,
