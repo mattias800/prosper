@@ -970,6 +970,20 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                             config.local_z, config.threads_x, config.threads_y,
                             config.threads_z, config.wave_size, config.lds_bytes,
                             config.native_subgroup_size);
+                // The VALUES, not just the count. A dispatch-constant entry SGPR decides scalar
+                // control flow -- s10==0 is what proves GTA V 0x413ce6000's pc35 branch untaken and
+                // its pc62..179 interval (and the pc70/153/156/158 resources in it) dead. The
+                // capture has always retained these; printing only `.size()` sent one investigation
+                // through a live GPU probe and a reverted per-lane predicate to reach a fact that
+                // was already sitting in the artifact. Eight per line, indexed, so a specific sN is
+                // greppable.
+                for (size_t i = 0; i < config.user_sgprs.size(); ++i) {
+                    if (i % 8 == 0)
+                        std::printf("    user-sgpr[%2zu..] ", i);
+                    std::printf(" %08x", config.user_sgprs[i]);
+                    if (i % 8 == 7 || i + 1 == config.user_sgprs.size())
+                        std::printf("\n");
+                }
             }
             for (size_t resource_index = 0;
                  resource_index < stage.resource_table.resources.size(); ++resource_index) {
