@@ -2,7 +2,10 @@
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/guest_texture_layout.hpp"
 #include "../src/gpu/pm4_registers.hpp"
+#include "../src/gpu/rdna2_gta5_cf9200_contract.hpp"
+#include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/tile.hpp"
+#include "gta5_cf9200_fixture.hpp"
 #include "gta5_nullable_output_fixture.hpp"
 
 #include <algorithm>
@@ -2208,6 +2211,124 @@ int main(int argc, char** argv) {
         kGtaNullableOutputFixtureRecordCount + 1u;
     CHECK(!materialize_gpu_replay(stale_nullable_launch_capture, nullable_replay, error),
           "replay rejects nullable-output provenance after the captured dispatch grid changes");
+
+    // GTA V 0x413cf9200 retains the whole 224-byte root as the authority witness for its exact
+    // application-record variants. Every no-backing site aliases that range in the capture, while
+    // replay independently repeats full shader/launch/root/site validation before minting a token.
+    constexpr uint64_t cf9200_code_addr = 0x750000u;
+    constexpr uint64_t cf9200_root_addr = 0x760000u;
+    auto cf9200_root = prosper::test::gta5_cf9200_source_and_output_null_root();
+    ShaderResource cf9200_root_resource;
+    cf9200_root_resource.cls = ResourceClass::ConstantBuffer;
+    cf9200_root_resource.format = DataFormat::Float32;
+    cf9200_root_resource.num_components = 1u;
+    cf9200_root_resource.gpu_addr = cf9200_root_addr;
+    cf9200_root_resource.size = kGtaCf9200RootBytes;
+    cf9200_root_resource.stride = kGtaCf9200RootBytes;
+    cf9200_root_resource.fetch_pc = kGtaCf9200RootPc;
+    cf9200_root_resource.host_data =
+        reinterpret_cast<uint8_t*>(cf9200_root.data());
+    cf9200_root_resource.host_data_size = sizeof(cf9200_root);
+
+    ComputeShaderConfig cf9200_config;
+    cf9200_config.user_sgprs = {
+        static_cast<uint32_t>(cf9200_root_addr),
+        static_cast<uint32_t>(cf9200_root_addr >> 32u),
+    };
+    cf9200_config.local_x = cf9200_config.local_y = cf9200_config.local_z = 1u;
+    cf9200_config.threads_x = cf9200_config.threads_y = cf9200_config.threads_z = 1u;
+    cf9200_config.wave_size = 64u;
+    ShaderResourceTable cf9200_table;
+    cf9200_table.resources.push_back(cf9200_root_resource);
+    CHECK(discover_rdna2_gta5_cf9200_no_backing(
+              prosper::test::kGta5Cf9200Program.data(),
+              prosper::test::kGta5Cf9200Program.size(), cf9200_config, cf9200_table),
+          "test setup discovers the complete GTA root-record marker set");
+    assign_convention_bindings(cf9200_table, 2u);
+
+    ComputeItem cf9200_compute;
+    cf9200_compute.spirv = recompile_compute(
+        prosper::test::kGta5Cf9200Program.data(),
+        prosper::test::kGta5Cf9200Program.size(), &cf9200_table, cf9200_config);
+    cf9200_compute.user_sgprs = cf9200_config.user_sgprs;
+    cf9200_compute.resources = std::make_shared<ShaderResourceTable>(cf9200_table);
+    cf9200_compute.launch.threads_x = cf9200_compute.launch.threads_y =
+        cf9200_compute.launch.threads_z = 1u;
+    cf9200_compute.launch.local_x = cf9200_compute.launch.local_y =
+        cf9200_compute.launch.local_z = 1u;
+    cf9200_compute.launch.groups_x = cf9200_compute.launch.groups_y =
+        cf9200_compute.launch.groups_z = 1u;
+    cf9200_compute.code_addr = cf9200_code_addr;
+    cf9200_compute.dispatch_index = 2482u;
+    cf9200_compute.command_order = 2482u;
+    cf9200_compute.recompile_config = cf9200_config;
+    cf9200_compute.recompile_config_available = true;
+    cf9200_compute.gta5_cf9200_no_backing_validated = true;
+    const std::vector<SubmitOperation> cf9200_operations = {
+        {SubmitOperationKind::Dispatch, 2482u, 2482u},
+    };
+    auto cf9200_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        const auto read_span = [&](uint64_t base, const uint8_t* src,
+                                   size_t bytes) -> size_t {
+            if (addr < base || addr >= base + bytes) return 0u;
+            const size_t offset = static_cast<size_t>(addr - base);
+            const size_t take = std::min(n, bytes - offset);
+            std::memcpy(dst, src + offset, take);
+            return take;
+        };
+        if (const size_t read = read_span(
+                cf9200_code_addr,
+                reinterpret_cast<const uint8_t*>(
+                    prosper::test::kGta5Cf9200Program.data()),
+                sizeof(prosper::test::kGta5Cf9200Program)))
+            return read;
+        return read_span(cf9200_root_addr,
+                         reinterpret_cast<const uint8_t*>(cf9200_root.data()),
+                         sizeof(cf9200_root));
+    };
+
+    GpuCaptureFile cf9200_capture;
+    CHECK(!cf9200_compute.spirv.empty() &&
+              capture_submit_items({}, {cf9200_compute}, cf9200_operations, meta,
+                                   cf9200_reader, cf9200_capture, error),
+          "capture retains the exact root-record program, launch, sites, and shared witness");
+    std::vector<uint8_t> cf9200_capture_bytes;
+    GpuCaptureFile cf9200_loaded;
+    GpuReplayFrame cf9200_replay;
+    CHECK(serialize_gpu_capture(cf9200_capture, cf9200_capture_bytes, error) &&
+              deserialize_gpu_capture(cf9200_capture_bytes, cf9200_loaded, error) &&
+              materialize_gpu_replay(cf9200_loaded, cf9200_replay, error) &&
+              cf9200_replay.computes.size() == 1u &&
+              cf9200_replay.computes[0].gta5_cf9200_no_backing_validated,
+          "root-record capture round-trip revalidates provenance and mints the replay token");
+
+    GpuCaptureFile stale_cf9200_site = cf9200_loaded;
+    auto& stale_cf9200_raw = stale_cf9200_site.raw_shader_versions[
+        stale_cf9200_site.computes[0].raw_shader_index];
+    stale_cf9200_raw.words[5] ^= 1u; // mutate the exact pc5 load authorized by the contract
+    stale_cf9200_raw.content_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(stale_cf9200_raw.words.data()),
+        stale_cf9200_raw.words.size() * sizeof(uint32_t));
+    CHECK(!materialize_gpu_replay(stale_cf9200_site, cf9200_replay, error),
+          "replay rejects root-record provenance after mutating the exact pc5 site");
+
+    GpuCaptureFile stale_cf9200_root = cf9200_loaded;
+    const auto root_capture = std::find_if(
+        stale_cf9200_root.computes[0].resources.resources.begin(),
+        stale_cf9200_root.computes[0].resources.resources.end(),
+        [](const GpuCapturedResource& captured) {
+            return captured.resource.fetch_pc == kGtaCf9200RootPc;
+        });
+    CHECK(root_capture != stale_cf9200_root.computes[0].resources.resources.end(),
+          "captured root descriptor remains discoverable by its exact pc64 identity");
+    if (root_capture != stale_cf9200_root.computes[0].resources.resources.end()) {
+        uint32_t zero = 0u;
+        std::memcpy(stale_cf9200_root.blobs[root_capture->blob_index].bytes.data() +
+                        root_capture->blob_offset + 50u * sizeof(uint32_t),
+                    &zero, sizeof(zero));
+        CHECK(!materialize_gpu_replay(stale_cf9200_root, cf9200_replay, error),
+              "replay rejects a captured root whose source sentinel changed");
+    }
 
     GpuCaptureFile mixed_atomic = mixed;
     mixed_atomic.computes[0].recompile_config.storage_buffer_int64_atomics = true;

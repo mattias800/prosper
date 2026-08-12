@@ -1,4 +1,5 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/rdna2_gta5_cf9200_contract.hpp"
 #include "../src/gpu/rdna2_gta5_compute_contracts.hpp"
 #include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/gpu_capture.hpp"
@@ -8,6 +9,7 @@
 #include "../src/host/guest_write_watch.hpp"
 #include "live_compute.hpp"
 #include "seed_reprove.hpp"
+#include "gta5_cf9200_fixture.hpp"
 #include "test_scratch.h"
 
 #include <algorithm>
@@ -730,6 +732,32 @@ int main() {
     malformed_nullable_output_item.resources->resources[0].fetch_pc = UINT32_MAX;
     CHECK(!prosper::frontend::execute_live_compute_items({malformed_nullable_output_item}),
           "the nullable-output token cannot authorize a malformed impossible-stride marker");
+
+    auto cf9200_root_witness =
+        prosper::test::gta5_cf9200_source_and_output_null_root();
+    ShaderResource cf9200_marker = zero_record_rt.resources[0];
+    cf9200_marker.gpu_addr = 0x730000u;
+    cf9200_marker.size = kGtaCf9200RootBytes;
+    cf9200_marker.stride = kGtaCf9200NoBackingStride;
+    cf9200_marker.fetch_pc = 5u;
+    cf9200_marker.host_data =
+        reinterpret_cast<uint8_t*>(cf9200_root_witness.data());
+    cf9200_marker.host_data_size = sizeof(cf9200_root_witness);
+    ComputeItem cf9200_marker_item = zero_record_item;
+    cf9200_marker_item.resources = std::make_shared<ShaderResourceTable>();
+    cf9200_marker_item.resources->resources.push_back(cf9200_marker);
+    CHECK(is_proven_gta5_cf9200_no_backing(cf9200_marker) &&
+              !prosper::frontend::execute_live_compute_items({cf9200_marker_item}),
+          "a GTA root-record marker has no live-backend authority without its token");
+    cf9200_marker_item.gta5_cf9200_no_backing_validated = true;
+    CHECK(prosper::frontend::execute_live_compute_items({cf9200_marker_item}),
+          "a validated GTA root-record marker completes as a descriptorless no-op");
+    ComputeItem malformed_cf9200_item = cf9200_marker_item;
+    malformed_cf9200_item.resources =
+        std::make_shared<ShaderResourceTable>(*cf9200_marker_item.resources);
+    malformed_cf9200_item.resources->resources[0].size--;
+    CHECK(!prosper::frontend::execute_live_compute_items({malformed_cf9200_item}),
+          "the root-record token cannot authorize a malformed marker");
 
     std::array<uint32_t, 81> guarded_store_code;
     guarded_store_code.fill(0xbf800000u); // s_nop 0
