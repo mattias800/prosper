@@ -895,27 +895,45 @@ int main() {
                            [](const Rdna2Inst& in) { return in.pc == 4; }),
           "s_lshl_b32 folds, so its SCC branch prunes the dead resource block");
 
-    // The right-shift sibling, and the compare constant is chosen so the arm separates a right
-    // shift from a LEFT one rather than merely proving that something folded. 8 >> 3 = 1 makes
-    // `s_cmp_lg_u32 s1, 1` false, SCC = 0, and s_cbranch_scc0 taken, so the block is pruned; the
-    // left-shift misreading gives 8 << 3 = 64, `(64 != 1)` true, SCC = 1, branch not taken, block
-    // retained. Comparing against 8 instead -- the obvious first choice -- would pass under BOTH
-    // readings, since 1 and 64 are both unequal to 8. Verified by mutation: folding 0x20 as a left
-    // shift fails this arm; deleting the 0x20 entry fails it too, via the `== 1`.
-    const uint32_t shifted_live_fetch[] = {
-        0xBE800388u,             // pc0: s_mov_b32 s0, 8
-        0x90018300u,             // pc1: s_lshr_b32 s1, s0, 3   -> 1
-        0xBF078101u,             // pc2: s_cmp_lg_u32 s1, 1     -> SCC = (1 != 1) = false
-        0xBF840002u,             // pc3: s_cbranch_scc0 +2      -> taken, skips pc4..5
-        0xE0002000u, 0x80030100u,// pc4: dead buffer_load_format_x
-        0xBF810000u,             // pc6: s_endpgm
+    // The two right shifts, each pinned against the OTHER one. The shifted value has bit 31 set,
+    // which is the whole point: an operand with bit 31 clear cannot separate them, because
+    // `8 >> 3` is 1 under both a logical and an arithmetic shift. A first version of this arm used
+    // 8 and would have passed with 0x20 and 0x22 swapped -- and since both entries arrived in one
+    // commit, nothing else pinned them apart. Same failure as comparing against 8 instead of 1 at
+    // the left-vs-right level, one level deeper.
+    //
+    // 0x80000000 >> 28 is 0x8 logically and 0xFFFFFFF8 arithmetically, so each arm's compare
+    // constant is the OTHER opcode's wrong answer's complement: the logical arm compares against 8
+    // and the arithmetic arm against -8. Mutation-verified in both directions.
+    const uint32_t logical_shift_fetch[] = {
+        0xBE8003FFu, 0x80000000u,// pc0: s_mov_b32 s0, 0x80000000
+        0x90019C00u,             // pc2: s_lshr_b32 s1, s0, 28  -> 0x00000008
+        0xBF078801u,             // pc3: s_cmp_lg_u32 s1, 8     -> SCC = (8 != 8) = false
+        0xBF840002u,             // pc4: s_cbranch_scc0 +2      -> taken, skips pc5..6
+        0xE0002000u, 0x80030100u,// pc5: dead buffer_load_format_x
+        0xBF810000u,             // pc7: s_endpgm
     };
-    std::vector<Rdna2Inst> shifted_live;
-    rdna2_walk(shifted_live_fetch, std::size(shifted_live_fetch), shifted_live);
-    CHECK(rdna2_specialize_shader_constant_branches(shifted_live) == 1 &&
-              std::none_of(shifted_live.begin(), shifted_live.end(),
-                           [](const Rdna2Inst& in) { return in.pc == 4; }),
-          "s_lshr_b32 folds to the RIGHT-shifted value, not the left-shifted one");
+    std::vector<Rdna2Inst> logical_shift;
+    rdna2_walk(logical_shift_fetch, std::size(logical_shift_fetch), logical_shift);
+    CHECK(rdna2_specialize_shader_constant_branches(logical_shift) == 1 &&
+              std::none_of(logical_shift.begin(), logical_shift.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 5; }),
+          "s_lshr_b32 folds LOGICALLY -- 0x80000000 >> 28 is 8, not -8");
+
+    const uint32_t arithmetic_shift_fetch[] = {
+        0xBE8003FFu, 0x80000000u,// pc0: s_mov_b32 s0, 0x80000000
+        0x91019C00u,             // pc2: s_ashr_i32 s1, s0, 28  -> 0xFFFFFFF8
+        0xBF07C801u,             // pc3: s_cmp_lg_u32 s1, -8    -> SCC = (-8 != -8) = false
+        0xBF840002u,             // pc4: s_cbranch_scc0 +2      -> taken, skips pc5..6
+        0xE0002000u, 0x80030100u,// pc5: dead buffer_load_format_x
+        0xBF810000u,             // pc7: s_endpgm
+    };
+    std::vector<Rdna2Inst> arithmetic_shift;
+    rdna2_walk(arithmetic_shift_fetch, std::size(arithmetic_shift_fetch), arithmetic_shift);
+    CHECK(rdna2_specialize_shader_constant_branches(arithmetic_shift) == 1 &&
+              std::none_of(arithmetic_shift.begin(), arithmetic_shift.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 5; }),
+          "s_ashr_i32 folds ARITHMETICALLY -- 0x80000000 >> 28 is -8, not 8");
 
     // Exact instruction words and PCs from the live traversal loop. The loop-selected BVH sites at
     // PC968/1007 can write work into v59/v60 and return through PC1671/1674, so shader-constant
