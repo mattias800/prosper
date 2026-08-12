@@ -12,6 +12,7 @@
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
+#include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
 #include "../host/guest_memory_map.hpp"
@@ -300,6 +301,7 @@ struct ShaderResourceCompileKey {
     bool zero_record_raw = false;
     bool optional_null_raw_load = false;
     bool proven_null_guarded_raw_store = false;
+    bool proven_null_nullable_raw_buffer = false;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -496,6 +498,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.zero_record_raw);
             hash = hash_mix(hash, resource.optional_null_raw_load);
             hash = hash_mix(hash, resource.proven_null_guarded_raw_store);
+            hash = hash_mix(hash, resource.proven_null_nullable_raw_buffer);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1247,6 +1250,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             // documents and enforces the semantic boundary directly.
             compiled.proven_null_guarded_raw_store =
                 is_proven_null_guarded_raw_store(resource);
+            compiled.proven_null_nullable_raw_buffer =
+                is_proven_null_nullable_raw_buffer(resource);
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1542,12 +1547,18 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const bool has_null_guarded_raw_store = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_proven_null_guarded_raw_store);
+    const bool has_nullable_output_raw_buffer = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_nullable_raw_buffer_marker_candidate);
     // Push-constant values intentionally stay out of the general compute cache key. Conditional
     // store elision is the exception: validate its raw shader and exact dispatch before even looking
     // in the cache, so a warm null-dispatch module cannot be returned for changed s2:s3.
     if (has_null_guarded_raw_store &&
         !rdna2_gta5_null_guarded_raw_store_dispatch(
             code, dwords, config.user_sgprs.data(), config.user_sgprs.size()))
+        return {};
+    if (has_nullable_output_raw_buffer &&
+        !rdna2_gta5_nullable_output_dispatch(code, dwords, config, *resources))
         return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
@@ -2160,6 +2171,19 @@ static bool gta_optional_null_descriptor_shape(
            descriptor.size_bytes <= 0x10000000u;
 }
 
+static bool gta_nullable_output_descriptor_shape(
+        const DecodedBufferDescriptor& descriptor, const uint32_t words[4],
+        uint32_t record_count) {
+    return words[0] == 0u && words[1] == kGtaNullableOutputStrideWord &&
+           record_count != 0u && record_count <= kGtaNullableOutputMaxRecordCount &&
+           words[2] == record_count &&
+           words[3] == kGtaNullableOutputConfigWord &&
+           descriptor.base == 0u && descriptor.stride == kGtaNullableOutputStride &&
+           descriptor.num_records == record_count &&
+           descriptor.size_bytes == static_cast<uint64_t>(record_count) *
+                                        kGtaNullableOutputStride;
+}
+
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
@@ -2267,6 +2291,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // Producer PC per tagged origin. The exact location lets the optional proof impose a narrow
     // dominance contract over direct CFG instead of trusting this fold's linear walk.
     std::vector<uint32_t> optional_table_null_origin_pc(1u, UINT32_MAX);
+    // Same mapped-qword proof for GTA V's distinct +0x20 output/work pointer convention. Keeping a
+    // separate origin table prevents the existing +0x58 load-only contract from authorizing stores.
+    std::vector<uint32_t> nullable_output_null_origin_pc(1u, UINT32_MAX);
     // Only x16-header roots need the narrow straight-line dominance contract added for GTA V. The
     // generic mapped-qword null proof predates this shape and has separate loop/CFG validation.
     // Origin ids are monotonic and never restored, so this metadata is immutable once published.
@@ -3664,6 +3691,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
                     addr == base + kGtaOptionalBufferPointerOffset &&
                     readable(base, kGtaOptionalBufferTableBytes);
+                const bool nullable_output_table_source =
+                    !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
+                    imm_only && in.literal == kGtaNullableOutputPointerOffset &&
+                    sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
+                    addr == base + kGtaNullableOutputPointerOffset &&
+                    readable(base, kGtaNullableOutputWitnessBytes);
                 uint32_t bvh_count_origin = 0;
                 if (!is_buffer && n == 4 && imm_only && in.literal == 0x58u &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
@@ -3713,6 +3746,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             optional_table_null_origin_pc.resize(
                                 (size_t)origin + 1u, UINT32_MAX);
                         optional_table_null_origin_pc[(size_t)origin] = in.pc;
+                        mark_optional_null_role(sdst, OptionalNullRole::BaseLo);
+                        mark_optional_null_role(sdst + 1, OptionalNullRole::BaseHi);
+                    }
+                    if (nullable_output_table_source) {
+                        if (nullable_output_null_origin_pc.size() <= origin)
+                            nullable_output_null_origin_pc.resize(
+                                static_cast<size_t>(origin) + 1u, UINT32_MAX);
+                        nullable_output_null_origin_pc[static_cast<size_t>(origin)] = in.pc;
                         mark_optional_null_role(sdst, OptionalNullRole::BaseLo);
                         mark_optional_null_role(sdst + 1, OptionalNullRole::BaseHi);
                     }
@@ -4156,6 +4197,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             optional_null_role[(size_t)(srsrc + 2)] == OptionalNullRole::RecordCount &&
                             optional_null_role[(size_t)(srsrc + 3)] == OptionalNullRole::Config &&
                             gta_optional_null_descriptor_shape(d, u.v4.data());
+                        const bool nullable_origin = optional_low_origin &&
+                            optional_low_origin == optional_high_origin &&
+                            optional_low_origin < nullable_output_null_origin_pc.size() &&
+                            nullable_output_null_origin_pc[static_cast<size_t>(
+                                optional_low_origin)] != UINT32_MAX;
+                        const bool proven_null_nullable_raw_buffer =
+                            nullable_origin &&
+                            rdna2_gta5_nullable_output_shader(code, dwords) &&
+                            rdna2_gta5_nullable_output_site(in) !=
+                                Gta5NullableOutputAccess::None &&
+                            valid_reg(srsrc + 3) &&
+                            user_sgprs && nsgpr > 7u &&
+                            gta_nullable_output_descriptor_shape(
+                                d, u.v4.data(), user_sgprs[7]);
                         if (trc && d.base == 0u && d.num_records != 0u)
                             fprintf(stderr,
                                     "[dyntrace] optional-null-candidate pc=%u origin=%u/%u tagged=%d "
@@ -4174,7 +4229,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             gta5_null_raw_store_descriptor(u.v4) &&
                             rdna2_gta5_null_guarded_raw_store_site(in);
                         if (proven_null_guarded_raw_store || zero_record_raw ||
-                            optional_null_raw_load || (!format_load_use &&
+                            optional_null_raw_load || proven_null_nullable_raw_buffer ||
+                            (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
                              d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
                              (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
@@ -4182,6 +4238,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             u.optional_null_raw_load = optional_null_raw_load;
                             u.proven_null_guarded_raw_store =
                                 proven_null_guarded_raw_store;
+                            u.proven_null_nullable_raw_buffer =
+                                proven_null_nullable_raw_buffer;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
                                              "stride=%u size=%u zero-record=%d optional-null=%d "
@@ -4569,7 +4627,9 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  const uint32_t* user_sgprs, uint32_t nsgpr,
                                                  uint32_t linear_local_x,
                                                  uint32_t linear_threads_x,
-                                                 uint32_t tgid_x_sgpr) {
+                                                 uint32_t tgid_x_sgpr,
+                                                 const ComputeResourceDispatchContext*
+                                                     dispatch_context) {
     std::vector<SrtUse> srt_uses;
     const std::vector<DynFetch> direct_fetches = resolve_dynamic_fetch(
         code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/0, &srt_uses);
@@ -4660,6 +4720,41 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 code, dwords, user_sgprs, nsgpr);
     }
 
+    bool nullable_output_shape = false;
+    uint64_t nullable_output_table_root = 0;
+    const bool has_nullable_output_candidate =
+        std::any_of(srt_uses.begin(), srt_uses.end(), [](const SrtUse& use) {
+            return use.proven_null_nullable_raw_buffer;
+        });
+    if (dispatch_context && user_sgprs && nsgpr >= 2u &&
+        has_nullable_output_candidate) {
+        const bool nullable_output_launch = rdna2_gta5_nullable_output_launch(
+            code, dwords, user_sgprs, nsgpr,
+            dispatch_context->local_x, dispatch_context->local_y,
+            dispatch_context->local_z, dispatch_context->threads_x,
+            dispatch_context->threads_y, dispatch_context->threads_z,
+            dispatch_context->exact_thread_extent, dispatch_context->wave_size,
+            dispatch_context->tgid_x_en, dispatch_context->tgid_y_en,
+            dispatch_context->tgid_z_en, dispatch_context->tidig_comp_cnt);
+        nullable_output_shape = nullable_output_launch;
+        nullable_output_table_root = static_cast<uint64_t>(user_sgprs[0]) |
+            (static_cast<uint64_t>(user_sgprs[1]) << 32u);
+        if (nullable_output_shape) {
+            if (!guest_readable(nullable_output_table_root,
+                                kGtaNullableOutputWitnessBytes)) {
+                nullable_output_shape = false;
+            } else {
+                uint64_t witnessed_pointer = UINT64_MAX;
+                std::memcpy(&witnessed_pointer,
+                    reinterpret_cast<const uint8_t*>(
+                        static_cast<uintptr_t>(nullable_output_table_root)) +
+                        kGtaNullableOutputPointerOffset,
+                    sizeof(witnessed_pointer));
+                nullable_output_shape = witnessed_pointer == 0u;
+            }
+        }
+    }
+
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
         if (u.kind == 3) {
@@ -4725,6 +4820,39 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 if (r0.srt_offset == u.key) { clash = true; break; }
 
         const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+        if (u.proven_null_nullable_raw_buffer) {
+            // Repeat the complete program/launch/witness proof before preserving a source-table
+            // range whose only semantic effect is to authorize exact zero-load/drop-store emission.
+            // Ordinary non-null buffers never acquire this impossible-stride marker.
+            if (u.zero_record_raw || u.optional_null_raw_load ||
+                u.proven_null_guarded_raw_store || u.instruction_format != UINT32_MAX ||
+                u.key != 0xFFFFFFFFu || u.required_size != 0u ||
+                !nullable_output_shape ||
+                !gta_nullable_output_descriptor_shape(
+                    d, u.v4.data(), user_sgprs[7]) ||
+                u.use_pc >= dwords)
+                continue;
+            Rdna2Inst marker_consumer =
+                rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
+            marker_consumer.pc = u.use_pc;
+            if (rdna2_gta5_nullable_output_site(marker_consumer) ==
+                Gta5NullableOutputAccess::None)
+                continue;
+            const uint64_t marker_key = 0x8000000500000000ull | u.use_pc;
+            if (!seen.insert(marker_key).second) continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Unknown;
+            r.num_components = 0;
+            r.gpu_addr = nullable_output_table_root;
+            r.size = kGtaNullableOutputWitnessBytes;
+            r.stride = kProvenNullNullableRawBufferStride;
+            r.srt_offset = 0xFFFFFFFFu;
+            r.sgpr_base = 0xFFFFFFFFu;
+            r.fetch_pc = u.use_pc;
+            table.resources.push_back(r);
+            continue;
+        }
         if (u.optional_null_raw_load) {
             // The fold proves the mapped +0x58 producer and exact scalar V# construction. Repeat
             // the packet/launch half here so a forged SrtUse cannot manufacture zero semantics.
@@ -6124,12 +6252,23 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // fold call had not been given that bound, so the two disagreed about which registers exist.
         const uint32_t fold_user_count = std::min<uint32_t>(user_count, kUserSgprs);
         {
+            const ComputeResourceDispatchContext resource_dispatch_context{
+                launch.local_x, launch.local_y, launch.local_z,
+                launch.threads_x, launch.threads_y, launch.threads_z,
+                ((dispatch.modifier >>
+                    P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT) &
+                    P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_MASK) != 0,
+                compute_wave_size,
+                tgid_x_en, tgid_y_en, tgid_z_en,
+                field(P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_SHIFT,
+                      P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_MASK),
+            };
             const std::vector<SrtUse> srt_uses = add_compute_buffer_resources(
                 *table, (const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                 sgprs, fold_user_count,
-                linear_store_proof_context ? launch.local_x : 0,
-                linear_store_proof_context ? launch.threads_x : 0,
-                linear_store_proof_context ? user_count : UINT32_MAX);
+                launch.local_x, launch.threads_x,
+                linear_store_proof_context ? user_count : UINT32_MAX,
+                &resource_dispatch_context);
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
                 if (u.kind != 0) continue;                 // buffers were materialized by the shared helper
@@ -6513,6 +6652,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
             rdna2_gta5_null_guarded_raw_store_dispatch(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords, config.user_sgprs.data(), config.user_sgprs.size());
+        item.nullable_output_raw_buffer_validated = item.spirv.size() &&
+            table && std::any_of(table->resources.begin(), table->resources.end(),
+                                 is_proven_null_nullable_raw_buffer) &&
+            rdna2_gta5_nullable_output_dispatch(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, config, *table);
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;

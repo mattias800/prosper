@@ -3,6 +3,7 @@
 #include "../src/gpu/guest_texture_layout.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/tile.hpp"
+#include "gta5_nullable_output_fixture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2087,6 +2088,126 @@ int main(int argc, char** argv) {
     CHECK(!serialize_gpu_capture(stale_guarded_store_capture,
                                  guarded_store_bytes, error),
           "capture rejects guarded-store provenance whose shader overwrites s2 before pc42");
+
+    // The nullable-output marker is backed by a captured 40-byte dispatch-table witness. Its
+    // impossible stride remains metadata only: replay mints the internal authority token after
+    // independently checking the exact raw shader, launch, marker PC, and zero +0x20 qword.
+    constexpr uint64_t nullable_code_addr = 0x730000u;
+    constexpr uint64_t nullable_table_addr = 0x740000u;
+    std::array<uint8_t, kGtaNullableOutputWitnessBytes> nullable_witness{};
+    ShaderResource nullable_marker;
+    nullable_marker.cls = ResourceClass::ConstantBuffer;
+    nullable_marker.format = DataFormat::Unknown;
+    nullable_marker.num_components = 0u;
+    nullable_marker.gpu_addr = nullable_table_addr;
+    nullable_marker.size = kGtaNullableOutputWitnessBytes;
+    nullable_marker.stride = kProvenNullNullableRawBufferStride;
+    nullable_marker.fetch_pc = 38u;
+    nullable_marker.host_data = nullable_witness.data();
+    nullable_marker.host_data_size = nullable_witness.size();
+
+    ComputeShaderConfig nullable_config;
+    nullable_config.user_sgprs.assign(9u, 0u);
+    nullable_config.user_sgprs[0] = static_cast<uint32_t>(nullable_table_addr);
+    nullable_config.user_sgprs[1] = static_cast<uint32_t>(nullable_table_addr >> 32u);
+    nullable_config.user_sgprs[7] = kGtaNullableOutputFixtureRecordCount;
+    nullable_config.user_sgprs[8] = kGtaNullableOutputUserSgpr8;
+    nullable_config.local_x = kGtaNullableOutputLocalSize;
+    nullable_config.local_y = nullable_config.local_z = 1u;
+    nullable_config.threads_x = kGtaNullableOutputFixtureThreads;
+    nullable_config.threads_y = nullable_config.threads_z = 1u;
+    nullable_config.wave_size = 64u;
+    nullable_config.tgid_x_en = true;
+
+    ComputeItem nullable_compute;
+    nullable_compute.spirv = {0x07230203u};
+    nullable_compute.user_sgprs = nullable_config.user_sgprs;
+    nullable_compute.resources = std::make_shared<ShaderResourceTable>();
+    nullable_compute.resources->resources.push_back(nullable_marker);
+    nullable_compute.launch.threads_x = kGtaNullableOutputFixtureThreads;
+    nullable_compute.launch.threads_y = nullable_compute.launch.threads_z = 1u;
+    nullable_compute.launch.local_x = kGtaNullableOutputLocalSize;
+    nullable_compute.launch.local_y = nullable_compute.launch.local_z = 1u;
+    nullable_compute.launch.groups_x = kGtaNullableOutputFixtureRecordCount;
+    nullable_compute.launch.groups_y = nullable_compute.launch.groups_z = 1u;
+    nullable_compute.code_addr = nullable_code_addr;
+    nullable_compute.dispatch_index = 2481u;
+    nullable_compute.command_order = 2481u;
+    nullable_compute.recompile_config = nullable_config;
+    nullable_compute.recompile_config_available = true;
+    const std::vector<SubmitOperation> nullable_operations = {
+        {SubmitOperationKind::Dispatch, 2481u, 2481u},
+    };
+    auto nullable_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        const auto read_span = [&](uint64_t base, const uint8_t* src,
+                                   size_t bytes) -> size_t {
+            if (addr < base || addr >= base + bytes) return 0u;
+            const size_t offset = static_cast<size_t>(addr - base);
+            const size_t take = std::min(n, bytes - offset);
+            std::memcpy(dst, src + offset, take);
+            return take;
+        };
+        if (const size_t read = read_span(
+                nullable_code_addr,
+                reinterpret_cast<const uint8_t*>(
+                    prosper::test::kGta5WorkgroupStoreProgram.data()),
+                sizeof(prosper::test::kGta5WorkgroupStoreProgram)))
+            return read;
+        return read_span(nullable_table_addr, nullable_witness.data(),
+                         nullable_witness.size());
+    };
+
+    GpuCaptureFile nullable_capture;
+    CHECK(capture_submit_items({}, {nullable_compute}, nullable_operations, meta,
+                               nullable_reader, nullable_capture, error) &&
+              nullable_capture.computes.size() == 1u &&
+              nullable_capture.computes[0].raw_shader_index <
+                  nullable_capture.raw_shader_versions.size() &&
+              nullable_capture.computes[0].resources.resources.size() == 1u &&
+              nullable_capture.computes[0].resources.resources[0].captured_size ==
+                  kGtaNullableOutputWitnessBytes,
+          "capture retains the exact nullable-output shader, launch, marker, and table witness");
+    std::vector<uint8_t> nullable_capture_bytes;
+    GpuCaptureFile nullable_loaded;
+    GpuReplayFrame nullable_replay;
+    CHECK(serialize_gpu_capture(nullable_capture, nullable_capture_bytes, error) &&
+              deserialize_gpu_capture(nullable_capture_bytes, nullable_loaded, error) &&
+              materialize_gpu_replay(nullable_loaded, nullable_replay, error) &&
+              nullable_replay.computes.size() == 1u &&
+              nullable_replay.computes[0].nullable_output_raw_buffer_validated &&
+              is_proven_null_nullable_raw_buffer(
+                  nullable_replay.computes[0].resources->resources[0]),
+          "nullable-output capture round-trip revalidates provenance and mints the replay token");
+
+    GpuCaptureFile nonnull_nullable_capture = nullable_loaded;
+    const GpuCapturedResource& loaded_nullable_marker =
+        nonnull_nullable_capture.computes[0].resources.resources[0];
+    nonnull_nullable_capture.blobs[loaded_nullable_marker.blob_index]
+        .bytes[loaded_nullable_marker.blob_offset + kGtaNullableOutputPointerOffset] = 1u;
+    CHECK(!materialize_gpu_replay(nonnull_nullable_capture, nullable_replay, error),
+          "replay rejects a nullable-output capture whose +0x20 witness became non-null");
+
+    GpuCaptureFile wrong_pc_nullable_capture = nullable_loaded;
+    wrong_pc_nullable_capture.computes[0].resources.resources[0].resource.fetch_pc =
+        UINT32_MAX;
+    CHECK(!materialize_gpu_replay(wrong_pc_nullable_capture, nullable_replay, error),
+          "replay rejects a malformed nullable-output sentinel whose exact marker PC was lost");
+
+    GpuCaptureFile stale_nullable_shader_capture = nullable_loaded;
+    auto& stale_nullable_raw = stale_nullable_shader_capture.raw_shader_versions[
+        stale_nullable_shader_capture.computes[0].raw_shader_index];
+    stale_nullable_raw.words[38] ^= 1u;
+    stale_nullable_raw.content_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(stale_nullable_raw.words.data()),
+        stale_nullable_raw.words.size() * sizeof(uint32_t));
+    CHECK(!materialize_gpu_replay(stale_nullable_shader_capture, nullable_replay, error),
+          "replay rejects nullable-output provenance after mutating the exact raw-buffer site");
+
+    GpuCaptureFile stale_nullable_launch_capture = nullable_loaded;
+    stale_nullable_launch_capture.computes[0].launch.groups_x =
+        kGtaNullableOutputFixtureRecordCount + 1u;
+    CHECK(!materialize_gpu_replay(stale_nullable_launch_capture, nullable_replay, error),
+          "replay rejects nullable-output provenance after the captured dispatch grid changes");
 
     GpuCaptureFile mixed_atomic = mixed;
     mixed_atomic.computes[0].recompile_config.storage_buffer_int64_atomics = true;

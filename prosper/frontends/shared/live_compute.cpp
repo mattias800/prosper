@@ -4213,6 +4213,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // pc42 scalar dataflow, and the dispatch's user s2:s3.
     if (has_conditional_noop && !item.null_guarded_raw_store_validated)
         return false;
+    const bool has_nullable_output = item.resources &&
+        std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+                    is_nullable_raw_buffer_marker_candidate);
+    // This marker retains a mapped/captured source-table witness, but that byte range is still data,
+    // not authority. Only realization or replay may mint the family-specific final-proof token.
+    if (has_nullable_output &&
+        (!item.nullable_output_raw_buffer_validated ||
+         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+                     [](const ShaderResource& resource) {
+                         return is_nullable_raw_buffer_marker_candidate(resource) &&
+                                !is_proven_null_nullable_raw_buffer(resource);
+                     }))) return false;
     double setup_validate_ms = std::chrono::duration<double, std::milli>(
         ComputeClock::now() - setup_validate_start).count();
     double setup_buffers_ms = 0.0;
@@ -4245,7 +4257,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::all_of(item.resources->resources.begin(), item.resources->resources.end(),
                     [](const ShaderResource& resource) {
                         return is_zero_record_raw_buffer(resource) ||
-                               is_proven_null_guarded_raw_store(resource);
+                               is_proven_null_guarded_raw_store(resource) ||
+                               is_proven_null_nullable_raw_buffer(resource);
                     });
     if (descriptors.empty() && image_descriptors.empty() && !all_proven_no_backing_noop)
         return false;

@@ -12,6 +12,7 @@
 #include "build_revision.hpp"
 #include "guest_texture_layout.hpp"
 #include "rdna2_decode.hpp"
+#include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
 #include "videoout_present.hpp"
@@ -1348,6 +1349,72 @@ bool validate_captured_null_guarded_raw_store(
     return true;
 }
 
+bool captured_compute_has_nullable_output_raw_buffer(
+        const GpuCapturedCompute& compute) {
+    return compute.resources.present &&
+        std::any_of(compute.resources.resources.begin(),
+                    compute.resources.resources.end(),
+                    [](const GpuCapturedResource& captured) {
+                        return is_nullable_raw_buffer_marker_candidate(captured.resource);
+                    });
+}
+
+bool validate_captured_nullable_output_raw_buffer(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!captured_compute_has_nullable_output_raw_buffer(compute)) return true;
+    if (!compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        error = "nullable-output marker lacks raw recompile provenance";
+        return false;
+    }
+    if (compute.launch.local_x != kGtaNullableOutputLocalSize ||
+        compute.launch.local_y != 1u || compute.launch.local_z != 1u ||
+        compute.recompile_config.user_sgprs.size() <= 7u ||
+        compute.recompile_config.user_sgprs[7] == 0u ||
+        compute.recompile_config.user_sgprs[7] > kGtaNullableOutputMaxRecordCount ||
+        static_cast<uint64_t>(compute.launch.threads_x) !=
+            static_cast<uint64_t>(compute.recompile_config.user_sgprs[7]) *
+                kGtaNullableOutputLocalSize ||
+        compute.launch.threads_y != 1u || compute.launch.threads_z != 1u ||
+        compute.launch.groups_x != compute.recompile_config.user_sgprs[7] ||
+        compute.launch.groups_y != 1u || compute.launch.groups_z != 1u) {
+        error = "nullable-output marker has stale captured launch provenance";
+        return false;
+    }
+
+    ShaderResourceTable validated_resources;
+    validated_resources.resources.reserve(compute.resources.resources.size());
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        ShaderResource resource = captured.resource;
+        if (is_nullable_raw_buffer_marker_candidate(resource)) {
+            if (!is_proven_null_nullable_raw_buffer(resource)) {
+                error = "nullable-output marker has malformed sentinel metadata";
+                return false;
+            }
+            if (captured.blob_index >= capture.blobs.size() ||
+                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
+                kGtaNullableOutputWitnessBytes >
+                    capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset) {
+                error = "nullable-output marker lacks its table witness";
+                return false;
+            }
+            resource.host_data = const_cast<uint8_t*>(
+                capture.blobs[captured.blob_index].bytes.data() + captured.blob_offset);
+            resource.host_data_size = kGtaNullableOutputWitnessBytes;
+        }
+        validated_resources.resources.push_back(resource);
+    }
+
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    if (!rdna2_gta5_nullable_output_dispatch(
+            raw.data(), raw.size(), compute.recompile_config, validated_resources)) {
+        error = "nullable-output marker has stale shader, launch, or table provenance";
+        return false;
+    }
+    return true;
+}
+
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
     if (capture.raw_shader_versions.size() > kMaxResources ||
         capture.failure_diagnostics.size() > kMaxOperations) {
@@ -1389,6 +1456,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
             return false;
         }
         if (!validate_captured_null_guarded_raw_store(capture, compute, error))
+            return false;
+        if (!validate_captured_nullable_output_raw_buffer(capture, compute, error))
             return false;
         if (compute.raw_shader_index != 0xFFFFFFFFu)
             raw_referenced[compute.raw_shader_index] = true;
@@ -4190,6 +4259,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     out.computes.reserve(c.computes.size());
     for (const auto& x : c.computes) {
         if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
+        if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
         ComputeItem compute;
         compute.spirv = x.spirv;
         compute.launch = x.launch;
@@ -4203,6 +4273,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.recompile_config_available = x.recompile_config_available;
         compute.null_guarded_raw_store_validated =
             captured_compute_has_null_guarded_raw_store(x);
+        compute.nullable_output_raw_buffer_validated =
+            captured_compute_has_nullable_output_raw_buffer(x);
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
         if (!table(x.resources, compute.resources)) return false;
