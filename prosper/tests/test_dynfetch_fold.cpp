@@ -2692,9 +2692,10 @@ int main() {
           "conditional branch across count/config keeps the optional chain fail-visible");
 
     // The sibling 0x413cf5400 terminal reaches the same table convention through an in-place
-    // s_or_b32 stride patch rather than s_bitset1_b32. Keep its exact prefix through pc40 so the
-    // second observed production chain cannot regress behind the pc10 fixture.
-    const std::array<uint32_t, 43> optional_null_raw_or = {
+    // s_or_b32 stride patch rather than s_bitset1_b32. Keep its exact prefix through the
+    // post-consumer pc46 branch: later control flow is irrelevant unless it enters the straight-line
+    // producer/consumer interval, and a fixture ending at pc40 failed to exercise that distinction.
+    const std::array<uint32_t, 48> optional_null_raw_or = {
         0xbfa00003u, 0xd7460016u, 0x04010c0fu, 0x8f6a9e0eu,
         0x8010ff00u, 0x000000e8u, 0xbe920382u, 0x82118001u,
         0xbe9303ffu, 0x00016204u, 0xbe88047eu, 0x7d2d00f9u,
@@ -2709,6 +2710,9 @@ int main() {
         0x811ec102u,                         // pc37: s_add_i32 s30,s2,-1
         0xbe9f03ffu, kGtaOptionalBufferConfigWord,
         0xe0302000u, 0x80070016u,            // pc40: exact optional RAW load
+        0xbe9f03ffu, kGtaOptionalBufferConfigWord, // pc42: production tail
+        0xbf8c3f70u, 0x7daa0087u,
+        0xbf88010fu,                         // pc46: production branch -> pc318
         0xbf810000u,
     };
     ShaderResourceTable optional_or_resources;
@@ -2722,7 +2726,7 @@ int main() {
               is_optional_null_raw_load_buffer(*optional_or_resources.by_fetch_pc(40u)),
           "pc40 in-place OR chain materializes the same distinct optional-null marker");
 
-    std::array<uint32_t, 43> optional_or_wrong_stride = optional_null_raw_or;
+    std::array<uint32_t, 48> optional_or_wrong_stride = optional_null_raw_or;
     optional_or_wrong_stride[36] = 0x00080000u;
     ShaderResourceTable optional_or_wrong_stride_resources;
     const std::vector<SrtUse> optional_or_wrong_stride_uses = add_compute_buffer_resources(
@@ -2739,6 +2743,23 @@ int main() {
                !is_optional_null_raw_load_buffer(
                    *optional_or_wrong_stride_resources.by_fetch_pc(40u))),
           "pc35 OR-literal mutation removes the second terminal's optional-null proof");
+
+    std::array<uint32_t, 48> optional_or_backedge_into_tail = optional_null_raw_or;
+    optional_or_backedge_into_tail[46] = 0xbf88fff7u; // pc46 -> pc38, after the producer
+    ShaderResourceTable optional_or_backedge_resources;
+    const std::vector<SrtUse> optional_or_backedge_uses = add_compute_buffer_resources(
+        optional_or_backedge_resources, optional_or_backedge_into_tail.data(),
+        optional_or_backedge_into_tail.size(), optional_user_sgprs.data(),
+        optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+        kGtaOptionalBufferTgidSgpr);
+    CHECK(std::none_of(optional_or_backedge_uses.begin(), optional_or_backedge_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.use_pc == 40u && use.optional_null_raw_load;
+                       }) &&
+              (!optional_or_backedge_resources.by_fetch_pc(40u) ||
+               !is_optional_null_raw_load_buffer(
+                   *optional_or_backedge_resources.by_fetch_pc(40u))),
+          "pc46 backedge into the descriptor tail keeps the optional chain fail-visible");
 
     auto optional_mutation_stays_rejected = [&](std::array<uint32_t, 13> code) {
         ShaderResourceTable resources;

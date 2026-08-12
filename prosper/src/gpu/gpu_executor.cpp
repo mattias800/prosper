@@ -2135,22 +2135,6 @@ static bool gta_optional_null_descriptor_shape(
            descriptor.size_bytes <= 0x10000000u;
 }
 
-static bool gta_optional_null_direct_cfg_dominates(
-        const std::vector<Rdna2Inst>& instructions, uint32_t producer_pc,
-        uint32_t consumer_pc) {
-    if (producer_pc >= consumer_pc) return false;
-    for (const Rdna2Inst& in : instructions) {
-        if (!sopp_is_branch(in)) continue;
-        // The second captured terminal has one pre-producer EXECZ branch whose taken target is the
-        // exact +0x58 producer; fallthrough also reaches that same producer. No role is observable
-        // before the join. Any other direct edge could enter or leave the linear fold's descriptor
-        // construction interval, so keep it fail-visible until the fold itself is path-sensitive.
-        if (in.pc >= producer_pc || sopp_branch_target(in) != producer_pc)
-            return false;
-    }
-    return true;
-}
-
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
@@ -4127,7 +4111,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             : UINT32_MAX;
                         const bool optional_cfg_dominates = optional_origin &&
                             !has_indirect_control_flow(decoded->instructions) &&
-                            gta_optional_null_direct_cfg_dominates(
+                            straight_line_null_chain_dominates(
                                 decoded->instructions, optional_producer_pc, in.pc);
                         const bool optional_null_raw_load =
                             optional_cfg_dominates &&
@@ -4490,7 +4474,7 @@ static bool gta_optional_null_linear_load_launch(
             descriptor_producer = &in;
     }
     if (!descriptor_producer ||
-        !gta_optional_null_direct_cfg_dominates(
+        !straight_line_null_chain_dominates(
             instructions, descriptor_producer->pc, use_pc))
         return false;
 
