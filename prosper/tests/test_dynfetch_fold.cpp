@@ -3131,6 +3131,8 @@ int main() {
         0xE0E40000u, // and
         0xE0E80000u, // or
         0xE0EC0000u, // xor
+        0xE0FC0000u, // fmin
+        0xE1000000u, // fmax
     };
     uint32_t supported_atomic_uses = 0;
     for (uint32_t dw0 : supported_atomic_dw0) {
@@ -3142,6 +3144,63 @@ int main() {
     }
     CHECK(supported_atomic_uses == std::size(supported_atomic_dw0),
           "resource discovery admits exactly every emitter-supported 32-bit MUBUF RMW opcode");
+
+    // GTA V's six-packet reduction tail uses one direct stride-24 V# in s[4:7]. Opcode emission and
+    // descriptor discovery are separate passes; accepting FMIN/FMAX in only the former leaves the
+    // exact live shader terminal at its first packet with pc_res=null. Exercise the whole production
+    // boundary, including one exact-PC alias per consumer and the live FP32 mode.
+    static uint32_t gta_float_atomic_output[6] = {};
+    const uint64_t gta_float_atomic_base =
+        reinterpret_cast<uint64_t>(gta_float_atomic_output);
+    uint32_t gta_float_atomic_seed[10] = {};
+    gta_float_atomic_seed[4] = static_cast<uint32_t>(gta_float_atomic_base);
+    gta_float_atomic_seed[5] = static_cast<uint32_t>(gta_float_atomic_base >> 32) |
+                               (24u << 16);
+    gta_float_atomic_seed[6] = 1u;
+    gta_float_atomic_seed[7] = 0x00005204u;
+    const uint32_t gta_float_atomic_tail[] = {
+        0xE0FC0000u, 0x80010000u, // buffer_atomic_fmin v0, off, s[4:7], 0
+        0xE0FC0004u, 0x80010100u, // buffer_atomic_fmin v1, off, s[4:7], 4
+        0xE0FC0008u, 0x80010200u, // buffer_atomic_fmin v2, off, s[4:7], 8
+        0xE100000Cu, 0x80010300u, // buffer_atomic_fmax v3, off, s[4:7], 12
+        0xBF8CC07Fu,              // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xE1000010u, 0x80010400u, // buffer_atomic_fmax v4, off, s[4:7], 16
+        0xE1000014u, 0x80010500u, // buffer_atomic_fmax v5, off, s[4:7], 20
+        0xBF810000u,
+    };
+    std::vector<SrtUse> gta_float_atomic_uses;
+    resolve_dynamic_fetch(gta_float_atomic_tail, std::size(gta_float_atomic_tail),
+                          gta_float_atomic_seed, std::size(gta_float_atomic_seed), 0,
+                          &gta_float_atomic_uses);
+    ShaderResourceTable gta_float_atomic_table;
+    add_compute_buffer_resources(gta_float_atomic_table, gta_float_atomic_tail,
+                                 std::size(gta_float_atomic_tail), gta_float_atomic_seed,
+                                 std::size(gta_float_atomic_seed));
+    assign_convention_bindings(gta_float_atomic_table, 2);
+    ComputeShaderConfig gta_float_atomic_config;
+    gta_float_atomic_config.user_sgprs.assign(
+        std::begin(gta_float_atomic_seed), std::end(gta_float_atomic_seed));
+    gta_float_atomic_config.local_x = gta_float_atomic_config.local_y =
+        gta_float_atomic_config.local_z = 1;
+    gta_float_atomic_config.compute_pgm_rsrc1 = 0x402c00c3u;
+    const uint32_t gta_float_atomic_pcs[] = {0u, 2u, 4u, 6u, 9u, 11u};
+    const bool gta_float_atomic_exact_pcs =
+        gta_float_atomic_uses.size() == std::size(gta_float_atomic_pcs) &&
+        gta_float_atomic_table.resources.size() == std::size(gta_float_atomic_pcs) &&
+        std::equal(gta_float_atomic_uses.begin(), gta_float_atomic_uses.end(),
+                   std::begin(gta_float_atomic_pcs),
+                   [](const SrtUse& use, uint32_t pc) { return use.use_pc == pc; }) &&
+        std::equal(gta_float_atomic_table.resources.begin(),
+                   gta_float_atomic_table.resources.end(),
+                   std::begin(gta_float_atomic_pcs),
+                   [](const ShaderResource& resource, uint32_t pc) {
+                       return resource.fetch_pc == pc && resource.stride == 24u &&
+                              resource.size == 24u;
+                   });
+    CHECK(gta_float_atomic_exact_pcs &&
+              !recompile_compute(gta_float_atomic_tail, std::size(gta_float_atomic_tail),
+                                 &gta_float_atomic_table, gta_float_atomic_config).empty(),
+          "GTA V float-atomic tail publishes six exact-PC resources and recompiles");
 
     const uint32_t unknown_atomic_descriptor[] = {
         0xBE801F00u,              // s_getpc_b64 s[0:1]: not a concrete entry V# anymore

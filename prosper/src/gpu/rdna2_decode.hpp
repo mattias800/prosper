@@ -27,6 +27,28 @@ enum class Rdna2Format : uint8_t {
     Unknown,
 };
 
+// GFX10.3 MUBUF atomic opcodes (ISA Table 99). Keep these names at the decode boundary so resource
+// discovery and SPIR-V emission do not maintain separate, opaque hexadecimal inventories. These are
+// compile-time constants: using them in comparisons and switch labels adds no runtime indirection.
+inline constexpr uint32_t kMubufOpcodeAtomicSwap        = 0x30;
+inline constexpr uint32_t kMubufOpcodeAtomicCompareSwap = 0x31;
+inline constexpr uint32_t kMubufOpcodeAtomicAdd         = 0x32;
+inline constexpr uint32_t kMubufOpcodeAtomicSub         = 0x33;
+inline constexpr uint32_t kMubufOpcodeAtomicConditionalSub = 0x34;
+inline constexpr uint32_t kMubufOpcodeAtomicSmin        = 0x35;
+inline constexpr uint32_t kMubufOpcodeAtomicUmin        = 0x36;
+inline constexpr uint32_t kMubufOpcodeAtomicSmax        = 0x37;
+inline constexpr uint32_t kMubufOpcodeAtomicUmax        = 0x38;
+inline constexpr uint32_t kMubufOpcodeAtomicAnd         = 0x39;
+inline constexpr uint32_t kMubufOpcodeAtomicOr          = 0x3a;
+inline constexpr uint32_t kMubufOpcodeAtomicXor         = 0x3b;
+inline constexpr uint32_t kMubufOpcodeAtomicInc         = 0x3c;
+inline constexpr uint32_t kMubufOpcodeAtomicDec         = 0x3d;
+inline constexpr uint32_t kMubufOpcodeAtomicFmin        = 0x3f;
+inline constexpr uint32_t kMubufOpcodeAtomicFmax        = 0x40;
+inline constexpr uint32_t kMubufOpcodeAtomicSwapX2      = 0x50;
+inline constexpr uint32_t kMubufOpcodeAtomicOrX2        = 0x5a;
+
 // An operand's kind + payload. For SGPR/VGPR, `value` is the register number; for InlineInt, the
 // signed integer constant (-16..64); for InlineFloat, the AMD encoding code (240..248, see
 // inline_float_value); for Literal, the constant is in Rdna2Inst::literal; for Special, the field

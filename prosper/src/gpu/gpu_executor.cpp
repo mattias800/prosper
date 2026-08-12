@@ -3906,10 +3906,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // fail-closed rather than inheriting ordinary 32-bit bounds.
                 const bool atomic_buffer_use_32 =
                     !is_mtbuf &&
-                    (in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
-                     (in.opcode >= 0x35 && in.opcode <= 0x3B));
+                    (in.opcode == kMubufOpcodeAtomicSwap ||
+                     in.opcode == kMubufOpcodeAtomicAdd ||
+                     in.opcode == kMubufOpcodeAtomicSub ||
+                     (in.opcode >= kMubufOpcodeAtomicSmin &&
+                      in.opcode <= kMubufOpcodeAtomicXor) ||
+                     in.opcode == kMubufOpcodeAtomicFmin ||
+                     in.opcode == kMubufOpcodeAtomicFmax);
                 const bool atomic_x2_candidate =
-                    !is_mtbuf && (in.opcode == 0x50u || in.opcode == 0x5au);
+                    !is_mtbuf && (in.opcode == kMubufOpcodeAtomicSwapX2 ||
+                                  in.opcode == kMubufOpcodeAtomicOrX2);
                 if (srt_uses &&
                     (format_load_use || format_store_use || raw_buffer_use ||
                      atomic_buffer_use_32 || atomic_x2_candidate)) {
