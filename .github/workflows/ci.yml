@@ -34,7 +34,7 @@ jobs:
       # shader-recompiler and GPU-execution differential. They are designed for a software device
       # (llvmpipe/lavapipe) and run in seconds locally, so CI can run them too.
       - name: Configure
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON
 
       # A configuration that quietly loses Vulkan would silently drop those tests again and still
       # report 100% green. Fail the job instead of shrinking the suite.
@@ -327,7 +327,7 @@ jobs:
 
       - name: Configure
         shell: msys2 {0}
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
         shell: msys2 {0}
@@ -454,7 +454,7 @@ jobs:
       - name: Configure
         # Vulkan is disabled (Homebrew's loader is arm64-only; the headless core + substrate tests
         # don't need it — MoltenVK is a later frontier). x86_64 target, run under Rosetta.
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
         run: cmake --build prosper/build-ci
