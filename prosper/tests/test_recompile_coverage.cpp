@@ -439,6 +439,65 @@ int main() {
                             smem_x2_sbuffer_fragment_config).empty(),
           "GTA V pc10 same-site SDATA mutation remains fail-visible");
 
+    // GTA V program 0x413dc6700 reuses only VCC_LO as a scalar descriptor-table offset under an
+    // EXECZ arm. The preceding VOPC establishes a Wave64 predicate, pc77 starts a scalar lifetime
+    // in the same physical low word, and pc85 replaces the complete pair before VCC_HI can be
+    // observed. Retain the production pc74..103 packets and the loop that forces CFG dispatch.
+    std::vector<uint32_t> wave64_vcc_lo_scalar_offset(74, 0xbf800000u);
+    const uint32_t wave64_vcc_lo_scalar_tail[] = {
+        0x7d288812u,                         // pc74: v_cmp_* vcc,s18,v68
+        0xbf88001bu,                         // pc75: s_cbranch_execz pc103
+        0x7e020344u,                         // pc76: v_mov_b32 v1,v68
+        0x8f6a8300u,                         // pc77: s_lshl_b32 vcc_lo,s0,3
+        0xbe820312u,                         // pc78: s_mov_b32 s2,s18
+        0x876a886au,                         // pc79: s_and_b32 vcc_lo,vcc_lo,8
+        0xbe8303ffu, 0x00016204u,            // pc80: fill V#.word3
+        0xf404000bu, 0xd4000018u,            // pc82: s_load_dwordx2 s[0:1],s[22:23],vcc_lo
+        0xbe960380u,                         // pc84: s_mov_b32 s22,0
+        0xbeea047eu,                         // pc85: s_mov_b64 vcc,exec (complete replacement)
+        0xbf8cc07fu,                         // pc86: s_waitcnt
+        0xbe811d92u,                         // pc87: s_bitset1_b32 s1,18
+        0x7e040216u,                         // pc88: v_mov_b32 v2,s22
+        0x7daa0280u,                         // pc89: v_cmp_* vcc,0,v1
+        0xbf880007u,                         // pc90: s_cbranch_execz pc98
+        0xe0302000u, 0x80000101u,            // pc91: buffer_load_dword v1,v1,s[0:3]
+        0x81168116u,                         // pc93: s_add_i32 s22,s22,1
+        0xbf8c3f70u,                         // pc94: s_waitcnt
+        0xd5480001u, 0x026d0701u,            // pc95: v_alignbit_b32
+        0xbf82fff6u,                         // pc97: s_branch pc88
+        0xbefe046au,                         // pc98: s_mov_b64 exec,vcc
+        0x36020481u,                         // pc99: v_and_b32 v1,1,v2
+        0x7d840218u,                         // pc100: v_cmp_* vcc,s24,v1
+        0x020302f9u, 0x86860680u,            // pc101: v_cndmask_b32
+        0x8afe7e14u,                         // pc103: s_andn2_b64 exec,s[20:21],exec
+        0xbf810000u,
+    };
+    wave64_vcc_lo_scalar_offset.insert(wave64_vcc_lo_scalar_offset.end(),
+                                       std::begin(wave64_vcc_lo_scalar_tail),
+                                       std::end(wave64_vcc_lo_scalar_tail));
+    ShaderResourceTable wave64_vcc_lo_scalar_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1; buffer.binding = 4;
+      buffer.gpu_addr = 0x400000u; buffer.size = 120; buffer.fetch_pc = 91;
+      wave64_vcc_lo_scalar_rt.resources.push_back(buffer); }
+    ComputeShaderConfig wave64_vcc_lo_scalar_config = smem_x2_descriptor_fragment_config;
+    wave64_vcc_lo_scalar_config.user_sgprs.resize(24);
+    CHECK(!recompile_compute(wave64_vcc_lo_scalar_offset.data(),
+                             wave64_vcc_lo_scalar_offset.size(),
+                             &wave64_vcc_lo_scalar_rt,
+                             wave64_vcc_lo_scalar_config).empty(),
+          "GTA V pc79 scalar-only VCC_LO descriptor offset survives Wave64 CFG dispatch");
+
+    // Same production site, but now the scalar operation observes VCC_HI. The dead-high proof must
+    // disappear and the unavailable physical word must remain fail-visible.
+    std::vector<uint32_t> wave64_vcc_lo_reads_high = wave64_vcc_lo_scalar_offset;
+    wave64_vcc_lo_reads_high[79] = 0x876a6b6au; // s_and_b32 vcc_lo,vcc_lo,vcc_hi
+    CHECK(recompile_compute(wave64_vcc_lo_reads_high.data(),
+                            wave64_vcc_lo_reads_high.size(),
+                            &wave64_vcc_lo_scalar_rt,
+                            wave64_vcc_lo_scalar_config).empty(),
+          "GTA V pc79 same-site VCC_HI read remains fail-visible");
+
     // GTA V's texture-transfer compute kernels load two adjacent eight-word T# descriptors with one
     // immediate s_load_dwordx16. The load has one SRT offset but the halves are distinct resources,
     // so only exact consuming-PC bindings are sound. Prove both bindings are emitted and the scalar

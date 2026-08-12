@@ -4248,12 +4248,23 @@ bool is_gtav_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
          in.src[1].kind == OperandKind::InlineFloat);
 }
 
+// A one-dword scalar write to Wave64 VCC_LO normally has to preserve VCC_HI and rebuild the
+// architectural per-lane predicate from both physical words. GTA V also recycles only the low word
+// as scalar scratch, then replaces the complete pair before anything can observe the untouched high
+// word. The scalar-data-vs-mask decision remains path-local in emit_alu; this predicate only names
+// B32 packets for which a dead-high proof can make that scalar path discard the old predicate.
+bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
+    return is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
+        (in.fmt == Rdna2Format::SOP2 && sop2_is_b32_logical(in.opcode) &&
+         in.dst.kind == OperandKind::SGPR && in.dst.value == 106);
+}
+
 std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
         const std::vector<Rdna2Inst>& ins) {
     std::unordered_set<uint32_t> result;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
-        if (is_gtav_wave64_vcc_lo_scalar_cselect(in) &&
+        if (is_wave64_vcc_lo_scalar_b32_candidate(in) &&
             sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
             result.insert(in.pc);
     }
@@ -8789,12 +8800,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                    b.uconst(1)),
                             b.uconst(0));
                         rs.vcc = b.bsel(in_written_half, result_bit, other_bit);
+                    } else if (b.vcc_b32_low_only_pcs.contains(in.pc)) {
+                        // The whole-CFG proof established that the untouched high word cannot be
+                        // observed before a complete pair replacement. This instruction therefore
+                        // starts a scalar-only VCC_LO lifetime; retaining the old Bool predicate
+                        // would give later dispatcher blocks a competing stale mask domain.
+                        rs.vcc = 0;
+                        rs.sreg_bool.erase(106);
+                        rs.sreg_bool_narrowed.erase(106);
+                        rs.sreg_bool_b32.erase(106);
                     } else {
                         if (!rs.vcc) { ok = false; return true; }
                         rs.vcc = b.bsel(in_written_half, result_bit, rs.vcc);
                     }
-                    rs.sreg_bool[in.dst.value] = rs.vcc;
-                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                    if (rs.vcc) {
+                        rs.sreg_bool[in.dst.value] = rs.vcc;
+                        rs.sreg_bool_narrowed[in.dst.value] = true;
+                    }
                     return true;
                 }
 
