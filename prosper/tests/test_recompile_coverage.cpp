@@ -498,6 +498,52 @@ int main() {
                             wave64_vcc_lo_scalar_config).empty(),
           "GTA V pc79 same-site VCC_HI read remains fail-visible");
 
+    // Program 0x413dc3400 loads a V# fragment at pc137 and ORs the descriptor's high control bits
+    // into the loaded second word at pc141. Keep the production PCs and packets: the RMW is still
+    // descriptor provenance, and the complete V# is observed only by the exact pc180 MUBUF.
+    std::vector<uint32_t> smem_x2_or_descriptor_patch(133, 0xbf800000u);
+    const uint32_t smem_x2_or_descriptor_tail[] = {
+        0x8f6a8300u,                         // pc133: s_lshl_b32 vcc_lo,s0,3
+        0x876a886au,                         // pc134: s_and_b32 vcc_lo,vcc_lo,8
+        0x4a7418c4u,                         // pc135: independent vector ALU
+        0x888e020eu,                         // pc136: independent scalar ALU
+        0xf4040006u, 0xd4000028u,            // pc137: s_load_dwordx2 s[0:1],s[12:13],vcc_lo
+        0xbe82031au,                         // pc139: fill V#.word2 from s26
+        0xbf8cc07fu,                         // pc140: s_waitcnt
+        0x8801ff01u, 0x000c0000u,            // pc141: s_or_b32 s1,s1,0x000c0000
+        0xbe8303ffu, 0x00016204u,            // pc143: fill V#.word3
+        0xbf8c3f71u,                         // pc145: s_waitcnt
+    };
+    smem_x2_or_descriptor_patch.insert(smem_x2_or_descriptor_patch.end(),
+                                        std::begin(smem_x2_or_descriptor_tail),
+                                        std::end(smem_x2_or_descriptor_tail));
+    smem_x2_or_descriptor_patch.resize(180, 0xbf800000u);
+    smem_x2_or_descriptor_patch.push_back(0xe0302008u);
+    smem_x2_or_descriptor_patch.push_back(0x80001818u); // pc180: buffer_load_dword v24,v24,s[0:3]
+    smem_x2_or_descriptor_patch.push_back(0xbf810000u);
+    ShaderResourceTable smem_x2_or_descriptor_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1; buffer.binding = 4;
+      buffer.gpu_addr = 0x500000u; buffer.size = 120; buffer.fetch_pc = 180;
+      smem_x2_or_descriptor_rt.resources.push_back(buffer); }
+    ComputeShaderConfig smem_x2_or_descriptor_config = smem_x2_descriptor_fragment_config;
+    smem_x2_or_descriptor_config.user_sgprs.resize(28);
+    CHECK(!recompile_compute(smem_x2_or_descriptor_patch.data(),
+                             smem_x2_or_descriptor_patch.size(),
+                             &smem_x2_or_descriptor_rt,
+                             smem_x2_or_descriptor_config).empty(),
+          "GTA V pc141 descriptor OR preserves pc137 fragment provenance to exact pc180");
+
+    // Same production site with XOR is not the proved descriptor control-bit patch. Its read of the
+    // loaded word must remain an ordinary scalar observation and keep the raw x2 load fail-visible.
+    std::vector<uint32_t> smem_x2_xor_descriptor_patch = smem_x2_or_descriptor_patch;
+    smem_x2_xor_descriptor_patch[141] = 0x8901ff01u; // s_xor_b32 s1,s1,0x000c0000
+    CHECK(recompile_compute(smem_x2_xor_descriptor_patch.data(),
+                            smem_x2_xor_descriptor_patch.size(),
+                            &smem_x2_or_descriptor_rt,
+                            smem_x2_or_descriptor_config).empty(),
+          "GTA V pc141 same-site XOR mutation remains fail-visible");
+
     // GTA V's texture-transfer compute kernels load two adjacent eight-word T# descriptors with one
     // immediate s_load_dwordx16. The load has one SRT offset but the halves are distinct resources,
     // so only exact consuming-PC bindings are sound. Prove both bindings are emitted and the scalar
