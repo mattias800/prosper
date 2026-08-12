@@ -2959,7 +2959,7 @@ int main() {
     auto gta_zero_record_compile_resources = [&]() {
         ShaderResourceTable resources;
         resources.resources = {
-            ordinary_pc_buffer(27, 128, 32), ordinary_pc_buffer(29, 8, 4),
+            ordinary_pc_buffer(27, 32, 32), ordinary_pc_buffer(29, 8, 4),
             optional_null_marker(40), ordinary_pc_buffer(53, 120, 0),
             zero_record_marker(56), zero_record_marker(200),
         };
@@ -2988,8 +2988,18 @@ int main() {
         validate_spirv_descriptor_interface(
             gta_zero_record_spirv, &gta_zero_record_compile_table, 0,
             SpirvShaderStage::Compute, false);
-    CHECK(!gta_zero_record_spirv.empty() && gta_zero_record_spirv_report.ok(),
-          "GTA zero-record elected-lane proof reaches production compute translation");
+    const size_t gta_zero_record_pc27_range_issues = std::count_if(
+        gta_zero_record_spirv_report.issues.begin(),
+        gta_zero_record_spirv_report.issues.end(),
+        [](const DescriptorValidationIssue& issue) {
+            return issue.code == DescriptorIssueCode::UndersizedBuffer &&
+                issue.binding == 2u && issue.required_bytes == 88u &&
+                issue.available_bytes == 32u;
+        });
+    CHECK(!gta_zero_record_spirv.empty() && !gta_zero_record_spirv_report.ok() &&
+              gta_zero_record_spirv_report.issues.size() == 1u &&
+              gta_zero_record_pc27_range_issues == 1u,
+          "GTA zero-record proof reaches translation and preserves pc27's exact next frontier");
 
     ShaderResourceTable gta_zero_record_compile_ne_table =
         gta_zero_record_compile_resources();
