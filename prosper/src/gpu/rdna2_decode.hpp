@@ -130,10 +130,14 @@ inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
 inline constexpr uint32_t kVop1OpcodeFfblB32 = 0x3a;
 inline constexpr uint32_t kVop1OpcodeMovreldB32 = 0x42;
 
-// GFX10.3 VOP3 opcodes shared by source-lifetime and exact packet-shape proofs. Both consume three
-// independent B32 operands; neither reads an SGPR pair.
+// GFX10.3 VOP3 opcodes shared by source-lifetime and exact packet-shape proofs. The shift-reverse
+// B64 pair consumes a B32 shift count followed by a B64 value; the arithmetic forms consume three
+// independent B32 operands.
+inline constexpr uint32_t kVop3OpcodeLshlrevB64 = 0x2ff;
+inline constexpr uint32_t kVop3OpcodeLshrrevB64 = 0x300;
 inline constexpr uint32_t kVop3OpcodeLshlAddU32 = 0x346;
 inline constexpr uint32_t kVop3OpcodeAdd3U32 = 0x36d;
+inline constexpr uint32_t kVop3OpcodeAndOrB32 = 0x371;
 
 // GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
 // admission, and emission. These inline constants compile to the same immediate comparisons as raw
@@ -206,6 +210,10 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
 // field is a source. Appended TFE status and dynamic destinations such as v_movreld_b32 are separate:
 // consumers must also use `rdna2_tfe_status_vgpr` and handle dynamic destinations fail-closed.
 uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in);
+// Number of consecutive VGPR dwords consumed by one decoded source operand. Most encoded vector
+// sources name one dword; a small set of B64 operations names a pair through one base operand.
+// Keeping this beside destination accounting makes CFG register discovery and shader sizing agree.
+uint32_t rdna2_vgpr_source_span(const Rdna2Inst& in, uint32_t source_index);
 // Appended TFE status destination, or -1 when the instruction has none. Unlike the consecutive data
 // result above, a store's decoded VDATA is a source prefix and only the trailing status is written.
 // This remains exact for decoded MTBUF forms that emission rejects, including packed-D16 forms.

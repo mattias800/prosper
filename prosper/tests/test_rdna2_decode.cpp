@@ -139,7 +139,7 @@ int main() {
     const uint32_t gta_lshlrev_b64_words[] = {0xd6ff0018u, 0x00010304u};
     const Rdna2Inst gta_lshlrev_b64 = rdna2_decode_one(gta_lshlrev_b64_words, 2);
     CHECK(gta_lshlrev_b64.fmt == Rdna2Format::VOP3 &&
-          gta_lshlrev_b64.opcode == 0x2ffu && gta_lshlrev_b64.n_src == 2 &&
+          gta_lshlrev_b64.opcode == kVop3OpcodeLshlrevB64 && gta_lshlrev_b64.n_src == 2 &&
           isV(gta_lshlrev_b64.dst, 24) && isV(gta_lshlrev_b64.src[0], 4) &&
           gta_lshlrev_b64.src[1].kind == OperandKind::InlineInt &&
           gta_lshlrev_b64.src[1].value == 1 &&
@@ -147,6 +147,20 @@ int main() {
           rdna2_vgpr_write_count(gta_lshlrev_b64) == 2u &&
           rdna2_vgpr_destination_span(gta_lshlrev_b64) == 2u,
           "GTA V v_lshlrev_b64 decodes two sources and a two-VGPR destination");
+    // GTA V exec_cs_413e1ac00 pc59: `v_lshrrev_b64 v[1:2], s2, v[5:6]`. Both the
+    // destination and SRC1 name pairs, while the reserved SRC2 field must not invent an s0 read.
+    const uint32_t gta_lshrrev_b64_words[] = {0xd7000001u, 0x00020a02u};
+    const Rdna2Inst gta_lshrrev_b64 = rdna2_decode_one(gta_lshrrev_b64_words, 2);
+    CHECK(gta_lshrrev_b64.fmt == Rdna2Format::VOP3 &&
+          gta_lshrrev_b64.opcode == kVop3OpcodeLshrrevB64 &&
+          gta_lshrrev_b64.n_src == 2 && isV(gta_lshrrev_b64.dst, 1) &&
+          isS(gta_lshrrev_b64.src[0], 2) && isV(gta_lshrrev_b64.src[1], 5) &&
+          gta_lshrrev_b64.src[2].kind == OperandKind::None &&
+          rdna2_vgpr_source_span(gta_lshrrev_b64, 0) == 0u &&
+          rdna2_vgpr_source_span(gta_lshrrev_b64, 1) == 2u &&
+          rdna2_vgpr_write_count(gta_lshrrev_b64) == 2u &&
+          rdna2_vgpr_destination_span(gta_lshrrev_b64) == 2u,
+          "GTA V v_lshrrev_b64 decodes exact B32/B64 sources and a two-VGPR destination");
     // GTA V exec_cs_205b54f200 pc21, exact llvm-mc gfx1030 packet:
     // `v_cvt_rpi_i32_f32_e32 v1, v1`. Keep the plain one-dword form distinct from the
     // modifier encodings that the emitter intentionally leaves unsupported.
