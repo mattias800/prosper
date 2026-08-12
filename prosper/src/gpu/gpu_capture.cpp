@@ -121,8 +121,96 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 constexpr uint32_t kVersion = 50;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
-constexpr uint64_t kMaxBlobBytes = 1ull << 30;
+constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
 constexpr uint64_t kMaxTotalBlobBytes = 3ull << 30;
+
+// PROSPER_CAPTURE_BLOB_MAX_MB (#2440): the per-resource blob ceiling, 1 GiB by default.
+//
+// It is a runtime value rather than a constant because a real title exceeds it by a hair and loses the
+// whole capture: GTA V gameplay binds a 1,105,723,396-byte buffer -- 1.0298x over -- and one resource
+// over the line aborts the entire grab, which makes the F9/bundle workflow unavailable in exactly the
+// phase under investigation.
+//
+// WHY RAISING IT IS SAFE, since this is not only a policy knob. Nine sites check it, and **three are
+// on the read side** -- so a writer-only change would emit bundles a reader rejects. Each of the three
+// has a DIFFERENT real bound, and this is spelled out per-site because a single blanket claim about
+// them was wrong when first written (review on #2500):
+//
+//   * `Reader::bytes` -- bounded by `n > left`: a blob length cannot exceed the bytes actually
+//     remaining in the buffer, so a corrupt or hostile length is caught without this term at all.
+//   * `validate_dma_copies` -- operates on an ALREADY-LOADED file, so there is no `left` here. Each
+//     copy must additionally pass `validate_blob(...)` for both endpoints, i.e. lie inside a real
+//     blob at a real offset; it inherits the blob bounds transitively.
+//   * `validate_resource_provenance` -- also post-load, also no `left`. `requested_bytes` must EQUAL
+//     an already-read blob's size and fit inside a second blob at its recorded offset, so the
+//     subsequent hash over `post.bytes.data() + post_blob_offset` is in range by that chain.
+//
+// In every case the aggregate is bounded independently by the neighbours above -- kMaxFileBytes
+// (4 GiB) and kMaxTotalBlobBytes (3 GiB) -- and the per-blob ceiling is redundant defence layered over
+// bounds that already hold. **Do not read `n > left` as the guard at the two validators**: it is not
+// available there, and a future use that consumes `requested_bytes` BEFORE its equality check would
+// not be covered by it.
+//
+// Writer and reader consult this same accessor, so a bundle produced under a raised ceiling is
+// readable by the process that produced it.
+//
+// Clamped to kMaxTotalBlobBytes: a per-blob ceiling above the total-blob budget could never be
+// satisfied, so accepting one would only move the failure later and make it harder to read. A
+// malformed or out-of-range value leaves the default in place rather than guessing -- a typo must cost
+// a capture, never silently widen a bound.
+//
+// A bundle written under a raised ceiling and read back LATER without the variable set will fail the
+// reader's check. That is deliberate and loud (`invalid blob length`), not silent corruption; set the
+// same value to read it.
+// Pure, so the parse and clamp rules are testable without a process per case: the accessor below
+// caches in a `static`, which makes both the default and a raised value unreachable from one test.
+uint64_t blob_max_bytes_from_env(const char* s, std::string* note) {
+    const auto say = [&](const std::string& m) { if (note) *note = m; };
+    if (!s || !*s) return kMaxBlobDefaultBytes;
+    // Reject a sign before strtoull sees it. strtoull ACCEPTS a leading '-' and WRAPS: "-4" yields
+    // 18446744073709551612, which passes every check below and then clamps to the maximum -- so a
+    // typo would silently widen the ceiling to the largest value the reader will accept, the exact
+    // direction this parse must never fail in. Caught by the malformed-input arm in
+    // test_gpu_capture, not by review.
+    for (const char* c = s; *c; ++c) {
+        if (*c == ' ' || *c == '\t') continue;
+        if (*c == '-' || *c == '+') {
+            say("must be an unsigned decimal count of MiB; keeping the default");
+            return kMaxBlobDefaultBytes;
+        }
+        break;
+    }
+    char* end = nullptr;
+    const unsigned long long mb = std::strtoull(s, &end, 10);
+    if (end == s || (end && *end) || mb == 0) {
+        say("not a positive integer; keeping the default");
+        return kMaxBlobDefaultBytes;
+    }
+    if (mb > (kMaxTotalBlobBytes >> 20)) {
+        say("exceeds the total-blob budget; clamped to it");
+        return kMaxTotalBlobBytes;
+    }
+    return mb << 20;
+}
+
+inline uint64_t max_blob_bytes() {
+    static const uint64_t v = [] {
+        const char* s = getenv("PROSPER_CAPTURE_BLOB_MAX_MB");
+        std::string note;
+        const uint64_t v = blob_max_bytes_from_env(s, &note);
+        if (!note.empty())
+            std::fprintf(stderr, "[gpucapture] PROSPER_CAPTURE_BLOB_MAX_MB=%s %s (%llu MiB)\n",
+                         s ? s : "", note.c_str(), (unsigned long long)(v >> 20));
+        else if (v != kMaxBlobDefaultBytes)
+            std::fprintf(stderr,
+                         "[gpucapture] per-resource blob ceiling raised to %llu MiB "
+                         "(PROSPER_CAPTURE_BLOB_MAX_MB); a bundle written now needs the same value "
+                         "to be read back\n",
+                         (unsigned long long)(v >> 20));
+        return v;
+    }();
+    return v;
+}
 constexpr uint32_t kMaxDraws = 65536;
 constexpr uint32_t kMaxComputes = 65536;
 constexpr uint32_t kMaxOperations = 131072;
@@ -221,7 +309,7 @@ struct Reader {
     }
     bool bytes(std::vector<uint8_t>& v) {
         uint64_t n; if (!u64(n)) return false;
-        if (n > kMaxBlobBytes || n > left || n > std::numeric_limits<size_t>::max()) {
+        if (n > max_blob_bytes() || n > left || n > std::numeric_limits<size_t>::max()) {
             if (error) *error = "invalid blob length"; return false;
         }
         v.resize(static_cast<size_t>(n)); return take(v.data(), v.size());
@@ -710,14 +798,18 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
             if (is_compute_internal_gds(r)) continue;
             uint64_t n = resource_footprint(r);
             if (n) {
-                if (n > kMaxBlobBytes || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
+                if (n > max_blob_bytes() || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
                     char detail[512];
                     std::snprintf(
                         detail, sizeof(detail),
-                        "resource capture range is invalid or exceeds 1 GiB: binding=%u class=%u "
+                        "resource capture range is invalid or exceeds the %llu MiB per-resource "
+                        "ceiling (raise with PROSPER_CAPTURE_BLOB_MAX_MB; note "
+                        "PROSPER_CAPTURE_BUNDLE_MAX_MB is the TOTAL budget and does not govern this): "
+                        "binding=%u class=%u "
                         "addr=0x%llx declared=%llu footprint=%llu format=%u components=%u "
                         "extent=%ux%ux%u img-dim=%u tile=%u layer-stride=%llu "
                         "layer-mip-offset=%llu mip-tail=%d/%llu",
+                        static_cast<unsigned long long>(max_blob_bytes() >> 20),
                         r.binding, static_cast<unsigned>(r.cls),
                         static_cast<unsigned long long>(r.gpu_addr),
                         static_cast<unsigned long long>(r.size),
@@ -734,8 +826,10 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
             }
             n = dcc_metadata_footprint(r);
             if (n) {
-                if (n > kMaxBlobBytes || r.metadata_addr > std::numeric_limits<uint64_t>::max() - n) {
-                    error = "DCC metadata capture range is invalid or exceeds 1 GiB"; return false;
+                if (n > max_blob_bytes() || r.metadata_addr > std::numeric_limits<uint64_t>::max() - n) {
+                    error = "DCC metadata capture range is invalid or exceeds the per-resource ceiling "
+                            "(raise with PROSPER_CAPTURE_BLOB_MAX_MB, not "
+                            "PROSPER_CAPTURE_BUNDLE_MAX_MB)"; return false;
                 }
                 intervals.push_back({r.metadata_addr, r.metadata_addr + n});
             }
@@ -893,7 +987,7 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
     }
     const uint64_t pixels = checked_mul(seed.width, seed.height);
     const uint64_t bytes = checked_mul(pixels, bytes_per_pixel);
-    if (bytes > kMaxBlobBytes || bytes != seed.rgba.size()) {
+    if (bytes > max_blob_bytes() || bytes != seed.rgba.size()) {
         error = "RTT seed byte count does not match its color format and extent"; return false;
     }
     return true;
@@ -920,12 +1014,12 @@ bool validate_ds_seed(const GpuCaptureDsSeed& seed, std::string& error) {
     }
     const uint64_t pixels = checked_mul(seed.width, seed.height);
     const uint64_t depth_bytes = checked_mul(pixels, 4);
-    if ((seed.depth_valid && (depth_bytes > kMaxBlobBytes || depth_bytes != seed.depth.size())) ||
+    if ((seed.depth_valid && (depth_bytes > max_blob_bytes() || depth_bytes != seed.depth.size())) ||
         (!seed.depth_valid && !seed.depth.empty())) {
         error = "DS seed depth byte count does not match its extent and validity"; return false;
     }
     if ((seed.stencil_valid &&
-         (seed.format != GpuCaptureDsFormat::D32FloatS8 || pixels > kMaxBlobBytes ||
+         (seed.format != GpuCaptureDsFormat::D32FloatS8 || pixels > max_blob_bytes() ||
           pixels != seed.stencil.size())) ||
         (!seed.stencil_valid && !seed.stencil.empty())) {
         error = "DS seed stencil byte count does not match its extent, format, and validity";
@@ -1033,7 +1127,7 @@ bool validate_dma_copies(const GpuCaptureFile& capture, std::string& error) {
             }
         }
         if ((!destination_gds && !copy.dst) || !copy.src || !copy.bytes ||
-            copy.bytes > kMaxBlobBytes || !gds_destination_valid ||
+            copy.bytes > max_blob_bytes() || !gds_destination_valid ||
             (!destination_gds &&
              copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes) ||
             copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes ||
@@ -1102,7 +1196,7 @@ bool validate_resource_provenance(const GpuCaptureFile& capture, std::string& er
             static_cast<uint32_t>(provenance.resource_class) >
                 static_cast<uint32_t>(ResourceClass::StorageImage) ||
             !provenance.guest_addr || !provenance.requested_bytes ||
-            provenance.requested_bytes > kMaxBlobBytes ||
+            provenance.requested_bytes > max_blob_bytes() ||
             provenance.realization_blob_index >= capture.blobs.size() ||
             provenance.post_blob_index >= capture.blobs.size()) {
             error = "invalid resource provenance identity";
@@ -1630,6 +1724,12 @@ bool capture_failure_diagnostics(
 }
 
 } // namespace
+
+// Exported for test only (#2440): `max_blob_bytes()` caches in a `static`, so a test process can see
+// exactly one value. The parse/clamp rules are the part worth asserting, so expose them purely.
+uint64_t capture_blob_max_bytes_from_env_for_test(const char* env, std::string* note) {
+    return blob_max_bytes_from_env(env, note);
+}
 
 void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata) {
     const uint64_t address = present_front_address();
@@ -4735,7 +4835,7 @@ void snapshot_pending_gpu_capture_draw_resource(PendingGpuCapture* pending,
     }
 
     const uint64_t bytes = gpu_capture_resource_footprint(*selected);
-    if (!selected->gpu_addr || !bytes || bytes > kMaxBlobBytes ||
+    if (!selected->gpu_addr || !bytes || bytes > max_blob_bytes() ||
         bytes > std::numeric_limits<size_t>::max()) {
         pending->resource_provenance_error =
             "selected draw resource has no bounded guest byte span";

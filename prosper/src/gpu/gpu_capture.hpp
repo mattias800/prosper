@@ -509,4 +509,9 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
 void request_interactive_gpu_capture(const std::string& path);
 bool interactive_gpu_capture_armed();
 
+// The per-resource blob ceiling's parse/clamp rules (#2440), exported for test. Returns the byte
+// ceiling for a PROSPER_CAPTURE_BLOB_MAX_MB value; `note` receives a reason when the input was
+// rejected or clamped, and is left untouched when the value was taken as given.
+uint64_t capture_blob_max_bytes_from_env_for_test(const char* env, std::string* note);
+
 } // namespace prosper::gpu

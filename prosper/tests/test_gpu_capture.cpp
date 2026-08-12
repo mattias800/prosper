@@ -3359,6 +3359,49 @@ int main(int argc, char** argv) {
     { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
     CHECK(!interactive_gpu_capture_armed(), "the re-armed grab is consumed by the next drawing invocation");
 
+    // --- PROSPER_CAPTURE_BLOB_MAX_MB parse/clamp rules (#2440) ------------------------------------
+    // The per-resource ceiling is a runtime value because GTA V gameplay binds a 1,105,723,396-byte
+    // buffer -- 1.0298x over the 1 GiB default -- and one resource over the line aborts the whole
+    // grab. Asserted through the pure parse function rather than the accessor, which caches in a
+    // `static` and so exposes exactly one value per process.
+    {
+        constexpr uint64_t kDefault = 1ull << 30;
+        constexpr uint64_t kTotal   = 3ull << 30;
+        std::string note;
+
+        note.clear();
+        CHECK(capture_blob_max_bytes_from_env_for_test(nullptr, &note) == kDefault && note.empty(),
+              "unset leaves the 1 GiB default, silently");
+        note.clear();
+        CHECK(capture_blob_max_bytes_from_env_for_test("", &note) == kDefault && note.empty(),
+              "empty leaves the default, silently");
+
+        // The case the issue is about: 1057 MiB clears a 1,105,723,396-byte resource.
+        note.clear();
+        CHECK(capture_blob_max_bytes_from_env_for_test("1057", &note) == 1057ull * (1ull << 20) &&
+                  note.empty(),
+              "a plain value is taken as given, in MiB");
+        CHECK(capture_blob_max_bytes_from_env_for_test("1057", nullptr) > 1105723396ull,
+              "and 1057 MiB really does clear GTA V's oversized buffer");
+
+        // Malformed input must keep the default and SAY so -- a typo costs a capture, never a
+        // silently widened bound.
+        for (const char* bad : {"0", "abc", "12x", "-4", "1.5"}) {
+            note.clear();
+            CHECK(capture_blob_max_bytes_from_env_for_test(bad, &note) == kDefault && !note.empty(),
+                  "a malformed value keeps the default and reports why");
+        }
+
+        // Above the total-blob budget is unsatisfiable, so clamp rather than accept a ceiling that
+        // could only fail later and further from the cause.
+        note.clear();
+        CHECK(capture_blob_max_bytes_from_env_for_test("999999", &note) == kTotal && !note.empty(),
+              "a value above the total-blob budget clamps to it, and reports the clamp");
+        note.clear();
+        CHECK(capture_blob_max_bytes_from_env_for_test("3072", &note) == kTotal && note.empty(),
+              "exactly the total-blob budget is accepted as given (boundary, not clamped)");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }
