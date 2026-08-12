@@ -34,7 +34,7 @@ jobs:
       # shader-recompiler and GPU-execution differential. They are designed for a software device
       # (llvmpipe/lavapipe) and run in seconds locally, so CI can run them too.
       - name: Configure
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON
 
       # A configuration that quietly loses Vulkan would silently drop those tests again and still
       # report 100% green. Fail the job instead of shrinking the suite.
@@ -327,7 +327,7 @@ jobs:
 
       - name: Configure
         shell: msys2 {0}
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
         shell: msys2 {0}
@@ -379,6 +379,14 @@ jobs:
       # See the linux job (#2187) for --no-tests=error. This job is the one it matters most for:
       # it is the only job testing a directory other than build-ci, so a --test-dir that drifted
       # back to the common name would find an absent or unbuilt tree, register nothing, and pass.
+      #
+      # It is ALSO the only job that runs ctest against a core built with PROSPER_DIAGNOSTICS at
+      # its default (OFF). linux, windows-mingw and macos all pass -DPROSPER_DIAGNOSTICS=ON, so
+      # diagnostics_disabled_stubs executes here and nowhere else -- this job is what keeps the
+      # configuration users actually get from going untested. That dependency is invisible from
+      # this file's own text, which is why it is written down: adding the flag here to make the
+      # jobs 'consistent' would silently delete the last coverage of the default build. Raised in
+      # review on #2496.
       # The comment lives out here rather than inside the block below because `run: >-` is a
       # FOLDED scalar: every line is joined into ONE command, so a `#` line would comment out the
       # rest of it -- which is exactly what a first attempt at this edit did.
@@ -454,7 +462,7 @@ jobs:
       - name: Configure
         # Vulkan is disabled (Homebrew's loader is arm64-only; the headless core + substrate tests
         # don't need it — MoltenVK is a later frontier). x86_64 target, run under Rosetta.
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
         run: cmake --build prosper/build-ci
