@@ -2708,6 +2708,77 @@ int main() {
                     subgroup17d1.size);
     }
 
+    // GTA V 0x413cf6100 pc21 first uses S_AND_SAVEEXEC_B64 to place OLD_EXEC in VCC, restores EXEC
+    // from that exact mask, copies VCC to s[0:1] at pc55, and scans the saved pair at pc123. The
+    // SAVEEXEC destination is the architectural producer: treating only VOPC as a mask definition
+    // loses the fact before the structured loop even though every path preserves s[0:1].
+    const uint32_t code17d1b_structured_saveexec[] = {
+        0xbe8003a8u,              // s_mov_b32 s0,40
+        0x7d840000u,              // v_cmp_eq_u32 vcc,s0,v0: sole hit at lane 40
+        0xbeea246au,              // GTA pc21: s_and_saveexec_b64 vcc,vcc (VCC=OLD_EXEC)
+        0xbefe046au,              // GTA pc30: s_mov_b64 exec,vcc (restore OLD_EXEC)
+        0xbe80046au,              // GTA pc55: s_mov_b64 s[0:1],vcc
+        0xbe940380u,              // s_mov_b32 s20,0 (induction variable)
+        0xbe950382u,              // s_mov_b32 s21,2 (trip count)
+        0xbf0a1514u,              // loop: s_cmp_lt_u32 s20,s21
+        0xbf840003u,              // s_cbranch_scc0 +3 -> reduction
+        0xbe8c0381u,              // harmless scalar write inside the loop
+        0x81148114u,              // s_add_i32 s20,s20,1
+        0xbf82fffbu,              // s_branch -5 -> loop header
+        0xbeea1400u,              // GTA pc123 form: s_ff1_i32_b64 vcc_lo,s[0:1]
+        0xbe84036au,              // copy scalar result before replacing EXEC
+        0xbefe04c1u,              // restore full EXEC
+        0x7e020204u,              // v_mov_b32 v1,s4
+        0xe0702000u, 0x80020100u, // output[lane] = first set bit
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d1b_structured_saveexec = recompile_compute(
+        code17d1b_structured_saveexec, std::size(code17d1b_structured_saveexec), &rt17d1,
+        native_cfg17d1b);
+    CHECK(!spv17d1b_structured_saveexec.empty(),
+          "structured Wave64 SAVEEXEC-old-EXEC chain reaches saved-mask S_FF1");
+    std::vector<uint32_t> code17d1b_saveexec_consumer_mutated(
+        std::begin(code17d1b_structured_saveexec),
+        std::end(code17d1b_structured_saveexec));
+    code17d1b_saveexec_consumer_mutated[12] =
+        0xbeea1402u;              // same S_FF1 site reads unproved s[2:3]
+    CHECK(recompile_compute(code17d1b_saveexec_consumer_mutated.data(),
+                            code17d1b_saveexec_consumer_mutated.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "same-site SAVEEXEC-chain S_FF1 source mutation remains fail-visible");
+    std::vector<uint32_t> code17d1b_saveexec_producer_mutated(
+        std::begin(code17d1b_structured_saveexec),
+        std::end(code17d1b_structured_saveexec));
+    code17d1b_saveexec_producer_mutated[2] =
+        0xbeea04c1u;              // producer site becomes s_mov_b64 vcc,-1, not OLD_EXEC capture
+    CHECK(recompile_compute(code17d1b_saveexec_producer_mutated.data(),
+                            code17d1b_saveexec_producer_mutated.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "same producer-site mutation cannot inherit SAVEEXEC-old-EXEC proof");
+    std::vector<uint32_t> code17d1b_saveexec_path_overwrite(
+        std::begin(code17d1b_structured_saveexec),
+        std::end(code17d1b_structured_saveexec));
+    code17d1b_saveexec_path_overwrite[9] =
+        0xbe800380u;              // same loop-body site overwrites saved-mask low half
+    CHECK(recompile_compute(code17d1b_saveexec_path_overwrite.data(),
+                            code17d1b_saveexec_path_overwrite.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "loop-path half overwrite invalidates SAVEEXEC-chain mask proof");
+    if (can_execute17d1b && !spv17d1b_structured_saveexec.empty()) {
+        std::vector<uint32_t> got17d1b_structured_saveexec;
+        prosper::test::run_compute(
+            spv17d1b_structured_saveexec, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1b_structured_saveexec);
+        CHECK(got17d1b_structured_saveexec.size() == 64 &&
+                  std::all_of(got17d1b_structured_saveexec.begin(),
+                              got17d1b_structured_saveexec.end(),
+                              [](uint32_t value) { return value == 0u; }),
+              "structured SAVEEXEC-old-EXEC S_FF1 returns lane zero for every invocation");
+    } else {
+        std::printf("  [skip] structured SAVEEXEC s_ff1 execution: host subgroup is %u or lacks vote/arithmetic\n",
+                    subgroup17d1.size);
+    }
+
     // S_BCNT consumes the same structured saved-mask proof independently of S_FF1. Keep the exact
     // loop/join and change only the reduction/consumer sites: the high-half lane-40 predicate must
     // count as one, while either an unproved source or a loop-carried half overwrite must reject.
