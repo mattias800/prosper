@@ -901,6 +901,62 @@ int main() {
               count_occurrences(live_reject_capture.output, live_reject_program) == 1,
           "live shader-recompile failure reports its final dispatch-skipped consequence");
 
+    // Drive FP32_DENORM through the actual register-file realization boundary. Unit-level config
+    // and cache tests cannot catch a missing/wrong register read here: deleting the production read
+    // would leave both dispatches at the synthetic mode-3 default and make these modules identical.
+    alignas(256) static const uint32_t kLiveFloatAtomicMode[] = {
+        0x7e000280u,              // v_mov_b32 v0, 0 (LDS byte address)
+        0x7e1202ffu, 0x00000001u, // v_mov_b32 v9, +minimum subnormal
+        0xd8480000u, 0x00000900u, // ds_min_f32 v0, v9
+        0xbf810000u,
+    };
+    ShaderReg live_float_registers[2] = {
+        {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
+        {prosper::agc::Pm4::COMPUTE_PGM_HI, 0},
+    };
+    AgcShaderHeader live_float_header{};
+    live_float_header.file_header = 0x34333231u;
+    live_float_header.version = 0x18;
+    live_float_header.sh_registers = live_float_registers;
+    live_float_header.shader_size = sizeof(kLiveFloatAtomicMode);
+    live_float_header.type = 0;
+    live_float_header.num_sh_registers = 2;
+    void* registered_live_float = nullptr;
+    const bool live_float_registered = create_shader &&
+        create_shader(reinterpret_cast<uint64_t>(&registered_live_float),
+                      reinterpret_cast<uint64_t>(&live_float_header),
+                      reinterpret_cast<uint64_t>(kLiveFloatAtomicMode), 0, 0, 0) == 0 &&
+        registered_live_float == &live_float_header;
+    auto realize_float_mode = [&](uint32_t compute_pgm_rsrc1, uint64_t command_order) {
+        GpuState state;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = live_float_registers[0].value;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = live_float_registers[1].value;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_RSRC1] = compute_pgm_rsrc1;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_X] = 64;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Y] = 1;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Z] = 1;
+        GpuState::Dispatch dispatch;
+        dispatch.threads_x = 64;
+        dispatch.threads_y = dispatch.threads_z = 1;
+        dispatch.modifier =
+            1ull << prosper::agc::Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT;
+        dispatch.command_order = command_order;
+        dispatch.state = std::make_shared<GpuState>(state);
+        state.dispatches.push_back(dispatch);
+        return realize_compute_dispatches(state, 0x2481);
+    };
+    clear_shader_recompile_cache();
+    const std::vector<ComputeItem> live_float_mode0 = realize_float_mode(0u, 0x24810u);
+    const std::vector<ComputeItem> live_float_mode3 = realize_float_mode(
+        kDefaultComputePgmRsrc1, 0x24813u);
+    CHECK(live_float_registered && live_float_mode0.size() == 1 &&
+              live_float_mode3.size() == 1 &&
+              live_float_mode0[0].recompile_config.compute_pgm_rsrc1 == 0u &&
+              live_float_mode3[0].recompile_config.compute_pgm_rsrc1 ==
+                  kDefaultComputePgmRsrc1 &&
+              live_float_mode0[0].spirv != live_float_mode3[0].spirv,
+          "live compute realization reads PGM_RSRC1 and separates float-atomic denormal modes");
+
     // IMAGE_LOAD_MIP level-zero lowering is compiled semantics, not runtime descriptor data. A
     // captured or later dispatch without the instruction-scoped proof must miss and reject rather
     // than reuse the specialized module; restoring the proof should hit the original entry.
