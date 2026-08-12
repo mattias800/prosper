@@ -5817,10 +5817,10 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
             if (in.is_end) continue;
             uint8_t live = state.live;
 
-            // The captured builder sets one descriptor type bit in the loaded second word before
-            // the V# is consumed. Its result remains descriptor provenance: retain that word's live
-            // marker so every later use is still checked, but do not mistake this exact RMW patch for
-            // an ordinary scalar observation of guest data.
+            // Captured builders patch descriptor control bits in the loaded second word before the
+            // V# is consumed. Their results remain descriptor provenance: retain that word's live
+            // marker so every later use is still checked, but do not mistake these exact RMW patches
+            // for ordinary scalar observations of guest data.
             const bool bitset_descriptor_patch =
                 in.fmt == Rdna2Format::SOP1 &&
                 in.opcode == kSop1OpcodeBitset1B32 &&
@@ -5835,7 +5835,16 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
                   in.src[1].kind == OperandKind::Literal) ||
                  (in.src[1].kind == OperandKind::SGPR && in.src[1].value == in.dst.value &&
                   in.src[0].kind == OperandKind::Literal));
-            const bool descriptor_patch = bitset_descriptor_patch || or_descriptor_patch;
+            constexpr uint32_t kGtavBufferDescriptorHighControlBits = 0x000c0000u;
+            const bool high_control_descriptor_patch =
+                register_offset && in.fmt == Rdna2Format::SOP2 &&
+                in.opcode == kSop2OpcodeOrB32 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value == base + 1 &&
+                in.n_src == 2 && in.src[0].kind == OperandKind::SGPR &&
+                in.src[0].value == in.dst.value && in.src[1].kind == OperandKind::Literal &&
+                in.literal == kGtavBufferDescriptorHighControlBits;
+            const bool descriptor_patch = bitset_descriptor_patch || or_descriptor_patch ||
+                high_control_descriptor_patch;
 
             bool branch = false;
             bool fallthrough = true;
