@@ -4378,6 +4378,16 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
         if (!table(x.resources, compute.resources)) return false;
+        // The selected-SBUFFER marker is deliberately derived rather than serialized. A raw replay
+        // with complete captured backing can reconstruct it from the exact shader/launch/source
+        // domain; metadata-only captures retain their already-compiled SPIR-V and remain materializable.
+        if (compute.resources && compute.recompile_config_available &&
+            compute.raw_shader_index < c.raw_shader_versions.size()) {
+            const auto& raw = c.raw_shader_versions[compute.raw_shader_index].words;
+            if (rdna2_gta5_selected_sbuffer_shader(raw.data(), raw.size()))
+                (void)discover_rdna2_gta5_selected_sbuffer(
+                    raw.data(), raw.size(), compute.recompile_config, *compute.resources);
+        }
         out.computes.push_back(std::move(compute));
     }
     out.dma_copies.reserve(c.dma_copies.size());

@@ -160,6 +160,9 @@ inline constexpr uint32_t kMubufOpcodeStoreDwordX3 = 0x1f;
 inline constexpr uint32_t kSopcOpcodeCmpEqU64 = 0x12;
 
 inline constexpr uint32_t kMubufOpcodeLoadDword         = 0x0c;
+inline constexpr uint32_t kMubufOpcodeLoadDwordX2       = 0x0d;
+inline constexpr uint32_t kMubufOpcodeLoadDwordX4       = 0x0e;
+inline constexpr uint32_t kMubufOpcodeLoadDwordX3       = 0x0f;
 inline constexpr uint32_t kMubufOpcodeAtomicSwap        = 0x30;
 inline constexpr uint32_t kMubufOpcodeAtomicCompareSwap = 0x31;
 inline constexpr uint32_t kMubufOpcodeAtomicAdd         = 0x32;
