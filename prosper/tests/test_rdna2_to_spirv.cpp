@@ -2035,6 +2035,71 @@ int main() {
         CHECK(got17d1h_exec_hi_and == std::vector<uint32_t>(64, 0u),
               "same-site AND mutation distinguishes EXEC_HI scalar-zero semantics");
     }
+
+    // Kernel 17d1i: GTA V's newly exposed pc115 packet gathers DATA0 backward through a byte
+    // address. Keep its exact v30/v6/v9 encoding and the irreducible dispatcher tail. Offset +4 is
+    // a same-site mutation selecting the following source lane, including wrap at each 32-lane half.
+    std::vector<uint32_t> code17d1i = {
+        0x340c0082u,              // v_lshlrev_b32 v6,2,v0: byte address for this lane
+        0x4a1200ffu, 0x00000064u, // v_add_nc_u32 v9,100,v0: lane-distinct DATA0
+        0xdacc0000u, 0x1e000906u, // exact pc115: ds_bpermute_b32 v30,v6,v9 offset:0
+        0x7e02031eu,              // v_mov_b32 v1,v30
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+    };
+    code17d1i.insert(code17d1i.end(), std::begin(code17d), std::end(code17d));
+    const auto native_spv17d1i = recompile_compute(
+        code17d1i.data(), code17d1i.size(), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1i.empty() && count_spirv_opcode(native_spv17d1i, 345) == 3,
+          "exact Wave32 DS_BPERMUTE shuffles DATA0, EXEC, and its static event tag");
+    CHECK(recompile_compute(code17d1i.data(), code17d1i.size(), &rt17d1,
+                            portable_cfg17d1).empty(),
+          "DS_BPERMUTE stays fail-visible without an exact native wave contract");
+    std::vector<uint32_t> code17d1i_offset4 = code17d1i;
+    code17d1i_offset4[3] = 0xdacc0004u; // same packet, OFFSET changes from 0 to 4 bytes
+    const auto native_spv17d1i_offset4 = recompile_compute(
+        code17d1i_offset4.data(), code17d1i_offset4.size(), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1i_offset4.empty() &&
+              count_spirv_opcode(native_spv17d1i_offset4, 345) == 3,
+          "same-site DS_BPERMUTE offset mutation remains representable");
+
+    // The test runner uses the device's default subgroup width. Compile the identical packets as
+    // Wave64 when that width is 64 so their two independent 32-lane halves execute locally too;
+    // the Wave32 modules above remain the byte-exact live admission check.
+    const bool can_execute17d1i = subgroup17d1.size == 64 &&
+        (subgroup17d1.stages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup17d1.operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    if (can_execute17d1i) {
+        ComputeShaderConfig native_wave64_cfg17d1i = native_cfg17d1;
+        native_wave64_cfg17d1i.wave_size = 64;
+        native_wave64_cfg17d1i.native_subgroup_size = 64;
+        const auto native_wave64_spv17d1i = recompile_compute(
+            code17d1i.data(), code17d1i.size(), &rt17d1, native_wave64_cfg17d1i);
+        const auto native_wave64_spv17d1i_offset4 = recompile_compute(
+            code17d1i_offset4.data(), code17d1i_offset4.size(),
+            &rt17d1, native_wave64_cfg17d1i);
+        std::vector<uint32_t> got17d1i, got17d1i_offset4;
+        if (!native_wave64_spv17d1i.empty())
+            prosper::test::run_compute(
+                native_wave64_spv17d1i, std::vector<float>(64, 0.0f), 64, 64, {},
+                std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1i);
+        if (!native_wave64_spv17d1i_offset4.empty())
+            prosper::test::run_compute(
+                native_wave64_spv17d1i_offset4, std::vector<float>(64, 0.0f), 64, 64, {},
+                std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1i_offset4);
+        std::vector<uint32_t> expected17d1i(64), expected17d1i_offset4(64);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            expected17d1i[lane] = 100u + lane;
+            expected17d1i_offset4[lane] = 100u +
+                (lane & ~31u) + ((lane + 1u) & 31u);
+        }
+        CHECK(got17d1i == expected17d1i,
+              "DS_BPERMUTE offset zero gathers within both 32-lane halves");
+        CHECK(got17d1i_offset4 == expected17d1i_offset4,
+              "same-site offset +4 mutation selects the next lane and wraps each half");
+    } else {
+        std::printf("  [skip] DS_BPERMUTE execution: host subgroup is %u or lacks shuffle\n",
+                    subgroup17d1.size);
+    }
     if (can_execute17d1) {
         std::vector<uint32_t> initial17d1(64, 0u), got17d1;
         prosper::test::run_compute(native_spv17d1, std::vector<float>(64, 0.0f),

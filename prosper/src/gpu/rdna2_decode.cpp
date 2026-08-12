@@ -134,7 +134,7 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             // encodings in that subset are stores or no-return atomics whose VDST field is a source.
             if (in.opcode == 0x35u || in.opcode == 0x36u || in.opcode == 0x3du ||
                 in.opcode == 0x3eu || in.opcode == 0xb1u || in.opcode == 0x20u ||
-                in.opcode == 0x2du)
+                in.opcode == 0x2du || in.opcode == kDsOpcodeBpermuteB32)
                 return 1;
             if (in.opcode == 0x37u || in.opcode == 0x76u) return 2;
             if (in.opcode == 0xfeu) return 3;
