@@ -1992,6 +1992,49 @@ int main() {
         CHECK(got17d1h_pc67_or == std::vector<uint32_t>(64, 0x7fffffffu),
               "same-site pc67 OR mutation produces its distinct scalar result");
     }
+
+    // EXEC_HI is architectural scalar zero in Wave32. Combining it with the saved s20 mask must
+    // therefore use the scalar-data route, and that classification must agree with the dispatcher's
+    // save/reload analysis. The same-target branch creates the boundary at which a stale mask-domain
+    // classification used to replace s26 with false before its downstream scalar read.
+    std::vector<uint32_t> code17d1h_exec_hi = {
+        0x7e160280u,              // v_mov_b32 v11,0
+        0x7d8416f9u, 0x06869480u, // v_cmp_eq_u32_sdwa s20,0,v11: full saved mask
+        0x881a7f14u,              // s_or_b32 s26,s20,exec_hi: scalar 0xffffffff
+        0xbf068000u,              // s_cmp_eq_u32 0,0
+        0xbf840000u,              // same target/fallthrough forces a dispatcher reload
+        0x7e02021au,              // v_mov_b32 v1,s26: observe the reloaded scalar dword
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+    };
+    code17d1h_exec_hi.insert(
+        code17d1h_exec_hi.end(), std::begin(code17d), std::end(code17d));
+    const auto native_spv17d1h_exec_hi = recompile_compute(
+        code17d1h_exec_hi.data(), code17d1h_exec_hi.size(), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1h_exec_hi.empty(),
+          "Wave32 EXEC_HI stays scalar across a dispatcher reload");
+    CHECK(recompile_compute(code17d1h_exec_hi.data(), code17d1h_exec_hi.size(),
+                            &rt17d1, portable_cfg17d1).empty(),
+          "saved-mask scalar materialization rejects without an exact Wave32 subgroup");
+    std::vector<uint32_t> code17d1h_exec_hi_and = code17d1h_exec_hi;
+    code17d1h_exec_hi_and[3] = 0x871a7f14u; // same-site s_and_b32 s26,s20,exec_hi
+    const auto native_spv17d1h_exec_hi_and = recompile_compute(
+        code17d1h_exec_hi_and.data(), code17d1h_exec_hi_and.size(),
+        &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1h_exec_hi_and.empty(),
+          "same-site EXEC_HI AND mutation remains representable");
+    if (can_execute17d1h) {
+        std::vector<uint32_t> got17d1h_exec_hi, got17d1h_exec_hi_and;
+        prosper::test::run_compute(native_spv17d1h_exec_hi, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(64, 0u),
+                                   &got17d1h_exec_hi);
+        prosper::test::run_compute(native_spv17d1h_exec_hi_and,
+                                   std::vector<float>(64, 0.0f), 64, 64, {},
+                                   std::vector<uint32_t>(64, 0u), &got17d1h_exec_hi_and);
+        CHECK(got17d1h_exec_hi == std::vector<uint32_t>(64, 0xffffffffu),
+              "saved mask OR architectural EXEC_HI zero survives the reload");
+        CHECK(got17d1h_exec_hi_and == std::vector<uint32_t>(64, 0u),
+              "same-site AND mutation distinguishes EXEC_HI scalar-zero semantics");
+    }
     if (can_execute17d1) {
         std::vector<uint32_t> initial17d1(64, 0u), got17d1;
         prosper::test::run_compute(native_spv17d1, std::vector<float>(64, 0.0f),
