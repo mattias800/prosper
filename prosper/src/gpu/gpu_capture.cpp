@@ -115,7 +115,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // must not silently compile a sorted guest descriptor with the historical physical-child order.
 // v49 (#2481): retain the exact linear stride-8 qword-atomic record count. Size/stride alone do not
 // preserve the descriptor's OOB_SELECT proof, which controls the all-or-nothing record range check.
-constexpr uint32_t kVersion = 49;
+// v50 (#2481): retain COMPUTE_PGM_RSRC1 in every exact compute recompile configuration. FP32 memory
+// and LDS atomics consume its denormal mode; older artifacts leave the state explicitly unknown.
+constexpr uint32_t kVersion = 50;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -278,6 +280,8 @@ bool read_compute_config(Reader& r, ComputeShaderConfig& config, uint32_t captur
         !r.u32(config.lds_bytes) || !r.u32(config.native_subgroup_size) ||
         !r.u32(config.native_storage_format_support))
         return false;
+    if (capture_version < 50)
+        config.compute_pgm_rsrc1 = UINT32_MAX;
     config.exact_thread_extent = exact != 0;
     config.tgid_x_en = (flags & 1u) != 0;
     config.tgid_y_en = (flags & 2u) != 0;
@@ -2739,6 +2743,27 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             write_atomic_x2_state(stage.resource_table);
+    // v50 retains the launch register only for configurations that exist. Keep this append-only:
+    // COMPUTE_PGM_RSRC1 became semantically necessary after v42 embedded the config records, and
+    // inserting it into those historical records would make every v42-v49 suffix non-removable.
+    uint64_t compute_pgm_rsrc1_count = 0;
+    for (const auto& compute : c.computes)
+        compute_pgm_rsrc1_count += compute.recompile_config_available;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            compute_pgm_rsrc1_count += stage.recompile_config_available;
+    if (compute_pgm_rsrc1_count > UINT32_MAX) {
+        error = "invalid compute PGM_RSRC1 state count";
+        return false;
+    }
+    w.u32(static_cast<uint32_t>(compute_pgm_rsrc1_count));
+    for (const auto& compute : c.computes)
+        if (compute.recompile_config_available)
+            w.u32(compute.recompile_config.compute_pgm_rsrc1);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (stage.recompile_config_available)
+                w.u32(stage.recompile_config.compute_pgm_rsrc1);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3964,6 +3989,28 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     error = "invalid atomic-x2 state";
                     return false;
                 }
+    }
+    if (version >= 50) {
+        size_t expected = 0;
+        for (const auto& compute : c.computes)
+            expected += compute.recompile_config_available;
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.recompile_config_available;
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid compute PGM_RSRC1 state count";
+            return false;
+        }
+        for (auto& compute : c.computes)
+            if (compute.recompile_config_available &&
+                !r.u32(compute.recompile_config.compute_pgm_rsrc1))
+                return false;
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (stage.recompile_config_available &&
+                    !r.u32(stage.recompile_config.compute_pgm_rsrc1))
+                    return false;
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)

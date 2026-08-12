@@ -645,6 +645,39 @@ int main() {
               push_constant_identity == cached_compute_identity,
           "diagnostic provenance stays outside compute shader cache identity");
 
+    // BUFFER_ATOMIC_FMIN bakes COMPUTE_PGM_RSRC1.FP32_DENORM into its integer CAS selection.
+    // The same packet must therefore miss across launch modes, while repeating one mode hits.
+    clear_shader_recompile_cache();
+    static const uint32_t kAtomicFminCompute[] = {
+        0xe0fc0000u, 0x80010000u, // buffer_atomic_fmin v0, off, s[4:7], 0
+        0xbf810000u,
+    };
+    ShaderResource atomic_buffer;
+    atomic_buffer.cls = ResourceClass::ConstantBuffer;
+    atomic_buffer.format = DataFormat::Uint32;
+    atomic_buffer.num_components = 1;
+    atomic_buffer.binding = 3;
+    atomic_buffer.stride = 4;
+    atomic_buffer.sgpr_base = 4;
+    atomic_buffer.size = 4;
+    ShaderResourceTable float_atomic_table;
+    float_atomic_table.resources.push_back(atomic_buffer);
+    ComputeShaderConfig atomic_mode0 = compute_config;
+    atomic_mode0.compute_pgm_rsrc1 = 0u;
+    ComputeShaderConfig atomic_mode3 = atomic_mode0;
+    atomic_mode3.compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
+    const auto atomic_flush = recompile_compute_shader_cached(
+        kAtomicFminCompute, std::size(kAtomicFminCompute), &float_atomic_table, atomic_mode0);
+    const auto atomic_preserve = recompile_compute_shader_cached(
+        kAtomicFminCompute, std::size(kAtomicFminCompute), &float_atomic_table, atomic_mode3);
+    const auto atomic_flush_again = recompile_compute_shader_cached(
+        kAtomicFminCompute, std::size(kAtomicFminCompute), &float_atomic_table, atomic_mode0);
+    stats = shader_recompile_cache_stats();
+    CHECK(!atomic_flush.empty() && !atomic_preserve.empty() &&
+              atomic_flush != atomic_preserve && atomic_flush_again == atomic_flush &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates float-atomic modules by PGM_RSRC1 denormal mode");
+
     // Diagnostic provenance is not shader semantics. Force two recompiles of one rejected site so
     // each call must carry its own immutable program identity through the cache wrapper, builder and
     // structurizer, while a direct standalone call must remain explicitly neutral.

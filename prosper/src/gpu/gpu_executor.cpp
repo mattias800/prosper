@@ -331,6 +331,7 @@ struct ShaderCompileKey {
     bool compute_exact_thread_extent = false;
     uint32_t compute_threads_x = 0, compute_threads_y = 0, compute_threads_z = 0;
     uint32_t compute_wave_size = 64;
+    uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
     uint32_t compute_tidig_comp_cnt = 0;
     bool compute_tgid_x_en = false, compute_tgid_y_en = false, compute_tgid_z_en = false;
     bool compute_tg_size_en = false;
@@ -379,6 +380,7 @@ struct ShaderCompileKey {
                compute_threads_y == other.compute_threads_y &&
                compute_threads_z == other.compute_threads_z &&
                compute_wave_size == other.compute_wave_size &&
+               compute_pgm_rsrc1 == other.compute_pgm_rsrc1 &&
                compute_tidig_comp_cnt == other.compute_tidig_comp_cnt &&
                compute_tgid_x_en == other.compute_tgid_x_en &&
                compute_tgid_y_en == other.compute_tgid_y_en &&
@@ -445,6 +447,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_threads_y);
             hash = hash_mix(hash, key.compute_threads_z);
             hash = hash_mix(hash, key.compute_wave_size);
+            hash = hash_mix(hash, key.compute_pgm_rsrc1);
             hash = hash_mix(hash, key.compute_tidig_comp_cnt);
             hash = hash_mix(hash, key.compute_tgid_x_en);
             hash = hash_mix(hash, key.compute_tgid_y_en);
@@ -1109,6 +1112,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_threads_y = compute_config->threads_y;
         key.compute_threads_z = compute_config->threads_z;
         key.compute_wave_size = compute_config->wave_size;
+        key.compute_pgm_rsrc1 = compute_config->compute_pgm_rsrc1;
         key.compute_tidig_comp_cnt = compute_config->tidig_comp_cnt;
         key.compute_tgid_x_en = compute_config->tgid_x_en;
         key.compute_tgid_y_en = compute_config->tgid_y_en;
@@ -6085,6 +6089,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         }
 
         ComputeShaderConfig config;
+        config.compute_pgm_rsrc1 = rd(ds.sh, P::COMPUTE_PGM_RSRC1);
         config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;

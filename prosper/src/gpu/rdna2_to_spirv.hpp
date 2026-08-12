@@ -18,6 +18,10 @@
 
 namespace prosper::gpu {
 
+// Synthetic shader tests preserve FP32 input/output subnormals unless they provide real launch
+// state. Live dispatches always replace this with the raw COMPUTE_PGM_RSRC1 register.
+constexpr uint32_t kDefaultComputePgmRsrc1 = 3u << 16;
+
 inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
@@ -226,7 +230,8 @@ std::vector<uint32_t> recompile_interpolation_geometry(
 // default (also the safe cap for the common maxComputeSharedMemorySize of 32 KB).
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
-                                     const ShaderResourceTable* rt = nullptr, uint32_t lds_bytes = 0);
+                                     const ShaderResourceTable* rt = nullptr, uint32_t lds_bytes = 0,
+                                     uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1);
 
 // Register and launch state for a real compute program. User SGPR values are supplied as one
 // push-constant dword per register; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
@@ -240,6 +245,11 @@ struct ComputeShaderConfig {
     bool exact_thread_extent = false;
     uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
     uint32_t wave_size = 64; // COMPUTE_DISPATCH_INITIATOR.CS_W32_EN selects 32; otherwise 64.
+    // Raw COMPUTE_PGM_RSRC1 launch state. Floating-point memory/LDS atomics consume its FP32
+    // denormal mode even though their CAS lowering stays in integer SPIR-V. Synthetic callers use
+    // the no-flush default; legacy captures explicitly load UINT32_MAX and remain fail-visible for
+    // instructions whose semantics need state that the old artifact did not record.
+    uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
     uint32_t tidig_comp_cnt = 0;
     bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
     bool tg_size_en = false;

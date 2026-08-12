@@ -3300,7 +3300,8 @@ int main() {
         0xbf810000u,
     };
     const std::vector<uint32_t> spv_atomic_fmin = recompile_valu(
-        code_atomic_fmin, std::size(code_atomic_fmin), 1, 0, &rt_atomic_float);
+        code_atomic_fmin, std::size(code_atomic_fmin), 1, 0, &rt_atomic_float, 0,
+        0u); // GTA COMPUTE_PGM_RSRC1: compare FP32 subnormals as signed zero, IEEE off
     CHECK(!spv_atomic_fmin.empty() && count_spirv_opcode(spv_atomic_fmin, 230) == 1 &&
               count_spirv_opcode(spv_atomic_fmin, 236) == 0 &&
               count_spirv_opcode(spv_atomic_fmin, 237) == 0,
@@ -3318,12 +3319,48 @@ int main() {
     CHECK(atomic_fmin_out.size() == 1 && atomic_fmin_out[0] == 0xc0600000u,
           "GTA BUFFER_ATOMIC_FMIN atomically reduces finite, NaN, and denormal operands");
 
+    auto run_atomic_float_one = [&](const std::vector<uint32_t>& module, uint32_t value,
+                                    uint32_t resident) {
+        std::vector<uint32_t> memory;
+        prosper::test::run_compute(module, {std::bit_cast<float>(value)}, 1, 1, {},
+                                   {resident}, &memory, 1);
+        return memory.size() == 1 ? memory[0] : 0xdeadc0deu;
+    };
+    const uint32_t code_atomic_fmin_lane0[] = {
+        0xbefe0481u,              // s_mov_b64 exec, 1: isolate one CAS from the 64-lane shell
+        0xe0fc0000u, 0x80010000u, // same exact GTA pc88 BUFFER_ATOMIC_FMIN packet
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv_atomic_fmin_lane0 = recompile_valu(
+        code_atomic_fmin_lane0, std::size(code_atomic_fmin_lane0), 1, 0,
+        &rt_atomic_float, 0, 0u);
+    const uint32_t atomic_snan_value =
+        run_atomic_float_one(spv_atomic_fmin_lane0, 0x7f812345u, 0x3f800000u);
+    const uint32_t atomic_snan_resident =
+        run_atomic_float_one(spv_atomic_fmin_lane0, 0x3f800000u, 0xff812345u);
+    if (atomic_snan_value != 0x7fc12345u || atomic_snan_resident != 0xffc12345u)
+        std::printf("  atomic sNaN value=0x%08x resident=0x%08x\n",
+                    atomic_snan_value, atomic_snan_resident);
+    CHECK(atomic_snan_value == 0x7fc12345u && atomic_snan_resident == 0xffc12345u,
+          "BUFFER_ATOMIC_FMIN quiets and propagates signaling NaNs from VDATA or memory");
+    CHECK(run_atomic_float_one(spv_atomic_fmin, 0x00000000u, 0x00000001u) == 0x00000001u,
+          "GTA FP32 mode compares subnormal atomic operands as zero but returns original bits");
+    const std::vector<uint32_t> spv_atomic_fmin_preserve = recompile_valu(
+        code_atomic_fmin, std::size(code_atomic_fmin), 1, 0, &rt_atomic_float, 0,
+        kDefaultComputePgmRsrc1);
+    CHECK(run_atomic_float_one(spv_atomic_fmin_preserve, 0x00000000u, 0x00000001u) ==
+              0x00000000u,
+          "the same atomic site retains subnormal ordering when FP32 mode preserves inputs");
+    CHECK(recompile_valu(code_atomic_fmin, std::size(code_atomic_fmin), 1, 0,
+                         &rt_atomic_float, 0, UINT32_MAX).empty(),
+          "the exact float-atomic site stays fail-visible when legacy state lacks PGM_RSRC1");
+
     const uint32_t code_atomic_fmax[] = {
         0xe1000000u, 0x80010000u,  // GTA pc94 opcode: buffer_atomic_fmax v0, off, s[4:7], 0
         0xbf810000u,
     };
     const std::vector<uint32_t> spv_atomic_fmax = recompile_valu(
-        code_atomic_fmax, std::size(code_atomic_fmax), 1, 0, &rt_atomic_float);
+        code_atomic_fmax, std::size(code_atomic_fmax), 1, 0, &rt_atomic_float, 0, 0u);
     std::vector<uint32_t> atomic_fmax_out;
     prosper::test::run_compute(spv_atomic_fmax, atomic_float_operands, N, N, {},
                                {0xff800000u}, &atomic_fmax_out);
@@ -3338,7 +3375,7 @@ int main() {
         0xbf810000u,
     };
     const std::vector<uint32_t> spv_atomic_fmin_glc = recompile_valu(
-        code_atomic_fmin_glc, std::size(code_atomic_fmin_glc), 1, 0, &rt_atomic_float);
+        code_atomic_fmin_glc, std::size(code_atomic_fmin_glc), 1, 0, &rt_atomic_float, 0, 0u);
     std::vector<uint32_t> atomic_fmin_glc_out;
     const std::vector<float> atomic_fmin_glc_input = {std::bit_cast<float>(0xc0600000u)};
     const std::vector<float> atomic_fmin_glc_result = prosper::test::run_compute(
