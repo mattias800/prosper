@@ -30,6 +30,10 @@ enum class Rdna2Format : uint8_t {
 // GFX10.3 scalar ALU opcodes shared by emission and source-lifetime analysis.
 inline constexpr uint32_t kSop1OpcodeMovB64 = 0x04;
 inline constexpr uint32_t kSop1OpcodeBrevB32 = 0x0b;
+inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
+inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
+inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
+inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
 inline constexpr uint32_t kSop2OpcodeAndB32 = 0x0e;
 inline constexpr uint32_t kSop2OpcodeOrB32 = 0x10;
@@ -42,6 +46,34 @@ inline constexpr uint32_t kSop2OpcodeXnorB32 = 0x1c;
 inline constexpr uint32_t kSop2OpcodeBfmB32 = 0x24;
 inline constexpr uint32_t kSopkOpcodeMovkI32 = 0x00;
 inline constexpr uint32_t kSopkOpcodeWaitcntVscnt = 0x17;
+inline constexpr uint32_t kSoppOpcodeBranch = 0x02;
+inline constexpr uint32_t kSoppOpcodeCbranchScc0 = 0x04;
+inline constexpr uint32_t kSoppOpcodeCbranchExecnz = 0x09;
+inline constexpr uint32_t kSoppOpcodeBarrier = 0x0a;
+
+inline constexpr bool sopp_opcode_is_direct_branch(uint32_t opcode) {
+    return opcode == kSoppOpcodeBranch ||
+           (opcode >= kSoppOpcodeCbranchScc0 && opcode <= kSoppOpcodeCbranchExecnz);
+}
+
+// GFX10.3 scalar-memory load opcodes shared by provenance analysis and emission. These are
+// compile-time constants, so naming them has no runtime cost; it keeps width/family tests from
+// becoming opaque hexadecimal comparisons at each consumer.
+inline constexpr uint32_t kSmemOpcodeLoadDword          = 0x00;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX2        = 0x01;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX4        = 0x02;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX8        = 0x03;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX16       = 0x04;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDword    = 0x08;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX2  = 0x09;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX4  = 0x0a;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX8  = 0x0b;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX16 = 0x0c;
+
+inline constexpr bool smem_opcode_is_buffer_load(uint32_t opcode) {
+    return opcode >= kSmemOpcodeBufferLoadDword &&
+           opcode <= kSmemOpcodeBufferLoadDwordX16;
+}
 
 inline constexpr bool sop2_is_b32_logical(uint32_t opcode) {
     return opcode == kSop2OpcodeAndB32 || opcode == kSop2OpcodeOrB32 ||

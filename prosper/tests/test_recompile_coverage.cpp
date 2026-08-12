@@ -298,6 +298,147 @@ int main() {
                             &sampled_vcc_rt, sampled_vcc_config).empty(),
           "an MIMG sampler range overlapping VCC keeps the guarded scalar write live");
 
+    // GTA V program 0x413dc3400 loads the low fragment of a V# at exact pc18 with a VCC_LO
+    // byte offset. Scalar writes replace word1 and fill words2/3 before the exact pc26 MUBUF
+    // consumer. Retain the production prefix and its pc23..32 loop: the descriptor-fragment proof
+    // must follow the actual CFG rather than mistake lexical order for the only execution path.
+    const uint32_t smem_x2_descriptor_fragment[] = {
+        0xbfa00003u,
+        0xd7460044u, 0x04011002u,
+        0x870c00c2u,
+        0xbe8d0301u,
+        0x87010081u,
+        0xf4000686u, 0xfa000074u,   // pc6:  ordinary s_load_dword s26
+        0xbe82047eu,
+        0xbf8cc07fu,
+        0x7d28881au,
+        0xbf88001au,               // pc11: forward early-out to pc38
+        0x7e020344u,
+        0x8f6a8300u,
+        0xbe9b03ffu, 0x00016204u,
+        0x876a886au,
+        0xbe880380u,
+        0xf4040606u, 0xd4000018u,   // pc18: s_load_dwordx2 s[24:25], s[12:13], vcc_lo
+        0xbeea047eu,
+        0xbf8cc07fu,
+        0xbe991d92u,               // pc22: replace loaded word1 (s25)
+        0x7e040208u,
+        0x7daa0280u,
+        0xbf880007u,
+        0xe0302000u, 0x80060101u,   // pc26: buffer_load_dword v1, v1, s[24:27], 0 offen
+        0x81088108u,
+        0xbf8c3f70u,
+        0xd5480001u, 0x026d0701u,
+        0xbf82fff6u,               // pc32: loop back to pc23
+        0xbefe046au,
+        0xbf800000u, 0xbf800000u, 0xbf800000u, 0xbf800000u,
+        0xbf810000u,               // pc38: early-out/end
+    };
+    ShaderResourceTable smem_x2_descriptor_fragment_rt;
+    { ShaderResource data{}; data.cls = ResourceClass::ConstantBuffer;
+      data.format = DataFormat::Uint32; data.num_components = 1; data.binding = 3;
+      data.gpu_addr = 0x100000u; data.size = 120; data.fetch_pc = 6;
+      smem_x2_descriptor_fragment_rt.resources.push_back(data); }
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1; buffer.binding = 4;
+      buffer.gpu_addr = 0x200000u; buffer.size = 120; buffer.fetch_pc = 26;
+      smem_x2_descriptor_fragment_rt.resources.push_back(buffer); }
+    ComputeShaderConfig smem_x2_descriptor_fragment_config;
+    smem_x2_descriptor_fragment_config.local_x = 64;
+    smem_x2_descriptor_fragment_config.threads_x = 64;
+    smem_x2_descriptor_fragment_config.wave_size = 64;
+    smem_x2_descriptor_fragment_config.native_subgroup_size = 64;
+    smem_x2_descriptor_fragment_config.user_sgprs.resize(28);
+    const std::vector<uint32_t> smem_x2_descriptor_fragment_spv = recompile_compute(
+        smem_x2_descriptor_fragment, std::size(smem_x2_descriptor_fragment),
+        &smem_x2_descriptor_fragment_rt, smem_x2_descriptor_fragment_config);
+    const DescriptorValidationReport smem_x2_descriptor_fragment_report =
+        validate_spirv_descriptor_interface(smem_x2_descriptor_fragment_spv,
+                                            &smem_x2_descriptor_fragment_rt, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(!smem_x2_descriptor_fragment_spv.empty() &&
+              smem_x2_descriptor_fragment_report.ok() &&
+              find_spirv_descriptor_binding(smem_x2_descriptor_fragment_report, 0, 3) &&
+              find_spirv_descriptor_binding(smem_x2_descriptor_fragment_report, 0, 4) &&
+              !find_spirv_descriptor_binding(smem_x2_descriptor_fragment_report, 0, 2),
+          "GTA V pc18 x2 descriptor fragment crosses its loop and routes pc26 without fallback cbuf");
+
+    // Mutation arm at the production fix site: changing only pc18 SDATA from s24 to s20 disconnects
+    // the loaded pair from pc26's V#. The proof must disappear, leaving register-offset raw x2
+    // fail-visible rather than silently turning unrelated scalar data into placeholders.
+    uint32_t smem_x2_descriptor_fragment_wrong_dst[std::size(smem_x2_descriptor_fragment)];
+    std::copy(std::begin(smem_x2_descriptor_fragment),
+              std::end(smem_x2_descriptor_fragment),
+              std::begin(smem_x2_descriptor_fragment_wrong_dst));
+    smem_x2_descriptor_fragment_wrong_dst[18] = 0xf4040506u;
+    CHECK(recompile_compute(smem_x2_descriptor_fragment_wrong_dst,
+                            std::size(smem_x2_descriptor_fragment_wrong_dst),
+                            &smem_x2_descriptor_fragment_rt,
+                            smem_x2_descriptor_fragment_config).empty(),
+          "GTA V pc18 same-site SDATA mutation remains fail-visible");
+    uint32_t smem_x2_descriptor_fragment_scalar_read[std::size(smem_x2_descriptor_fragment)];
+    std::copy(std::begin(smem_x2_descriptor_fragment),
+              std::end(smem_x2_descriptor_fragment),
+              std::begin(smem_x2_descriptor_fragment_scalar_read));
+    smem_x2_descriptor_fragment_scalar_read[23] = 0x7e040218u; // pc23: v_mov_b32 v2,s24
+    CHECK(recompile_compute(smem_x2_descriptor_fragment_scalar_read,
+                            std::size(smem_x2_descriptor_fragment_scalar_read),
+                            &smem_x2_descriptor_fragment_rt,
+                            smem_x2_descriptor_fragment_config).empty(),
+          "x2 fragment with an ordinary scalar observation remains fail-visible");
+    ShaderResourceTable smem_x2_descriptor_fragment_keyed_rt =
+        smem_x2_descriptor_fragment_rt;
+    smem_x2_descriptor_fragment_keyed_rt.resources[1].srt_offset = 0x18u;
+    CHECK(recompile_compute(smem_x2_descriptor_fragment,
+                            std::size(smem_x2_descriptor_fragment),
+                            &smem_x2_descriptor_fragment_keyed_rt,
+                            smem_x2_descriptor_fragment_config).empty(),
+          "x2 fragment rejects a consumer lacking key-less exact-PC provenance");
+
+    // Program 0x413dc6700 has the same family at exact pc10, this time feeding the V# consumed by
+    // S_BUFFER_LOAD at pc67. Keep both production packets at their original PCs; transparent NOPs
+    // stand in for the unrelated body between descriptor construction and consumption.
+    std::vector<uint32_t> smem_x2_sbuffer_fragment = {
+        0xbfa00003u,
+        0xd7460044u, 0x04011002u,
+        0x8f6a8300u,
+        0x8a6b0081u,
+        0x87180081u,
+        0x876a886au,
+        0x871600c2u,
+        0xbe970301u,
+        0x8f6b836bu,
+        0xf404040bu, 0xd4000028u,   // pc10: s_load_dwordx2 s[16:17], s[22:23], vcc_lo
+        0xbe920380u,               // pc12: fill V#.word2
+        0xbe9303ffu, 0x00016204u,  // pc13: fill V#.word3
+        0xbe911d92u,               // pc15: patch loaded V#.word1
+    };
+    smem_x2_sbuffer_fragment.resize(67, 0xbf800000u);
+    smem_x2_sbuffer_fragment.push_back(0xf4201a88u);
+    smem_x2_sbuffer_fragment.push_back(0xfa000000u); // pc67: s_buffer_load_dword vcc_lo,s[16:19],0
+    smem_x2_sbuffer_fragment.push_back(0xbf8cc07fu);
+    smem_x2_sbuffer_fragment.push_back(0x7e02026au);
+    smem_x2_sbuffer_fragment.push_back(0xbf810000u);
+    ShaderResourceTable smem_x2_sbuffer_fragment_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1; buffer.binding = 4;
+      buffer.gpu_addr = 0x300000u; buffer.size = 120; buffer.fetch_pc = 67;
+      smem_x2_sbuffer_fragment_rt.resources.push_back(buffer); }
+    ComputeShaderConfig smem_x2_sbuffer_fragment_config = smem_x2_descriptor_fragment_config;
+    smem_x2_sbuffer_fragment_config.user_sgprs.resize(24);
+    CHECK(!recompile_compute(smem_x2_sbuffer_fragment.data(),
+                             smem_x2_sbuffer_fragment.size(),
+                             &smem_x2_sbuffer_fragment_rt,
+                             smem_x2_sbuffer_fragment_config).empty(),
+          "GTA V pc10 x2 descriptor fragment routes its exact pc67 scalar-buffer consumer");
+    std::vector<uint32_t> smem_x2_sbuffer_fragment_wrong_dst = smem_x2_sbuffer_fragment;
+    smem_x2_sbuffer_fragment_wrong_dst[10] = 0xf404050bu;
+    CHECK(recompile_compute(smem_x2_sbuffer_fragment_wrong_dst.data(),
+                            smem_x2_sbuffer_fragment_wrong_dst.size(),
+                            &smem_x2_sbuffer_fragment_rt,
+                            smem_x2_sbuffer_fragment_config).empty(),
+          "GTA V pc10 same-site SDATA mutation remains fail-visible");
+
     // GTA V's texture-transfer compute kernels load two adjacent eight-word T# descriptors with one
     // immediate s_load_dwordx16. The load has one SRT offset but the halves are distinct resources,
     // so only exact consuming-PC bindings are sound. Prove both bindings are emitted and the scalar
