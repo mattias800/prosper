@@ -29,6 +29,7 @@ enum class Rdna2Format : uint8_t {
 
 // GFX10.3 scalar ALU opcodes shared by emission and source-lifetime analysis.
 inline constexpr uint32_t kSop1OpcodeMovB64 = 0x04;
+inline constexpr uint32_t kSop1OpcodeBrevB32 = 0x0b;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
 inline constexpr uint32_t kSop2OpcodeAndB32 = 0x0e;
 inline constexpr uint32_t kSop2OpcodeOrB32 = 0x10;

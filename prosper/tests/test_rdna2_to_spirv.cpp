@@ -2165,6 +2165,49 @@ int main() {
     CHECK(got17d1_exec_bfm_width15 == expected17d1_exec_bfm_width15,
           "same-site width mutation leaves lane 31 inactive in each Wave32 wave");
 
+    // GTA V pc1083 reverses scalar bits directly into EXEC_LO: bitreverse(0xfffffff0) is
+    // 0x0fffffff, selecting lanes 0..27 of each Wave32 wave. Mutating the exact source operand to
+    // -8 produces 0x1fffffff and activates lane 28 as well.
+    std::vector<uint32_t> code17d1_exec_brev = {
+        0xbefe0bd0u,              // exact pc1083: s_brev_b32 exec_lo,-16
+        0x7e0202aau,              // v_mov_b32 v1,42
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbefe03c1u,              // s_mov_b32 exec_lo,-1
+    };
+    code17d1_exec_brev.insert(
+        code17d1_exec_brev.end(), std::begin(code17d), std::end(code17d));
+    const auto portable_spv17d1_exec_brev = recompile_compute(
+        code17d1_exec_brev.data(), code17d1_exec_brev.size(), &rt17d1, portable_cfg17d1);
+    std::vector<uint32_t> code17d1_exec_brev_neg8 = code17d1_exec_brev;
+    code17d1_exec_brev_neg8[0] = 0xbefe0bc8u; // same site: s_brev_b32 exec_lo,-8
+    const auto portable_spv17d1_exec_brev_neg8 = recompile_compute(
+        code17d1_exec_brev_neg8.data(), code17d1_exec_brev_neg8.size(),
+        &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1_exec_brev.empty() &&
+              !portable_spv17d1_exec_brev_neg8.empty(),
+          "Wave32 BREV EXEC write and exact-site source mutation recompile");
+    std::vector<uint32_t> got17d1_exec_brev, got17d1_exec_brev_neg8;
+    if (!portable_spv17d1_exec_brev.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_brev, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_brev);
+    if (!portable_spv17d1_exec_brev_neg8.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_brev_neg8, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_brev_neg8);
+    std::vector<uint32_t> expected17d1_exec_brev(64, 0xdeadbeefu);
+    std::vector<uint32_t> expected17d1_exec_brev_neg8(64, 0xdeadbeefu);
+    for (uint32_t wave = 0; wave < 2; ++wave) {
+        for (uint32_t lane = 0; lane < 28; ++lane)
+            expected17d1_exec_brev[wave * 32 + lane] = 42u;
+        for (uint32_t lane = 0; lane < 29; ++lane)
+            expected17d1_exec_brev_neg8[wave * 32 + lane] = 42u;
+    }
+    CHECK(got17d1_exec_brev == expected17d1_exec_brev,
+          "pc1083 BREV selects lanes 0 through 27 of each Wave32 wave");
+    CHECK(got17d1_exec_brev_neg8 == expected17d1_exec_brev_neg8,
+          "same-site source mutation additionally selects lane 28 of each Wave32 wave");
+
     // Kernel 17d1i: GTA V's newly exposed pc115 packet gathers DATA0 backward through a byte
     // address. Keep its exact v30/v6/v9 encoding and the irreducible dispatcher tail. Offset +4 is
     // a same-site mutation selecting the following source lane, including wrap at each 32-lane half.
