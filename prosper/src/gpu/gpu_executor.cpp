@@ -4444,6 +4444,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                              (int)optional_null_raw_load,
                                              (int)proven_null_guarded_raw_store);
                             srt_uses->push_back(u);
+                        } else if (trc) {
+                            // Fail-visible: say WHY a raw buffer use was not published. Without this
+                            // the site simply vanishes from the trace, which reads as "the fold never
+                            // walked it" and sends the reader upstream to control flow. Three separate
+                            // static derivations of why GTA V 0x413ce6000's pc70 is missing were wrong
+                            // before this line existed (#2481).
+                            fprintf(stderr,
+                                    "[dyntrace] MUBUF pc=%u NOT-PUBLISHED s%d v4=%08x:%08x:%08x:%08x "
+                                    "base=0x%llx stride=%u records=%u size=%u "
+                                    "fmt-load=%d raw=%d base>64k=%d size!=0=%d size<=256M=%d "
+                                    "stride-ok=%d format-ok=%d\n",
+                                    in.pc, srsrc, u.v4[0], u.v4[1], u.v4[2], u.v4[3],
+                                    (unsigned long long)d.base, d.stride, d.num_records, d.size_bytes,
+                                    (int)format_load_use, (int)raw_buffer_use,
+                                    (int)(d.base > 0x10000), (int)(d.size_bytes != 0),
+                                    (int)(d.size_bytes <= 0x10000000u),
+                                    (int)stride_supported, (int)format_supported);
                         }
                     }
                 }
