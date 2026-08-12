@@ -11885,11 +11885,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1: n = 2; is_format = true; break;   // buffer_load_format_xy
                 case 0x2: n = 3; is_format = true; break;   // buffer_load_format_xyz
                 case 0x3: n = 4; is_format = true; break;   // buffer_load_format_xyzw
-                case 0x1C: n = 1; is_store = true; break;   // buffer_store_dword
-                case 0x1D: n = 2; is_store = true; break;   // buffer_store_dwordx2
-                case 0x1E: n = 4; is_store = true; break;   // buffer_store_dwordx4
-                case 0x1F: n = 3; is_store = true; break;   // buffer_store_dwordx3 (like loads,
-                                                            // x3 sorts after x4 in this ISA)
+                case kMubufOpcodeStoreDword: n = 1; is_store = true; break;
+                case kMubufOpcodeStoreDwordX2: n = 2; is_store = true; break;
+                case kMubufOpcodeStoreDwordX4: n = 4; is_store = true; break;
+                case kMubufOpcodeStoreDwordX3: n = 3; is_store = true; break;
                 case 0x4: n = 1; is_format = true; is_store = true; break;   // buffer_store_format_x
                 case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
                 case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
@@ -12133,6 +12132,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 sreg_range_written(rs, in.src[1].value, 4), rt->resources.size());
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
+                }
+                if (is_proven_null_guarded_raw_store(*res)) {
+                    // The front half proved the exact pc74/76/78 consumer lies in GTA V's
+                    // dispatch-specialized null-output region. Accept only the raw store family;
+                    // a load, typed store, or atomic at the same pc must remain fail-visible rather
+                    // than inheriting a no-op from stale/malformed resource metadata.
+                    const bool supported_store = in.fmt == Rdna2Format::MUBUF && is_store &&
+                        !is_format && !is_atomic &&
+                        (in.opcode == kMubufOpcodeStoreDword ||
+                         in.opcode == kMubufOpcodeStoreDwordX2 ||
+                         in.opcode == kMubufOpcodeStoreDwordX4 ||
+                         in.opcode == kMubufOpcodeStoreDwordX3) &&
+                        rdna2_gta5_null_guarded_raw_store_site(in);
+                    if (!supported_store || res->fetch_pc != in.pc) {
+                        ok = false;
+                        return true;
+                    }
+                    return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
                     // The front half proved all four live V# words at this exact instruction and
@@ -20488,6 +20505,16 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    const bool has_null_guarded_raw_store = rt &&
+        std::any_of(rt->resources.begin(), rt->resources.end(),
+                    is_proven_null_guarded_raw_store);
+    // A resource table is externally constructible and can outlive the shader bytes or dispatch
+    // that produced it. Re-establish the complete static guard and dynamic null-entry contract at
+    // the final translation boundary before any marker is permitted to erase a real store.
+    if (has_null_guarded_raw_store &&
+        !rdna2_gta5_null_guarded_raw_store_dispatch(
+            code, dwords, config.user_sgprs.data(), config.user_sgprs.size()))
+        return {};
     const uint32_t local_x = std::max(1u, config.local_x);
     const uint32_t local_y = std::max(1u, config.local_y);
     const uint32_t local_z = std::max(1u, config.local_z);

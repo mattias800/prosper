@@ -4205,6 +4205,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     auto report = validate_spirv_descriptor_interface(
         spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
     if (!report.ok()) return false;
+    const bool has_conditional_noop = item.resources &&
+        std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
+                    is_proven_null_guarded_raw_store);
+    // The impossible-stride resource shape is serialized data, not authority. Only the live
+    // compiler or replay materializer can mint this non-serialized token after checking raw bytes,
+    // pc42 scalar dataflow, and the dispatch's user s2:s3.
+    if (has_conditional_noop && !item.null_guarded_raw_store_validated)
+        return false;
     double setup_validate_ms = std::chrono::duration<double, std::milli>(
         ComputeClock::now() - setup_validate_start).count();
     double setup_buffers_ms = 0.0;
@@ -4227,17 +4235,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 return false;
         }
     }
-    // A compute program whose every external RAW access was proven NUM_RECORDS=0 contains no
-    // storage/image operation after recompilation. Treat that exact runtime contract as a successful
-    // no-op: reporting failure here would publish an unknown authority boundary and poison later
-    // producer ordering even though the guest operation completed architecturally. Keep the proof
-    // deliberately stronger than merely "descriptorless SPIR-V": the table must be nonempty and every
-    // entry must be the exact-PC marker produced by add_compute_buffer_resources.
-    const bool all_zero_record_raw_noop = descriptors.empty() && image_descriptors.empty() &&
+    // A compute program whose every external RAW access either has NUM_RECORDS=0 or is a proven
+    // unreachable store contains no storage/image operation after recompilation. Treat only those
+    // exact runtime contracts as a successful no-op: reporting failure here would publish an unknown
+    // authority boundary and poison later producer ordering even though the guest operation completed
+    // architecturally. A merely descriptorless module or an ordinary empty table remains a failure.
+    const bool all_proven_no_backing_noop = descriptors.empty() && image_descriptors.empty() &&
         item.resources && !item.resources->resources.empty() &&
         std::all_of(item.resources->resources.begin(), item.resources->resources.end(),
-                    is_zero_record_raw_buffer);
-    if (descriptors.empty() && image_descriptors.empty() && !all_zero_record_raw_noop)
+                    [](const ShaderResource& resource) {
+                        return is_zero_record_raw_buffer(resource) ||
+                               is_proven_null_guarded_raw_store(resource);
+                    });
+    if (descriptors.empty() && image_descriptors.empty() && !all_proven_no_backing_noop)
         return false;
     const bool has_storage_images = std::any_of(
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
@@ -4285,10 +4295,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         (!timing_trace_only || trace);
     // Keep timing selection and the transfer/authority censuses above this return so investigations
     // still observe the proven no-op program. No Vulkan objects or queue submission are needed.
-    if (all_zero_record_raw_noop) {
+    if (all_proven_no_backing_noop) {
         if (trace)
             std::fprintf(stderr,
-                         "[compute] program 0x%llx has only zero-record RAW resources -> no-op\n",
+                         "[compute] program 0x%llx has only proven no-backing resources -> no-op\n",
                          static_cast<unsigned long long>(item.code_addr));
         return true;
     }

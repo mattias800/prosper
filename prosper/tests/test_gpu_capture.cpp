@@ -1994,6 +1994,100 @@ int main(int argc, char** argv) {
               mixed_replay.raw_shader_versions.size() &&
           mixed_replay.computes[0].resources->resources[0].host_data[0] == repeated[32],
           "offline materialization owns compute resources and preserves raw-recompile state");
+
+    // The guarded-null raw-store marker is conditional proof, not self-authenticating metadata.
+    // An unrelated captured shader cannot acquire it merely by forging the impossible stride.
+    GpuCaptureFile guarded_store_capture = mixed;
+    GpuCapturedResource& guarded_store_captured =
+        guarded_store_capture.computes[0].resources.resources[0];
+    guarded_store_captured.resource.cls = ResourceClass::ConstantBuffer;
+    guarded_store_captured.resource.format = DataFormat::Unknown;
+    guarded_store_captured.resource.num_components = 0u;
+    guarded_store_captured.resource.gpu_addr = 0u;
+    guarded_store_captured.resource.size = 0u;
+    guarded_store_captured.resource.stride = kProvenNullGuardedRawStoreStride;
+    guarded_store_captured.resource.srt_offset = 0xFFFFFFFFu;
+    guarded_store_captured.resource.sgpr_base = 0xFFFFFFFFu;
+    guarded_store_captured.resource.fetch_pc = 74u;
+    guarded_store_captured.captured_size = 0u;
+    guarded_store_captured.blob_index = 0xFFFFFFFFu;
+    guarded_store_captured.blob_offset = 0u;
+    std::vector<uint8_t> guarded_store_bytes;
+    GpuCaptureFile guarded_store_loaded;
+    GpuReplayFrame guarded_store_replay;
+    CHECK(!serialize_gpu_capture(guarded_store_capture, guarded_store_bytes, error),
+          "a forged guarded-null marker is rejected at the capture boundary");
+
+    std::vector<uint32_t> guarded_store_raw(81u, 0xbf800000u); // s_nop 0
+    guarded_store_raw[22] = 0xbe92047eu; // s_mov_b64 s[18:19], exec
+    guarded_store_raw[41] = 0xbefe0412u; // s_mov_b64 exec, s[18:19]
+    guarded_store_raw[42] = 0xbf128002u;
+    guarded_store_raw[43] = 0x7d8a00f9u;
+    guarded_store_raw[44] = 0x06868080u;
+    guarded_store_raw[45] = 0x85ea8012u;
+    guarded_store_raw[46] = 0x8dea006au;
+    guarded_store_raw[47] = 0x87fe126au;
+    guarded_store_raw[48] = 0xbf88001fu;
+    guarded_store_raw[74] = 0xe0740030u;
+    guarded_store_raw[75] = 0x80000700u;
+    guarded_store_raw[80] = 0xbf810000u;
+    GpuCaptureFile validated_guarded_store_capture = guarded_store_capture;
+    auto& validated_compute = validated_guarded_store_capture.computes[0];
+    CHECK(validated_compute.raw_shader_index <
+              validated_guarded_store_capture.raw_shader_versions.size(),
+          "guarded-store capture fixture retains a raw compute slot");
+    auto& validated_raw = validated_guarded_store_capture.raw_shader_versions[
+        validated_compute.raw_shader_index];
+    validated_raw.words = guarded_store_raw;
+    validated_raw.has_endpgm = true;
+    validated_raw.content_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(guarded_store_raw.data()),
+        guarded_store_raw.size() * sizeof(uint32_t));
+    validated_compute.recompile_config_available = true;
+    validated_compute.recompile_config.user_sgprs.assign(4u, 0u);
+    validated_compute.recompile_config.local_x = validated_compute.launch.local_x;
+    validated_compute.recompile_config.local_y = validated_compute.launch.local_y;
+    validated_compute.recompile_config.local_z = validated_compute.launch.local_z;
+    validated_compute.recompile_config.threads_x = validated_compute.launch.threads_x;
+    validated_compute.recompile_config.threads_y = validated_compute.launch.threads_y;
+    validated_compute.recompile_config.threads_z = validated_compute.launch.threads_z;
+    validated_compute.recompile_config.native_subgroup_size =
+        validated_compute.required_subgroup_size;
+    error.clear();
+    CHECK(serialize_gpu_capture(validated_guarded_store_capture,
+                                guarded_store_bytes, error) &&
+              deserialize_gpu_capture(guarded_store_bytes, guarded_store_loaded, error) &&
+              is_proven_null_guarded_raw_store(
+                  guarded_store_loaded.computes[0].resources.resources[0].resource) &&
+              materialize_gpu_replay(guarded_store_loaded, guarded_store_replay, error) &&
+              is_proven_null_guarded_raw_store(
+                  guarded_store_replay.computes[0].resources->resources[0]) &&
+              guarded_store_replay.computes[0].null_guarded_raw_store_validated,
+          "raw shader and dispatch proof mint the replay backend's internal marker token");
+
+    for (const uint32_t wrong_fetch_pc : {73u, 79u}) {
+        GpuCaptureFile wrong_site_guarded_store_capture = validated_guarded_store_capture;
+        wrong_site_guarded_store_capture.computes[0]
+            .resources.resources[0].resource.fetch_pc = wrong_fetch_pc;
+        error.clear();
+        CHECK(!serialize_gpu_capture(wrong_site_guarded_store_capture,
+                                     guarded_store_bytes, error),
+              "capture rejects a guarded-store marker whose fetch PC is not an exact store site");
+    }
+
+    GpuCaptureFile stale_guarded_store_capture = validated_guarded_store_capture;
+    auto& stale_guarded_raw_version = stale_guarded_store_capture.raw_shader_versions[
+        stale_guarded_store_capture.computes[0].raw_shader_index];
+    stale_guarded_raw_version.words[40] =
+        0xbe820381u; // s_mov_b32 s2, 1 before the pc42 compare
+    stale_guarded_raw_version.content_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(stale_guarded_raw_version.words.data()),
+        stale_guarded_raw_version.words.size() * sizeof(uint32_t));
+    error.clear();
+    CHECK(!serialize_gpu_capture(stale_guarded_store_capture,
+                                 guarded_store_bytes, error),
+          "capture rejects guarded-store provenance whose shader overwrites s2 before pc42");
+
     GpuCaptureFile mixed_atomic = mixed;
     mixed_atomic.computes[0].recompile_config.storage_buffer_int64_atomics = true;
     // Capture serialization treats the marker as opaque provenance; the emitter separately
