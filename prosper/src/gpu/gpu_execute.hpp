@@ -306,6 +306,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 // the same proof from raw shader bytes; dropping that marker would silently undo the specialization.
 struct ComputeResourcePathSpecializationReport {
     size_t proven_null_exits = 0;
+    size_t zero_record_execz_exits = 0;
     size_t shader_constant_branches = 0;
     size_t removed_resources = 0;
     std::vector<uint32_t> removed_pcs;

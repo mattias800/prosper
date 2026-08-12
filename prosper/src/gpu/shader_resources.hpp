@@ -482,6 +482,9 @@ inline bool is_zero_record_raw_buffer(const ShaderResource& resource) {
 // sampler_sgpr_base because that field is serialized for every resource but is otherwise inert for
 // a ConstantBuffer; 0xFFFFFFFE is not a valid scalar-register base.
 inline constexpr uint32_t kGtaOptionalBufferTableBytes = 272u;
+// GTA V's adjacent +0x50 pair is loaded as the low descriptor fragment for exact-PC raw buffers;
+// the whole-CFG proof in the recompiler verifies every surviving use before eliding that SMEM load.
+inline constexpr uint32_t kGtaBufferDescriptorFragmentOffset = 0x50u;
 inline constexpr uint32_t kGtaOptionalBufferPointerOffset = 0x58u;
 inline constexpr uint32_t kGtaOptionalBufferStride = 4u;
 inline constexpr uint32_t kGtaOptionalBufferStrideWord = kGtaOptionalBufferStride << 16u;

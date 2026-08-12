@@ -184,6 +184,14 @@ int main() {
           isS(mb.src[1], 8) && ((mb.literal >> 12) & 1u), "buffer_load_dwordx4 MUBUF op/VDATA/VADDR/SRSRC/offen");
     CHECK(mb.src[2].kind == OperandKind::InlineInt && mb.src[2].value == 0,
           "MUBUF SOFFSET 0x80 decodes as inline 0, not SGPR s0");
+    // gfx1030 llvm-mc: buffer_load_dword v[0:1], v22, s[4:7], 0 offen tfe.
+    const uint32_t mubuf_tfe_words[] = {0xe0301000u, 0x80810016u};
+    const Rdna2Inst mubuf_tfe = rdna2_decode_one(mubuf_tfe_words, 2);
+    CHECK(mubuf_tfe.fmt == Rdna2Format::MUBUF && mubuf_tfe.mubuf_tfe &&
+              rdna2_vgpr_write_count(mubuf_tfe) == 1u &&
+              rdna2_tfe_status_vgpr(mubuf_tfe) == 1 &&
+              rdna2_vgpr_destination_span(mubuf_tfe) == 2u,
+          "MUBUF TFE decodes and appends its status VGPR after the load result");
     // Astro Bot world-map PS, exact final packet: buffer_store_dwordx3
     // v[3:5], v10, s[16:19], 0 idxen. Raw x3 stores use opcode 0x1f, after x4.
     const uint32_t astro_store_x3[] = { 0xe07c2000u, 0x8004030au };
@@ -654,6 +662,7 @@ int main() {
     const uint32_t mimg_store_mip_tfe_words[] = {0xf0250308u, 0x00050003u};
     const uint32_t mtbuf_store_tfe_words[] = {0xe9e72000u, 0x80882008u};
     const uint32_t wide_mubuf_words[] = {0xe0382020u, 0x80020000u};
+    const uint32_t atomic_x2_words[] = {0xe1406000u, 0x80000000u};
     const Rdna2Inst gta_pc10_vop2 = rdna2_decode_one(gta_pc10_vop2_word, 1);
     const Rdna2Inst wide_vop3 = rdna2_decode_one(wide_vop3_words, 2);
     const Rdna2Inst wide_mimg = rdna2_decode_one(wide_mimg_words, 2);
@@ -662,6 +671,7 @@ int main() {
     const Rdna2Inst mimg_store_mip_tfe = rdna2_decode_one(mimg_store_mip_tfe_words, 2);
     const Rdna2Inst mtbuf_store_tfe = rdna2_decode_one(mtbuf_store_tfe_words, 2);
     const Rdna2Inst wide_mubuf = rdna2_decode_one(wide_mubuf_words, 2);
+    const Rdna2Inst atomic_x2 = rdna2_decode_one(atomic_x2_words, 2);
     CHECK(gta_pc10_vop2.fmt == Rdna2Format::VOP2 && gta_pc10_vop2.dst.value == 0 &&
               rdna2_vgpr_write_count(gta_pc10_vop2) == 1u &&
               wide_vop3.fmt == Rdna2Format::VOP3 && wide_vop3.dst.value == 1 &&
@@ -672,6 +682,9 @@ int main() {
               rdna2_tfe_status_vgpr(mimg_tfe) == 2 &&
               rdna2_vgpr_destination_span(mimg_tfe) == 3u &&
               rdna2_vgpr_write_count(wide_mubuf) == 4u &&
+              atomic_x2.opcode == kMubufOpcodeAtomicSwapX2 && atomic_x2.mubuf_glc &&
+              rdna2_vgpr_write_count(atomic_x2) == 2u &&
+              rdna2_vgpr_destination_span(atomic_x2) == 2u &&
               rdna2_vgpr_write_count(mt_tfe) == 1u &&
               rdna2_tfe_status_vgpr(mt_tfe) == 2 &&
               rdna2_vgpr_destination_span(mt_tfe) == 2u &&

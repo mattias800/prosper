@@ -151,8 +151,13 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             if (in.opcode == 0x0du) return 2;
             if (in.opcode == 0x0eu) return 4;
             if (in.opcode == 0x0fu) return 3;
-            // Supported return-value atomics are one dword. Unknown buffer operations remain a
-            // conservative one-register clobber, matching the prior analysis contract.
+            // The supported qword atomics can return a consecutive VGPR pair when GLC requests their
+            // pre-op value, so conservatively count both words even when this packet has GLC clear.
+            // Other supported return-value atomics are one dword. Unknown buffer operations remain
+            // a conservative one-register clobber, matching the prior contract.
+            if (in.opcode == kMubufOpcodeAtomicSwapX2 ||
+                in.opcode == kMubufOpcodeAtomicOrX2)
+                return 2;
             return 1;
         case Rdna2Format::MTBUF:
             if (in.opcode <= 3u || (in.opcode >= 8u && in.opcode <= 11u))
@@ -191,6 +196,10 @@ uint32_t rdna2_vgpr_source_span(const Rdna2Inst& in, uint32_t source_index) {
 
 int rdna2_tfe_status_vgpr(const Rdna2Inst& in) {
     if (in.dst.kind != OperandKind::VGPR || in.dst.value < 0) return -1;
+    if (in.fmt == Rdna2Format::MUBUF && in.mubuf_tfe) {
+        const uint32_t data_dwords = rdna2_vgpr_write_count(in);
+        if (data_dwords) return in.dst.value + static_cast<int>(data_dwords);
+    }
     if (in.fmt == Rdna2Format::MIMG && in.mimg_tfe)
         return in.dst.value + static_cast<int>(mimg_vdata_dwords(in));
     if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) {
@@ -795,6 +804,7 @@ void decode_operands(Rdna2Inst& i) {
             i.mubuf_glc = ((w >> 14) & 1u) != 0;   // atomics: return pre-op value to VGPR
             i.mubuf_dlc = ((w >> 15) & 1u) != 0;   // ordinary loads: bypass device-level cache
             i.mubuf_lds = ((w >> 16) & 1u) != 0;   // buffer<->LDS transfer (rejected in stage 2)
+            i.mubuf_tfe = ((d1 >> 23) & 1u) != 0;  // append fault/status VGPR after load data
             i.dst    = vgpr(d1 >> 8);                          // VDATA
             i.src[0] = vgpr(d1);                              // VADDR
             i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);       // SRSRC (descriptor base)
