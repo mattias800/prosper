@@ -129,6 +129,8 @@ inline constexpr bool sop2_is_b32_logical(uint32_t opcode) {
 inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
 inline constexpr uint32_t kVop1OpcodeFfblB32 = 0x3a;
 inline constexpr uint32_t kVop1OpcodeMovreldB32 = 0x42;
+inline constexpr uint32_t kVop2OpcodeAndB32 = 0x1b;
+inline constexpr uint32_t kVopcOpcodeCmpxEqU32 = 0xd2;
 
 // GFX10.3 VOP3 opcodes shared by source-lifetime and exact packet-shape proofs. The shift-reverse
 // B64 pair consumes a B32 shift count followed by a B64 value; the arithmetic forms consume three

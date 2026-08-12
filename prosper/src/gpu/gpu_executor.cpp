@@ -5011,7 +5011,9 @@ ComputeResourcePathSpecializationReport specialize_compute_resource_paths(
 
     report.proven_null_exits = rdna2_specialize_proven_null_bvh_paths(
         instructions, &resources, wave_size);
-    if (!report.proven_null_exits) return report;
+    report.zero_record_execz_exits = rdna2_specialize_zero_record_execz_paths(
+        instructions, &resources, wave_size);
+    if (!report.proven_null_exits && !report.zero_record_execz_exits) return report;
     report.shader_constant_branches =
         rdna2_specialize_shader_constant_branches(instructions);
 
@@ -6494,12 +6496,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
             std::vector<Rdna2Inst> resource_paths = decoded;
             const ComputeResourcePathSpecializationReport path_report =
                 specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
-            if (std::getenv("PROSPER_DBG") && path_report.proven_null_exits) {
+            if (std::getenv("PROSPER_DBG") &&
+                (path_report.proven_null_exits || path_report.zero_record_execz_exits)) {
                 std::fprintf(stderr,
-                             "[compute-resource-specialization] code=0x%llx null-exits=%zu constants=%zu "
+                             "[compute-resource-specialization] code=0x%llx null-exits=%zu zero-record-execz=%zu constants=%zu "
                              "removed-resources=%zu removed-pcs=",
                              static_cast<unsigned long long>(code_addr),
                              path_report.proven_null_exits,
+                             path_report.zero_record_execz_exits,
                              path_report.shader_constant_branches,
                              path_report.removed_resources);
                 for (size_t index = 0; index < path_report.removed_pcs.size(); ++index)

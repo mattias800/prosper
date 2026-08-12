@@ -102,6 +102,15 @@ size_t rdna2_specialize_proven_null_bvh_paths(
     std::vector<Rdna2Inst>& instructions, const ShaderResourceTable* resources,
     uint32_t wave_size);
 
+// A zero-record RAW load writes zero to every currently active lane. Prove the exact reaching
+// definition through a B32 mask and an adjacent CMPX_EQ/EXECZ exit, then make that exit
+// unconditional and prune its dead scalar-CFG arm. EXEC changes between the load and comparison
+// are admitted only while their saved-mask lineage proves the active set remains within the load's
+// active set. Returns the number of exits specialized.
+size_t rdna2_specialize_zero_record_execz_paths(
+    std::vector<Rdna2Inst>& instructions, const ShaderResourceTable* resources,
+    uint32_t wave_size);
+
 // Return the portion of a raw shader blob that participates in recompilation. This normally ends at
 // S_ENDPGM, but compiler-generated PC-relative lookup tables may live immediately after the program and
 // must remain part of an owning/cache copy. The result never exceeds `dwords`.

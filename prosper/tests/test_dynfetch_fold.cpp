@@ -14,6 +14,7 @@
 #include "../src/gpu/rdna2_gta5_compute_contracts.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "gta5_nullable_output_fixture.hpp"
+#include "gta5_zero_record_execz_fixture.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -2762,6 +2763,249 @@ int main() {
                !is_optional_null_raw_load_buffer(
                    *optional_or_backedge_resources.by_fetch_pc(40u))),
           "pc46 backedge into the descriptor tail keeps the optional chain fail-visible");
+
+    // Full routed 0x413cf5400 shape. The exact pc56/pc200 resources are architectural
+    // NUM_RECORDS=0 markers. Their dword loads therefore write zero to every active lane. GTA then
+    // elects one of those lanes, restores that one-hot mask, ANDs the loaded zero with 7, and uses
+    // CMPX_EQ 5 + EXECZ to skip the unresolved optional-buffer stores at pc194/pc314. This is a
+    // reachability proof, not optional-null store support: the store packets remain unmodified and
+    // must become live again when the compare at the same production site changes from EQ to NE.
+    auto zero_record_marker = [](uint32_t fetch_pc) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Unknown;
+        resource.num_components = 0;
+        resource.fetch_pc = fetch_pc;
+        return resource;
+    };
+    auto unresolved_store = [](uint32_t fetch_pc) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Uint32;
+        resource.num_components = 1;
+        resource.size = 4;
+        resource.fetch_pc = fetch_pc;
+        return resource;
+    };
+    auto gta_zero_record_execz_resources = [&]() {
+        ShaderResourceTable resources;
+        resources.resources = {
+            zero_record_marker(56), zero_record_marker(200),
+            unresolved_store(194), unresolved_store(314),
+        };
+        return resources;
+    };
+    auto instruction_at = [](std::vector<Rdna2Inst>& instructions, uint32_t pc) {
+        return std::find_if(instructions.begin(), instructions.end(),
+                            [=](const Rdna2Inst& in) { return in.pc == pc; });
+    };
+
+    std::vector<Rdna2Inst> gta_zero_record_execz;
+    rdna2_walk(prosper::test::kGta5ZeroRecordExeczProgram.data(),
+               prosper::test::kGta5ZeroRecordExeczProgram.size(), gta_zero_record_execz);
+    ShaderResourceTable gta_zero_record_execz_table = gta_zero_record_execz_resources();
+    const ComputeResourcePathSpecializationReport gta_zero_record_execz_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_execz, gta_zero_record_execz_table, 64);
+    const auto pc92 = instruction_at(gta_zero_record_execz, 92);
+    const auto pc212 = instruction_at(gta_zero_record_execz, 212);
+    CHECK(gta_zero_record_execz_report.proven_null_exits == 0 &&
+              gta_zero_record_execz_report.zero_record_execz_exits == 2 &&
+              gta_zero_record_execz_report.removed_resources == 2 &&
+              gta_zero_record_execz_table.by_fetch_pc(56) &&
+              gta_zero_record_execz_table.by_fetch_pc(200) &&
+              !gta_zero_record_execz_table.by_fetch_pc(194) &&
+              !gta_zero_record_execz_table.by_fetch_pc(314) &&
+              pc92 != gta_zero_record_execz.end() &&
+              pc92->opcode != kSoppOpcodeCbranchExecz &&
+              pc212 != gta_zero_record_execz.end() &&
+              pc212->opcode != kSoppOpcodeCbranchExecz &&
+              instruction_at(gta_zero_record_execz, 194) == gta_zero_record_execz.end() &&
+              instruction_at(gta_zero_record_execz, 314) == gta_zero_record_execz.end(),
+          "GTA zero-record elected-lane proof prunes both unreachable optional stores");
+
+    std::array<uint32_t, 319> gta_zero_record_compare_ne =
+        prosper::test::kGta5ZeroRecordExeczProgram;
+    gta_zero_record_compare_ne[91] = 0x7daa0285u; // exact pc91 CMPX_EQ -> CMPX_NE
+    std::vector<Rdna2Inst> gta_zero_record_compare_ne_ins;
+    rdna2_walk(gta_zero_record_compare_ne.data(), gta_zero_record_compare_ne.size(),
+               gta_zero_record_compare_ne_ins);
+    ShaderResourceTable gta_zero_record_compare_ne_table = gta_zero_record_execz_resources();
+    const ComputeResourcePathSpecializationReport gta_zero_record_compare_ne_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_compare_ne_ins, gta_zero_record_compare_ne_table, 64);
+    const auto live_pc194 = instruction_at(gta_zero_record_compare_ne_ins, 194);
+    CHECK(gta_zero_record_compare_ne_report.zero_record_execz_exits == 1 &&
+              gta_zero_record_compare_ne_table.by_fetch_pc(194) &&
+              !gta_zero_record_compare_ne_table.by_fetch_pc(314) &&
+              live_pc194 != gta_zero_record_compare_ne_ins.end() &&
+              live_pc194->words[0] == 0xe0702000u &&
+              live_pc194->words[1] == 0x80070201u,
+          "same-site pc91 CMPX_NE mutation keeps the exact pc194 store live and fail-visible");
+
+    std::array<uint32_t, 319> gta_zero_record_second_compare_ne =
+        prosper::test::kGta5ZeroRecordExeczProgram;
+    gta_zero_record_second_compare_ne[211] = 0x7daa0285u; // exact pc211 CMPX_EQ -> CMPX_NE
+    std::vector<Rdna2Inst> gta_zero_record_second_compare_ne_ins;
+    rdna2_walk(gta_zero_record_second_compare_ne.data(),
+               gta_zero_record_second_compare_ne.size(),
+               gta_zero_record_second_compare_ne_ins);
+    ShaderResourceTable gta_zero_record_second_compare_ne_table =
+        gta_zero_record_execz_resources();
+    const ComputeResourcePathSpecializationReport gta_zero_record_second_compare_ne_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_second_compare_ne_ins,
+            gta_zero_record_second_compare_ne_table, 64);
+    const auto live_pc314 = instruction_at(gta_zero_record_second_compare_ne_ins, 314);
+    CHECK(gta_zero_record_second_compare_ne_report.zero_record_execz_exits == 1 &&
+              !gta_zero_record_second_compare_ne_table.by_fetch_pc(194) &&
+              gta_zero_record_second_compare_ne_table.by_fetch_pc(314) &&
+              live_pc314 != gta_zero_record_second_compare_ne_ins.end() &&
+              live_pc314->words[0] == 0xe0702000u &&
+              live_pc314->words[1] == 0x80070201u,
+          "same-site pc211 CMPX_NE mutation keeps the exact pc314 store live and fail-visible");
+
+    std::array<uint32_t, 319> gta_zero_record_external_entry =
+        prosper::test::kGta5ZeroRecordExeczProgram;
+    gta_zero_record_external_entry[46] = 0xbf88002cu; // pc46 EXECZ -> pc91, bypassing pc56
+    std::vector<Rdna2Inst> gta_zero_record_external_entry_ins;
+    rdna2_walk(gta_zero_record_external_entry.data(), gta_zero_record_external_entry.size(),
+               gta_zero_record_external_entry_ins);
+    ShaderResourceTable gta_zero_record_external_entry_table =
+        gta_zero_record_execz_resources();
+    const ComputeResourcePathSpecializationReport gta_zero_record_external_entry_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_external_entry_ins, gta_zero_record_external_entry_table, 64);
+    CHECK(gta_zero_record_external_entry_report.zero_record_execz_exits == 1 &&
+              gta_zero_record_external_entry_table.by_fetch_pc(194) &&
+              !gta_zero_record_external_entry_table.by_fetch_pc(314),
+          "external entry that bypasses pc56 prevents the first zero-reaching proof");
+
+    std::array<uint32_t, 319> gta_zero_record_expanding_restore =
+        prosper::test::kGta5ZeroRecordExeczProgram;
+    gta_zero_record_expanding_restore[67] = 0xbefe04c1u; // pc67: s_mov_b64 exec, -1
+    std::vector<Rdna2Inst> gta_zero_record_expanding_restore_ins;
+    rdna2_walk(gta_zero_record_expanding_restore.data(),
+               gta_zero_record_expanding_restore.size(),
+               gta_zero_record_expanding_restore_ins);
+    ShaderResourceTable gta_zero_record_expanding_restore_table =
+        gta_zero_record_execz_resources();
+    const ComputeResourcePathSpecializationReport gta_zero_record_expanding_restore_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_expanding_restore_ins,
+            gta_zero_record_expanding_restore_table, 64);
+    CHECK(gta_zero_record_expanding_restore_report.zero_record_execz_exits == 1 &&
+              gta_zero_record_expanding_restore_table.by_fetch_pc(194) &&
+              !gta_zero_record_expanding_restore_table.by_fetch_pc(314),
+          "pc67 expanding EXEC restore cannot inherit the pc56 load's active-lane proof");
+
+    std::array<uint32_t, 319> gta_zero_record_v0_clobber =
+        prosper::test::kGta5ZeroRecordExeczProgram;
+    gta_zero_record_v0_clobber[64] = 0x7e000285u; // pc64: v_mov_b32 v0, 5
+    std::vector<Rdna2Inst> gta_zero_record_v0_clobber_ins;
+    rdna2_walk(gta_zero_record_v0_clobber.data(), gta_zero_record_v0_clobber.size(),
+               gta_zero_record_v0_clobber_ins);
+    ShaderResourceTable gta_zero_record_v0_clobber_table =
+        gta_zero_record_execz_resources();
+    const ComputeResourcePathSpecializationReport gta_zero_record_v0_clobber_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_v0_clobber_ins, gta_zero_record_v0_clobber_table, 64);
+    CHECK(gta_zero_record_v0_clobber_report.zero_record_execz_exits == 1 &&
+              gta_zero_record_v0_clobber_table.by_fetch_pc(194) &&
+              !gta_zero_record_v0_clobber_table.by_fetch_pc(314),
+          "pc64 v0 clobber prevents the first zero-reaching proof");
+
+    ShaderResourceTable gta_zero_record_missing_marker_table;
+    gta_zero_record_missing_marker_table.resources = {
+        zero_record_marker(200), unresolved_store(194), unresolved_store(314),
+    };
+    std::vector<Rdna2Inst> gta_zero_record_missing_marker_ins;
+    rdna2_walk(prosper::test::kGta5ZeroRecordExeczProgram.data(),
+               prosper::test::kGta5ZeroRecordExeczProgram.size(),
+               gta_zero_record_missing_marker_ins);
+    const ComputeResourcePathSpecializationReport gta_zero_record_missing_marker_report =
+        specialize_compute_resource_paths(
+            gta_zero_record_missing_marker_ins, gta_zero_record_missing_marker_table, 64);
+    CHECK(gta_zero_record_missing_marker_report.zero_record_execz_exits == 1 &&
+              gta_zero_record_missing_marker_table.by_fetch_pc(194) &&
+              !gta_zero_record_missing_marker_table.by_fetch_pc(314),
+          "missing pc56 zero-record marker keeps the first store live and fail-visible");
+
+    // Exercise the raw-byte translation boundary too. After the two proven exits, only the
+    // prefix's two ordinary stores, optional load, scalar data load, and the two zero-record loads
+    // remain. Deliberately omit resources for pc194/pc314: either same-site compare mutation must
+    // make the corresponding store visible to the production recompiler and therefore reject.
+    auto ordinary_pc_buffer = [](uint32_t fetch_pc, uint32_t size, uint32_t stride) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Uint32;
+        resource.num_components = 1;
+        resource.gpu_addr = 0x10000u + static_cast<uint64_t>(fetch_pc) * 0x100u;
+        resource.size = size;
+        resource.stride = stride;
+        resource.fetch_pc = fetch_pc;
+        return resource;
+    };
+    auto optional_null_marker = [](uint32_t fetch_pc) {
+        ShaderResource resource{};
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Uint32;
+        resource.num_components = 1;
+        resource.stride = kGtaOptionalBufferStride;
+        resource.sampler_sgpr_base = kOptionalNullRawLoadMarkerSamplerBase;
+        resource.fetch_pc = fetch_pc;
+        return resource;
+    };
+    auto gta_zero_record_compile_resources = [&]() {
+        ShaderResourceTable resources;
+        resources.resources = {
+            ordinary_pc_buffer(27, 128, 32), ordinary_pc_buffer(29, 8, 4),
+            optional_null_marker(40), ordinary_pc_buffer(53, 120, 0),
+            zero_record_marker(56), zero_record_marker(200),
+        };
+        assign_convention_bindings(resources, 2);
+        return resources;
+    };
+    ComputeShaderConfig gta_zero_record_compile_config;
+    gta_zero_record_compile_config.user_sgprs.resize(15);
+    gta_zero_record_compile_config.local_x = 64;
+    gta_zero_record_compile_config.local_y = gta_zero_record_compile_config.local_z = 1;
+    gta_zero_record_compile_config.exact_thread_extent = true;
+    gta_zero_record_compile_config.threads_x = 2063;
+    gta_zero_record_compile_config.threads_y = gta_zero_record_compile_config.threads_z = 1;
+    gta_zero_record_compile_config.wave_size = 64;
+    gta_zero_record_compile_config.native_subgroup_size = 64;
+    gta_zero_record_compile_config.tidig_comp_cnt = 0;
+    gta_zero_record_compile_config.tgid_x_en = true;
+    gta_zero_record_compile_config.lds_bytes = 65536;
+    ShaderResourceTable gta_zero_record_compile_table =
+        gta_zero_record_compile_resources();
+    const std::vector<uint32_t> gta_zero_record_spirv = recompile_compute(
+        prosper::test::kGta5ZeroRecordExeczProgram.data(),
+        prosper::test::kGta5ZeroRecordExeczProgram.size(),
+        &gta_zero_record_compile_table, gta_zero_record_compile_config);
+    const DescriptorValidationReport gta_zero_record_spirv_report =
+        validate_spirv_descriptor_interface(
+            gta_zero_record_spirv, &gta_zero_record_compile_table, 0,
+            SpirvShaderStage::Compute, false);
+    CHECK(!gta_zero_record_spirv.empty() && gta_zero_record_spirv_report.ok(),
+          "GTA zero-record elected-lane proof reaches production compute translation");
+
+    ShaderResourceTable gta_zero_record_compile_ne_table =
+        gta_zero_record_compile_resources();
+    CHECK(recompile_compute(gta_zero_record_compare_ne.data(),
+                            gta_zero_record_compare_ne.size(),
+                            &gta_zero_record_compile_ne_table,
+                            gta_zero_record_compile_config).empty(),
+          "production translation rejects the same-site pc91 CMPX_NE mutation at live pc194");
+
+    ShaderResourceTable gta_zero_record_compile_second_ne_table =
+        gta_zero_record_compile_resources();
+    CHECK(recompile_compute(gta_zero_record_second_compare_ne.data(),
+                            gta_zero_record_second_compare_ne.size(),
+                            &gta_zero_record_compile_second_ne_table,
+                            gta_zero_record_compile_config).empty(),
+          "production translation rejects the same-site pc211 CMPX_NE mutation at live pc314");
 
     auto optional_mutation_stays_rejected = [&](std::array<uint32_t, 13> code) {
         ShaderResourceTable resources;
