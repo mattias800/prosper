@@ -310,10 +310,12 @@ struct Rdna2Inst {
 
     // MUBUF/MTBUF flags (ISA Table 98): GLC (bit 14) — for atomics, "return pre-op value to VGPR";
     // DLC (bit 15) — device-level cache policy for ordinary loads; LDS (bit 16, MUBUF only) —
-    // transfer between LDS and memory instead of VGPRs (rejected until modeled).
+    // transfer between LDS and memory instead of VGPRs (rejected until modeled). MUBUF TFE lives
+    // in dword1 bit 23 and appends a status VGPR after the data result, like MTBUF TFE below.
     bool     mubuf_glc = false;
     bool     mubuf_dlc = false;
     bool     mubuf_lds = false;
+    bool     mubuf_tfe = false;
     // MTBUF carries the GFX10 combined 7-bit BUF_FMT at dword0[25:19], just like a Gen5 V#.
     // Interpreting these bits as the older PS4 DFMT/NFMT split maps valid gfx1030 formats to the
     // wrong type (for example 32_FLOAT is combined format 22).
