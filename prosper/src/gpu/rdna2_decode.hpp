@@ -28,6 +28,7 @@ enum class Rdna2Format : uint8_t {
 };
 
 // GFX10.3 scalar ALU opcodes shared by emission and source-lifetime analysis.
+inline constexpr uint32_t kSop1OpcodeMovB32 = 0x03;
 inline constexpr uint32_t kSop1OpcodeMovB64 = 0x04;
 inline constexpr uint32_t kSop1OpcodeBrevB32 = 0x0b;
 inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
@@ -35,6 +36,7 @@ inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
 inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
 inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
+inline constexpr uint32_t kSop2OpcodeAddI32 = 0x02;
 inline constexpr uint32_t kSop2OpcodeAndB32 = 0x0e;
 inline constexpr uint32_t kSop2OpcodeOrB32 = 0x10;
 inline constexpr uint32_t kSop2OpcodeXorB32 = 0x12;
@@ -86,9 +88,11 @@ inline constexpr bool sop2_is_b32_logical(uint32_t opcode) {
 // boundary keeps dispatcher admission and ALU emission on one compile-time constant.
 inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
 inline constexpr uint32_t kVop1OpcodeFfblB32 = 0x3a;
+inline constexpr uint32_t kVop1OpcodeMovreldB32 = 0x42;
 
-// GFX10.3 VOP3 opcodes whose scalar-source width matters to CFG lifetime analysis.
-// V_ADD3_U32 consumes three independent B32 operands; it never reads an SGPR pair.
+// GFX10.3 VOP3 opcodes shared by source-lifetime and exact packet-shape proofs. Both consume three
+// independent B32 operands; neither reads an SGPR pair.
+inline constexpr uint32_t kVop3OpcodeLshlAddU32 = 0x346;
 inline constexpr uint32_t kVop3OpcodeAdd3U32 = 0x36d;
 
 // GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
@@ -98,9 +102,10 @@ inline constexpr uint32_t kDsOpcodeBpermuteB32 = 0xb3;
 inline constexpr uint32_t kDsOpcodeMinF32 = 0x12;
 inline constexpr uint32_t kDsOpcodeMaxF32 = 0x13;
 
-// GFX10.3 MUBUF atomic opcodes (ISA Table 99). Keep these names at the decode boundary so resource
+// GFX10.3 MUBUF opcodes (ISA Table 99). Keep these names at the decode boundary so resource
 // discovery and SPIR-V emission do not maintain separate, opaque hexadecimal inventories. These are
 // compile-time constants: using them in comparisons and switch labels adds no runtime indirection.
+inline constexpr uint32_t kMubufOpcodeLoadDword         = 0x0c;
 inline constexpr uint32_t kMubufOpcodeAtomicSwap        = 0x30;
 inline constexpr uint32_t kMubufOpcodeAtomicCompareSwap = 0x31;
 inline constexpr uint32_t kMubufOpcodeAtomicAdd         = 0x32;
@@ -309,6 +314,11 @@ struct Rdna2Inst {
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown
 // encoding, returns fmt=Unknown with len_dwords clamped so a walker still terminates.
 Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords);
+
+// Packet half of GTA V's optional-null buffer convention: one plain idxen-only RAW dword load with
+// no instruction offset, SOFFSET, cache/status, LDS, or reserved controls. Descriptor provenance and
+// launch/index geometry are independent proofs supplied by the front half.
+bool rdna2_optional_null_raw_load_shape(const Rdna2Inst& in);
 
 // Walk from code[0], appending each decoded instruction to `out`, until S_ENDPGM, an Unknown
 // encoding, or the end of the buffer. Returns the number of dwords consumed.

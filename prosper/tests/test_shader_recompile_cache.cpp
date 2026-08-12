@@ -1125,6 +1125,47 @@ int main() {
               stats.hits == 1 && stats.entries == 2,
           "compute cache separates exact zero-record RAW lowering from nonzero buffers");
 
+    // The application-level optional-null marker has different load-only semantics from an
+    // ordinary explicit null resource. Its serialized sampler provenance sentinel is inert for a
+    // ConstantBuffer, so key the semantic predicate explicitly rather than its unused raw field.
+    clear_shader_recompile_cache();
+    static const uint32_t kOptionalNullRawCompute[] = {
+        0xe0302000u, 0x80000000u, // buffer_load_dword v0, v0, s[0:3], idxen
+        0xbf810000u,
+    };
+    ShaderResource optional_null_raw;
+    optional_null_raw.cls = ResourceClass::ConstantBuffer;
+    optional_null_raw.format = DataFormat::Uint32;
+    optional_null_raw.num_components = 1;
+    optional_null_raw.binding = 3;
+    optional_null_raw.stride = kGtaOptionalBufferStride;
+    optional_null_raw.fetch_pc = 0;
+    optional_null_raw.sampler_sgpr_base = kOptionalNullRawLoadMarkerSamplerBase;
+    ShaderResourceTable optional_null_raw_table;
+    optional_null_raw_table.resources.push_back(optional_null_raw);
+    ComputeShaderConfig optional_null_raw_config;
+    optional_null_raw_config.user_sgprs.resize(4);
+    optional_null_raw_config.local_x = kGtaOptionalBufferLocalSize;
+    const auto cached_optional_null_raw = recompile_compute_shader_cached(
+        kOptionalNullRawCompute, std::size(kOptionalNullRawCompute),
+        &optional_null_raw_table, optional_null_raw_config);
+    optional_null_raw_table.resources[0].sampler_sgpr_base = 0xFFFFFFFFu;
+    const auto cached_ordinary_null_raw = recompile_compute_shader_cached(
+        kOptionalNullRawCompute, std::size(kOptionalNullRawCompute),
+        &optional_null_raw_table, optional_null_raw_config);
+    optional_null_raw_table.resources[0].sampler_sgpr_base =
+        kOptionalNullRawLoadMarkerSamplerBase;
+    const auto repeated_optional_null_raw = recompile_compute_shader_cached(
+        kOptionalNullRawCompute, std::size(kOptionalNullRawCompute),
+        &optional_null_raw_table, optional_null_raw_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(is_optional_null_raw_load_buffer(optional_null_raw_table.resources[0]) &&
+              !cached_optional_null_raw.empty() &&
+              cached_optional_null_raw != cached_ordinary_null_raw &&
+              repeated_optional_null_raw == cached_optional_null_raw &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates optional-null load lowering from ordinary null resources");
+
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw
     // uint-channel fallback, even when the guest code and every binding/provenance field are equal.

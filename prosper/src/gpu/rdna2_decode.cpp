@@ -1112,6 +1112,19 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
     return pc;
 }
 
+bool rdna2_optional_null_raw_load_shape(const Rdna2Inst& in) {
+    const bool zero_soffset =
+        (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+        (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+    return in.fmt == Rdna2Format::MUBUF && in.opcode == kMubufOpcodeLoadDword &&
+           in.len_dwords == 2u && in.dst.kind == OperandKind::VGPR &&
+           in.src[0].kind == OperandKind::VGPR && in.src[1].kind == OperandKind::SGPR &&
+           zero_soffset && (in.literal & 0x3fffu) == 0x2000u &&
+           !in.mubuf_glc && !in.mubuf_dlc && !in.mubuf_lds &&
+           (in.words[0] & 0x00020000u) == 0u &&
+           (in.words[1] & 0x00e00000u) == 0u;
+}
+
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
     if (in.fmt != Rdna2Format::MIMG || !in.mimg_unorm || !in.mimg_glc ||
         in.mimg_dlc || in.mimg_r128 ||

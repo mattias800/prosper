@@ -217,6 +217,12 @@ struct SrtUse {
     // "unbounded" and required_size supplies the proven access span. Only resolve_dynamic_fetch may set
     // this after decoding all four live descriptor words at the exact consuming instruction.
     bool zero_record_raw = false;
+    // GTA V's dispatch table carries an optional buffer pointer at byte offset 0x58. Before the
+    // guest's later WRITE_DATA initializes that entry, its mapped qword is genuinely zero while the
+    // separately-built V# still has a nonzero record count. This flag is admitted only when exact
+    // scalar provenance connects that mapped qword to the exact linear RAW load; materialization
+    // separately checks the launch/index contract before creating a load-only zero marker.
+    bool optional_null_raw_load = false;
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
     // Minimum byte span needed by this scalar-buffer consumer, measured from V#.Base. Some PS5

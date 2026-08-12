@@ -13,6 +13,7 @@
 #include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -2608,6 +2609,218 @@ int main() {
                                  std::size(addr0_nonzero_record_seed));
     CHECK(addr0_nonzero_record_uses.empty() && addr0_nonzero_record_table.resources.empty(),
           "addr0 plus nonzero NUM_RECORDS stays rejected at the zero-record boundary");
+
+    // GTA V's 0x413cf6100 pc10 walks a dispatch-sized optional buffer table. The mapped pointer
+    // entry at user-data root +0x58 is zero before a later WRITE_DATA initializes it, while scalar
+    // code independently builds a stride-4 V# with a nonzero record count. Preserve the exact
+    // producer/use packets: only this mapped provenance plus the linear launch proof may return zero.
+    const std::array<uint32_t, 13> optional_null_raw = {
+        0xbfa00003u,                         // pc0:  s_clause 4
+        0xd7460002u, 0x04010c0fu,            // pc1:  v_lshl_add_u32 v2,s15,6,v0
+        0xf4040400u, 0xfa000058u,            // pc3:  s_load_dwordx2 s[16:17],s[0:1],0x58
+        0x8112c102u,                         // pc5:  s_add_i32 s18,s2,-1
+        0xbe9303ffu, kGtaOptionalBufferConfigWord, // pc6: s_mov_b32 s19,config
+        0xbf8cc07fu,                         // pc8:  s_waitcnt
+        0xbe911d92u,                         // pc9:  s_bitset1_b32 s17,18 (stride 4)
+        0xe0302000u, 0x80040002u,            // pc10: buffer_load_dword v0,v2,s[16:19],0 idxen
+        0xbf810000u,                         // pc12: s_endpgm
+    };
+    constexpr uint32_t optional_records = 127u;
+    alignas(8) std::array<uint32_t, kGtaOptionalBufferTableBytes / sizeof(uint32_t)>
+        optional_table{};
+    std::array<uint32_t, 15> optional_user_sgprs{};
+    const uint64_t optional_root = reinterpret_cast<uint64_t>(optional_table.data());
+    optional_user_sgprs[0] = static_cast<uint32_t>(optional_root);
+    optional_user_sgprs[1] = static_cast<uint32_t>(optional_root >> 32);
+    optional_user_sgprs[2] = optional_records + 1u;
+
+    ComputeShaderConfig optional_config;
+    optional_config.user_sgprs.assign(optional_user_sgprs.begin(), optional_user_sgprs.end());
+    optional_config.local_x = kGtaOptionalBufferLocalSize;
+    optional_config.local_y = optional_config.local_z = 1u;
+    ShaderResourceTable optional_table_resources;
+    const std::vector<SrtUse> optional_uses = add_compute_buffer_resources(
+        optional_table_resources, optional_null_raw.data(), optional_null_raw.size(),
+        optional_user_sgprs.data(), optional_user_sgprs.size(),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    assign_convention_bindings(optional_table_resources, 2);
+    const std::vector<uint32_t> optional_spirv = recompile_compute(
+        optional_null_raw.data(), optional_null_raw.size(), &optional_table_resources,
+        optional_config);
+    const DescriptorValidationReport optional_report = validate_spirv_descriptor_interface(
+        optional_spirv, &optional_table_resources, 0, SpirvShaderStage::Compute, false);
+    CHECK(optional_uses.size() == 1 && optional_uses[0].use_pc == 10u &&
+              optional_uses[0].optional_null_raw_load && !optional_uses[0].zero_record_raw &&
+              optional_table_resources.resources.size() == 1 &&
+              is_optional_null_raw_load_buffer(optional_table_resources.resources[0]) &&
+              !is_zero_record_raw_buffer(optional_table_resources.resources[0]) &&
+              optional_table_resources.by_fetch_pc(10u) && !optional_spirv.empty() &&
+              optional_report.ok() && optional_report.descriptors.empty(),
+          "mapped optional +0x58 entry lowers the exact linear RAW dword load to zero");
+
+    // Direct-CFG counter-arm for the same production chain. The conditional branch reaches the
+    // existing wait/stride-patch/consumer tail while skipping count/config construction. A linear
+    // fold still visits those skipped writes, so this must remain rejected until the producer roles
+    // have a path-sensitive dominance proof.
+    const std::array<uint32_t, 14> optional_null_raw_branch = {
+        optional_null_raw[0], optional_null_raw[1], optional_null_raw[2],
+        optional_null_raw[3], optional_null_raw[4],
+        0xbf840003u,                         // pc5: s_cbranch_scc0 +3 -> pc9
+        optional_null_raw[5],                // pc6: count (skipped on taken arm)
+        optional_null_raw[6], optional_null_raw[7], // pc7: config (skipped)
+        optional_null_raw[8], optional_null_raw[9],
+        optional_null_raw[10], optional_null_raw[11], optional_null_raw[12],
+    };
+    ShaderResourceTable optional_branch_resources;
+    const std::vector<SrtUse> optional_branch_uses = add_compute_buffer_resources(
+        optional_branch_resources, optional_null_raw_branch.data(),
+        optional_null_raw_branch.size(), optional_user_sgprs.data(),
+        optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+        kGtaOptionalBufferTgidSgpr);
+    const bool optional_branch_has_marker = std::any_of(
+        optional_branch_resources.resources.begin(),
+        optional_branch_resources.resources.end(),
+        [](const ShaderResource& resource) {
+            return is_optional_null_raw_load_buffer(resource);
+        });
+    CHECK(std::none_of(optional_branch_uses.begin(), optional_branch_uses.end(),
+                       [](const SrtUse& use) { return use.optional_null_raw_load; }) &&
+              optional_branch_resources.resources.empty() && !optional_branch_has_marker &&
+              recompile_compute(optional_null_raw_branch.data(),
+                                optional_null_raw_branch.size(),
+                                &optional_branch_resources, optional_config).empty(),
+          "conditional branch across count/config keeps the optional chain fail-visible");
+
+    // The sibling 0x413cf5400 terminal reaches the same table convention through an in-place
+    // s_or_b32 stride patch rather than s_bitset1_b32. Keep its exact prefix through pc40 so the
+    // second observed production chain cannot regress behind the pc10 fixture.
+    const std::array<uint32_t, 43> optional_null_raw_or = {
+        0xbfa00003u, 0xd7460016u, 0x04010c0fu, 0x8f6a9e0eu,
+        0x8010ff00u, 0x000000e8u, 0xbe920382u, 0x82118001u,
+        0xbe9303ffu, 0x00016204u, 0xbe88047eu, 0x7d2d00f9u,
+        0x8686006au, 0xbe911d92u, 0x7da42c80u, 0xbf88000fu,
+        0x7e000280u, 0xbeea070eu, 0x7e020281u, 0x7e040281u,
+        0x3606d4f9u, 0x86860681u, 0x7e080280u, 0xbe860381u,
+        0xbe8703ffu, 0x00016204u, 0xbe851d95u, 0xe07c0000u,
+        0x80010000u, 0xe0702000u, 0x80040403u,
+        0xf4040700u, 0xfa000058u,             // pc31: x2 optional pointer -> s[28:29]
+        0xbefe0408u, 0xbf8cc07fu,
+        0x881dff1du, kGtaOptionalBufferStrideWord, // pc35: s_or_b32 s29,s29,stride
+        0x811ec102u,                         // pc37: s_add_i32 s30,s2,-1
+        0xbe9f03ffu, kGtaOptionalBufferConfigWord,
+        0xe0302000u, 0x80070016u,            // pc40: exact optional RAW load
+        0xbf810000u,
+    };
+    ShaderResourceTable optional_or_resources;
+    const std::vector<SrtUse> optional_or_uses = add_compute_buffer_resources(
+        optional_or_resources, optional_null_raw_or.data(), optional_null_raw_or.size(),
+        optional_user_sgprs.data(), optional_user_sgprs.size(),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    const bool optional_or_use = std::any_of(optional_or_uses.begin(), optional_or_uses.end(),
+        [](const SrtUse& use) { return use.use_pc == 40u && use.optional_null_raw_load; });
+    CHECK(optional_or_use && optional_or_resources.by_fetch_pc(40u) &&
+              is_optional_null_raw_load_buffer(*optional_or_resources.by_fetch_pc(40u)),
+          "pc40 in-place OR chain materializes the same distinct optional-null marker");
+
+    std::array<uint32_t, 43> optional_or_wrong_stride = optional_null_raw_or;
+    optional_or_wrong_stride[36] = 0x00080000u;
+    ShaderResourceTable optional_or_wrong_stride_resources;
+    const std::vector<SrtUse> optional_or_wrong_stride_uses = add_compute_buffer_resources(
+        optional_or_wrong_stride_resources, optional_or_wrong_stride.data(),
+        optional_or_wrong_stride.size(), optional_user_sgprs.data(),
+        optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+        kGtaOptionalBufferTgidSgpr);
+    CHECK(std::none_of(optional_or_wrong_stride_uses.begin(),
+                       optional_or_wrong_stride_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.use_pc == 40u && use.optional_null_raw_load;
+                       }) &&
+              (!optional_or_wrong_stride_resources.by_fetch_pc(40u) ||
+               !is_optional_null_raw_load_buffer(
+                   *optional_or_wrong_stride_resources.by_fetch_pc(40u))),
+          "pc35 OR-literal mutation removes the second terminal's optional-null proof");
+
+    auto optional_mutation_stays_rejected = [&](std::array<uint32_t, 13> code) {
+        ShaderResourceTable resources;
+        const std::vector<SrtUse> uses = add_compute_buffer_resources(
+            resources, code.data(), code.size(), optional_user_sgprs.data(),
+            optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+            kGtaOptionalBufferTgidSgpr);
+        const bool no_optional_use = std::none_of(uses.begin(), uses.end(),
+            [](const SrtUse& use) { return use.optional_null_raw_load; });
+        return no_optional_use && resources.resources.empty() &&
+            recompile_compute(code.data(), code.size(), &resources, optional_config).empty();
+    };
+
+    std::array<uint32_t, 13> optional_wrong_srsrc = optional_null_raw;
+    optional_wrong_srsrc[11] = 0x80050002u; // pc10 consumes s[20:23], not the produced V#
+    CHECK(optional_mutation_stays_rejected(optional_wrong_srsrc),
+          "pc10 SRSRC mutation disconnects the optional producer and stays fail-visible");
+
+    std::array<uint32_t, 13> optional_wrong_offset = optional_null_raw;
+    optional_wrong_offset[4] = 0xfa000050u; // same zero table, different producer field
+    CHECK(optional_mutation_stays_rejected(optional_wrong_offset),
+          "x2 producer offset mutation does not infer optional semantics from another zero qword");
+
+    std::array<uint32_t, 13> optional_no_idxen = optional_null_raw;
+    optional_no_idxen[10] = 0xe0300000u;
+    CHECK(optional_mutation_stays_rejected(optional_no_idxen),
+          "pc10 idxen mutation stays outside the linear optional-null contract");
+
+    std::array<uint32_t, 13> optional_store = optional_null_raw;
+    optional_store[10] = 0xe0702000u;
+    CHECK(optional_mutation_stays_rejected(optional_store),
+          "pc10 store mutation cannot inherit load-only optional-null semantics");
+    CHECK(recompile_compute(optional_store.data(), optional_store.size(),
+                            &optional_table_resources, optional_config).empty(),
+          "even a forged pc10 optional marker cannot turn the load-only convention into a store");
+
+    // Independent domain negative: the exact V# and launch geometry are insufficient without the
+    // mapped +0x58 producer. This retains the broad addr0+nonzero rejection even when every static
+    // descriptor dword happens to match the admitted live shape.
+    const uint32_t direct_optional_shape[] = {
+        0xe0302000u, 0x80000000u,
+        0xbf810000u,
+    };
+    const uint32_t direct_optional_seed[4] = {
+        0u, kGtaOptionalBufferStrideWord, optional_records,
+        kGtaOptionalBufferConfigWord,
+    };
+    ShaderResourceTable direct_optional_table;
+    const std::vector<SrtUse> direct_optional_uses = add_compute_buffer_resources(
+        direct_optional_table, direct_optional_shape, std::size(direct_optional_shape),
+        direct_optional_seed, std::size(direct_optional_seed),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    CHECK(direct_optional_uses.empty() && direct_optional_table.resources.empty(),
+          "direct addr0 nonzero V# stays rejected without mapped optional-entry provenance");
+
+    // Positive initialized state from the same guest field: after WRITE_DATA places a mapped pointer
+    // at +0x58, the exact program must materialize the ordinary resource rather than retain a zero
+    // marker. This tests the discriminator that changes over the title's early/later dispatches.
+    alignas(8) std::array<uint32_t, optional_records> optional_payload{};
+    const uint64_t optional_payload_addr =
+        reinterpret_cast<uint64_t>(optional_payload.data());
+    optional_table[kGtaOptionalBufferPointerOffset / 4u] =
+        static_cast<uint32_t>(optional_payload_addr);
+    optional_table[kGtaOptionalBufferPointerOffset / 4u + 1u] =
+        static_cast<uint32_t>(optional_payload_addr >> 32);
+    ShaderResourceTable initialized_optional_table;
+    const std::vector<SrtUse> initialized_optional_uses = add_compute_buffer_resources(
+        initialized_optional_table, optional_null_raw.data(), optional_null_raw.size(),
+        optional_user_sgprs.data(), optional_user_sgprs.size(),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    assign_convention_bindings(initialized_optional_table, 2);
+    const std::vector<uint32_t> initialized_optional_spirv = recompile_compute(
+        optional_null_raw.data(), optional_null_raw.size(), &initialized_optional_table,
+        optional_config);
+    CHECK(initialized_optional_uses.size() == 1 &&
+              !initialized_optional_uses[0].optional_null_raw_load &&
+              initialized_optional_table.resources.size() == 1 &&
+              initialized_optional_table.resources[0].gpu_addr == optional_payload_addr &&
+              initialized_optional_table.resources[0].size == optional_payload.size() * 4u &&
+              !is_optional_null_raw_load_buffer(initialized_optional_table.resources[0]) &&
+              !initialized_optional_spirv.empty(),
+          "initialized +0x58 entry materializes and recompiles its ordinary mapped buffer");
 
     // GTA V 0x413d59600 pc67 uses this exact FORMAT-load packet through the all-zero descriptor
     // produced by its earlier zero-record scalar loads. Keep the exact pc because the marker is

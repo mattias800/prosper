@@ -475,6 +475,32 @@ inline bool is_zero_record_raw_buffer(const ShaderResource& resource) {
            resource.host_data_size == 0u;
 }
 
+// Exact-PC marker for GTA V's provenance-backed optional-null RAW dword load. It deliberately uses
+// a different structural shape from the NUM_RECORDS=0 marker: the latter may drop stores/atomics,
+// while this convention is load-only. Existing serialized resource fields therefore preserve the
+// semantic distinction across capture/replay without a capture-format extension. The marker uses
+// sampler_sgpr_base because that field is serialized for every resource but is otherwise inert for
+// a ConstantBuffer; 0xFFFFFFFE is not a valid scalar-register base.
+inline constexpr uint32_t kGtaOptionalBufferTableBytes = 272u;
+inline constexpr uint32_t kGtaOptionalBufferPointerOffset = 0x58u;
+inline constexpr uint32_t kGtaOptionalBufferStride = 4u;
+inline constexpr uint32_t kGtaOptionalBufferStrideWord = kGtaOptionalBufferStride << 16u;
+inline constexpr uint32_t kGtaOptionalBufferConfigWord = 0x00016204u;
+inline constexpr uint32_t kGtaOptionalBufferTgidSgpr = 15u;
+inline constexpr uint32_t kGtaOptionalBufferLocalSize = 64u;
+inline constexpr uint32_t kOptionalNullRawLoadMarkerSamplerBase = 0xFFFFFFFEu;
+
+inline bool is_optional_null_raw_load_buffer(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+           resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
+           resource.gpu_addr == 0 && resource.size == 0u && resource.stride == 4u &&
+           resource.srt_offset == 0xFFFFFFFFu && resource.sgpr_base == 0xFFFFFFFFu &&
+           resource.sampler_sgpr_base == kOptionalNullRawLoadMarkerSamplerBase &&
+           resource.flat_base_sgpr == 0xFFFFFFFFu &&
+           resource.fetch_pc != 0xFFFFFFFFu && resource.host_data == nullptr &&
+           resource.host_data_size == 0u;
+}
+
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {
