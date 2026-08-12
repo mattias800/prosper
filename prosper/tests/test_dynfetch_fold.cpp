@@ -2190,6 +2190,66 @@ int main() {
                                  &direct_sbuffer_table, direct_sbuffer_config).empty(),
           "#1029: pc-keyed direct scalar buffer is bound and recompiles");
 
+    // GTA V selects one of two adjacent descriptor fragments with the low bit of a raw table
+    // pointer. The high-half selector is `s_andn2_b32 1, s0`: without folding AND-NOT, VCC_HI and
+    // the register-SOFFSET x2 load become unknown, so the exact buffer_store at pc10 cannot publish
+    // its V#. Exercise both pointer parities because reversing AND-NOT's operands produces a very
+    // different (and unsound) table offset while still looking superficially like a bit clear.
+    alignas(16) uint32_t andn2_fragment_payload[16]{};
+    const uint64_t andn2_payload_base =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(andn2_fragment_payload));
+    alignas(16) uint32_t andn2_fragment_table[10] = {
+        0u, 0u, 0u, 0u, 0u, 0u,
+        static_cast<uint32_t>(andn2_payload_base),
+        (static_cast<uint32_t>(andn2_payload_base >> 32) & 0xffffu) | (4u << 16),
+        static_cast<uint32_t>(andn2_payload_base),
+        (static_cast<uint32_t>(andn2_payload_base >> 32) & 0xffffu) | (4u << 16),
+    };
+    const uint32_t gta_andn2_fragment[] = {
+        0x8a6b0081u,              // pc0: s_andn2_b32 s107, 1, s0
+        0x8f6b836bu,              // pc1: s_lshl_b32 s107, s107, 3
+        0x871600c2u,              // pc2: s_and_b32 s22, -2, s0
+        0xbe970301u,              // pc3: s_mov_b32 s23, s1
+        0xf404020bu, 0xd6000018u, // pc4: s_load_dwordx2 s[8:9], s[22:23], s107
+        0xbe8a03ffu, 16u,         // pc6: s_mov_b32 s10, 16 records
+        0xbe8b03ffu, 4u << 12,    // pc8: s_mov_b32 s11, raw R32 descriptor control
+        0xe0702000u, 0x80020103u, // pc10: buffer_store_dword v1, v3, s[8:11]
+        0xbf810000u,
+    };
+    for (uint32_t parity = 0; parity < 2; ++parity) {
+        const uint64_t tagged_table =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(andn2_fragment_table)) | parity;
+        uint32_t andn2_seed[2] = {
+            static_cast<uint32_t>(tagged_table),
+            static_cast<uint32_t>(tagged_table >> 32),
+        };
+        ShaderResourceTable andn2_table;
+        const std::vector<SrtUse> andn2_uses = add_compute_buffer_resources(
+            andn2_table, gta_andn2_fragment, std::size(gta_andn2_fragment),
+            andn2_seed, std::size(andn2_seed));
+        assign_convention_bindings(andn2_table, 2);
+        ComputeShaderConfig andn2_config;
+        andn2_config.user_sgprs.assign(andn2_seed, andn2_seed + std::size(andn2_seed));
+        andn2_config.local_x = andn2_config.local_y = andn2_config.local_z = 1;
+        CHECK(andn2_uses.size() == 1 && andn2_uses[0].use_pc == 10 &&
+                  andn2_uses[0].v4[0] == static_cast<uint32_t>(andn2_payload_base) &&
+                  andn2_uses[0].v4[1] == andn2_fragment_table[7] &&
+                  andn2_table.resources.size() == 1 && andn2_table.by_fetch_pc(10) &&
+                  !recompile_compute(gta_andn2_fragment, std::size(gta_andn2_fragment),
+                                     &andn2_table, andn2_config).empty(),
+              "GTA V s_andn2 table selector resolves the exact pc10 descriptor fragment");
+
+        std::vector<uint32_t> reversed_andn2(
+            std::begin(gta_andn2_fragment), std::end(gta_andn2_fragment));
+        reversed_andn2[0] = 0x8a6b8100u; // pc0: s_andn2_b32 s107, s0, 1
+        ShaderResourceTable reversed_andn2_table;
+        const std::vector<SrtUse> reversed_andn2_uses = add_compute_buffer_resources(
+            reversed_andn2_table, reversed_andn2.data(), reversed_andn2.size(),
+            andn2_seed, std::size(andn2_seed));
+        CHECK(reversed_andn2_uses.empty() && reversed_andn2_table.resources.empty(),
+              "same-site reversed s_andn2 operands do not inherit GTA V's fragment proof");
+    }
+
     // Astro's world-map PS derives VCC_LO from v_readfirstlane. That value is uniform at runtime
     // and the SPIR-V translator tracks it, but the CPU descriptor fold intentionally cannot assign
     // a concrete value to a VGPR read. Retain the exact bounded V# with required_size=0: production

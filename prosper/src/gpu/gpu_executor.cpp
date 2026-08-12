@@ -3050,9 +3050,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         next_scc = static_cast<int>(sum >> 32);
                         break;
                     }
-                    case 0x0E: r = a & c; next_scc = r != 0; break;         // s_and_b32
-                    case 0x10: r = a | c; next_scc = r != 0; break;         // s_or_b32
-                    case 0x12: r = a ^ c; next_scc = r != 0; break;         // s_xor_b32
+                    case kSop2OpcodeAndB32:
+                        r = a & c; next_scc = r != 0; break;
+                    case kSop2OpcodeOrB32:
+                        r = a | c; next_scc = r != 0; break;
+                    case kSop2OpcodeXorB32:
+                        r = a ^ c; next_scc = r != 0; break;
+                    case kSop2OpcodeAndn2B32:
+                        r = a & ~c; next_scc = r != 0; break;
                     case 0x1E:                                             // s_lshl_b32
                         r = a << (c & 31); next_scc = r != 0; break;
                     case 0x20:                                             // s_lshr_b32
@@ -3068,7 +3073,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1)));
                                  next_scc = r != 0; break; }
-                    case 0x0A:   // s_cselect_b32: dst = SCC ? src0 : src1 (the vertex-fetch format patch's tail)
+                    case kSop2OpcodeCselectB32: // dst = SCC ? src0 : src1
                         if (scc < 0) ok = false; else r = scc ? a : c;
                         break;
                     case 0x1F: case 0x21: {  // s_lshl_b64 / s_lshr_b64
