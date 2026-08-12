@@ -2079,6 +2079,49 @@ int main() {
     CHECK(got17d1_exec_inline2 == expected17d1_exec_inline2,
           "same-site inline mask 2 activates only lane one of each Wave32 wave");
 
+    // GTA V pc398 treats physical VCC_LO as ordinary scalar scratch: MOVK writes 0x80, then this
+    // exact SOP2 packet combines that complete dword with literal 0x100 and writes EXEC_LO. The
+    // architectural result 0x180 selects lanes 7 and 8 independently in each Wave32 guest wave.
+    // Mutating OR to AND at the SAME packet produces zero and must suppress every store.
+    std::vector<uint32_t> code17d1_exec_scalar_or = {
+        0xb06a0080u,              // exact pc394: s_movk_i32 vcc_lo,128
+        0x887eff6au, 0x00000100u, // exact pc398: s_or_b32 exec_lo,vcc_lo,0x100
+        0x7e0202aau,              // v_mov_b32 v1,42
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbefe03c1u,              // s_mov_b32 exec_lo,-1
+    };
+    code17d1_exec_scalar_or.insert(
+        code17d1_exec_scalar_or.end(), std::begin(code17d), std::end(code17d));
+    const auto portable_spv17d1_exec_scalar_or = recompile_compute(
+        code17d1_exec_scalar_or.data(), code17d1_exec_scalar_or.size(),
+        &rt17d1, portable_cfg17d1);
+    std::vector<uint32_t> code17d1_exec_scalar_and = code17d1_exec_scalar_or;
+    code17d1_exec_scalar_and[1] = 0x877eff6au; // same site: s_and_b32 exec_lo,vcc_lo,0x100
+    const auto portable_spv17d1_exec_scalar_and = recompile_compute(
+        code17d1_exec_scalar_and.data(), code17d1_exec_scalar_and.size(),
+        &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1_exec_scalar_or.empty() &&
+              !portable_spv17d1_exec_scalar_and.empty(),
+          "Wave32 scalar-dword logical EXEC write and exact-site mutation recompile");
+    std::vector<uint32_t> got17d1_exec_scalar_or, got17d1_exec_scalar_and;
+    if (!portable_spv17d1_exec_scalar_or.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_scalar_or, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_scalar_or);
+    if (!portable_spv17d1_exec_scalar_and.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_scalar_and, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_scalar_and);
+    std::vector<uint32_t> expected17d1_exec_scalar_or(64, 0xdeadbeefu);
+    for (uint32_t wave = 0; wave < 2; ++wave) {
+        expected17d1_exec_scalar_or[wave * 32 + 7] = 42u;
+        expected17d1_exec_scalar_or[wave * 32 + 8] = 42u;
+    }
+    CHECK(got17d1_exec_scalar_or == expected17d1_exec_scalar_or,
+          "pc398 scalar OR selects lanes 7 and 8 of each Wave32 wave");
+    CHECK(got17d1_exec_scalar_and == std::vector<uint32_t>(64, 0xdeadbeefu),
+          "same-site AND mutation produces empty EXEC and suppresses every store");
+
     // Kernel 17d1i: GTA V's newly exposed pc115 packet gathers DATA0 backward through a byte
     // address. Keep its exact v30/v6/v9 encoding and the irreducible dispatcher tail. Offset +4 is
     // a same-site mutation selecting the following source lane, including wrap at each 32-lane half.
