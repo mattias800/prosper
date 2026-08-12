@@ -1522,6 +1522,60 @@ int main() {
                                 native_cfg17d).empty(),
           "Wave64 VCC_LO scalar exception rejects packet drift and a live high-half mask");
 
+    // GTA V 0x413ce6d00 pc232 selects an inline float bit-pattern into VCC_LO and consumes that
+    // ordinary scalar dword through V_ADD3_U32 at pc240. V_ADD3's scalar operands are B32; treating
+    // src0 as the low word of a pair falsely makes the untouched VCC_HI lifetime look observable.
+    const uint32_t code17d1_vcc_low_add3[] = {
+        0xbf068008u,                         // SCC = 1
+        0x856af6f4u,                         // exact pc232: cselect vcc_lo, inline 244, inline 246
+        0xbf0bff0au, 0x3fffffffu,            // exact pc233: scalar compare
+        0xbe8303ffu, 0x00016204u,            // exact pc235: scalar descriptor word
+        0x850a6af2u,                         // exact pc237: cselect s10,inline 242,vcc_lo
+        0x846a820eu,                         // exact pc238: B32 shift overwrites vcc_lo
+        0x811a0e15u,                         // exact pc239: scalar add
+        0xd76d0004u, 0x042d826au,            // exact pc240: v_add3_u32 v4,vcc_lo,-1,v11
+        0xbf880005u,                         // captured-shape exit skips to end
+        0x7e000280u,                         // fallthrough vector work
+        0xbbfd0000u,                         // exact pc271: s_waitcnt_vscnt null,0
+        0x7daa0880u,                         // exact pc277 CMPX writes EXEC, not VCC
+        0xb00803fbu,                         // exact pc282: s_movk_i32 s8,1019
+        0xbeea047eu,                         // exact pc284 complete VCC replacement
+        0xbf810000u,
+    };
+    CHECK(!recompile_compute(code17d1_vcc_low_add3,
+                             std::size(code17d1_vcc_low_add3), nullptr,
+                             native_cfg17d).empty(),
+          "Wave64 VCC_LO scalar scratch reaches GTA's B32 V_ADD3 consumer");
+    std::vector<uint32_t> code17d1_vcc_low_add3_pair_read(
+        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
+    code17d1_vcc_low_add3_pair_read[9] = 0xd5010004u;
+    code17d1_vcc_low_add3_pair_read[10] = 0x01a9826au; // same site: cndmask reads full VCC pair
+    CHECK(recompile_compute(code17d1_vcc_low_add3_pair_read.data(),
+                            code17d1_vcc_low_add3_pair_read.size(), nullptr,
+                            native_cfg17d).empty(),
+          "same-site pair-reading mutation keeps a live VCC_HI fail-visible");
+    std::vector<uint32_t> code17d1_vcc_low_cselect_pair_read(
+        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
+    code17d1_vcc_low_cselect_pair_read[6] = 0x858a6af2u; // same pc237 site: CSELECT_B64
+    CHECK(recompile_compute(code17d1_vcc_low_cselect_pair_read.data(),
+                            code17d1_vcc_low_cselect_pair_read.size(), nullptr,
+                            native_cfg17d).empty(),
+          "same-site B64 CSELECT mutation observes VCC_HI and remains fail-visible");
+    std::vector<uint32_t> code17d1_vcc_low_sopk_write(
+        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
+    code17d1_vcc_low_sopk_write[13] = 0xbbeb0000u; // same opcode: VCC_HI replaces NULL source
+    CHECK(recompile_compute(code17d1_vcc_low_sopk_write.data(),
+                            code17d1_vcc_low_sopk_write.size(), nullptr,
+                            native_cfg17d).empty(),
+          "same-site non-null WAIT source observes VCC_HI and remains fail-visible");
+    std::vector<uint32_t> code17d1_vcc_low_sopk_rmw(
+        std::begin(code17d1_vcc_low_add3), std::end(code17d1_vcc_low_add3));
+    code17d1_vcc_low_sopk_rmw[15] = 0xb70803fbu; // same pc282 site: s_addk_i32 is RMW
+    CHECK(recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
+                            code17d1_vcc_low_sopk_rmw.size(), nullptr,
+                            native_cfg17d).empty(),
+          "same-site SOPK RMW mutation remains conservative in the death proof");
+
     ComputeShaderConfig native_linear_cfg17d = native_cfg17d;
     native_linear_cfg17d.local_x = 64;
     native_linear_cfg17d.local_y = 1;

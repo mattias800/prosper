@@ -27,9 +27,18 @@ enum class Rdna2Format : uint8_t {
     Unknown,
 };
 
+// GFX10.3 scalar ALU opcodes shared by emission and source-lifetime analysis.
+inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
+inline constexpr uint32_t kSopkOpcodeMovkI32 = 0x00;
+inline constexpr uint32_t kSopkOpcodeWaitcntVscnt = 0x17;
+
 // GFX10.3 VOP1 opcodes used outside the decoder itself. Naming cross-component opcodes at this
 // boundary keeps dispatcher admission and ALU emission on one compile-time constant.
 inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
+
+// GFX10.3 VOP3 opcodes whose scalar-source width matters to CFG lifetime analysis.
+// V_ADD3_U32 consumes three independent B32 operands; it never reads an SGPR pair.
+inline constexpr uint32_t kVop3OpcodeAdd3U32 = 0x36d;
 
 // GFX10.3 MUBUF atomic opcodes (ISA Table 99). Keep these names at the decode boundary so resource
 // discovery and SPIR-V emission do not maintain separate, opaque hexadecimal inventories. These are
