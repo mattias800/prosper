@@ -2526,6 +2526,35 @@ int main() {
         return 1;
     }
 
+    // GTA V 0x413cf7000 pc173..175 carries the SCC produced by an exact B64 mask logical across
+    // S_MOV_B64 into the consuming branch. S_MOV changes EXEC but architecturally preserves SCC;
+    // the dispatcher must therefore associate the branch with pc173's existing synchronized vote.
+    std::vector<uint32_t> gta_b64_mask_scc_mov(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    gta_b64_mask_scc_mov[3] = 0xbe9a047eu; // saved mask s[26:27] = exec
+    gta_b64_mask_scc_mov[4] = 0x8a9a7e1au; // exact pc173: s_andn2_b64 s26,s26,exec
+    gta_b64_mask_scc_mov[5] = 0xbefe041au; // exact pc174: s_mov_b64 exec,s26 (SCC-preserving)
+    gta_b64_mask_scc_mov[6] = 0xbf850003u; // pc175 shape: s_cbranch_scc1
+    const auto gta_b64_mask_scc_mov_spv = recompile_compute(
+        gta_b64_mask_scc_mov.data(), gta_b64_mask_scc_mov.size(), nullptr,
+        portable_wave64_compute_config);
+    if (gta_b64_mask_scc_mov_spv.empty() ||
+        !has_opcode(gta_b64_mask_scc_mov_spv, 224) || // synchronized guest-wave vote
+        !has_opcode(gta_b64_mask_scc_mov_spv, 251) || // arbitrary CFG dispatcher
+        !type_result_ids_are_nonzero(gta_b64_mask_scc_mov_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_b64_mask_scc_mov_spv)) {
+        printf("  [FAIL] GTA B64 mask SCC did not survive S_MOV_B64 to its branch\n");
+        return 1;
+    }
+    gta_b64_mask_scc_mov[5] = 0xbefe081au; // same pc174 site: S_NOT_B64 writes SCC
+    if (!recompile_compute(gta_b64_mask_scc_mov.data(), gta_b64_mask_scc_mov.size(),
+                           nullptr, portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] SCC-writing pc174 mutation was treated as preserving pc173 SCC\n");
+        return 1;
+    }
+    printf("  [ok]   GTA B64 mask SCC survives only the exact SCC-preserving S_MOV_B64\n");
+
     // GTA V's compute culling kernels execute this exact in-place V_FFBH_U32 e32 packet inside
     // crossing control flow. Replace the SCC-preserving VALU in the proven Wave64 dispatcher
     // fixture, retaining every branch offset, and require the real FindUMsb lowering to be present.
