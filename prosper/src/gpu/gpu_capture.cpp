@@ -130,14 +130,28 @@ constexpr uint64_t kMaxTotalBlobBytes = 3ull << 30;
 // over the line aborts the entire grab, which makes the F9/bundle workflow unavailable in exactly the
 // phase under investigation.
 //
-// WHY RAISING IT IS SAFE, since this is not only a policy knob -- one of its uses is a READ path
-// (`Reader::bytes`), so a writer-only change would emit bundles the reader rejects as
-// `invalid blob length`. That reader's load-bearing bound is `n > left`: a blob length cannot exceed
-// the bytes actually remaining in the buffer, so a corrupt or hostile length is caught without this
-// term at all. The aggregate is bounded independently by its neighbours above -- kMaxFileBytes (4 GiB)
-// and kMaxTotalBlobBytes (3 GiB). So the per-blob ceiling is redundant defence layered over sufficient
-// bounds, and both writer and reader consult this same accessor so a bundle produced under a raised
-// ceiling is readable by the process that produced it.
+// WHY RAISING IT IS SAFE, since this is not only a policy knob. Nine sites check it, and **three are
+// on the read side** -- so a writer-only change would emit bundles a reader rejects. Each of the three
+// has a DIFFERENT real bound, and this is spelled out per-site because a single blanket claim about
+// them was wrong when first written (review on #2500):
+//
+//   * `Reader::bytes` -- bounded by `n > left`: a blob length cannot exceed the bytes actually
+//     remaining in the buffer, so a corrupt or hostile length is caught without this term at all.
+//   * `validate_dma_copies` -- operates on an ALREADY-LOADED file, so there is no `left` here. Each
+//     copy must additionally pass `validate_blob(...)` for both endpoints, i.e. lie inside a real
+//     blob at a real offset; it inherits the blob bounds transitively.
+//   * `validate_resource_provenance` -- also post-load, also no `left`. `requested_bytes` must EQUAL
+//     an already-read blob's size and fit inside a second blob at its recorded offset, so the
+//     subsequent hash over `post.bytes.data() + post_blob_offset` is in range by that chain.
+//
+// In every case the aggregate is bounded independently by the neighbours above -- kMaxFileBytes
+// (4 GiB) and kMaxTotalBlobBytes (3 GiB) -- and the per-blob ceiling is redundant defence layered over
+// bounds that already hold. **Do not read `n > left` as the guard at the two validators**: it is not
+// available there, and a future use that consumes `requested_bytes` BEFORE its equality check would
+// not be covered by it.
+//
+// Writer and reader consult this same accessor, so a bundle produced under a raised ceiling is
+// readable by the process that produced it.
 //
 // Clamped to kMaxTotalBlobBytes: a per-blob ceiling above the total-blob budget could never be
 // satisfied, so accepting one would only move the failure later and make it harder to read. A
