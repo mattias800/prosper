@@ -13,6 +13,7 @@
 #include "guest_texture_layout.hpp"
 #include "rdna2_decode.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
+#include "rdna2_gta5_packed_pointer.hpp"
 #include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
 #include "videoout_present.hpp"
@@ -118,7 +119,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // preserve the descriptor's OOB_SELECT proof, which controls the all-or-nothing record range check.
 // v50 (#2481): retain COMPUTE_PGM_RSRC1 in every exact compute recompile configuration. FP32 memory
 // and LDS atomics consume its denormal mode; older artifacts leave the state explicitly unknown.
-constexpr uint32_t kVersion = 50;
+// v51 (#2481): internal resource bytes may also carry GTA V's exact pc26 packed-pointer shadow.
+// Unlike shared GDS state, every dispatch owns a distinct snapshot even when bindings coincide.
+constexpr uint32_t kVersion = 51;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -795,7 +798,7 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     auto add_table = [&](const ShaderResourceTable* t) -> bool {
         if (!t) return true;
         for (const auto& r : t->resources) {
-            if (is_compute_internal_gds(r)) continue;
+            if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) continue;
             uint64_t n = resource_footprint(r);
             if (n) {
                 if (n > max_blob_bytes() || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
@@ -894,10 +897,15 @@ bool assign_blob_range(const std::vector<Interval>& intervals, uint64_t addr, ui
 }
 
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
-                   bool include_resource_data, GpuCapturedTable& dst, std::string& error) {
+                   bool include_resource_data, bool allow_packed_pointer,
+                   GpuCapturedTable& dst, std::string& error) {
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
+        if (!allow_packed_pointer && is_gta5_packed_pointer_marker_candidate(r)) {
+            error = "packed-pointer state is only valid for a compute dispatch";
+            return false;
+        }
         GpuCapturedResource c;
         c.resource = r;
         if (r.cls == ResourceClass::Texture &&
@@ -925,12 +933,17 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);
         c.captured_size = n;
-        if (is_compute_internal_gds(r) && include_resource_data) {
-            if (!r.host_data || r.host_data_size < n) {
-                error = "compute GDS resource has no complete host backing";
+        if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) &&
+            include_resource_data) {
+            const uint64_t internal_size = is_compute_internal_gds(r) ? n : r.host_data_size;
+            if (!r.host_data || r.host_data_size < internal_size ||
+                (is_gta5_packed_pointer_resource(r) &&
+                 !is_gta5_packed_pointer_serialized_shadow(
+                     r, r.host_data, r.host_data_size))) {
+                error = "compute internal resource has no complete host backing";
                 return false;
             }
-            c.internal_bytes.assign(r.host_data, r.host_data + n);
+            c.internal_bytes.assign(r.host_data, r.host_data + internal_size);
         } else if (n && include_resource_data &&
             !assign_blob_range(intervals, r.gpu_addr, n, c.blob_index, c.blob_offset,
                                "resource was not assigned to a capture blob", error)) return false;
@@ -1509,6 +1522,76 @@ bool validate_captured_nullable_output_raw_buffer(
     return true;
 }
 
+bool captured_resource_has_packed_pointer_state(const GpuCapturedResource& captured) {
+    return !captured.internal_bytes.empty() &&
+           !is_compute_internal_gds(captured.resource);
+}
+
+bool validate_captured_gta5_packed_pointer(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!compute.resources.present) return true;
+    const size_t candidates = static_cast<size_t>(std::count_if(
+        compute.resources.resources.begin(), compute.resources.resources.end(),
+        captured_resource_has_packed_pointer_state));
+    if (!candidates) return true;
+    if (capture.format_version < 51u || candidates != 1u ||
+        !compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        error = "packed-pointer state lacks exact compute provenance";
+        return false;
+    }
+    const auto& config = compute.recompile_config;
+    const uint64_t groups_x =
+        (static_cast<uint64_t>(config.threads_x) + config.local_x - 1u) / config.local_x;
+    if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
+        compute.launch.groups_z != 1u) {
+        error = "packed-pointer state has stale captured launch provenance";
+        return false;
+    }
+
+    ShaderResourceTable validated_resources;
+    validated_resources.resources.reserve(compute.resources.resources.size());
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        ShaderResource resource = captured.resource;
+        resource.indirect_buffer_contract_tag = 0u;
+        resource.indirect_buffer_binding_bytes = 0u;
+        resource.indirect_buffer_slot_count = 0u;
+        resource.indirect_buffer_header_bytes = 0u;
+        resource.indirect_buffer_slot_bytes = 0u;
+        resource.host_data = nullptr;
+        resource.host_data_size = 0u;
+        if (captured_resource_has_packed_pointer_state(captured)) {
+            if (!is_gta5_packed_pointer_serialized_shadow(
+                    resource, captured.internal_bytes.data(), captured.internal_bytes.size())) {
+                error = "packed-pointer state has malformed internal bytes";
+                return false;
+            }
+            resource.host_data = const_cast<uint8_t*>(captured.internal_bytes.data());
+            resource.host_data_size = captured.internal_bytes.size();
+        } else if (captured.blob_index != UINT32_MAX) {
+            if (captured.blob_index >= capture.blobs.size() ||
+                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size()) {
+                error = "packed-pointer state references an invalid resource blob";
+                return false;
+            }
+            const auto& blob = capture.blobs[captured.blob_index].bytes;
+            resource.host_data = const_cast<uint8_t*>(blob.data() + captured.blob_offset);
+            resource.host_data_size = blob.size() - captured.blob_offset;
+        }
+        validated_resources.resources.push_back(resource);
+    }
+
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    if (!rdna2_gta5_packed_pointer_shader(raw.data(), raw.size()) ||
+        !discover_rdna2_gta5_packed_pointer(
+            raw.data(), raw.size(), config, validated_resources)) {
+        error = "packed-pointer state has stale shader, launch, or table provenance";
+        return false;
+    }
+    return true;
+}
+
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
     if (capture.raw_shader_versions.size() > kMaxResources ||
         capture.failure_diagnostics.size() > kMaxOperations) {
@@ -1552,6 +1635,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
         if (!validate_captured_null_guarded_raw_store(capture, compute, error))
             return false;
         if (!validate_captured_nullable_output_raw_buffer(capture, compute, error))
+            return false;
+        if (!validate_captured_gta5_packed_pointer(capture, compute, error))
             return false;
         if (compute.raw_shader_index != 0xFFFFFFFFu)
             raw_referenced[compute.raw_shader_index] = true;
@@ -1689,7 +1774,7 @@ bool capture_failure_diagnostics(
             stage.first_descriptor_issue = runtime_stage.first_descriptor_issue;
             stage.recompile_config = runtime_stage.recompile_config;
             stage.recompile_config_available = runtime_stage.recompile_config_available;
-            if (!capture_table(runtime_stage.resources.get(), {}, false,
+            if (!capture_table(runtime_stage.resources.get(), {}, false, false,
                                stage.resource_table, error)) return false;
             if (!capture_raw_shader_version(stage.program_addr, reader, capture, raw_words,
                                             raw_shader_index_by_address,
@@ -1897,8 +1982,9 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.system_inputs = d.system_inputs;
         c.has_pixel_inputs = d.has_pixel_inputs;
         c.has_system_inputs = d.has_system_inputs;
-        if (!capture_table(d.vrt.get(), intervals, include_resource_data, c.vrt, error) ||
-            !capture_table(d.prt.get(), intervals, include_resource_data, c.prt, error)) return false;
+        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false, c.vrt, error) ||
+            !capture_table(d.prt.get(), intervals, include_resource_data, false, c.prt, error))
+            return false;
         out.draws.push_back(std::move(c));
     }
     for (const auto& compute : computes) {
@@ -1916,7 +2002,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             !capture_raw_shader_version(compute.code_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
                                         c.raw_shader_index, error)) return false;
-        if (!capture_table(compute.resources.get(), intervals, include_resource_data,
+        if (!capture_table(compute.resources.get(), intervals, include_resource_data, true,
                            c.resources, error)) return false;
         out.computes.push_back(std::move(c));
     }
@@ -2471,13 +2557,21 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // v22 explicitly captures host-backed compute GDS state. Unlike guest-addressed resources,
     // this state has no valid capture interval; one shared replay instance preserves dispatch order.
     w.u32(static_cast<uint32_t>(resource_depth_count));
-    auto write_internal_state = [&](const GpuCapturedTable& table) {
+    auto write_internal_state = [&](const GpuCapturedTable& table,
+                                    bool allow_packed_pointer) {
         for (const auto& captured : table.resources) {
-            const bool internal = is_compute_internal_gds(captured.resource);
-            if ((!internal && !captured.internal_bytes.empty()) ||
-                (internal && !captured.internal_bytes.empty() &&
-                 captured.internal_bytes.size() != resource_footprint(captured.resource))) {
-                error = "invalid compute GDS capture state";
+            const bool gds = is_compute_internal_gds(captured.resource);
+            const bool packed = is_gta5_packed_pointer_serialized_shadow(
+                captured.resource, captured.internal_bytes.data(),
+                captured.internal_bytes.size());
+            const bool expected_packed =
+                is_gta5_packed_pointer_marker_candidate(captured.resource);
+            if ((!allow_packed_pointer && (packed || expected_packed)) ||
+                (!gds && !packed && !captured.internal_bytes.empty()) ||
+                (gds && !captured.internal_bytes.empty() &&
+                 captured.internal_bytes.size() != resource_footprint(captured.resource)) ||
+                (expected_packed && !captured.internal_bytes.empty() && !packed)) {
+                error = "invalid compute internal capture state";
                 return false;
             }
             w.bytes(captured.internal_bytes);
@@ -2485,9 +2579,10 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         return true;
     };
     for (const auto& draw : c.draws)
-        if (!write_internal_state(draw.vrt) || !write_internal_state(draw.prt)) return false;
+        if (!write_internal_state(draw.vrt, false) ||
+            !write_internal_state(draw.prt, false)) return false;
     for (const auto& compute : c.computes)
-        if (!write_internal_state(compute.resources)) return false;
+        if (!write_internal_state(compute.resources, true)) return false;
     // v23 (#1256) appends the raw draw-packet state (DrawIndexAuto/DrawIndex index_count + indexed flag)
     // per realized draw, decoded from the guest BEFORE realization. Older captures default to 0/false
     // ("unknown"). Kept as a trailing block so every v1-v22 record prefix stays byte-exact.
@@ -3514,23 +3609,30 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             error = "invalid compute GDS state count";
             return false;
         }
-        auto read_internal_state = [&](GpuCapturedTable& table) {
+        auto read_internal_state = [&](GpuCapturedTable& table,
+                                       bool allow_packed_pointer) {
             for (auto& captured : table.resources) {
                 if (!r.bytes(captured.internal_bytes)) return false;
-                const bool internal = is_compute_internal_gds(captured.resource);
-                if ((!internal && !captured.internal_bytes.empty()) ||
-                    (internal && !captured.internal_bytes.empty() &&
+                const bool gds = is_compute_internal_gds(captured.resource);
+                const bool packed = version >= 51u &&
+                    is_gta5_packed_pointer_serialized_shadow(
+                        captured.resource, captured.internal_bytes.data(),
+                        captured.internal_bytes.size());
+                if ((!allow_packed_pointer && packed) ||
+                    (!gds && !packed && !captured.internal_bytes.empty()) ||
+                    (gds && !captured.internal_bytes.empty() &&
                      captured.internal_bytes.size() != resource_footprint(captured.resource))) {
-                    error = "invalid compute GDS capture state";
+                    error = "invalid compute internal capture state";
                     return false;
                 }
             }
             return true;
         };
         for (auto& draw : c.draws)
-            if (!read_internal_state(draw.vrt) || !read_internal_state(draw.prt)) return false;
+            if (!read_internal_state(draw.vrt, false) ||
+                !read_internal_state(draw.prt, false)) return false;
         for (auto& compute : c.computes)
-            if (!read_internal_state(compute.resources)) return false;
+            if (!read_internal_state(compute.resources, true)) return false;
     }
     if (version >= 23) {   // #1256: raw draw-packet state per realized draw
         uint32_t nd = 0;
@@ -4238,8 +4340,11 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
     error.clear();
-    if (!validate_dma_copies(c, error)) return false;
-    out = {}; out.metadata = c.metadata; out.blobs = c.blobs;
+    out = {};
+    if (!validate_dma_copies(c, error) ||
+        (c.format_version >= 7u && !validate_failure_diagnostics(c, error)))
+        return false;
+    out.metadata = c.metadata; out.blobs = c.blobs;
     out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
     out.raw_shader_versions = c.raw_shader_versions;
     out.failure_diagnostics = c.failure_diagnostics;
@@ -4277,7 +4382,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         host_data_size = need;
         return true;
     };
-    auto table = [&](const GpuCapturedTable& src, std::shared_ptr<ShaderResourceTable>& dst) -> bool {
+    auto table = [&](const GpuCapturedTable& src, bool allow_packed_pointer,
+                     std::shared_ptr<ShaderResourceTable>& dst) -> bool {
         if (!src.present) { dst.reset(); return src.resources.empty(); }
         dst = std::make_shared<ShaderResourceTable>();
         for (const auto& x : src.resources) {
@@ -4301,15 +4407,31 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             r.dcc_metadata_host_data = nullptr;
             r.dcc_metadata_host_data_size = 0;
             if (!x.internal_bytes.empty()) {
-                auto [it, inserted] = internal_instance_by_binding.emplace(
-                    r.binding, out.resource_instances.size());
-                if (inserted)
-                    out.resource_instances.push_back({0, 0xFFFFFFFFu, x.internal_bytes});
-                auto& instance = out.resource_instances[it->second].bytes;
-                if (!inserted && instance != x.internal_bytes) {
-                    error = "compute GDS resources disagree on initial state";
+                const bool gds = is_compute_internal_gds(r);
+                const bool packed = c.format_version >= 51u &&
+                    is_gta5_packed_pointer_serialized_shadow(
+                        r, x.internal_bytes.data(), x.internal_bytes.size());
+                if ((!allow_packed_pointer && packed) || (!gds && !packed)) {
+                    error = "invalid compute internal replay state";
                     return false;
                 }
+                size_t instance_index = 0;
+                if (packed) {
+                    instance_index = out.resource_instances.size();
+                    out.resource_instances.push_back({0, 0xFFFFFFFFu, x.internal_bytes});
+                } else {
+                    auto [it, inserted] = internal_instance_by_binding.emplace(
+                        r.binding, out.resource_instances.size());
+                    if (inserted)
+                        out.resource_instances.push_back({0, 0xFFFFFFFFu, x.internal_bytes});
+                    instance_index = it->second;
+                    auto& instance = out.resource_instances[instance_index].bytes;
+                    if (!inserted && instance != x.internal_bytes) {
+                        error = "compute GDS resources disagree on initial state";
+                        return false;
+                    }
+                }
+                auto& instance = out.resource_instances[instance_index].bytes;
                 r.host_data = instance.data();
                 r.host_data_size = instance.size();
             } else if (!bind_range(x.blob_index, x.blob_offset, r.gpu_addr, captured_footprint,
@@ -4352,7 +4474,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.system_inputs = x.system_inputs;
         d.has_pixel_inputs = x.has_pixel_inputs;
         d.has_system_inputs = x.has_system_inputs;
-        if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
+        if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
         if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
         out.items.push_back(std::move(d));
     }
@@ -4377,16 +4499,36 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             captured_compute_has_nullable_output_raw_buffer(x);
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
-        if (!table(x.resources, compute.resources)) return false;
+        const bool has_packed_pointer_state = c.format_version >= 51u &&
+            std::any_of(x.resources.resources.begin(), x.resources.resources.end(),
+                        [](const GpuCapturedResource& resource) {
+                return is_gta5_packed_pointer_serialized_shadow(
+                    resource.resource, resource.internal_bytes.data(),
+                    resource.internal_bytes.size());
+            });
+        if (!table(x.resources, true, compute.resources)) return false;
         // The selected-SBUFFER marker is deliberately derived rather than serialized. A raw replay
         // with complete captured backing can reconstruct it from the exact shader/launch/source
         // domain; metadata-only captures retain their already-compiled SPIR-V and remain materializable.
+        if (has_packed_pointer_state &&
+            (!compute.resources || !compute.recompile_config_available ||
+             compute.raw_shader_index >= c.raw_shader_versions.size())) {
+            error = "packed-pointer replay lacks exact raw shader or launch state";
+            return false;
+        }
         if (compute.resources && compute.recompile_config_available &&
             compute.raw_shader_index < c.raw_shader_versions.size()) {
             const auto& raw = c.raw_shader_versions[compute.raw_shader_index].words;
             if (rdna2_gta5_selected_sbuffer_shader(raw.data(), raw.size()))
                 (void)discover_rdna2_gta5_selected_sbuffer(
                     raw.data(), raw.size(), compute.recompile_config, *compute.resources);
+            if (has_packed_pointer_state &&
+                (!rdna2_gta5_packed_pointer_shader(raw.data(), raw.size()) ||
+                 !discover_rdna2_gta5_packed_pointer(
+                     raw.data(), raw.size(), compute.recompile_config, *compute.resources))) {
+                error = "packed-pointer replay failed exact dispatch validation";
+                return false;
+            }
         }
         out.computes.push_back(std::move(compute));
     }

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -384,6 +385,11 @@ struct ShaderResource {
     // capture, and per-dispatch revalidation carry the proof explicitly.
     uint32_t       atomic_x2_record_count = 0;
 
+    // Exact upper pointer word for key-less scalar-SMEM raw-pointer resources. The normalized
+    // Base48/stride view cannot retain bits 48..63 even though later shader code may consume them
+    // while rebuilding a V#. UINT32_MAX means this resource did not come from that raw-pointer path.
+    uint32_t       scalar_raw_pointer_word_hi = UINT32_MAX;
+
     // Dispatch-scoped proof for GTA V 0x413ce6000's pc153 scalar descriptor-table lookup. The
     // front half admits either the complete zero-descriptor chain, or only the one in-bounds SOFFSET
     // (record 4) plus wholly OOB offsets, then keeps the exact selected V# words here. UINT32_MAX
@@ -391,6 +397,15 @@ struct ShaderResource {
     // target bindings (including ordinary zero-record bindings in the all-zero mode).
     uint32_t       selected_sbuffer_soffset = UINT32_MAX;
     std::array<uint32_t, 4> selected_sbuffer_words{};
+
+    // Derived authority for a dispatch-owned indirect-buffer shadow. A validated program contract
+    // may append bounded pointee slots to host_data and lower only its exact indirect access sites.
+    // These fields never promise that arbitrary FLAT addresses may index the shadow.
+    uint32_t       indirect_buffer_contract_tag = 0;
+    uint32_t       indirect_buffer_binding_bytes = 0;
+    uint32_t       indirect_buffer_slot_count = 0;
+    uint32_t       indirect_buffer_header_bytes = 0;
+    uint32_t       indirect_buffer_slot_bytes = 0;
 };
 
 inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& resource) {
@@ -606,6 +621,10 @@ inline bool is_proven_null_nullable_raw_buffer(const ShaderResource& resource) {
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {
     std::vector<ShaderResource> resources;
+    // Exact dispatch contracts may materialize immutable host-only resources. ShaderResource keeps
+    // raw pointers for the renderer ABI, so the table owns those allocations separately; table
+    // copies retain stable backing through shared ownership.
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> owned_host_data;
     // Graphics-only draw ABI input used by the portable NGG shell. Hardware packs consecutive
     // vertex/instance invocations into guest waves; flattening InstanceIndex therefore needs the
     // submitted number of vertices per instance. Zero keeps standalone shader fixtures compatible.
