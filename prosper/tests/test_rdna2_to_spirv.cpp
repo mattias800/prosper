@@ -2122,6 +2122,49 @@ int main() {
     CHECK(got17d1_exec_scalar_and == std::vector<uint32_t>(64, 0xdeadbeefu),
           "same-site AND mutation produces empty EXEC and suppresses every store");
 
+    // GTA V pc791 constructs the upper half of EXEC_LO directly with S_BFM_B32. Width 16 and
+    // offset 16 select lanes 16..31 of each Wave32 wave; mutating width at that exact packet to 15
+    // must leave lane 31 inactive without changing the surrounding observer.
+    std::vector<uint32_t> code17d1_exec_bfm = {
+        0x927e9090u,              // exact pc791: s_bfm_b32 exec_lo,16,16
+        0x7e0202aau,              // v_mov_b32 v1,42
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbefe03c1u,              // s_mov_b32 exec_lo,-1
+    };
+    code17d1_exec_bfm.insert(
+        code17d1_exec_bfm.end(), std::begin(code17d), std::end(code17d));
+    const auto portable_spv17d1_exec_bfm = recompile_compute(
+        code17d1_exec_bfm.data(), code17d1_exec_bfm.size(), &rt17d1, portable_cfg17d1);
+    std::vector<uint32_t> code17d1_exec_bfm_width15 = code17d1_exec_bfm;
+    code17d1_exec_bfm_width15[0] = 0x927e908fu; // same site: s_bfm_b32 exec_lo,15,16
+    const auto portable_spv17d1_exec_bfm_width15 = recompile_compute(
+        code17d1_exec_bfm_width15.data(), code17d1_exec_bfm_width15.size(),
+        &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1_exec_bfm.empty() &&
+              !portable_spv17d1_exec_bfm_width15.empty(),
+          "Wave32 BFM EXEC write and exact-site width mutation recompile");
+    std::vector<uint32_t> got17d1_exec_bfm, got17d1_exec_bfm_width15;
+    if (!portable_spv17d1_exec_bfm.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_bfm, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_bfm);
+    if (!portable_spv17d1_exec_bfm_width15.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_bfm_width15, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_bfm_width15);
+    std::vector<uint32_t> expected17d1_exec_bfm(64, 0xdeadbeefu);
+    std::vector<uint32_t> expected17d1_exec_bfm_width15(64, 0xdeadbeefu);
+    for (uint32_t wave = 0; wave < 2; ++wave) {
+        for (uint32_t lane = 16; lane < 32; ++lane)
+            expected17d1_exec_bfm[wave * 32 + lane] = 42u;
+        for (uint32_t lane = 16; lane < 31; ++lane)
+            expected17d1_exec_bfm_width15[wave * 32 + lane] = 42u;
+    }
+    CHECK(got17d1_exec_bfm == expected17d1_exec_bfm,
+          "pc791 BFM selects lanes 16 through 31 of each Wave32 wave");
+    CHECK(got17d1_exec_bfm_width15 == expected17d1_exec_bfm_width15,
+          "same-site width mutation leaves lane 31 inactive in each Wave32 wave");
+
     // Kernel 17d1i: GTA V's newly exposed pc115 packet gathers DATA0 backward through a byte
     // address. Keep its exact v30/v6/v9 encoding and the irreducible dispatcher tail. Offset +4 is
     // a same-site mutation selecting the following source lane, including wrap at each 32-lane half.
