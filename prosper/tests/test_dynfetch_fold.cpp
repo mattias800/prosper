@@ -870,6 +870,53 @@ int main() {
                                 constant_branch_seed.data(), constant_branch_seed.size(), 0).empty(),
           "dynamic resource discovery ignores the provably dead buffer fetch");
 
+    // Scalar ALU opcodes the constant folder did not model. Every word below was produced by
+    // `llvm-mc -arch=amdgcn -mcpu=gfx1030 -show-encoding`, not by reading this repo's own tables --
+    // prosper's decoder is upstream of those tables, so it cannot check them, and #2481 records a
+    // mnemonic error that survived three internally consistent internal anchors and inverted a
+    // frontier conclusion.
+    //
+    // These arms discriminate: without the corresponding fold entry, `shader_constant_operand`
+    // reports the shifted value unknown, `shader_constant_compare` declines, and the specializer
+    // returns 0 with the dead block retained. Verified by removing case 0x1e and re-running --
+    // the first arm reports 0 rather than 1.
+    const uint32_t shifted_dead_fetch[] = {
+        0xBE800381u,             // pc0: s_mov_b32 s0, 1
+        0x8F018300u,             // pc1: s_lshl_b32 s1, s0, 3   -> 8
+        0xBF078801u,             // pc2: s_cmp_lg_u32 s1, 8     -> SCC = (8 != 8) = false
+        0xBF840002u,             // pc3: s_cbranch_scc0 +2      -> taken, skips pc4..5
+        0xE0002000u, 0x80030100u,// pc4: dead buffer_load_format_x
+        0xBF810000u,             // pc6: s_endpgm
+    };
+    std::vector<Rdna2Inst> shifted_branch;
+    rdna2_walk(shifted_dead_fetch, std::size(shifted_dead_fetch), shifted_branch);
+    CHECK(rdna2_specialize_shader_constant_branches(shifted_branch) == 1 &&
+              std::none_of(shifted_branch.begin(), shifted_branch.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 4; }),
+          "s_lshl_b32 folds, so its SCC branch prunes the dead resource block");
+
+    // The right-shift sibling, and the compare constant is chosen so the arm separates a right
+    // shift from a LEFT one rather than merely proving that something folded. 8 >> 3 = 1 makes
+    // `s_cmp_lg_u32 s1, 1` false, SCC = 0, and s_cbranch_scc0 taken, so the block is pruned; the
+    // left-shift misreading gives 8 << 3 = 64, `(64 != 1)` true, SCC = 1, branch not taken, block
+    // retained. Comparing against 8 instead -- the obvious first choice -- would pass under BOTH
+    // readings, since 1 and 64 are both unequal to 8. Verified by mutation: folding 0x20 as a left
+    // shift fails this arm; deleting the 0x20 entry fails it too, via the `== 1`.
+    const uint32_t shifted_live_fetch[] = {
+        0xBE800388u,             // pc0: s_mov_b32 s0, 8
+        0x90018300u,             // pc1: s_lshr_b32 s1, s0, 3   -> 1
+        0xBF078101u,             // pc2: s_cmp_lg_u32 s1, 1     -> SCC = (1 != 1) = false
+        0xBF840002u,             // pc3: s_cbranch_scc0 +2      -> taken, skips pc4..5
+        0xE0002000u, 0x80030100u,// pc4: dead buffer_load_format_x
+        0xBF810000u,             // pc6: s_endpgm
+    };
+    std::vector<Rdna2Inst> shifted_live;
+    rdna2_walk(shifted_live_fetch, std::size(shifted_live_fetch), shifted_live);
+    CHECK(rdna2_specialize_shader_constant_branches(shifted_live) == 1 &&
+              std::none_of(shifted_live.begin(), shifted_live.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 4; }),
+          "s_lshr_b32 folds to the RIGHT-shifted value, not the left-shifted one");
+
     // Exact instruction words and PCs from the live traversal loop. The loop-selected BVH sites at
     // PC968/1007 can write work into v59/v60 and return through PC1671/1674, so shader-constant
     // folding alone must retain them. The first entry, however, initializes s45=0 and s11=37, visits
