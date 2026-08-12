@@ -59,9 +59,12 @@ inline constexpr uint32_t kVop1OpcodeFfblB32 = 0x3a;
 // V_ADD3_U32 consumes three independent B32 operands; it never reads an SGPR pair.
 inline constexpr uint32_t kVop3OpcodeAdd3U32 = 0x36d;
 
-// GFX10.3 DS cross-lane opcodes shared by decode-side write accounting, control-flow admission,
-// and emission. These inline constants compile to the same immediate comparisons as raw literals.
+// GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
+// admission, and emission. These inline constants compile to the same immediate comparisons as raw
+// literals.
 inline constexpr uint32_t kDsOpcodeBpermuteB32 = 0xb3;
+inline constexpr uint32_t kDsOpcodeMinF32 = 0x12;
+inline constexpr uint32_t kDsOpcodeMaxF32 = 0x13;
 
 // GFX10.3 MUBUF atomic opcodes (ISA Table 99). Keep these names at the decode boundary so resource
 // discovery and SPIR-V emission do not maintain separate, opaque hexadecimal inventories. These are

@@ -4982,6 +4982,100 @@ int main() {
               unproved_ds_write2_b64_fmin, std::size(unproved_ds_write2_b64_fmin), 10, 0).empty(),
           "DS_WRITE2_B64 before DS_MIN_F32 remains an inventoried unsynchronized store");
 
+    // GTA V exec_cs_413cf9d00 separates its lane-zero initializer at pc1/15/17 from the six float
+    // atomics at pc275 with a large trap-bearing CFG. Preserve those production PCs in a compact
+    // resource-free skeleton: the dispatcher must publish each atomic from its selected case and
+    // execute it only in the workgroup-common phase. The traps remain on always-skipped arms, but are
+    // still present at the captured sites to exercise ACTIVE termination rather than weakening it.
+    auto build_cfg_ds_fminmax = [&] {
+        std::vector<uint32_t> code(362, 0xbf800000u); // s_nop 0
+        auto literal_at = [&](uint32_t pc, uint32_t vgpr, uint32_t bits) {
+            code[pc] = 0x7e0002ffu | (vgpr << 17u);
+            code[pc + 1] = bits;
+        };
+        code[1] = 0xbeea2481u; // s_and_saveexec_b64 vcc, 1
+        literal_at(2, 5, 0xff800000u);
+        literal_at(4, 6, 0xff800000u);
+        literal_at(6, 1, 0x7f800000u);
+        literal_at(8, 2, 0x7f800000u);
+        literal_at(10, 3, 0x7f800000u);
+        literal_at(12, 4, 0xff800000u);
+        code[14] = 0x7e0e0280u; // v_mov_b32 v7, 0
+        code[15] = 0xd9340010u; code[16] = 0x00000507u;
+        code[17] = 0xdb7c0000u; code[18] = 0x00000107u;
+        code[19] = 0xbefe046au; // restore EXEC from VCC
+        code[20] = 0xbe8604c1u; // s_mov_b64 s[6:7], -1 (captured pc257 restore source)
+        for (uint32_t branch_pc : {76u, 83u, 145u, 152u}) {
+            code[branch_pc - 1] = 0xbf060000u; // s_cmp_eq_u32 s0,s0
+            code[branch_pc] = 0xbf850001u;     // skip the following captured trap
+            code[branch_pc + 1] = 0xbf920001u;
+        }
+        code[257] = 0xbefe0406u; // s_mov_b64 exec, s[6:7]
+        literal_at(258, 0, 0x40400000u); // max Z = 3
+        literal_at(260, 1, 0x40000000u); // max Y = 2
+        literal_at(262, 2, 0x3f800000u); // max X = 1
+        code[272] = 0xbf8cc07fu; // s_waitcnt lgkmcnt(0)
+        code[274] = 0x7e080280u; // v_mov_b32 v4, 0
+        code[275] = 0xd8480000u; code[276] = 0x00000204u;
+        code[277] = 0xd8480004u; code[278] = 0x00000104u;
+        code[279] = 0xd8480008u; code[280] = 0x00000004u;
+        code[281] = 0xd84c000cu; code[282] = 0x00000204u;
+        code[283] = 0xd84c0010u; code[284] = 0x00000104u;
+        code[285] = 0xd84c0014u; code[286] = 0x00000004u;
+        code[308] = 0x87fe0681u; // s_and_b64 exec, 1, s[6:7]
+        code[309] = 0x7e080280u; // v_mov_b32 v4, 0
+        code[316] = 0xdbfc0000u; code[317] = 0x00000004u;
+        code[320] = 0xbf8cc07fu;
+        code[326] = 0xd9d80010u; code[327] = 0x04000004u;
+        code[328] = 0xbefe04c1u; // expose the lane-zero gathered minimum to the test shell
+        code[361] = 0xbf810000u;
+        return code;
+    };
+    const std::vector<uint32_t> cfg_ds_fminmax = build_cfg_ds_fminmax();
+    const std::vector<uint32_t> cfg_ds_fminmax_spv = recompile_valu(
+        cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), 0, 0);
+    CHECK(!cfg_ds_fminmax_spv.empty() &&
+              count_spirv_opcode(cfg_ds_fminmax_spv, 230) == 2 &&
+              count_spirv_opcode(cfg_ds_fminmax_spv, 224) >= 2,
+          "#2481: captured pc275 float atomics lower through one synchronized dispatcher event");
+    const std::vector<float> cfg_ds_fminmax_got = cfg_ds_fminmax_spv.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(cfg_ds_fminmax_spv, std::vector<float>(WG), WG, WG);
+    CHECK(cfg_ds_fminmax_got.size() == WG && bits_of(cfg_ds_fminmax_got[0]) == 0x3f800000u,
+          "#2481: captured initializer/CFG/atomic/gather layout returns min X = 1");
+    ComputeShaderConfig cfg_ds_fminmax_portable;
+    cfg_ds_fminmax_portable.local_x = WG;
+    cfg_ds_fminmax_portable.wave_size = WG;
+    ComputeShaderConfig cfg_ds_fminmax_native = cfg_ds_fminmax_portable;
+    cfg_ds_fminmax_native.native_subgroup_size = WG;
+    CHECK(!recompile_compute(cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr,
+                             cfg_ds_fminmax_portable).empty() &&
+              !recompile_compute(cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr,
+                                 cfg_ds_fminmax_native).empty(),
+          "#2481: captured float-atomic CFG recompiles in portable and exact-native modes");
+    ComputeShaderConfig cfg_ds_fminmax_multiwave = cfg_ds_fminmax_portable;
+    cfg_ds_fminmax_multiwave.local_x = WG * 2u;
+    CHECK(recompile_compute(cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr,
+                            cfg_ds_fminmax_multiwave).empty(),
+          "#2481: captured ordinary initializer stays fail-visible for multiple guest waves");
+
+    std::vector<uint32_t> cfg_ds_fminmax_data_mutation = cfg_ds_fminmax;
+    cfg_ds_fminmax_data_mutation[276] = 0x00000404u; // pc275 DATA0 v2 -> v4 (zero)
+    const std::vector<uint32_t> cfg_ds_fminmax_data_spv = recompile_valu(
+        cfg_ds_fminmax_data_mutation.data(), cfg_ds_fminmax_data_mutation.size(), 0, 0);
+    const std::vector<float> cfg_ds_fminmax_data_got = cfg_ds_fminmax_data_spv.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(
+              cfg_ds_fminmax_data_spv, std::vector<float>(WG), WG, WG);
+    CHECK(cfg_ds_fminmax_data_got.size() == WG &&
+              bits_of(cfg_ds_fminmax_data_got[0]) == 0x00000000u,
+          "#2481: same-site pc275 DATA0 mutation selects v4 and lowers min X to zero");
+    std::vector<uint32_t> cfg_ds_fminmax_gds_mutation = cfg_ds_fminmax;
+    cfg_ds_fminmax_gds_mutation[275] = 0xd84a0000u; // pc275 LDS -> unsupported GDS
+    CHECK(recompile_valu(cfg_ds_fminmax_gds_mutation.data(),
+                         cfg_ds_fminmax_gds_mutation.size(), 0, 0).empty(),
+          "#2481: same-site pc275 GDS mutation remains fail-visible");
+
     // Plucky Squire's first-gameplay compute shaders use the non-returning DS_OR_B32 form. Seed an
     // LDS dword with 4, OR in 3 using the exact opcode-0x0a encoding, then read back 7.
     const uint32_t code32c_or[] = {
