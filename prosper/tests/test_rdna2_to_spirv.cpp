@@ -5036,8 +5036,8 @@ int main() {
         cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), 0, 0);
     CHECK(!cfg_ds_fminmax_spv.empty() &&
               count_spirv_opcode(cfg_ds_fminmax_spv, 230) == 2 &&
-              count_spirv_opcode(cfg_ds_fminmax_spv, 224) >= 2,
-          "#2481: captured pc275 float atomics lower through one synchronized dispatcher event");
+              count_spirv_opcode(cfg_ds_fminmax_spv, 224) == 4,
+          "#2481: captured pc275 event adds two barriers beyond dispatcher liveness");
     const std::vector<float> cfg_ds_fminmax_got = cfg_ds_fminmax_spv.empty()
         ? std::vector<float>{}
         : prosper::test::run_compute(cfg_ds_fminmax_spv, std::vector<float>(WG), WG, WG);
@@ -5048,16 +5048,28 @@ int main() {
     cfg_ds_fminmax_portable.wave_size = WG;
     ComputeShaderConfig cfg_ds_fminmax_native = cfg_ds_fminmax_portable;
     cfg_ds_fminmax_native.native_subgroup_size = WG;
-    CHECK(!recompile_compute(cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr,
-                             cfg_ds_fminmax_portable).empty() &&
-              !recompile_compute(cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr,
-                                 cfg_ds_fminmax_native).empty(),
-          "#2481: captured float-atomic CFG recompiles in portable and exact-native modes");
+    const std::vector<uint32_t> cfg_ds_fminmax_portable_spv = recompile_compute(
+        cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr, cfg_ds_fminmax_portable);
+    const std::vector<uint32_t> cfg_ds_fminmax_native_spv = recompile_compute(
+        cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr, cfg_ds_fminmax_native);
+    CHECK(!cfg_ds_fminmax_portable_spv.empty() &&
+              count_spirv_opcode(cfg_ds_fminmax_portable_spv, 230) == 2 &&
+              count_spirv_opcode(cfg_ds_fminmax_portable_spv, 224) == 4 &&
+              !cfg_ds_fminmax_native_spv.empty() &&
+              count_spirv_opcode(cfg_ds_fminmax_native_spv, 230) == 2 &&
+              count_spirv_opcode(cfg_ds_fminmax_native_spv, 224) == 4,
+          "#2481: portable and exact-native launches retain the synchronized atomic common phase");
     ComputeShaderConfig cfg_ds_fminmax_multiwave = cfg_ds_fminmax_portable;
     cfg_ds_fminmax_multiwave.local_x = WG * 2u;
     CHECK(recompile_compute(cfg_ds_fminmax.data(), cfg_ds_fminmax.size(), nullptr,
                             cfg_ds_fminmax_multiwave).empty(),
           "#2481: captured ordinary initializer stays fail-visible for multiple guest waves");
+    std::vector<uint32_t> cfg_ds_fminmax_store_reentry = cfg_ds_fminmax;
+    cfg_ds_fminmax_store_reentry[21] = 0xbefe04c1u; // restore full EXEC after initializer stores
+    cfg_ds_fminmax_store_reentry[22] = 0xbf82fff8u; // branch back to pc15, bypassing lane-zero mask
+    CHECK(recompile_valu(cfg_ds_fminmax_store_reentry.data(),
+                         cfg_ds_fminmax_store_reentry.size(), 0, 0).empty(),
+          "#2481: full-EXEC backward re-entry to pc15 cannot satisfy lane-zero store ownership");
 
     std::vector<uint32_t> cfg_ds_fminmax_data_mutation = cfg_ds_fminmax;
     cfg_ds_fminmax_data_mutation[276] = 0x00000404u; // pc275 DATA0 v2 -> v4 (zero)
