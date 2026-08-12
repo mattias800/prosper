@@ -273,6 +273,149 @@ bool dyntrace_failed_shader_enabled(uint64_t code_addr) {
     return errno == 0 && end != filter && *end == '\0' && parsed == code_addr;
 }
 
+// PROSPER_COMPUTE_MEMPROBE — read the SAME guest dwords twice for one dispatch: once when the
+// CPU-side const-fold resolves its descriptors, and once at command-ordered realization, just before
+// the dispatch executes. It answers one question and only that one:
+//
+//     did the bytes this dispatch's descriptor was derived from change in between?
+//
+// Same bytes at both points means fold-time staleness cannot explain a wrong descriptor, whatever
+// else might. Different bytes means it demonstrably can, for that dispatch, by observation rather
+// than by a ratio over runs. It therefore fails informatively in both directions, which a
+// success-rate comparison across routed runs does not: those runs reach different game state and
+// their rates are computed over different populations (#2516).
+//
+// The address is derived per dispatch rather than fixed, because the interesting slot is at a
+// constant offset from a POINTER the guest passes in. Format, all fields hex except the dword count:
+//
+//     PROSPER_COMPUTE_MEMPROBE=<code_addr>:<user_sgpr_index>:<byte_offset>:<dwords>
+//     e.g. 413ce6000:0:a8:4   -> (user_sgprs[0] | user_sgprs[1]<<32) + 0xa8, 4 dwords
+//
+// Read-only and opt-in; a malformed value disables the probe rather than probing something else.
+struct ComputeMemProbeSpec {
+    bool on = false;
+    uint64_t code_addr = 0;
+    uint32_t sgpr_index = 0;
+    uint64_t offset = 0;
+    uint32_t dwords = 0;
+};
+
+const ComputeMemProbeSpec& compute_memprobe_spec() {
+    static const ComputeMemProbeSpec spec = [] {
+        ComputeMemProbeSpec s;
+        const char* raw = std::getenv("PROSPER_COMPUTE_MEMPROBE");
+        if (!raw || !*raw) return s;
+        unsigned long long code = 0, off = 0;
+        unsigned idx = 0, n = 0;
+        if (std::sscanf(raw, "%llx:%u:%llx:%u", &code, &idx, &off, &n) != 4 || n == 0 || n > 64) {
+            std::fprintf(stderr, "[memprobe] malformed PROSPER_COMPUTE_MEMPROBE=\"%s\" "
+                                 "(want <code_addr>:<sgpr_index>:<byte_offset>:<dwords>) — probe disabled\n",
+                         raw);
+            return s;
+        }
+        s.on = true; s.code_addr = code; s.sgpr_index = idx; s.offset = off; s.dwords = n;
+        std::fprintf(stderr, "[memprobe] armed: program=0x%llx addr=(user_sgprs[%u..%u])+0x%llx dwords=%u\n",
+                     code, idx, idx + 1, off, n);
+        return s;
+    }();
+    return spec;
+}
+
+struct ComputeMemProbeSample {
+    uint64_t addr = 0;
+    std::vector<uint32_t> words;
+    bool readable = false;
+};
+
+// Keyed by dispatch identity, not by address: two dispatches of one program have different base
+// pointers, and pairing them by address would silently compare different structures.
+std::mutex g_memprobe_mu;
+std::map<uint64_t /*addr*/, ComputeMemProbeSample> g_memprobe_fold;
+
+bool compute_memprobe_read(const std::vector<uint32_t>& user_sgprs, ComputeMemProbeSample& out) {
+    const ComputeMemProbeSpec& spec = compute_memprobe_spec();
+    if (user_sgprs.size() <= spec.sgpr_index + 1) return false;
+    const uint64_t base = static_cast<uint64_t>(user_sgprs[spec.sgpr_index]) |
+                          (static_cast<uint64_t>(user_sgprs[spec.sgpr_index + 1]) << 32);
+    if (!base) return false;
+    out.addr = base + spec.offset;
+    const uint32_t bytes = spec.dwords * 4u;
+    out.readable = guest_readable(out.addr, bytes);
+    out.words.assign(spec.dwords, 0u);
+    if (out.readable)
+        std::memcpy(out.words.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(out.addr)), bytes);
+    return true;
+}
+
+std::string compute_memprobe_words(const ComputeMemProbeSample& s) {
+    if (!s.readable) return "<unreadable>";
+    std::string out;
+    char buf[16];
+    for (size_t i = 0; i < s.words.size(); ++i) {
+        std::snprintf(buf, sizeof buf, "%s%08x", i ? ":" : "", s.words[i]);
+        out += buf;
+    }
+    return out;
+}
+
+void compute_memprobe_flush(const char* whence);
+
+void compute_memprobe_at_fold(uint64_t code_addr, uint64_t dispatch_index,
+                              const std::vector<uint32_t>& user_sgprs) {
+    const ComputeMemProbeSpec& spec = compute_memprobe_spec();
+    if (!spec.on || code_addr != spec.code_addr) return;
+    compute_memprobe_flush("next-fold");
+    ComputeMemProbeSample s;
+    if (!compute_memprobe_read(user_sgprs, s)) {
+        // Fail visibly. A probe that records nothing looks identical to a probe whose subject never
+        // ran, and distinguishing those by absence of output is exactly the silent-instrument trap.
+        std::fprintf(stderr, "[memprobe] program=0x%llx dispatch=%llu SKIPPED "
+                             "(user_sgprs=%zu need>%u, base=%s)\n",
+                     (unsigned long long)code_addr, (unsigned long long)dispatch_index,
+                     user_sgprs.size(), compute_memprobe_spec().sgpr_index + 1,
+                     user_sgprs.size() > compute_memprobe_spec().sgpr_index + 1 ? "zero" : "n/a");
+        return;
+    }
+    std::fprintf(stderr, "[memprobe] program=0x%llx dispatch=%llu addr=0x%llx FOLD %s\n",
+                 (unsigned long long)code_addr, (unsigned long long)dispatch_index,
+                 (unsigned long long)s.addr, compute_memprobe_words(s).c_str());
+    std::lock_guard<std::mutex> lock(g_memprobe_mu);
+    g_memprobe_fold.emplace(s.addr, s);   // first fold of an address wins; later folds compare against it
+}
+
+// Re-read every recorded fold sample at its OWN address and report which changed.
+//
+// This is called at the ordered-execution boundary rather than from the dispatch path, and that is
+// the whole point: a dispatch whose descriptors failed to resolve is SKIPPED before execution, so a
+// re-read hung off the dispatch itself can only ever observe dispatches that succeeded -- exactly
+// the population the question is not about. Keying on the address recorded at fold time keeps the
+// comparison per dispatch while removing any need for the dispatch to run.
+void compute_memprobe_flush(const char* whence) {
+    const ComputeMemProbeSpec& spec = compute_memprobe_spec();
+    if (!spec.on) return;
+    std::map<uint64_t, ComputeMemProbeSample> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_memprobe_mu);
+        pending.swap(g_memprobe_fold);
+    }
+    const uint32_t bytes = spec.dwords * 4u;
+    for (const auto& [key, folded] : pending) {
+        (void)key;
+        ComputeMemProbeSample now;
+        now.addr = folded.addr;
+        now.readable = guest_readable(now.addr, bytes);
+        now.words.assign(spec.dwords, 0u);
+        if (now.readable)
+            std::memcpy(now.words.data(),
+                        reinterpret_cast<const void*>(static_cast<uintptr_t>(now.addr)), bytes);
+        const bool changed = folded.readable != now.readable || folded.words != now.words;
+        std::fprintf(stderr, "[memprobe] program=0x%llx addr=0x%llx %s at=%s fold=%s later=%s\n",
+                     (unsigned long long)compute_memprobe_spec().code_addr,
+                     (unsigned long long)now.addr, changed ? "CHANGED" : "SAME", whence,
+                     compute_memprobe_words(folded).c_str(), compute_memprobe_words(now).c_str());
+    }
+}
+
 namespace {
 
 struct ShaderResourceCompileKey {
@@ -6747,6 +6890,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
         assign_convention_bindings(*table, 2);
 
         ComputeItem item;
+        // Fold-time half of the paired read: the descriptors this dispatch will use were just
+        // resolved from guest memory, so sample that memory NOW, before anything else runs.
+        compute_memprobe_at_fold(code_addr, dispatch_index, config.user_sgprs);
         item.spirv = recompile_compute_shader_cached(
             (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config, nullptr,
             recompile_diagnostic);
@@ -8695,7 +8841,12 @@ std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
     return frame.storage ? *frame.storage : std::vector<uint8_t>{};
 }
 bool execute_compute_items(const std::vector<ComputeItem>& items) {
-    return g_compute && !items.empty() && g_compute(items);
+    // Realization-time half of the paired read, taken at command-ordered execution rather than at
+    // fold. Deliberately before the dispatch runs, so the comparison isolates what happened BETWEEN
+    // resolution and execution and not what this dispatch itself wrote.
+    const bool ok = g_compute && !items.empty() && g_compute(items);
+    compute_memprobe_flush("post-compute-submit");
+    return ok;
 }
 
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
