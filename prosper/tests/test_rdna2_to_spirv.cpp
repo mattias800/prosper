@@ -2036,6 +2036,49 @@ int main() {
               "same-site AND mutation distinguishes EXEC_HI scalar-zero semantics");
     }
 
+    // GTA V pc118 selects exactly lane zero with an inline one-word EXEC mask. Inline dwords are
+    // bitsets in Wave32, so mutating the same packet to 2 must instead select lane one. Restore EXEC
+    // before the irreducible suffix; the resource-backed stores make both behaviors observable on
+    // the portable dispatcher regardless of the host's native subgroup width.
+    std::vector<uint32_t> code17d1_exec_inline = {
+        0xbefe0381u,              // exact pc118: s_mov_b32 exec_lo,1
+        0x7e0202aau,              // v_mov_b32 v1,42 (predicated by the selected EXEC bit)
+        0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
+        0xbefe03c1u,              // s_mov_b32 exec_lo,-1
+    };
+    code17d1_exec_inline.insert(
+        code17d1_exec_inline.end(), std::begin(code17d), std::end(code17d));
+    const auto portable_spv17d1_exec_inline = recompile_compute(
+        code17d1_exec_inline.data(), code17d1_exec_inline.size(),
+        &rt17d1, portable_cfg17d1);
+    std::vector<uint32_t> code17d1_exec_inline2 = code17d1_exec_inline;
+    code17d1_exec_inline2[0] = 0xbefe0382u; // same-site s_mov_b32 exec_lo,2
+    const auto portable_spv17d1_exec_inline2 = recompile_compute(
+        code17d1_exec_inline2.data(), code17d1_exec_inline2.size(),
+        &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1_exec_inline.empty() &&
+              !portable_spv17d1_exec_inline2.empty(),
+          "Wave32 inline EXEC masks and their exact-site mutation recompile");
+    std::vector<uint32_t> got17d1_exec_inline, got17d1_exec_inline2;
+    if (!portable_spv17d1_exec_inline.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_inline, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_inline);
+    if (!portable_spv17d1_exec_inline2.empty())
+        prosper::test::run_compute(
+            portable_spv17d1_exec_inline2, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0xdeadbeefu), &got17d1_exec_inline2);
+    std::vector<uint32_t> expected17d1_exec_inline(64, 0xdeadbeefu);
+    std::vector<uint32_t> expected17d1_exec_inline2(64, 0xdeadbeefu);
+    expected17d1_exec_inline[0] = 42u;
+    expected17d1_exec_inline[32] = 42u;
+    expected17d1_exec_inline2[1] = 42u;
+    expected17d1_exec_inline2[33] = 42u;
+    CHECK(got17d1_exec_inline == expected17d1_exec_inline,
+          "pc118 inline mask 1 activates only lane zero of each Wave32 wave");
+    CHECK(got17d1_exec_inline2 == expected17d1_exec_inline2,
+          "same-site inline mask 2 activates only lane one of each Wave32 wave");
+
     // Kernel 17d1i: GTA V's newly exposed pc115 packet gathers DATA0 backward through a byte
     // address. Keep its exact v30/v6/v9 encoding and the irreducible dispatcher tail. Offset +4 is
     // a same-site mutation selecting the following source lane, including wrap at each 32-lane half.
