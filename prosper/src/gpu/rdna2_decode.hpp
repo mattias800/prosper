@@ -30,8 +30,23 @@ enum class Rdna2Format : uint8_t {
 // GFX10.3 scalar ALU opcodes shared by emission and source-lifetime analysis.
 inline constexpr uint32_t kSop1OpcodeMovB64 = 0x04;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
+inline constexpr uint32_t kSop2OpcodeAndB32 = 0x0e;
+inline constexpr uint32_t kSop2OpcodeOrB32 = 0x10;
+inline constexpr uint32_t kSop2OpcodeXorB32 = 0x12;
+inline constexpr uint32_t kSop2OpcodeAndn2B32 = 0x14;
+inline constexpr uint32_t kSop2OpcodeOrn2B32 = 0x16;
+inline constexpr uint32_t kSop2OpcodeNandB32 = 0x18;
+inline constexpr uint32_t kSop2OpcodeNorB32 = 0x1a;
+inline constexpr uint32_t kSop2OpcodeXnorB32 = 0x1c;
 inline constexpr uint32_t kSopkOpcodeMovkI32 = 0x00;
 inline constexpr uint32_t kSopkOpcodeWaitcntVscnt = 0x17;
+
+inline constexpr bool sop2_is_b32_logical(uint32_t opcode) {
+    return opcode == kSop2OpcodeAndB32 || opcode == kSop2OpcodeOrB32 ||
+           opcode == kSop2OpcodeXorB32 || opcode == kSop2OpcodeAndn2B32 ||
+           opcode == kSop2OpcodeOrn2B32 || opcode == kSop2OpcodeNandB32 ||
+           opcode == kSop2OpcodeNorB32 || opcode == kSop2OpcodeXnorB32;
+}
 
 // GFX10.3 VOP1 opcodes used outside the decoder itself. Naming cross-component opcodes at this
 // boundary keeps dispatcher admission and ALU emission on one compile-time constant.

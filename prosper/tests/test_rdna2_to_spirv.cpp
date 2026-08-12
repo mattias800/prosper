@@ -1895,13 +1895,15 @@ int main() {
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
 
-    // Kernel 17d1h: GTA V's Wave32 terrain kernel uses VCC_HI as ordinary scalar scratch. The
-    // exact pc57 packet materializes EXEC_LO, masks it into VCC_HI, and later reads that dword at
-    // pc67. VCC_LO remains the architectural mask: pc59 narrows it, and pc68 reads its complete
-    // dword through the same exact Wave32 ballot. Append the irreducible dispatcher tail so this
-    // exercises the same emit_alu call site as the live shader rather than only straight-line code.
+    // Kernel 17d1h: GTA V's Wave32 terrain kernel first writes a one-dword mask to s20 with the
+    // exact pc44 VOPC SDWA packet, then uses VCC_HI as ordinary scalar scratch. The pc57 packet
+    // materializes EXEC_LO into VCC_HI; pc67 reads BOTH s20's ballot dword and that scalar scratch.
+    // VCC_LO remains the architectural mask: pc59 narrows it, and pc68 reads its complete dword
+    // through the same exact Wave32 ballot. Append the irreducible dispatcher tail so this exercises
+    // the same emit_alu call site as the live shader rather than only straight-line code.
     std::vector<uint32_t> code17d1h = {
-        0xbe9403c1u,              // s_mov_b32 s20,-1
+        0x7e160280u,              // v_mov_b32 v11,0: make the exact pc44 compare true
+        0x7d8416f9u, 0x06869480u, // pc44: v_cmp_eq_u32_sdwa s20,0,v11
         0x7d840100u,              // v_cmp_eq_u32 vcc,v0,v0
         0x876bff7eu, 0x0fffffffu, // pc57: s_and_b32 vcc_hi,exec_lo,0x0fffffff
         0xbf068000u,              // synthetic scalar condition keeps the exact lifetime at a join
@@ -1917,19 +1919,35 @@ int main() {
     code17d1h.insert(code17d1h.end(), std::begin(code17d), std::end(code17d));
     const std::vector<uint32_t> native_spv17d1h = recompile_compute(
         code17d1h.data(), code17d1h.size(), &rt17d1, native_cfg17d1);
-    CHECK(!native_spv17d1h.empty() && count_spirv_opcode(native_spv17d1h, 339) == 2,
-          "GTA Wave32 VCC_HI scratch materializes exact EXEC/VCC ballots");
+    CHECK(!native_spv17d1h.empty() && count_spirv_opcode(native_spv17d1h, 339) == 3,
+          "GTA Wave32 s20/VCC_HI scratch materializes exact mask dwords");
     CHECK(recompile_compute(code17d1h.data(), code17d1h.size(), &rt17d1,
                             portable_cfg17d1).empty(),
           "Wave32 VCC_HI scratch rejects without an exact subgroup ballot");
     const bool can_execute17d1h = can_execute17d1 &&
         (subgroup17d1.operations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    // Same pc67 site, one opcode bit changed: OR still consumes the exact saved-mask ballot but
+    // produces a distinct scalar result. This mutation catches a test that accidentally probes
+    // only the setup/helper instead of the instruction whose operand admission changed.
+    std::vector<uint32_t> code17d1h_pc67_or = code17d1h;
+    code17d1h_pc67_or[11] = 0x881a6b14u; // s_or_b32 s26,s20,vcc_hi
+    const auto native_spv17d1h_pc67_or = recompile_compute(
+        code17d1h_pc67_or.data(), code17d1h_pc67_or.size(), &rt17d1, native_cfg17d1);
+    CHECK(!native_spv17d1h_pc67_or.empty() &&
+              count_spirv_opcode(native_spv17d1h_pc67_or, 339) == 3,
+          "same-site pc67 OR mutation consumes the independently materialized s20 dword");
     if (can_execute17d1h) {
         std::vector<uint32_t> got17d1h;
         prosper::test::run_compute(native_spv17d1h, std::vector<float>(64, 0.0f),
                                    64, 64, {}, std::vector<uint32_t>(64, 0u), &got17d1h);
         CHECK(got17d1h == std::vector<uint32_t>(64, 0x8fffffffu),
-              "VCC_HI scalar scratch and VCC_LO mask dwords remain independently exact");
+              "saved s20, VCC_HI scalar scratch, and VCC_LO remain independently exact");
+        std::vector<uint32_t> got17d1h_pc67_or;
+        prosper::test::run_compute(native_spv17d1h_pc67_or, std::vector<float>(64, 0.0f),
+                                   64, 64, {}, std::vector<uint32_t>(64, 0u),
+                                   &got17d1h_pc67_or);
+        CHECK(got17d1h_pc67_or == std::vector<uint32_t>(64, 0x7fffffffu),
+              "same-site pc67 OR mutation produces its distinct scalar result");
     }
     if (can_execute17d1) {
         std::vector<uint32_t> initial17d1(64, 0u), got17d1;
