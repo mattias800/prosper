@@ -738,6 +738,88 @@ int main() {
     CHECK(padded_lanes_untouched,
           "partial workgroup suppresses all 62 padded invocations without a guest bounds check");
 
+    // GTA V's culling programs scan the physical high and low dwords of a saved Wave64 predicate.
+    // Their live route cannot require a matching Vulkan subgroup width, so execute the exact FFBH
+    // packets through the portable arbitrary-CFG dispatcher. The two masks prove both paths: lanes
+    // 0..16 force the zero high dword and return 15 from the low dword; lane 63 returns zero directly
+    // from the high dword. Crossing scalar branches keep this on the same dispatcher path as GTA.
+    {
+        std::array<uint32_t, 13> portable_mask_ffbh_code = {
+            0x7d8800f9u, 0x06868891u,            // pc0: s[8:9] = ballot(17 > local_id.x)
+            0xbf060000u,                         // pc2: establish SCC
+            0xbf840003u,                         // pc3: s_cbranch_scc0 -> pc7
+            0x7e147209u,                         // pc4: exact v_ffbh_u32 v10,s9
+            0x7d8a14c1u,                         // pc5: high result != -1
+            0xbf860002u,                         // pc6: s_cbranch_vccz -> pc9
+            0xbf060000u,                         // pc7: independent SCC lifetime
+            0xbf850001u,                         // pc8: s_cbranch_scc1 -> pc10
+            0x7e147208u,                         // pc9: exact v_ffbh_u32 v10,s8
+            0xe0702000u, 0x80000a00u,            // pc10: buffer_store_dword v10,v0,s[0:3],idxen
+            0xbf810000u,                         // pc12: s_endpgm
+        };
+        std::vector<uint32_t> mask_ffbh_result(64, 0xccccccccu);
+        ShaderResourceTable mask_ffbh_rt;
+        ShaderResource mask_ffbh_buffer;
+        mask_ffbh_buffer.cls = ResourceClass::ConstantBuffer;
+        mask_ffbh_buffer.format = DataFormat::Uint32;
+        mask_ffbh_buffer.num_components = 1;
+        mask_ffbh_buffer.binding = 2;
+        mask_ffbh_buffer.gpu_addr =
+            reinterpret_cast<uint64_t>(mask_ffbh_result.data());
+        mask_ffbh_buffer.size = mask_ffbh_result.size() * sizeof(uint32_t);
+        mask_ffbh_buffer.stride = sizeof(uint32_t);
+        mask_ffbh_buffer.sgpr_base = 0;
+        mask_ffbh_rt.resources.push_back(mask_ffbh_buffer);
+
+        ComputeShaderConfig mask_ffbh_config;
+        mask_ffbh_config.user_sgprs.resize(4);
+        mask_ffbh_config.local_x = 64;
+        mask_ffbh_config.wave_size = 64;
+        mask_ffbh_config.tidig_comp_cnt = 0;
+        mask_ffbh_config.native_subgroup_size = 0;
+
+        auto run_mask_ffbh = [&](uint32_t producer0, uint32_t producer1,
+                                 uint32_t expected, uint64_t code_addr) {
+            portable_mask_ffbh_code[0] = producer0;
+            portable_mask_ffbh_code[1] = producer1;
+            std::fill(mask_ffbh_result.begin(), mask_ffbh_result.end(), 0xccccccccu);
+            const std::vector<uint32_t> module = recompile_compute(
+                portable_mask_ffbh_code.data(), portable_mask_ffbh_code.size(),
+                &mask_ffbh_rt, mask_ffbh_config);
+            CHECK(!module.empty(),
+                  "portable Wave64 saved-mask FFBH execution fixture recompiles");
+            if (module.empty()) return false;
+
+            ComputeItem mask_ffbh_item;
+            mask_ffbh_item.spirv = module;
+            mask_ffbh_item.user_sgprs = mask_ffbh_config.user_sgprs;
+            mask_ffbh_item.resources =
+                std::make_shared<ShaderResourceTable>(mask_ffbh_rt);
+            mask_ffbh_item.launch.threads_x = 64;
+            mask_ffbh_item.launch.threads_y = mask_ffbh_item.launch.threads_z = 1;
+            mask_ffbh_item.launch.local_x = 64;
+            mask_ffbh_item.launch.local_y = mask_ffbh_item.launch.local_z = 1;
+            mask_ffbh_item.launch.groups_x = mask_ffbh_item.launch.groups_y =
+                mask_ffbh_item.launch.groups_z = 1;
+            mask_ffbh_item.code_addr = code_addr;
+            mask_ffbh_item.recompile_config = mask_ffbh_config;
+            mask_ffbh_item.recompile_config_available = true;
+            const bool executed =
+                prosper::frontend::execute_live_compute_items({mask_ffbh_item});
+            CHECK(executed, "portable Wave64 saved-mask FFBH executes on Vulkan");
+            return executed && std::all_of(
+                mask_ffbh_result.begin(), mask_ffbh_result.end(),
+                [&](uint32_t value) { return value == expected; });
+        };
+
+        CHECK(run_mask_ffbh(
+                  0x7d8800f9u, 0x06868891u, 15u, 0x413e15400ull),
+              "portable Wave64 FFBH assembles and scans the saved low mask dword");
+        CHECK(run_mask_ffbh(
+                  0x7d8400f9u, 0x068688bfu, 0u, 0x413e16400ull),
+              "portable Wave64 FFBH assembles and scans the saved high mask dword");
+    }
+
     std::fill(result.begin(), result.end(), 0xddddddddu);
     ComputeItem cpu_fill_item = item;
     cpu_fill_item.cpu_fast_path = ComputeCpuFastPath::FillSgprUvec4;

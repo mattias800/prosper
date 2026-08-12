@@ -2545,6 +2545,55 @@ int main() {
         return 1;
     }
 
+    // GTA V's live culling programs 0x413e15400/0x413e16400 do not feed FFBH from a VGPR. They
+    // produce a Wave64 predicate in s[8:9], then scan its exact high/low physical dwords with these
+    // captured packets. Cover both runtime routes: the portable dispatcher must assemble each
+    // dword through its uniform workgroup-scratch phase, while an exact native Wave64 dispatcher
+    // may materialize it directly with a subgroup ballot. Crossing branches preserve the captured
+    // packet words and saved-mask lifetime.
+    const uint32_t gta_portable_mask_ffbh_cfg[] = {
+        0x7d0626f9u, 0x06868880u,            // pc0: VOPC SDWA writes saved mask s[8:9]
+        0xbf060000u,                         // pc2: establish SCC
+        0xbf840003u,                         // pc3: s_cbranch_scc0 -> pc7
+        0x7e147209u,                         // pc4: exact v_ffbh_u32 v10,s9 (high half)
+        0x7d8a14c1u,                         // pc5: compare the high-half result with -1
+        0xbf860002u,                         // pc6: s_cbranch_vccz -> pc9 (crossing)
+        0xbf060000u,                         // pc7: independent SCC lifetime
+        0xbf850001u,                         // pc8: s_cbranch_scc1 -> pc10
+        0x7e147208u,                         // pc9: exact v_ffbh_u32 v10,s8 (low half)
+        0xbf810000u,                         // pc10: s_endpgm
+    };
+    const auto gta_portable_mask_ffbh_spv = recompile_compute(
+        gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
+        portable_wave64_compute_config);
+    if (gta_portable_mask_ffbh_spv.empty() ||
+        !has_opcode(gta_portable_mask_ffbh_spv, 251) || // arbitrary CFG dispatcher
+        !has_opcode(gta_portable_mask_ffbh_spv, 224) || // synchronized scratch phase
+        !has_glsl_ext_inst(gta_portable_mask_ffbh_spv, 75) || // shared FFBH semantics
+        has_opcode(gta_portable_mask_ffbh_spv, 339) || // no exact-width subgroup ballot
+        !type_result_ids_are_nonzero(gta_portable_mask_ffbh_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_portable_mask_ffbh_spv)) {
+        printf("  [FAIL] GTA portable saved-mask FFBH did not assemble both physical halves\n");
+        return 1;
+    }
+    printf("  [ok]   GTA portable saved-mask FFBH uses a synchronized dword phase\n");
+
+    ComputeShaderConfig native_wave64_mask_ffbh_config = portable_wave64_compute_config;
+    native_wave64_mask_ffbh_config.native_subgroup_size = 64;
+    const auto gta_native_mask_ffbh_spv = recompile_compute(
+        gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
+        native_wave64_mask_ffbh_config);
+    if (gta_native_mask_ffbh_spv.empty() ||
+        !has_opcode(gta_native_mask_ffbh_spv, 251) || // arbitrary CFG dispatcher
+        !has_opcode(gta_native_mask_ffbh_spv, 339) || // exact saved-mask dword ballot
+        !has_glsl_ext_inst(gta_native_mask_ffbh_spv, 75) ||
+        !type_result_ids_are_nonzero(gta_native_mask_ffbh_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_native_mask_ffbh_spv)) {
+        printf("  [FAIL] GTA native Wave64 saved-mask FFBH did not materialize its dword\n");
+        return 1;
+    }
+    printf("  [ok]   GTA native Wave64 saved-mask FFBH uses an exact ballot dword\n");
+
     // SDWA source NEG is deliberately outside this plain-e32 admission. Without the gate the
     // generic VOP1 prologue would negate in the f32 domain before the integer FFBH operation.
     const uint32_t ffbh_sdwa_neg[] = {

@@ -1416,22 +1416,29 @@ int main() {
 
     // A definite mask lifetime (as opposed to an ambiguous join) must survive the dispatcher's
     // Function-variable round trip without its synthetic scalar-zero placeholders shadowing the
-    // Bool value. Scalar use of that mask remains fail-visible; changing the exact producer to an
-    // inline constant gives both physical words a real scalar lifetime and makes the same use valid.
+    // Bool value. Exact native Wave64 can materialize either physical word from that Bool through a
+    // ballot; the portable route must still reject this generic scalar use. Changing the producer
+    // to an inline constant gives both words an ordinary scalar lifetime on either route.
     std::vector<uint32_t> compute_cfg_dispatch_mask_only_scalar_reload = {
         0xBE900A7Eu,                         // pc0: mask-only s_wqm_b64 s[16:17],exec
         0xBF068008u,                         // pc1: fresh SCC condition
         0xBF840001u,                         // pc2: conditional dispatcher edge to consumer
         0xBF800000u,                         // pc3: fallthrough arm rejoins consumer
-        0x7E040210u,                         // pc4: invalid scalar read v2=s16 after reload
+        0x7E040210u,                         // pc4: physical low-dword read v2=s16 after reload
     };
     compute_cfg_dispatch_mask_only_scalar_reload.insert(
         compute_cfg_dispatch_mask_only_scalar_reload.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    CHECK(!recompile_compute(compute_cfg_dispatch_mask_only_scalar_reload.data(),
+                             compute_cfg_dispatch_mask_only_scalar_reload.size(), &dispatch_rt,
+                             wave64_dispatch_config).empty(),
+          "exact native Wave64 materializes a reloaded saved-mask physical dword");
+    ComputeShaderConfig portable_mask_scalar_read_config = wave64_dispatch_config;
+    portable_mask_scalar_read_config.native_subgroup_size = 0;
     CHECK(recompile_compute(compute_cfg_dispatch_mask_only_scalar_reload.data(),
                             compute_cfg_dispatch_mask_only_scalar_reload.size(), &dispatch_rt,
-                            wave64_dispatch_config).empty(),
-          "a reloaded mask-only pair cannot be read through scalar placeholder variables");
+                            portable_mask_scalar_read_config).empty(),
+          "portable Wave64 rejects a generic saved-mask scalar read without a synchronized phase");
     std::vector<uint32_t> compute_cfg_dispatch_dual_scalar_reload =
         compute_cfg_dispatch_mask_only_scalar_reload;
     compute_cfg_dispatch_dual_scalar_reload[0] =

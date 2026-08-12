@@ -27,6 +27,10 @@ enum class Rdna2Format : uint8_t {
     Unknown,
 };
 
+// GFX10.3 VOP1 opcodes used outside the decoder itself. Naming cross-component opcodes at this
+// boundary keeps dispatcher admission and ALU emission on one compile-time constant.
+inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
+
 // GFX10.3 MUBUF atomic opcodes (ISA Table 99). Keep these names at the decode boundary so resource
 // discovery and SPIR-V emission do not maintain separate, opaque hexadecimal inventories. These are
 // compile-time constants: using them in comparisons and switch labels adds no runtime indirection.
