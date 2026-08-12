@@ -125,10 +125,11 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             return 1;
         case Rdna2Format::VOP3:
             if (in.opcode == 0x360u) return 0; // v_readlane_b32 writes an SGPR.
-            // v_div_scale_f64, the two integer MAD64 forms, and the 64-bit reversed left shift
-            // write a consecutive VGPR pair.
+            // v_div_scale_f64, the two integer MAD64 forms, and the 64-bit reversed shifts write a
+            // consecutive VGPR pair.
             return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ||
-                   in.opcode == 0x2ffu ? 2u : 1u;
+                   in.opcode == kVop3OpcodeLshlrevB64 ||
+                   in.opcode == kVop3OpcodeLshrrevB64 ? 2u : 1u;
         case Rdna2Format::DS:
             // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
             // encodings in that subset are stores or no-return atomics whose VDST field is a source.
@@ -174,6 +175,18 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
         default:
             return 0;
     }
+}
+
+uint32_t rdna2_vgpr_source_span(const Rdna2Inst& in, uint32_t source_index) {
+    if (source_index >= in.n_src || in.src[source_index].kind != OperandKind::VGPR)
+        return 0;
+    if (in.fmt == Rdna2Format::VOP3 &&
+        in.opcode == kVop3OpcodeLshrrevB64 && source_index == 1)
+        return 2;
+    // Dispatcher discovery historically treats every admitted DS source as a conservative four
+    // dword range because read/write2 and 64/96/128-bit packets encode only the base register.
+    if (in.fmt == Rdna2Format::DS) return 4;
+    return 1;
 }
 
 int rdna2_tfe_status_vgpr(const Rdna2Inst& in) {
@@ -636,12 +649,13 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
-            // V_MAC_F32, V_LSHLREV_B64, V_LDEXP_F32, and V_BFM_B32 are two-source VOP3A
-            // instructions. Their reserved SRC2 bits are zero in GTA V's exact packets and
+            // V_MAC_F32, V_LSHLREV_B64, V_LSHRREV_B64, V_LDEXP_F32, and V_BFM_B32 are
+            // two-source VOP3A instructions. Their reserved SRC2 bits are zero in GTA V's packets and
             // therefore decode as s0 unless cleared here.
             // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
             // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (i.opcode == 0x11fu || i.opcode == 0x2ffu ||
+            if (i.opcode == 0x11fu || i.opcode == kVop3OpcodeLshlrevB64 ||
+                i.opcode == kVop3OpcodeLshrrevB64 ||
                 i.opcode == 0x362u || i.opcode == 0x363u) {
                 i.src[2] = {};
                 i.n_src = 2;
