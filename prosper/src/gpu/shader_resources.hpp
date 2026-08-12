@@ -516,6 +516,49 @@ inline bool is_proven_null_guarded_raw_store(const ShaderResource& resource) {
            resource.host_data_size == 0u;
 }
 
+// GTA V's workgroup-list kernels read an optional output/work pointer from the mapped dispatch table
+// at s0:s1+0x20, then build a launch-sized V# with 1024-byte stride. A zero pointer is an application
+// convention, not NUM_RECORDS=0, so preserve a distinct exact-PC marker and retain the complete
+// 40-byte source-table witness for capture/replay revalidation. UINT32_MAX-1 lies outside the V#'s
+// 14-bit stride domain and cannot alias the guarded-store marker above.
+inline constexpr uint32_t kGtaNullableOutputPointerOffset = 0x20u;
+inline constexpr uint32_t kGtaNullableOutputWitnessBytes = 0x28u;
+inline constexpr uint32_t kGtaNullableOutputStride = 1024u;
+inline constexpr uint32_t kGtaNullableOutputStrideWord =
+    kGtaNullableOutputStride << 16u;
+// The first retained route used 57 groups; later gameplay uses the same exact kernels with 63.
+// Keep 57 as the fixture count, but production validation relates the live descriptor count to
+// entry s7 and the dispatch grid instead of treating one observed launch as program identity.
+inline constexpr uint32_t kGtaNullableOutputFixtureRecordCount = 57u;
+inline constexpr uint32_t kGtaNullableOutputMaxRecordCount =
+    0x10000000u / kGtaNullableOutputStride;
+inline constexpr uint32_t kGtaNullableOutputConfigWord = 0x00016204u;
+inline constexpr uint32_t kGtaNullableOutputLocalSize = 256u;
+inline constexpr uint32_t kGtaNullableOutputFixtureThreads =
+    kGtaNullableOutputFixtureRecordCount * kGtaNullableOutputLocalSize;
+inline constexpr uint32_t kGtaNullableOutputUserSgpr8 = 0x08000200u;
+// The process kernel extracts bits 30:28 as a three-bit work selector at pc2. Routed gameplay
+// exercised all eight selector values with every other entry-s8 bit unchanged.
+inline constexpr uint32_t kGtaNullableOutputProcessSelectorMask = 0x70000000u;
+inline constexpr uint32_t kProvenNullNullableRawBufferStride = UINT32_MAX - 1u;
+
+inline bool is_nullable_raw_buffer_marker_candidate(const ShaderResource& resource) {
+    return resource.stride == kProvenNullNullableRawBufferStride;
+}
+
+inline bool is_proven_null_nullable_raw_buffer(const ShaderResource& resource) {
+    const bool valid_host_witness = resource.host_data
+        ? resource.host_data_size >= kGtaNullableOutputWitnessBytes
+        : resource.host_data_size == 0u;
+    return resource.cls == ResourceClass::ConstantBuffer &&
+           resource.format == DataFormat::Unknown && resource.num_components == 0u &&
+           resource.gpu_addr > 0x10000u &&
+           resource.size == kGtaNullableOutputWitnessBytes &&
+           is_nullable_raw_buffer_marker_candidate(resource) &&
+           resource.srt_offset == 0xFFFFFFFFu && resource.sgpr_base == 0xFFFFFFFFu &&
+           resource.fetch_pc != 0xFFFFFFFFu && valid_host_witness;
+}
+
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
 // recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
 struct ShaderResourceTable {

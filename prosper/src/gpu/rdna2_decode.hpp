@@ -386,22 +386,6 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
 // materialized, uncompressed mip.
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
-// Exact raw-store consumers in GTA V 0x413cf9a00's null-output region. This is packet identity only;
-// callers must independently prove the pc42..48 EXEC guard and the dispatch's null pointer.
-bool rdna2_gta5_null_guarded_raw_store_site(const Rdna2Inst& in);
-
-// Complete byte and direct-CFG identity for GTA V 0x413cf9a00's pc42..80 nullable-output guard.
-// This proves only the static program shape; callers must independently prove that entry user SGPRs
-// s2:s3 are zero for the dispatch before treating the exact pc74/76/78 stores as no-ops.
-bool rdna2_gta5_null_guarded_raw_store_shader(const uint32_t* code, size_t dwords);
-
-// Complete dispatch proof for the same conditional stores. In addition to the static shader shape,
-// entry s2:s3 must be null and no decoded scalar destination may overlap either word before pc42.
-// This is the transferable trust-boundary check used by cached compilation and capture replay.
-bool rdna2_gta5_null_guarded_raw_store_dispatch(
-    const uint32_t* code, size_t dwords,
-    const uint32_t* user_sgprs, size_t user_sgpr_count);
-
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers
 // use this to size pointer-backed user-data tables from the shader's actual accesses.

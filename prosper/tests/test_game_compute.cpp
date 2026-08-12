@@ -1,4 +1,5 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/rdna2_gta5_compute_contracts.hpp"
 #include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/gpu_execute.hpp"
@@ -705,6 +706,30 @@ int main() {
               forged_guarded_store_item.resources->resources.front()) &&
               !prosper::frontend::execute_live_compute_items({forged_guarded_store_item}),
           "a forged guarded-null-store marker has no live-backend proof token");
+
+    std::array<uint8_t, kGtaNullableOutputWitnessBytes> nullable_output_witness{};
+    ShaderResource nullable_output_resource = zero_record_rt.resources[0];
+    nullable_output_resource.gpu_addr = 0x720000u;
+    nullable_output_resource.size = kGtaNullableOutputWitnessBytes;
+    nullable_output_resource.stride = kProvenNullNullableRawBufferStride;
+    nullable_output_resource.fetch_pc = 38u;
+    nullable_output_resource.host_data = nullable_output_witness.data();
+    nullable_output_resource.host_data_size = nullable_output_witness.size();
+    ComputeItem nullable_output_item = zero_record_item;
+    nullable_output_item.resources = std::make_shared<ShaderResourceTable>();
+    nullable_output_item.resources->resources.push_back(nullable_output_resource);
+    CHECK(is_proven_null_nullable_raw_buffer(nullable_output_resource) &&
+              !prosper::frontend::execute_live_compute_items({nullable_output_item}),
+          "a nullable-output marker has no live-backend authority without its separate token");
+    nullable_output_item.nullable_output_raw_buffer_validated = true;
+    CHECK(prosper::frontend::execute_live_compute_items({nullable_output_item}),
+          "a validated nullable-output marker completes as a descriptorless live-backend no-op");
+    ComputeItem malformed_nullable_output_item = nullable_output_item;
+    malformed_nullable_output_item.resources =
+        std::make_shared<ShaderResourceTable>(*nullable_output_item.resources);
+    malformed_nullable_output_item.resources->resources[0].fetch_pc = UINT32_MAX;
+    CHECK(!prosper::frontend::execute_live_compute_items({malformed_nullable_output_item}),
+          "the nullable-output token cannot authorize a malformed impossible-stride marker");
 
     std::array<uint32_t, 81> guarded_store_code;
     guarded_store_code.fill(0xbf800000u); // s_nop 0

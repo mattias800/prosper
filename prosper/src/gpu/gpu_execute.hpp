@@ -228,6 +228,10 @@ struct SrtUse {
     // NUM_RECORDS=0: the descriptor has one valid record and must remain a real buffer when the
     // dispatch supplies a non-null output pointer.
     bool proven_null_guarded_raw_store = false;
+    // GTA V's exact +0x20 nullable output/work buffer convention. The fold sets this only after
+    // recovering the mapped zero qword and the full production descriptor at an admitted site;
+    // materialization separately validates the exact shader and launch before retaining a witness.
+    bool proven_null_nullable_raw_buffer = false;
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
     // Minimum byte span needed by this scalar-buffer consumer, measured from V#.Base. Some PS5
@@ -277,12 +281,23 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
 // buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
 // final resource identities instead of manually rebuilding a lookalike table. Returned SrtUses also
 // contain image uses, which the production caller materializes with image-specific view handling.
+struct ComputeResourceDispatchContext {
+    uint32_t local_x = 0, local_y = 0, local_z = 0;
+    uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
+    bool exact_thread_extent = false;
+    uint32_t wave_size = 64;
+    bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
+    uint32_t tidig_comp_cnt = 0;
+};
+
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  const uint32_t* code, size_t dwords,
                                                  const uint32_t* user_sgprs, uint32_t nsgpr,
                                                  uint32_t linear_local_x = 0,
                                                  uint32_t linear_threads_x = 0,
-                                                 uint32_t tgid_x_sgpr = UINT32_MAX);
+                                                 uint32_t tgid_x_sgpr = UINT32_MAX,
+                                                 const ComputeResourceDispatchContext*
+                                                     dispatch_context = nullptr);
 
 // Apply the exact dispatch-scoped resource-path specialization used by the live compute executor.
 // The report makes the production decision observable to tests and diagnostics: callers can verify
@@ -415,6 +430,9 @@ struct ComputeItem {
     // Internal, non-serialized token: the final compiler/capture materializer re-established the
     // complete raw-shader, pc42 scalar-dataflow, and null-dispatch proof for conditional no-op stores.
     bool null_guarded_raw_store_validated = false;
+    // Separate authority token for the +0x20 nullable raw-buffer family. It cannot authorize the
+    // guarded-store marker above: the two conventions have different witnesses and load semantics.
+    bool nullable_output_raw_buffer_validated = false;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };

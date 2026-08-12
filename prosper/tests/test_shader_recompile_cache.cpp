@@ -15,6 +15,7 @@
 #else
 #include <unistd.h>
 #endif
+#include "gta5_nullable_output_fixture.hpp"
 #include "test_scratch.h"
 
 using namespace prosper::gpu;
@@ -1229,6 +1230,92 @@ int main() {
               repeated_guarded_null_store == cached_guarded_null_store &&
               stats.misses == 2u && stats.hits == 1u && stats.entries == 2u,
           "compute cache separates guarded-null store elision from ordinary writable buffers");
+
+    // GTA V's exact workgroup-store kernel retains the mapped dispatch-table bytes that proved its
+    // optional +0x20 output pointer null. That witness is dispatch state rather than compile-key
+    // state, so it must be revalidated before a warm lookup can reuse the store-eliding module.
+    clear_shader_recompile_cache();
+    alignas(16) std::array<uint32_t, kGtaNullableOutputWitnessBytes / sizeof(uint32_t)>
+        nullable_output_witness{};
+    std::array<uint32_t, 64u * 4u> nullable_input_a{};
+    std::array<uint32_t, 64u * 4u> nullable_input_b{};
+    auto split_address = [](uint64_t address, uint32_t& low, uint32_t& high) {
+        low = static_cast<uint32_t>(address);
+        high = static_cast<uint32_t>(address >> 32u);
+    };
+    std::array<uint32_t, 9> nullable_output_seed{};
+    split_address(reinterpret_cast<uint64_t>(nullable_output_witness.data()),
+                  nullable_output_seed[0], nullable_output_seed[1]);
+    split_address(reinterpret_cast<uint64_t>(nullable_input_a.data()),
+                  nullable_output_seed[2], nullable_output_seed[3]);
+    split_address(reinterpret_cast<uint64_t>(nullable_input_b.data()),
+                  nullable_output_seed[4], nullable_output_seed[5]);
+    nullable_output_seed[6] = 64u;
+    nullable_output_seed[7] = kGtaNullableOutputFixtureRecordCount;
+    nullable_output_seed[8] = kGtaNullableOutputUserSgpr8;
+
+    ComputeResourceDispatchContext nullable_output_context;
+    nullable_output_context.local_x = kGtaNullableOutputLocalSize;
+    nullable_output_context.local_y = nullable_output_context.local_z = 1u;
+    nullable_output_context.threads_x = kGtaNullableOutputFixtureThreads;
+    nullable_output_context.threads_y = nullable_output_context.threads_z = 1u;
+    nullable_output_context.wave_size = 64u;
+    nullable_output_context.tgid_x_en = true;
+    nullable_output_context.tidig_comp_cnt = 0u;
+    ShaderResourceTable nullable_output_table;
+    (void)add_compute_buffer_resources(
+        nullable_output_table, prosper::test::kGta5WorkgroupStoreProgram.data(),
+        prosper::test::kGta5WorkgroupStoreProgram.size(), nullable_output_seed.data(),
+        nullable_output_seed.size(), nullable_output_context.local_x,
+        nullable_output_context.threads_x, static_cast<uint32_t>(nullable_output_seed.size()),
+        &nullable_output_context);
+    assign_convention_bindings(nullable_output_table, 2u);
+    for (ShaderResource& resource : nullable_output_table.resources) {
+        if (!is_proven_null_nullable_raw_buffer(resource)) continue;
+        resource.host_data = reinterpret_cast<uint8_t*>(nullable_output_witness.data());
+        resource.host_data_size = kGtaNullableOutputWitnessBytes;
+    }
+
+    ComputeShaderConfig nullable_output_config;
+    nullable_output_config.user_sgprs.assign(nullable_output_seed.begin(),
+                                              nullable_output_seed.end());
+    nullable_output_config.local_x = nullable_output_context.local_x;
+    nullable_output_config.local_y = nullable_output_context.local_y;
+    nullable_output_config.local_z = nullable_output_context.local_z;
+    nullable_output_config.threads_x = nullable_output_context.threads_x;
+    nullable_output_config.threads_y = nullable_output_context.threads_y;
+    nullable_output_config.threads_z = nullable_output_context.threads_z;
+    nullable_output_config.wave_size = nullable_output_context.wave_size;
+    nullable_output_config.tgid_x_en = nullable_output_context.tgid_x_en;
+    uint64_t nullable_cold_identity = 0u;
+    const auto nullable_cold = recompile_compute_shader_cached(
+        prosper::test::kGta5WorkgroupStoreProgram.data(),
+        prosper::test::kGta5WorkgroupStoreProgram.size(), &nullable_output_table,
+        nullable_output_config, &nullable_cold_identity);
+
+    // Mutate the same retained producer bytes consumed by the production pre-cache validator. A
+    // different helper/marker mutation would not prove the warm-cache trust boundary itself.
+    nullable_output_witness[kGtaNullableOutputPointerOffset / sizeof(uint32_t)] = 1u;
+    uint64_t nullable_stale_identity = 1u;
+    const auto nullable_stale = recompile_compute_shader_cached(
+        prosper::test::kGta5WorkgroupStoreProgram.data(),
+        prosper::test::kGta5WorkgroupStoreProgram.size(), &nullable_output_table,
+        nullable_output_config, &nullable_stale_identity);
+    nullable_output_witness[kGtaNullableOutputPointerOffset / sizeof(uint32_t)] = 0u;
+    uint64_t nullable_warm_identity = 0u;
+    const auto nullable_warm = recompile_compute_shader_cached(
+        prosper::test::kGta5WorkgroupStoreProgram.data(),
+        prosper::test::kGta5WorkgroupStoreProgram.size(), &nullable_output_table,
+        nullable_output_config, &nullable_warm_identity);
+    stats = shader_recompile_cache_stats();
+    CHECK(std::count_if(nullable_output_table.resources.begin(),
+                        nullable_output_table.resources.end(),
+                        is_proven_null_nullable_raw_buffer) == 1u &&
+              !nullable_cold.empty() && nullable_stale.empty() &&
+              nullable_stale_identity == 0u && nullable_warm == nullable_cold &&
+              nullable_cold_identity != 0u && nullable_warm_identity == nullable_cold_identity &&
+              stats.misses == 1u && stats.hits == 1u && stats.entries == 1u,
+          "nullable-output cache revalidates its retained +0x20 witness before warm reuse");
 
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw

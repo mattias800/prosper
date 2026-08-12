@@ -11,7 +11,9 @@
 // round-trip verified with llvm-mc -mcpu=gfx1030.
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/rdna2_decode.hpp"
+#include "../src/gpu/rdna2_gta5_compute_contracts.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gta5_nullable_output_fixture.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -3200,6 +3202,334 @@ int main() {
                             &gta_null_store_table,
                             gta_nonnull_unmapped_config).empty(),
           "a stale null-dispatch marker cannot erase stores for non-null user s2:s3");
+
+    // GTA V's two workgroup-list kernels load an optional pointer from the mapped dispatch table at
+    // +0x20, then build [base=0,stride=1024,records=s7,config=0x16204]. Keep their complete production
+    // arrays: the three stores may disappear and pc166 may return zero only under exact byte, launch,
+    // provenance, and retained-witness identity.
+    alignas(16) std::array<uint32_t, 16> nullable_output_witness{};
+    std::vector<uint32_t> nullable_input_a(64u * 4u);
+    std::vector<uint32_t> nullable_input_b(64u * 4u);
+    std::vector<uint32_t> nullable_output(
+        kGtaNullableOutputFixtureRecordCount * kGtaNullableOutputStride /
+        sizeof(uint32_t));
+    auto split_address = [](uint64_t address, uint32_t& lo, uint32_t& hi) {
+        lo = static_cast<uint32_t>(address);
+        hi = static_cast<uint32_t>(address >> 32u);
+    };
+    auto nullable_seed = [&](uint64_t pointer) {
+        nullable_output_witness[kGtaNullableOutputPointerOffset / 4u] =
+            static_cast<uint32_t>(pointer);
+        nullable_output_witness[kGtaNullableOutputPointerOffset / 4u + 1u] =
+            static_cast<uint32_t>(pointer >> 32u);
+        std::array<uint32_t, 9> seed{};
+        split_address(reinterpret_cast<uint64_t>(nullable_output_witness.data()),
+                      seed[0], seed[1]);
+        split_address(reinterpret_cast<uint64_t>(nullable_input_a.data()),
+                      seed[2], seed[3]);
+        split_address(reinterpret_cast<uint64_t>(nullable_input_b.data()),
+                      seed[4], seed[5]);
+        seed[6] = 64u;
+        seed[7] = kGtaNullableOutputFixtureRecordCount;
+        seed[8] = kGtaNullableOutputUserSgpr8;
+        return seed;
+    };
+    auto nullable_context = [](bool tgid_x) {
+        ComputeResourceDispatchContext context;
+        context.local_x = kGtaNullableOutputLocalSize;
+        context.local_y = context.local_z = 1u;
+        context.threads_x = kGtaNullableOutputFixtureThreads;
+        context.threads_y = context.threads_z = 1u;
+        context.wave_size = 64u;
+        context.tgid_x_en = tgid_x;
+        context.tidig_comp_cnt = 0u;
+        return context;
+    };
+    auto nullable_config = [](const std::array<uint32_t, 9>& seed,
+                              const ComputeResourceDispatchContext& context) {
+        ComputeShaderConfig config;
+        config.user_sgprs.assign(seed.begin(), seed.end());
+        config.local_x = context.local_x;
+        config.local_y = context.local_y;
+        config.local_z = context.local_z;
+        config.threads_x = context.threads_x;
+        config.threads_y = context.threads_y;
+        config.threads_z = context.threads_z;
+        config.exact_thread_extent = context.exact_thread_extent;
+        config.wave_size = context.wave_size;
+        config.tgid_x_en = context.tgid_x_en;
+        config.tgid_y_en = context.tgid_y_en;
+        config.tgid_z_en = context.tgid_z_en;
+        config.tidig_comp_cnt = context.tidig_comp_cnt;
+        return config;
+    };
+    auto materialize_nullable = [&](const auto& program, bool tgid_x,
+                                    const std::array<uint32_t, 9>& seed,
+                                    const ComputeResourceDispatchContext& context,
+                                    ShaderResourceTable& table) {
+        const std::vector<SrtUse> uses = add_compute_buffer_resources(
+            table, program.data(), program.size(), seed.data(), seed.size(),
+            context.local_x, context.threads_x,
+            tgid_x ? static_cast<uint32_t>(seed.size()) : UINT32_MAX, &context);
+        assign_convention_bindings(table, 2u);
+        return uses;
+    };
+
+    const auto null_nullable_seed = nullable_seed(0u);
+    const ComputeResourceDispatchContext short_nullable_context = nullable_context(true);
+    ShaderResourceTable short_nullable_table;
+    const std::vector<SrtUse> short_nullable_uses = materialize_nullable(
+        prosper::test::kGta5WorkgroupStoreProgram, true, null_nullable_seed,
+        short_nullable_context, short_nullable_table);
+    const ComputeShaderConfig short_nullable_config = nullable_config(
+        null_nullable_seed, short_nullable_context);
+    const std::vector<uint32_t> short_nullable_spirv = recompile_compute(
+        prosper::test::kGta5WorkgroupStoreProgram.data(),
+        prosper::test::kGta5WorkgroupStoreProgram.size(), &short_nullable_table,
+        short_nullable_config);
+    CHECK(std::count_if(short_nullable_uses.begin(), short_nullable_uses.end(),
+                        [](const SrtUse& use) {
+                            return use.proven_null_nullable_raw_buffer;
+                        }) == 1u &&
+              std::count_if(short_nullable_table.resources.begin(),
+                            short_nullable_table.resources.end(),
+                            is_proven_null_nullable_raw_buffer) == 1u &&
+              short_nullable_table.by_fetch_pc(38u) &&
+              is_proven_null_nullable_raw_buffer(*short_nullable_table.by_fetch_pc(38u)) &&
+              rdna2_gta5_nullable_output_dispatch(
+                  prosper::test::kGta5WorkgroupStoreProgram.data(),
+                  prosper::test::kGta5WorkgroupStoreProgram.size(),
+                  short_nullable_config, short_nullable_table) &&
+              !short_nullable_spirv.empty(),
+          "GTA 0x413e192 exact null dispatch emits its pc38 store as a witnessed no-op");
+
+    // The first retained fixture used 57 groups, while a later live Story Mode route used 63 with
+    // identical program bytes and descriptor construction. Count is an exact dispatch equality,
+    // not a fixed shader identity: s7, descriptor word2, groups_x, and threads_x/256 must agree.
+    constexpr uint32_t kLaterLiveRecordCount = 63u;
+    auto variable_nullable_seed = null_nullable_seed;
+    variable_nullable_seed[7] = kLaterLiveRecordCount;
+    ComputeResourceDispatchContext variable_nullable_context = short_nullable_context;
+    variable_nullable_context.threads_x =
+        kLaterLiveRecordCount * kGtaNullableOutputLocalSize;
+    ShaderResourceTable variable_nullable_table;
+    const std::vector<SrtUse> variable_nullable_uses = materialize_nullable(
+        prosper::test::kGta5WorkgroupStoreProgram, true, variable_nullable_seed,
+        variable_nullable_context, variable_nullable_table);
+    const ComputeShaderConfig variable_nullable_config = nullable_config(
+        variable_nullable_seed, variable_nullable_context);
+    CHECK(std::count_if(variable_nullable_uses.begin(), variable_nullable_uses.end(),
+                        [](const SrtUse& use) {
+                            return use.proven_null_nullable_raw_buffer;
+                        }) == 1u &&
+              std::count_if(variable_nullable_table.resources.begin(),
+                            variable_nullable_table.resources.end(),
+                            is_proven_null_nullable_raw_buffer) == 1u &&
+              !recompile_compute(
+                  prosper::test::kGta5WorkgroupStoreProgram.data(),
+                  prosper::test::kGta5WorkgroupStoreProgram.size(),
+                  &variable_nullable_table, variable_nullable_config).empty(),
+          "GTA 0x413e192 admits the exact later-live 63-group nullable dispatch");
+
+    const ComputeResourceDispatchContext long_nullable_context = nullable_context(false);
+    ShaderResourceTable long_nullable_table;
+    const std::vector<SrtUse> long_nullable_uses = materialize_nullable(
+        prosper::test::kGta5WorkgroupProcessProgram, false, null_nullable_seed,
+        long_nullable_context, long_nullable_table);
+    const ComputeShaderConfig long_nullable_config = nullable_config(
+        null_nullable_seed, long_nullable_context);
+    const std::vector<uint32_t> long_nullable_spirv = recompile_compute(
+        prosper::test::kGta5WorkgroupProcessProgram.data(),
+        prosper::test::kGta5WorkgroupProcessProgram.size(), &long_nullable_table,
+        long_nullable_config);
+    CHECK(std::count_if(long_nullable_uses.begin(), long_nullable_uses.end(),
+                        [](const SrtUse& use) {
+                            return use.proven_null_nullable_raw_buffer;
+                        }) == 3u &&
+              std::count_if(long_nullable_table.resources.begin(),
+                            long_nullable_table.resources.end(),
+                            is_proven_null_nullable_raw_buffer) == 3u &&
+              long_nullable_table.by_fetch_pc(152u) &&
+              long_nullable_table.by_fetch_pc(166u) &&
+              long_nullable_table.by_fetch_pc(193u) &&
+              rdna2_gta5_nullable_output_dispatch(
+                  prosper::test::kGta5WorkgroupProcessProgram.data(),
+                  prosper::test::kGta5WorkgroupProcessProgram.size(),
+                  long_nullable_config, long_nullable_table) &&
+              !long_nullable_spirv.empty(),
+          "GTA 0x413e1ac exact null dispatch drops two stores and zero-loads pc166");
+
+    // The exact long kernel extracts entry-s8 bits 30:28 at pc2 as ordinary work-selection data.
+    // Routed gameplay exercised all eight values while the independently recovered nullable V#
+    // remained exact. Validate the complete selector domain, including the alternate exact-thread
+    // representation accepted for a dispatch with no partial workgroup.
+    auto live_long_nullable_seed = null_nullable_seed;
+    for (uint32_t selector = 0u; selector != 8u; ++selector) {
+        live_long_nullable_seed[8] = kGtaNullableOutputUserSgpr8 | (selector << 28u);
+        ComputeResourceDispatchContext live_long_nullable_context = long_nullable_context;
+        live_long_nullable_context.exact_thread_extent = selector == 7u;
+        ShaderResourceTable live_long_nullable_table;
+        const std::vector<SrtUse> live_long_nullable_uses = materialize_nullable(
+            prosper::test::kGta5WorkgroupProcessProgram, false, live_long_nullable_seed,
+            live_long_nullable_context, live_long_nullable_table);
+        const ComputeShaderConfig live_long_nullable_config = nullable_config(
+            live_long_nullable_seed, live_long_nullable_context);
+        CHECK(std::count_if(live_long_nullable_uses.begin(), live_long_nullable_uses.end(),
+                            [](const SrtUse& use) {
+                                return use.proven_null_nullable_raw_buffer;
+                            }) == 3u &&
+                  std::count_if(live_long_nullable_table.resources.begin(),
+                                live_long_nullable_table.resources.end(),
+                                is_proven_null_nullable_raw_buffer) == 3u &&
+                  !recompile_compute(
+                      prosper::test::kGta5WorkgroupProcessProgram.data(),
+                      prosper::test::kGta5WorkgroupProcessProgram.size(),
+                      &live_long_nullable_table, live_long_nullable_config).empty(),
+              "GTA 0x413e1ac admits each routed s8 work selector");
+    }
+
+    auto unknown_long_nullable_seed = null_nullable_seed;
+    unknown_long_nullable_seed[8] |= 0x80000000u;
+    ShaderResourceTable unknown_long_nullable_table;
+    (void)materialize_nullable(
+        prosper::test::kGta5WorkgroupProcessProgram, false, unknown_long_nullable_seed,
+        long_nullable_context, unknown_long_nullable_table);
+    const ComputeShaderConfig unknown_long_nullable_config = nullable_config(
+        unknown_long_nullable_seed, long_nullable_context);
+    CHECK(std::none_of(unknown_long_nullable_table.resources.begin(),
+                       unknown_long_nullable_table.resources.end(),
+                       is_nullable_raw_buffer_marker_candidate) &&
+              recompile_compute(
+                  prosper::test::kGta5WorkgroupProcessProgram.data(),
+                  prosper::test::kGta5WorkgroupProcessProgram.size(),
+                  &unknown_long_nullable_table, unknown_long_nullable_config).empty(),
+          "an unobserved long-kernel s8 flag cannot authorize nullable semantics");
+    CHECK(!rdna2_gta5_nullable_output_launch(
+              prosper::test::kGta5WorkgroupProcessProgram.data(),
+              prosper::test::kGta5WorkgroupProcessProgram.size(),
+              live_long_nullable_seed.data(), live_long_nullable_seed.size() - 1u,
+              long_nullable_context.local_x, long_nullable_context.local_y,
+              long_nullable_context.local_z, long_nullable_context.threads_x,
+              long_nullable_context.threads_y, long_nullable_context.threads_z,
+              long_nullable_context.exact_thread_extent, long_nullable_context.wave_size,
+              long_nullable_context.tgid_x_en, long_nullable_context.tgid_y_en,
+              long_nullable_context.tgid_z_en, long_nullable_context.tidig_comp_cnt),
+          "a short user-SGPR block rejects before reading the exact s8 ABI word");
+
+    ShaderResourceTable short_nullable_witness = long_nullable_table;
+    for (ShaderResource& resource : short_nullable_witness.resources) {
+        if (!is_nullable_raw_buffer_marker_candidate(resource)) continue;
+        resource.host_data = reinterpret_cast<uint8_t*>(nullable_output_witness.data());
+        resource.host_data_size = kGtaNullableOutputWitnessBytes - 1u;
+    }
+    CHECK(recompile_compute(
+              prosper::test::kGta5WorkgroupProcessProgram.data(),
+              prosper::test::kGta5WorkgroupProcessProgram.size(),
+              &short_nullable_witness, long_nullable_config).empty(),
+          "a short retained +0x20 witness cannot authorize nullable load/store semantics");
+
+    ShaderResourceTable unreadable_nullable_witness = long_nullable_table;
+    ComputeShaderConfig unreadable_nullable_config = long_nullable_config;
+    constexpr uint64_t kUnmappedWitnessAddress = 0xffffffffffff0000ull;
+    unreadable_nullable_config.user_sgprs[0] =
+        static_cast<uint32_t>(kUnmappedWitnessAddress);
+    unreadable_nullable_config.user_sgprs[1] =
+        static_cast<uint32_t>(kUnmappedWitnessAddress >> 32u);
+    for (ShaderResource& resource : unreadable_nullable_witness.resources) {
+        if (!is_nullable_raw_buffer_marker_candidate(resource)) continue;
+        resource.gpu_addr = kUnmappedWitnessAddress;
+    }
+    CHECK(recompile_compute(
+              prosper::test::kGta5WorkgroupProcessProgram.data(),
+              prosper::test::kGta5WorkgroupProcessProgram.size(),
+              &unreadable_nullable_witness, unreadable_nullable_config).empty(),
+          "an unreadable retained +0x20 witness cannot authorize nullable load/store semantics");
+
+    // The same guest table after initialization is not a null marker. It must materialize ordinary
+    // address-backed resources for all three consumers and retain real load/store behavior.
+    const auto nonnull_nullable_seed = nullable_seed(
+        reinterpret_cast<uint64_t>(nullable_output.data()));
+    ShaderResourceTable nonnull_nullable_table;
+    const std::vector<SrtUse> nonnull_nullable_uses = materialize_nullable(
+        prosper::test::kGta5WorkgroupProcessProgram, false, nonnull_nullable_seed,
+        long_nullable_context, nonnull_nullable_table);
+    const ComputeShaderConfig nonnull_nullable_config = nullable_config(
+        nonnull_nullable_seed, long_nullable_context);
+    CHECK(std::none_of(nonnull_nullable_uses.begin(), nonnull_nullable_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.proven_null_nullable_raw_buffer;
+                       }) &&
+              std::none_of(nonnull_nullable_table.resources.begin(),
+                           nonnull_nullable_table.resources.end(),
+                           is_proven_null_nullable_raw_buffer) &&
+              nonnull_nullable_table.by_fetch_pc(152u) &&
+              nonnull_nullable_table.by_fetch_pc(166u) &&
+              nonnull_nullable_table.by_fetch_pc(193u) &&
+              !recompile_compute(
+                   prosper::test::kGta5WorkgroupProcessProgram.data(),
+                   prosper::test::kGta5WorkgroupProcessProgram.size(),
+                   &nonnull_nullable_table, nonnull_nullable_config).empty(),
+          "initialized +0x20 output keeps ordinary GTA load/store resources");
+    nullable_seed(0u); // restore the zero witness for all mutation arms below
+
+    auto nullable_mutation_rejects = [&](const auto& program, bool tgid_x,
+                                         const ComputeResourceDispatchContext& context,
+                                         const char* message,
+                                         bool require_no_candidate = true) {
+        ShaderResourceTable table;
+        const std::vector<SrtUse> uses = materialize_nullable(
+            program, tgid_x, null_nullable_seed, context, table);
+        const ComputeShaderConfig config = nullable_config(null_nullable_seed, context);
+        const bool rejected =
+            (!require_no_candidate ||
+             std::none_of(uses.begin(), uses.end(), [](const SrtUse& use) {
+                 return use.proven_null_nullable_raw_buffer;
+             })) &&
+            std::none_of(table.resources.begin(), table.resources.end(),
+                         is_proven_null_nullable_raw_buffer) &&
+            recompile_compute(program.data(), program.size(), &table, config).empty();
+        CHECK(rejected, message);
+    };
+
+    // Same-site mutation arms: perturb each admitted MUBUF packet, not a helper or assertion path.
+    auto short_store_mutation = prosper::test::kGta5WorkgroupStoreProgram;
+    short_store_mutation[38] ^= 0x00040000u; // store_dword -> store_dwordx2
+    nullable_mutation_rejects(short_store_mutation, true, short_nullable_context,
+        "pc38 store-width mutation removes the nullable-output proof");
+    for (const auto [pc, name] : std::array<std::pair<uint32_t, const char*>, 3>{
+             std::pair{152u, "pc152 store-width mutation removes the nullable-output proof"},
+             std::pair{166u, "pc166 load-width mutation removes the nullable-output proof"},
+             std::pair{193u, "pc193 store-width mutation removes the nullable-output proof"}}) {
+        auto mutation = prosper::test::kGta5WorkgroupProcessProgram;
+        mutation[pc] ^= 0x00040000u;
+        nullable_mutation_rejects(mutation, false, long_nullable_context, name);
+    }
+
+    auto nullable_producer_mutation = prosper::test::kGta5WorkgroupProcessProgram;
+    nullable_producer_mutation[103] = 0xfa000024u; // exact +0x20 S_LOAD producer -> +0x24
+    nullable_mutation_rejects(nullable_producer_mutation, false, long_nullable_context,
+        "+0x20 producer-site mutation cannot manufacture nullable markers");
+    auto nullable_stride_mutation = prosper::test::kGta5WorkgroupProcessProgram;
+    nullable_stride_mutation[106] = 0x02000000u;
+    nullable_mutation_rejects(nullable_stride_mutation, false, long_nullable_context,
+        "descriptor stride-builder mutation removes the nullable-output proof");
+    auto nullable_count_mutation = prosper::test::kGta5WorkgroupProcessProgram;
+    nullable_count_mutation[107] = 0xbe8a0306u; // s10=s6 instead of exact dispatch count s7
+    nullable_mutation_rejects(nullable_count_mutation, false, long_nullable_context,
+        "descriptor count-builder mutation removes the nullable-output proof");
+    auto nullable_config_mutation = prosper::test::kGta5WorkgroupProcessProgram;
+    nullable_config_mutation[110] ^= 1u;
+    nullable_mutation_rejects(nullable_config_mutation, false, long_nullable_context,
+        "descriptor config-word mutation removes the nullable-output proof");
+
+    ComputeResourceDispatchContext wrong_nullable_local = long_nullable_context;
+    wrong_nullable_local.local_x = 128u;
+    nullable_mutation_rejects(prosper::test::kGta5WorkgroupProcessProgram, false,
+        wrong_nullable_local, "local-size mutation cannot retain nullable-output markers", false);
+    ComputeResourceDispatchContext wrong_nullable_threads = long_nullable_context;
+    --wrong_nullable_threads.threads_x;
+    nullable_mutation_rejects(prosper::test::kGta5WorkgroupProcessProgram, false,
+        wrong_nullable_threads, "group-count mutation cannot retain nullable-output markers", false);
 
     // GTA V 0x413d59600 pc67 uses this exact FORMAT-load packet through the all-zero descriptor
     // produced by its earlier zero-record scalar loads. Keep the exact pc because the marker is
