@@ -302,6 +302,8 @@ struct ShaderResourceCompileKey {
     bool optional_null_raw_load = false;
     bool proven_null_guarded_raw_store = false;
     bool proven_null_nullable_raw_buffer = false;
+    uint32_t selected_sbuffer_soffset = UINT32_MAX;
+    std::array<uint32_t, 4> selected_sbuffer_words{};
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -499,6 +501,9 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.optional_null_raw_load);
             hash = hash_mix(hash, resource.proven_null_guarded_raw_store);
             hash = hash_mix(hash, resource.proven_null_nullable_raw_buffer);
+            hash = hash_mix(hash, resource.selected_sbuffer_soffset);
+            for (const uint32_t word : resource.selected_sbuffer_words)
+                hash = hash_mix(hash, word);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1252,6 +1257,10 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 is_proven_null_guarded_raw_store(resource);
             compiled.proven_null_nullable_raw_buffer =
                 is_proven_null_nullable_raw_buffer(resource);
+            if (is_gta5_selected_sbuffer_descriptor(resource)) {
+                compiled.selected_sbuffer_soffset = resource.selected_sbuffer_soffset;
+                compiled.selected_sbuffer_words = resource.selected_sbuffer_words;
+            }
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1550,6 +1559,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const bool has_nullable_output_raw_buffer = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_nullable_raw_buffer_marker_candidate);
+    const bool has_selected_sbuffer_descriptor = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_gta5_selected_sbuffer_marker_candidate);
     // Push-constant values intentionally stay out of the general compute cache key. Conditional
     // store elision is the exception: validate its raw shader and exact dispatch before even looking
     // in the cache, so a warm null-dispatch module cannot be returned for changed s2:s3.
@@ -1559,6 +1571,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         return {};
     if (has_nullable_output_raw_buffer &&
         !rdna2_gta5_nullable_output_dispatch(code, dwords, config, *resources))
+        return {};
+    if (has_selected_sbuffer_descriptor &&
+        !rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, *resources))
         return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
@@ -6511,7 +6526,6 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  path_report.removed_pcs[index]);
                 std::fprintf(stderr, "\n");
             }
-            assign_convention_bindings(*table, 2);
             native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
                 decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords, recompile_diagnostic);
@@ -6635,6 +6649,25 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                       P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_MASK);
         config.lds_bytes = field(P::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT,
                                  P::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK) * 512u;
+
+        // GTA V 0x413ce6000 selects one V# from a scalar-buffer table with a wave-uniform value
+        // derived from live source records. Generic const-folding intentionally cannot manufacture
+        // that dynamic descriptor. Certify this dispatch's complete selector domain and materialize
+        // the sole in-bounds record before assigning Vulkan bindings.
+        const bool selected_sbuffer_candidate = rdna2_gta5_selected_sbuffer_shader(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords);
+        const bool selected_sbuffer_valid = discover_rdna2_gta5_selected_sbuffer(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords, config, *table);
+        if (selected_sbuffer_candidate &&
+            (selected_sbuffer_valid || config.threads_x == kGtaSelectedSbufferThreads) &&
+            std::getenv("PROSPER_DBG"))
+            std::fprintf(stderr,
+                         "[gta-selected-sbuffer] code=0x%llx valid=%d resources=%zu\n",
+                         static_cast<unsigned long long>(code_addr),
+                         static_cast<int>(selected_sbuffer_valid), table->resources.size());
+        assign_convention_bindings(*table, 2);
 
         ComputeItem item;
         item.spirv = recompile_compute_shader_cached(

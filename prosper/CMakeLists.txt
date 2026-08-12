@@ -1030,6 +1030,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
 
+  add_executable(test_gta5_selected_sbuffer tests/test_gta5_selected_sbuffer.cpp)
+  target_link_libraries(test_gta5_selected_sbuffer PRIVATE prosper_core)
+  add_test(NAME gta5_selected_sbuffer COMMAND test_gta5_selected_sbuffer)
+
   # Cross-submit readability reuse is valid only while the HLE mapping generation is unchanged.
   add_executable(test_guest_memory_map tests/test_guest_memory_map.cpp)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)

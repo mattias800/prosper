@@ -13,6 +13,8 @@
 // front-half fills. See docs/RESOURCE_BINDING.md for the model, the descriptor-provenance mechanism,
 // and the staged implementation plan.
 #pragma once
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -381,7 +383,45 @@ struct ShaderResource {
     // OOB_SELECT is not otherwise retained by this normalized resource, so emission, cache identity,
     // capture, and per-dispatch revalidation carry the proof explicitly.
     uint32_t       atomic_x2_record_count = 0;
+
+    // Dispatch-scoped proof for GTA V 0x413ce6000's pc153 scalar descriptor-table lookup. The
+    // front half admits either the complete zero-descriptor chain, or only the one in-bounds SOFFSET
+    // (record 4) plus wholly OOB offsets, then keeps the exact selected V# words here. UINT32_MAX
+    // means this is an ordinary resource. The marker lives only on pc153; pc156/158 remain ordinary
+    // target bindings (including ordinary zero-record bindings in the all-zero mode).
+    uint32_t       selected_sbuffer_soffset = UINT32_MAX;
+    std::array<uint32_t, 4> selected_sbuffer_words{};
 };
+
+inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& resource) {
+    return resource.selected_sbuffer_soffset != UINT32_MAX;
+}
+
+inline constexpr uint32_t kGtaSelectedSbufferRecord4Soffset = 480u;
+inline constexpr uint32_t kGtaSelectedSbufferZeroChainSoffset = UINT32_MAX - 1u;
+inline constexpr uint32_t kGtaSelectedSbufferAllOobSoffset = UINT32_MAX - 2u;
+
+inline bool is_gta5_selected_sbuffer_descriptor(const ShaderResource& resource) {
+    if (resource.cls != ResourceClass::ConstantBuffer || resource.fetch_pc != 153u)
+        return false;
+    if (resource.selected_sbuffer_soffset == kGtaSelectedSbufferZeroChainSoffset)
+        return resource.format == DataFormat::Unknown && resource.num_components == 0u &&
+               resource.gpu_addr == 0u && resource.size == 0u && resource.stride == 0u &&
+               resource.srt_offset == UINT32_MAX && resource.sgpr_base == UINT32_MAX &&
+               resource.host_data == nullptr && resource.host_data_size == 0u &&
+               std::all_of(resource.selected_sbuffer_words.begin(),
+                           resource.selected_sbuffer_words.end(),
+                           [](uint32_t word) { return word == 0u; });
+    if (resource.selected_sbuffer_soffset == kGtaSelectedSbufferAllOobSoffset)
+        return resource.gpu_addr > 0x10000u && resource.stride == 120u &&
+               resource.size == 600u &&
+               std::all_of(resource.selected_sbuffer_words.begin(),
+                           resource.selected_sbuffer_words.end(),
+                           [](uint32_t word) { return word == 0u; });
+    return resource.gpu_addr > 0x10000u && resource.stride == 120u &&
+           resource.size == 600u &&
+           resource.selected_sbuffer_soffset == kGtaSelectedSbufferRecord4Soffset;
+}
 
 // A one-layer guest 2D-array descriptor is byte-identical to an ordinary 2D image, and some guest
 // shaders deliberately address it with a non-arrayed DIM=2D instruction. Keep that established

@@ -12,6 +12,8 @@ struct ComputeShaderConfig;
 struct Rdna2Inst;
 struct ShaderResourceTable;
 
+inline constexpr uint32_t kGtaSelectedSbufferThreads = 2064u;
+
 // Exact raw-store consumers in GTA V 0x413cf9a00's null-output region. This is packet identity only;
 // callers must independently prove the pc42..48 EXEC guard and the dispatch's null pointer.
 bool rdna2_gta5_null_guarded_raw_store_site(const Rdna2Inst& in);
@@ -56,6 +58,29 @@ bool rdna2_gta5_nullable_output_launch(
 // Final trust boundary: repeat byte/launch validation, require the complete exact marker set, and
 // read its retained 40-byte table witness to prove s0:s1+0x20 is still the zero qword.
 bool rdna2_gta5_nullable_output_dispatch(
+    const uint32_t* code, size_t dwords,
+    const ComputeShaderConfig& config,
+    const ShaderResourceTable& resources);
+
+// Exact GTA V 0x413ce6000 program and launch identity. The selected-SBUFFER specialization is
+// dispatch-scoped because the selector domain comes from a live 2,064-record source buffer.
+bool rdna2_gta5_selected_sbuffer_shader(const uint32_t* code, size_t dwords);
+bool rdna2_gta5_selected_sbuffer_launch(
+    const uint32_t* code, size_t dwords,
+    const ComputeShaderConfig& config);
+
+// Discover the source/outer descriptors; propagate their complete zero-record state, prove a wholly
+// OOB selector domain, or retain the sole possible in-bounds record-4 V#. Add ordinary resources for
+// the exact pc156/158 consumers in every admitted mode. Existing marker state is cleared first,
+// making this safe to repeat at replay materialization.
+bool discover_rdna2_gta5_selected_sbuffer(
+    const uint32_t* code, size_t dwords,
+    const ComputeShaderConfig& config,
+    ShaderResourceTable& resources);
+
+// Final compiler/cache trust boundary. Repeats the full byte, launch, descriptor, source-domain,
+// marker, and consumer-resource proof without mutating the supplied table.
+bool rdna2_gta5_selected_sbuffer_dispatch(
     const uint32_t* code, size_t dwords,
     const ComputeShaderConfig& config,
     const ShaderResourceTable& resources);
