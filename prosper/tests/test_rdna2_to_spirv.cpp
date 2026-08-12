@@ -1041,6 +1041,49 @@ int main() {
     CHECK(got15c.size() == N && bad15c == 0,
           "recompiled kernel 15c counts leading zeroes and preserves the zero sentinel exactly");
 
+    // Kernel 15c1: GTA V's exact Wave32 terrain packet at dispatcher pc106. V_FFBL_B32 returns
+    // the first set-bit index from the LSB and -1 for zero. Mutate the opcode at the SAME packet to
+    // FFBH and require its distinct results, so this cannot pass by testing only shared setup code.
+    const uint32_t code15c1[] = { 0x7e047515u, 0xbf810000u }; // v_ffbl_b32_e32 v2,v21
+    const uint32_t code15c1_ffbh[] = { 0x7e047315u, 0xbf810000u }; // same site: v_ffbh_u32 v2,v21
+    const auto spv15c1 = recompile_valu(
+        code15c1, std::size(code15c1), /*num_inputs*/22, /*out_vgpr*/2);
+    const auto spv15c1_ffbh = recompile_valu(
+        code15c1_ffbh, std::size(code15c1_ffbh), /*num_inputs*/22, /*out_vgpr*/2);
+    CHECK(!spv15c1.empty() && !spv15c1_ffbh.empty(),
+          "exact pc106 FFBL and same-site FFBH mutation recompile");
+    constexpr uint32_t ffbl_inputs[] = {
+        0x00000000u, 0xff000001u, 0xff000008u, 0xffff0000u,
+        0x80000000u, 0x00000001u, 0x00f00000u, 0xffffffffu,
+    };
+    constexpr uint32_t ffbl_expected[] = {
+        0xffffffffu, 0u, 3u, 16u, 31u, 0u, 20u, 0u,
+    };
+    constexpr uint32_t ffbl_mutated_ffbh_expected[] = {
+        0xffffffffu, 0u, 0u, 0u, 0u, 31u, 8u, 0u,
+    };
+    std::vector<float> in15c1(N * 22, 0.0f);
+    std::vector<uint32_t> exp15c1(N), exp15c1_ffbh(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const size_t sample = i % std::size(ffbl_inputs);
+        in15c1[i * 22 + 21] = std::bit_cast<float>(ffbl_inputs[sample]);
+        exp15c1[i] = ffbl_expected[sample];
+        exp15c1_ffbh[i] = ffbl_mutated_ffbh_expected[sample];
+    }
+    const auto got15c1 = spv15c1.empty() ? std::vector<float>()
+                                         : prosper::test::run_compute(spv15c1, in15c1, N, N);
+    const auto got15c1_ffbh = spv15c1_ffbh.empty() ? std::vector<float>()
+        : prosper::test::run_compute(spv15c1_ffbh, in15c1, N, N);
+    uint32_t bad15c1 = 0, bad15c1_ffbh = 0;
+    for (uint32_t i = 0; i < N && got15c1.size() == N; ++i)
+        if (bits_of(got15c1[i]) != exp15c1[i]) ++bad15c1;
+    for (uint32_t i = 0; i < N && got15c1_ffbh.size() == N; ++i)
+        if (bits_of(got15c1_ffbh[i]) != exp15c1_ffbh[i]) ++bad15c1_ffbh;
+    CHECK(got15c1.size() == N && bad15c1 == 0,
+          "exact pc106 FFBL returns first LSB set-bit index and the zero sentinel");
+    CHECK(got15c1_ffbh.size() == N && bad15c1_ffbh == 0,
+          "same-site FFBH mutation produces its distinct MSB-relative result");
+
     // Kernel 15d: V_ALIGNBYTE_B32 (VOP3 0x14f).  Exercise every masked byte offset, including
     // the 4..7 high-dword tail and 8..31 zero region.  Raw input bits avoid float conversion;
     // src0 is the high dword and src1 the low dword in the ISA's {S0,S1} concatenation.

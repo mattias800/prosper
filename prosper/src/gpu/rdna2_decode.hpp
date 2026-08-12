@@ -51,6 +51,7 @@ inline constexpr bool sop2_is_b32_logical(uint32_t opcode) {
 // GFX10.3 VOP1 opcodes used outside the decoder itself. Naming cross-component opcodes at this
 // boundary keeps dispatcher admission and ALU emission on one compile-time constant.
 inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
+inline constexpr uint32_t kVop1OpcodeFfblB32 = 0x3a;
 
 // GFX10.3 VOP3 opcodes whose scalar-source width matters to CFG lifetime analysis.
 // V_ADD3_U32 consumes three independent B32 operands; it never reads an SGPR pair.
