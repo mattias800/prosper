@@ -444,6 +444,27 @@ const char* class_name(prosper::gpu::ResourceClass c) {
     return "?";
 }
 
+// Dispatch-entry user SGPR VALUES. A dispatch-constant entry SGPR decides scalar control flow, so
+// these decide which intervals of a kernel can execute at all -- and the capture has always carried
+// them while --inspect-only printed only the count.
+//
+// `realized` distinguishes the two populations, and the distinction is load-bearing: the failed set
+// is selected on the very failure under investigation, so a statistic over it is near-tautological
+// (a healthy dispatch cannot appear in it). Only the two together support a claim about a program.
+// Each line repeats program= so a stanza is greppable on its own -- attributing these by adjacency
+// to the nearest program= header five lines up is a mistake that has already been made once here.
+void print_user_sgprs(uint64_t program_addr, const char* realized,
+                      const std::vector<uint32_t>& user_sgprs) {
+    for (size_t i = 0; i < user_sgprs.size(); ++i) {
+        if (i % 8 == 0)
+            std::printf("    user-sgpr program=%016llx %s [%2zu..]",
+                        static_cast<unsigned long long>(program_addr), realized, i);
+        std::printf(" %08x", user_sgprs[i]);
+        if (i % 8 == 7 || i + 1 == user_sgprs.size())
+            std::printf("\n");
+    }
+}
+
 void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* table,
                    const std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds) {
     if (!table) { std::printf("  %s: none\n", stage); return; }
@@ -838,6 +859,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
                     raw_available ? "yes" : "no");
+        if (c.recompile_config_available)
+            print_user_sgprs(c.code_addr, "realized", c.recompile_config.user_sgprs);
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);
     }
     for (size_t i = 0; i < replay.dma_copies.size(); ++i) {
@@ -977,13 +1000,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                 // through a live GPU probe and a reverted per-lane predicate to reach a fact that
                 // was already sitting in the artifact. Eight per line, indexed, so a specific sN is
                 // greppable.
-                for (size_t i = 0; i < config.user_sgprs.size(); ++i) {
-                    if (i % 8 == 0)
-                        std::printf("    user-sgpr[%2zu..] ", i);
-                    std::printf(" %08x", config.user_sgprs[i]);
-                    if (i % 8 == 7 || i + 1 == config.user_sgprs.size())
-                        std::printf("\n");
-                }
+                print_user_sgprs(stage.program_addr, "failed", config.user_sgprs);
             }
             for (size_t resource_index = 0;
                  resource_index < stage.resource_table.resources.size(); ++resource_index) {
