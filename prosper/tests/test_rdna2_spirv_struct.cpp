@@ -3866,6 +3866,39 @@ int main() {
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
 
+    // Fragment Wave64 SAVEEXEC computes SCC with an exact subgroup vote when the shader later
+    // reads it. Put the SCC reader after the non-lexical dispatcher shape: the CFG state transfer
+    // must preserve the producer's exact Boolean instead of reloading the false placeholder.
+    const uint32_t fragment_saveexec_scc_prelude[] = {
+        0x7c020300u,                         // v_cmp_lt_f32 vcc,v0,v1
+        0xbe84246au,                         // s_and_saveexec_b64 s[4:5],vcc -> exact SCC
+    };
+    std::vector<uint32_t> fragment_saveexec_scc(
+        std::begin(fragment_saveexec_scc_prelude),
+        std::end(fragment_saveexec_scc_prelude));
+    fragment_saveexec_scc.insert(fragment_saveexec_scc.end(),
+        std::begin(fragment_cfg_dispatch), std::end(fragment_cfg_dispatch));
+    fragment_saveexec_scc[10] =
+        0x85068081u;                         // replace pc8 work with SCC read after dispatcher reload
+    const auto fragment_saveexec_scc_spv = recompile_fragment(
+        fragment_saveexec_scc.data(), fragment_saveexec_scc.size());
+    if (fragment_saveexec_scc_spv.empty() ||
+        fragment_spirv_required_subgroup_size(fragment_saveexec_scc_spv) != 64 ||
+        !has_opcode(fragment_saveexec_scc_spv, 251)) {
+        printf("  [FAIL] fragment SAVEEXEC SCC did not survive a dispatcher reload\n");
+        return 1;
+    }
+    printf("  [ok]   fragment SAVEEXEC SCC survives a dispatcher reload exactly\n");
+    std::vector<uint32_t> fragment_saveexec_scc_mutated = fragment_saveexec_scc;
+    fragment_saveexec_scc_mutated[1] =
+        0xbe842400u;                         // same SAVEEXEC site reads unproved s[0:1]
+    if (!recompile_fragment(fragment_saveexec_scc_mutated.data(),
+                            fragment_saveexec_scc_mutated.size()).empty()) {
+        printf("  [FAIL] same-site SAVEEXEC source mutation certified an unproved mask\n");
+        return 1;
+    }
+    printf("  [ok]   same-site SAVEEXEC source mutation remains fail-visible\n");
+
     // Astro Bot's second world-map material is Wave32 and carries saved one-word masks through the
     // same non-lexical branch graph. The explicit VOPC writes below intentionally target adjacent
     // s1 then s0: both independent masks must survive every dispatcher case and feed the later EXEC

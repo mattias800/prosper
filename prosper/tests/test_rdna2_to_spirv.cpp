@@ -1629,9 +1629,9 @@ int main() {
     // The irreducible tail forces a dispatcher reload, so map presence alone cannot make this pass:
     // the Wave64 MUST analysis has to prove the sibling word before rebuilding the complete mask.
     std::vector<uint32_t> code17d1_vcc_scalar_pair = {
-        0xbe8f0380u, 0xbf060000u, // s_cmp_eq_u32 s0,s0: select a nonzero high word
+        0xbe8f0380u, 0xbf060f0fu, // s_cmp_eq_u32 s15,s15: select a nonzero high word
         0x856b8081u,              // exact pc238: s_cselect_b32 vcc_hi,1,0
-        0xbf060000u,              // pc240 role: re-arm SCC with a representable true value
+        0xbf060f0fu,              // pc240 role: re-arm SCC from proved scalar words
         0x876a6bfdu,              // exact pc242: s_and_b32 vcc_lo,scc,vcc_hi
         0x7e06026au,              // scalar-data consumer of the new low word
         0x7e020280u,              // v_mov_b32 v1,0
@@ -1701,6 +1701,266 @@ int main() {
                             code17d1_vcc_scalar_source_mutated.size(), nullptr,
                             native_linear_cfg17d).empty(),
           "Wave64 scalar-pair proof rejects a mask-derived source after dispatcher reload");
+
+    // SCC has the same dispatcher-placeholder hazard as the scalar VCC words: the Function
+    // variable contains false on a path where the preceding mask operation did not publish a
+    // scalar SCC. Only a scalar SCC definition in the current dispatcher block may certify the
+    // exact B32 consumer. The stale-SCC predecessor arm keeps that contract fail-visible at the
+    // same consumer site.
+    std::vector<uint32_t> code17d1_vcc_scalar_scc_source = {
+        0xbe8f0380u,              // establish a proved scalar word for SOPC
+        0x7d8800a1u,              // establish a genuine Wave64 VCC mask
+        0xbf880000u,              // force a dispatcher reload at the following block
+        0xbf060f0fu,              // scalar SOPC publishes an exact SCC value in this block
+        0x876a81fdu,              // exact site: VCC_LO = 1 & SCC
+        0x7d840100u,              // complete VCC replacement before any pair consumer
+    };
+    code17d1_vcc_scalar_scc_source.insert(
+        code17d1_vcc_scalar_scc_source.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_vcc_scalar_scc_source.data(),
+                             code17d1_vcc_scalar_scc_source.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 dispatcher accepts a locally proved scalar SCC source");
+    std::vector<uint32_t> code17d1_vcc_stale_scc_source = {
+        0x7d8800a1u,              // establish a genuine Wave64 VCC mask
+        0x876a816au,              // mask-domain logical leaves SCC without scalar provenance
+        0xbf880000u,              // reloads the poisoned SCC Function variable as false
+        0x876a81fdu,              // same exact consumer must not certify the stale placeholder
+        0x7d840100u,              // complete VCC replacement
+    };
+    code17d1_vcc_stale_scc_source.insert(
+        code17d1_vcc_stale_scc_source.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(code17d1_vcc_stale_scc_source.data(),
+                            code17d1_vcc_stale_scc_source.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "Wave64 dispatcher rejects an SCC placeholder after a mask-domain producer");
+
+    // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
+    // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
+    // SCC. A dispatcher placeholder at that read makes the instruction itself unrepresentable;
+    // its result cannot become a scalar-word certificate for the following exact VCC_LO write.
+    std::vector<uint32_t> code17d1_vcc_stale_scc_propagation = {
+        0x7d8800a1u,              // establish a genuine Wave64 VCC mask
+        0x876a816au,              // mask-domain logical poisons scalar SCC provenance
+        0xbf880000u,              // force dispatcher save/load before the SCC reader
+        0x85008081u,              // s_cselect_b32 s0,1,0 consumes the invalid SCC
+        0x876a8100u,              // VCC_LO = s0 & 1 must not certify the derived placeholder
+        0x7d840100u,              // complete VCC replacement
+    };
+    code17d1_vcc_stale_scc_propagation.insert(
+        code17d1_vcc_stale_scc_propagation.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(code17d1_vcc_stale_scc_propagation.data(),
+                            code17d1_vcc_stale_scc_propagation.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "Wave64 stale SCC cannot propagate through S_CSELECT into scalar provenance");
+    for (uint32_t carry_reader : {0x82008081u, 0x82808081u}) {
+        std::vector<uint32_t> mutated = code17d1_vcc_stale_scc_propagation;
+        mutated[3] = carry_reader; // same SCC-reader site: S_ADDC_U32 / S_SUBB_U32
+        CHECK(recompile_compute(mutated.data(), mutated.size(), nullptr,
+                                native_linear_cfg17d).empty(),
+              "Wave64 stale SCC cannot propagate through scalar carry arithmetic");
+    }
+    std::vector<uint32_t> code17d1_vcc_local_scc_propagation = {
+        0xbe8f0380u,              // establish a proved scalar source
+        0x7d8800a1u,              // unrelated live Wave64 mask
+        0xbf880000u,              // force dispatcher save/load
+        0xbf060f0fu,              // locally publish a valid scalar SCC
+        0x85008081u,              // s_cselect_b32 s0,1,0
+        0x876a8100u,              // VCC_LO = s0 & 1
+        0x7d840100u,              // complete VCC replacement
+    };
+    code17d1_vcc_local_scc_propagation.insert(
+        code17d1_vcc_local_scc_propagation.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_vcc_local_scc_propagation.data(),
+                             code17d1_vcc_local_scc_propagation.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 locally valid SCC propagates through S_CSELECT exactly");
+
+    // SOPK hides its scalar input in SDST, and wait-counter packets preserve both SGPRs and SCC.
+    // Keep the producer and consumer in different dispatcher cases so these pass only when the
+    // CFG transfer models the implicit source and the wait's register-transparent contract.
+    std::vector<uint32_t> code17d1_sopk_cmp_scc = {
+        0xbe800381u,              // s_mov_b32 s0,1
+        0xb1800001u,              // s_cmpk_eq_i32 s0,1 -> exact SCC
+        0xbbfd0000u,              // s_waitcnt_vscnt null,0 preserves SCC
+        0xbf880000u,              // force dispatcher save/load before the SCC reader
+        0x85018081u,              // s_cselect_b32 s1,1,0
+        0x7e020201u,              // v_mov_b32 v1,s1
+    };
+    code17d1_sopk_cmp_scc.insert(
+        code17d1_sopk_cmp_scc.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_sopk_cmp_scc.data(),
+                             code17d1_sopk_cmp_scc.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 CMPK SCC survives WAITCNT and a dispatcher reload");
+    std::vector<uint32_t> code17d1_sopk_cmp_unproved = code17d1_sopk_cmp_scc;
+    code17d1_sopk_cmp_unproved[1] =
+        0xb1820001u;              // same CMPK site reads unproved s2
+    CHECK(recompile_compute(code17d1_sopk_cmp_unproved.data(),
+                            code17d1_sopk_cmp_unproved.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "same-site CMPK mutation cannot certify an unproved implicit SDST source");
+
+    std::vector<uint32_t> code17d1_sopk_add_scc = {
+        0xbe8003ffu, 0x7fffffffu, // s_mov_b32 s0,INT_MAX
+        0xb7800001u,              // s_addk_i32 s0,1 -> signed-overflow SCC
+        0xbf880000u,              // force dispatcher save/load before the SCC reader
+        0x85018081u,              // s_cselect_b32 s1,1,0
+        0x7e020201u,              // v_mov_b32 v1,s1
+    };
+    code17d1_sopk_add_scc.insert(
+        code17d1_sopk_add_scc.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_sopk_add_scc.data(),
+                             code17d1_sopk_add_scc.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 ADDK publishes exact SCC across a dispatcher reload");
+    std::vector<uint32_t> code17d1_sopk_add_unproved = code17d1_sopk_add_scc;
+    code17d1_sopk_add_unproved[2] =
+        0xb7820001u;              // same ADDK site reads/writes unproved s2
+    CHECK(recompile_compute(code17d1_sopk_add_unproved.data(),
+                            code17d1_sopk_add_unproved.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "same-site ADDK mutation cannot publish SCC from an unproved implicit SDST");
+
+    // BFM_B64 does not modify SCC, while BFE_U64 publishes exact SCC only for an ordinary scalar
+    // destination. Both contracts must survive the dispatcher's separate SCC-validity transfer;
+    // retargeting the exact BFE site to VCC selects its mask lowering and must poison SCC instead.
+    std::vector<uint32_t> code17d1_bfm_b64_preserves_scc = {
+        0xbe800380u,              // s_mov_b32 s0,0
+        0xbf068000u,              // s_cmp_eq_u32 s0,0 -> SCC true
+        0x92848081u,              // s_bfm_b64 s[4:5],1,0 preserves SCC
+        0xbf880000u,              // force dispatcher reload
+        0x85018081u,              // observe SCC through s_cselect_b32
+        0x7e020201u,              // v_mov_b32 v1,s1
+    };
+    code17d1_bfm_b64_preserves_scc.insert(
+        code17d1_bfm_b64_preserves_scc.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_bfm_b64_preserves_scc.data(),
+                             code17d1_bfm_b64_preserves_scc.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 BFM_B64 preserves exact SCC across a dispatcher reload");
+    std::vector<uint32_t> code17d1_bfm_b64_scc_mutation =
+        code17d1_bfm_b64_preserves_scc;
+    code17d1_bfm_b64_scc_mutation[2] =
+        0x87848081u;              // same site becomes S_AND_B64 mask op with unproved SCC
+    CHECK(recompile_compute(code17d1_bfm_b64_scc_mutation.data(),
+                            code17d1_bfm_b64_scc_mutation.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "same-site B64 logical mutation cannot inherit BFM_B64's SCC-preserving contract");
+
+    std::vector<uint32_t> code17d1_bfe_u64_scc = {
+        0xbe800381u,              // s_mov_b32 s0,1
+        0xbe810380u,              // s_mov_b32 s1,0
+        0x9484ff00u, 0x00080020u, // s_bfe_u64 s[4:5],s[0:1],8:32 -> exact SCC
+        0xbf880000u,              // force dispatcher reload
+        0x85018081u,              // observe SCC through s_cselect_b32
+        0x7e020201u,              // v_mov_b32 v1,s1
+    };
+    code17d1_bfe_u64_scc.insert(
+        code17d1_bfe_u64_scc.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_bfe_u64_scc.data(),
+                             code17d1_bfe_u64_scc.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 scalar BFE_U64 publishes exact SCC across a dispatcher reload");
+    std::vector<uint32_t> code17d1_bfe_u64_vcc = code17d1_bfe_u64_scc;
+    code17d1_bfe_u64_vcc[2] =
+        0x94eaff00u;              // same BFE site targets VCC and poisons SCC
+    CHECK(recompile_compute(code17d1_bfe_u64_vcc.data(),
+                            code17d1_bfe_u64_vcc.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "same-site VCC BFE_U64 mutation cannot publish a scalar SCC fact");
+
+    // Ordinary scalar S_NOT writes exact SCC, but the supported Wave64 self-VCC form writes only a
+    // mask half and deliberately poisons SCC/scalar-data state. The reload plus following B32 VCC
+    // logical makes a false scalar certificate observable as a zero Function-variable placeholder.
+    std::vector<uint32_t> code17d1_scalar_not_scc = {
+        0xbe800380u,              // s_mov_b32 s0,0
+        0xbe800700u,              // s_not_b32 s0,s0 -> exact SCC
+        0xbf880000u,              // force dispatcher save/load before the SCC reader
+        0x85018081u,              // s_cselect_b32 s1,1,0
+        0x7e020201u,              // v_mov_b32 v1,s1
+    };
+    code17d1_scalar_not_scc.insert(
+        code17d1_scalar_not_scc.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_scalar_not_scc.data(),
+                             code17d1_scalar_not_scc.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 scalar S_NOT publishes exact SCC across a dispatcher reload");
+    std::vector<uint32_t> code17d1_scalar_not_unproved = code17d1_scalar_not_scc;
+    code17d1_scalar_not_unproved[1] =
+        0xbe820702u;              // same S_NOT site reads/writes unproved s2
+    CHECK(recompile_compute(code17d1_scalar_not_unproved.data(),
+                            code17d1_scalar_not_unproved.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "same-site scalar S_NOT mutation cannot publish SCC from an unproved word");
+    std::vector<uint32_t> code17d1_vcc_mask_not = {
+        0xbe800385u,              // s_mov_b32 s0,5
+        0x7d840000u,              // v_cmp_eq_u32 vcc,s0,v0: lane 5 only
+        0xbeea076au,              // s_not_b32 vcc_lo,vcc_lo: mask-half update, no scalar dword
+        0xbf880000u,              // force dispatcher reload of the physical VCC slots
+        0x876ac16au,              // s_and_b32 vcc_lo,vcc_lo,-1 remains mask-domain
+        0x7e02026au,              // materialize the resulting low mask dword
+        0xbefe04c1u,              // restore EXEC before the output store
+        0xe0702000u, 0x80020100u, // output[lane] = VCC_LO bits
+    };
+    code17d1_vcc_mask_not.insert(
+        code17d1_vcc_mask_not.end(), std::begin(code17d), std::end(code17d));
+    const std::vector<uint32_t> spv17d1_vcc_mask_not = recompile_compute(
+        code17d1_vcc_mask_not.data(), code17d1_vcc_mask_not.size(), &rt17d1,
+        native_linear_cfg17d);
+    CHECK(!spv17d1_vcc_mask_not.empty(),
+          "Wave64 self-VCC S_NOT recompiles with mask semantics");
+    const bool can_execute_vcc_mask_not = can_execute_exec_ballot &&
+        (exec_ballot_subgroup.operations & VK_SUBGROUP_FEATURE_VOTE_BIT);
+    if (can_execute_vcc_mask_not && !spv17d1_vcc_mask_not.empty()) {
+        std::vector<uint32_t> got17d1_vcc_mask_not;
+        prosper::test::run_compute(
+            spv17d1_vcc_mask_not, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0), &got17d1_vcc_mask_not);
+        CHECK(got17d1_vcc_mask_not.size() == 64 &&
+                  std::all_of(got17d1_vcc_mask_not.begin(),
+                              got17d1_vcc_mask_not.end(),
+                              [](uint32_t value) { return value == 0xffffffdfu; }),
+              "Wave64 self-VCC S_NOT keeps mask semantics across a dispatcher reload");
+    } else {
+        std::printf("  [skip] self-VCC S_NOT execution: host subgroup is %u or lacks ballot/vote\n",
+                    exec_ballot_subgroup.size);
+    }
+    std::vector<uint32_t> code17d1_vcc_scalar_not_mutation = code17d1_vcc_mask_not;
+    code17d1_vcc_scalar_not_mutation[2] =
+        0xbeea03c1u;              // same site becomes s_mov_b32 vcc_lo,-1 scalar data
+    CHECK(!recompile_compute(code17d1_vcc_scalar_not_mutation.data(),
+                             code17d1_vcc_scalar_not_mutation.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "same-site scalar VCC_LO mutation keeps the S_NOT mask guard load-bearing");
+
+    // A native Wave64 S_MOV_B64 can materialize both VCC's Bool mask and scalar ballot words. Once
+    // that scalar word exists, the identical self-VCC S_NOT packet follows emit_alu's scalar path
+    // and publishes an exact SCC; the dispatcher transfer must not guess mask semantics merely from
+    // the coexisting Bool. The same S_NOT opcode with an unproved source remains fail-closed.
+    std::vector<uint32_t> code17d1_vcc_dual_scalar_not = {
+        0xbe800385u,              // s_mov_b32 s0,5
+        0x7d840000u,              // v_cmp_eq_u32 vcc,s0,v0
+        0xbeea046au,              // s_mov_b64 vcc,vcc materializes ballot words too
+        0xbeea076au,              // scalar self-VCC S_NOT writes exact SCC
+        0xbf880000u,              // force dispatcher reload
+        0x85018081u,              // observe SCC through s_cselect_b32
+        0x7e020201u,              // v_mov_b32 v1,s1
+    };
+    code17d1_vcc_dual_scalar_not.insert(
+        code17d1_vcc_dual_scalar_not.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(code17d1_vcc_dual_scalar_not.data(),
+                             code17d1_vcc_dual_scalar_not.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "dual-domain self-VCC S_NOT retains scalar SCC across a dispatcher reload");
+    std::vector<uint32_t> code17d1_vcc_dual_not_unproved =
+        code17d1_vcc_dual_scalar_not;
+    code17d1_vcc_dual_not_unproved[3] =
+        0xbeea0702u;              // same S_NOT site reads unproved s2
+    CHECK(recompile_compute(code17d1_vcc_dual_not_unproved.data(),
+                            code17d1_vcc_dual_not_unproved.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "same-site dual-domain S_NOT mutation cannot certify an unproved source");
 
     // GTA 0x205b658800 spills EXEC_LO/HI through v31 lanes 5/6, then restores each as ordinary
     // scalar data for V_AND_B32. The dispatcher Bool slots retain the mask value but not its physical
@@ -2379,6 +2639,112 @@ int main() {
                     subgroup17d1.size);
     }
 
+    // GTA V 0x413cf6100 saves VCC into s[0:1], carries that pair unchanged through structured
+    // joins/loops, then reduces it with `s_ff1_i32_b64 vcc_lo,s[0:1]`. Native Wave64 keeps both
+    // a Bool mask and materialized ballot dwords for the saved pair, so map presence alone is
+    // ambiguous. The exact-consumer MUST proof selects the Bool view only when every CFG path
+    // retains the original complete pair.
+    const uint32_t code17d1b_structured_saved[] = {
+        0xbe8003a8u,              // s_mov_b32 s0,40
+        0x7d840000u,              // v_cmp_eq_u32 vcc,s0,v0: sole hit at lane 40
+        0xbe80046au,              // s_mov_b64 s[0:1],vcc: exact saved-mask generator
+        0xbe940380u,              // s_mov_b32 s20,0 (induction variable)
+        0xbe950382u,              // s_mov_b32 s21,2 (trip count)
+        0xbf0a1514u,              // loop: s_cmp_lt_u32 s20,s21
+        0xbf840003u,              // s_cbranch_scc0 +3 -> reduction
+        0xbe8c0381u,              // harmless scalar write inside the loop
+        0x81148114u,              // s_add_i32 s20,s20,1
+        0xbf82fffbu,              // s_branch -5 -> loop header
+        0xbeea1400u,              // exact GTA form: s_ff1_i32_b64 vcc_lo,s[0:1]
+        0xbe84036au,              // copy the scalar result before replacing EXEC
+        0xbefe04c1u,              // restore full EXEC
+        0x7e020204u,              // v_mov_b32 v1,s4
+        0xe0702000u, 0x80020100u, // output[lane] = first set bit
+        0xbf810000u,
+    };
+    const std::vector<uint32_t> spv17d1b_structured_saved = recompile_compute(
+        code17d1b_structured_saved, std::size(code17d1b_structured_saved), &rt17d1,
+        native_cfg17d1b);
+    CHECK(!spv17d1b_structured_saved.empty(),
+          "structured Wave64 loop preserves a saved VCC pair through S_FF1");
+    std::vector<uint32_t> code17d1b_structured_site_mutated(
+        std::begin(code17d1b_structured_saved), std::end(code17d1b_structured_saved));
+    code17d1b_structured_site_mutated[10] =
+        0xbeea1402u;              // same S_FF1 site reads unproved s[2:3]
+    CHECK(recompile_compute(code17d1b_structured_site_mutated.data(),
+                            code17d1b_structured_site_mutated.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "same-site S_FF1 source mutation remains fail-visible");
+    std::vector<uint32_t> code17d1b_structured_overwrite(
+        std::begin(code17d1b_structured_saved), std::end(code17d1b_structured_saved));
+    code17d1b_structured_overwrite[7] =
+        0xbe800380u;              // same loop-body site overwrites one saved-mask half
+    CHECK(recompile_compute(code17d1b_structured_overwrite.data(),
+                            code17d1b_structured_overwrite.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "a loop-carried half overwrite invalidates the saved-mask S_FF1 proof");
+    std::vector<uint32_t> code17d1b_structured_scalar_vcc(
+        std::begin(code17d1b_structured_saved), std::end(code17d1b_structured_saved));
+    code17d1b_structured_scalar_vcc[1] =
+        0xbeea0481u;              // same producer PC writes scalar data into VCC before the copy
+    CHECK(recompile_compute(code17d1b_structured_scalar_vcc.data(),
+                            code17d1b_structured_scalar_vcc.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "a scalar VCC producer cannot certify the unchanged S_MOV/S_FF1 saved-mask chain");
+    if (can_execute17d1b && !spv17d1b_structured_saved.empty()) {
+        std::vector<uint32_t> got17d1b_structured_saved;
+        prosper::test::run_compute(
+            spv17d1b_structured_saved, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0), &got17d1b_structured_saved);
+        uint32_t bad17d1b_structured_saved = 0;
+        for (uint32_t lane = 0;
+             lane < 64 && got17d1b_structured_saved.size() == 64; ++lane)
+            bad17d1b_structured_saved += got17d1b_structured_saved[lane] != 40u;
+        CHECK(got17d1b_structured_saved.size() == 64 &&
+                  bad17d1b_structured_saved == 0,
+              "structured saved-mask S_FF1 returns lane 40 for every invocation");
+    } else {
+        std::printf("  [skip] structured saved-mask s_ff1 execution: host subgroup is %u or lacks vote/arithmetic\n",
+                    subgroup17d1.size);
+    }
+
+    // S_BCNT consumes the same structured saved-mask proof independently of S_FF1. Keep the exact
+    // loop/join and change only the reduction/consumer sites: the high-half lane-40 predicate must
+    // count as one, while either an unproved source or a loop-carried half overwrite must reject.
+    std::vector<uint32_t> code17d1b_structured_bcnt(
+        std::begin(code17d1b_structured_saved), std::end(code17d1b_structured_saved));
+    code17d1b_structured_bcnt[10] =
+        0xbe841000u;              // s_bcnt1_i32_b64 s4,s[0:1]
+    code17d1b_structured_bcnt[11] =
+        0xbf800000u;              // s_nop 0: result already resides in s4
+    const std::vector<uint32_t> spv17d1b_structured_bcnt = recompile_compute(
+        code17d1b_structured_bcnt.data(), code17d1b_structured_bcnt.size(), &rt17d1,
+        native_cfg17d1b);
+    CHECK(!spv17d1b_structured_bcnt.empty(),
+          "structured Wave64 loop preserves a saved VCC pair through S_BCNT");
+    std::vector<uint32_t> code17d1b_structured_bcnt_site =
+        code17d1b_structured_bcnt;
+    code17d1b_structured_bcnt_site[10] =
+        0xbe841002u;              // same S_BCNT site reads unproved s[2:3]
+    CHECK(recompile_compute(code17d1b_structured_bcnt_site.data(),
+                            code17d1b_structured_bcnt_site.size(), &rt17d1,
+                            native_cfg17d1b).empty(),
+          "same-site S_BCNT source mutation remains fail-visible");
+    if (can_execute17d1b && !spv17d1b_structured_bcnt.empty()) {
+        std::vector<uint32_t> got17d1b_structured_bcnt;
+        prosper::test::run_compute(
+            spv17d1b_structured_bcnt, std::vector<float>(64, 0.0f), 64, 64, {},
+            std::vector<uint32_t>(64, 0), &got17d1b_structured_bcnt);
+        CHECK(got17d1b_structured_bcnt.size() == 64 &&
+                  std::all_of(got17d1b_structured_bcnt.begin(),
+                              got17d1b_structured_bcnt.end(),
+                              [](uint32_t value) { return value == 1u; }),
+              "structured saved-mask S_BCNT counts the lane-40 predicate exactly");
+    } else {
+        std::printf("  [skip] structured saved-mask s_bcnt execution: host subgroup is %u or lacks arithmetic\n",
+                    subgroup17d1.size);
+    }
+
     // VCC is the third admitted complete-mask source.  This structural arm is intentionally
     // separate from the two exact GTA words above so the resolver cannot accidentally cover only
     // EXEC and saved SGPR pairs.
@@ -2770,8 +3136,10 @@ int main() {
     // A dedicated VCC Bool variable is a value, not proof that both physical VCC words still hold
     // that mask. A scalar write to VCC_HI kills the pair lifetime, and a path that may bypass that
     // write leaves the join ambiguous. Both shapes must stay out of the mask-vote specialization
-    // instead of voting stale predicate state. These negatives exercise the same Wave64 MUST-domain
-    // proof as the admission.
+    // instead of voting stale predicate state. Once SCC validity is tracked across dispatcher
+    // blocks, the half-overwrite also cannot fall through to a lane-local scalar comparison: its
+    // result would not be the wave-uniform architectural SCC consumed by the following branch.
+    // These negatives exercise the same Wave64 MUST-domain proof as the admission.
     std::vector<uint32_t> code17d2v_high_overwrite(
         std::begin(code17d2v), std::end(code17d2v));
     code17d2v_high_overwrite.insert(
@@ -2782,14 +3150,10 @@ int main() {
     const auto native_high_overwrite = recompile_compute(
         code17d2v_high_overwrite.data(), code17d2v_high_overwrite.size(), nullptr,
         native_cfg17d);
-    CHECK(!portable_high_overwrite.empty() &&
-              count_spirv_opcode(portable_high_overwrite, 224) ==
-                  count_spirv_opcode(spv17d, 224),
-          "portable VCC-vs-zero does not vote stale VCC after a scalar high-half overwrite");
-    CHECK(!native_high_overwrite.empty() &&
-              count_spirv_opcode(native_high_overwrite, 335) ==
-                  count_spirv_opcode(native_spv17d, 335),
-          "native VCC-vs-zero does not vote stale VCC after a scalar high-half overwrite");
+    CHECK(portable_high_overwrite.empty(),
+          "portable VCC-vs-zero rejects a scalar high-half overwrite before SCC use");
+    CHECK(native_high_overwrite.empty(),
+          "native VCC-vs-zero rejects a scalar high-half overwrite before SCC use");
 
     std::vector<uint32_t> code17d2v_ambiguous_join(
         std::begin(code17d2v), std::end(code17d2v));
