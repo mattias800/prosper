@@ -2555,6 +2555,82 @@ int main() {
     }
     printf("  [ok]   GTA B64 mask SCC survives only the exact SCC-preserving S_MOV_B64\n");
 
+    // GTA V 0x413e1c300 reaches pc22 through the compact structured emitter. V_READFIRSTLANE has
+    // definitely established scalar VCC_HI on that exact path, while the scalar prefix computes
+    // VCC_LO before S_CSELECT_B32 replaces it. Map presence is therefore the compact emitter's
+    // path-local lifetime proof; the dispatcher's Function-variable placeholders must continue to
+    // require its separate whole-CFG MUST fact. Retain one forward SCC region so this exercises
+    // structured emission rather than merely accepting the packet in a straight-line shader.
+    std::vector<uint32_t> gta_structured_vcc_scalar_pair = {
+        0xbfa00003u,
+        0x8f090681u,
+        0xbe880300u,
+        0x7e020c09u,
+        0x81ea0980u,
+        0xbe8a0302u,
+        0xbe8b03ffu, 0x00016204u,
+        0xbe900380u,
+        0x7e025701u,
+        0x100202ffu, 0x4f7ffffeu,
+        0x7e020f01u,
+        0x7ed60501u,                         // pc13: scalar VCC_HI definition
+        0x936a6b6au,
+        0x9aea6b6au,
+        0x816a6a6bu,
+        0x9aeb076au,
+        0x8f6a066bu,
+        0x80806a07u,
+        0xbf090900u,
+        0xbf800000u,
+        0x856a8081u,                         // exact pc22: s_cselect_b32 vcc_lo,1,0
+        0xbf840001u,                         // pc23: structured SCC arm -> pc25
+        0x7e000280u,
+        0x02020100u,                         // pc25: consume the complete VCC predicate
+        0xbf810000u,
+    };
+    ComputeShaderConfig gta_structured_vcc_config = portable_wave64_compute_config;
+    gta_structured_vcc_config.local_x = 64;
+    gta_structured_vcc_config.native_subgroup_size = 64;
+    const auto gta_structured_vcc_scalar_pair_spv = recompile_compute(
+        gta_structured_vcc_scalar_pair.data(), gta_structured_vcc_scalar_pair.size(), nullptr,
+        gta_structured_vcc_config);
+    if (gta_structured_vcc_scalar_pair_spv.empty() ||
+        !has_opcode(gta_structured_vcc_scalar_pair_spv, 247) || // OpSelectionMerge
+        has_opcode(gta_structured_vcc_scalar_pair_spv, 251) ||  // no CFG dispatcher
+        !type_result_ids_are_nonzero(gta_structured_vcc_scalar_pair_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_structured_vcc_scalar_pair_spv)) {
+        printf("  [FAIL] GTA structured CSELECT did not retain its path-local scalar VCC pair\n");
+        return 1;
+    }
+    gta_structured_vcc_scalar_pair[22] =
+        0x856a806bu;                         // same pc22 site: scalar inline source -> VCC_HI
+    if (!recompile_compute(gta_structured_vcc_scalar_pair.data(),
+                           gta_structured_vcc_scalar_pair.size(), nullptr,
+                           gta_structured_vcc_config).empty()) {
+        printf("  [FAIL] GTA structured CSELECT admitted a same-site mask-source mutation\n");
+        return 1;
+    }
+
+    // A structured merge may materialize zero for an SGPR that exists on only one predecessor.
+    // That representation is deliberately not a scalar-lifetime proof: if the arm is skipped,
+    // hardware retains the prior physical VCC_HI bits rather than defining scalar zero.
+    const uint32_t gta_structured_vcc_placeholder_join[] = {
+        0xbf060000u,                         // pc0: establish SCC
+        0xbf840001u,                         // pc1: one-arm structured branch -> pc3
+        0x7ed60500u,                         // pc2: only this arm defines scalar VCC_HI
+        0xbf060000u,                         // pc3: re-arm SCC for CSELECT
+        0x856a8081u,                         // pc4: exact packet must not trust the merge zero
+        0x02020100u,                         // pc5: keep VCC_HI live (not a low-only exception)
+        0xbf810000u,
+    };
+    if (!recompile_compute(gta_structured_vcc_placeholder_join,
+                           std::size(gta_structured_vcc_placeholder_join), nullptr,
+                           gta_structured_vcc_config).empty()) {
+        printf("  [FAIL] structured merge placeholder became a scalar VCC_HI lifetime\n");
+        return 1;
+    }
+    printf("  [ok]   GTA structured CSELECT uses only a path-local complete scalar VCC pair\n");
+
     // GTA V's compute culling kernels execute this exact in-place V_FFBH_U32 e32 packet inside
     // crossing control flow. Replace the SCC-preserving VALU in the proven Wave64 dispatcher
     // fixture, retaining every branch offset, and require the real FindUMsb lowering to be present.
