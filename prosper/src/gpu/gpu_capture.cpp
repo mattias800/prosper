@@ -115,7 +115,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // must not silently compile a sorted guest descriptor with the historical physical-child order.
 // v49 (#2481): retain the exact linear stride-8 qword-atomic record count. Size/stride alone do not
 // preserve the descriptor's OOB_SELECT proof, which controls the all-or-nothing record range check.
-constexpr uint32_t kVersion = 49;
+// v50 (#2481): retain COMPUTE_PGM_RSRC1 in every exact compute recompile configuration. FP32 memory
+// and LDS atomics consume its denormal mode; older artifacts leave the state explicitly unknown.
+constexpr uint32_t kVersion = 50;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -278,6 +280,8 @@ bool read_compute_config(Reader& r, ComputeShaderConfig& config, uint32_t captur
         !r.u32(config.lds_bytes) || !r.u32(config.native_subgroup_size) ||
         !r.u32(config.native_storage_format_support))
         return false;
+    if (capture_version < 50)
+        config.compute_pgm_rsrc1 = UINT32_MAX;
     config.exact_thread_extent = exact != 0;
     config.tgid_x_en = (flags & 1u) != 0;
     config.tgid_y_en = (flags & 2u) != 0;
@@ -1300,6 +1304,50 @@ bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
                                    "invalid compute recompile state", error);
 }
 
+bool captured_compute_has_null_guarded_raw_store(
+        const GpuCapturedCompute& compute) {
+    return compute.resources.present &&
+        std::any_of(compute.resources.resources.begin(),
+                    compute.resources.resources.end(),
+                    [](const GpuCapturedResource& captured) {
+                        return is_proven_null_guarded_raw_store(captured.resource);
+                    });
+}
+
+bool validate_captured_null_guarded_raw_store(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!captured_compute_has_null_guarded_raw_store(compute)) return true;
+    if (!compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        error = "guarded-null store marker lacks raw recompile provenance";
+        return false;
+    }
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    const auto& user = compute.recompile_config.user_sgprs;
+    if (!rdna2_gta5_null_guarded_raw_store_dispatch(
+            raw.data(), raw.size(), user.data(), user.size())) {
+        error = "guarded-null store marker has stale shader or dispatch provenance";
+        return false;
+    }
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        const ShaderResource& marker = captured.resource;
+        if (!is_proven_null_guarded_raw_store(marker)) continue;
+        if (marker.fetch_pc >= raw.size()) {
+            error = "guarded-null store marker has stale shader or dispatch provenance";
+            return false;
+        }
+        Rdna2Inst site = rdna2_decode_one(raw.data() + marker.fetch_pc,
+                                         raw.size() - marker.fetch_pc);
+        site.pc = marker.fetch_pc;
+        if (!rdna2_gta5_null_guarded_raw_store_site(site)) {
+            error = "guarded-null store marker has stale shader or dispatch provenance";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
     if (capture.raw_shader_versions.size() > kMaxResources ||
         capture.failure_diagnostics.size() > kMaxOperations) {
@@ -1335,12 +1383,15 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
     }
     for (const auto& compute : capture.computes) {
         if (!validate_compute_recompile_state(compute, error)) return false;
-        if (compute.raw_shader_index == 0xFFFFFFFFu) continue;
-        if (compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        if (compute.raw_shader_index != 0xFFFFFFFFu &&
+            compute.raw_shader_index >= capture.raw_shader_versions.size()) {
             error = "realized compute references an invalid raw shader";
             return false;
         }
-        raw_referenced[compute.raw_shader_index] = true;
+        if (!validate_captured_null_guarded_raw_store(capture, compute, error))
+            return false;
+        if (compute.raw_shader_index != 0xFFFFFFFFu)
+            raw_referenced[compute.raw_shader_index] = true;
     }
     for (const auto& diagnostic : capture.failure_diagnostics) {
         if (diagnostic.kind > SubmitOperationKind::Dispatch ||
@@ -2739,6 +2790,27 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             write_atomic_x2_state(stage.resource_table);
+    // v50 retains the launch register only for configurations that exist. Keep this append-only:
+    // COMPUTE_PGM_RSRC1 became semantically necessary after v42 embedded the config records, and
+    // inserting it into those historical records would make every v42-v49 suffix non-removable.
+    uint64_t compute_pgm_rsrc1_count = 0;
+    for (const auto& compute : c.computes)
+        compute_pgm_rsrc1_count += compute.recompile_config_available;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            compute_pgm_rsrc1_count += stage.recompile_config_available;
+    if (compute_pgm_rsrc1_count > UINT32_MAX) {
+        error = "invalid compute PGM_RSRC1 state count";
+        return false;
+    }
+    w.u32(static_cast<uint32_t>(compute_pgm_rsrc1_count));
+    for (const auto& compute : c.computes)
+        if (compute.recompile_config_available)
+            w.u32(compute.recompile_config.compute_pgm_rsrc1);
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (stage.recompile_config_available)
+                w.u32(stage.recompile_config.compute_pgm_rsrc1);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3965,6 +4037,28 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     return false;
                 }
     }
+    if (version >= 50) {
+        size_t expected = 0;
+        for (const auto& compute : c.computes)
+            expected += compute.recompile_config_available;
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.recompile_config_available;
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid compute PGM_RSRC1 state count";
+            return false;
+        }
+        for (auto& compute : c.computes)
+            if (compute.recompile_config_available &&
+                !r.u32(compute.recompile_config.compute_pgm_rsrc1))
+                return false;
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (stage.recompile_config_available &&
+                    !r.u32(stage.recompile_config.compute_pgm_rsrc1))
+                    return false;
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -4095,6 +4189,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     }
     out.computes.reserve(c.computes.size());
     for (const auto& x : c.computes) {
+        if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
         ComputeItem compute;
         compute.spirv = x.spirv;
         compute.launch = x.launch;
@@ -4106,6 +4201,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.raw_shader_index = x.raw_shader_index;
         compute.recompile_config = x.recompile_config;
         compute.recompile_config_available = x.recompile_config_available;
+        compute.null_guarded_raw_store_validated =
+            captured_compute_has_null_guarded_raw_store(x);
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
         if (!table(x.resources, compute.resources)) return false;

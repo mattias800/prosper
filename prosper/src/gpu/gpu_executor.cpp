@@ -298,6 +298,8 @@ struct ShaderResourceCompileKey {
     bool bvh_sort_enabled = false;
     bool null_bvh = false;
     bool zero_record_raw = false;
+    bool optional_null_raw_load = false;
+    bool proven_null_guarded_raw_store = false;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -331,6 +333,7 @@ struct ShaderCompileKey {
     bool compute_exact_thread_extent = false;
     uint32_t compute_threads_x = 0, compute_threads_y = 0, compute_threads_z = 0;
     uint32_t compute_wave_size = 64;
+    uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
     uint32_t compute_tidig_comp_cnt = 0;
     bool compute_tgid_x_en = false, compute_tgid_y_en = false, compute_tgid_z_en = false;
     bool compute_tg_size_en = false;
@@ -379,6 +382,7 @@ struct ShaderCompileKey {
                compute_threads_y == other.compute_threads_y &&
                compute_threads_z == other.compute_threads_z &&
                compute_wave_size == other.compute_wave_size &&
+               compute_pgm_rsrc1 == other.compute_pgm_rsrc1 &&
                compute_tidig_comp_cnt == other.compute_tidig_comp_cnt &&
                compute_tgid_x_en == other.compute_tgid_x_en &&
                compute_tgid_y_en == other.compute_tgid_y_en &&
@@ -445,6 +449,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_threads_y);
             hash = hash_mix(hash, key.compute_threads_z);
             hash = hash_mix(hash, key.compute_wave_size);
+            hash = hash_mix(hash, key.compute_pgm_rsrc1);
             hash = hash_mix(hash, key.compute_tidig_comp_cnt);
             hash = hash_mix(hash, key.compute_tgid_x_en);
             hash = hash_mix(hash, key.compute_tgid_y_en);
@@ -489,6 +494,8 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.bvh_sort_enabled);
             hash = hash_mix(hash, resource.null_bvh);
             hash = hash_mix(hash, resource.zero_record_raw);
+            hash = hash_mix(hash, resource.optional_null_raw_load);
+            hash = hash_mix(hash, resource.proven_null_guarded_raw_store);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1109,6 +1116,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         key.compute_threads_y = compute_config->threads_y;
         key.compute_threads_z = compute_config->threads_z;
         key.compute_wave_size = compute_config->wave_size;
+        key.compute_pgm_rsrc1 = compute_config->compute_pgm_rsrc1;
         key.compute_tidig_comp_cnt = compute_config->tidig_comp_cnt;
         key.compute_tgid_x_en = compute_config->tgid_x_en;
         key.compute_tgid_y_en = compute_config->tgid_y_en;
@@ -1233,6 +1241,12 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             // into zero-producing/no-op instructions. Partition exactly this proven marker so a
             // later nonzero descriptor at the same pc cannot reuse the specialized module.
             compiled.zero_record_raw = is_zero_record_raw_buffer(resource);
+            compiled.optional_null_raw_load = is_optional_null_raw_load_buffer(resource);
+            // This marker elides a real one-record store, unlike NUM_RECORDS=0. Keep the admission
+            // result explicit even though its impossible V# stride also differs, so cache identity
+            // documents and enforces the semantic boundary directly.
+            compiled.proven_null_guarded_raw_store =
+                is_proven_null_guarded_raw_store(resource);
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1525,6 +1539,16 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         const ComputeShaderConfig& config, uint64_t* cache_identity,
         RecompileDiagnosticContext diagnostic) {
     if (cache_identity) *cache_identity = 0;
+    const bool has_null_guarded_raw_store = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_proven_null_guarded_raw_store);
+    // Push-constant values intentionally stay out of the general compute cache key. Conditional
+    // store elision is the exception: validate its raw shader and exact dispatch before even looking
+    // in the cache, so a warm null-dispatch module cannot be returned for changed s2:s3.
+    if (has_null_guarded_raw_store &&
+        !rdna2_gta5_null_guarded_raw_store_dispatch(
+            code, dwords, config.user_sgprs.data(), config.user_sgprs.size()))
+        return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
         nullptr, 0, 0, &config);
@@ -2024,6 +2048,14 @@ bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc
     return false;
 }
 
+bool gta5_null_raw_store_descriptor(const std::array<uint32_t, 4>& descriptor) {
+    // Exact live null V#: base=0, stride=56, one record, 56 bytes, OOB_SELECT=0, TYPE=0 and no
+    // swizzled-address controls. A non-null dispatch changes the base words and stays on the ordinary
+    // materialized-buffer path.
+    return descriptor == std::array<uint32_t, 4>{
+        0x00000000u, 0x00380000u, 0x00000001u, 0x00016204u};
+}
+
 // The x16-header null proof deliberately accepts one observed straight-line descriptor builder, not
 // a general scalar phi analysis. Every instruction that carries the root from its mapped load to the
 // ray must therefore execute whenever the ray does. Reject a branch inside that interval, or any
@@ -2117,6 +2149,17 @@ static uint32_t exact_atomic_x2_record_count(
     return exact ? descriptor.num_records : 0u;
 }
 
+static bool gta_optional_null_descriptor_shape(
+        const DecodedBufferDescriptor& descriptor, const uint32_t words[4]) {
+    return words[0] == 0u && words[1] == kGtaOptionalBufferStrideWord &&
+           words[2] != 0u && words[3] == kGtaOptionalBufferConfigWord &&
+           descriptor.base == 0u && descriptor.stride == kGtaOptionalBufferStride &&
+           descriptor.num_records == words[2] &&
+           descriptor.size_bytes == static_cast<uint64_t>(words[2]) *
+                                        kGtaOptionalBufferStride &&
+           descriptor.size_bytes <= 0x10000000u;
+}
+
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
@@ -2152,6 +2195,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
         fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
+    const bool gta5_null_raw_store_guard = pcrel_dispatch_target == UINT32_MAX &&
+        rdna2_gta5_null_guarded_raw_store_shader(code, dwords);
 
     auto readable = [&](uint64_t addr, uint32_t bytes) {
         if (!profile_fold) return guest_readable(addr, bytes);
@@ -2214,6 +2259,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::array<uint32_t, kFoldSgprs> null_chain_origin{};
     std::bitset<kFoldSgprs> null_chain_known;
     uint32_t next_null_chain_origin = 0;
+    // Semantic provenance for GTA V's mapped optional table entry. Generic mapped zero qwords keep
+    // their existing null-chain identity, but only the exact s0:s1 + 0x58 producer may attach these
+    // descriptor roles and eventually publish a nonzero-record zero-read candidate.
+    enum class OptionalNullRole : uint8_t { None, BaseLo, BaseHi, RecordCount, Config };
+    std::array<OptionalNullRole, kFoldSgprs> optional_null_role{};
+    // Producer PC per tagged origin. The exact location lets the optional proof impose a narrow
+    // dominance contract over direct CFG instead of trusting this fold's linear walk.
+    std::vector<uint32_t> optional_table_null_origin_pc(1u, UINT32_MAX);
     // Only x16-header roots need the narrow straight-line dominance contract added for GTA V. The
     // generic mapped-qword null proof predates this shape and has separate loop/CFG validation.
     // Origin ids are monotonic and never restored, so this metadata is immutable once published.
@@ -2253,6 +2306,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         vector_index_mode[8] = VertexFetchIndexMode::Instance;
     }
     int scc = -1;   // tracked SCC (-1 unknown): set by s_cmp_*, consumed by s_cselect (the format patch's tail)
+    bool gta5_null_pointer_at_guard = false;
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
     auto valid_reg = [](int r) { return r >= 0 && r < (int)kFoldSgprs; };
@@ -2299,6 +2353,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
+            optional_null_role[(size_t)r] = OptionalNullRole::None;
             bvh_build_origin[(size_t)r] = 0;
             bvh_build_role[(size_t)r] = BvhBuildRole::None;
             mask_state[(size_t)r] = FoldMask::Unknown;
@@ -2313,6 +2368,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
+            optional_null_role[(size_t)r] = OptionalNullRole::None;
             bvh_build_origin[(size_t)r] = 0;
             bvh_build_role[(size_t)r] = BvhBuildRole::None;
             mask_state[(size_t)r] = FoldMask::Unknown;
@@ -2458,6 +2514,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr8_key_known;
         std::array<uint32_t, kFoldSgprs> null_chain_origin;
         std::bitset<kFoldSgprs> null_chain_known;
+        std::array<OptionalNullRole, kFoldSgprs> optional_null_role;
         uint32_t null_count_carry_origin;
         std::array<uint32_t, kFoldSgprs> bvh_build_origin;
         std::array<BvhBuildRole, kFoldSgprs> bvh_build_role;
@@ -2499,6 +2556,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
         s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
+        s.optional_null_role = optional_null_role;
         s.null_count_carry_origin = null_count_carry_origin;
         s.bvh_build_origin = bvh_build_origin; s.bvh_build_role = bvh_build_role;
         s.bvh_count_carry_origin = bvh_count_carry_origin;
@@ -2516,6 +2574,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
         null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
+        optional_null_role = s.optional_null_role;
         null_count_carry_origin = s.null_count_carry_origin;
         bvh_build_origin = s.bvh_build_origin; bvh_build_role = s.bvh_build_role;
         bvh_count_carry_origin = s.bvh_count_carry_origin;
@@ -2562,6 +2621,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         null_chain_origin[(size_t)r] = origin;
         null_chain_known.set((size_t)r);
     };
+    auto mark_optional_null_role = [&](int r, OptionalNullRole role) {
+        if (role != OptionalNullRole::None && valid_reg(r))
+            optional_null_role[(size_t)r] = role;
+    };
     auto mark_bvh_build = [&](int r, uint32_t origin, BvhBuildRole role) {
         if (!origin || role == BvhBuildRole::None || !valid_reg(r)) return;
         bvh_build_origin[(size_t)r] = origin;
@@ -2580,6 +2643,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             valid_reg(operand.value))
             return null_origin(operand.value);
         return 0u;
+    };
+    auto operand_optional_null_role = [&](const Operand& operand) -> OptionalNullRole {
+        if ((operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
+            valid_reg(operand.value))
+            return optional_null_role[(size_t)operand.value];
+        return OptionalNullRole::None;
     };
     auto unchanged_seed_range = [&](int first, int count) {
         if (!untouched_seed_range(first, count)) return false;
@@ -2715,6 +2784,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 saved_at_branch[slot->second].second = capture_fold_state();
             }
         }
+        if (gta5_null_raw_store_guard && in.pc == 42u) {
+            uint32_t pointer_lo = 0, pointer_hi = 0;
+            gta5_null_pointer_at_guard = known(2, pointer_lo) && known(3, pointer_hi) &&
+                                         pointer_lo == 0u && pointer_hi == 0u;
+        }
         const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
                                   (in.opcode == 0x360 || in.opcode == 0x361);
         const bool vector_select =
@@ -2746,7 +2820,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             // definition and IMAGE_LOAD_MIP; treating that scalar VOP2 as a four-dword memory
             // payload erased the unrelated live mip proof. Wide MIMG/buffer/VALU results still
             // clear every register in their shared audited result-width inventory.
-            if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x42u) {
+            if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
                 // v_movreld_b32 writes VGPR[VDST+M0]. M0 is not tracked by this proof, so no
                 // individual zero fact is safe across the dynamic destination write. Keep this
                 // separate from the consecutive-width inventory; CFG phi discovery models the
@@ -2772,7 +2846,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         }
         switch (in.fmt) {
             case Rdna2Format::SOP1:
-                if (in.opcode == 0x03) {                        // s_mov_b32
+                if (in.opcode == kSop1OpcodeMovB32) {            // s_mov_b32
                     uint32_t v, source_key = 0;
                     const uint32_t source_null_origin = operand_null_origin(in.src[0]);
                     const bool source_key_known =
@@ -2796,6 +2870,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         }
                     } else forget(in.dst.value);
                     mark_null_origin(in.dst.value, source_null_origin);
+                    if (in.dst.kind == OperandKind::SGPR &&
+                        in.src[0].kind == OperandKind::Literal &&
+                        in.literal == kGtaOptionalBufferConfigWord)
+                        mark_optional_null_role(in.dst.value, OptionalNullRole::Config);
                 } else if (in.opcode == 0x34) {                 // s_abs_i32
                     // This is a 32-bit destination. Treating every unmodeled SOP1 as a possible
                     // 64-bit pair write erased the untouched adjacent SGPR; Astro Bot keeps the
@@ -2822,6 +2900,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         ? bvh_build_origin[(size_t)in.dst.value] : 0u;
                     const BvhBuildRole old_bvh_role = valid_reg(in.dst.value)
                         ? bvh_build_role[(size_t)in.dst.value] : BvhBuildRole::None;
+                    const OptionalNullRole old_optional_role = valid_reg(in.dst.value)
+                        ? optional_null_role[(size_t)in.dst.value] : OptionalNullRole::None;
                     const bool old_known = known(in.dst.value, old_value);
                     const bool bit_known = in.src[0].kind == OperandKind::Literal
                         ? (bit_index = in.literal, true) : srcval(in.src[0], bit_index);
@@ -2833,6 +2913,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         forget(in.dst.value);
                     }
                     mark_null_origin(in.dst.value, old_null_origin);
+                    if (in.opcode == kSop1OpcodeBitset1B32 && bit_known && bit_index == 18u &&
+                        old_optional_role == OptionalNullRole::BaseHi)
+                        mark_optional_null_role(in.dst.value, OptionalNullRole::BaseHi);
                     if (in.opcode == 0x1d && bit_known && bit_index == 31u &&
                         old_bvh_role == BvhBuildRole::BaseHi)
                         mark_bvh_build(in.dst.value, old_bvh_origin,
@@ -2936,7 +3019,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
                 // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
-                if (in.opcode != 0x03 && in.opcode != 0x04) {
+                if (in.opcode != kSop1OpcodeMovB32 && in.opcode != kSop1OpcodeMovB64) {
                     scc = -1;
                     null_count_carry_origin = 0;
                     bvh_count_carry_origin = 0;
@@ -2967,6 +3050,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 int next_scc = scc;
                 const uint32_t null0 = operand_null_origin(in.src[0]);
                 const uint32_t null1 = operand_null_origin(in.src[1]);
+                const OptionalNullRole optional0 = operand_optional_null_role(in.src[0]);
+                const OptionalNullRole optional1 = operand_optional_null_role(in.src[1]);
                 uint32_t null0_hi = 0;
                 if ((in.src[0].kind == OperandKind::SGPR ||
                      in.src[0].kind == OperandKind::Special) &&
@@ -3046,9 +3131,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         next_scc = static_cast<int>(sum >> 32);
                         break;
                     }
-                    case 0x0E: r = a & c; next_scc = r != 0; break;         // s_and_b32
-                    case 0x10: r = a | c; next_scc = r != 0; break;         // s_or_b32
-                    case 0x12: r = a ^ c; next_scc = r != 0; break;         // s_xor_b32
+                    case kSop2OpcodeAndB32:
+                        r = a & c; next_scc = r != 0; break;
+                    case kSop2OpcodeOrB32:
+                        r = a | c; next_scc = r != 0; break;
+                    case kSop2OpcodeXorB32:
+                        r = a ^ c; next_scc = r != 0; break;
+                    case kSop2OpcodeAndn2B32:
+                        r = a & ~c; next_scc = r != 0; break;
                     case 0x1E:                                             // s_lshl_b32
                         r = a << (c & 31); next_scc = r != 0; break;
                     case 0x20:                                             // s_lshr_b32
@@ -3064,7 +3154,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1)));
                                  next_scc = r != 0; break; }
-                    case 0x0A:   // s_cselect_b32: dst = SCC ? src0 : src1 (the vertex-fetch format patch's tail)
+                    case kSop2OpcodeCselectB32: // dst = SCC ? src0 : src1
                         if (scc < 0) ok = false; else r = scc ? a : c;
                         break;
                     case 0x1F: case 0x21: {  // s_lshl_b64 / s_lshr_b64
@@ -3149,6 +3239,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 mark_null_origin(d, propagated_null_origin);
                 if (wrote_pair || in.opcode == 0x1F || in.opcode == 0x21 || in.opcode == 0x29)
                     mark_null_origin(d + 1, propagated_null_origin);
+                if (ok && in.opcode == kSop2OpcodeAddI32 &&
+                    in.src[0].kind == OperandKind::SGPR && in.src[0].value == 2 &&
+                    c == UINT32_MAX &&
+                    ((in.src[1].kind == OperandKind::InlineInt && in.src[1].value == -1) ||
+                     in.src[1].kind == OperandKind::Literal)) {
+                    mark_optional_null_role(d, OptionalNullRole::RecordCount);
+                } else if (ok && in.opcode == kSop2OpcodeOrB32 &&
+                           ((optional0 == OptionalNullRole::BaseHi &&
+                             in.src[0].kind == OperandKind::SGPR && in.src[0].value == d &&
+                             in.src[1].kind == OperandKind::Literal &&
+                             in.literal == kGtaOptionalBufferStrideWord) ||
+                            (optional1 == OptionalNullRole::BaseHi &&
+                             in.src[1].kind == OperandKind::SGPR && in.src[1].value == d &&
+                             in.src[0].kind == OperandKind::Literal &&
+                             in.literal == kGtaOptionalBufferStrideWord))) {
+                    mark_optional_null_role(d, OptionalNullRole::BaseHi);
+                }
                 // Every SOP2 writes SCC, so a count carry survives only when this exact instruction
                 // creates it. Capture the old origin above for the following s_addc_u32.
                 null_count_carry_origin = 0;
@@ -3551,6 +3658,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
+                const bool optional_table_source =
+                    !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
+                    imm_only && in.literal == kGtaOptionalBufferPointerOffset &&
+                    sbase == 0 && consecutive_seed_copy_range(sbase, 2) &&
+                    addr == base + kGtaOptionalBufferPointerOffset &&
+                    readable(base, kGtaOptionalBufferTableBytes);
                 uint32_t bvh_count_origin = 0;
                 if (!is_buffer && n == 4 && imm_only && in.literal == 0x58u &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
@@ -3595,6 +3708,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     if (!origin) origin = ++next_null_chain_origin;
                     mark_null_origin(sdst, origin);
                     mark_null_origin(sdst + 1, origin);
+                    if (optional_table_source) {
+                        if (optional_table_null_origin_pc.size() <= origin)
+                            optional_table_null_origin_pc.resize(
+                                (size_t)origin + 1u, UINT32_MAX);
+                        optional_table_null_origin_pc[(size_t)origin] = in.pc;
+                        mark_optional_null_role(sdst, OptionalNullRole::BaseLo);
+                        mark_optional_null_role(sdst + 1, OptionalNullRole::BaseHi);
+                    }
                 }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
                     const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
@@ -3894,7 +4015,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 const bool format_load_use = !is_mtbuf && in.opcode <= 0x03;
                 const bool raw_buffer_use = !is_mtbuf &&
                     ((in.opcode >= 0x08 && in.opcode <= 0x0F) ||
-                     (in.opcode >= 0x1C && in.opcode <= 0x1F));
+                     (in.opcode >= kMubufOpcodeStoreDword &&
+                      in.opcode <= kMubufOpcodeStoreDwordX3));
                 const bool format_store_use = in.opcode >= 0x04 && in.opcode <= 0x07;
                 // Keep the generic set aligned with the 32-bit RMW opcodes the SPIR-V emitter lowers.
                 // Opcodes 0x50/0x5a reach descriptor inspection separately: only GTA V's exact
@@ -3902,10 +4024,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // fail-closed rather than inheriting ordinary 32-bit bounds.
                 const bool atomic_buffer_use_32 =
                     !is_mtbuf &&
-                    (in.opcode == 0x30 || in.opcode == 0x32 || in.opcode == 0x33 ||
-                     (in.opcode >= 0x35 && in.opcode <= 0x3B));
+                    (in.opcode == kMubufOpcodeAtomicSwap ||
+                     in.opcode == kMubufOpcodeAtomicAdd ||
+                     in.opcode == kMubufOpcodeAtomicSub ||
+                     (in.opcode >= kMubufOpcodeAtomicSmin &&
+                      in.opcode <= kMubufOpcodeAtomicXor) ||
+                     in.opcode == kMubufOpcodeAtomicFmin ||
+                     in.opcode == kMubufOpcodeAtomicFmax);
                 const bool atomic_x2_candidate =
-                    !is_mtbuf && (in.opcode == 0x50u || in.opcode == 0x5au);
+                    !is_mtbuf && (in.opcode == kMubufOpcodeAtomicSwapX2 ||
+                                  in.opcode == kMubufOpcodeAtomicOrX2);
                 if (srt_uses &&
                     (format_load_use || format_store_use || raw_buffer_use ||
                      atomic_buffer_use_32 || atomic_x2_candidate)) {
@@ -4006,16 +4134,62 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         const bool zero_record_raw =
                             (zero_record_format || raw_buffer_use || atomic_buffer_use_32) &&
                             d.num_records == 0u && d.size_bytes == 0u;
-                        if (zero_record_raw || (!format_load_use &&
+                        const uint32_t optional_low_origin = null_origin(srsrc);
+                        const uint32_t optional_high_origin = null_origin(srsrc + 1);
+                        const bool optional_origin = optional_low_origin &&
+                            optional_low_origin == optional_high_origin &&
+                            optional_low_origin < optional_table_null_origin_pc.size() &&
+                            optional_table_null_origin_pc[(size_t)optional_low_origin] != UINT32_MAX;
+                        const uint32_t optional_producer_pc = optional_origin
+                            ? optional_table_null_origin_pc[(size_t)optional_low_origin]
+                            : UINT32_MAX;
+                        const bool optional_cfg_dominates = optional_origin &&
+                            !has_indirect_control_flow(decoded->instructions) &&
+                            straight_line_null_chain_dominates(
+                                decoded->instructions, optional_producer_pc, in.pc);
+                        const bool optional_null_raw_load =
+                            optional_cfg_dominates &&
+                            rdna2_optional_null_raw_load_shape(in) &&
+                            valid_reg(srsrc + 3) &&
+                            optional_null_role[(size_t)srsrc] == OptionalNullRole::BaseLo &&
+                            optional_null_role[(size_t)(srsrc + 1)] == OptionalNullRole::BaseHi &&
+                            optional_null_role[(size_t)(srsrc + 2)] == OptionalNullRole::RecordCount &&
+                            optional_null_role[(size_t)(srsrc + 3)] == OptionalNullRole::Config &&
+                            gta_optional_null_descriptor_shape(d, u.v4.data());
+                        if (trc && d.base == 0u && d.num_records != 0u)
+                            fprintf(stderr,
+                                    "[dyntrace] optional-null-candidate pc=%u origin=%u/%u tagged=%d "
+                                    "producer=%u cfg=%d roles=%u/%u/%u/%u packet=%d descriptor=%d\n",
+                                    in.pc, optional_low_origin, optional_high_origin,
+                                    (int)optional_origin, optional_producer_pc,
+                                    (int)optional_cfg_dominates,
+                                    (unsigned)optional_null_role[(size_t)srsrc],
+                                    (unsigned)optional_null_role[(size_t)(srsrc + 1)],
+                                    (unsigned)optional_null_role[(size_t)(srsrc + 2)],
+                                    (unsigned)optional_null_role[(size_t)(srsrc + 3)],
+                                    (int)rdna2_optional_null_raw_load_shape(in),
+                                    (int)gta_optional_null_descriptor_shape(d, u.v4.data()));
+                        const bool proven_null_guarded_raw_store =
+                            gta5_null_pointer_at_guard &&
+                            gta5_null_raw_store_descriptor(u.v4) &&
+                            rdna2_gta5_null_guarded_raw_store_site(in);
+                        if (proven_null_guarded_raw_store || zero_record_raw ||
+                            optional_null_raw_load || (!format_load_use &&
                             (d.base > 0x10000 && d.size_bytes != 0 &&
                              d.size_bytes <= 0x10000000u && stride_supported && format_supported &&
                              (!atomic_x2_candidate || atomic_x2_record_count != 0u)))) {
                             u.zero_record_raw = zero_record_raw;
+                            u.optional_null_raw_load = optional_null_raw_load;
+                            u.proven_null_guarded_raw_store =
+                                proven_null_guarded_raw_store;
                             if (trc) fprintf(stderr,
                                              "[dyntrace] MUBUF pc=%u live V# s%d base=0x%llx "
-                                             "stride=%u size=%u zero-record=%d\n",
+                                             "stride=%u size=%u zero-record=%d optional-null=%d "
+                                             "null-guarded-store=%d\n",
                                              in.pc, srsrc, (unsigned long long)d.base,
-                                             d.stride, d.size_bytes, (int)zero_record_raw);
+                                             d.stride, d.size_bytes, (int)zero_record_raw,
+                                             (int)optional_null_raw_load,
+                                             (int)proven_null_guarded_raw_store);
                             srt_uses->push_back(u);
                         }
                     }
@@ -4311,6 +4485,76 @@ static uint32_t linear_dispatch_raw_store_size(const uint32_t* code, size_t dwor
     return static_cast<uint32_t>(required);
 }
 
+static bool gta_optional_null_linear_load_launch(
+        const uint32_t* code, size_t dwords, uint32_t use_pc,
+        const DecodedBufferDescriptor& descriptor, const uint32_t descriptor_words[4],
+        uint32_t local_x, uint32_t threads_x, uint32_t tgid_x_sgpr) {
+    if (!code || !dwords || local_x != kGtaOptionalBufferLocalSize ||
+        tgid_x_sgpr != kGtaOptionalBufferTgidSgpr || !threads_x ||
+        threads_x != descriptor.num_records ||
+        !gta_optional_null_descriptor_shape(descriptor, descriptor_words))
+        return false;
+
+    std::vector<Rdna2Inst> instructions;
+    rdna2_walk(code, dwords, instructions);
+    if (has_indirect_control_flow(instructions)) return false;
+
+    const Rdna2Inst* consumer = nullptr;
+    for (const Rdna2Inst& in : instructions)
+        if (in.pc == use_pc) { consumer = &in; break; }
+    if (!consumer || !rdna2_optional_null_raw_load_shape(*consumer)) return false;
+
+    const int srsrc = consumer->src[1].value;
+    const Rdna2Inst* descriptor_producer = nullptr;
+    for (const Rdna2Inst& in : instructions) {
+        if (in.pc >= use_pc) break;
+        if (in.fmt == Rdna2Format::SMEM &&
+            in.opcode == kSmemOpcodeLoadDwordX2 && in.len_dwords == 2u &&
+            in.dst.kind == OperandKind::SGPR && in.dst.value == srsrc &&
+            in.src[0].kind == OperandKind::SGPR && in.src[0].value == 0 &&
+            in.src[1].kind == OperandKind::Special && in.src[1].value == 125 &&
+            in.literal == kGtaOptionalBufferPointerOffset)
+            descriptor_producer = &in;
+    }
+    if (!descriptor_producer ||
+        !straight_line_null_chain_dominates(
+            instructions, descriptor_producer->pc, use_pc))
+        return false;
+
+    const int vaddr = consumer->src[0].value;
+    const Rdna2Inst* index_writer = nullptr;
+    for (const Rdna2Inst& in : instructions) {
+        if (in.pc >= use_pc) break;
+        // M0-relative writes have no statically enumerable destination. One after the candidate
+        // index definition could overwrite VADDR, so the narrow proof declines the whole program.
+        if (in.fmt == Rdna2Format::VOP1 &&
+            in.opcode == kVop1OpcodeMovreldB32 && in.pc > 1u)
+            return false;
+        if (in.dst.kind == OperandKind::VGPR && in.dst.value >= 0) {
+            const uint32_t writes = rdna2_vgpr_write_count(in);
+            if (vaddr >= in.dst.value &&
+                vaddr < in.dst.value + static_cast<int>(writes))
+                index_writer = &in;
+        }
+        if (rdna2_tfe_status_vgpr(in) == vaddr)
+            index_writer = &in;
+    }
+    if (!index_writer || index_writer->pc != 1u ||
+        index_writer->fmt != Rdna2Format::VOP3 ||
+        index_writer->opcode != kVop3OpcodeLshlAddU32 ||
+        index_writer->len_dwords != 2u || index_writer->has_modifier ||
+        index_writer->dst.kind != OperandKind::VGPR ||
+        index_writer->dst.value != vaddr ||
+        index_writer->src[0].kind != OperandKind::SGPR ||
+        static_cast<uint32_t>(index_writer->src[0].value) != tgid_x_sgpr ||
+        index_writer->src[1].kind != OperandKind::InlineInt ||
+        index_writer->src[1].value != 6 ||
+        index_writer->src[2].kind != OperandKind::VGPR ||
+        index_writer->src[2].value != 0)
+        return false;
+    return true;
+}
+
 bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view) {
@@ -4407,6 +4651,15 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         }
     }
 
+    bool null_guarded_store_shape = false;
+    if (std::any_of(srt_uses.begin(), srt_uses.end(), [](const SrtUse& use) {
+            return use.proven_null_guarded_raw_store;
+        })) {
+        null_guarded_store_shape =
+            rdna2_gta5_null_guarded_raw_store_dispatch(
+                code, dwords, user_sgprs, nsgpr);
+    }
+
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
         if (u.kind == 3) {
@@ -4472,6 +4725,59 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 if (r0.srt_offset == u.key) { clash = true; break; }
 
         const DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+        if (u.optional_null_raw_load) {
+            // The fold proves the mapped +0x58 producer and exact scalar V# construction. Repeat
+            // the packet/launch half here so a forged SrtUse cannot manufacture zero semantics.
+            if (u.zero_record_raw || u.instruction_format != UINT32_MAX ||
+                u.key != 0xFFFFFFFFu || u.required_size != 0u ||
+                !gta_optional_null_linear_load_launch(
+                    code, dwords, u.use_pc, d, u.v4.data(), linear_local_x,
+                    linear_threads_x, tgid_x_sgpr))
+                continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Uint32;
+            r.num_components = 1;
+            r.gpu_addr = 0;
+            r.size = 0;
+            r.stride = kGtaOptionalBufferStride;
+            r.srt_offset = 0xFFFFFFFFu;
+            r.sgpr_base = 0xFFFFFFFFu;
+            // Not a valid SGPR index. This field is serialized even for ConstantBuffers, where it
+            // is otherwise inert, so capture/replay preserves the load-only marker without a
+            // format extension.
+            r.sampler_sgpr_base = kOptionalNullRawLoadMarkerSamplerBase;
+            r.fetch_pc = u.use_pc;
+            table.resources.push_back(r);
+            continue;
+        }
+        if (u.proven_null_guarded_raw_store) {
+            // Re-check every retained part of the dispatch proof at materialization. In particular,
+            // this is not a base-zero shortcut: the observed descriptor has one in-bounds record and
+            // becomes an ordinary writable resource when the entry pointer is non-null.
+            if (u.zero_record_raw || u.instruction_format != UINT32_MAX ||
+                !null_guarded_store_shape ||
+                !gta5_null_raw_store_descriptor(u.v4) || u.use_pc >= dwords)
+                continue;
+            Rdna2Inst marker_consumer =
+                rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
+            marker_consumer.pc = u.use_pc;
+            if (!rdna2_gta5_null_guarded_raw_store_site(marker_consumer)) continue;
+            const uint64_t marker_key = 0x8000000400000000ull | u.use_pc;
+            if (!seen.insert(marker_key).second) continue;
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = DataFormat::Unknown;
+            r.num_components = 0;
+            r.gpu_addr = 0;
+            r.size = 0;
+            r.stride = kProvenNullGuardedRawStoreStride;
+            r.srt_offset = 0xFFFFFFFFu;
+            r.sgpr_base = 0xFFFFFFFFu;
+            r.fetch_pc = u.use_pc;
+            table.resources.push_back(r);
+            continue;
+        }
         if (u.zero_record_raw) {
             // Re-check the producer's proof at materialization so a malformed/manually-constructed
             // SrtUse cannot manufacture zero semantics. The resource deliberately carries only
@@ -6085,6 +6391,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         }
 
         ComputeShaderConfig config;
+        config.compute_pgm_rsrc1 = rd(ds.sh, P::COMPUTE_PGM_RSRC1);
         config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;
@@ -6200,6 +6507,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
         item.recompile_config.native_storage_format_support =
             replay_native_storage_format_support;
         item.recompile_config_available = true;
+        item.null_guarded_raw_store_validated = item.spirv.size() &&
+            table && std::any_of(table->resources.begin(), table->resources.end(),
+                                 is_proven_null_guarded_raw_store) &&
+            rdna2_gta5_null_guarded_raw_store_dispatch(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, config.user_sgprs.data(), config.user_sgprs.size());
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;

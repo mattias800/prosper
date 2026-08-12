@@ -2526,6 +2526,111 @@ int main() {
         return 1;
     }
 
+    // GTA V 0x413cf7000 pc173..175 carries the SCC produced by an exact B64 mask logical across
+    // S_MOV_B64 into the consuming branch. S_MOV changes EXEC but architecturally preserves SCC;
+    // the dispatcher must therefore associate the branch with pc173's existing synchronized vote.
+    std::vector<uint32_t> gta_b64_mask_scc_mov(
+        std::begin(wave64_compute_live_b64_mask_scc),
+        std::end(wave64_compute_live_b64_mask_scc));
+    gta_b64_mask_scc_mov[3] = 0xbe9a047eu; // saved mask s[26:27] = exec
+    gta_b64_mask_scc_mov[4] = 0x8a9a7e1au; // exact pc173: s_andn2_b64 s26,s26,exec
+    gta_b64_mask_scc_mov[5] = 0xbefe041au; // exact pc174: s_mov_b64 exec,s26 (SCC-preserving)
+    gta_b64_mask_scc_mov[6] = 0xbf850003u; // pc175 shape: s_cbranch_scc1
+    const auto gta_b64_mask_scc_mov_spv = recompile_compute(
+        gta_b64_mask_scc_mov.data(), gta_b64_mask_scc_mov.size(), nullptr,
+        portable_wave64_compute_config);
+    if (gta_b64_mask_scc_mov_spv.empty() ||
+        !has_opcode(gta_b64_mask_scc_mov_spv, 224) || // synchronized guest-wave vote
+        !has_opcode(gta_b64_mask_scc_mov_spv, 251) || // arbitrary CFG dispatcher
+        !type_result_ids_are_nonzero(gta_b64_mask_scc_mov_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_b64_mask_scc_mov_spv)) {
+        printf("  [FAIL] GTA B64 mask SCC did not survive S_MOV_B64 to its branch\n");
+        return 1;
+    }
+    gta_b64_mask_scc_mov[5] = 0xbefe081au; // same pc174 site: S_NOT_B64 writes SCC
+    if (!recompile_compute(gta_b64_mask_scc_mov.data(), gta_b64_mask_scc_mov.size(),
+                           nullptr, portable_wave64_compute_config).empty()) {
+        printf("  [FAIL] SCC-writing pc174 mutation was treated as preserving pc173 SCC\n");
+        return 1;
+    }
+    printf("  [ok]   GTA B64 mask SCC survives only the exact SCC-preserving S_MOV_B64\n");
+
+    // GTA V 0x413e1c300 reaches pc22 through the compact structured emitter. V_READFIRSTLANE has
+    // definitely established scalar VCC_HI on that exact path, while the scalar prefix computes
+    // VCC_LO before S_CSELECT_B32 replaces it. Map presence is therefore the compact emitter's
+    // path-local lifetime proof; the dispatcher's Function-variable placeholders must continue to
+    // require its separate whole-CFG MUST fact. Retain one forward SCC region so this exercises
+    // structured emission rather than merely accepting the packet in a straight-line shader.
+    std::vector<uint32_t> gta_structured_vcc_scalar_pair = {
+        0xbfa00003u,
+        0x8f090681u,
+        0xbe880300u,
+        0x7e020c09u,
+        0x81ea0980u,
+        0xbe8a0302u,
+        0xbe8b03ffu, 0x00016204u,
+        0xbe900380u,
+        0x7e025701u,
+        0x100202ffu, 0x4f7ffffeu,
+        0x7e020f01u,
+        0x7ed60501u,                         // pc13: scalar VCC_HI definition
+        0x936a6b6au,
+        0x9aea6b6au,
+        0x816a6a6bu,
+        0x9aeb076au,
+        0x8f6a066bu,
+        0x80806a07u,
+        0xbf090900u,
+        0xbf800000u,
+        0x856a8081u,                         // exact pc22: s_cselect_b32 vcc_lo,1,0
+        0xbf840001u,                         // pc23: structured SCC arm -> pc25
+        0x7e000280u,
+        0x02020100u,                         // pc25: consume the complete VCC predicate
+        0xbf810000u,
+    };
+    ComputeShaderConfig gta_structured_vcc_config = portable_wave64_compute_config;
+    gta_structured_vcc_config.local_x = 64;
+    gta_structured_vcc_config.native_subgroup_size = 64;
+    const auto gta_structured_vcc_scalar_pair_spv = recompile_compute(
+        gta_structured_vcc_scalar_pair.data(), gta_structured_vcc_scalar_pair.size(), nullptr,
+        gta_structured_vcc_config);
+    if (gta_structured_vcc_scalar_pair_spv.empty() ||
+        !has_opcode(gta_structured_vcc_scalar_pair_spv, 247) || // OpSelectionMerge
+        has_opcode(gta_structured_vcc_scalar_pair_spv, 251) ||  // no CFG dispatcher
+        !type_result_ids_are_nonzero(gta_structured_vcc_scalar_pair_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_structured_vcc_scalar_pair_spv)) {
+        printf("  [FAIL] GTA structured CSELECT did not retain its path-local scalar VCC pair\n");
+        return 1;
+    }
+    gta_structured_vcc_scalar_pair[22] =
+        0x856a806bu;                         // same pc22 site: scalar inline source -> VCC_HI
+    if (!recompile_compute(gta_structured_vcc_scalar_pair.data(),
+                           gta_structured_vcc_scalar_pair.size(), nullptr,
+                           gta_structured_vcc_config).empty()) {
+        printf("  [FAIL] GTA structured CSELECT admitted a same-site mask-source mutation\n");
+        return 1;
+    }
+
+    // A structured merge may materialize zero for an SGPR that exists on only one predecessor.
+    // That representation is deliberately not a scalar-lifetime proof: if the arm is skipped,
+    // hardware retains the prior physical VCC_HI bits rather than defining scalar zero.
+    const uint32_t gta_structured_vcc_placeholder_join[] = {
+        0xbf060000u,                         // pc0: establish SCC
+        0xbf840001u,                         // pc1: one-arm structured branch -> pc3
+        0x7ed60500u,                         // pc2: only this arm defines scalar VCC_HI
+        0xbf060000u,                         // pc3: re-arm SCC for CSELECT
+        0x856a8081u,                         // pc4: exact packet must not trust the merge zero
+        0x02020100u,                         // pc5: keep VCC_HI live (not a low-only exception)
+        0xbf810000u,
+    };
+    if (!recompile_compute(gta_structured_vcc_placeholder_join,
+                           std::size(gta_structured_vcc_placeholder_join), nullptr,
+                           gta_structured_vcc_config).empty()) {
+        printf("  [FAIL] structured merge placeholder became a scalar VCC_HI lifetime\n");
+        return 1;
+    }
+    printf("  [ok]   GTA structured CSELECT uses only a path-local complete scalar VCC pair\n");
+
     // GTA V's compute culling kernels execute this exact in-place V_FFBH_U32 e32 packet inside
     // crossing control flow. Replace the SCC-preserving VALU in the proven Wave64 dispatcher
     // fixture, retaining every branch offset, and require the real FindUMsb lowering to be present.
@@ -2544,6 +2649,55 @@ int main() {
         printf("  [FAIL] GTA V v_ffbh_u32 did not lower inside crossing Wave64 compute CFG\n");
         return 1;
     }
+
+    // GTA V's live culling programs 0x413e15400/0x413e16400 do not feed FFBH from a VGPR. They
+    // produce a Wave64 predicate in s[8:9], then scan its exact high/low physical dwords with these
+    // captured packets. Cover both runtime routes: the portable dispatcher must assemble each
+    // dword through its uniform workgroup-scratch phase, while an exact native Wave64 dispatcher
+    // may materialize it directly with a subgroup ballot. Crossing branches preserve the captured
+    // packet words and saved-mask lifetime.
+    const uint32_t gta_portable_mask_ffbh_cfg[] = {
+        0x7d0626f9u, 0x06868880u,            // pc0: VOPC SDWA writes saved mask s[8:9]
+        0xbf060000u,                         // pc2: establish SCC
+        0xbf840003u,                         // pc3: s_cbranch_scc0 -> pc7
+        0x7e147209u,                         // pc4: exact v_ffbh_u32 v10,s9 (high half)
+        0x7d8a14c1u,                         // pc5: compare the high-half result with -1
+        0xbf860002u,                         // pc6: s_cbranch_vccz -> pc9 (crossing)
+        0xbf060000u,                         // pc7: independent SCC lifetime
+        0xbf850001u,                         // pc8: s_cbranch_scc1 -> pc10
+        0x7e147208u,                         // pc9: exact v_ffbh_u32 v10,s8 (low half)
+        0xbf810000u,                         // pc10: s_endpgm
+    };
+    const auto gta_portable_mask_ffbh_spv = recompile_compute(
+        gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
+        portable_wave64_compute_config);
+    if (gta_portable_mask_ffbh_spv.empty() ||
+        !has_opcode(gta_portable_mask_ffbh_spv, 251) || // arbitrary CFG dispatcher
+        !has_opcode(gta_portable_mask_ffbh_spv, 224) || // synchronized scratch phase
+        !has_glsl_ext_inst(gta_portable_mask_ffbh_spv, 75) || // shared FFBH semantics
+        has_opcode(gta_portable_mask_ffbh_spv, 339) || // no exact-width subgroup ballot
+        !type_result_ids_are_nonzero(gta_portable_mask_ffbh_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_portable_mask_ffbh_spv)) {
+        printf("  [FAIL] GTA portable saved-mask FFBH did not assemble both physical halves\n");
+        return 1;
+    }
+    printf("  [ok]   GTA portable saved-mask FFBH uses a synchronized dword phase\n");
+
+    ComputeShaderConfig native_wave64_mask_ffbh_config = portable_wave64_compute_config;
+    native_wave64_mask_ffbh_config.native_subgroup_size = 64;
+    const auto gta_native_mask_ffbh_spv = recompile_compute(
+        gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
+        native_wave64_mask_ffbh_config);
+    if (gta_native_mask_ffbh_spv.empty() ||
+        !has_opcode(gta_native_mask_ffbh_spv, 251) || // arbitrary CFG dispatcher
+        !has_opcode(gta_native_mask_ffbh_spv, 339) || // exact saved-mask dword ballot
+        !has_glsl_ext_inst(gta_native_mask_ffbh_spv, 75) ||
+        !type_result_ids_are_nonzero(gta_native_mask_ffbh_spv, nullptr) ||
+        !phi_ids_are_nonzero(gta_native_mask_ffbh_spv)) {
+        printf("  [FAIL] GTA native Wave64 saved-mask FFBH did not materialize its dword\n");
+        return 1;
+    }
+    printf("  [ok]   GTA native Wave64 saved-mask FFBH uses an exact ballot dword\n");
 
     // SDWA source NEG is deliberately outside this plain-e32 admission. Without the gate the
     // generic VOP1 prologue would negate in the f32 domain before the integer FFBH operation.
@@ -3711,6 +3865,39 @@ int main() {
         return 1;
     }
     printf("  [ok]   complex fragment CFG exports active state from both alternate sites\n");
+
+    // Fragment Wave64 SAVEEXEC computes SCC with an exact subgroup vote when the shader later
+    // reads it. Put the SCC reader after the non-lexical dispatcher shape: the CFG state transfer
+    // must preserve the producer's exact Boolean instead of reloading the false placeholder.
+    const uint32_t fragment_saveexec_scc_prelude[] = {
+        0x7c020300u,                         // v_cmp_lt_f32 vcc,v0,v1
+        0xbe84246au,                         // s_and_saveexec_b64 s[4:5],vcc -> exact SCC
+    };
+    std::vector<uint32_t> fragment_saveexec_scc(
+        std::begin(fragment_saveexec_scc_prelude),
+        std::end(fragment_saveexec_scc_prelude));
+    fragment_saveexec_scc.insert(fragment_saveexec_scc.end(),
+        std::begin(fragment_cfg_dispatch), std::end(fragment_cfg_dispatch));
+    fragment_saveexec_scc[10] =
+        0x85068081u;                         // replace pc8 work with SCC read after dispatcher reload
+    const auto fragment_saveexec_scc_spv = recompile_fragment(
+        fragment_saveexec_scc.data(), fragment_saveexec_scc.size());
+    if (fragment_saveexec_scc_spv.empty() ||
+        fragment_spirv_required_subgroup_size(fragment_saveexec_scc_spv) != 64 ||
+        !has_opcode(fragment_saveexec_scc_spv, 251)) {
+        printf("  [FAIL] fragment SAVEEXEC SCC did not survive a dispatcher reload\n");
+        return 1;
+    }
+    printf("  [ok]   fragment SAVEEXEC SCC survives a dispatcher reload exactly\n");
+    std::vector<uint32_t> fragment_saveexec_scc_mutated = fragment_saveexec_scc;
+    fragment_saveexec_scc_mutated[1] =
+        0xbe842400u;                         // same SAVEEXEC site reads unproved s[0:1]
+    if (!recompile_fragment(fragment_saveexec_scc_mutated.data(),
+                            fragment_saveexec_scc_mutated.size()).empty()) {
+        printf("  [FAIL] same-site SAVEEXEC source mutation certified an unproved mask\n");
+        return 1;
+    }
+    printf("  [ok]   same-site SAVEEXEC source mutation remains fail-visible\n");
 
     // Astro Bot's second world-map material is Wave32 and carries saved one-word masks through the
     // same non-lexical branch graph. The explicit VOPC writes below intentionally target adjacent

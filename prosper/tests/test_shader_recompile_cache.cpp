@@ -1,5 +1,6 @@
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/hle/dispatch.hpp"
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -645,6 +646,39 @@ int main() {
               push_constant_identity == cached_compute_identity,
           "diagnostic provenance stays outside compute shader cache identity");
 
+    // BUFFER_ATOMIC_FMIN bakes COMPUTE_PGM_RSRC1.FP32_DENORM into its integer CAS selection.
+    // The same packet must therefore miss across launch modes, while repeating one mode hits.
+    clear_shader_recompile_cache();
+    static const uint32_t kAtomicFminCompute[] = {
+        0xe0fc0000u, 0x80010000u, // buffer_atomic_fmin v0, off, s[4:7], 0
+        0xbf810000u,
+    };
+    ShaderResource atomic_buffer;
+    atomic_buffer.cls = ResourceClass::ConstantBuffer;
+    atomic_buffer.format = DataFormat::Uint32;
+    atomic_buffer.num_components = 1;
+    atomic_buffer.binding = 3;
+    atomic_buffer.stride = 4;
+    atomic_buffer.sgpr_base = 4;
+    atomic_buffer.size = 4;
+    ShaderResourceTable float_atomic_table;
+    float_atomic_table.resources.push_back(atomic_buffer);
+    ComputeShaderConfig atomic_mode0 = compute_config;
+    atomic_mode0.compute_pgm_rsrc1 = 0u;
+    ComputeShaderConfig atomic_mode3 = atomic_mode0;
+    atomic_mode3.compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
+    const auto atomic_flush = recompile_compute_shader_cached(
+        kAtomicFminCompute, std::size(kAtomicFminCompute), &float_atomic_table, atomic_mode0);
+    const auto atomic_preserve = recompile_compute_shader_cached(
+        kAtomicFminCompute, std::size(kAtomicFminCompute), &float_atomic_table, atomic_mode3);
+    const auto atomic_flush_again = recompile_compute_shader_cached(
+        kAtomicFminCompute, std::size(kAtomicFminCompute), &float_atomic_table, atomic_mode0);
+    stats = shader_recompile_cache_stats();
+    CHECK(!atomic_flush.empty() && !atomic_preserve.empty() &&
+              atomic_flush != atomic_preserve && atomic_flush_again == atomic_flush &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates float-atomic modules by PGM_RSRC1 denormal mode");
+
     // Diagnostic provenance is not shader semantics. Force two recompiles of one rejected site so
     // each call must carry its own immutable program identity through the cache wrapper, builder and
     // structurizer, while a direct standalone call must remain explicitly neutral.
@@ -868,6 +902,62 @@ int main() {
               count_occurrences(live_reject_capture.output, live_reject_program) == 1,
           "live shader-recompile failure reports its final dispatch-skipped consequence");
 
+    // Drive FP32_DENORM through the actual register-file realization boundary. Unit-level config
+    // and cache tests cannot catch a missing/wrong register read here: deleting the production read
+    // would leave both dispatches at the synthetic mode-3 default and make these modules identical.
+    alignas(256) static const uint32_t kLiveFloatAtomicMode[] = {
+        0x7e000280u,              // v_mov_b32 v0, 0 (LDS byte address)
+        0x7e1202ffu, 0x00000001u, // v_mov_b32 v9, +minimum subnormal
+        0xd8480000u, 0x00000900u, // ds_min_f32 v0, v9
+        0xbf810000u,
+    };
+    ShaderReg live_float_registers[2] = {
+        {prosper::agc::Pm4::COMPUTE_PGM_LO, 0},
+        {prosper::agc::Pm4::COMPUTE_PGM_HI, 0},
+    };
+    AgcShaderHeader live_float_header{};
+    live_float_header.file_header = 0x34333231u;
+    live_float_header.version = 0x18;
+    live_float_header.sh_registers = live_float_registers;
+    live_float_header.shader_size = sizeof(kLiveFloatAtomicMode);
+    live_float_header.type = 0;
+    live_float_header.num_sh_registers = 2;
+    void* registered_live_float = nullptr;
+    const bool live_float_registered = create_shader &&
+        create_shader(reinterpret_cast<uint64_t>(&registered_live_float),
+                      reinterpret_cast<uint64_t>(&live_float_header),
+                      reinterpret_cast<uint64_t>(kLiveFloatAtomicMode), 0, 0, 0) == 0 &&
+        registered_live_float == &live_float_header;
+    auto realize_float_mode = [&](uint32_t compute_pgm_rsrc1, uint64_t command_order) {
+        GpuState state;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_LO] = live_float_registers[0].value;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_HI] = live_float_registers[1].value;
+        state.sh[prosper::agc::Pm4::COMPUTE_PGM_RSRC1] = compute_pgm_rsrc1;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_X] = 64;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Y] = 1;
+        state.sh[prosper::agc::Pm4::COMPUTE_NUM_THREAD_Z] = 1;
+        GpuState::Dispatch dispatch;
+        dispatch.threads_x = 64;
+        dispatch.threads_y = dispatch.threads_z = 1;
+        dispatch.modifier =
+            1ull << prosper::agc::Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT;
+        dispatch.command_order = command_order;
+        dispatch.state = std::make_shared<GpuState>(state);
+        state.dispatches.push_back(dispatch);
+        return realize_compute_dispatches(state, 0x2481);
+    };
+    clear_shader_recompile_cache();
+    const std::vector<ComputeItem> live_float_mode0 = realize_float_mode(0u, 0x24810u);
+    const std::vector<ComputeItem> live_float_mode3 = realize_float_mode(
+        kDefaultComputePgmRsrc1, 0x24813u);
+    CHECK(live_float_registered && live_float_mode0.size() == 1 &&
+              live_float_mode3.size() == 1 &&
+              live_float_mode0[0].recompile_config.compute_pgm_rsrc1 == 0u &&
+              live_float_mode3[0].recompile_config.compute_pgm_rsrc1 ==
+                  kDefaultComputePgmRsrc1 &&
+              live_float_mode0[0].spirv != live_float_mode3[0].spirv,
+          "live compute realization reads PGM_RSRC1 and separates float-atomic denormal modes");
+
     // IMAGE_LOAD_MIP level-zero lowering is compiled semantics, not runtime descriptor data. A
     // captured or later dispatch without the instruction-scoped proof must miss and reject rather
     // than reuse the specialized module; restoring the proof should hit the original entry.
@@ -1035,6 +1125,110 @@ int main() {
               repeated_zero_record_raw == cached_zero_record_raw && stats.misses == 2 &&
               stats.hits == 1 && stats.entries == 2,
           "compute cache separates exact zero-record RAW lowering from nonzero buffers");
+
+    // The application-level optional-null marker has different load-only semantics from an
+    // ordinary explicit null resource. Its serialized sampler provenance sentinel is inert for a
+    // ConstantBuffer, so key the semantic predicate explicitly rather than its unused raw field.
+    clear_shader_recompile_cache();
+    static const uint32_t kOptionalNullRawCompute[] = {
+        0xe0302000u, 0x80000000u, // buffer_load_dword v0, v0, s[0:3], idxen
+        0xbf810000u,
+    };
+    ShaderResource optional_null_raw;
+    optional_null_raw.cls = ResourceClass::ConstantBuffer;
+    optional_null_raw.format = DataFormat::Uint32;
+    optional_null_raw.num_components = 1;
+    optional_null_raw.binding = 3;
+    optional_null_raw.stride = kGtaOptionalBufferStride;
+    optional_null_raw.fetch_pc = 0;
+    optional_null_raw.sampler_sgpr_base = kOptionalNullRawLoadMarkerSamplerBase;
+    ShaderResourceTable optional_null_raw_table;
+    optional_null_raw_table.resources.push_back(optional_null_raw);
+    ComputeShaderConfig optional_null_raw_config;
+    optional_null_raw_config.user_sgprs.resize(4);
+    optional_null_raw_config.local_x = kGtaOptionalBufferLocalSize;
+    const auto cached_optional_null_raw = recompile_compute_shader_cached(
+        kOptionalNullRawCompute, std::size(kOptionalNullRawCompute),
+        &optional_null_raw_table, optional_null_raw_config);
+    optional_null_raw_table.resources[0].sampler_sgpr_base = 0xFFFFFFFFu;
+    const auto cached_ordinary_null_raw = recompile_compute_shader_cached(
+        kOptionalNullRawCompute, std::size(kOptionalNullRawCompute),
+        &optional_null_raw_table, optional_null_raw_config);
+    optional_null_raw_table.resources[0].sampler_sgpr_base =
+        kOptionalNullRawLoadMarkerSamplerBase;
+    const auto repeated_optional_null_raw = recompile_compute_shader_cached(
+        kOptionalNullRawCompute, std::size(kOptionalNullRawCompute),
+        &optional_null_raw_table, optional_null_raw_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(is_optional_null_raw_load_buffer(optional_null_raw_table.resources[0]) &&
+              !cached_optional_null_raw.empty() &&
+              cached_optional_null_raw != cached_ordinary_null_raw &&
+              repeated_optional_null_raw == cached_optional_null_raw &&
+              stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
+          "compute cache separates optional-null load lowering from ordinary null resources");
+    // Guarded-null stores compile to no memory operation too, but for a different reason: their V#
+    // has one record and only the exact dispatch CFG proves the store unreachable. Partition that
+    // marker explicitly from an ordinary writable resource at the same fetch pc.
+    clear_shader_recompile_cache();
+    std::array<uint32_t, 81> guarded_null_store_compute;
+    guarded_null_store_compute.fill(0xbf800000u); // s_nop 0
+    guarded_null_store_compute[22] = 0xbe92047eu; // s_mov_b64 s[18:19], exec
+    guarded_null_store_compute[41] = 0xbefe0412u; // s_mov_b64 exec, s[18:19]
+    guarded_null_store_compute[42] = 0xbf128002u;
+    guarded_null_store_compute[43] = 0x7d8a00f9u;
+    guarded_null_store_compute[44] = 0x06868080u;
+    guarded_null_store_compute[45] = 0x85ea8012u;
+    guarded_null_store_compute[46] = 0x8dea006au;
+    guarded_null_store_compute[47] = 0x87fe126au;
+    guarded_null_store_compute[48] = 0xbf88001fu;
+    guarded_null_store_compute[74] = 0xe0740030u;
+    guarded_null_store_compute[75] = 0x80000700u;
+    guarded_null_store_compute[80] = 0xbf810000u;
+    ShaderResource guarded_null_store = zero_record_raw;
+    guarded_null_store.fetch_pc = 74u;
+    guarded_null_store.stride = kProvenNullGuardedRawStoreStride;
+    ShaderResourceTable guarded_null_store_table;
+    guarded_null_store_table.resources.push_back(guarded_null_store);
+    ComputeShaderConfig stale_guarded_store_config = zero_record_raw_config;
+    stale_guarded_store_config.user_sgprs[2] = 1u;
+    // Exercise both sides of the cache boundary: invalid conditional metadata must fail before a
+    // cold lookup and must still fail after the valid null-dispatch module has warmed the cache.
+    const auto cold_stale_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, stale_guarded_store_config);
+    const auto cached_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    const auto warm_stale_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, stale_guarded_store_config);
+    std::array<uint32_t, 81> overwritten_guarded_null_store_compute =
+        guarded_null_store_compute;
+    overwritten_guarded_null_store_compute[40] = 0xbe820381u; // s_mov_b32 s2, 1
+    const auto overwritten_guarded_null_store = recompile_compute_shader_cached(
+        overwritten_guarded_null_store_compute.data(),
+        overwritten_guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    guarded_null_store_table.resources[0].gpu_addr = 0x20000u;
+    guarded_null_store_table.resources[0].size = 4u;
+    guarded_null_store_table.resources[0].stride = 4u;
+    const auto cached_ordinary_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    guarded_null_store_table.resources[0] = guarded_null_store;
+    const auto repeated_guarded_null_store = recompile_compute_shader_cached(
+        guarded_null_store_compute.data(), guarded_null_store_compute.size(),
+        &guarded_null_store_table, zero_record_raw_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(is_proven_null_guarded_raw_store(guarded_null_store_table.resources[0]) &&
+              cold_stale_guarded_null_store.empty() &&
+              warm_stale_guarded_null_store.empty() &&
+              overwritten_guarded_null_store.empty() &&
+              !cached_guarded_null_store.empty() && !cached_ordinary_store.empty() &&
+              cached_guarded_null_store != cached_ordinary_store &&
+              repeated_guarded_null_store == cached_guarded_null_store &&
+              stats.misses == 2u && stats.hits == 1u && stats.entries == 2u,
+          "compute cache separates guarded-null store elision from ordinary writable buffers");
 
     // Resource descriptor fields that specialize SPIR-V must participate in the cache identity.
     // Storage-image sRGB state changes whether the module declares a native float image or the raw

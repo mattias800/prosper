@@ -13,6 +13,7 @@
 #include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -2190,6 +2191,66 @@ int main() {
                                  &direct_sbuffer_table, direct_sbuffer_config).empty(),
           "#1029: pc-keyed direct scalar buffer is bound and recompiles");
 
+    // GTA V selects one of two adjacent descriptor fragments with the low bit of a raw table
+    // pointer. The high-half selector is `s_andn2_b32 1, s0`: without folding AND-NOT, VCC_HI and
+    // the register-SOFFSET x2 load become unknown, so the exact buffer_store at pc10 cannot publish
+    // its V#. Exercise both pointer parities because reversing AND-NOT's operands produces a very
+    // different (and unsound) table offset while still looking superficially like a bit clear.
+    alignas(16) uint32_t andn2_fragment_payload[16]{};
+    const uint64_t andn2_payload_base =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(andn2_fragment_payload));
+    alignas(16) uint32_t andn2_fragment_table[10] = {
+        0u, 0u, 0u, 0u, 0u, 0u,
+        static_cast<uint32_t>(andn2_payload_base),
+        (static_cast<uint32_t>(andn2_payload_base >> 32) & 0xffffu) | (4u << 16),
+        static_cast<uint32_t>(andn2_payload_base),
+        (static_cast<uint32_t>(andn2_payload_base >> 32) & 0xffffu) | (4u << 16),
+    };
+    const uint32_t gta_andn2_fragment[] = {
+        0x8a6b0081u,              // pc0: s_andn2_b32 s107, 1, s0
+        0x8f6b836bu,              // pc1: s_lshl_b32 s107, s107, 3
+        0x871600c2u,              // pc2: s_and_b32 s22, -2, s0
+        0xbe970301u,              // pc3: s_mov_b32 s23, s1
+        0xf404020bu, 0xd6000018u, // pc4: s_load_dwordx2 s[8:9], s[22:23], s107
+        0xbe8a03ffu, 16u,         // pc6: s_mov_b32 s10, 16 records
+        0xbe8b03ffu, 4u << 12,    // pc8: s_mov_b32 s11, raw R32 descriptor control
+        0xe0702000u, 0x80020103u, // pc10: buffer_store_dword v1, v3, s[8:11]
+        0xbf810000u,
+    };
+    for (uint32_t parity = 0; parity < 2; ++parity) {
+        const uint64_t tagged_table =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(andn2_fragment_table)) | parity;
+        uint32_t andn2_seed[2] = {
+            static_cast<uint32_t>(tagged_table),
+            static_cast<uint32_t>(tagged_table >> 32),
+        };
+        ShaderResourceTable andn2_table;
+        const std::vector<SrtUse> andn2_uses = add_compute_buffer_resources(
+            andn2_table, gta_andn2_fragment, std::size(gta_andn2_fragment),
+            andn2_seed, std::size(andn2_seed));
+        assign_convention_bindings(andn2_table, 2);
+        ComputeShaderConfig andn2_config;
+        andn2_config.user_sgprs.assign(andn2_seed, andn2_seed + std::size(andn2_seed));
+        andn2_config.local_x = andn2_config.local_y = andn2_config.local_z = 1;
+        CHECK(andn2_uses.size() == 1 && andn2_uses[0].use_pc == 10 &&
+                  andn2_uses[0].v4[0] == static_cast<uint32_t>(andn2_payload_base) &&
+                  andn2_uses[0].v4[1] == andn2_fragment_table[7] &&
+                  andn2_table.resources.size() == 1 && andn2_table.by_fetch_pc(10) &&
+                  !recompile_compute(gta_andn2_fragment, std::size(gta_andn2_fragment),
+                                     &andn2_table, andn2_config).empty(),
+              "GTA V s_andn2 table selector resolves the exact pc10 descriptor fragment");
+
+        std::vector<uint32_t> reversed_andn2(
+            std::begin(gta_andn2_fragment), std::end(gta_andn2_fragment));
+        reversed_andn2[0] = 0x8a6b8100u; // pc0: s_andn2_b32 s107, s0, 1
+        ShaderResourceTable reversed_andn2_table;
+        const std::vector<SrtUse> reversed_andn2_uses = add_compute_buffer_resources(
+            reversed_andn2_table, reversed_andn2.data(), reversed_andn2.size(),
+            andn2_seed, std::size(andn2_seed));
+        CHECK(reversed_andn2_uses.empty() && reversed_andn2_table.resources.empty(),
+              "same-site reversed s_andn2 operands do not inherit GTA V's fragment proof");
+    }
+
     // Astro's world-map PS derives VCC_LO from v_readfirstlane. That value is uniform at runtime
     // and the SPIR-V translator tracks it, but the CPU descriptor fold intentionally cannot assign
     // a concrete value to a VGPR read. Retain the exact bounded V# with required_size=0: production
@@ -2548,6 +2609,597 @@ int main() {
                                  std::size(addr0_nonzero_record_seed));
     CHECK(addr0_nonzero_record_uses.empty() && addr0_nonzero_record_table.resources.empty(),
           "addr0 plus nonzero NUM_RECORDS stays rejected at the zero-record boundary");
+
+    // GTA V's 0x413cf6100 pc10 walks a dispatch-sized optional buffer table. The mapped pointer
+    // entry at user-data root +0x58 is zero before a later WRITE_DATA initializes it, while scalar
+    // code independently builds a stride-4 V# with a nonzero record count. Preserve the exact
+    // producer/use packets: only this mapped provenance plus the linear launch proof may return zero.
+    const std::array<uint32_t, 13> optional_null_raw = {
+        0xbfa00003u,                         // pc0:  s_clause 4
+        0xd7460002u, 0x04010c0fu,            // pc1:  v_lshl_add_u32 v2,s15,6,v0
+        0xf4040400u, 0xfa000058u,            // pc3:  s_load_dwordx2 s[16:17],s[0:1],0x58
+        0x8112c102u,                         // pc5:  s_add_i32 s18,s2,-1
+        0xbe9303ffu, kGtaOptionalBufferConfigWord, // pc6: s_mov_b32 s19,config
+        0xbf8cc07fu,                         // pc8:  s_waitcnt
+        0xbe911d92u,                         // pc9:  s_bitset1_b32 s17,18 (stride 4)
+        0xe0302000u, 0x80040002u,            // pc10: buffer_load_dword v0,v2,s[16:19],0 idxen
+        0xbf810000u,                         // pc12: s_endpgm
+    };
+    constexpr uint32_t optional_records = 127u;
+    alignas(8) std::array<uint32_t, kGtaOptionalBufferTableBytes / sizeof(uint32_t)>
+        optional_table{};
+    std::array<uint32_t, 15> optional_user_sgprs{};
+    const uint64_t optional_root = reinterpret_cast<uint64_t>(optional_table.data());
+    optional_user_sgprs[0] = static_cast<uint32_t>(optional_root);
+    optional_user_sgprs[1] = static_cast<uint32_t>(optional_root >> 32);
+    optional_user_sgprs[2] = optional_records + 1u;
+
+    ComputeShaderConfig optional_config;
+    optional_config.user_sgprs.assign(optional_user_sgprs.begin(), optional_user_sgprs.end());
+    optional_config.local_x = kGtaOptionalBufferLocalSize;
+    optional_config.local_y = optional_config.local_z = 1u;
+    ShaderResourceTable optional_table_resources;
+    const std::vector<SrtUse> optional_uses = add_compute_buffer_resources(
+        optional_table_resources, optional_null_raw.data(), optional_null_raw.size(),
+        optional_user_sgprs.data(), optional_user_sgprs.size(),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    assign_convention_bindings(optional_table_resources, 2);
+    const std::vector<uint32_t> optional_spirv = recompile_compute(
+        optional_null_raw.data(), optional_null_raw.size(), &optional_table_resources,
+        optional_config);
+    const DescriptorValidationReport optional_report = validate_spirv_descriptor_interface(
+        optional_spirv, &optional_table_resources, 0, SpirvShaderStage::Compute, false);
+    CHECK(optional_uses.size() == 1 && optional_uses[0].use_pc == 10u &&
+              optional_uses[0].optional_null_raw_load && !optional_uses[0].zero_record_raw &&
+              optional_table_resources.resources.size() == 1 &&
+              is_optional_null_raw_load_buffer(optional_table_resources.resources[0]) &&
+              !is_zero_record_raw_buffer(optional_table_resources.resources[0]) &&
+              optional_table_resources.by_fetch_pc(10u) && !optional_spirv.empty() &&
+              optional_report.ok() && optional_report.descriptors.empty(),
+          "mapped optional +0x58 entry lowers the exact linear RAW dword load to zero");
+
+    // Direct-CFG counter-arm for the same production chain. The conditional branch reaches the
+    // existing wait/stride-patch/consumer tail while skipping count/config construction. A linear
+    // fold still visits those skipped writes, so this must remain rejected until the producer roles
+    // have a path-sensitive dominance proof.
+    const std::array<uint32_t, 14> optional_null_raw_branch = {
+        optional_null_raw[0], optional_null_raw[1], optional_null_raw[2],
+        optional_null_raw[3], optional_null_raw[4],
+        0xbf840003u,                         // pc5: s_cbranch_scc0 +3 -> pc9
+        optional_null_raw[5],                // pc6: count (skipped on taken arm)
+        optional_null_raw[6], optional_null_raw[7], // pc7: config (skipped)
+        optional_null_raw[8], optional_null_raw[9],
+        optional_null_raw[10], optional_null_raw[11], optional_null_raw[12],
+    };
+    ShaderResourceTable optional_branch_resources;
+    const std::vector<SrtUse> optional_branch_uses = add_compute_buffer_resources(
+        optional_branch_resources, optional_null_raw_branch.data(),
+        optional_null_raw_branch.size(), optional_user_sgprs.data(),
+        optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+        kGtaOptionalBufferTgidSgpr);
+    const bool optional_branch_has_marker = std::any_of(
+        optional_branch_resources.resources.begin(),
+        optional_branch_resources.resources.end(),
+        [](const ShaderResource& resource) {
+            return is_optional_null_raw_load_buffer(resource);
+        });
+    CHECK(std::none_of(optional_branch_uses.begin(), optional_branch_uses.end(),
+                       [](const SrtUse& use) { return use.optional_null_raw_load; }) &&
+              optional_branch_resources.resources.empty() && !optional_branch_has_marker &&
+              recompile_compute(optional_null_raw_branch.data(),
+                                optional_null_raw_branch.size(),
+                                &optional_branch_resources, optional_config).empty(),
+          "conditional branch across count/config keeps the optional chain fail-visible");
+
+    // The sibling 0x413cf5400 terminal reaches the same table convention through an in-place
+    // s_or_b32 stride patch rather than s_bitset1_b32. Keep its exact prefix through the
+    // post-consumer pc46 branch: later control flow is irrelevant unless it enters the straight-line
+    // producer/consumer interval, and a fixture ending at pc40 failed to exercise that distinction.
+    const std::array<uint32_t, 48> optional_null_raw_or = {
+        0xbfa00003u, 0xd7460016u, 0x04010c0fu, 0x8f6a9e0eu,
+        0x8010ff00u, 0x000000e8u, 0xbe920382u, 0x82118001u,
+        0xbe9303ffu, 0x00016204u, 0xbe88047eu, 0x7d2d00f9u,
+        0x8686006au, 0xbe911d92u, 0x7da42c80u, 0xbf88000fu,
+        0x7e000280u, 0xbeea070eu, 0x7e020281u, 0x7e040281u,
+        0x3606d4f9u, 0x86860681u, 0x7e080280u, 0xbe860381u,
+        0xbe8703ffu, 0x00016204u, 0xbe851d95u, 0xe07c0000u,
+        0x80010000u, 0xe0702000u, 0x80040403u,
+        0xf4040700u, 0xfa000058u,             // pc31: x2 optional pointer -> s[28:29]
+        0xbefe0408u, 0xbf8cc07fu,
+        0x881dff1du, kGtaOptionalBufferStrideWord, // pc35: s_or_b32 s29,s29,stride
+        0x811ec102u,                         // pc37: s_add_i32 s30,s2,-1
+        0xbe9f03ffu, kGtaOptionalBufferConfigWord,
+        0xe0302000u, 0x80070016u,            // pc40: exact optional RAW load
+        0xbe9f03ffu, kGtaOptionalBufferConfigWord, // pc42: production tail
+        0xbf8c3f70u, 0x7daa0087u,
+        0xbf88010fu,                         // pc46: production branch -> pc318
+        0xbf810000u,
+    };
+    ShaderResourceTable optional_or_resources;
+    const std::vector<SrtUse> optional_or_uses = add_compute_buffer_resources(
+        optional_or_resources, optional_null_raw_or.data(), optional_null_raw_or.size(),
+        optional_user_sgprs.data(), optional_user_sgprs.size(),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    const bool optional_or_use = std::any_of(optional_or_uses.begin(), optional_or_uses.end(),
+        [](const SrtUse& use) { return use.use_pc == 40u && use.optional_null_raw_load; });
+    CHECK(optional_or_use && optional_or_resources.by_fetch_pc(40u) &&
+              is_optional_null_raw_load_buffer(*optional_or_resources.by_fetch_pc(40u)),
+          "pc40 in-place OR chain materializes the same distinct optional-null marker");
+
+    std::array<uint32_t, 48> optional_or_wrong_stride = optional_null_raw_or;
+    optional_or_wrong_stride[36] = 0x00080000u;
+    ShaderResourceTable optional_or_wrong_stride_resources;
+    const std::vector<SrtUse> optional_or_wrong_stride_uses = add_compute_buffer_resources(
+        optional_or_wrong_stride_resources, optional_or_wrong_stride.data(),
+        optional_or_wrong_stride.size(), optional_user_sgprs.data(),
+        optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+        kGtaOptionalBufferTgidSgpr);
+    CHECK(std::none_of(optional_or_wrong_stride_uses.begin(),
+                       optional_or_wrong_stride_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.use_pc == 40u && use.optional_null_raw_load;
+                       }) &&
+              (!optional_or_wrong_stride_resources.by_fetch_pc(40u) ||
+               !is_optional_null_raw_load_buffer(
+                   *optional_or_wrong_stride_resources.by_fetch_pc(40u))),
+          "pc35 OR-literal mutation removes the second terminal's optional-null proof");
+
+    std::array<uint32_t, 48> optional_or_backedge_into_tail = optional_null_raw_or;
+    optional_or_backedge_into_tail[46] = 0xbf88fff7u; // pc46 -> pc38, after the producer
+    ShaderResourceTable optional_or_backedge_resources;
+    const std::vector<SrtUse> optional_or_backedge_uses = add_compute_buffer_resources(
+        optional_or_backedge_resources, optional_or_backedge_into_tail.data(),
+        optional_or_backedge_into_tail.size(), optional_user_sgprs.data(),
+        optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+        kGtaOptionalBufferTgidSgpr);
+    CHECK(std::none_of(optional_or_backedge_uses.begin(), optional_or_backedge_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.use_pc == 40u && use.optional_null_raw_load;
+                       }) &&
+              (!optional_or_backedge_resources.by_fetch_pc(40u) ||
+               !is_optional_null_raw_load_buffer(
+                   *optional_or_backedge_resources.by_fetch_pc(40u))),
+          "pc46 backedge into the descriptor tail keeps the optional chain fail-visible");
+
+    auto optional_mutation_stays_rejected = [&](std::array<uint32_t, 13> code) {
+        ShaderResourceTable resources;
+        const std::vector<SrtUse> uses = add_compute_buffer_resources(
+            resources, code.data(), code.size(), optional_user_sgprs.data(),
+            optional_user_sgprs.size(), kGtaOptionalBufferLocalSize, optional_records,
+            kGtaOptionalBufferTgidSgpr);
+        const bool no_optional_use = std::none_of(uses.begin(), uses.end(),
+            [](const SrtUse& use) { return use.optional_null_raw_load; });
+        return no_optional_use && resources.resources.empty() &&
+            recompile_compute(code.data(), code.size(), &resources, optional_config).empty();
+    };
+
+    std::array<uint32_t, 13> optional_wrong_srsrc = optional_null_raw;
+    optional_wrong_srsrc[11] = 0x80050002u; // pc10 consumes s[20:23], not the produced V#
+    CHECK(optional_mutation_stays_rejected(optional_wrong_srsrc),
+          "pc10 SRSRC mutation disconnects the optional producer and stays fail-visible");
+
+    std::array<uint32_t, 13> optional_wrong_offset = optional_null_raw;
+    optional_wrong_offset[4] = 0xfa000050u; // same zero table, different producer field
+    CHECK(optional_mutation_stays_rejected(optional_wrong_offset),
+          "x2 producer offset mutation does not infer optional semantics from another zero qword");
+
+    std::array<uint32_t, 13> optional_no_idxen = optional_null_raw;
+    optional_no_idxen[10] = 0xe0300000u;
+    CHECK(optional_mutation_stays_rejected(optional_no_idxen),
+          "pc10 idxen mutation stays outside the linear optional-null contract");
+
+    std::array<uint32_t, 13> optional_store = optional_null_raw;
+    optional_store[10] = 0xe0702000u;
+    CHECK(optional_mutation_stays_rejected(optional_store),
+          "pc10 store mutation cannot inherit load-only optional-null semantics");
+    CHECK(recompile_compute(optional_store.data(), optional_store.size(),
+                            &optional_table_resources, optional_config).empty(),
+          "even a forged pc10 optional marker cannot turn the load-only convention into a store");
+
+    // Independent domain negative: the exact V# and launch geometry are insufficient without the
+    // mapped +0x58 producer. This retains the broad addr0+nonzero rejection even when every static
+    // descriptor dword happens to match the admitted live shape.
+    const uint32_t direct_optional_shape[] = {
+        0xe0302000u, 0x80000000u,
+        0xbf810000u,
+    };
+    const uint32_t direct_optional_seed[4] = {
+        0u, kGtaOptionalBufferStrideWord, optional_records,
+        kGtaOptionalBufferConfigWord,
+    };
+    ShaderResourceTable direct_optional_table;
+    const std::vector<SrtUse> direct_optional_uses = add_compute_buffer_resources(
+        direct_optional_table, direct_optional_shape, std::size(direct_optional_shape),
+        direct_optional_seed, std::size(direct_optional_seed),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    CHECK(direct_optional_uses.empty() && direct_optional_table.resources.empty(),
+          "direct addr0 nonzero V# stays rejected without mapped optional-entry provenance");
+
+    // Positive initialized state from the same guest field: after WRITE_DATA places a mapped pointer
+    // at +0x58, the exact program must materialize the ordinary resource rather than retain a zero
+    // marker. This tests the discriminator that changes over the title's early/later dispatches.
+    alignas(8) std::array<uint32_t, optional_records> optional_payload{};
+    const uint64_t optional_payload_addr =
+        reinterpret_cast<uint64_t>(optional_payload.data());
+    optional_table[kGtaOptionalBufferPointerOffset / 4u] =
+        static_cast<uint32_t>(optional_payload_addr);
+    optional_table[kGtaOptionalBufferPointerOffset / 4u + 1u] =
+        static_cast<uint32_t>(optional_payload_addr >> 32);
+    ShaderResourceTable initialized_optional_table;
+    const std::vector<SrtUse> initialized_optional_uses = add_compute_buffer_resources(
+        initialized_optional_table, optional_null_raw.data(), optional_null_raw.size(),
+        optional_user_sgprs.data(), optional_user_sgprs.size(),
+        kGtaOptionalBufferLocalSize, optional_records, kGtaOptionalBufferTgidSgpr);
+    assign_convention_bindings(initialized_optional_table, 2);
+    const std::vector<uint32_t> initialized_optional_spirv = recompile_compute(
+        optional_null_raw.data(), optional_null_raw.size(), &initialized_optional_table,
+        optional_config);
+    CHECK(initialized_optional_uses.size() == 1 &&
+              !initialized_optional_uses[0].optional_null_raw_load &&
+              initialized_optional_table.resources.size() == 1 &&
+              initialized_optional_table.resources[0].gpu_addr == optional_payload_addr &&
+              initialized_optional_table.resources[0].size == optional_payload.size() * 4u &&
+              !is_optional_null_raw_load_buffer(initialized_optional_table.resources[0]) &&
+              !initialized_optional_spirv.empty(),
+          "initialized +0x58 entry materializes and recompiles its ordinary mapped buffer");
+    // GTA V 0x413cf9a00's null-output dispatch rebuilds a one-record V# at s[0:3], then places its
+    // three stores behind `~(S | M) & S` and an EXECZ exit. Keep the complete production 81-dword
+    // shader so the proof is tied to the observed PCs, packets, descriptor builder, and CFG rather
+    // than a helper-shaped toy. Give its unrelated input/table accesses real mapped backing so this
+    // test reaches complete compute translation instead of stopping at an earlier resource use.
+    const std::vector<uint32_t> gta_413cf9a00 = {
+        0xbfa00003u, 0xd7460000u, 0x04010c07u, 0xf4040500u,
+        0xfa000090u, 0xbe960304u, 0xbe9703ffu, 0x00016204u,
+        0xbf8cc07fu, 0xbe951d92u, 0x816ac104u, 0xe0302000u,
+        0x80050100u, 0xf4080300u, 0xfa0000c0u, 0xbf8cc07fu,
+        0xf4200406u, 0xfa000000u, 0xbf8cc07fu, 0x7e040210u,
+        0xbe9703ffu, 0x00016204u, 0xbe92047eu, 0x7da8006au,
+        0xbf880003u, 0x4a040081u, 0xe0302000u, 0x80050202u,
+        0xbefe0412u, 0xbf8c3f70u, 0x7da80302u, 0xbf880009u,
+        0xf4040200u, 0xfa000098u, 0xbe8a0304u, 0xbe8b03ffu,
+        0x00016204u, 0xbf8cc07fu, 0xbe891d92u, 0xe0702000u,
+        0x80020001u, 0xbefe0412u, 0xbf128002u, 0x7d8a00f9u,
+        0x06868080u, 0x85ea8012u, 0x8dea006au, 0x87fe126au,
+        0xbf88001fu, 0x7e0e0210u, 0x936b6a10u, 0x936a056au,
+        0x87048106u, 0x816b6a6bu, 0x9aea0510u, 0x93000510u,
+        0x81016b6au, 0xbf078004u, 0x4a0620f9u, 0x86860681u,
+        0x85ea1000u, 0x7e000210u, 0x7e10026au, 0x7e020210u,
+        0x7e040280u, 0x7e080210u, 0x7e0a0281u, 0x7e0c0281u,
+        0x8801ff03u, 0x00380000u, 0xbe800302u, 0xbe820381u,
+        0xbe8303ffu, 0x00016204u, 0xe0740030u, 0x80000700u,
+        0xe0780020u, 0x80000000u, 0xe07c0000u, 0x80000400u,
+        0xbf810000u,
+    };
+    alignas(256) std::array<uint32_t, 64> gta_null_store_srt{};
+    alignas(256) std::array<uint32_t, 256> gta_null_store_input{};
+    alignas(256) std::array<uint32_t, 256> gta_null_store_output{};
+    alignas(256) std::array<uint32_t, 16> gta_null_store_scalar{};
+    auto put_address = [](uint32_t* words, uint64_t address) {
+        words[0] = static_cast<uint32_t>(address);
+        words[1] = static_cast<uint32_t>(address >> 32);
+    };
+    put_address(gta_null_store_srt.data() + 0x90u / 4u,
+                reinterpret_cast<uint64_t>(gta_null_store_input.data()));
+    put_address(gta_null_store_srt.data() + 0x98u / 4u,
+                reinterpret_cast<uint64_t>(gta_null_store_output.data()));
+    put_address(gta_null_store_srt.data() + 0xc0u / 4u,
+                reinterpret_cast<uint64_t>(gta_null_store_scalar.data()));
+    gta_null_store_srt[0xc0u / 4u + 1u] |= 4u << 16;
+    gta_null_store_srt[0xc0u / 4u + 2u] = gta_null_store_scalar.size();
+    gta_null_store_srt[0xc0u / 4u + 3u] = 0x00016204u;
+    const uint64_t gta_null_store_srt_address =
+        reinterpret_cast<uint64_t>(gta_null_store_srt.data());
+    const uint32_t gta_413cf9a00_null_seed[7] = {
+        static_cast<uint32_t>(gta_null_store_srt_address),
+        static_cast<uint32_t>(gta_null_store_srt_address >> 32),
+        0u, 0u, // nullable output pointer: the exact live null dispatch
+        151u, 4u, 0u,
+    };
+    ShaderResourceTable gta_null_store_table;
+    ShaderResource gta_null_store_srt_resource;
+    gta_null_store_srt_resource.cls = ResourceClass::ConstantBuffer;
+    gta_null_store_srt_resource.format = DataFormat::Uint32;
+    gta_null_store_srt_resource.num_components = 1;
+    gta_null_store_srt_resource.gpu_addr = gta_null_store_srt_address;
+    gta_null_store_srt_resource.size = sizeof(gta_null_store_srt);
+    gta_null_store_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_null_store_uses = add_compute_buffer_resources(
+        gta_null_store_table, gta_413cf9a00.data(), gta_413cf9a00.size(),
+        gta_413cf9a00_null_seed, std::size(gta_413cf9a00_null_seed));
+    assign_convention_bindings(gta_null_store_table, 2);
+    ComputeShaderConfig gta_null_store_config;
+    gta_null_store_config.user_sgprs.assign(
+        std::begin(gta_413cf9a00_null_seed), std::end(gta_413cf9a00_null_seed));
+    gta_null_store_config.local_x = 64u;
+    gta_null_store_config.local_y = gta_null_store_config.local_z = 1u;
+    gta_null_store_config.wave_size = 64u;
+    gta_null_store_config.native_subgroup_size = 64u;
+    gta_null_store_config.tidig_comp_cnt = 0u;
+    const std::vector<uint32_t> gta_null_store_spirv = recompile_compute(
+        gta_413cf9a00.data(), gta_413cf9a00.size(), &gta_null_store_table,
+        gta_null_store_config);
+    const DescriptorValidationReport gta_null_store_report =
+        validate_spirv_descriptor_interface(gta_null_store_spirv, &gta_null_store_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    const auto gta_null_store_markers = std::count_if(
+        gta_null_store_table.resources.begin(), gta_null_store_table.resources.end(),
+        is_proven_null_guarded_raw_store);
+    CHECK(gta_null_store_markers == 3u &&
+              gta_null_store_table.by_fetch_pc(74u) &&
+              gta_null_store_table.by_fetch_pc(76u) &&
+              gta_null_store_table.by_fetch_pc(78u) &&
+              std::count_if(gta_null_store_uses.begin(), gta_null_store_uses.end(),
+                          [](const SrtUse& use) {
+                              return use.proven_null_guarded_raw_store && !use.zero_record_raw;
+                          }) == 3u &&
+              !gta_null_store_spirv.empty() && gta_null_store_report.ok(),
+          "GTA V 0x413cf9a00 null dispatch materializes three exact guarded-store markers");
+
+    // Production-site mutation arm: change only pc47 from S_AND_B64 EXEC,VCC,s[18:19] to S_OR_B64.
+    // The identity no longer proves empty EXEC, so the unchanged one-record base-zero stores must
+    // remain unresolved and recompilation must fail. This exercises the proof site itself.
+    std::vector<uint32_t> gta_null_store_or_mutation = gta_413cf9a00;
+    gta_null_store_or_mutation[47] = 0x88fe126au;
+    ShaderResourceTable gta_null_store_or_table;
+    gta_null_store_or_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_null_store_or_uses = add_compute_buffer_resources(
+        gta_null_store_or_table, gta_null_store_or_mutation.data(),
+        gta_null_store_or_mutation.size(), gta_413cf9a00_null_seed,
+        std::size(gta_413cf9a00_null_seed));
+    assign_convention_bindings(gta_null_store_or_table, 2);
+    CHECK(std::none_of(gta_null_store_or_uses.begin(), gta_null_store_or_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.proven_null_guarded_raw_store;
+                       }) &&
+              std::none_of(gta_null_store_or_table.resources.begin(),
+                           gta_null_store_or_table.resources.end(),
+                           is_proven_null_guarded_raw_store) &&
+              recompile_compute(gta_null_store_or_mutation.data(),
+                                gta_null_store_or_mutation.size(),
+                                &gta_null_store_or_table,
+                                gta_null_store_config).empty(),
+          "pc47 AND_B64-to-OR_B64 mutation removes the guarded-store proof and rejects pc74");
+
+    // CFG mutation arm: redirect the existing pc24 branch to pc48, entering after the mask identity
+    // and EXEC write. The store packets and null seed are unchanged, but the guard no longer
+    // dominates them, so resource discovery must not manufacture any guarded-store markers.
+    std::vector<uint32_t> gta_null_store_entry_mutation = gta_413cf9a00;
+    gta_null_store_entry_mutation[24] = 0xbf820017u; // s_branch pc48
+    ShaderResourceTable gta_null_store_entry_table;
+    gta_null_store_entry_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_null_store_entry_uses = add_compute_buffer_resources(
+        gta_null_store_entry_table, gta_null_store_entry_mutation.data(),
+        gta_null_store_entry_mutation.size(), gta_413cf9a00_null_seed,
+        std::size(gta_413cf9a00_null_seed));
+    assign_convention_bindings(gta_null_store_entry_table, 2);
+    CHECK(std::none_of(gta_null_store_entry_uses.begin(),
+                       gta_null_store_entry_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.proven_null_guarded_raw_store;
+                       }) &&
+              std::none_of(gta_null_store_entry_table.resources.begin(),
+                           gta_null_store_entry_table.resources.end(),
+                           is_proven_null_guarded_raw_store) &&
+              !gta_null_store_entry_table.by_fetch_pc(74u) &&
+              !gta_null_store_entry_table.by_fetch_pc(76u) &&
+              !gta_null_store_entry_table.by_fetch_pc(78u) &&
+              recompile_compute(gta_null_store_entry_mutation.data(),
+                                gta_null_store_entry_mutation.size(),
+                                &gta_null_store_entry_table,
+                                gta_null_store_config).empty(),
+          "an alternate pc24-to-pc48 entry cannot acquire guarded-store resources");
+
+    // Entering at the compare is also unsafe: it executes the visible mask sequence, but bypasses
+    // the scalar dataflow that established the compared pointer. Keep this boundary distinct from
+    // the pc48 arm so both the proof start and its interior remain fail-closed.
+    std::vector<uint32_t> gta_null_store_compare_entry_mutation = gta_413cf9a00;
+    gta_null_store_compare_entry_mutation[24] = 0xbf820011u; // s_branch pc42
+    ShaderResourceTable gta_null_store_compare_entry_table;
+    gta_null_store_compare_entry_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_null_store_compare_entry_uses =
+        add_compute_buffer_resources(
+            gta_null_store_compare_entry_table,
+            gta_null_store_compare_entry_mutation.data(),
+            gta_null_store_compare_entry_mutation.size(), gta_413cf9a00_null_seed,
+            std::size(gta_413cf9a00_null_seed));
+    assign_convention_bindings(gta_null_store_compare_entry_table, 2);
+    CHECK(std::none_of(gta_null_store_compare_entry_uses.begin(),
+                       gta_null_store_compare_entry_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.proven_null_guarded_raw_store;
+                       }) &&
+              std::none_of(gta_null_store_compare_entry_table.resources.begin(),
+                           gta_null_store_compare_entry_table.resources.end(),
+                           is_proven_null_guarded_raw_store) &&
+              !gta_null_store_compare_entry_table.by_fetch_pc(74u) &&
+              !gta_null_store_compare_entry_table.by_fetch_pc(76u) &&
+              !gta_null_store_compare_entry_table.by_fetch_pc(78u) &&
+              recompile_compute(gta_null_store_compare_entry_mutation.data(),
+                                gta_null_store_compare_entry_mutation.size(),
+                                &gta_null_store_compare_entry_table,
+                                gta_null_store_config).empty(),
+          "an alternate pc24-to-pc42 entry cannot acquire guarded-store resources");
+
+    // GFX10.3's debug-condition SOPP branches also carry direct simm16 targets. Mutate the same
+    // pc24 entry edge to S_CBRANCH_CDBGSYS pc42; recognizing only the common branch family would
+    // let this alternate entry bypass the pointer dataflow while preserving the visible guard.
+    std::vector<uint32_t> gta_null_store_debug_entry_mutation = gta_413cf9a00;
+    gta_null_store_debug_entry_mutation[24] = 0xbf970011u; // s_cbranch_cdbgsys pc42
+    ShaderResourceTable gta_null_store_debug_entry_table;
+    gta_null_store_debug_entry_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_null_store_debug_entry_uses =
+        add_compute_buffer_resources(
+            gta_null_store_debug_entry_table,
+            gta_null_store_debug_entry_mutation.data(),
+            gta_null_store_debug_entry_mutation.size(), gta_413cf9a00_null_seed,
+            std::size(gta_413cf9a00_null_seed));
+    assign_convention_bindings(gta_null_store_debug_entry_table, 2);
+    CHECK(std::none_of(gta_null_store_debug_entry_uses.begin(),
+                       gta_null_store_debug_entry_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.proven_null_guarded_raw_store;
+                       }) &&
+              std::none_of(gta_null_store_debug_entry_table.resources.begin(),
+                           gta_null_store_debug_entry_table.resources.end(),
+                           is_proven_null_guarded_raw_store) &&
+              !gta_null_store_debug_entry_table.by_fetch_pc(74u) &&
+              !gta_null_store_debug_entry_table.by_fetch_pc(76u) &&
+              !gta_null_store_debug_entry_table.by_fetch_pc(78u) &&
+              recompile_compute(gta_null_store_debug_entry_mutation.data(),
+                                gta_null_store_debug_entry_mutation.size(),
+                                &gta_null_store_debug_entry_table,
+                                gta_null_store_config).empty(),
+          "an S_CBRANCH_CDBGSYS pc24-to-pc42 entry cannot acquire guarded-store resources");
+
+    auto rejects_guarded_store_control_flow =
+        [&](const std::vector<uint32_t>& mutated_shader) {
+            ShaderResourceTable table;
+            table.resources.push_back(gta_null_store_srt_resource);
+            const std::vector<SrtUse> uses = add_compute_buffer_resources(
+                table, mutated_shader.data(), mutated_shader.size(),
+                gta_413cf9a00_null_seed, std::size(gta_413cf9a00_null_seed));
+            assign_convention_bindings(table, 2);
+            return std::none_of(uses.begin(), uses.end(),
+                                [](const SrtUse& use) {
+                                    return use.proven_null_guarded_raw_store;
+                                }) &&
+                   std::none_of(table.resources.begin(), table.resources.end(),
+                                is_proven_null_guarded_raw_store) &&
+                   !table.by_fetch_pc(74u) && !table.by_fetch_pc(76u) &&
+                   !table.by_fetch_pc(78u) &&
+                   recompile_compute(mutated_shader.data(), mutated_shader.size(),
+                                     &table, gta_null_store_config).empty();
+        };
+
+    // The SOPK subvector-loop pair also carries direct SIMM16 transfers. Exercise both named
+    // opcodes at the same pc24 edge; LOOP_END pc48 is the reviewer-observed alternate entry that
+    // skips the guard, while LOOP_BEGIN proves the complete family remains fail-closed.
+    std::vector<uint32_t> gta_null_store_loop_begin_mutation = gta_413cf9a00;
+    gta_null_store_loop_begin_mutation[24] = 0xbd800017u; // s_subvector_loop_begin pc48
+    CHECK(rejects_guarded_store_control_flow(gta_null_store_loop_begin_mutation),
+          "an S_SUBVECTOR_LOOP_BEGIN pc24-to-pc48 entry cannot acquire guarded-store resources");
+    std::vector<uint32_t> gta_null_store_loop_end_mutation = gta_413cf9a00;
+    gta_null_store_loop_end_mutation[24] = 0xbe000017u; // s_subvector_loop_end pc48
+    CHECK(rejects_guarded_store_control_flow(gta_null_store_loop_end_mutation),
+          "an S_SUBVECTOR_LOOP_END pc24-to-pc48 entry cannot acquire guarded-store resources");
+
+    // S_TRAP leaves the shader for an externally configured handler. Even if the packet is placed
+    // before the visible guard, its unobservable return path invalidates a closed dominance proof.
+    std::vector<uint32_t> gta_null_store_trap_mutation = gta_413cf9a00;
+    gta_null_store_trap_mutation[24] = 0xbf920000u; // s_trap 0
+    CHECK(rejects_guarded_store_control_flow(gta_null_store_trap_mutation),
+          "an S_TRAP transfer prevents guarded-store closed-CFG provenance");
+
+    // Relative scalar moves add runtime M0 to the encoded destination. Keep the encoded base at s0
+    // so the ordinary fixed-destination overlap check cannot catch these pc38 mutations: each must
+    // be rejected specifically because it can dynamically overwrite nullable s2:s3 before pc42.
+    auto rejects_guarded_store_dynamic_destination =
+        [&](const std::vector<uint32_t>& mutated_shader) {
+            ShaderResourceTable table;
+            table.resources.push_back(gta_null_store_srt_resource);
+            add_compute_buffer_resources(
+                table, mutated_shader.data(), mutated_shader.size(),
+                gta_413cf9a00_null_seed, std::size(gta_413cf9a00_null_seed));
+            assign_convention_bindings(table, 2);
+            return !rdna2_gta5_null_guarded_raw_store_dispatch(
+                       mutated_shader.data(), mutated_shader.size(),
+                       gta_413cf9a00_null_seed,
+                       std::size(gta_413cf9a00_null_seed)) &&
+                   std::none_of(table.resources.begin(), table.resources.end(),
+                                is_proven_null_guarded_raw_store) &&
+                   !table.by_fetch_pc(74u) && !table.by_fetch_pc(76u) &&
+                   !table.by_fetch_pc(78u) &&
+                   recompile_compute(mutated_shader.data(), mutated_shader.size(),
+                                     &table, gta_null_store_config).empty();
+        };
+    for (const auto& [word, name] : std::array<std::pair<uint32_t, const char*>, 3>{
+             std::pair{0xbe803001u, "S_MOVRELD_B32"},
+             std::pair{0xbe803102u, "S_MOVRELD_B64"},
+             std::pair{0xbe804901u, "S_MOVRELSD_2_B32"},
+        }) {
+        std::vector<uint32_t> gta_null_store_relative_dst_mutation = gta_413cf9a00;
+        gta_null_store_relative_dst_mutation[38] = word;
+        CHECK(rejects_guarded_store_dynamic_destination(
+                  gta_null_store_relative_dst_mutation), name);
+    }
+
+    // A table can be stale or hand-built independently of its shader. The exact pc74 marker and
+    // store packet are insufficient without the complete pc42..80 byte/CFG proof.
+    std::vector<uint32_t> stale_guarded_store_shader(77u, 0x7e000000u);
+    stale_guarded_store_shader[74] = 0xe0740030u;
+    stale_guarded_store_shader[75] = 0x80000700u;
+    stale_guarded_store_shader[76] = 0xbf810000u;
+    ShaderResourceTable stale_guarded_store_table;
+    ShaderResource stale_guarded_store_marker;
+    stale_guarded_store_marker.cls = ResourceClass::ConstantBuffer;
+    stale_guarded_store_marker.format = DataFormat::Unknown;
+    stale_guarded_store_marker.num_components = 0u;
+    stale_guarded_store_marker.gpu_addr = 0u;
+    stale_guarded_store_marker.size = 0u;
+    stale_guarded_store_marker.stride = kProvenNullGuardedRawStoreStride;
+    stale_guarded_store_marker.srt_offset = 0xFFFFFFFFu;
+    stale_guarded_store_marker.sgpr_base = 0xFFFFFFFFu;
+    stale_guarded_store_marker.fetch_pc = 74u;
+    stale_guarded_store_table.resources.push_back(stale_guarded_store_marker);
+    assign_convention_bindings(stale_guarded_store_table, 2);
+    CHECK(is_proven_null_guarded_raw_store(stale_guarded_store_marker) &&
+              recompile_compute(stale_guarded_store_shader.data(),
+                                stale_guarded_store_shader.size(),
+                                &stale_guarded_store_table,
+                                gta_null_store_config).empty(),
+          "a hand-built pc74 marker cannot bypass the complete guarded-shader proof");
+
+    std::vector<uint32_t> gta_null_store_consumer_mutation = gta_413cf9a00;
+    gta_null_store_consumer_mutation[74] = 0xe0340030u; // same packet fields, load_dwordx2
+    ShaderResourceTable gta_null_store_consumer_table;
+    gta_null_store_consumer_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_null_store_consumer_uses = add_compute_buffer_resources(
+        gta_null_store_consumer_table, gta_null_store_consumer_mutation.data(),
+        gta_null_store_consumer_mutation.size(), gta_413cf9a00_null_seed,
+        std::size(gta_413cf9a00_null_seed));
+    assign_convention_bindings(gta_null_store_consumer_table, 2);
+    CHECK(std::count_if(gta_null_store_consumer_uses.begin(),
+                        gta_null_store_consumer_uses.end(),
+                        [](const SrtUse& use) {
+                            return use.proven_null_guarded_raw_store;
+                        }) == 2u &&
+              !gta_null_store_consumer_table.by_fetch_pc(74u) &&
+              gta_null_store_consumer_table.by_fetch_pc(76u) &&
+              gta_null_store_consumer_table.by_fetch_pc(78u) &&
+              recompile_compute(gta_null_store_consumer_mutation.data(),
+                                gta_null_store_consumer_mutation.size(),
+                                &gta_null_store_consumer_table,
+                                gta_null_store_config).empty(),
+          "a load at exact pc74 cannot inherit guarded-store no-op semantics");
+
+    uint32_t gta_413cf9a00_nonnull_seed[7];
+    std::copy(std::begin(gta_413cf9a00_null_seed), std::end(gta_413cf9a00_null_seed),
+              gta_413cf9a00_nonnull_seed);
+    gta_413cf9a00_nonnull_seed[2] = 1u;
+    ShaderResourceTable gta_nonnull_unmapped_table;
+    gta_nonnull_unmapped_table.resources.push_back(gta_null_store_srt_resource);
+    const std::vector<SrtUse> gta_nonnull_unmapped_uses = add_compute_buffer_resources(
+        gta_nonnull_unmapped_table, gta_413cf9a00.data(), gta_413cf9a00.size(),
+        gta_413cf9a00_nonnull_seed, std::size(gta_413cf9a00_nonnull_seed));
+    assign_convention_bindings(gta_nonnull_unmapped_table, 2);
+    ComputeShaderConfig gta_nonnull_unmapped_config = gta_null_store_config;
+    gta_nonnull_unmapped_config.user_sgprs.assign(
+        std::begin(gta_413cf9a00_nonnull_seed), std::end(gta_413cf9a00_nonnull_seed));
+    CHECK(std::none_of(gta_nonnull_unmapped_uses.begin(), gta_nonnull_unmapped_uses.end(),
+                       [](const SrtUse& use) {
+                           return use.proven_null_guarded_raw_store;
+                       }) &&
+              std::none_of(gta_nonnull_unmapped_table.resources.begin(),
+                           gta_nonnull_unmapped_table.resources.end(),
+                           is_proven_null_guarded_raw_store) &&
+              recompile_compute(gta_413cf9a00.data(), gta_413cf9a00.size(),
+                                &gta_nonnull_unmapped_table,
+                                gta_nonnull_unmapped_config).empty(),
+          "a non-null unmapped output pointer does not acquire null-guarded store markers");
+    CHECK(recompile_compute(gta_413cf9a00.data(), gta_413cf9a00.size(),
+                            &gta_null_store_table,
+                            gta_nonnull_unmapped_config).empty(),
+          "a stale null-dispatch marker cannot erase stores for non-null user s2:s3");
 
     // GTA V 0x413d59600 pc67 uses this exact FORMAT-load packet through the all-zero descriptor
     // produced by its earlier zero-record scalar loads. Keep the exact pc because the marker is
@@ -3131,6 +3783,8 @@ int main() {
         0xE0E40000u, // and
         0xE0E80000u, // or
         0xE0EC0000u, // xor
+        0xE0FC0000u, // fmin
+        0xE1000000u, // fmax
     };
     uint32_t supported_atomic_uses = 0;
     for (uint32_t dw0 : supported_atomic_dw0) {
@@ -3142,6 +3796,63 @@ int main() {
     }
     CHECK(supported_atomic_uses == std::size(supported_atomic_dw0),
           "resource discovery admits exactly every emitter-supported 32-bit MUBUF RMW opcode");
+
+    // GTA V's six-packet reduction tail uses one direct stride-24 V# in s[4:7]. Opcode emission and
+    // descriptor discovery are separate passes; accepting FMIN/FMAX in only the former leaves the
+    // exact live shader terminal at its first packet with pc_res=null. Exercise the whole production
+    // boundary, including one exact-PC alias per consumer and the live FP32 mode.
+    static uint32_t gta_float_atomic_output[6] = {};
+    const uint64_t gta_float_atomic_base =
+        reinterpret_cast<uint64_t>(gta_float_atomic_output);
+    uint32_t gta_float_atomic_seed[10] = {};
+    gta_float_atomic_seed[4] = static_cast<uint32_t>(gta_float_atomic_base);
+    gta_float_atomic_seed[5] = static_cast<uint32_t>(gta_float_atomic_base >> 32) |
+                               (24u << 16);
+    gta_float_atomic_seed[6] = 1u;
+    gta_float_atomic_seed[7] = 0x00005204u;
+    const uint32_t gta_float_atomic_tail[] = {
+        0xE0FC0000u, 0x80010000u, // buffer_atomic_fmin v0, off, s[4:7], 0
+        0xE0FC0004u, 0x80010100u, // buffer_atomic_fmin v1, off, s[4:7], 4
+        0xE0FC0008u, 0x80010200u, // buffer_atomic_fmin v2, off, s[4:7], 8
+        0xE100000Cu, 0x80010300u, // buffer_atomic_fmax v3, off, s[4:7], 12
+        0xBF8CC07Fu,              // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xE1000010u, 0x80010400u, // buffer_atomic_fmax v4, off, s[4:7], 16
+        0xE1000014u, 0x80010500u, // buffer_atomic_fmax v5, off, s[4:7], 20
+        0xBF810000u,
+    };
+    std::vector<SrtUse> gta_float_atomic_uses;
+    resolve_dynamic_fetch(gta_float_atomic_tail, std::size(gta_float_atomic_tail),
+                          gta_float_atomic_seed, std::size(gta_float_atomic_seed), 0,
+                          &gta_float_atomic_uses);
+    ShaderResourceTable gta_float_atomic_table;
+    add_compute_buffer_resources(gta_float_atomic_table, gta_float_atomic_tail,
+                                 std::size(gta_float_atomic_tail), gta_float_atomic_seed,
+                                 std::size(gta_float_atomic_seed));
+    assign_convention_bindings(gta_float_atomic_table, 2);
+    ComputeShaderConfig gta_float_atomic_config;
+    gta_float_atomic_config.user_sgprs.assign(
+        std::begin(gta_float_atomic_seed), std::end(gta_float_atomic_seed));
+    gta_float_atomic_config.local_x = gta_float_atomic_config.local_y =
+        gta_float_atomic_config.local_z = 1;
+    gta_float_atomic_config.compute_pgm_rsrc1 = 0x402c00c3u;
+    const uint32_t gta_float_atomic_pcs[] = {0u, 2u, 4u, 6u, 9u, 11u};
+    const bool gta_float_atomic_exact_pcs =
+        gta_float_atomic_uses.size() == std::size(gta_float_atomic_pcs) &&
+        gta_float_atomic_table.resources.size() == std::size(gta_float_atomic_pcs) &&
+        std::equal(gta_float_atomic_uses.begin(), gta_float_atomic_uses.end(),
+                   std::begin(gta_float_atomic_pcs),
+                   [](const SrtUse& use, uint32_t pc) { return use.use_pc == pc; }) &&
+        std::equal(gta_float_atomic_table.resources.begin(),
+                   gta_float_atomic_table.resources.end(),
+                   std::begin(gta_float_atomic_pcs),
+                   [](const ShaderResource& resource, uint32_t pc) {
+                       return resource.fetch_pc == pc && resource.stride == 24u &&
+                              resource.size == 24u;
+                   });
+    CHECK(gta_float_atomic_exact_pcs &&
+              !recompile_compute(gta_float_atomic_tail, std::size(gta_float_atomic_tail),
+                                 &gta_float_atomic_table, gta_float_atomic_config).empty(),
+          "GTA V float-atomic tail publishes six exact-PC resources and recompiles");
 
     const uint32_t unknown_atomic_descriptor[] = {
         0xBE801F00u,              // s_getpc_b64 s[0:1]: not a concrete entry V# anymore

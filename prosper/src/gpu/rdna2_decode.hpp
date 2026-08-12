@@ -27,6 +27,152 @@ enum class Rdna2Format : uint8_t {
     Unknown,
 };
 
+// GFX10.3 scalar ALU opcodes shared by emission and source-lifetime analysis.
+inline constexpr uint32_t kSop1OpcodeMovB32 = 0x03;
+inline constexpr uint32_t kSop1OpcodeMovB64 = 0x04;
+inline constexpr uint32_t kSop1OpcodeCmovB32 = 0x05;
+inline constexpr uint32_t kSop1OpcodeCmovB64 = 0x06;
+inline constexpr uint32_t kSop1OpcodeNotB32 = 0x07;
+inline constexpr uint32_t kSop1OpcodeBrevB32 = 0x0b;
+inline constexpr uint32_t kSop1OpcodeBcnt1I32B64 = 0x10;
+inline constexpr uint32_t kSop1OpcodeFf1I32B64 = 0x14;
+inline constexpr uint32_t kSop1OpcodeFlbitI32B32 = 0x15;
+inline constexpr uint32_t kSop1OpcodeFlbitI32B64 = 0x16;
+inline constexpr uint32_t kSop1OpcodeBitset0B32 = 0x1b;
+inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
+inline constexpr uint32_t kSop1OpcodeGetpcB64 = 0x1f;
+inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
+inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
+inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
+inline constexpr uint32_t kSop1OpcodeAndSaveexecB64 = 0x24;
+inline constexpr uint32_t kSop1OpcodeXnorSaveexecB64 = 0x2b;
+inline constexpr uint32_t kSop1OpcodeQuadmaskB64 = 0x2d;
+inline constexpr uint32_t kSop1OpcodeAbsI32 = 0x34;
+inline constexpr uint32_t kSop1OpcodeAndn1SaveexecB64 = 0x37;
+inline constexpr uint32_t kSop1OpcodeOrn1SaveexecB64 = 0x38;
+inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
+inline constexpr uint32_t kSop2OpcodeAddI32 = 0x02;
+inline constexpr uint32_t kSop1OpcodeMovreldB32 = 0x30;
+inline constexpr uint32_t kSop1OpcodeMovreldB64 = 0x31;
+inline constexpr uint32_t kSop1OpcodeMovrelsd2B32 = 0x49;
+inline constexpr uint32_t kSop2OpcodeCselectB64 = 0x0b;
+inline constexpr uint32_t kSop2OpcodeAndB32 = 0x0e;
+inline constexpr uint32_t kSop2OpcodeAndB64 = 0x0f;
+inline constexpr uint32_t kSop2OpcodeOrB32 = 0x10;
+inline constexpr uint32_t kSop2OpcodeOrB64 = 0x11;
+inline constexpr uint32_t kSop2OpcodeXorB32 = 0x12;
+inline constexpr uint32_t kSop2OpcodeAndn2B32 = 0x14;
+inline constexpr uint32_t kSop2OpcodeOrn2B32 = 0x16;
+inline constexpr uint32_t kSop2OpcodeNandB32 = 0x18;
+inline constexpr uint32_t kSop2OpcodeNorB32 = 0x1a;
+inline constexpr uint32_t kSop2OpcodeNorB64 = 0x1b;
+inline constexpr uint32_t kSop2OpcodeXnorB32 = 0x1c;
+inline constexpr uint32_t kSop2OpcodeBfmB32 = 0x24;
+inline constexpr uint32_t kSop2OpcodeBfmB64 = 0x25;
+inline constexpr uint32_t kSop2OpcodeBfeU64 = 0x29;
+inline constexpr uint32_t kSopkOpcodeMovkI32 = 0x00;
+inline constexpr uint32_t kSopkOpcodeCmovkI32 = 0x02;
+inline constexpr uint32_t kSopkOpcodeCmpkFirst = 0x03;
+inline constexpr uint32_t kSopkOpcodeCmpkLast = 0x0e;
+inline constexpr uint32_t kSopkOpcodeAddkI32 = 0x0f;
+inline constexpr uint32_t kSopkOpcodeMulkI32 = 0x10;
+inline constexpr uint32_t kSopkOpcodeSetregB32 = 0x13;
+inline constexpr uint32_t kSopkOpcodeWaitcntVscnt = 0x17;
+inline constexpr uint32_t kSopkOpcodeWaitcntLgkmcnt = 0x1a;
+inline constexpr uint32_t kSopkOpcodeCallB64 = 0x16;
+inline constexpr uint32_t kSopkOpcodeSubvectorLoopBegin = 0x1b;
+inline constexpr uint32_t kSopkOpcodeSubvectorLoopEnd = 0x1c;
+inline constexpr uint32_t kSoppOpcodeBranch = 0x02;
+inline constexpr uint32_t kSoppOpcodeCbranchScc0 = 0x04;
+inline constexpr uint32_t kSoppOpcodeCbranchExecz = 0x08;
+inline constexpr uint32_t kSoppOpcodeCbranchExecnz = 0x09;
+inline constexpr uint32_t kSoppOpcodeBarrier = 0x0a;
+inline constexpr uint32_t kSoppOpcodeTrap = 0x12;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbgsys = 0x17;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbguser = 0x18;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbgsysOrUser = 0x19;
+inline constexpr uint32_t kSoppOpcodeCbranchCdbgsysAndUser = 0x1a;
+
+inline constexpr bool sopp_opcode_is_direct_branch(uint32_t opcode) {
+    return opcode == kSoppOpcodeBranch ||
+           (opcode >= kSoppOpcodeCbranchScc0 && opcode <= kSoppOpcodeCbranchExecnz);
+}
+
+// GFX10.3 scalar-memory load opcodes shared by provenance analysis and emission. These are
+// compile-time constants, so naming them has no runtime cost; it keeps width/family tests from
+// becoming opaque hexadecimal comparisons at each consumer.
+inline constexpr uint32_t kSmemOpcodeLoadDword          = 0x00;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX2        = 0x01;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX4        = 0x02;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX8        = 0x03;
+inline constexpr uint32_t kSmemOpcodeLoadDwordX16       = 0x04;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDword    = 0x08;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX2  = 0x09;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX4  = 0x0a;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX8  = 0x0b;
+inline constexpr uint32_t kSmemOpcodeBufferLoadDwordX16 = 0x0c;
+
+inline constexpr bool smem_opcode_is_buffer_load(uint32_t opcode) {
+    return opcode >= kSmemOpcodeBufferLoadDword &&
+           opcode <= kSmemOpcodeBufferLoadDwordX16;
+}
+
+inline constexpr bool sop2_is_b32_logical(uint32_t opcode) {
+    return opcode == kSop2OpcodeAndB32 || opcode == kSop2OpcodeOrB32 ||
+           opcode == kSop2OpcodeXorB32 || opcode == kSop2OpcodeAndn2B32 ||
+           opcode == kSop2OpcodeOrn2B32 || opcode == kSop2OpcodeNandB32 ||
+           opcode == kSop2OpcodeNorB32 || opcode == kSop2OpcodeXnorB32;
+}
+
+// GFX10.3 VOP1 opcodes used outside the decoder itself. Naming cross-component opcodes at this
+// boundary keeps dispatcher admission and ALU emission on one compile-time constant.
+inline constexpr uint32_t kVop1OpcodeFfbhU32 = 0x39;
+inline constexpr uint32_t kVop1OpcodeFfblB32 = 0x3a;
+inline constexpr uint32_t kVop1OpcodeMovreldB32 = 0x42;
+
+// GFX10.3 VOP3 opcodes shared by source-lifetime and exact packet-shape proofs. Both consume three
+// independent B32 operands; neither reads an SGPR pair.
+inline constexpr uint32_t kVop3OpcodeLshlAddU32 = 0x346;
+inline constexpr uint32_t kVop3OpcodeAdd3U32 = 0x36d;
+
+// GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
+// admission, and emission. These inline constants compile to the same immediate comparisons as raw
+// literals.
+inline constexpr uint32_t kDsOpcodeBpermuteB32 = 0xb3;
+inline constexpr uint32_t kDsOpcodeMinF32 = 0x12;
+inline constexpr uint32_t kDsOpcodeMaxF32 = 0x13;
+
+// GFX10.3 MUBUF opcodes shared by descriptor discovery and emission. These inline constants compile
+// to the same immediate comparisons as the old literals.
+inline constexpr uint32_t kMubufOpcodeStoreDword   = 0x1c;
+inline constexpr uint32_t kMubufOpcodeStoreDwordX2 = 0x1d;
+inline constexpr uint32_t kMubufOpcodeStoreDwordX4 = 0x1e;
+inline constexpr uint32_t kMubufOpcodeStoreDwordX3 = 0x1f;
+
+// GFX10.3 unsigned 64-bit scalar equality compare. Kept with the other scalar opcodes because the
+// guarded-null resource proof and scalar emission must identify the same instruction.
+inline constexpr uint32_t kSopcOpcodeCmpEqU64 = 0x12;
+
+inline constexpr uint32_t kMubufOpcodeLoadDword         = 0x0c;
+inline constexpr uint32_t kMubufOpcodeAtomicSwap        = 0x30;
+inline constexpr uint32_t kMubufOpcodeAtomicCompareSwap = 0x31;
+inline constexpr uint32_t kMubufOpcodeAtomicAdd         = 0x32;
+inline constexpr uint32_t kMubufOpcodeAtomicSub         = 0x33;
+inline constexpr uint32_t kMubufOpcodeAtomicConditionalSub = 0x34;
+inline constexpr uint32_t kMubufOpcodeAtomicSmin        = 0x35;
+inline constexpr uint32_t kMubufOpcodeAtomicUmin        = 0x36;
+inline constexpr uint32_t kMubufOpcodeAtomicSmax        = 0x37;
+inline constexpr uint32_t kMubufOpcodeAtomicUmax        = 0x38;
+inline constexpr uint32_t kMubufOpcodeAtomicAnd         = 0x39;
+inline constexpr uint32_t kMubufOpcodeAtomicOr          = 0x3a;
+inline constexpr uint32_t kMubufOpcodeAtomicXor         = 0x3b;
+inline constexpr uint32_t kMubufOpcodeAtomicInc         = 0x3c;
+inline constexpr uint32_t kMubufOpcodeAtomicDec         = 0x3d;
+inline constexpr uint32_t kMubufOpcodeAtomicFmin        = 0x3f;
+inline constexpr uint32_t kMubufOpcodeAtomicFmax        = 0x40;
+inline constexpr uint32_t kMubufOpcodeAtomicSwapX2      = 0x50;
+inline constexpr uint32_t kMubufOpcodeAtomicOrX2        = 0x5a;
+
 // An operand's kind + payload. For SGPR/VGPR, `value` is the register number; for InlineInt, the
 // signed integer constant (-16..64); for InlineFloat, the AMD encoding code (240..248, see
 // inline_float_value); for Literal, the constant is in Rdna2Inst::literal; for Special, the field
@@ -217,6 +363,11 @@ struct Rdna2Inst {
 // encoding, returns fmt=Unknown with len_dwords clamped so a walker still terminates.
 Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords);
 
+// Packet half of GTA V's optional-null buffer convention: one plain idxen-only RAW dword load with
+// no instruction offset, SOFFSET, cache/status, LDS, or reserved controls. Descriptor provenance and
+// launch/index geometry are independent proofs supplied by the front half.
+bool rdna2_optional_null_raw_load_shape(const Rdna2Inst& in);
+
 // Walk from code[0], appending each decoded instruction to `out`, until S_ENDPGM, an Unknown
 // encoding, or the end of the buffer. Returns the number of dwords consumed.
 size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& out);
@@ -226,6 +377,22 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
 // only packet shape; callers must still prove that VGPR is zero and that the resource has one
 // materialized, uncompressed mip.
 bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
+
+// Exact raw-store consumers in GTA V 0x413cf9a00's null-output region. This is packet identity only;
+// callers must independently prove the pc42..48 EXEC guard and the dispatch's null pointer.
+bool rdna2_gta5_null_guarded_raw_store_site(const Rdna2Inst& in);
+
+// Complete byte and direct-CFG identity for GTA V 0x413cf9a00's pc42..80 nullable-output guard.
+// This proves only the static program shape; callers must independently prove that entry user SGPRs
+// s2:s3 are zero for the dispatch before treating the exact pc74/76/78 stores as no-ops.
+bool rdna2_gta5_null_guarded_raw_store_shader(const uint32_t* code, size_t dwords);
+
+// Complete dispatch proof for the same conditional stores. In addition to the static shader shape,
+// entry s2:s3 must be null and no decoded scalar destination may overlap either word before pc42.
+// This is the transferable trust-boundary check used by cached compilation and capture replay.
+bool rdna2_gta5_null_guarded_raw_store_dispatch(
+    const uint32_t* code, size_t dwords,
+    const uint32_t* user_sgprs, size_t user_sgpr_count);
 
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers
