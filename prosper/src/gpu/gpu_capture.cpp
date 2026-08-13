@@ -5468,7 +5468,10 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
         // before capture_submit_items would otherwise synthesize a permanently empty Unknown.
         for (size_t index = 0; index < semantic_state->dispatches.size(); ++index) {
             const GpuState::Dispatch& dispatch = semantic_state->dispatches[index];
-            const bool captured_operation = operations.empty() || std::any_of(
+            // An exact ordered trace may legitimately contain no operations after zero-workgroup
+            // dispatches are removed. Only the semantic fallback treats an empty plan as "all";
+            // otherwise it would fabricate Unknown failures for hardware no-ops.
+            const bool captured_operation = std::any_of(
                 operations.begin(), operations.end(), [&](const SubmitOperation& operation) {
                     return operation.kind == SubmitOperationKind::Dispatch &&
                            operation.index == index &&
@@ -5546,8 +5549,9 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
     const std::vector<ComputeItem> snapshot_computes =
         with_pending_gds_snapshot(pending, computes);
     const std::vector<SubmitOperation> semantic_operations =
-        operations.empty() && semantic_state ? plan_submit_operations(*semantic_state)
-                                             : std::vector<SubmitOperation>{};
+        operations.empty() && semantic_state && !exact_failures
+            ? plan_submit_operations(*semantic_state)
+            : std::vector<SubmitOperation>{};
     const std::vector<SubmitOperation>& exact_operations =
         semantic_operations.empty() ? operations : semantic_operations;
     const CaptureMemoryReader reader = pending_capture_reader(pending);

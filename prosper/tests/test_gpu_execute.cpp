@@ -374,6 +374,7 @@ int main() {
         after.command_order = 300;
         mixed.draws = {before, after};
         GpuState::Dispatch dispatch;
+        dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
         dispatch.command_order = 200;
         mixed.dispatches.push_back(dispatch);
         auto operations = plan_submit_operations(mixed);
@@ -568,6 +569,7 @@ int main() {
             (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
             1, 0, 100, 0});
         GpuState::Dispatch dispatch;
+        dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
         dispatch.command_order = 200;
         compute_only.dispatches.push_back(dispatch);
         const auto operations = plan_submit_operations(compute_only);
@@ -1221,20 +1223,141 @@ int main() {
         GpuState nonrender;
         nonrender.sh[P::COMPUTE_PGM_LO] = compute_registers[0].value;
         nonrender.sh[P::COMPUTE_PGM_HI] = compute_registers[1].value;
+
+        // A zero direct dimension is a hardware no-op. Keep it out of resource realization,
+        // ordered execution, and the semantic operation plan; otherwise an unreachable shader gap
+        // is counted as a failed dispatch and can poison a later indirect consumer epoch. Mutating
+        // the same X dimension to one must cross all three boundaries and execute normally.
+        GpuState zero_direct = nonrender;
+        GpuState::Dispatch zero_dispatch;
+        zero_dispatch.threads_x = 0;
+        zero_dispatch.threads_y = zero_dispatch.threads_z = 1;
+        zero_dispatch.command_order = 13;
+        zero_direct.dispatches.push_back(zero_dispatch);
+        std::vector<OperationRealizationFailure> zero_failures;
+        const std::vector<ComputeItem> zero_items =
+            realize_compute_dispatches(zero_direct, 1440, &zero_failures);
+        const std::vector<SubmitOperation> zero_operations =
+            plan_submit_operations(zero_direct);
+        uint32_t zero_backend_calls = 0;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            zero_backend_calls += static_cast<uint32_t>(items.size());
+            return !items.empty();
+        });
+        const bool zero_executed = execute_nonrender_submit_work(zero_direct, 1440);
+        set_submit_compute({});
+        CHECK(zero_items.empty() && zero_failures.empty() && zero_operations.empty() &&
+                  !zero_executed && zero_backend_calls == 0,
+              "zero direct compute dimension is an unplanned hardware no-op");
+
+        GpuState one_direct = zero_direct;
+        one_direct.dispatches[0].threads_x = 1;
+        std::vector<OperationRealizationFailure> one_failures;
+        const std::vector<ComputeItem> one_items =
+            realize_compute_dispatches(one_direct, 1440, &one_failures);
+        const std::vector<SubmitOperation> one_operations =
+            plan_submit_operations(one_direct);
+        uint32_t one_backend_calls = 0;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            one_backend_calls += static_cast<uint32_t>(items.size());
+            return !items.empty();
+        });
+        const bool one_executed = execute_nonrender_submit_work(one_direct, 1440);
+        set_submit_compute({});
+        CHECK(one_items.size() == 1 && one_failures.empty() &&
+                  one_operations.size() == 1 && one_executed && one_backend_calls == 1,
+              "nonzero mutation reaches direct compute realization, planning, and execution");
+
+        // Indirect dimensions become known only at their ordered position. A zero indirect packet
+        // must be a neutral no-op rather than a failed producer epoch; after the parser stall, the
+        // following valid indirect consumer still executes.
+        alignas(4) uint32_t zero_indirect_args[3] = {0, 1, 1};
+        alignas(4) uint32_t one_indirect_args[3] = {1, 1, 1};
+        GpuState indirect_noop_then_work = nonrender;
+        GpuState::Dispatch indirect_zero;
+        indirect_zero.indirect = true;
+        indirect_zero.indirect_args_addr =
+            reinterpret_cast<uint64_t>(zero_indirect_args);
+        indirect_zero.command_order = 10;
+        GpuState::Dispatch indirect_one = indirect_zero;
+        indirect_one.indirect_args_addr =
+            reinterpret_cast<uint64_t>(one_indirect_args);
+        indirect_one.command_order = 30;
+        indirect_noop_then_work.dispatches = {indirect_zero, indirect_one};
+        indirect_noop_then_work.parser_stalls.push_back({20});
+        uint32_t indirect_backend_calls = 0;
+        set_submit_compute([&](const std::vector<ComputeItem>& items) {
+            indirect_backend_calls += static_cast<uint32_t>(items.size());
+            return !items.empty();
+        });
+        const bool indirect_after_noop_executed =
+            execute_nonrender_submit_work(indirect_noop_then_work, 1440);
+        set_submit_compute({});
+        CHECK(indirect_after_noop_executed && indirect_backend_calls == 1,
+              "zero indirect dispatch does not poison the following producer epoch");
+
+        // Classification precedes backend selection. With no compute callback, the zero packet is
+        // still neutral; mutating the same runtime argument to one makes the missing backend an
+        // unknown compute boundary.
+        GpuState backendless_indirect = indirect_noop_then_work;
+        backendless_indirect.dispatches.resize(1);
+        backendless_indirect.parser_stalls.clear();
+        std::vector<ComputeAuthorityBoundary> backendless_boundaries;
+        set_submit_compute({});
+        set_submit_renderer([](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+            return RenderedFrame{};
+        });
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                backendless_boundaries.push_back(boundary);
+            });
+        const bool backendless_zero_executed =
+            execute_ordered_and_present(
+                backendless_indirect, W, H, 1440, /*publish=*/false);
+        const bool backendless_zero_unknown = std::any_of(
+            backendless_boundaries.begin(), backendless_boundaries.end(),
+            [](const ComputeAuthorityBoundary& boundary) {
+                return boundary.kind == ComputeAuthorityBoundaryKind::Compute;
+            });
+        zero_indirect_args[0] = 1;
+        backendless_boundaries.clear();
+        const bool backendless_one_executed =
+            execute_ordered_and_present(
+                backendless_indirect, W, H, 1440, /*publish=*/false);
+        const bool backendless_one_unknown = std::any_of(
+            backendless_boundaries.begin(), backendless_boundaries.end(),
+            [](const ComputeAuthorityBoundary& boundary) {
+                return boundary.kind == ComputeAuthorityBoundaryKind::Compute;
+            });
+        set_compute_authority_boundary_observer({});
+        set_submit_renderer({});
+        zero_indirect_args[0] = 0;
+        CHECK(!backendless_zero_executed && !backendless_zero_unknown &&
+                  !backendless_one_executed && backendless_one_unknown,
+              "indirect no-op classification precedes the compute-backend requirement");
+
+        // The production capture below sees the same indirect argument address twice: first as a
+        // zero-workgroup no-op, then after the ordered WRITE_DATA mutates X to one. This is the
+        // capture mutation arm for the no-op classifier itself.
+        GpuState::Dispatch captured_zero_dispatch = indirect_zero;
+        captured_zero_dispatch.command_order = 16;
+        nonrender.dispatches.push_back(captured_zero_dispatch);
         GpuState::Dispatch direct_dispatch;
         direct_dispatch.threads_x = direct_dispatch.threads_y = direct_dispatch.threads_z = 1;
         direct_dispatch.command_order = 17;
         nonrender.dispatches.push_back(direct_dispatch);
+        GpuState::Dispatch captured_one_dispatch = captured_zero_dispatch;
+        captured_one_dispatch.command_order = 19;
+        nonrender.dispatches.push_back(captured_one_dispatch);
         GpuState::Dispatch unresolved_dispatch;
         unresolved_dispatch.indirect = true;
         unresolved_dispatch.indirect_args_addr = 0xdead00000000ull;
-        unresolved_dispatch.command_order = 19;
+        unresolved_dispatch.command_order = 20;
         nonrender.dispatches.push_back(unresolved_dispatch);
-        uint32_t authority_effect_target = 0;
-        const uint32_t authority_effect_value = 0x1854cafeu;
+        const uint32_t authority_effect_value = 1;
         Pm4Command authority_effect;
         authority_effect.kind = Pm4Command::Kind::WriteData;
-        authority_effect.wd_addr = reinterpret_cast<uint64_t>(&authority_effect_target);
+        authority_effect.wd_addr = reinterpret_cast<uint64_t>(zero_indirect_args);
         authority_effect.wd_declared_num = 1;
         authority_effect.wd_num = 1;
         authority_effect.wd_data = &authority_effect_value;
@@ -1279,20 +1402,25 @@ int main() {
         const GpuCapturedStageDiagnostic* unresolved_stage = unresolved_failure &&
             unresolved_failure->stages.size() == 1
                 ? &unresolved_failure->stages.front() : nullptr;
-        CHECK(executed && compute_calls == 1 && captured_read &&
-                  captured.metadata.submit_index == 1441 && captured.computes.size() == 1 &&
+        CHECK(executed && compute_calls == 2 && captured_read &&
+                  captured.metadata.submit_index == 1441 && captured.computes.size() == 2 &&
                   captured.computes[0].code_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
-                  captured.operations.size() == 2 && captured.operations[0].realized &&
+                  captured.computes[1].code_addr == reinterpret_cast<uint64_t>(kNoopCs) &&
+                  captured.operations.size() == 3 && captured.operations[0].realized &&
                   captured.operations[0].kind == SubmitOperationKind::Dispatch &&
-                  captured.operations[0].source_index == 0 &&
+                  captured.operations[0].source_index == 1 &&
                   captured.operations[0].command_order == direct_dispatch.command_order &&
-                  !captured.operations[1].realized &&
+                  captured.operations[1].realized &&
                   captured.operations[1].kind == SubmitOperationKind::Dispatch &&
-                  captured.operations[1].source_index == 1 &&
-                  captured.operations[1].command_order == unresolved_dispatch.command_order &&
+                  captured.operations[1].source_index == 2 &&
+                  captured.operations[1].command_order == captured_one_dispatch.command_order &&
+                  !captured.operations[2].realized &&
+                  captured.operations[2].kind == SubmitOperationKind::Dispatch &&
+                  captured.operations[2].source_index == 3 &&
+                  captured.operations[2].command_order == unresolved_dispatch.command_order &&
                   captured.failure_diagnostics.size() == 1 && unresolved_failure &&
                   unresolved_failure->kind == SubmitOperationKind::Dispatch &&
-                  unresolved_failure->source_index == 1 &&
+                  unresolved_failure->source_index == 3 &&
                   unresolved_failure->command_order == unresolved_dispatch.command_order &&
                   unresolved_failure->reason ==
                       RealizationFailureReason::Unknown &&
@@ -1307,7 +1435,7 @@ int main() {
                   captured.raw_shader_versions[unresolved_stage->raw_shader_index].words ==
                       std::vector<uint32_t>(std::begin(kNoopCs), std::end(kNoopCs)) &&
                   !captured.expected_output_valid,
-              "ordered capture retains exact direct and unresolved indirect compute evidence");
+              "ordered capture omits an indirect no-op and retains its nonzero mutation");
         CHECK(nonrender_authority_boundaries.size() == 5 &&
                   nonrender_authority_boundaries[0].kind ==
                       ComputeAuthorityBoundaryKind::SubmitBegin &&
@@ -1316,19 +1444,79 @@ int main() {
                       ComputeAuthorityBoundaryKind::OrderedMemoryEffect &&
                   nonrender_authority_boundaries[1].range_known &&
                   nonrender_authority_boundaries[1].address ==
-                      reinterpret_cast<uint64_t>(&authority_effect_target) &&
+                      reinterpret_cast<uint64_t>(zero_indirect_args) &&
                   nonrender_authority_boundaries[1].bytes == sizeof(uint32_t) &&
                   nonrender_authority_boundaries[1].command_order == 18 &&
-                  authority_effect_target == authority_effect_value &&
+                  zero_indirect_args[0] == authority_effect_value &&
                   nonrender_authority_boundaries[2].kind ==
                       ComputeAuthorityBoundaryKind::Compute &&
                   !nonrender_authority_boundaries[2].range_known &&
-                  nonrender_authority_boundaries[2].command_order == 19 &&
+                  nonrender_authority_boundaries[2].command_order ==
+                      unresolved_dispatch.command_order &&
                   nonrender_authority_boundaries[3].kind ==
                       ComputeAuthorityBoundaryKind::Capture &&
                   nonrender_authority_boundaries[4].kind ==
                       ComputeAuthorityBoundaryKind::SubmitEnd,
               "non-render authority hook fail-closes unrealized compute before capture and end");
+        zero_indirect_args[0] = 0;
+        std::filesystem::remove(path, filesystem_error);
+
+        // Exact capture has no operation to replay for a zero-workgroup indirect packet. Exercise
+        // the empty-exact-plan seam so capture does not synthesize an Unknown shader failure merely
+        // because no ComputeItem was produced.
+        GpuState captured_indirect_noop = indirect_noop_then_work;
+        captured_indirect_noop.dispatches.clear();
+        captured_indirect_noop.parser_stalls.clear();
+        captured_indirect_noop.dispatches.push_back(indirect_zero);
+
+        auto captured_noop_pending = std::make_unique<PendingGpuCapture>();
+        captured_noop_pending->materialized = false;
+        captured_noop_pending->path = path.string();
+        captured_noop_pending->capture.metadata.submit_index = 1442;
+        const std::vector<SubmitOperation> captured_noop_operations;
+        const std::vector<OperationRealizationFailure> captured_noop_failures;
+        const std::vector<DrawItem> captured_noop_draws;
+        const std::vector<ComputeItem> captured_noop_computes;
+        const bool captured_noop_written = finish_requested_gpu_capture(
+            std::move(captured_noop_pending), {}, capture_error,
+            &captured_noop_draws, &captured_noop_computes,
+            &captured_noop_operations, &captured_indirect_noop,
+            &captured_noop_failures);
+        GpuCaptureFile captured_noop;
+        const bool captured_noop_read = captured_noop_written &&
+            read_gpu_capture(path.string(), captured_noop, capture_error);
+        CHECK(captured_noop_read && captured_noop.operations.empty() &&
+                  captured_noop.computes.empty() &&
+                  captured_noop.failure_diagnostics.empty(),
+              "exact capture omits an indirect zero-workgroup hardware no-op");
+        std::filesystem::remove(path, filesystem_error);
+
+        // Mutating that exact plan to retain the same dispatch must synthesize the missing failure;
+        // this guards the empty-plan distinction rather than only asserting an already-empty input.
+        auto captured_matching_pending = std::make_unique<PendingGpuCapture>();
+        captured_matching_pending->materialized = false;
+        captured_matching_pending->path = path.string();
+        captured_matching_pending->capture.metadata.submit_index = 1442;
+        const std::vector<SubmitOperation> captured_matching_operations = {
+            {SubmitOperationKind::Dispatch, 0, indirect_zero.command_order},
+        };
+        const bool captured_matching_written = finish_requested_gpu_capture(
+            std::move(captured_matching_pending), {}, capture_error,
+            &captured_noop_draws, &captured_noop_computes,
+            &captured_matching_operations, &captured_indirect_noop,
+            &captured_noop_failures);
+        GpuCaptureFile captured_matching;
+        const bool captured_matching_read = captured_matching_written &&
+            read_gpu_capture(path.string(), captured_matching, capture_error);
+        CHECK(captured_matching_read && captured_matching.operations.size() == 1 &&
+                  !captured_matching.operations[0].realized &&
+                  captured_matching.failure_diagnostics.size() == 1 &&
+                  captured_matching.failure_diagnostics[0].reason ==
+                      RealizationFailureReason::Unknown &&
+                  captured_matching.failure_diagnostics[0].source_index == 0 &&
+                  captured_matching.failure_diagnostics[0].command_order ==
+                      indirect_zero.command_order,
+              "retaining the matching operation synthesizes its missing exact failure");
         std::filesystem::remove(path, filesystem_error);
 
         // A partial exact trace can identify an operation whose source index happens to exist in
