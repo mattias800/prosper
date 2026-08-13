@@ -189,15 +189,24 @@ inline bool snapshot_post_compute_resource(const gpu::ShaderResourceTable* table
         }
         found = &resource;
     }
-    if (!found || found->cls != gpu::ResourceClass::StorageImage ||
-        !found->host_data || !found->host_data_size ||
+    if (!found || !found->host_data || !found->host_data_size ||
         found->host_data_size > SIZE_MAX) {
-        error = "selected binding is not a captured storage image";
+        error = "selected binding has no captured bytes";
         return false;
     }
     snapshot.raw.assign(found->host_data,
                         found->host_data + static_cast<size_t>(found->host_data_size));
     snapshot.raw_hash = gpu::gpu_capture_hash(snapshot.raw);
+    if (found->cls == gpu::ResourceClass::ConstantBuffer ||
+        found->cls == gpu::ResourceClass::VertexBuffer) {
+        snapshot.linear = snapshot.raw;
+        snapshot.linear_hash = snapshot.raw_hash;
+        return true;
+    }
+    if (found->cls != gpu::ResourceClass::StorageImage) {
+        error = "selected binding is not a captured buffer or storage image";
+        return false;
+    }
     if (!linearize_post_compute_resource(*found, snapshot.raw, snapshot.linear, error))
         return false;
     snapshot.linear_hash = gpu::gpu_capture_hash(snapshot.linear);

@@ -165,6 +165,34 @@ int main() {
               error == "selected compute binding is duplicated",
           "ambiguous selectors fail visibly instead of choosing one resource");
 
+    std::array<uint8_t, 8> buffer_bytes = {0, 1, 2, 3, 4, 5, 6, 7};
+    gpu::ShaderResourceTable buffer_table;
+    gpu::ShaderResource buffer;
+    buffer.binding = 23;
+    buffer.cls = gpu::ResourceClass::ConstantBuffer;
+    buffer.host_data = buffer_bytes.data();
+    buffer.host_data_size = buffer_bytes.size();
+    buffer.size = buffer_bytes.size();
+    buffer_table.resources.push_back(buffer);
+    tools::PostComputeResourceSnapshot buffer_before;
+    error.clear();
+    CHECK(tools::snapshot_post_compute_resource(
+              &buffer_table, 23, buffer_before, error) &&
+              buffer_before.raw == buffer_before.linear &&
+              buffer_before.raw_hash == buffer_before.linear_hash,
+          "storage-buffer snapshot preserves exact descriptor-visible bytes");
+    // Mutation arm: perturb the exact captured buffer byte consumed by the snapshot helper.
+    buffer_bytes[3] ^= 0xffu;
+    tools::PostComputeResourceSnapshot buffer_after;
+    error.clear();
+    CHECK(tools::snapshot_post_compute_resource(
+              &buffer_table, 23, buffer_after, error) &&
+              buffer_after.raw == buffer_after.linear &&
+              buffer_after.raw_hash != buffer_before.raw_hash &&
+              tools::post_compute_change_evidence(
+                  buffer_before, buffer_before, buffer_after).selected_changed,
+          "same-site storage-buffer mutation moves post-compute change evidence");
+
     std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
     return fails ? 1 : 0;
 }
