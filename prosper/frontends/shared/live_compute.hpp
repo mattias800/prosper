@@ -155,6 +155,28 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
 bool pack_live_target_r11g11b10(const prosper::gpu::LiveTargetSnapshot& snapshot,
                                 uint8_t* packed, size_t packed_size);
 
+// One reflected storage-buffer binding can occupy several Vulkan descriptors when the guest
+// selects a V# from a runtime table. Keep the descriptor run as one shared plan so pool capacity,
+// layout arity, and descriptor writes cannot derive the same count three different ways.
+struct LiveComputeBufferBindingRun {
+    size_t first_descriptor = 0;
+    uint32_t descriptor_count = 0;
+};
+
+struct LiveComputeBufferDescriptorPlan {
+    std::vector<LiveComputeBufferBindingRun> bindings;
+    uint32_t total_descriptor_count = 0;
+    bool valid = false;
+};
+
+// Validate and flatten the reflected/runtime storage-buffer arities. Descriptor arrays currently
+// support read-only access; writable/atomic arrays reject until per-entry write authority is part of
+// the public contract. Scalar bindings retain their historical one-descriptor plan.
+LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
+    const std::vector<prosper::gpu::SpirvDescriptorBinding>& descriptors,
+    const prosper::gpu::ShaderResourceTable* resources,
+    bool descriptor_indexing_support);
+
 // Execute already-realized compute items synchronously. Exposed for the production-backend test.
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items);
 

@@ -1546,6 +1546,11 @@ if(TARGET prosper_core)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
 
+      add_executable(test_live_compute_descriptor_array
+                     tests/test_live_compute_descriptor_array.cpp)
+      target_link_libraries(test_live_compute_descriptor_array PRIVATE prosper_live_renderer)
+      add_test(NAME live_compute_descriptor_array COMMAND test_live_compute_descriptor_array)
+
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/test_spirv_builder.cpp)
       target_link_libraries(test_spirv_builder PRIVATE prosper_core Vulkan::Vulkan)

@@ -53,6 +53,41 @@
 
 namespace prosper::frontend {
 
+LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
+    const std::vector<prosper::gpu::SpirvDescriptorBinding>& descriptors,
+    const prosper::gpu::ShaderResourceTable* resources,
+    bool descriptor_indexing_support) {
+    using namespace prosper::gpu;
+    LiveComputeBufferDescriptorPlan plan;
+    plan.bindings.reserve(descriptors.size());
+    if (!resources) return plan;
+
+    uint64_t total = 0;
+    for (const SpirvDescriptorBinding& descriptor : descriptors) {
+        if (descriptor.kind != SpirvDescriptorKind::StorageBuffer) return plan;
+
+        const ShaderResource* resource = resources->by_binding(descriptor.binding);
+        if (!resource || !valid_shader_buffer_table_contract(*resource)) return plan;
+        const uint32_t runtime_count = resource->table_index_count
+            ? resource->table_index_count : 1u;
+        const bool array = resource->table_index_count != 0u;
+        if (descriptor.descriptor_count == kDescriptorArityUnknown ||
+            (array && descriptor.descriptor_count != 0u &&
+             descriptor.descriptor_count != runtime_count) ||
+            (!array && descriptor.descriptor_count != 1u) ||
+            (array && (!descriptor_indexing_support || descriptor.writable ||
+                       descriptor.atomic_access)))
+            return plan;
+        if (total + runtime_count > UINT32_MAX) return plan;
+
+        plan.bindings.push_back({static_cast<size_t>(total), runtime_count});
+        total += runtime_count;
+    }
+    plan.total_descriptor_count = static_cast<uint32_t>(total);
+    plan.valid = true;
+    return plan;
+}
+
 bool compute_sampled_dcc_fast_clear_rgba8(
     const prosper::gpu::ShaderResource& resource,
     bool ordinary_guest_backed_sampled_view,
@@ -2427,6 +2462,7 @@ struct BorrowedComputeImageLease {
 
 struct BoundBuffer {
     const prosper::gpu::ShaderResource* resource = nullptr;
+    size_t descriptor_index = SIZE_MAX; // reflected binding that owns this flattened table entry
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     size_t alias_of = SIZE_MAX;         // exact guest range sharing an earlier storage buffer
@@ -4341,7 +4377,66 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         return a.binding < b.binding;
     });
 
-    std::vector<BoundBuffer> buffers(descriptors.size());
+    const LiveComputeBufferDescriptorPlan buffer_plan =
+        plan_live_compute_buffer_descriptors(
+            descriptors, item.resources.get(), ctx.descriptor_indexing_support);
+    if (!buffer_plan.valid) {
+        if (trace)
+            std::fprintf(stderr,
+                         "[compute] program 0x%llx has an unsupported buffer-array binding "
+                         "(descriptor-indexing=%u; arrays must be read-only)\n",
+                         static_cast<unsigned long long>(item.code_addr),
+                         ctx.descriptor_indexing_support ? 1u : 0u);
+        return false;
+    }
+
+    // Flatten each reflected binding into the exact run of concrete resources Vulkan will receive.
+    // A cleared template avoids copying the parent table payload once per entry (quadratic at the
+    // 4096-entry contract limit) while retaining every ordinary scalar field unchanged.
+    // Explicit null V#s bind a small zero source. robustBufferAccess supplies zero for every access
+    // beyond that first word, matching the guest's null-buffer read semantics without inventing a
+    // guest address or making the cache believe those bytes have external authority.
+    std::array<uint32_t, 4> null_buffer_seed{};
+    std::vector<ShaderResource> buffer_resources;
+    buffer_resources.reserve(buffer_plan.total_descriptor_count);
+    std::vector<size_t> buffer_descriptor_indices;
+    buffer_descriptor_indices.reserve(buffer_plan.total_descriptor_count);
+    for (size_t descriptor_index = 0; descriptor_index < descriptors.size(); ++descriptor_index) {
+        const ShaderResource* parent =
+            item.resources->by_binding(descriptors[descriptor_index].binding);
+        if (!parent) return false; // validation and the plan above normally make this unreachable
+        if (!parent->table_index_count) {
+            buffer_resources.push_back(*parent);
+            buffer_descriptor_indices.push_back(descriptor_index);
+            continue;
+        }
+
+        ShaderResource entry_resource = *parent;
+        entry_resource.table_index_count = 0;
+        entry_resource.table_entry_stride = 0;
+        entry_resource.table_index_sgpr = UINT32_MAX;
+        entry_resource.table_selector_mode = BufferTableSelectorMode::None;
+        entry_resource.table_load_pc = UINT32_MAX;
+        entry_resource.table_entries.clear();
+        for (const ShaderBufferTableEntry& entry : parent->table_entries) {
+            const bool null_entry = entry.gpu_addr == 0u && entry.size == 0u &&
+                                    entry.host_data == nullptr;
+            entry_resource.gpu_addr = entry.gpu_addr;
+            entry_resource.size = null_entry ? sizeof(uint32_t) : entry.size;
+            entry_resource.stride = entry.stride;
+            entry_resource.host_data = null_entry
+                ? reinterpret_cast<uint8_t*>(null_buffer_seed.data()) : entry.host_data;
+            entry_resource.host_data_size = null_entry
+                ? null_buffer_seed.size() * sizeof(uint32_t) : entry.host_data_size;
+            buffer_resources.push_back(entry_resource);
+            buffer_descriptor_indices.push_back(descriptor_index);
+        }
+    }
+    if (buffer_resources.size() != buffer_plan.total_descriptor_count) return false;
+
+    std::vector<BoundBuffer> buffers(buffer_plan.total_descriptor_count);
+    for (size_t i = 0; i < buffers.size(); ++i)
+        buffers[i].descriptor_index = buffer_descriptor_indices[i];
     std::vector<BoundImage> images(image_descriptors.size());
     std::vector<VkBuffer> staging(image_descriptors.size(), VK_NULL_HANDLE);          // upload/readback
     std::vector<VkDeviceMemory> staging_memory(image_descriptors.size(), VK_NULL_HANDLE);
@@ -4452,6 +4547,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
     do {
         std::vector<VkDescriptorSetLayoutBinding> layout_bindings(descriptors.size());
+        for (size_t descriptor_index = 0; descriptor_index < descriptors.size();
+             ++descriptor_index) {
+            layout_bindings[descriptor_index].binding = descriptors[descriptor_index].binding;
+            layout_bindings[descriptor_index].descriptorType =
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            layout_bindings[descriptor_index].descriptorCount =
+                buffer_plan.bindings[descriptor_index].descriptor_count;
+            layout_bindings[descriptor_index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
         bool buffer_setup_failure_reported = false;
         auto skip_buffer = [&](uint32_t binding, const ShaderResource* resource,
                                const char* why) {
@@ -4463,28 +4567,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          (unsigned long long)(resource ? resource->gpu_addr : 0),
                          resource ? resource->size : 0, why);
         };
-        for (size_t i = 0; i < descriptors.size(); i++) {
-            const ShaderResource* resource = item.resources->by_binding(descriptors[i].binding);
+        for (size_t i = 0; i < buffers.size(); i++) {
+            const size_t descriptor_index = buffers[i].descriptor_index;
+            const SpirvDescriptorBinding& descriptor = descriptors[descriptor_index];
+            const ShaderResource* resource = &buffer_resources[i];
             if (!resource || !resource->size ||
                 ((!resource->host_data || resource->host_data_size < resource->size) &&
                  !guest_readable(resource->gpu_addr, resource->size))) {
-                skip_buffer(descriptors[i].binding, resource,
+                skip_buffer(descriptor.binding, resource,
                             !resource ? "missing resource" :
                             !resource->size ? "empty resource" : "unreadable backing");
                 break;
             }
             buffers[i].resource = resource;
             buffers[i].guest_bytes = resource->size;
-            buffers[i].writable = descriptors[i].writable;
+            buffers[i].writable = descriptor.writable;
             const StorageBufferMaterializationPlan materialization =
-                plan_storage_buffer_materialization(descriptors[i], *resource);
+                plan_storage_buffer_materialization(descriptor, *resource);
             if (!materialization.valid) {
-                skip_buffer(descriptors[i].binding, resource,
+                skip_buffer(descriptor.binding, resource,
                             "invalid storage-buffer materialization contract");
                 break;
             }
             // #2265: one shared shape test with the lowering gate and the descriptor validator.
-            buffers[i].atomic_image = descriptors[i].atomic_access &&
+            buffers[i].atomic_image = descriptor.atomic_access &&
                 shader_resource_supports_atomic_image_buffer(*resource);
             buffers[i].atomic_layers = buffers[i].atomic_image
                 ? shader_resource_atomic_image_layers(*resource) : 1u;
@@ -4512,14 +4618,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (!resource->tile_mode && resource->linear_row_pitch_bytes &&
                      resource->linear_row_pitch_bytes < tight_pitch) ||
                     !guest_image_bytes || guest_image_bytes > UINT32_MAX) {
-                    skip_buffer(descriptors[i].binding, resource,
+                    skip_buffer(descriptor.binding, resource,
                                 "invalid atomic-image buffer layout");
                     break;
                 }
                 if ((!resource->host_data || resource->host_data_size < guest_image_bytes) &&
                     !guest_readable(resource->gpu_addr,
                                     static_cast<uint32_t>(guest_image_bytes))) {
-                    skip_buffer(descriptors[i].binding, resource,
+                    skip_buffer(descriptor.binding, resource,
                                 "unreadable atomic-image physical backing");
                     break;
                 }
@@ -4592,7 +4698,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (!materialize_storage_buffer_bytes(
                             materialization, source, buffers[i].guest_bytes,
                             buffers[i].linear_seed.data(), buffers[i].linear_seed.size())) {
-                        skip_buffer(descriptors[i].binding, resource,
+                        skip_buffer(descriptor.binding, resource,
                                     "failed zero-padded storage-buffer materialization");
                         break;
                     }
@@ -4625,13 +4731,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     vkGetBufferMemoryRequirements(ctx.device, buffers[i].buffer, &requirements);
                     const uint32_t memory_type = ctx.host_memory_type(requirements.memoryTypeBits);
                     if (memory_type == UINT32_MAX) {
-                        skip_buffer(descriptors[i].binding, resource,
+                        skip_buffer(descriptor.binding, resource,
                                     "no host-visible memory type");
                         break;
                     }
                     buffers[i].memory = ctx.allocate_memory(requirements.size, memory_type, true);
                     if (!buffers[i].memory) {
-                        skip_buffer(descriptors[i].binding, resource,
+                        skip_buffer(descriptor.binding, resource,
                                     "host-visible memory allocation failed");
                         break;
                     }
@@ -4663,10 +4769,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  buffers[i].total_watch_chunks);
             }
 
-            layout_bindings[i].binding = descriptors[i].binding;
-            layout_bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            layout_bindings[i].descriptorCount = 1;
-            layout_bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
         for (BoundBuffer& buffer : buffers)
             if (buffer.alias_of == SIZE_MAX && buffer.persistent && buffer.writable &&
@@ -4679,7 +4781,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (trace && !buffer_setup_failure_reported) {
                 for (size_t i = 0; i < buffers.size(); ++i) {
                     if (buffers[i].resource && buffers[i].memory) continue;
-                    skip_buffer(descriptors[i].binding, buffers[i].resource,
+                    const size_t descriptor_index = buffers[i].descriptor_index;
+                    skip_buffer(descriptors[descriptor_index].binding, buffers[i].resource,
                                 "binding was not prepared");
                     break;
                 }
@@ -6638,17 +6741,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             for (size_t i = 0; i < buffers.size(); ++i) {
                 const BoundBuffer& buffer = buffers[i];
                 if (!buffer.resource) continue;
+                const SpirvDescriptorBinding& descriptor =
+                    descriptors[buffer.descriptor_index];
                 const ShadowComputeAuthorityRange range =
                     ShadowComputeAuthorityRange::from(
                         buffer.resource->gpu_addr, buffer.guest_bytes);
-                if (descriptors[i].readable)
+                if (descriptor.readable)
                     authority_census.observe_compute_access(
-                        item, descriptors[i].binding,
+                        item, descriptor.binding,
                         ShadowComputeAuthorityConsumerKind::RawBuffer,
                         range, "compute-buffer-input");
                 if (buffer.writable)
                     authority_census.observe_compute_access(
-                        item, descriptors[i].binding,
+                        item, descriptor.binding,
                         ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect,
                         range, "compute-buffer-output");
             }
@@ -6728,14 +6833,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         VkDescriptorPoolSize pool_sizes[3]; uint32_t pool_size_count = 0;
         if (!buffers.empty())
             pool_sizes[pool_size_count++] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                             static_cast<uint32_t>(buffers.size())};
+                                             buffer_plan.total_descriptor_count};
         if (sampled_count)
             pool_sizes[pool_size_count++] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampled_count};
         if (storage_image_count)
             pool_sizes[pool_size_count++] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storage_image_count};
         if (VulkanComputeContext::descriptor_pool_reuse_enabled()) {
             descriptor_pool = ctx.prepare_descriptor_pool(
-                static_cast<uint32_t>(buffers.size()), sampled_count, storage_image_count);
+                buffer_plan.total_descriptor_count, sampled_count, storage_image_count);
             descriptor_pool_reused = descriptor_pool != VK_NULL_HANDLE;
             if (!vk_handle_ok(descriptor_pool, "descriptor-pool-reuse")) break;
         } else {
@@ -6755,19 +6860,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
         std::vector<VkDescriptorBufferInfo> buffer_infos(buffers.size());
         std::vector<VkDescriptorImageInfo> image_infos(images.size());
-        std::vector<VkWriteDescriptorSet> writes(buffers.size() + images.size());
+        std::vector<VkWriteDescriptorSet> writes(descriptors.size() + images.size());
         for (size_t i = 0; i < buffers.size(); i++) {
             buffer_infos[i] = {buffers[i].buffer, 0, buffers[i].bytes};
-            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            writes[i].dstSet = descriptor_set;
-            writes[i].dstBinding = descriptors[i].binding;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buffer_infos[i];
+        }
+        for (size_t descriptor_index = 0; descriptor_index < descriptors.size();
+             ++descriptor_index) {
+            const LiveComputeBufferBindingRun& run = buffer_plan.bindings[descriptor_index];
+            writes[descriptor_index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[descriptor_index].dstSet = descriptor_set;
+            writes[descriptor_index].dstBinding = descriptors[descriptor_index].binding;
+            writes[descriptor_index].descriptorCount = run.descriptor_count;
+            writes[descriptor_index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[descriptor_index].pBufferInfo = &buffer_infos[run.first_descriptor];
         }
         for (size_t i = 0; i < images.size(); i++) {
             image_infos[i] = {images[i].sampler, images[i].view, VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet& w = writes[buffers.size() + i];
+            VkWriteDescriptorSet& w = writes[descriptors.size() + i];
             w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet = descriptor_set;
             w.dstBinding = images[i].binding;
