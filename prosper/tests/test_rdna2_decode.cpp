@@ -134,6 +134,22 @@ int main() {
           gta_vmac.src[2].kind == OperandKind::None && gta_vmac.src_neg[0] &&
           !gta_vmac.src_neg[1],
           "GTA V v_mac_f32 decodes two sources and no phantom s0");
+    // GTA V exec_cs_205b67ce00 pc576: `v_mul_lo_u32 v1, v2, v1`. The encoded SRC2 field is
+    // reserved. Mutating only this packet's opcode to v_mad_u32_u24 makes the exact same field a
+    // real third source, pinning the arity decision to the production site.
+    const uint32_t gta_mul_lo_words[] = {0xd5690001u, 0x00020302u};
+    const Rdna2Inst gta_mul_lo = rdna2_decode_one(gta_mul_lo_words, 2);
+    CHECK(gta_mul_lo.fmt == Rdna2Format::VOP3 &&
+          gta_mul_lo.opcode == kVop3OpcodeMulLoU32 && gta_mul_lo.n_src == 2 &&
+          isV(gta_mul_lo.dst, 1) && isV(gta_mul_lo.src[0], 2) &&
+          isV(gta_mul_lo.src[1], 1) && gta_mul_lo.src[2].kind == OperandKind::None,
+          "GTA V v_mul_lo_u32 decodes two sources and no phantom s0");
+    const uint32_t gta_mul_lo_mutation_words[] = {0xd5430001u, 0x00020302u};
+    const Rdna2Inst gta_mul_lo_mutation =
+        rdna2_decode_one(gta_mul_lo_mutation_words, 2);
+    CHECK(gta_mul_lo_mutation.opcode == kVop3OpcodeMadU32U24 &&
+          gta_mul_lo_mutation.n_src == 3 && isS(gta_mul_lo_mutation.src[2], 0),
+          "same-site three-source multiply mutation retains its real s0 dependency");
     // GTA V exec_cs_205b658800 pc61: `v_lshlrev_b64 v[24:25], v4, 1`. The reserved SRC2 field
     // must not surface as s0, and the shared writer inventory must retain both result halves.
     const uint32_t gta_lshlrev_b64_words[] = {0xd6ff0018u, 0x00010304u};

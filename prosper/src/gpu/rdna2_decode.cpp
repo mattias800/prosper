@@ -654,18 +654,11 @@ void decode_operands(Rdna2Inst& i) {
             // carry-in. Their reserved SRC2 field commonly decodes as s0; exposing that phantom
             // operand makes CFG provenance reject a valid instruction when s0 differs across a
             // join, before the instruction can replace it with its fresh carry result.
-            if (i.opcode == 0x30Fu || i.opcode == 0x310u || i.opcode == 0x319u) {
-                i.src[2] = {};
-                i.n_src = 2;
-            }
-            // V_MAC_F32, V_LSHLREV_B64, V_LSHRREV_B64, V_LDEXP_F32, and V_BFM_B32 are
-            // two-source VOP3A instructions. Their reserved SRC2 bits are zero in GTA V's packets and
-            // therefore decode as s0 unless cleared here.
+            // The no-carry-in VOP3B family above and several VOP3A operations have two explicit
+            // sources. Their reserved SRC2 bits commonly decode as s0 unless cleared here.
             // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
             // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (i.opcode == 0x11fu || i.opcode == kVop3OpcodeLshlrevB64 ||
-                i.opcode == kVop3OpcodeLshrrevB64 ||
-                i.opcode == 0x362u || i.opcode == 0x363u) {
+            if (vop3_opcode_has_two_data_sources(i.opcode)) {
                 i.src[2] = {};
                 i.n_src = 2;
             }

@@ -172,9 +172,31 @@ inline constexpr uint32_t kVopcOpcodeCmpxEqU32 = 0xd2;
 // independent B32 operands.
 inline constexpr uint32_t kVop3OpcodeLshlrevB64 = 0x2ff;
 inline constexpr uint32_t kVop3OpcodeLshrrevB64 = 0x300;
+inline constexpr uint32_t kVop3OpcodeMacF32 = 0x11f;
+inline constexpr uint32_t kVop3OpcodeMadU32U24 = 0x143;
+inline constexpr uint32_t kVop3OpcodeMulLoU32 = 0x169;
+inline constexpr uint32_t kVop3OpcodeMulHiU32 = 0x16a;
+inline constexpr uint32_t kVop3OpcodeMulHiI32 = 0x16c;
+inline constexpr uint32_t kVop3OpcodeAddCoU32 = 0x30f;
+inline constexpr uint32_t kVop3OpcodeSubCoU32 = 0x310;
+inline constexpr uint32_t kVop3OpcodeSubrevCoU32 = 0x319;
 inline constexpr uint32_t kVop3OpcodeLshlAddU32 = 0x346;
 inline constexpr uint32_t kVop3OpcodeAdd3U32 = 0x36d;
 inline constexpr uint32_t kVop3OpcodeAndOrB32 = 0x371;
+inline constexpr uint32_t kVop3OpcodeLdexpF32 = 0x362;
+inline constexpr uint32_t kVop3OpcodeBfmB32 = 0x363;
+
+// VOP3 reserves three encoded source fields even for operations with only two explicit data
+// sources. Keep the architectural arity in one inventory so the decoder never exposes those
+// reserved bits as a phantom scalar dependency to control-flow or resource analysis.
+inline constexpr bool vop3_opcode_has_two_data_sources(uint32_t opcode) {
+    return opcode == kVop3OpcodeMacF32 || opcode == kVop3OpcodeMulLoU32 ||
+           opcode == kVop3OpcodeMulHiU32 || opcode == kVop3OpcodeMulHiI32 ||
+           opcode == kVop3OpcodeLshlrevB64 || opcode == kVop3OpcodeLshrrevB64 ||
+           opcode == kVop3OpcodeAddCoU32 || opcode == kVop3OpcodeSubCoU32 ||
+           opcode == kVop3OpcodeSubrevCoU32 || opcode == kVop3OpcodeLdexpF32 ||
+           opcode == kVop3OpcodeBfmB32;
+}
 
 // GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
 // admission, and emission. These inline constants compile to the same immediate comparisons as raw
