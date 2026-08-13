@@ -3,11 +3,13 @@
 #include "gpu/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/rdna2_to_spirv.hpp"
 #include "gpu/shader_resources.hpp"
+#include "../tools/gpu_replay/compute_recompile.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -23,6 +25,15 @@ int failures = 0;
 #define CHECK(condition, message) do { \
     if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
 } while (0)
+
+void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
 
 uint8_t nibble(char value) {
     return value >= '0' && value <= '9' ? static_cast<uint8_t>(value - '0')
@@ -233,6 +244,25 @@ bool spirv_declares_capability(const std::vector<uint32_t>& spirv, uint32_t capa
     return false;
 }
 
+bool retarget_spirv_binding(std::vector<uint32_t>& spirv,
+                            uint32_t old_binding, uint32_t new_binding) {
+    bool changed = false;
+    if (spirv.size() < 5u) return false;
+    for (size_t cursor = 5u; cursor < spirv.size();) {
+        const uint32_t word_count = spirv[cursor] >> 16u;
+        const uint32_t opcode = spirv[cursor] & 0xffffu;
+        if (!word_count || cursor + word_count > spirv.size()) return false;
+        // OpDecorate target Decoration Binding
+        if (opcode == 71u && word_count == 4u && spirv[cursor + 2u] == 33u &&
+            spirv[cursor + 3u] == old_binding) {
+            spirv[cursor + 3u] = new_binding;
+            changed = true;
+        }
+        cursor += word_count;
+    }
+    return changed;
+}
+
 void test_emitter_integration(const Shape& shape, const std::vector<uint32_t>& exact,
                               const Fixture& fixture) {
     ShaderResourceTable compile_table = fixture.table;
@@ -323,6 +353,37 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
         {RecompileDiagnosticStage::Compute, 0u});
     CHECK(!spirv.empty(),
           "production emitter lowers the DescriptorRange shader before capture");
+    ShaderResource* capture_source = nullptr;
+    ShaderResource* unused_large = nullptr;
+    for (ShaderResource& resource : capture_table.resources) {
+        if (resource.fetch_pc == shape.source_pc) capture_source = &resource;
+    }
+    const uint32_t source_binding = capture_source ? capture_source->binding : UINT32_MAX;
+    const DescriptorValidationReport capture_report = validate_spirv_descriptor_interface(
+        spirv, &capture_table, 0u, SpirvShaderStage::Compute, false);
+    for (ShaderResource& resource : capture_table.resources) {
+        if (&resource != capture_source && !find_spirv_descriptor_binding(
+                capture_report, 0u, resource.binding))
+            unused_large = &resource;
+    }
+    const uint32_t unused_large_binding = unused_large
+        ? unused_large->binding : UINT32_MAX;
+    const uint32_t unused_large_pc = unused_large
+        ? unused_large->fetch_pc : UINT32_MAX;
+    if (unused_large) {
+        unused_large->cls = ResourceClass::ConstantBuffer;
+        unused_large->format = DataFormat::Uint32;
+        unused_large->num_components = 1u;
+        unused_large->gpu_addr = UINT64_C(0x0000123400000000);
+        unused_large->size = UINT32_MAX;
+        unused_large->stride = 4u;
+        unused_large->host_data = nullptr;
+        unused_large->host_data_size = 0u;
+    }
+    CHECK(capture_source && unused_large && capture_report.ok() &&
+              !find_spirv_descriptor_binding(
+                  capture_report, 0u, unused_large_binding),
+          "capture fixture retains an oversized runtime candidate unused by final SPIR-V");
     ComputeItem compute;
     compute.spirv = spirv;
     compute.resources = std::make_shared<ShaderResourceTable>(capture_table);
@@ -370,7 +431,31 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
               {}, {compute}, {{SubmitOperationKind::Dispatch, 0u, 1u}},
               metadata, capture_reader, captured, error) &&
               captured.format_version == 53u,
-          "v53 capture stores a DescriptorRange dispatch");
+          "v53 capture stores a DescriptorRange dispatch without reading unused candidates");
+    const GpuCapturedResource* captured_unused = captured_resource_at(
+        captured, unused_large_pc);
+    CHECK(captured_unused && captured_unused->blob_index == UINT32_MAX &&
+              captured_unused->internal_bytes.empty(),
+          "unused oversized descriptor remains inspectable without a fabricated backing");
+
+    ComputeItem used_oversized = compute;
+    used_oversized.spirv = compute.spirv;
+    GpuCaptureFile rejected_capture;
+    const bool retargeted = retarget_spirv_binding(
+        used_oversized.spirv, source_binding, unused_large_binding);
+    const DescriptorValidationReport retargeted_report =
+        validate_spirv_descriptor_interface(
+            used_oversized.spirv, used_oversized.resources.get(), 0u,
+            SpirvShaderStage::Compute, false);
+    error.clear();
+    CHECK(retargeted && retargeted_report.ok() &&
+              find_spirv_descriptor_binding(
+                  retargeted_report, 0u, unused_large_binding) &&
+              !capture_submit_items(
+              {}, {used_oversized}, {{SubmitOperationKind::Dispatch, 0u, 1u}},
+              metadata, capture_reader, rejected_capture, error) &&
+              error.find("per-resource ceiling") != std::string::npos,
+          "same binding-decoration mutation remains valid and restores the oversized-resource rejection");
     GpuCapturedResource* captured_source = captured_resource_at(captured, shape.source_pc);
     CHECK(captured_source &&
               captured_source->internal_bytes.size() ==
@@ -391,6 +476,11 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
         ? replay.computes[0].resources->by_fetch_pc(shape.source_pc) : nullptr;
     CHECK(replay_source && is_indirect_pointer_relocation_resource(*replay_source),
           "v53 serialize/deserialize/replay re-derives DescriptorRange authority");
+    CHECK(replayed && !prosper::tools::
+              recompiled_compute_preserves_capture_descriptor_domain(
+                  compute.spirv, used_oversized.spirv,
+                  replay.computes[0].resources.get()),
+          "raw replay rejects a newly-live binding whose capture backing was omitted");
 
     GpuCaptureFile q_mutation = loaded;
     GpuCapturedResource* q_source = captured_resource_at(q_mutation, shape.source_pc);
@@ -432,6 +522,28 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
     if (missing_source) missing_source->internal_bytes.clear();
     CHECK(!materialize_gpu_replay(missing, replay, error),
           "replay rejects a DescriptorRange dispatch with its carrier removed");
+
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+    GpuCaptureFile metadata_only;
+    error.clear();
+    const bool metadata_captured = capture_submit_items(
+        {}, {compute}, {{SubmitOperationKind::Dispatch, 0u, 1u}},
+        metadata, capture_reader, metadata_only, error);
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", nullptr);
+    GpuCapturedResource* metadata_source = metadata_captured
+        ? captured_resource_at(metadata_only, shape.source_pc) : nullptr;
+    CHECK(metadata_source && metadata_source->internal_bytes.empty() &&
+              !is_indirect_pointer_relocation_marker_candidate(
+                  metadata_source->resource),
+          "metadata-only capture strips byte-dependent relocation authority");
+    std::vector<uint8_t> metadata_bytes;
+    GpuCaptureFile metadata_loaded;
+    error.clear();
+    CHECK(metadata_captured &&
+              serialize_gpu_capture(metadata_only, metadata_bytes, error) &&
+              deserialize_gpu_capture(metadata_bytes, metadata_loaded, error) &&
+              materialize_gpu_replay(metadata_loaded, replay, error),
+          "metadata-only relocation capture remains serializable and inspectable");
 }
 
 void test_shape(const Shape& shape) {
