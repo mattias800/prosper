@@ -59,10 +59,8 @@ bool canonical_relocation_intervals(
     std::vector<RelocationInterval> intervals;
     intervals.reserve(records.size());
     for (const auto& record : records) {
-        if (!record.guest_address || !record.byte_count) {
-            if (record.guest_address || record.byte_count) return false;
-            continue;
-        }
+        if (!record.byte_count) continue; // statically inactive or nullable record
+        if (!record.guest_address) return false;
         uint64_t end = 0;
         if (!interval_end(record.guest_address, record.byte_count, end)) return false;
         intervals.push_back({record.guest_address, end});
@@ -325,9 +323,9 @@ bool parse_indirect_buffer_relocation(
             load_u64(bytes, record.source_byte_offset) != record.guest_address)
             return false;
         prior_source_end = static_cast<uint64_t>(record.source_byte_offset) + sizeof(uint64_t);
-        if (!record.guest_address || !record.byte_count) {
-            if (record.guest_address || record.byte_count || segment != UINT32_MAX) return false;
-        } else if (segment >= segment_count) {
+        if (!record.byte_count) {
+            if (segment != UINT32_MAX) return false;
+        } else if (!record.guest_address || segment >= segment_count) {
             return false;
         }
     }
@@ -364,7 +362,7 @@ bool parse_indirect_buffer_relocation(
 
     std::vector<bool> referenced_segments(segment_count, false);
     for (size_t index = 0; index < record_count; ++index) {
-        if (!info.records[index].guest_address) continue;
+        if (!info.records[index].byte_count) continue;
         const size_t offset = records_base + index * kRelocationRecordBytes;
         const uint32_t segment_index = load_u32(bytes, offset + 4u);
         referenced_segments[segment_index] = true;
@@ -386,6 +384,31 @@ bool parse_indirect_buffer_relocation(
     for (size_t index = 0; index < witness_count; ++index)
         info.witness_words[index] = load_u32(bytes, witness_base + index * sizeof(uint32_t));
     return true;
+}
+
+bool inspect_indirect_buffer_relocation(
+        const ShaderResource& source, const uint8_t* bytes, size_t byte_count,
+        const IndirectBufferRelocationLayout& layout,
+        IndirectBufferRelocationInfo& info) {
+    info = {};
+    if (!bytes || source.size > byte_count ||
+        kRelocationHeaderBytes > byte_count - source.size)
+        return false;
+    const size_t header = static_cast<size_t>(source.size);
+    const uint32_t record_count = load_u32(bytes, header + 16u);
+    if (!relocation_layout_valid(source, layout, record_count)) return false;
+    const uint64_t record_bytes = static_cast<uint64_t>(record_count) * kRelocationRecordBytes;
+    if (record_bytes > byte_count - header - kRelocationHeaderBytes) return false;
+    const size_t records_base = header + kRelocationHeaderBytes;
+    std::vector<IndirectBufferRelocationRecord> records(record_count);
+    for (size_t index = 0; index < records.size(); ++index) {
+        const size_t offset = records_base + index * kRelocationRecordBytes;
+        records[index].source_byte_offset = load_u32(bytes, offset);
+        records[index].guest_address = load_u64(bytes, offset + 8u);
+        records[index].byte_count = load_u32(bytes, offset + 16u);
+    }
+    return parse_indirect_buffer_relocation(
+        source, bytes, byte_count, layout, records, info);
 }
 
 bool build_indirect_buffer_relocation(
@@ -412,10 +435,8 @@ bool build_indirect_buffer_relocation(
         std::memcpy(&source_pointer, source_bytes + record.source_byte_offset,
                     sizeof(source_pointer));
         if (source_pointer != record.guest_address) return false;
-        if (!record.guest_address || !record.byte_count) {
-            if (record.guest_address || record.byte_count) return false;
-            continue;
-        }
+        if (!record.byte_count) continue; // retain nonzero inactive pointers as source witnesses
+        if (!record.guest_address) return false;
         uint64_t end = 0;
         if (!interval_end(record.guest_address, record.byte_count, end) ||
             !guest_readable(record.guest_address, record.byte_count))
@@ -465,7 +486,7 @@ bool build_indirect_buffer_relocation(
         const auto& record = records[index];
         const size_t offset = records_base + index * kRelocationRecordBytes;
         uint32_t segment_index = UINT32_MAX;
-        if (record.guest_address) {
+        if (record.byte_count) {
             auto segment = std::find_if(merged.begin(), merged.end(), [&](const auto& candidate) {
                 return record.guest_address >= candidate.begin &&
                        record.guest_address <= candidate.end &&

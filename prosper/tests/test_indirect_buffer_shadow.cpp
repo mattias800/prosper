@@ -43,6 +43,7 @@ int main() {
     store_u64(source_bytes.data(), 0u, pointer0);
     store_u64(source_bytes.data(), 16u, pointer1);
     store_u64(source_bytes.data(), 32u, 0u);
+    store_u64(source_bytes.data(), 48u, pointer0 + 64u);
 
     ShaderResource source;
     source.cls = ResourceClass::ConstantBuffer;
@@ -57,10 +58,11 @@ int main() {
 
     const IndirectBufferRelocationLayout layout{
         0x1d1e2481u, 2u, 4u, 4u, 4096u, 2u};
-    const std::array<IndirectBufferRelocationRecord, 3> records{{
+    const std::array<IndirectBufferRelocationRecord, 4> records{{
         {0u, pointer0, 32u},
         {16u, pointer1, 32u},
         {32u, 0u, 0u},
+        {48u, pointer0 + 64u, 0u},
     }};
     const std::array<uint32_t, 2> witnesses{0x12345678u, 0x9abcdef0u};
 
@@ -73,7 +75,7 @@ int main() {
         std::fputs("FAIL: relocation shadow owner was not produced\n", stderr);
         return 1;
     }
-    CHECK(owner && info.records.size() == 3u && info.segments.size() == 1u &&
+    CHECK(owner && info.records.size() == 4u && info.segments.size() == 1u &&
               info.segments[0].guest_address == pointer0 &&
               info.segments[0].byte_count == 48u && info.payload_bytes == 48u,
           "overlapping pointee intervals normalize to one disjoint segment");
@@ -90,6 +92,16 @@ int main() {
               source, owner->data(), owner->size(), layout, records, reparsed) &&
               reparsed.payload_byte_offset == info.payload_byte_offset,
           "serialized relocation directory reparses against its exact record proof");
+    CHECK(owner && inspect_indirect_buffer_relocation(
+              source, owner->data(), owner->size(), layout, reparsed) &&
+              reparsed.records == info.records,
+          "syntax-only inspection retains null and nonzero inactive record witnesses");
+    auto inactive_pointer_corrupt = *owner;
+    inactive_pointer_corrupt[48u] ^= 1u;
+    CHECK(!inspect_indirect_buffer_relocation(
+              source, inactive_pointer_corrupt.data(), inactive_pointer_corrupt.size(),
+              layout, reparsed),
+          "syntax-only inspection rejects a changed inactive nonzero pointer witness");
 
     ShaderResourceTable table;
     table.owned_host_data.push_back(owner);

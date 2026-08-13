@@ -52,6 +52,8 @@ struct IndirectBufferRelocationRecord {
     uint32_t source_byte_offset = 0;
     uint64_t guest_address = 0;
     uint32_t byte_count = 0;
+
+    bool operator==(const IndirectBufferRelocationRecord&) const = default;
 };
 
 struct IndirectBufferRelocationSegment {
@@ -90,6 +92,15 @@ bool parse_indirect_buffer_relocation(
     const ShaderResource& source, const uint8_t* bytes, size_t byte_count,
     const IndirectBufferRelocationLayout& layout,
     std::span<const IndirectBufferRelocationRecord> expected_records,
+    IndirectBufferRelocationInfo& info);
+
+// Syntax-only inspection for backend/capture boundaries that do not own the shader proof. It
+// derives the serialized record directory and still enforces source-qword identity plus the exact
+// canonical segment union. A compiler/discovery boundary must additionally call the overload above
+// with independently derived expected records before granting relocation authority.
+bool inspect_indirect_buffer_relocation(
+    const ShaderResource& source, const uint8_t* bytes, size_t byte_count,
+    const IndirectBufferRelocationLayout& layout,
     IndirectBufferRelocationInfo& info);
 
 bool build_indirect_buffer_relocation(
