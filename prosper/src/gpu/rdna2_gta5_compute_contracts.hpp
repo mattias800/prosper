@@ -70,9 +70,9 @@ bool rdna2_gta5_selected_sbuffer_launch(
     const ComputeShaderConfig& config);
 
 // Discover the source/outer descriptors; propagate their complete zero-record state, prove a wholly
-// OOB selector domain, or retain the sole possible in-bounds record-4 V#. Add ordinary resources for
-// the exact pc156/158 consumers in every admitted mode. Existing marker state is cleared first,
-// making this safe to repeat at replay materialization.
+// OOB selector domain, or retain the sole possible in-bounds record-4 V#. A selected record-4 V# with
+// NUM_RECORDS=0 is likewise carried into the exact pc156/158 raw consumers as architectural empty
+// state. Existing marker state is cleared first, making this safe to repeat at replay materialization.
 bool discover_rdna2_gta5_selected_sbuffer(
     const uint32_t* code, size_t dwords,
     const ComputeShaderConfig& config,

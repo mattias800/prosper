@@ -270,6 +270,66 @@ int main() {
               SpirvShaderStage::Compute, false).ok(),
           "selected-null module matches the routed descriptor contract");
 
+    Fixture zero_record4;
+    const std::array<uint32_t, 4> zero_record_descriptor{0x3f800000u, 0u, 0u, 0u};
+    std::memcpy(zero_record4.outer.data() + 488u,
+                zero_record_descriptor.data(), sizeof(zero_record_descriptor));
+    CHECK(discover_rdna2_gta5_selected_sbuffer(
+              exact.data(), exact.size(), zero_record4.config, zero_record4.table) &&
+              zero_record4.table.by_fetch_pc(153u) &&
+              zero_record4.table.by_fetch_pc(153u)->selected_sbuffer_soffset ==
+                  kGtaSelectedSbufferRecord4Soffset &&
+              zero_record4.table.by_fetch_pc(153u)->selected_sbuffer_words ==
+                  zero_record_descriptor &&
+              zero_record4.table.by_fetch_pc(156u) && zero_record4.table.by_fetch_pc(158u) &&
+              is_zero_record_raw_buffer(*zero_record4.table.by_fetch_pc(156u)) &&
+              is_zero_record_raw_buffer(*zero_record4.table.by_fetch_pc(158u)),
+          "selected nonzero-base NUM_RECORDS=0 V# zeroes both raw consumers");
+    CHECK(rdna2_gta5_selected_sbuffer_dispatch(
+              exact.data(), exact.size(), zero_record4.config, zero_record4.table),
+          "final boundary accepts the selected nonzero-base zero-record descriptor");
+    zero_record4.outer[488u + 8u] = 1u;
+    CHECK(!rdna2_gta5_selected_sbuffer_dispatch(
+               exact.data(), exact.size(), zero_record4.config, zero_record4.table),
+          "same pc153 descriptor site: nonzero record count rejects stale empty authority");
+    zero_record4.outer[488u + 8u] = 0u;
+    for (const ShaderResource& resource : valid.table.resources) {
+        if (resource.fetch_pc == 70u || resource.fetch_pc == 153u ||
+            resource.fetch_pc == 156u || resource.fetch_pc == 158u)
+            continue;
+        zero_record4.table.resources.push_back(resource);
+    }
+    assign_convention_bindings(zero_record4.table, 2u);
+    const std::vector<uint32_t> zero_record4_translated = recompile_compute(
+        exact.data(), exact.size(), &zero_record4.table, zero_record4.config,
+        {RecompileDiagnosticStage::Compute, 0x413ce6000u});
+    CHECK(!zero_record4_translated.empty(),
+          "production emitter carries selected zero-record V# through pc153/156/158");
+    CHECK(validate_spirv_descriptor_interface(
+              zero_record4_translated, &zero_record4.table, 0u,
+              SpirvShaderStage::Compute, false).ok(),
+          "selected zero-record module matches the routed descriptor contract");
+
+    Fixture nonempty_record4;
+    const std::array<uint32_t, 4> nonempty_descriptor{0x3f800000u, 0u, 1u, 0u};
+    std::memcpy(nonempty_record4.outer.data() + 488u,
+                nonempty_descriptor.data(), sizeof(nonempty_descriptor));
+    CHECK(!discover_rdna2_gta5_selected_sbuffer(
+               exact.data(), exact.size(), nonempty_record4.config,
+               nonempty_record4.table) &&
+              marker_count(nonempty_record4.table) == 0u,
+          "same pc153 descriptor site: nonzero record count cannot acquire empty authority");
+
+    Fixture nonbuffer_record4;
+    const std::array<uint32_t, 4> nonbuffer_descriptor{0x3f800000u, 0u, 0u, 0xc0000000u};
+    std::memcpy(nonbuffer_record4.outer.data() + 488u,
+                nonbuffer_descriptor.data(), sizeof(nonbuffer_descriptor));
+    CHECK(!discover_rdna2_gta5_selected_sbuffer(
+               exact.data(), exact.size(), nonbuffer_record4.config,
+               nonbuffer_record4.table) &&
+              marker_count(nonbuffer_record4.table) == 0u,
+          "same pc153 descriptor site: a non-buffer type cannot acquire empty authority");
+
     Fixture malformed_null_record4;
     const std::array<uint32_t, 4> malformed_null_descriptor{0u, 0u, 1u, 0u};
     std::memcpy(malformed_null_record4.outer.data() + 488u,
