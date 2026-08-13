@@ -75,6 +75,7 @@ void usage(const char* argv0) {
                          "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--dump-compute-resource N:BINDING PATH] "
+                         "[--override-compute-resource N:BINDING PATH] "
                          "[--dump-post-compute-resource N:BINDING PATH] "
                          "[--require-post-change] [--expect-post-hash HASH] "
                          "[--legacy-htile-before-stencil] "
@@ -1878,6 +1879,9 @@ int main(int argc, char** argv) {
     bool resource_override_requested = false;
     prosper::tools::ResourceOverrideSelector resource_override_selector;
     std::string resource_override_path;
+    bool compute_resource_override_requested = false;
+    prosper::tools::ComputeResourceOverrideSelector compute_resource_override_selector;
+    std::string compute_resource_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string post_compute_resource_spec, post_compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
@@ -2049,6 +2053,22 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-compute-resource" && i + 2 < argc) {
             compute_resource_spec = argv[++i]; compute_resource_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--override-compute-resource" && i + 2 < argc) {
+            if (compute_resource_override_requested) {
+                std::fprintf(stderr, "gpu_replay: duplicate --override-compute-resource\n");
+                return 2;
+            }
+            const char* selector = argv[++i];
+            if (!prosper::tools::parse_compute_resource_override_selector(
+                    selector, compute_resource_override_selector)) {
+                std::fprintf(stderr,
+                             "gpu_replay: invalid compute resource override selector %s\n",
+                             selector);
+                return 2;
+            }
+            compute_resource_override_path = argv[++i];
+            compute_resource_override_requested = true;
+        }
         else if (std::string(argv[i]) == "--dump-post-compute-resource" && i + 2 < argc) {
             post_compute_resource_spec = argv[++i];
             post_compute_resource_path = argv[++i];
@@ -2093,6 +2113,7 @@ int main(int argc, char** argv) {
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             resource_override_requested ||
+            compute_resource_override_requested ||
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() ||
@@ -2193,6 +2214,29 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(target.captured_size),
                      static_cast<unsigned long long>(applied_resource_override.original_hash),
                      static_cast<unsigned long long>(applied_resource_override.replacement_hash));
+    }
+    prosper::tools::AppliedComputeResourceOverride applied_compute_resource_override;
+    if (compute_resource_override_requested) {
+        if (!prosper::tools::apply_compute_resource_override_file(
+                replay, compute_resource_override_selector, compute_resource_override_path,
+                applied_compute_resource_override, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot override compute resource: %s\n",
+                         error.c_str());
+            return 2;
+        }
+        const auto& selector = applied_compute_resource_override.selector;
+        const auto& target = applied_compute_resource_override.target;
+        std::fprintf(stderr,
+                     "[compute-resource-override] compute=%zu binding=%u addr=%016llx "
+                     "size=%llu original-hash=%016llx new-hash=%016llx\n",
+                     selector.compute_index, selector.binding,
+                     static_cast<unsigned long long>(target.gpu_addr),
+                     static_cast<unsigned long long>(target.captured_size),
+                     static_cast<unsigned long long>(
+                         applied_compute_resource_override.original_hash),
+                     static_cast<unsigned long long>(
+                         applied_compute_resource_override.replacement_hash));
+        allow_mismatch = true;
     }
     prosper::gpu::GpuCaptureFile prepend_capture;
     prosper::gpu::GpuReplayFrame prepend;

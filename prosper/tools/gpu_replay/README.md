@@ -266,6 +266,8 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --compute-only 0 --override-compute-spv 0 /tmp/reduced.spv \
   /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --compute-only 0 --override-compute-resource 0:2 ~/captures/storage.bin \
+  /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-post-compute-resource 12:14 ~/captures/storage-linear.bin \
   --require-post-change ~/captures/submit.prgcap
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
@@ -569,6 +571,13 @@ prove the replacement was installed without initializing Vulkan; the selected ta
 `hash=` field will equal the reported `new-hash`. A rendering replay still enforces the capture's
 output oracle, so add the explicit `--allow-mismatch` diagnostic option when an intentional input
 change is expected to alter the final image.
+
+`--override-compute-resource N:BINDING PATH` provides the matching dispatch-scoped operation for
+compute replay. The file must exactly match the selected captured span. The tool clones only compute
+N's resource table, owns the replacement bytes, and reports the original/replacement hashes, so a
+shared sibling dispatch remains untouched. Pair it with `--compute-only N` to reproduce a data-dependent
+shader failure without executing unrelated operations; like a SPIR-V override, this is a diagnostic input
+change and disables the capture pixel oracle.
 
 `--draw-with-compute-prefix` retains every compute operation before the selected draw while discarding the
 other graphics draws. This isolates geometry whose vertex/indirect buffers are produced earlier in the same
