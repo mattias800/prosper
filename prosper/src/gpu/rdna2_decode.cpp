@@ -658,7 +658,7 @@ void decode_operands(Rdna2Inst& i) {
             // sources. Their reserved SRC2 bits commonly decode as s0 unless cleared here.
             // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
             // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (vop3_opcode_has_two_data_sources(i.opcode)) {
+            if (emitted_vop3_opcode_has_two_data_sources(i.opcode)) {
                 i.src[2] = {};
                 i.n_src = 2;
             }

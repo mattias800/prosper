@@ -3284,34 +3284,34 @@ int main() {
               gta_zero_record_pc27_binding->dynamic_access,
           "GTA pc47 descriptor fragment elides without enlarging pc27's exact 32-byte output");
 
-    std::array<uint32_t, 319> gta_zero_record_pc47_wrong_offset =
+    std::array<uint32_t, 319> gta_zero_record_pc47_wrong_dst =
         prosper::test::kGta5ZeroRecordExeczProgram;
-    gta_zero_record_pc47_wrong_offset[48] = 0xfa00004cu; // pc47 immediate +0x50 -> +0x4c
-    ShaderResourceTable gta_zero_record_pc47_wrong_offset_table =
+    gta_zero_record_pc47_wrong_dst[47] = 0xf4040200u; // pc47 SDATA s[4:5] -> s[8:9]
+    ShaderResourceTable gta_zero_record_pc47_wrong_dst_table =
         gta_zero_record_compile_resources();
-    const std::vector<uint32_t> gta_zero_record_pc47_wrong_offset_spirv =
-        recompile_compute(gta_zero_record_pc47_wrong_offset.data(),
-                          gta_zero_record_pc47_wrong_offset.size(),
-                          &gta_zero_record_pc47_wrong_offset_table,
+    const std::vector<uint32_t> gta_zero_record_pc47_wrong_dst_spirv =
+        recompile_compute(gta_zero_record_pc47_wrong_dst.data(),
+                          gta_zero_record_pc47_wrong_dst.size(),
+                          &gta_zero_record_pc47_wrong_dst_table,
                           gta_zero_record_compile_config);
-    const DescriptorValidationReport gta_zero_record_pc47_wrong_offset_report =
+    const DescriptorValidationReport gta_zero_record_pc47_wrong_dst_report =
         validate_spirv_descriptor_interface(
-            gta_zero_record_pc47_wrong_offset_spirv,
-            &gta_zero_record_pc47_wrong_offset_table, 0,
+            gta_zero_record_pc47_wrong_dst_spirv,
+            &gta_zero_record_pc47_wrong_dst_table, 0,
             SpirvShaderStage::Compute, false);
-    const size_t gta_zero_record_pc47_wrong_offset_issues = std::count_if(
-        gta_zero_record_pc47_wrong_offset_report.issues.begin(),
-        gta_zero_record_pc47_wrong_offset_report.issues.end(),
+    const size_t gta_zero_record_pc47_wrong_dst_issues = std::count_if(
+        gta_zero_record_pc47_wrong_dst_report.issues.begin(),
+        gta_zero_record_pc47_wrong_dst_report.issues.end(),
         [](const DescriptorValidationIssue& issue) {
             return issue.code == DescriptorIssueCode::UndersizedBuffer &&
-                issue.binding == 2u && issue.required_bytes == 84u &&
+                issue.binding == 2u && issue.required_bytes == 88u &&
                 issue.available_bytes == 32u;
         });
-    CHECK(!gta_zero_record_pc47_wrong_offset_spirv.empty() &&
-              !gta_zero_record_pc47_wrong_offset_report.ok() &&
-              gta_zero_record_pc47_wrong_offset_report.issues.size() == 1u &&
-              gta_zero_record_pc47_wrong_offset_issues == 1u,
-          "same-site pc47 immediate mutation restores the exact accidental binding-2 read");
+    CHECK(!gta_zero_record_pc47_wrong_dst_spirv.empty() &&
+              !gta_zero_record_pc47_wrong_dst_report.ok() &&
+              gta_zero_record_pc47_wrong_dst_report.issues.size() == 1u &&
+              gta_zero_record_pc47_wrong_dst_issues == 1u,
+          "same-site pc47 SDATA mutation restores the exact accidental binding-2 read");
 
     ShaderResourceTable gta_zero_record_compile_ne_table =
         gta_zero_record_compile_resources();

@@ -150,6 +150,18 @@ int main() {
     CHECK(gta_mul_lo_mutation.opcode == kVop3OpcodeMadU32U24 &&
           gta_mul_lo_mutation.n_src == 3 && isS(gta_mul_lo_mutation.src[2], 0),
           "same-site three-source multiply mutation retains its real s0 dependency");
+    const uint32_t emitted_vop3_float_words[] = {0xd5030001u, 0x00020300u};
+    const Rdna2Inst emitted_vop3_float = rdna2_decode_one(emitted_vop3_float_words, 2);
+    CHECK(emitted_vop3_float.opcode == 0x103u && emitted_vop3_float.n_src == 2 &&
+          isV(emitted_vop3_float.src[0], 0) && isV(emitted_vop3_float.src[1], 1) &&
+          emitted_vop3_float.src[2].kind == OperandKind::None,
+          "shared emitted VOP3 arity inventory covers ordinary two-source float ALU");
+    const uint32_t emitted_vop3_bcnt_words[] = {0xd7640002u, 0x00020903u};
+    const Rdna2Inst emitted_vop3_bcnt = rdna2_decode_one(emitted_vop3_bcnt_words, 2);
+    CHECK(emitted_vop3_bcnt.opcode == 0x364u && emitted_vop3_bcnt.n_src == 2 &&
+          isV(emitted_vop3_bcnt.src[0], 3) && isV(emitted_vop3_bcnt.src[1], 4) &&
+          emitted_vop3_bcnt.src[2].kind == OperandKind::None,
+          "shared emitted VOP3 arity inventory covers late two-source integer ALU");
     // GTA V exec_cs_205b658800 pc61: `v_lshlrev_b64 v[24:25], v4, 1`. The reserved SRC2 field
     // must not surface as s0, and the shared writer inventory must retain both result halves.
     const uint32_t gta_lshlrev_b64_words[] = {0xd6ff0018u, 0x00010304u};
