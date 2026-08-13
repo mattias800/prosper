@@ -1,6 +1,7 @@
 // shader_resources.cpp — see shader_resources.hpp. Pure lookups + format sizing; no Vulkan, no state.
 #include "shader_resources.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -621,6 +622,18 @@ StorageBufferMaterializationPlan plan_storage_buffer_materialization(
             descriptor.required_bytes > resource.indirect_buffer_binding_bytes)
             return plan;
         plan.binding_bytes = resource.indirect_buffer_binding_bytes;
+        plan.valid = true;
+        return plan;
+    }
+
+    if (is_indirect_pointer_relocation_marker_candidate(resource)) {
+        if (!is_indirect_pointer_relocation_resource(resource) ||
+            descriptor.kind != SpirvDescriptorKind::StorageBuffer ||
+            !descriptor.readable || descriptor.writable || descriptor.atomic_access ||
+            descriptor.required_bytes > resource.indirect_pointer_relocation.binding_bytes)
+            return plan;
+        plan.logical_bytes = resource.indirect_pointer_relocation.binding_bytes;
+        plan.binding_bytes = resource.indirect_pointer_relocation.binding_bytes;
         plan.valid = true;
         return plan;
     }

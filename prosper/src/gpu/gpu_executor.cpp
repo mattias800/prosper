@@ -16,6 +16,7 @@
 #include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
 #include "../host/guest_memory_map.hpp"
@@ -594,6 +595,13 @@ struct ShaderResourceCompileKey {
     uint32_t indirect_buffer_slot_count = 0;
     uint32_t indirect_buffer_header_bytes = 0;
     uint32_t indirect_buffer_slot_bytes = 0;
+    uint32_t indirect_pointer_carrier_version = 0;
+    uint32_t indirect_pointer_proof_schema = 0;
+    uint32_t indirect_pointer_binding_bytes = 0;
+    uint32_t indirect_pointer_record_count = 0;
+    uint32_t indirect_pointer_segment_count = 0;
+    uint32_t indirect_pointer_segment_directory_byte_offset = 0;
+    uint64_t indirect_pointer_proof_fingerprint = 0;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -806,6 +814,14 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.indirect_buffer_slot_count);
             hash = hash_mix(hash, resource.indirect_buffer_header_bytes);
             hash = hash_mix(hash, resource.indirect_buffer_slot_bytes);
+            hash = hash_mix(hash, resource.indirect_pointer_carrier_version);
+            hash = hash_mix(hash, resource.indirect_pointer_proof_schema);
+            hash = hash_mix(hash, resource.indirect_pointer_binding_bytes);
+            hash = hash_mix(hash, resource.indirect_pointer_record_count);
+            hash = hash_mix(hash, resource.indirect_pointer_segment_count);
+            hash = hash_mix(
+                hash, resource.indirect_pointer_segment_directory_byte_offset);
+            hash = hash_mix(hash, resource.indirect_pointer_proof_fingerprint);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1581,6 +1597,18 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 compiled.indirect_buffer_header_bytes = resource.indirect_buffer_header_bytes;
                 compiled.indirect_buffer_slot_bytes = resource.indirect_buffer_slot_bytes;
             }
+            if (is_indirect_pointer_relocation_resource(resource)) {
+                const auto& relocation = resource.indirect_pointer_relocation;
+                compiled.indirect_pointer_carrier_version = relocation.carrier_version;
+                compiled.indirect_pointer_proof_schema = relocation.proof_schema;
+                compiled.indirect_pointer_binding_bytes = relocation.binding_bytes;
+                compiled.indirect_pointer_record_count = relocation.record_count;
+                compiled.indirect_pointer_segment_count = relocation.segment_count;
+                compiled.indirect_pointer_segment_directory_byte_offset =
+                    relocation.segment_directory_byte_offset;
+                compiled.indirect_pointer_proof_fingerprint =
+                    relocation.proof_fingerprint;
+            }
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
             compiled.depth_compare_func = manual_compare ? resource.depth_compare_func : 0u;
@@ -1885,6 +1913,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const bool has_gta5_packed_pointer = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_packed_pointer_marker_candidate);
+    const bool has_indirect_pointer_relocation = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_indirect_pointer_relocation_marker_candidate);
     const bool has_gta5_cf9200_no_backing = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_cf9200_no_backing_marker_candidate);
@@ -1903,6 +1934,10 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         return {};
     if (has_gta5_packed_pointer &&
         !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *resources))
+        return {};
+    if (has_indirect_pointer_relocation &&
+        !validate_rdna2_indirect_pointer_relocations(
+            code, dwords, config, *resources))
         return {};
     if (has_gta5_cf9200_no_backing &&
         !rdna2_gta5_cf9200_no_backing_dispatch(code, dwords, config, *resources))
@@ -7190,6 +7225,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
                          static_cast<unsigned long long>(source ? source->size : 0u),
                          static_cast<unsigned long long>(source ? source->host_data_size : 0u),
                          source ? source->indirect_buffer_slot_count : 0u);
+        }
+
+        // Generic dispatch-indexed pointer proofs preserve the source records verbatim and append
+        // only the selector-/consumer-bounded pointee intervals. Discovery happens at the same
+        // command-ordered realization point as the fixed-slot predecessor: preceding GPU producers
+        // are complete, and convention bindings have not yet hidden fetch provenance.
+        const bool indirect_pointer_valid = discover_rdna2_indirect_pointer_relocations(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords, config, *table);
+        if (indirect_pointer_valid && std::getenv("PROSPER_DBG")) {
+            const auto source_it = std::find_if(
+                table->resources.begin(), table->resources.end(),
+                is_indirect_pointer_relocation_resource);
+            const ShaderResource* source = source_it == table->resources.end()
+                ? nullptr : &*source_it;
+            const auto marker = source
+                ? source->indirect_pointer_relocation
+                : IndirectPointerRelocationBinding{};
+            std::fprintf(stderr,
+                         "[indirect-pointer-relocation] valid=1 records=%u segments=%u "
+                         "source-bytes=%llu binding-bytes=%u\n",
+                         marker.record_count, marker.segment_count,
+                         static_cast<unsigned long long>(source ? source->size : 0u),
+                         marker.binding_bytes);
         }
 
         // GTA V 0x413cf9200 overlays descriptor-shaped root fields with application records for

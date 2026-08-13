@@ -1,5 +1,6 @@
 #include "gpu_dependency_graph.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 #include "vk_translate.hpp"
 
 #include <algorithm>
@@ -72,6 +73,7 @@ uint64_t resource_size(const ShaderResource& resource) {
     // The appended packed slots are a dispatch-owned representation of lane-zero pointers, not guest
     // bytes following the source table's address. Dependency closure remains on the logical table.
     if (is_gta5_packed_pointer_resource(resource)) return resource.size;
+    if (is_indirect_pointer_relocation_resource(resource)) return resource.size;
     if (resource.host_data_size) return resource.host_data_size;
     if (resource.size) return resource.size;
     if (resource.width && resource.height)
@@ -113,6 +115,20 @@ bool append_compute_accesses(const ComputeItem& compute,
                              std::string& error) {
     const ShaderResourceTable* table = compute.resources.get();
     if (!table) return true;
+    auto append_relocation_segments = [&]() {
+        for (const ShaderResource& resource : table->resources) {
+            if (!is_indirect_pointer_relocation_resource(resource)) continue;
+            IndirectBufferRelocationInfo info;
+            if (!inspect_indirect_buffer_relocation(
+                    resource, resource.host_data, resource.host_data_size,
+                    kIndirectPointerStaticFootprintLayout, info))
+                continue;
+            for (const auto& segment : info.segments)
+                reads.push_back({segment.guest_address, segment.byte_count, 0, 0,
+                                 resource.binding, ResourceClass::ConstantBuffer,
+                                 "cs", DataFormat::Unknown, 1u, false});
+        }
+    };
     for (const ShaderResource& resource : table->resources) {
         if (!valid_shader_buffer_table_contract(resource)) {
             error = "resource has an invalid buffer descriptor-table dependency contract";
@@ -149,6 +165,7 @@ bool append_compute_accesses(const ComputeItem& compute,
                                   resource->height,
                                   resource->cls == ResourceClass::StorageImage});
         }
+        append_relocation_segments();
         return true;
     }
 
@@ -158,6 +175,7 @@ bool append_compute_accesses(const ComputeItem& compute,
     for (const auto& access : reads)
         writes.push_back({0, access.addr, access.size, access.width, access.height,
                           access.resource_class == ResourceClass::StorageImage});
+    append_relocation_segments();
     return true;
 }
 

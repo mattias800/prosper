@@ -37,6 +37,9 @@ struct IndirectBufferShadowAccess {
 
 // Version-2 relocation shadows preserve the source bytes verbatim. Each proven source record names
 // one bounded guest interval; overlapping intervals are normalized into disjoint packed segments.
+// Each segment starts at a dword boundary and its exact bytes are followed by deterministic zero
+// padding to the next boundary. Padding is physical SSBO safety for an unaligned final dword; it is
+// never included in the segment's guest interval or record authority.
 // The translated shader keeps computing the original guest address and relocates only at a proven
 // GLOBAL consumer, so guest pointer arithmetic (including high-word canonicalization) stays intact.
 struct IndirectBufferRelocationLayout {
@@ -70,6 +73,10 @@ struct IndirectBufferRelocationInfo {
     std::vector<IndirectBufferRelocationSegment> segments;
     std::vector<uint32_t> witness_words;
 };
+
+inline constexpr uint32_t kIndirectBufferRelocationHeaderBytes = 40u;
+inline constexpr uint32_t kIndirectBufferRelocationRecordBytes = 24u;
+inline constexpr uint32_t kIndirectBufferRelocationSegmentBytes = 24u;
 
 size_t indirect_buffer_shadow_header_bytes(const IndirectBufferShadowLayout& layout);
 
