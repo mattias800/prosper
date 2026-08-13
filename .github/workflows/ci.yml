@@ -167,7 +167,10 @@ jobs:
       - name: Check the contribution shape of this PR
         if: github.event_name == 'pull_request'
         run: |
-          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
+          # No --depth here: `fetch-depth: 0` above already fetched full history, and
+          # `--depth=0` is rejected outright (`fatal: depth 0 is not a positive number`) --
+          # which is how this job failed on its own first run.
+          git fetch --no-tags origin "${{ github.base_ref }}"
           python3 prosper/tools/ci/check_contribution_shape.py --github \
             --base "origin/${{ github.base_ref }}"
 
