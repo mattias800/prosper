@@ -8,6 +8,7 @@
 #include "gpu_capture.hpp"
 #include "gpu_timeline.hpp"
 #include "capture_compute_policy.hpp"
+#include "compute_parent_walk.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -8514,6 +8515,164 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
     item.dispatch_index = index;
     return true;
 }
+
+struct LiveComputeParentWalkPreflight {
+    bool selected = false;
+    bool available = false;
+    bool suspicious = false;
+    uint64_t resource_addr = 0;
+    uint32_t resource_bytes = 0;
+    uint64_t resource_hash = 0;
+    ComputeParentWalkReport report;
+};
+
+const std::optional<ComputeParentWalkSelector>& compute_parent_walk_selector() {
+    static const auto selector = [] {
+        const char* value = std::getenv("PROSPER_COMPUTE_PARENT_WALK");
+        auto parsed = parse_compute_parent_walk_selector(value);
+        if (value && *value && !parsed)
+            std::fprintf(stderr,
+                         "[compute-parent-walk] invalid selector '%s'; expected "
+                         "PROGRAM:FETCH_PC:SHIFT:MASK[:DEEP]\n",
+                         value);
+        return parsed;
+    }();
+    return selector;
+}
+
+void dump_suspicious_parent_walk(const ComputeItem& item, uint64_t hash,
+                                 const std::vector<uint32_t>& words) {
+    const char* root = std::getenv("PROSPER_COMPUTE_PARENT_WALK_DUMP");
+    if (!root || !*root) return;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        std::fprintf(stderr, "[compute-parent-walk] dump directory failed: %s\n",
+                     error.message().c_str());
+        return;
+    }
+    char leaf[192] = {};
+    std::snprintf(leaf, sizeof(leaf),
+                  "parent-walk-s%llu-d%llu-o%llu-%016llx.bin",
+                  static_cast<unsigned long long>(item.submit_no),
+                  static_cast<unsigned long long>(item.dispatch_index),
+                  static_cast<unsigned long long>(item.command_order),
+                  static_cast<unsigned long long>(hash));
+    const std::filesystem::path path = std::filesystem::path(root) / leaf;
+    FILE* file = std::fopen(path.string().c_str(), "wb");
+    if (!file) {
+        std::fprintf(stderr, "[compute-parent-walk] dump open failed: %s\n",
+                     path.string().c_str());
+        return;
+    }
+    const size_t written = std::fwrite(
+        words.data(), sizeof(uint32_t), words.size(), file);
+    const int close_result = std::fclose(file);
+    if (written != words.size() || close_result != 0) {
+        std::fprintf(stderr, "[compute-parent-walk] dump write failed: %s\n",
+                     path.string().c_str());
+        return;
+    }
+    std::fprintf(stderr, "[compute-parent-walk] dumped %zu bytes to %s\n",
+                 words.size() * sizeof(uint32_t), path.string().c_str());
+}
+
+LiveComputeParentWalkPreflight preflight_compute_parent_walk(
+        const ComputeItem& item, uint64_t previous_code,
+        bool previous_realized, bool previous_executed) {
+    LiveComputeParentWalkPreflight result;
+    const auto& selected = compute_parent_walk_selector();
+    if (!selected || item.code_addr != selected->program_addr) return result;
+    result.selected = true;
+
+    const ShaderResource* resource = nullptr;
+    if (item.resources) {
+        for (const ShaderResource& candidate : item.resources->resources) {
+            if (candidate.fetch_pc != selected->fetch_pc) continue;
+            if (resource) {
+                std::fprintf(stderr,
+                             "[compute-parent-walk] code=0x%llx fetch-pc=%u "
+                             "unavailable=ambiguous-resource\n",
+                             static_cast<unsigned long long>(item.code_addr),
+                             selected->fetch_pc);
+                return result;
+            }
+            resource = &candidate;
+        }
+    }
+    constexpr uint32_t kMaximumDiagnosticRecords = 1u << 20u;
+    if (!resource || !resource->size || (resource->size % sizeof(uint32_t)) != 0u ||
+        resource->stride != sizeof(uint32_t) ||
+        resource->size / sizeof(uint32_t) > kMaximumDiagnosticRecords) {
+        std::fprintf(stderr,
+                     "[compute-parent-walk] code=0x%llx fetch-pc=%u "
+                     "unavailable=resource-shape addr=0x%llx bytes=%u stride=%u\n",
+                     static_cast<unsigned long long>(item.code_addr), selected->fetch_pc,
+                     static_cast<unsigned long long>(resource ? resource->gpu_addr : 0u),
+                     resource ? resource->size : 0u, resource ? resource->stride : 0u);
+        return result;
+    }
+
+    const uint8_t* source = nullptr;
+    if (resource->host_data && resource->host_data_size >= resource->size) {
+        source = resource->host_data;
+    } else if (!resource->host_data && resource->host_data_size == 0u &&
+               guest_readable(resource->gpu_addr, resource->size)) {
+        source = reinterpret_cast<const uint8_t*>(
+            static_cast<uintptr_t>(resource->gpu_addr));
+    }
+    if (!source) {
+        std::fprintf(stderr,
+                     "[compute-parent-walk] code=0x%llx fetch-pc=%u "
+                     "unavailable=unreadable addr=0x%llx bytes=%u\n",
+                     static_cast<unsigned long long>(item.code_addr), selected->fetch_pc,
+                     static_cast<unsigned long long>(resource->gpu_addr), resource->size);
+        return result;
+    }
+
+    std::vector<uint32_t> words(resource->size / sizeof(uint32_t));
+    std::memcpy(words.data(), source, resource->size);
+    const uint64_t launched = std::min<uint64_t>(
+        static_cast<uint64_t>(item.launch.threads_x) * item.launch.threads_y *
+            item.launch.threads_z,
+        UINT32_MAX);
+    result.available = true;
+    result.resource_addr = resource->gpu_addr;
+    result.resource_bytes = resource->size;
+    result.resource_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(words.data()), resource->size);
+    result.report = analyze_compute_parent_walk(
+        words, static_cast<uint32_t>(launched), selected->index_shift,
+        selected->index_mask);
+    result.suspicious = compute_parent_walk_suspicious(
+        result.report, selected->deep_threshold);
+    std::fprintf(stderr,
+                 "[compute-parent-walk] submit=%llu dispatch=%llu order=%llu "
+                 "code=0x%llx fetch-pc=%u addr=0x%llx bytes=%u hash=%016llx "
+                 "groups=%ux%ux%u local=%ux%ux%u records=%u roots=%u "
+                 "cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u "
+                 "max-root=%u deep-threshold=%u suspicious=%u "
+                 "previous-code=0x%llx previous-realized=%u previous-executed=%u\n",
+                 static_cast<unsigned long long>(item.submit_no),
+                 static_cast<unsigned long long>(item.dispatch_index),
+                 static_cast<unsigned long long>(item.command_order),
+                 static_cast<unsigned long long>(item.code_addr), selected->fetch_pc,
+                 static_cast<unsigned long long>(result.resource_addr),
+                 result.resource_bytes,
+                 static_cast<unsigned long long>(result.resource_hash),
+                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z,
+                 item.launch.local_x, item.launch.local_y, item.launch.local_z,
+                 result.report.records, result.report.roots,
+                 result.report.distinct_cycles, result.report.cyclic_roots,
+                 result.report.oob_roots, result.report.max_depth,
+                 result.report.max_depth_root, selected->deep_threshold,
+                 static_cast<unsigned>(result.suspicious),
+                 static_cast<unsigned long long>(previous_code),
+                 static_cast<unsigned>(previous_realized),
+                 static_cast<unsigned>(previous_executed));
+    if (result.suspicious) dump_suspicious_parent_walk(item, result.resource_hash, words);
+    return result;
+}
 } // namespace
 
 std::vector<ComputeAuthorityBoundary> compute_authority_draw_resource_boundaries(
@@ -8640,6 +8799,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     bool producer_epoch_ok = true;
     bool indirect_dependencies_ok = true;
     bool final_callback_sent = false;
+    uint64_t previous_compute_code = 0;
+    bool previous_compute_realized = false;
+    bool previous_compute_executed = false;
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
         if (span.empty() || !render) return;
@@ -8724,6 +8886,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             }
             case RetainedSubmitKind::Dispatch: {
                 flush_span();
+                const uint64_t current_compute_code = compute_dispatch_code_addr(
+                    st, st.dispatches[operation.index]);
                 const bool indirect = st.dispatches[operation.index].indirect;
                 if (indirect && (!indirect_dependencies_ok || !producer_epoch_ok)) {
                     notify_compute_authority_unknown(
@@ -8736,6 +8900,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             RealizationFailureReason::IndirectDependencies});
                     }
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                     break;
                 }
                 if (!compute) {
@@ -8748,6 +8915,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             operation.command_order, RealizationFailureReason::Unknown});
                     }
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                     break;
                 }
                 ComputeItem item;
@@ -8755,6 +8925,31 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 if (realize_retained_compute(
                         st, operation.index, submit_no, item,
                         capture_trace ? &failure : nullptr)) {
+                    const LiveComputeParentWalkPreflight preflight =
+                        preflight_compute_parent_walk(
+                            item, previous_compute_code, previous_compute_realized,
+                            previous_compute_executed);
+                    if (preflight.selected && preflight.available && preflight.suspicious) {
+                        std::fprintf(stderr,
+                                     "[compute-parent-walk] DIAGNOSTIC-ONLY skip suspicious "
+                                     "dispatch submit=%llu dispatch=%zu order=%llu code=0x%llx\n",
+                                     static_cast<unsigned long long>(submit_no), operation.index,
+                                     static_cast<unsigned long long>(operation.command_order),
+                                     static_cast<unsigned long long>(item.code_addr));
+                        notify_compute_authority_unknown(
+                            ComputeAuthorityBoundaryKind::Compute,
+                            submit_no, operation.command_order);
+                        if (capture_trace) {
+                            capture_trace->failures.push_back({
+                                SubmitOperationKind::Dispatch, operation.index,
+                                operation.command_order, RealizationFailureReason::Unknown});
+                        }
+                        producer_epoch_ok = false;
+                        previous_compute_code = current_compute_code;
+                        previous_compute_realized = true;
+                        previous_compute_executed = false;
+                        break;
+                    }
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
                     if (capture_trace && executed)
@@ -8766,17 +8961,26 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     }
                     result.compute_executed |= executed;
                     producer_epoch_ok &= executed;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = true;
+                    previous_compute_executed = executed;
                 } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
                     capture_trace->failures.push_back(std::move(failure));
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                 } else {
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                 }
                 break;
             }

@@ -1042,6 +1042,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_gta5_cf9200 PRIVATE prosper_core)
   add_test(NAME gta5_cf9200_no_backing COMMAND test_gta5_cf9200)
 
+  add_executable(test_compute_parent_walk tests/test_compute_parent_walk.cpp)
+  target_link_libraries(test_compute_parent_walk PRIVATE prosper_core)
+  add_test(NAME compute_parent_walk COMMAND test_compute_parent_walk)
+
   # Cross-submit readability reuse is valid only while the HLE mapping generation is unchanged.
   add_executable(test_guest_memory_map tests/test_guest_memory_map.cpp)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
