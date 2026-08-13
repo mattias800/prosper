@@ -32,9 +32,17 @@ void store_u64(uint8_t* bytes, size_t offset, uint64_t value) {
     std::memcpy(bytes + offset, &value, sizeof(value));
 }
 
-constexpr size_t kRelocationHeaderBytes = 40u;
-constexpr size_t kRelocationRecordBytes = 24u;
-constexpr size_t kRelocationSegmentBytes = 24u;
+constexpr size_t kRelocationHeaderBytes = kIndirectBufferRelocationHeaderBytes;
+constexpr size_t kRelocationRecordBytes = kIndirectBufferRelocationRecordBytes;
+constexpr size_t kRelocationSegmentBytes = kIndirectBufferRelocationSegmentBytes;
+constexpr uint32_t kRelocationPayloadAlignment = sizeof(uint32_t);
+
+bool align_relocation_payload(uint32_t value, uint32_t& aligned) {
+    constexpr uint32_t mask = kRelocationPayloadAlignment - 1u;
+    if (value > UINT32_MAX - mask) return false;
+    aligned = (value + mask) & ~mask;
+    return true;
+}
 
 bool relocation_layout_valid(const ShaderResource& source,
                              const IndirectBufferRelocationLayout& layout,
@@ -42,7 +50,8 @@ bool relocation_layout_valid(const ShaderResource& source,
     return layout.tag && layout.version == 2u && layout.max_records &&
            layout.max_segments && layout.max_binding_bytes &&
            record_count && record_count <= layout.max_records &&
-           source.size && source.size <= UINT32_MAX;
+           source.size && source.size <= UINT32_MAX &&
+           source.size % kRelocationPayloadAlignment == 0u;
 }
 
 bool interval_end(uint64_t address, uint32_t bytes, uint64_t& end) {
@@ -345,20 +354,31 @@ bool parse_indirect_buffer_relocation(
         segment.byte_count = load_u32(bytes, offset + 8u);
         segment.packed_byte_offset = load_u32(bytes, offset + 12u);
         uint64_t end = 0;
-        if (load_u64(bytes, offset + 16u) != 0u ||
+        uint32_t expected_packed_offset = 0;
+        if (!align_relocation_payload(prior_packed_end, expected_packed_offset) ||
+            load_u64(bytes, offset + 16u) != 0u ||
             !interval_end(segment.guest_address, segment.byte_count, end) ||
             segment.guest_address != canonical_segments[index].begin ||
             end != canonical_segments[index].end ||
             (index && segment.guest_address < prior_end) ||
-            segment.packed_byte_offset != prior_packed_end ||
+            segment.packed_byte_offset != expected_packed_offset ||
             segment.packed_byte_offset > byte_count ||
             segment.byte_count > byte_count - segment.packed_byte_offset)
             return false;
+        if (std::any_of(bytes + prior_packed_end,
+                        bytes + segment.packed_byte_offset,
+                        [](uint8_t value) { return value != 0u; }))
+            return false;
         prior_end = end;
-        if (segment.byte_count > UINT32_MAX - prior_packed_end) return false;
-        prior_packed_end += segment.byte_count;
+        if (segment.byte_count > UINT32_MAX - segment.packed_byte_offset) return false;
+        prior_packed_end = segment.packed_byte_offset + segment.byte_count;
     }
-    if (prior_packed_end != byte_count) return false;
+    uint32_t padded_payload_end = 0;
+    if (!align_relocation_payload(prior_packed_end, padded_payload_end) ||
+        padded_payload_end != byte_count ||
+        std::any_of(bytes + prior_packed_end, bytes + byte_count,
+                    [](uint8_t value) { return value != 0u; }))
+        return false;
 
     std::vector<bool> referenced_segments(segment_count, false);
     for (size_t index = 0; index < record_count; ++index) {
@@ -454,8 +474,18 @@ bool build_indirect_buffer_relocation(
     uint64_t payload_bytes64 = 0;
     for (const auto& interval : merged) {
         const uint64_t bytes = interval.end - interval.begin;
-        if (bytes > UINT64_MAX - payload_bytes64) return false;
-        payload_bytes64 += bytes;
+        if (payload_bytes64 > UINT32_MAX) return false;
+        uint32_t aligned = 0;
+        if (!align_relocation_payload(static_cast<uint32_t>(payload_bytes64), aligned) ||
+            bytes > UINT64_MAX - aligned)
+            return false;
+        payload_bytes64 = static_cast<uint64_t>(aligned) + bytes;
+    }
+    if (payload_bytes64 <= UINT32_MAX) {
+        uint32_t aligned = 0;
+        if (!align_relocation_payload(static_cast<uint32_t>(payload_bytes64), aligned))
+            return false;
+        payload_bytes64 = aligned;
     }
     if (payload_offset64 > UINT32_MAX || payload_bytes64 > UINT32_MAX ||
         payload_offset64 > layout.max_binding_bytes ||
@@ -505,6 +535,7 @@ bool build_indirect_buffer_relocation(
     const size_t segments_base = records_base + static_cast<size_t>(record_bytes);
     uint32_t packed_offset = payload_offset;
     for (size_t index = 0; index < merged.size(); ++index) {
+        if (!align_relocation_payload(packed_offset, packed_offset)) return false;
         const size_t offset = segments_base + index * kRelocationSegmentBytes;
         const uint32_t bytes = static_cast<uint32_t>(merged[index].end - merged[index].begin);
         store_u64(owner->data(), offset, merged[index].begin);

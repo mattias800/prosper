@@ -185,6 +185,21 @@ enum class ResourceClass : uint32_t {
                      // use float texels and Vulkan's descriptor conversion.
 };
 
+// Derived, dispatch-owned binding for a generic indirect-pointer relocation proof. The scalar
+// marker is cache/capture metadata only: authority is re-derived from the raw shader, launch, source
+// records, and version-2 carrier at every compile boundary.
+struct IndirectPointerRelocationBinding {
+    uint32_t carrier_version = 0;
+    uint32_t proof_schema = 0;
+    uint32_t binding_bytes = 0;
+    uint32_t record_count = 0;
+    uint32_t segment_count = 0;
+    uint32_t segment_directory_byte_offset = 0;
+    uint64_t proof_fingerprint = 0;
+
+    bool operator==(const IndirectPointerRelocationBinding&) const = default;
+};
+
 // One resource a shader accesses. FILLED BY THE FRONT-HALF from the game's real descriptors (the
 // V#/T#/S# words in the shader's user_data / SRT, resolved against the game's bound resources and
 // guest memory). CONSUMED BY THE RECOMPILER: it uses `format`/`num_components` to emit correct
@@ -437,6 +452,11 @@ struct ShaderResource {
     uint32_t       indirect_buffer_slot_count = 0;
     uint32_t       indirect_buffer_header_bytes = 0;
     uint32_t       indirect_buffer_slot_bytes = 0;
+
+    // Version-2 carrier metadata stays separate from the fixed-slot v1 marker above. Reusing those
+    // fields would make a generic relocation enter the legacy title-specific validator before its
+    // independent proof could be re-established.
+    IndirectPointerRelocationBinding indirect_pointer_relocation{};
 };
 
 inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& resource) {

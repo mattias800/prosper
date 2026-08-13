@@ -165,6 +165,53 @@ int main() {
               rejected_owner, reparsed),
           "binding cap rejects the same production payload before allocation");
 
+    // Two valid intervals can overlap at a non-dword displacement. Keep the guest interval exact,
+    // but align the physical segment tail so an unaligned final dword can read its second u32
+    // without relying on a partially out-of-range Vulkan load.
+    std::vector<uint8_t> unaligned_source_bytes(32u, 0u);
+    std::array<uint8_t, 96> unaligned_pointee{};
+    for (size_t index = 0; index < unaligned_pointee.size(); ++index)
+        unaligned_pointee[index] = static_cast<uint8_t>(index + 7u);
+    const uint64_t unaligned_pointer0 =
+        reinterpret_cast<uint64_t>(unaligned_pointee.data());
+    const uint64_t unaligned_pointer1 = unaligned_pointer0 + 17u;
+    store_u64(unaligned_source_bytes.data(), 0u, unaligned_pointer0);
+    store_u64(unaligned_source_bytes.data(), 16u, unaligned_pointer1);
+    ShaderResource unaligned_source = source;
+    unaligned_source.gpu_addr =
+        reinterpret_cast<uint64_t>(unaligned_source_bytes.data());
+    unaligned_source.size = unaligned_source_bytes.size();
+    unaligned_source.host_data = unaligned_source_bytes.data();
+    unaligned_source.host_data_size = unaligned_source_bytes.size();
+    const IndirectBufferRelocationLayout unaligned_layout{
+        0x1d1e2482u, 2u, 2u, 2u, 4096u, 0u};
+    const std::array<IndirectBufferRelocationRecord, 2> unaligned_records{{
+        {0u, unaligned_pointer0, 32u},
+        {16u, unaligned_pointer1, 32u},
+    }};
+    std::shared_ptr<std::vector<uint8_t>> unaligned_owner;
+    IndirectBufferRelocationInfo unaligned_info;
+    CHECK(build_indirect_buffer_relocation(
+              unaligned_source, unaligned_source_bytes.data(), unaligned_layout,
+              unaligned_records, {}, unaligned_owner, unaligned_info) &&
+              unaligned_owner && unaligned_info.segments.size() == 1u &&
+              unaligned_info.segments[0].byte_count == 49u &&
+              unaligned_info.payload_bytes == 52u &&
+              unaligned_owner->size() % sizeof(uint32_t) == 0u,
+          "non-dword canonical interval keeps exact authority with a zero-padded physical tail");
+    if (unaligned_owner) {
+        CHECK((*unaligned_owner)[unaligned_owner->size() - 1u] == 0u &&
+                  (*unaligned_owner)[unaligned_owner->size() - 2u] == 0u &&
+                  (*unaligned_owner)[unaligned_owner->size() - 3u] == 0u,
+              "physical tail padding is deterministic zero data");
+        auto nonzero_padding = *unaligned_owner;
+        nonzero_padding.back() = 1u;
+        CHECK(!parse_indirect_buffer_relocation(
+                  unaligned_source, nonzero_padding.data(), nonzero_padding.size(),
+                  unaligned_layout, unaligned_records, unaligned_info),
+              "same physical padding mutation fails closed");
+    }
+
     if (failures) {
         std::fprintf(stderr, "%d indirect-buffer shadow assertion(s) failed\n", failures);
         return 1;

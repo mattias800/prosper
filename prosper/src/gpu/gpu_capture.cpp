@@ -15,6 +15,7 @@
 #include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 #include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
 #include "videoout_present.hpp"
@@ -125,7 +126,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v52: retain the complete generic runtime-selected buffer descriptor-array contract. Each resource
 // carries its declared arity/selector and every raw V# plus a separate captured backing reference;
 // the legacy resource prefix stays byte-exact.
-constexpr uint32_t kVersion = 52;
+// v53 (#2481): internal compute bytes may carry the generic static-footprint indirect-pointer
+// relocation snapshot. The proof marker is deliberately reconstructed from raw shader, launch,
+// source records, and carrier witnesses instead of being trusted as serialized authority.
+constexpr uint32_t kVersion = 53;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -806,7 +810,9 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                 error = "resource has an invalid buffer descriptor-table contract";
                 return false;
             }
-            if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) continue;
+            if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
+                is_indirect_pointer_relocation_resource(r))
+                continue;
             if (r.table_index_count) {
                 for (const ShaderBufferTableEntry& entry : r.table_entries) {
                     const uint64_t n = entry.size;
@@ -928,7 +934,9 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
             error = "resource has an invalid buffer descriptor-table contract";
             return false;
         }
-        if (!allow_packed_pointer && is_gta5_packed_pointer_marker_candidate(r)) {
+        if (!allow_packed_pointer &&
+            (is_gta5_packed_pointer_marker_candidate(r) ||
+             is_indirect_pointer_relocation_marker_candidate(r))) {
             error = "packed-pointer state is only valid for a compute dispatch";
             return false;
         }
@@ -981,12 +989,16 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);
         c.captured_size = n;
-        if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) &&
+        if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
+             is_indirect_pointer_relocation_resource(r)) &&
             include_resource_data) {
             const uint64_t internal_size = is_compute_internal_gds(r) ? n : r.host_data_size;
             if (!r.host_data || r.host_data_size < internal_size ||
                 (is_gta5_packed_pointer_resource(r) &&
                  !is_gta5_packed_pointer_serialized_shadow(
+                     r, r.host_data, r.host_data_size)) ||
+                (is_indirect_pointer_relocation_resource(r) &&
+                 !is_indirect_pointer_relocation_serialized(
                      r, r.host_data, r.host_data_size))) {
                 error = "compute internal resource has no complete host backing";
                 return false;
@@ -1631,13 +1643,27 @@ bool captured_resource_has_packed_pointer_state(const GpuCapturedResource& captu
            !is_compute_internal_gds(captured.resource);
 }
 
+bool captured_resource_has_indirect_pointer_state(
+        const GpuCapturedResource& captured) {
+    return !captured.internal_bytes.empty() &&
+           is_indirect_pointer_relocation_serialized(
+               captured.resource, captured.internal_bytes.data(),
+               captured.internal_bytes.size());
+}
+
+bool captured_resource_has_gta5_packed_pointer_candidate(
+        const GpuCapturedResource& captured) {
+    return captured_resource_has_packed_pointer_state(captured) &&
+           !captured_resource_has_indirect_pointer_state(captured);
+}
+
 bool validate_captured_gta5_packed_pointer(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
     const size_t candidates = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
-        captured_resource_has_packed_pointer_state));
+        captured_resource_has_gta5_packed_pointer_candidate));
     if (!candidates) return true;
     if (capture.format_version < 51u || candidates != 1u ||
         !compute.recompile_config_available ||
@@ -1665,7 +1691,7 @@ bool validate_captured_gta5_packed_pointer(
         resource.indirect_buffer_slot_bytes = 0u;
         resource.host_data = nullptr;
         resource.host_data_size = 0u;
-        if (captured_resource_has_packed_pointer_state(captured)) {
+        if (captured_resource_has_gta5_packed_pointer_candidate(captured)) {
             if (!is_gta5_packed_pointer_serialized_shadow(
                     resource, captured.internal_bytes.data(), captured.internal_bytes.size())) {
                 error = "packed-pointer state has malformed internal bytes";
@@ -1691,6 +1717,66 @@ bool validate_captured_gta5_packed_pointer(
         !discover_rdna2_gta5_packed_pointer(
             raw.data(), raw.size(), config, validated_resources)) {
         error = "packed-pointer state has stale shader, launch, or table provenance";
+        return false;
+    }
+    return true;
+}
+
+bool validate_captured_indirect_pointer_relocations(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!compute.resources.present) return true;
+    const size_t candidates = static_cast<size_t>(std::count_if(
+        compute.resources.resources.begin(), compute.resources.resources.end(),
+        captured_resource_has_indirect_pointer_state));
+    if (!candidates) return true;
+    if (capture.format_version < 53u || candidates != 1u ||
+        !compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        error = "indirect-pointer relocation lacks exact compute provenance";
+        return false;
+    }
+    const auto& config = compute.recompile_config;
+    const uint64_t groups_x =
+        (static_cast<uint64_t>(config.threads_x) + config.local_x - 1u) /
+        config.local_x;
+    if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
+        compute.launch.groups_z != 1u) {
+        error = "indirect-pointer relocation has stale captured launch provenance";
+        return false;
+    }
+
+    ShaderResourceTable validated_resources;
+    validated_resources.resources.reserve(compute.resources.resources.size());
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        ShaderResource resource = captured.resource;
+        resource.indirect_pointer_relocation = {};
+        resource.host_data = nullptr;
+        resource.host_data_size = 0u;
+        if (captured_resource_has_indirect_pointer_state(captured)) {
+            resource.host_data = const_cast<uint8_t*>(captured.internal_bytes.data());
+            resource.host_data_size = captured.internal_bytes.size();
+        } else if (captured.blob_index != UINT32_MAX) {
+            if (captured.blob_index >= capture.blobs.size() ||
+                captured.blob_offset >
+                    capture.blobs[captured.blob_index].bytes.size()) {
+                error = "indirect-pointer relocation references an invalid resource blob";
+                return false;
+            }
+            const auto& blob = capture.blobs[captured.blob_index].bytes;
+            resource.host_data = const_cast<uint8_t*>(
+                blob.data() + captured.blob_offset);
+            resource.host_data_size = blob.size() - captured.blob_offset;
+        }
+        validated_resources.resources.push_back(resource);
+    }
+
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    if (!discover_rdna2_indirect_pointer_relocations(
+            raw.data(), raw.size(), config, validated_resources) ||
+        !validate_rdna2_indirect_pointer_relocations(
+            raw.data(), raw.size(), config, validated_resources)) {
+        error = "indirect-pointer relocation has stale shader, launch, source, or proof state";
         return false;
     }
     return true;
@@ -1743,6 +1829,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
         if (!validate_captured_gta5_cf9200_no_backing(capture, compute, error))
             return false;
         if (!validate_captured_gta5_packed_pointer(capture, compute, error))
+            return false;
+        if (!validate_captured_indirect_pointer_relocations(capture, compute, error))
             return false;
         if (compute.raw_shader_index != 0xFFFFFFFFu)
             raw_referenced[compute.raw_shader_index] = true;
@@ -2670,13 +2758,20 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             const bool packed = is_gta5_packed_pointer_serialized_shadow(
                 captured.resource, captured.internal_bytes.data(),
                 captured.internal_bytes.size());
+            const bool relocated = is_indirect_pointer_relocation_serialized(
+                captured.resource, captured.internal_bytes.data(),
+                captured.internal_bytes.size());
             const bool expected_packed =
                 is_gta5_packed_pointer_marker_candidate(captured.resource);
-            if ((!allow_packed_pointer && (packed || expected_packed)) ||
-                (!gds && !packed && !captured.internal_bytes.empty()) ||
+            const bool expected_relocated =
+                is_indirect_pointer_relocation_marker_candidate(captured.resource);
+            if ((!allow_packed_pointer &&
+                 (packed || expected_packed || relocated || expected_relocated)) ||
+                (!gds && !packed && !relocated && !captured.internal_bytes.empty()) ||
                 (gds && !captured.internal_bytes.empty() &&
                  captured.internal_bytes.size() != resource_footprint(captured.resource)) ||
-                (expected_packed && !captured.internal_bytes.empty() && !packed)) {
+                (expected_packed && !captured.internal_bytes.empty() && !packed) ||
+                (expected_relocated && !captured.internal_bytes.empty() && !relocated)) {
                 error = "invalid compute internal capture state";
                 return false;
             }
@@ -3774,8 +3869,12 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     is_gta5_packed_pointer_serialized_shadow(
                         captured.resource, captured.internal_bytes.data(),
                         captured.internal_bytes.size());
-                if ((!allow_packed_pointer && packed) ||
-                    (!gds && !packed && !captured.internal_bytes.empty()) ||
+                const bool relocated = version >= 53u &&
+                    is_indirect_pointer_relocation_serialized(
+                        captured.resource, captured.internal_bytes.data(),
+                        captured.internal_bytes.size());
+                if ((!allow_packed_pointer && (packed || relocated)) ||
+                    (!gds && !packed && !relocated && !captured.internal_bytes.empty()) ||
                     (gds && !captured.internal_bytes.empty() &&
                      captured.internal_bytes.size() != resource_footprint(captured.resource))) {
                     error = "invalid compute internal capture state";
@@ -4664,12 +4763,16 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                 const bool packed = c.format_version >= 51u &&
                     is_gta5_packed_pointer_serialized_shadow(
                         r, x.internal_bytes.data(), x.internal_bytes.size());
-                if ((!allow_packed_pointer && packed) || (!gds && !packed)) {
+                const bool relocated = c.format_version >= 53u &&
+                    is_indirect_pointer_relocation_serialized(
+                        r, x.internal_bytes.data(), x.internal_bytes.size());
+                if ((!allow_packed_pointer && (packed || relocated)) ||
+                    (!gds && !packed && !relocated)) {
                     error = "invalid compute internal replay state";
                     return false;
                 }
                 size_t instance_index = 0;
-                if (packed) {
+                if (packed || relocated) {
                     instance_index = out.resource_instances.size();
                     out.resource_instances.push_back({0, 0xFFFFFFFFu, x.internal_bytes});
                 } else {
@@ -4736,6 +4839,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
         if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
         if (!validate_captured_gta5_cf9200_no_backing(c, x, error)) return false;
+        if (!validate_captured_indirect_pointer_relocations(c, x, error)) return false;
         ComputeItem compute;
         compute.spirv = x.spirv;
         compute.launch = x.launch;
@@ -4761,6 +4865,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                     resource.resource, resource.internal_bytes.data(),
                     resource.internal_bytes.size());
             });
+        const bool has_indirect_pointer_state = c.format_version >= 53u &&
+            std::any_of(x.resources.resources.begin(), x.resources.resources.end(),
+                        captured_resource_has_indirect_pointer_state);
         if (!table(x.resources, true, compute.resources)) return false;
         const bool has_cf9200_no_backing =
             captured_compute_has_gta5_cf9200_no_backing(x);
@@ -4777,6 +4884,12 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             (!compute.resources || !compute.recompile_config_available ||
              compute.raw_shader_index >= c.raw_shader_versions.size())) {
             error = "packed-pointer replay lacks exact raw shader or launch state";
+            return false;
+        }
+        if (has_indirect_pointer_state &&
+            (!compute.resources || !compute.recompile_config_available ||
+             compute.raw_shader_index >= c.raw_shader_versions.size())) {
+            error = "indirect-pointer replay lacks exact raw shader or launch state";
             return false;
         }
         if (compute.resources && compute.recompile_config_available &&
@@ -4799,6 +4912,13 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                  !discover_rdna2_gta5_packed_pointer(
                      raw.data(), raw.size(), compute.recompile_config, *compute.resources))) {
                 error = "packed-pointer replay failed exact dispatch validation";
+                return false;
+            }
+            if (has_indirect_pointer_state &&
+                !discover_rdna2_indirect_pointer_relocations(
+                    raw.data(), raw.size(), compute.recompile_config,
+                    *compute.resources)) {
+                error = "indirect-pointer replay failed exact dispatch validation";
                 return false;
             }
         }
