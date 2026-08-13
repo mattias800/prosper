@@ -70,6 +70,7 @@ inline constexpr uint32_t kSop2OpcodeXnorB32 = 0x1c;
 inline constexpr uint32_t kSop2OpcodeBfmB32 = 0x24;
 inline constexpr uint32_t kSop2OpcodeBfmB64 = 0x25;
 inline constexpr uint32_t kSop2OpcodeBfeU64 = 0x29;
+inline constexpr uint32_t kSop2OpcodePackLlB32B16 = 0x32;
 inline constexpr uint32_t kSopkOpcodeMovkI32 = 0x00;
 inline constexpr uint32_t kSopkOpcodeCmovkI32 = 0x02;
 inline constexpr uint32_t kSopkOpcodeCmpkFirst = 0x03;

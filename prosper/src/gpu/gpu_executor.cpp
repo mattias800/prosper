@@ -3543,6 +3543,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         next_scc = sum >= (uint64_t{1} << 32);
                         break;
                     }
+                    case kSop2OpcodePackLlB32B16:                           // s_pack_ll_b32_b16
+                        r = (a & 0xffffu) | ((c & 0xffffu) << 16);
+                        break;
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1)));
                                  next_scc = r != 0; break; }

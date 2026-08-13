@@ -5166,6 +5166,36 @@ int main() {
     CHECK(tagged_tex && tagged_cbuf,
           "tagged scalar Base48 pointer canonicalizes to the mapped descriptor table");
 
+    // Some dispatch tables first normalize the high address dword with s_pack_ll_b32_b16. Keep the
+    // low 16 address bits from s9 and clear the aperture bits in its upper half before interpreting
+    // s[8:9] as a scalar-load base. This exercises the production instruction walk and mapped-memory
+    // read, not a standalone ALU helper.
+    const uint32_t packed_tagged_k5[] = {
+        0x99098009u,                // s_pack_ll_b32_b16 s9, s9, 0
+        0xF40C0304u, 0xFA000040u,   // s_load_dwordx8 s[12:19], s[8:9], 0x40
+        0xF4080504u, 0xFA000080u,   // s_load_dwordx4 s[20:23], s[8:9], 0x80
+        0xF0800F08u, 0x00A30000u,   // image_sample v[0:3], v[0:1], s[12:19], s[20:23]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> packed_tagged_uses;
+    resolve_dynamic_fetch(packed_tagged_k5, std::size(packed_tagged_k5), tagged_seed5, 2, 8,
+                          &packed_tagged_uses);
+    bool packed_tagged_tex = false;
+    for (const auto& u : packed_tagged_uses)
+        if (u.kind == 0 && u.key == 0x40 && u.t8[0] == table[16]) packed_tagged_tex = true;
+    CHECK(packed_tagged_tex,
+          "s_pack_ll-normalized scalar pointer resolves its mapped descriptor table");
+
+    std::array<uint32_t, std::size(packed_tagged_k5)> packed_zero_high{};
+    std::copy(std::begin(packed_tagged_k5), std::end(packed_tagged_k5),
+              packed_zero_high.begin());
+    packed_zero_high[0] = 0x9909807Cu; // same pack site, but untracked m0 supplies its low half
+    std::vector<SrtUse> packed_zero_high_uses;
+    resolve_dynamic_fetch(packed_zero_high.data(), packed_zero_high.size(), tagged_seed5, 2, 8,
+                          &packed_zero_high_uses);
+    CHECK(packed_zero_high_uses.empty(),
+          "an untracked low-half source at the pack site does not fabricate a descriptor mapping");
+
     // Kernel 5m (#398): same as k5 but the T# s_load uses m0 as SOFFSET (field 124), a special register
     // the fold does not track. It must NOT be folded to offset 0 and snapshotted — that would decode a T#
     // from base+0x40+0 (the wrong address in general) and report it as valid. The fix marks s[12:19]
