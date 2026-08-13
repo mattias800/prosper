@@ -6606,6 +6606,17 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
+// A direct dispatch with zero workgroups on any axis launches no waves and therefore cannot read
+// its program, descriptors, or backing memory. Cull it before realization rather than reporting an
+// unreachable shader/resource failure. Indirect dimensions are not available at this boundary and
+// remain on the ordered argument-resolution path, which applies the same hardware no-op rule after
+// reading their three argument dwords.
+static bool direct_compute_dispatch_is_noop(const GpuState::Dispatch& dispatch) {
+    if (dispatch.indirect) return false;
+    const ComputeLaunchDimensions launch = resolve_compute_launch(dispatch);
+    return !launch.groups_x || !launch.groups_y || !launch.groups_z;
+}
+
 ComputeCpuFastPath classify_compute_cpu_fast_path(const uint32_t* code, size_t dwords) {
     // Compiler-generated 16-byte buffer fill:
     //   record = (tgid.x << 6) + tid.x; buffer[record] = {s4, s5, s6, s7}
@@ -6648,6 +6659,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
     items.reserve(st.dispatches.size());
     for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
         const auto& dispatch = st.dispatches[dispatch_index];
+        if (direct_compute_dispatch_is_noop(dispatch)) continue;
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
         const uint64_t code_addr = compute_dispatch_code_addr(st, dispatch);
         OperationRealizationFailure failure;
@@ -7441,8 +7453,20 @@ struct OrderedGpustateCaptureTrace {
     std::vector<DrawItem> draws;
     std::vector<ComputeItem> computes;
     std::vector<OperationRealizationFailure> failures;
+    std::vector<SubmitOperation> noops;
     PendingGpuCapture* pending_capture = nullptr;
 };
+
+static void omit_noop_dispatches(std::vector<SubmitOperation>& operations,
+                                 const std::vector<SubmitOperation>& noops) {
+    std::erase_if(operations, [&](const SubmitOperation& operation) {
+        return operation.kind == SubmitOperationKind::Dispatch &&
+            std::any_of(noops.begin(), noops.end(), [&](const SubmitOperation& noop) {
+                return noop.kind == operation.kind && noop.index == operation.index &&
+                       noop.command_order == operation.command_order;
+            });
+    });
+}
 
 static OrderedSubmitResult execute_ordered_gpustate(
     const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
@@ -7487,6 +7511,7 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
         std::string error;
         notify_compute_authority_unknown(
             ComputeAuthorityBoundaryKind::Capture, submit_no);
+        omit_noop_dispatches(capture_operations, capture_trace.noops);
         if (!finish_requested_gpu_capture(
                 std::move(pending_capture), {}, error,
                 can_defer_capture ? &capture_trace.draws : nullptr,
@@ -7791,7 +7816,9 @@ std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
     for (size_t i = 0; i < st.draws.size(); ++i)
         operations.push_back({SubmitOperationKind::Draw, i, st.draws[i].command_order});
     for (size_t i = 0; i < st.dispatches.size(); ++i)
-        operations.push_back({SubmitOperationKind::Dispatch, i, st.dispatches[i].command_order});
+        if (!direct_compute_dispatch_is_noop(st.dispatches[i]))
+            operations.push_back({SubmitOperationKind::Dispatch, i,
+                                  st.dispatches[i].command_order});
     for (size_t i = 0; i < st.dma_copies.size(); ++i)
         operations.push_back({SubmitOperationKind::DmaCopy, i, st.dma_copies[i].command_order});
     std::stable_sort(operations.begin(), operations.end(), [](const auto& a, const auto& b) {
@@ -8425,10 +8452,14 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
     return true;
 }
 
-bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
-                                         GpuState::Dispatch& resolved) {
+enum class DispatchArgumentResolution : uint8_t { Ready, Noop, Invalid };
+
+DispatchArgumentResolution resolve_indirect_dispatch_arguments(
+        const GpuState::Dispatch& source, GpuState::Dispatch& resolved) {
     resolved = source;
-    if (!source.indirect) return true;
+    if (!source.indirect)
+        return direct_compute_dispatch_is_noop(source)
+            ? DispatchArgumentResolution::Noop : DispatchArgumentResolution::Ready;
     constexpr uint32_t kArgumentBytes = 3u * sizeof(uint32_t);
     if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
         !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
@@ -8436,11 +8467,12 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr, "[agc] indirect dispatch skipped: unreadable arguments at 0x%llx\n",
                          static_cast<unsigned long long>(source.indirect_args_addr));
-        return false;
+        return DispatchArgumentResolution::Invalid;
     }
     uint32_t args[3] = {};
     std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
-    if (!args[0] || !args[1] || !args[2]) return false;  // hardware no-op
+    if (!args[0] || !args[1] || !args[2])
+        return DispatchArgumentResolution::Noop;
     resolved.threads_x = args[0];
     resolved.threads_y = args[1];
     resolved.threads_z = args[2];
@@ -8454,7 +8486,7 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
                          "%ux%ux%u workgroups\n",
                          args[0], args[1], args[2], launch.groups_x, launch.groups_y,
                          launch.groups_z);
-        return false;
+        return DispatchArgumentResolution::Noop;
     }
     if (std::getenv("PROSPER_INDIRECTLOG")) {
         static std::atomic<int> logged{0};
@@ -8469,10 +8501,10 @@ bool resolve_indirect_dispatch_arguments(const GpuState::Dispatch& source,
                          args[0], args[1], args[2], launch.groups_x, launch.groups_y,
                          launch.groups_z);
     }
-    return true;
+    return DispatchArgumentResolution::Ready;
 }
 
-// `failure`, when supplied, is filled on every false return — mirroring realize_retained_compute.
+// `failure`, when supplied, is filled on every failure return from the draw path below.
 // The two exits above realize_draw_item name themselves, because nothing was attempted there and a
 // shader/pipeline diagnostic cannot exist; the third forwards whatever realize_draw_item determined
 // (#1636). Callers that do not want a diagnostic keep passing nothing.
@@ -8518,17 +8550,18 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
     return true;
 }
 
-bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_no,
-                              ComputeItem& item,
-                              OperationRealizationFailure* failure = nullptr) {
-    if (index >= st.dispatches.size()) return false;
+enum class RetainedComputeRealization : uint8_t { Realized, Failed };
+
+RetainedComputeRealization realize_retained_compute(
+        const GpuState& st, size_t index, const GpuState::Dispatch& resolved_dispatch,
+        uint64_t submit_no, ComputeItem& item,
+        OperationRealizationFailure* failure = nullptr) {
+    if (index >= st.dispatches.size()) return RetainedComputeRealization::Failed;
     // DMA-bearing submits are uncommon. A one-dispatch state keeps the mature realization path
     // intact while ensuring it runs only after every preceding ordered producer has landed.
     GpuState one = st.dispatches[index].state ? *st.dispatches[index].state : st;
     one.dispatches.clear();
-    GpuState::Dispatch dispatch;
-    if (!resolve_indirect_dispatch_arguments(st.dispatches[index], dispatch)) return false;
-    one.dispatches.push_back(std::move(dispatch));
+    one.dispatches.push_back(resolved_dispatch);
     std::vector<OperationRealizationFailure> failures;
     std::vector<ComputeItem> realized = realize_compute_dispatches(
         one, submit_no, failure ? &failures : nullptr);
@@ -8538,11 +8571,11 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
             failure->index = index;
             failure->command_order = st.dispatches[index].command_order;
         }
-        return false;
+        return RetainedComputeRealization::Failed;
     }
     item = std::move(realized.front());
     item.dispatch_index = index;
-    return true;
+    return RetainedComputeRealization::Realized;
 }
 
 struct LiveComputeParentWalkPreflight {
@@ -8792,7 +8825,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         if (retained_draw_selected(st, i))
             executable.push_back({RetainedSubmitKind::Draw, i, st.draws[i].command_order});
     for (size_t i = 0; i < st.dispatches.size(); ++i)
-        executable.push_back({RetainedSubmitKind::Dispatch, i, st.dispatches[i].command_order});
+        if (!direct_compute_dispatch_is_noop(st.dispatches[i]))
+            executable.push_back({RetainedSubmitKind::Dispatch, i,
+                                  st.dispatches[i].command_order});
     for (size_t i = 0; i < st.dma_copies.size(); ++i)
         executable.push_back({RetainedSubmitKind::DmaCopy, i, st.dma_copies[i].command_order});
     for (size_t i = 0; i < st.parser_stalls.size(); ++i)
@@ -8934,6 +8969,34 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     previous_compute_executed = false;
                     break;
                 }
+                GpuState::Dispatch resolved_dispatch;
+                const DispatchArgumentResolution argument_resolution =
+                    resolve_indirect_dispatch_arguments(
+                        st.dispatches[operation.index], resolved_dispatch);
+                if (argument_resolution == DispatchArgumentResolution::Noop) {
+                    // Argument memory is readable and proves that no wave launches. This is neutral
+                    // even when no compute backend is installed: there is no producer to execute.
+                    if (capture_trace)
+                        capture_trace->noops.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order});
+                    break;
+                }
+                if (argument_resolution != DispatchArgumentResolution::Ready) {
+                    notify_compute_authority_unknown(
+                        ComputeAuthorityBoundaryKind::Compute,
+                        submit_no, operation.command_order);
+                    if (capture_trace) {
+                        capture_trace->failures.push_back({
+                            SubmitOperationKind::Dispatch, operation.index,
+                            operation.command_order, RealizationFailureReason::Unknown});
+                    }
+                    producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
+                    break;
+                }
                 if (!compute) {
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
@@ -8951,9 +9014,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 }
                 ComputeItem item;
                 OperationRealizationFailure failure;
-                if (realize_retained_compute(
-                        st, operation.index, submit_no, item,
-                        capture_trace ? &failure : nullptr)) {
+                const RetainedComputeRealization realization = realize_retained_compute(
+                    st, operation.index, resolved_dispatch, submit_no, item,
+                    capture_trace ? &failure : nullptr);
+                if (realization == RetainedComputeRealization::Realized) {
                     const LiveComputeParentWalkPreflight preflight =
                         preflight_compute_parent_walk(
                             item, previous_compute_code, previous_compute_realized,
@@ -9456,6 +9520,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         std::string error;
         notify_compute_authority_unknown(
             ComputeAuthorityBoundaryKind::Capture, submit_no);
+        omit_noop_dispatches(operations, capture_trace.noops);
         const std::vector<DrawItem>* capture_draws = needs_ordered_realization
             ? &capture_trace.draws : &draws;
         const std::vector<ComputeItem>* capture_computes = needs_ordered_realization
