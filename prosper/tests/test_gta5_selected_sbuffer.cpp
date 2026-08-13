@@ -232,6 +232,54 @@ int main() {
               SpirvShaderStage::Compute, false).ok(),
           "all-OOB module matches the routed descriptor contract");
 
+    Fixture null_record4;
+    const std::array<uint32_t, 4> null_descriptor{};
+    std::memcpy(null_record4.outer.data() + 488u,
+                null_descriptor.data(), sizeof(null_descriptor));
+    CHECK(discover_rdna2_gta5_selected_sbuffer(
+              exact.data(), exact.size(), null_record4.config, null_record4.table) &&
+              null_record4.table.by_fetch_pc(153u) &&
+              null_record4.table.by_fetch_pc(153u)->selected_sbuffer_soffset ==
+                  kGtaSelectedSbufferNullRecord4Soffset &&
+              null_record4.table.by_fetch_pc(156u) && null_record4.table.by_fetch_pc(158u) &&
+              is_zero_record_raw_buffer(*null_record4.table.by_fetch_pc(156u)) &&
+              is_zero_record_raw_buffer(*null_record4.table.by_fetch_pc(158u)),
+          "selected all-zero record 4 propagates zero through both raw consumers");
+    CHECK(rdna2_gta5_selected_sbuffer_dispatch(
+              exact.data(), exact.size(), null_record4.config, null_record4.table),
+          "final boundary rereads and accepts the selected all-zero descriptor");
+    null_record4.outer[488u + 8u] = 1u;
+    CHECK(!rdna2_gta5_selected_sbuffer_dispatch(
+               exact.data(), exact.size(), null_record4.config, null_record4.table),
+          "same pc153 descriptor site: final boundary rejects stale null authority");
+    null_record4.outer[488u + 8u] = 0u;
+    for (const ShaderResource& resource : valid.table.resources) {
+        if (resource.fetch_pc == 70u || resource.fetch_pc == 153u ||
+            resource.fetch_pc == 156u || resource.fetch_pc == 158u)
+            continue;
+        null_record4.table.resources.push_back(resource);
+    }
+    assign_convention_bindings(null_record4.table, 2u);
+    const std::vector<uint32_t> null_record4_translated = recompile_compute(
+        exact.data(), exact.size(), &null_record4.table, null_record4.config,
+        {RecompileDiagnosticStage::Compute, 0x413ce6000u});
+    CHECK(!null_record4_translated.empty(),
+          "production emitter propagates selected null through pc153/156/158");
+    CHECK(validate_spirv_descriptor_interface(
+              null_record4_translated, &null_record4.table, 0u,
+              SpirvShaderStage::Compute, false).ok(),
+          "selected-null module matches the routed descriptor contract");
+
+    Fixture malformed_null_record4;
+    const std::array<uint32_t, 4> malformed_null_descriptor{0u, 0u, 1u, 0u};
+    std::memcpy(malformed_null_record4.outer.data() + 488u,
+                malformed_null_descriptor.data(), sizeof(malformed_null_descriptor));
+    CHECK(!discover_rdna2_gta5_selected_sbuffer(
+               exact.data(), exact.size(), malformed_null_record4.config,
+               malformed_null_record4.table) &&
+              marker_count(malformed_null_record4.table) == 0u,
+          "same pc153 descriptor site: nonzero record count cannot acquire null authority");
+
     Fixture mixed_zero;
     mixed_zero.table.resources.front().format = DataFormat::Unknown;
     mixed_zero.table.resources.front().num_components = 0u;

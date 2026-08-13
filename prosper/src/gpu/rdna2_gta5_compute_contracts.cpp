@@ -716,6 +716,31 @@ bool discover_rdna2_gta5_selected_sbuffer(
     std::memcpy(selected_words.data(),
                 outer_bytes + kGtaSelectedSbufferRecord4Soffset + 8u,
                 sizeof(selected_words));
+    if (std::all_of(selected_words.begin(), selected_words.end(),
+                    [](uint32_t word) { return word == 0u; })) {
+        ShaderResource* target_x4 = exact_fetch_resource(resources, kSelectedSbufferLoadX4Pc);
+        ShaderResource* target_x2 = exact_fetch_resource(resources, kSelectedSbufferLoadX2Pc);
+        if ((target_x4 && !is_zero_record_raw_buffer(*target_x4)) ||
+            (target_x2 && !is_zero_record_raw_buffer(*target_x2)))
+            return false;
+        auto add_zero_target = [&](uint32_t pc) {
+            ShaderResource target;
+            target.cls = ResourceClass::ConstantBuffer;
+            target.format = DataFormat::Unknown;
+            target.num_components = 0u;
+            target.fetch_pc = pc;
+            resources.resources.push_back(target);
+        };
+        if (!target_x4) add_zero_target(kSelectedSbufferLoadX4Pc);
+        if (!target_x2) add_zero_target(kSelectedSbufferLoadX2Pc);
+        outer = exact_fetch_resource(resources, kSelectedSbufferOuterPc);
+        if (!outer) return false;
+        outer->selected_sbuffer_soffset = kGtaSelectedSbufferNullRecord4Soffset;
+        outer->selected_sbuffer_words = selected_words;
+        if (std::getenv("PROSPER_DBG"))
+            std::fprintf(stderr, "[gta-selected-sbuffer] domain=null-record4\n");
+        return rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, resources);
+    }
     DecodedBufferDescriptor selected{};
     if (!selected_sbuffer_target_descriptor(selected_words, selected)) {
         if (std::getenv("PROSPER_DBG"))
@@ -807,6 +832,11 @@ bool rdna2_gta5_selected_sbuffer_dispatch(
                 outer_bytes + kGtaSelectedSbufferRecord4Soffset + 8u,
                 sizeof(live_words));
     if (live_words != outer->selected_sbuffer_words) return false;
+    if (outer->selected_sbuffer_soffset == kGtaSelectedSbufferNullRecord4Soffset)
+        return std::all_of(live_words.begin(), live_words.end(),
+                           [](uint32_t word) { return word == 0u; }) &&
+               is_zero_record_raw_buffer(*target_x4) &&
+               is_zero_record_raw_buffer(*target_x2);
     DecodedBufferDescriptor selected{};
     if (!selected_sbuffer_target_descriptor(live_words, selected)) return false;
     return selected_sbuffer_target_resource(

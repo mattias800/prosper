@@ -415,6 +415,7 @@ inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& reso
 inline constexpr uint32_t kGtaSelectedSbufferRecord4Soffset = 480u;
 inline constexpr uint32_t kGtaSelectedSbufferZeroChainSoffset = UINT32_MAX - 1u;
 inline constexpr uint32_t kGtaSelectedSbufferAllOobSoffset = UINT32_MAX - 2u;
+inline constexpr uint32_t kGtaSelectedSbufferNullRecord4Soffset = UINT32_MAX - 3u;
 
 inline bool is_gta5_selected_sbuffer_descriptor(const ShaderResource& resource) {
     if (resource.cls != ResourceClass::ConstantBuffer || resource.fetch_pc != 153u)
@@ -428,6 +429,12 @@ inline bool is_gta5_selected_sbuffer_descriptor(const ShaderResource& resource) 
                            resource.selected_sbuffer_words.end(),
                            [](uint32_t word) { return word == 0u; });
     if (resource.selected_sbuffer_soffset == kGtaSelectedSbufferAllOobSoffset)
+        return resource.gpu_addr > 0x10000u && resource.stride == 120u &&
+               resource.size == 600u &&
+               std::all_of(resource.selected_sbuffer_words.begin(),
+                           resource.selected_sbuffer_words.end(),
+                           [](uint32_t word) { return word == 0u; });
+    if (resource.selected_sbuffer_soffset == kGtaSelectedSbufferNullRecord4Soffset)
         return resource.gpu_addr > 0x10000u && resource.stride == 120u &&
                resource.size == 600u &&
                std::all_of(resource.selected_sbuffer_words.begin(),
