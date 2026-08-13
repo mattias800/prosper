@@ -35,6 +35,17 @@ static void set_test_env(const char* name, const char* value) {
 #endif
 }
 
+static size_t count_spirv_opcode(const std::vector<uint32_t>& words, uint16_t opcode) {
+    size_t count = 0;
+    for (size_t at = 5; at < words.size();) {
+        const uint32_t word_count = words[at] >> 16u;
+        if (word_count == 0u || at + word_count > words.size()) return 0u;
+        count += static_cast<uint16_t>(words[at]) == opcode;
+        at += word_count;
+    }
+    return count;
+}
+
 int main() {
     printf("== test_dynfetch_fold ==\n");
 
@@ -648,8 +659,9 @@ int main() {
         0xBF810000u,
     };
     const uint32_t seed5n[4] = {
-        (uint32_t)nested_table_base, (uint32_t)(nested_table_base >> 32) & 0xFFFFu,
-        sizeof(nested_descriptors), 0u,
+        (uint32_t)nested_table_base,
+        ((uint32_t)(nested_table_base >> 32) & 0xFFFFu) | (4u << 16),
+        std::size(nested_descriptors), 0u,
     };
     std::vector<SrtUse> nested_uses;
     resolve_dynamic_fetch(k5n, sizeof(k5n)/sizeof(k5n[0]), seed5n, 4, 8, &nested_uses);
@@ -2398,6 +2410,228 @@ int main() {
               !recompile_compute(wave_offset_sbuffer, std::size(wave_offset_sbuffer),
                                  &wave_offset_sbuffer_table, direct_sbuffer_config).empty(),
           "Astro wave-derived SOFFSET binds its descriptor range and recompiles dynamically");
+
+    // GTA V 0x205b67ce00 reaches this generic shape at pc588 and again at pc634: a fully-known
+    // 2 MiB, stride-16 V# is read with a scalar offset such as 0xdcccccd0. That offset is not a
+    // declaration of a 3.70 GiB resource; every requested dword is beyond the descriptor's scalar
+    // bound and therefore returns zero. Use a smaller mapped fixture with the exact pc588 scalar
+    // packet shape, then consume its four result words as a V# just as the production kernel does.
+    alignas(16) static uint32_t bounded_sbuffer_inner[16]{};
+    alignas(16) static uint32_t bounded_sbuffer_outer[64]{};
+    const uint64_t bounded_sbuffer_inner_base =
+        reinterpret_cast<uint64_t>(bounded_sbuffer_inner);
+    bounded_sbuffer_outer[0] = static_cast<uint32_t>(bounded_sbuffer_inner_base);
+    bounded_sbuffer_outer[1] =
+        (static_cast<uint32_t>(bounded_sbuffer_inner_base >> 32) & 0xffffu) | (4u << 16);
+    bounded_sbuffer_outer[2] = std::size(bounded_sbuffer_inner);
+    bounded_sbuffer_outer[3] = 4u << 12;
+    const uint64_t bounded_sbuffer_outer_base =
+        reinterpret_cast<uint64_t>(bounded_sbuffer_outer);
+    uint32_t bounded_sbuffer_seed[28]{};
+    bounded_sbuffer_seed[24] = static_cast<uint32_t>(bounded_sbuffer_outer_base);
+    bounded_sbuffer_seed[25] =
+        (static_cast<uint32_t>(bounded_sbuffer_outer_base >> 32) & 0xffffu) | (4u << 16);
+    bounded_sbuffer_seed[26] = std::size(bounded_sbuffer_outer);
+    bounded_sbuffer_seed[27] = 4u << 12;
+    const std::array<uint32_t, 7> bounded_sbuffer_oob = {
+        0xbeea03ffu, 0xdcccccd0u,   // pc0: s_mov_b32 s106, 0xdcccccd0
+        0xf428000cu, 0xd4000000u,   // pc2: s_buffer_load_dwordx4 s[0:3],s[24:27],s106
+        0xe0382000u, 0x80000006u,   // pc4: buffer_load_dwordx4 v[0:3],v6,s[0:3],0
+        0xbf810000u,
+    };
+    ShaderResourceTable bounded_sbuffer_oob_table;
+    const std::vector<SrtUse> bounded_sbuffer_oob_uses = add_compute_buffer_resources(
+        bounded_sbuffer_oob_table, bounded_sbuffer_oob.data(), bounded_sbuffer_oob.size(),
+        bounded_sbuffer_seed, std::size(bounded_sbuffer_seed));
+    assign_convention_bindings(bounded_sbuffer_oob_table, 2);
+    ComputeShaderConfig bounded_sbuffer_config;
+    bounded_sbuffer_config.user_sgprs.assign(
+        bounded_sbuffer_seed, bounded_sbuffer_seed + std::size(bounded_sbuffer_seed));
+    bounded_sbuffer_config.local_x = bounded_sbuffer_config.local_y =
+        bounded_sbuffer_config.local_z = 1;
+    const std::vector<uint32_t> bounded_sbuffer_oob_spirv = recompile_compute(
+        bounded_sbuffer_oob.data(), bounded_sbuffer_oob.size(), &bounded_sbuffer_oob_table,
+        bounded_sbuffer_config);
+    const DescriptorValidationReport bounded_sbuffer_oob_report =
+        validate_spirv_descriptor_interface(bounded_sbuffer_oob_spirv,
+                                            &bounded_sbuffer_oob_table, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(bounded_sbuffer_oob_uses.size() == 2 &&
+              bounded_sbuffer_oob_uses[0].use_pc == 2u &&
+              !bounded_sbuffer_oob_uses[0].zero_record_raw &&
+              bounded_sbuffer_oob_uses[0].required_size == 0xdccccce0u &&
+              bounded_sbuffer_oob_uses[1].use_pc == 4u &&
+              bounded_sbuffer_oob_uses[1].zero_record_raw &&
+              bounded_sbuffer_oob_table.resources.size() == 2u &&
+              bounded_sbuffer_oob_table.by_fetch_pc(2u) &&
+              bounded_sbuffer_oob_table.by_fetch_pc(2u)->size ==
+                  sizeof(bounded_sbuffer_outer) &&
+              bounded_sbuffer_oob_table.by_fetch_pc(4u) &&
+              is_zero_record_raw_buffer(*bounded_sbuffer_oob_table.by_fetch_pc(4u)) &&
+              !bounded_sbuffer_oob_spirv.empty() && bounded_sbuffer_oob_report.ok() &&
+              bounded_sbuffer_oob_report.descriptors.size() == 1u &&
+              count_spirv_opcode(bounded_sbuffer_oob_spirv,
+                                 176u /* OpULessThan */) >= 4u,
+          "bounded scalar OOB returns zero without widening its physical V# binding");
+
+    // Mutation arm: perturb the SAME S_BUFFER_LOAD packet by replacing s106 with SGPR_NULL. Offset
+    // zero is in range and loads the real inner V#, so neither the scalar result nor its raw consumer
+    // may inherit the all-OOB result above. This would fail if the regression merely recognized the
+    // fixture or mutated a helper used only by the assertions.
+    std::array<uint32_t, 7> bounded_sbuffer_in_range = bounded_sbuffer_oob;
+    bounded_sbuffer_in_range[3] = 0xfa000000u;
+    ShaderResourceTable bounded_sbuffer_in_range_table;
+    const std::vector<SrtUse> bounded_sbuffer_in_range_uses = add_compute_buffer_resources(
+        bounded_sbuffer_in_range_table, bounded_sbuffer_in_range.data(),
+        bounded_sbuffer_in_range.size(), bounded_sbuffer_seed,
+        std::size(bounded_sbuffer_seed));
+    assign_convention_bindings(bounded_sbuffer_in_range_table, 2);
+    const std::vector<uint32_t> bounded_sbuffer_in_range_spirv = recompile_compute(
+        bounded_sbuffer_in_range.data(), bounded_sbuffer_in_range.size(),
+        &bounded_sbuffer_in_range_table, bounded_sbuffer_config);
+    CHECK(bounded_sbuffer_in_range_uses.size() == 2u &&
+              bounded_sbuffer_in_range_uses[0].use_pc == 2u &&
+              bounded_sbuffer_in_range_uses[0].required_size == 16u &&
+              bounded_sbuffer_in_range_uses[1].use_pc == 4u &&
+              std::none_of(bounded_sbuffer_in_range_uses.begin(),
+                           bounded_sbuffer_in_range_uses.end(),
+                           [](const SrtUse& use) { return use.zero_record_raw; }) &&
+              bounded_sbuffer_in_range_table.resources.size() == 2u &&
+              bounded_sbuffer_in_range_table.by_fetch_pc(4u) &&
+              bounded_sbuffer_in_range_table.by_fetch_pc(4u)->gpu_addr ==
+                  bounded_sbuffer_inner_base &&
+              !bounded_sbuffer_in_range_spirv.empty(),
+          "same-site in-range S_BUFFER mutation restores the real nested V#");
+
+    // Per-dword boundary arm. The physical allocation deliberately has a sentinel immediately after
+    // the descriptor-declared 256 bytes. An x4 load at byte 244 must return the last three in-range
+    // words followed by zero, never the mapped sentinel and never a 260-byte declaration. Arrange
+    // those three words plus architectural zero as a valid inner RAW V# so the downstream consumer
+    // independently observes every returned component.
+    alignas(16) static uint32_t straddling_sbuffer_outer[65]{};
+    straddling_sbuffer_outer[61] = static_cast<uint32_t>(bounded_sbuffer_inner_base);
+    straddling_sbuffer_outer[62] =
+        (static_cast<uint32_t>(bounded_sbuffer_inner_base >> 32) & 0xffffu) | (4u << 16);
+    straddling_sbuffer_outer[63] = std::size(bounded_sbuffer_inner);
+    straddling_sbuffer_outer[64] = 0xdeadbeefu;
+    const uint64_t straddling_sbuffer_outer_base =
+        reinterpret_cast<uint64_t>(straddling_sbuffer_outer);
+    uint32_t straddling_sbuffer_seed[28]{};
+    straddling_sbuffer_seed[24] = static_cast<uint32_t>(straddling_sbuffer_outer_base);
+    straddling_sbuffer_seed[25] =
+        (static_cast<uint32_t>(straddling_sbuffer_outer_base >> 32) & 0xffffu) | (4u << 16);
+    straddling_sbuffer_seed[26] = 64u; // 64 records, not the physically-present sentinel record
+    straddling_sbuffer_seed[27] = 4u << 12;
+    const std::array<uint32_t, 5> straddling_sbuffer = {
+        0xf428000cu, 0xfa0000f4u,   // pc0: x4 at byte 244; only dwords 61..63 are in range
+        0xe0382000u, 0x80000006u,   // pc2: consume [inner lo, inner hi, 16, architectural zero]
+        0xbf810000u,
+    };
+    ShaderResourceTable straddling_sbuffer_table;
+    const std::vector<SrtUse> straddling_sbuffer_uses = add_compute_buffer_resources(
+        straddling_sbuffer_table, straddling_sbuffer.data(), straddling_sbuffer.size(),
+        straddling_sbuffer_seed, std::size(straddling_sbuffer_seed));
+    CHECK(straddling_sbuffer_uses.size() == 2u &&
+              straddling_sbuffer_uses[0].use_pc == 0u &&
+              straddling_sbuffer_uses[0].required_size == 260u &&
+              straddling_sbuffer_uses[1].use_pc == 2u &&
+              straddling_sbuffer_uses[1].v4[0] == straddling_sbuffer_outer[61] &&
+              straddling_sbuffer_uses[1].v4[1] == straddling_sbuffer_outer[62] &&
+              straddling_sbuffer_uses[1].v4[2] == straddling_sbuffer_outer[63] &&
+              straddling_sbuffer_uses[1].v4[3] == 0u &&
+              straddling_sbuffer_table.by_fetch_pc(0u) &&
+              straddling_sbuffer_table.by_fetch_pc(0u)->size == 256u &&
+              straddling_sbuffer_table.by_fetch_pc(2u) &&
+              straddling_sbuffer_table.by_fetch_pc(2u)->gpu_addr ==
+                  bounded_sbuffer_inner_base,
+          "straddling scalar x4 zeroes only the OOB dword and ignores mapped tail memory");
+
+    // SOFFSET+OFFSET is 32-bit arithmetic. Wrap a huge known SOFFSET through zero at the exact same
+    // scalar packet: the effective byte offset is zero, so the real first V# must load. A 64-bit sum
+    // would classify this as OOB and reproduce the giant-footprint bug under a different bit pattern.
+    const std::array<uint32_t, 7> wrapping_sbuffer = {
+        0xbeea03ffu, 0xfffffffcu,   // pc0: s_mov_b32 s106, -4 as unsigned SOFFSET
+        0xf428000cu, 0xd4000004u,   // pc2: x4 with OFFSET 4 -> effective offset 0
+        0xe0382000u, 0x80000006u,
+        0xbf810000u,
+    };
+    ShaderResourceTable wrapping_sbuffer_table;
+    const std::vector<SrtUse> wrapping_sbuffer_uses = add_compute_buffer_resources(
+        wrapping_sbuffer_table, wrapping_sbuffer.data(), wrapping_sbuffer.size(),
+        bounded_sbuffer_seed, std::size(bounded_sbuffer_seed));
+    CHECK(wrapping_sbuffer_uses.size() == 2u &&
+              wrapping_sbuffer_uses[0].use_pc == 2u &&
+              wrapping_sbuffer_uses[0].required_size == 16u &&
+              wrapping_sbuffer_uses[1].use_pc == 4u &&
+              wrapping_sbuffer_uses[1].v4[0] == bounded_sbuffer_outer[0] &&
+              wrapping_sbuffer_uses[1].v4[1] == bounded_sbuffer_outer[1] &&
+              wrapping_sbuffer_uses[1].v4[2] == bounded_sbuffer_outer[2] &&
+              wrapping_sbuffer_uses[1].v4[3] == bounded_sbuffer_outer[3] &&
+              wrapping_sbuffer_table.by_fetch_pc(2u) &&
+              wrapping_sbuffer_table.by_fetch_pc(2u)->size ==
+                  sizeof(bounded_sbuffer_outer),
+          "scalar SOFFSET plus OFFSET wraps in 32 bits before bounds evaluation");
+
+    // STRIDE participates in S_BUFFER bounds mode but never scales its address. Four stride-1
+    // records therefore retain a four-byte vector footprint while exposing four scalar dwords at
+    // byte offsets 0, 4, 8 and 12. The explicit count must drive both safe emission and the staged
+    // backing span; deriving either value from size/4 would collapse the legal last three reads.
+    alignas(16) static uint32_t narrow_stride_sbuffer_backing[4] = {
+        0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+    };
+    const uint64_t narrow_stride_sbuffer_base =
+        reinterpret_cast<uint64_t>(narrow_stride_sbuffer_backing);
+    uint32_t narrow_stride_sbuffer_seed[28]{};
+    narrow_stride_sbuffer_seed[24] = static_cast<uint32_t>(narrow_stride_sbuffer_base);
+    narrow_stride_sbuffer_seed[25] =
+        (static_cast<uint32_t>(narrow_stride_sbuffer_base >> 32) & 0xffffu) | (1u << 16);
+    narrow_stride_sbuffer_seed[26] = 4u;
+    const std::array<uint32_t, 3> narrow_stride_sbuffer = {
+        0xf428000cu, 0xfa000000u,   // pc0: four scalar dwords from a stride-1, four-record V#
+        0xbf810000u,
+    };
+    ShaderResourceTable narrow_stride_sbuffer_table;
+    const std::vector<SrtUse> narrow_stride_sbuffer_uses = add_compute_buffer_resources(
+        narrow_stride_sbuffer_table, narrow_stride_sbuffer.data(),
+        narrow_stride_sbuffer.size(), narrow_stride_sbuffer_seed,
+        std::size(narrow_stride_sbuffer_seed));
+    assign_convention_bindings(narrow_stride_sbuffer_table, 2);
+    ComputeShaderConfig narrow_stride_sbuffer_config;
+    narrow_stride_sbuffer_config.user_sgprs.assign(
+        narrow_stride_sbuffer_seed,
+        narrow_stride_sbuffer_seed + std::size(narrow_stride_sbuffer_seed));
+    narrow_stride_sbuffer_config.local_x = narrow_stride_sbuffer_config.local_y =
+        narrow_stride_sbuffer_config.local_z = 1;
+    const std::vector<uint32_t> narrow_stride_sbuffer_spirv = recompile_compute(
+        narrow_stride_sbuffer.data(), narrow_stride_sbuffer.size(),
+        &narrow_stride_sbuffer_table, narrow_stride_sbuffer_config);
+    const DescriptorValidationReport narrow_stride_sbuffer_report =
+        validate_spirv_descriptor_interface(
+            narrow_stride_sbuffer_spirv, &narrow_stride_sbuffer_table, 0,
+            SpirvShaderStage::Compute, false);
+    const ShaderResource* narrow_stride_sbuffer_resource =
+        narrow_stride_sbuffer_table.by_fetch_pc(0u);
+    const SpirvDescriptorBinding* narrow_stride_sbuffer_descriptor =
+        narrow_stride_sbuffer_report.descriptors.empty()
+            ? nullptr : &narrow_stride_sbuffer_report.descriptors.front();
+    const StorageBufferMaterializationPlan narrow_stride_sbuffer_plan =
+        narrow_stride_sbuffer_descriptor && narrow_stride_sbuffer_resource
+            ? plan_storage_buffer_materialization(
+                  *narrow_stride_sbuffer_descriptor, *narrow_stride_sbuffer_resource)
+            : StorageBufferMaterializationPlan{};
+    CHECK(narrow_stride_sbuffer_uses.size() == 1u &&
+              narrow_stride_sbuffer_uses[0].scalar_buffer_dword_count == 4u &&
+              narrow_stride_sbuffer_resource && narrow_stride_sbuffer_resource->size == 4u &&
+              narrow_stride_sbuffer_resource->stride == 1u &&
+              narrow_stride_sbuffer_resource->scalar_buffer_dword_count == 4u &&
+              shader_resource_buffer_binding_bytes(*narrow_stride_sbuffer_resource) == 16u &&
+              !narrow_stride_sbuffer_spirv.empty() && narrow_stride_sbuffer_report.ok() &&
+              count_spirv_opcode(narrow_stride_sbuffer_spirv,
+                                 176u /* OpULessThan */) >= 4u &&
+              narrow_stride_sbuffer_plan.valid &&
+              narrow_stride_sbuffer_plan.logical_bytes == 16u &&
+              narrow_stride_sbuffer_plan.binding_bytes == 16u,
+          "stride-1 S_BUFFER retains four scalar dwords without changing its V# footprint");
 
     // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
     // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and

@@ -147,6 +147,32 @@ int main() {
               scalar_graph.external_leaves.empty(),
           "#636: dependency graph ignores unconsumed descriptor-looking scalar arguments");
 
+    DrawItem scalar_bound_draw;
+    scalar_bound_draw.draw_index = 638;
+    scalar_bound_draw.command_order = 638;
+    scalar_bound_draw.prt = std::make_shared<ShaderResourceTable>();
+    ShaderResource short_scalar = resource(
+        0x6400, 4, 2, ResourceClass::ConstantBuffer);
+    short_scalar.stride = 1;
+    short_scalar.srt_offset = 0x20;
+    short_scalar.scalar_buffer_dword_count = 4;
+    scalar_bound_draw.prt->resources = {short_scalar};
+    GpuReplayFrame scalar_bound_replay;
+    scalar_bound_replay.items = {scalar_bound_draw};
+    scalar_bound_replay.operations = {
+        {SubmitOperationKind::Draw, 638, 638, true},
+    };
+    GpuDependencyGraph scalar_bound_graph;
+    CHECK(build_gpu_dependency_graph(scalar_bound_replay, scalar_bound_graph, error) &&
+              scalar_bound_graph.external_leaves.size() == 1 &&
+              scalar_bound_graph.external_leaves[0].access.size == 16,
+          "scalar-buffer dependency closure is never truncated to a short host snapshot");
+    scalar_bound_replay.items[0].prt->resources[0].scalar_buffer_dword_count = 0;
+    CHECK(build_gpu_dependency_graph(scalar_bound_replay, scalar_bound_graph, error) &&
+              scalar_bound_graph.external_leaves.size() == 1 &&
+              scalar_bound_graph.external_leaves[0].access.size == 4,
+          "removing the scalar-buffer bound restores the ordinary host snapshot span");
+
     ComputeItem reflected_compute;
     reflected_compute.dispatch_index = 637;
     reflected_compute.command_order = 637;

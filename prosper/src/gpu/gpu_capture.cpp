@@ -129,7 +129,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v53 (#2481): internal compute bytes may carry the generic static-footprint indirect-pointer
 // relocation snapshot. The proof marker is deliberately reconstructed from raw shader, launch,
 // source records, and carrier witnesses instead of being trusted as serialized authority.
-constexpr uint32_t kVersion = 53;
+// v54: retain the explicit scalar S_BUFFER dword bound. The ordinary resource size remains the V#'s
+// independent vector footprint; replay cannot reconstruct one from the other when STRIDE < 4.
+constexpr uint32_t kVersion = 54;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -647,7 +649,13 @@ uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint
 
 uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;
-    if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return result;
+    if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) {
+        if (r.scalar_buffer_dword_count) {
+            const uint64_t scalar_bytes = shader_resource_buffer_binding_bytes(r);
+            if (scalar_bytes) result = scalar_bytes;
+        }
+        return result;
+    }
     const uint64_t layers = r.img_dim == 3u ? 6u
         : ((r.img_dim == 2u || r.img_dim == 5u) ? std::max(r.depth, 1u) : 1u);
     uint32_t w = r.width ? r.width : 4, h = r.height ? r.height : 4;
@@ -3423,6 +3431,37 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             if (!write_buffer_tables(stage.resource_table)) return false;
+    // v54 appends one scalar-buffer dword count per resource. Zero is the ordinary/no-metadata
+    // value; a nonzero value is serialized only after its normalized resource shape independently
+    // authenticates the bound.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_scalar_buffer_bounds = [&](const GpuCapturedTable& table) {
+        for (const GpuCapturedResource& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            if (resource.scalar_buffer_dword_count) {
+                const uint64_t binding_bytes =
+                    shader_resource_buffer_binding_bytes(resource);
+                if (!binding_bytes) {
+                    error = "invalid scalar-buffer bound metadata";
+                    return false;
+                }
+                if (captured.captured_size < binding_bytes) {
+                    error = "scalar-buffer captured span is shorter than its bound";
+                    return false;
+                }
+            }
+            w.u32(resource.scalar_buffer_dword_count);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_scalar_buffer_bounds(draw.vrt) ||
+            !write_scalar_buffer_bounds(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_scalar_buffer_bounds(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_scalar_buffer_bounds(stage.resource_table)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -4752,6 +4791,52 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     return false;
                 }
     }
+    if (version >= 54) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid scalar-buffer bound resource count";
+            return false;
+        }
+        auto read_scalar_buffer_bounds = [&](GpuCapturedTable& table) {
+            for (GpuCapturedResource& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                if (!r.u32(resource.scalar_buffer_dword_count))
+                    return false;
+                if (resource.scalar_buffer_dword_count) {
+                    const uint64_t binding_bytes =
+                        shader_resource_buffer_binding_bytes(resource);
+                    if (!binding_bytes || captured.captured_size < binding_bytes)
+                        return false;
+                }
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_scalar_buffer_bounds(draw.vrt) ||
+                !read_scalar_buffer_bounds(draw.prt)) {
+                error = "invalid scalar-buffer bound state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_scalar_buffer_bounds(compute.resources)) {
+                error = "invalid scalar-buffer bound state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_scalar_buffer_bounds(stage.resource_table)) {
+                    error = "invalid scalar-buffer bound state";
+                    return false;
+                }
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -4839,6 +4924,13 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             }
             const uint64_t captured_footprint = x.captured_size ? x.captured_size
                 : (c.format_version >= 28 ? resource_footprint(r) : legacy_resource_footprint(r));
+            if (r.scalar_buffer_dword_count) {
+                const uint64_t binding_bytes = shader_resource_buffer_binding_bytes(r);
+                if (!binding_bytes || x.captured_size < binding_bytes) {
+                    error = "scalar-buffer replay span is shorter than its bound";
+                    return false;
+                }
+            }
             // v1-v27 captured linear images tightly. Preserve that bounded backing so old files stay
             // readable, but derive the real guest pitch for best-effort replay of every retained row.
             if (c.format_version < 28 && r.cls == ResourceClass::Texture && r.img_dim == 1u &&

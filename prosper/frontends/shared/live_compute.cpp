@@ -4555,24 +4555,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const size_t descriptor_index = buffers[i].descriptor_index;
             const SpirvDescriptorBinding& descriptor = descriptors[descriptor_index];
             const ShaderResource* resource = &buffer_resources[i];
-            if (!resource || !resource->size ||
-                ((!resource->host_data || resource->host_data_size < resource->size) &&
-                 !guest_readable(resource->gpu_addr, resource->size))) {
+            if (!resource) {
+                skip_buffer(descriptor.binding, resource, "missing resource");
+                break;
+            }
+            const StorageBufferMaterializationPlan materialization =
+                plan_storage_buffer_materialization(descriptor, *resource);
+            if (!materialization.valid || !materialization.binding_bytes ||
+                materialization.logical_bytes > SIZE_MAX ||
+                ((!resource->host_data ||
+                  resource->host_data_size < materialization.logical_bytes) &&
+                 !guest_readable(resource->gpu_addr, materialization.logical_bytes))) {
                 skip_buffer(descriptor.binding, resource,
-                            !resource ? "missing resource" :
-                            !resource->size ? "empty resource" : "unreadable backing");
+                            !materialization.valid
+                                ? "invalid storage-buffer materialization contract"
+                                : !materialization.binding_bytes ? "empty resource"
+                                                                 : "unreadable backing");
                 break;
             }
             buffers[i].resource = resource;
-            buffers[i].guest_bytes = resource->size;
+            buffers[i].guest_bytes = static_cast<size_t>(materialization.logical_bytes);
             buffers[i].writable = descriptor.writable;
-            const StorageBufferMaterializationPlan materialization =
-                plan_storage_buffer_materialization(descriptor, *resource);
-            if (!materialization.valid) {
-                skip_buffer(descriptor.binding, resource,
-                            "invalid storage-buffer materialization contract");
-                break;
-            }
             // #2265: one shared shape test with the lowering gate and the descriptor validator.
             buffers[i].atomic_image = descriptor.atomic_access &&
                 shader_resource_supports_atomic_image_buffer(*resource);
@@ -4643,7 +4646,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (buffers[i].alias_of == SIZE_MAX) {
                 const uint8_t* source = buffers[i].atomic_image
                     ? resource_bytes_for(resource, buffers[i].guest_bytes)
-                    : resource_bytes(resource);
+                    : resource_bytes_for(resource, buffers[i].guest_bytes);
                 if (buffers[i].atomic_image) {
                     buffers[i].linear_seed.resize(buffers[i].bytes);
                     // #2265: per-layer 2D detile at the physical slice stride, into a tightly
@@ -7718,7 +7721,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             uint8_t* destination = buffer.atomic_image
                 ? resource_bytes_for(buffer.resource, buffer.guest_bytes)
-                : resource_bytes(buffer.resource);
+                : resource_bytes_for(buffer.resource, buffer.guest_bytes);
             const auto* result = static_cast<const uint8_t*>(mapped);
             if (buffer.atomic_image) {
                 if (trace) {
