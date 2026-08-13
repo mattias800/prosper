@@ -815,9 +815,51 @@ void test_shape(const Shape& shape) {
     Fixture bad_launch(shape);
     bad_launch.config.wave_size = 64u;
     CHECK(!analyze(exact, bad_launch), "DescriptorRange requires the exact Wave32 launch");
-    Fixture inexact_launch(shape);
-    inexact_launch.config.exact_thread_extent = false;
-    CHECK(!analyze(exact, inexact_launch), "DescriptorRange requires an exact thread extent");
+    Fixture group_count_launch(shape);
+    group_count_launch.config.exact_thread_extent = false;
+    IndirectPointerRelocationProof group_count_proof;
+    CHECK(analyze(exact, group_count_launch, &group_count_proof) &&
+              group_count_proof.records.size() == 2u,
+          "full workgroup-count launch retains the finite DescriptorRange domain");
+    // Production resource discovery retains explicit null V# aliases for the inactive raw-buffer
+    // arms and per-fetch aliases for the unrelated live-record table. Keep the group-count emitter
+    // fixture faithful to that table so compilation tests the relocated GLOBAL consumers rather
+    // than stopping at an absent ordinary MUBUF binding.
+    std::vector<uint8_t> live_records(6291456u);
+    if (shape.dwords == 642u) {
+        for (uint32_t fetch_pc : std::array<uint32_t, 18>{
+                 271u, 273u, 277u, 310u, 312u, 314u, 324u, 326u, 328u,
+                 330u, 354u, 356u, 358u, 365u, 367u, 369u, 402u, 404u})
+            group_count_launch.add_resource(fetch_pc, live_records, 48u);
+        for (uint32_t fetch_pc : std::array<uint32_t, 11>{
+                 140u, 142u, 144u, 146u, 148u, 150u,
+                 591u, 593u, 595u, 597u, 637u})
+            group_count_launch.add_empty_resource(fetch_pc);
+    } else {
+        for (uint32_t fetch_pc : std::array<uint32_t, 15>{
+                 276u, 278u, 282u, 326u, 328u, 330u, 375u, 377u,
+                 379u, 406u, 408u, 410u, 412u, 436u, 438u})
+            group_count_launch.add_resource(fetch_pc, live_records, 48u);
+        group_count_launch.add_resource(527u, group_count_launch.outer, 16u);
+        for (uint32_t fetch_pc : std::array<uint32_t, 11>{
+                 133u, 135u, 137u, 153u, 155u, 157u,
+                 611u, 613u, 615u, 617u, 657u})
+            group_count_launch.add_empty_resource(fetch_pc);
+    }
+    CHECK(discover_rdna2_indirect_pointer_relocations(
+              exact.data(), exact.size(), group_count_launch.config,
+              group_count_launch.table) &&
+              validate_rdna2_indirect_pointer_relocations(
+                  exact.data(), exact.size(), group_count_launch.config,
+                  group_count_launch.table),
+          "full workgroup-count launch materializes and validates its v3 carrier");
+    test_emitter_integration(shape, exact, group_count_launch);
+
+    Fixture inexact_partial_launch(shape);
+    inexact_partial_launch.config.exact_thread_extent = false;
+    inexact_partial_launch.config.threads_x = 63u;
+    CHECK(!analyze(exact, inexact_partial_launch),
+          "non-aligned inexact extent cannot masquerade as a full workgroup-count launch");
     Fixture huge_launch(shape);
     huge_launch.config.threads_x = 65537u;
     CHECK(!analyze(exact, huge_launch),

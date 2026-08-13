@@ -862,11 +862,20 @@ bool analyze_rdna2_descriptor_pointer_range(
     constexpr uint32_t kMaxProofInvocations = 65536u;
     if (!code || config.local_x != 32u || config.local_y != 1u ||
         config.local_z != 1u || config.wave_size != 32u ||
-        !config.exact_thread_extent || !config.threads_x ||
+        !config.threads_x ||
         config.threads_x > kMaxProofInvocations ||
         config.threads_y != 1u || config.threads_z != 1u ||
         !config.tgid_x_en || config.tgid_y_en || config.tgid_z_en ||
         config.tg_size_en || config.tidig_comp_cnt != 0u)
+        return false;
+    // USE_THREAD_DIMENSIONS=0 supplies workgroup counts rather than a possibly partial thread
+    // extent. resolve_compute_launch() has already converted those counts to physical invocations,
+    // so the domain is just as finite as an exact thread-dimension dispatch provided every axis is
+    // a whole local group. Do not reinterpret a non-aligned inexact extent as group-count authority.
+    if (!config.exact_thread_extent &&
+        (config.threads_x % config.local_x != 0u ||
+         config.threads_y % config.local_y != 0u ||
+         config.threads_z % config.local_z != 0u))
         return false;
 
     std::vector<Rdna2Inst> instructions;
