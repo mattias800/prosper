@@ -363,6 +363,7 @@ uint32_t fragment_spirv_required_subgroup_reasons(const std::vector<uint32_t>& s
 inline constexpr uint32_t kFragmentSubgroupVote = 1u << 0;
 inline constexpr uint32_t kFragmentSubgroupArithmetic = 1u << 1;
 inline constexpr uint32_t kFragmentSubgroupShuffle = 1u << 2;
+inline constexpr uint32_t kFragmentSubgroupBallot = 1u << 3;
 inline constexpr bool fragment_subgroup_features_supported(uint32_t required,
                                                            uint32_t supported) {
     return (required & ~supported) == 0;

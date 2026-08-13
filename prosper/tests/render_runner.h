@@ -4530,6 +4530,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupArithmetic;
         if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
+        if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_BALLOT_BIT)
+            available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupBallot;
         const bool uses_internal_gds =
             fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
         if (required_fragment_subgroup_size &&
@@ -4549,7 +4551,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::lock_guard<std::mutex> lock(log_mutex);
             if (logged.insert(shader_key).second) {
                 // WHY the width was required, decoded (#2147). `required-ops` cannot answer it:
-                // those are Vote/Arithmetic/Shuffle CAPABILITY bits, and the lane-id path declares
+                // those are Vote/Arithmetic/Shuffle/Ballot CAPABILITY bits, and the lane-id path declares
                 // none of them — so a shader needing 64 for lane IDENTITY (which can never run at
                 // 32, since SubgroupLocalInvocationId IS the guest lane id) printed identically to
                 // one needing it only for a branch-guard vote (which may be width-agnostic). Those
