@@ -3417,6 +3417,38 @@ int main(int argc, char** argv) {
           referenced_ds_capture.ds_seeds.size() == 1 &&
           referenced_ds_capture.ds_seeds[0].depth_read_base == 0xa10000,
           "standalone capture retains only the exact referenced live DS checkpoint");
+    unsigned unused_ds_snapshot_calls = 0;
+    set_gpu_capture_ds_seed_snapshot_reader(
+        [&](std::vector<GpuCaptureDsSeed>&, std::string& snapshot_error) {
+            ++unused_ds_snapshot_calls;
+            snapshot_error = "deliberate unavailable DS transfer";
+            return false;
+        });
+    GpuCaptureFile compute_only_capture;
+    compute_only_capture.computes.resize(1);
+    CHECK(capture_referenced_gpu_ds_seeds(compute_only_capture, error) &&
+          unused_ds_snapshot_calls == 0 && compute_only_capture.ds_seeds.empty(),
+          "compute-only capture does not request an unusable DS checkpoint");
+    // A graphics draw with DS disabled is governed by the same predicate as the compute-only case.
+    compute_only_capture.draws.resize(1);
+    CHECK(capture_referenced_gpu_ds_seeds(compute_only_capture, error) &&
+          unused_ds_snapshot_calls == 0 && compute_only_capture.ds_seeds.empty(),
+          "DS-disabled graphics capture does not request an unusable DS checkpoint");
+    // Mutation arm: enable DS on that exact captured draw. The snapshot is now required, so the
+    // deliberately failing reader must be reached and fail visibly.
+    compute_only_capture.draws[0].ps.depth_test_enable = true;
+    CHECK(!capture_referenced_gpu_ds_seeds(compute_only_capture, error) &&
+          unused_ds_snapshot_calls == 1 &&
+          error == "deliberate unavailable DS transfer",
+          "same-site DS-use mutation restores mandatory checkpoint capture");
+    set_gpu_capture_ds_seed_snapshot_reader(
+        [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
+            GpuCaptureDsSeed high = ds_seed, low = ds_seed;
+            high.depth_read_base = high.depth_write_base = 0xa10000;
+            low.depth_read_base = low.depth_write_base = 0x710000;
+            seeds.push_back(std::move(high)); seeds.push_back(std::move(low));
+            return true;
+        });
     DrawItem one_shot_ds_draw = draw;
     one_shot_ds_draw.vrt = std::make_shared<ShaderResourceTable>();
     one_shot_ds_draw.color0_width = one_shot_ds_draw.color0_height = 2;

@@ -4778,6 +4778,18 @@ bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error
         });
     if (metadata_only) return true;
 
+    // A depth/stencil checkpoint can only be consumed by a captured graphics draw that enables a
+    // DS operation. Avoid draining the renderer's live DS cache for compute-only captures (and
+    // graphics submits with no DS use); besides being unnecessary, that transfer must not prevent
+    // an otherwise self-contained compute capsule from being written.
+    const bool references_ds = std::any_of(
+        capture.draws.begin(), capture.draws.end(), [](const GpuCapturedDraw& draw) {
+            const auto& ps = draw.ps;
+            return ps.depth_test_enable || ps.depth_write_enable || ps.depth_clear_enable ||
+                   ps.stencil_enable || ps.stencil_clear_enable;
+        });
+    if (!references_ds) return true;
+
     std::vector<GpuCaptureDsSeed> live;
     if (!read_all_gpu_capture_ds_seeds(live, error)) return false;
     for (auto& seed : live) {
