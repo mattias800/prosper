@@ -140,10 +140,12 @@ int main(int argc, char** argv) {
     a.size = 16; a.stride = 4; a.format = DataFormat::Sint2_10_10_10; a.num_components = 4; a.fetch_pc = 12;
     a.fetch_index_mode = VertexFetchIndexMode::Instance;
     ShaderResource b{}; b.cls = ResourceClass::ConstantBuffer; b.binding = 2; b.gpu_addr = 0x1008;
-    b.size = 4; b.stride = 1; b.format = DataFormat::Float32; b.num_components = 4;
+    b.size = 16; b.stride = 4; b.format = DataFormat::Float32; b.num_components = 4;
     b.srt_offset = 0x20;
     b.bvh_box_grow = 6;
     b.bvh_sort_enabled = true;
+    // #2528: the scalar span is the V#'s own byte footprint, so a carried dword count is only ever
+    // size/4 and this resource's 16-byte binding needs no widening. Four stride-4 records.
     b.scalar_buffer_dword_count = 4;
     ShaderResource dcc{}; dcc.cls = ResourceClass::Texture; dcc.binding = 4; dcc.gpu_addr = 0x1000;
     dcc.size = 16; dcc.format = DataFormat::Unorm8; dcc.num_components = 4;
@@ -1645,7 +1647,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
     CHECK(loaded.format_version == 54 &&
-              loaded.draws[0].vrt.resources[1].resource.size == 4u &&
+              loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
                   loaded.draws[0].vrt.resources[1].resource) == 16u,
@@ -1690,8 +1692,8 @@ int main(int argc, char** argv) {
     constexpr uint32_t kDistinctScalarDwords = 0x00100001u;
     constexpr uint64_t kDistinctScalarBytes =
         static_cast<uint64_t>(kDistinctScalarDwords) * sizeof(uint32_t);
-    reader_scalar.resource.size = kDistinctScalarDwords;
-    reader_scalar.resource.stride = 1u;
+    reader_scalar.resource.size = static_cast<uint32_t>(kDistinctScalarBytes);
+    reader_scalar.resource.stride = 4u;
     reader_scalar.resource.scalar_buffer_dword_count = kDistinctScalarDwords;
     reader_scalar.captured_size = kDistinctScalarBytes;
     std::vector<uint8_t> short_scalar_reader_bytes;
