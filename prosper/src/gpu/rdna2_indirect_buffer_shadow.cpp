@@ -32,6 +32,52 @@ void store_u64(uint8_t* bytes, size_t offset, uint64_t value) {
     std::memcpy(bytes + offset, &value, sizeof(value));
 }
 
+constexpr size_t kRelocationHeaderBytes = 40u;
+constexpr size_t kRelocationRecordBytes = 24u;
+constexpr size_t kRelocationSegmentBytes = 24u;
+
+bool relocation_layout_valid(const ShaderResource& source,
+                             const IndirectBufferRelocationLayout& layout,
+                             size_t record_count) {
+    return layout.tag && layout.version == 2u && layout.max_records &&
+           layout.max_segments && layout.max_binding_bytes &&
+           record_count && record_count <= layout.max_records &&
+           source.size && source.size <= UINT32_MAX;
+}
+
+bool interval_end(uint64_t address, uint32_t bytes, uint64_t& end) {
+    if (!address || !bytes || bytes > UINT64_MAX - address) return false;
+    end = address + bytes;
+    return true;
+}
+
+struct RelocationInterval { uint64_t begin, end; };
+
+bool canonical_relocation_intervals(
+        std::span<const IndirectBufferRelocationRecord> records,
+        std::vector<RelocationInterval>& merged) {
+    std::vector<RelocationInterval> intervals;
+    intervals.reserve(records.size());
+    for (const auto& record : records) {
+        if (!record.byte_count) continue; // statically inactive or nullable record
+        if (!record.guest_address) return false;
+        uint64_t end = 0;
+        if (!interval_end(record.guest_address, record.byte_count, end)) return false;
+        intervals.push_back({record.guest_address, end});
+    }
+    std::sort(intervals.begin(), intervals.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.begin < rhs.begin || (lhs.begin == rhs.begin && lhs.end < rhs.end);
+    });
+    merged.clear();
+    for (const auto& interval : intervals) {
+        if (merged.empty() || interval.begin > merged.back().end)
+            merged.push_back(interval);
+        else
+            merged.back().end = std::max(merged.back().end, interval.end);
+    }
+    return true;
+}
+
 bool record_offsets_fit(const ShaderResource& source,
                         const IndirectBufferShadowLayout& layout,
                         std::span<const uint32_t> pointer_records) {
@@ -215,6 +261,293 @@ bool current_indirect_buffer_shadow_matches(
         cursor = offset + sizeof(uint64_t);
     }
     return std::memcmp(source.host_data + cursor, guest + cursor, source_bytes - cursor) == 0;
+}
+
+bool parse_indirect_buffer_relocation(
+        const ShaderResource& source, const uint8_t* bytes, size_t byte_count,
+        const IndirectBufferRelocationLayout& layout,
+        std::span<const IndirectBufferRelocationRecord> expected_records,
+        IndirectBufferRelocationInfo& info) {
+    info = {};
+    if (!bytes || !relocation_layout_valid(source, layout, expected_records.size())) return false;
+    const size_t source_bytes = static_cast<size_t>(source.size);
+    if (source_bytes > byte_count || kRelocationHeaderBytes > byte_count - source_bytes)
+        return false;
+    const size_t header = source_bytes;
+    const uint32_t record_count = load_u32(bytes, header + 16u);
+    const uint32_t segment_count = load_u32(bytes, header + 20u);
+    const uint32_t witness_count = load_u32(bytes, header + 24u);
+    const uint32_t payload_offset = load_u32(bytes, header + 28u);
+    const uint32_t payload_bytes = load_u32(bytes, header + 32u);
+    if (load_u32(bytes, header) != layout.tag ||
+        load_u32(bytes, header + 4u) != layout.version ||
+        load_u32(bytes, header + 8u) != layout.tag ||
+        load_u32(bytes, header + 12u) != source.size ||
+        load_u32(bytes, header + 36u) != (layout.tag ^ source.size ^ record_count ^
+                                         segment_count ^ payload_offset ^ payload_bytes) ||
+        record_count != expected_records.size() || segment_count > layout.max_segments ||
+        witness_count != layout.witness_word_count)
+        return false;
+
+    const uint64_t record_bytes = static_cast<uint64_t>(record_count) * kRelocationRecordBytes;
+    const uint64_t segment_bytes = static_cast<uint64_t>(segment_count) * kRelocationSegmentBytes;
+    const uint64_t witness_bytes = static_cast<uint64_t>(witness_count) * sizeof(uint32_t);
+    const uint64_t expected_payload = static_cast<uint64_t>(source_bytes) +
+        kRelocationHeaderBytes + record_bytes + segment_bytes + witness_bytes;
+    if (expected_payload > UINT32_MAX || payload_offset != expected_payload ||
+        payload_bytes > layout.max_binding_bytes ||
+        payload_offset > layout.max_binding_bytes - payload_bytes ||
+        byte_count != static_cast<size_t>(payload_offset) + payload_bytes)
+        return false;
+
+    info.source_bytes = static_cast<uint32_t>(source_bytes);
+    info.payload_byte_offset = payload_offset;
+    info.payload_bytes = payload_bytes;
+    info.records.resize(record_count);
+    const size_t records_base = header + kRelocationHeaderBytes;
+    uint64_t prior_source_end = 0;
+    for (size_t index = 0; index < record_count; ++index) {
+        const size_t offset = records_base + index * kRelocationRecordBytes;
+        auto& record = info.records[index];
+        record.source_byte_offset = load_u32(bytes, offset);
+        const uint32_t segment = load_u32(bytes, offset + 4u);
+        record.guest_address = load_u64(bytes, offset + 8u);
+        record.byte_count = load_u32(bytes, offset + 16u);
+        if (load_u32(bytes, offset + 20u) != 0u ||
+            record.source_byte_offset != expected_records[index].source_byte_offset ||
+            record.guest_address != expected_records[index].guest_address ||
+            record.byte_count != expected_records[index].byte_count ||
+            record.source_byte_offset > source.size ||
+            sizeof(uint64_t) > source.size - record.source_byte_offset ||
+            record.source_byte_offset < prior_source_end ||
+            load_u64(bytes, record.source_byte_offset) != record.guest_address)
+            return false;
+        prior_source_end = static_cast<uint64_t>(record.source_byte_offset) + sizeof(uint64_t);
+        if (!record.byte_count) {
+            if (segment != UINT32_MAX) return false;
+        } else if (!record.guest_address || segment >= segment_count) {
+            return false;
+        }
+    }
+
+    const size_t segments_base = records_base + static_cast<size_t>(record_bytes);
+    std::vector<RelocationInterval> canonical_segments;
+    if (!canonical_relocation_intervals(expected_records, canonical_segments) ||
+        canonical_segments.size() != segment_count)
+        return false;
+    info.segments.resize(segment_count);
+    uint64_t prior_end = 0;
+    uint32_t prior_packed_end = payload_offset;
+    for (size_t index = 0; index < segment_count; ++index) {
+        const size_t offset = segments_base + index * kRelocationSegmentBytes;
+        auto& segment = info.segments[index];
+        segment.guest_address = load_u64(bytes, offset);
+        segment.byte_count = load_u32(bytes, offset + 8u);
+        segment.packed_byte_offset = load_u32(bytes, offset + 12u);
+        uint64_t end = 0;
+        if (load_u64(bytes, offset + 16u) != 0u ||
+            !interval_end(segment.guest_address, segment.byte_count, end) ||
+            segment.guest_address != canonical_segments[index].begin ||
+            end != canonical_segments[index].end ||
+            (index && segment.guest_address < prior_end) ||
+            segment.packed_byte_offset != prior_packed_end ||
+            segment.packed_byte_offset > byte_count ||
+            segment.byte_count > byte_count - segment.packed_byte_offset)
+            return false;
+        prior_end = end;
+        if (segment.byte_count > UINT32_MAX - prior_packed_end) return false;
+        prior_packed_end += segment.byte_count;
+    }
+    if (prior_packed_end != byte_count) return false;
+
+    std::vector<bool> referenced_segments(segment_count, false);
+    for (size_t index = 0; index < record_count; ++index) {
+        if (!info.records[index].byte_count) continue;
+        const size_t offset = records_base + index * kRelocationRecordBytes;
+        const uint32_t segment_index = load_u32(bytes, offset + 4u);
+        referenced_segments[segment_index] = true;
+        const auto& segment = info.segments[segment_index];
+        uint64_t record_end = 0, segment_end = 0;
+        if (!interval_end(info.records[index].guest_address,
+                          info.records[index].byte_count, record_end) ||
+            !interval_end(segment.guest_address, segment.byte_count, segment_end) ||
+            info.records[index].guest_address < segment.guest_address ||
+            record_end > segment_end)
+            return false;
+    }
+    if (std::find(referenced_segments.begin(), referenced_segments.end(), false) !=
+        referenced_segments.end())
+        return false;
+
+    const size_t witness_base = segments_base + static_cast<size_t>(segment_bytes);
+    info.witness_words.resize(witness_count);
+    for (size_t index = 0; index < witness_count; ++index)
+        info.witness_words[index] = load_u32(bytes, witness_base + index * sizeof(uint32_t));
+    return true;
+}
+
+bool inspect_indirect_buffer_relocation(
+        const ShaderResource& source, const uint8_t* bytes, size_t byte_count,
+        const IndirectBufferRelocationLayout& layout,
+        IndirectBufferRelocationInfo& info) {
+    info = {};
+    if (!bytes || source.size > byte_count ||
+        kRelocationHeaderBytes > byte_count - source.size)
+        return false;
+    const size_t header = static_cast<size_t>(source.size);
+    const uint32_t record_count = load_u32(bytes, header + 16u);
+    if (!relocation_layout_valid(source, layout, record_count)) return false;
+    const uint64_t record_bytes = static_cast<uint64_t>(record_count) * kRelocationRecordBytes;
+    if (record_bytes > byte_count - header - kRelocationHeaderBytes) return false;
+    const size_t records_base = header + kRelocationHeaderBytes;
+    std::vector<IndirectBufferRelocationRecord> records(record_count);
+    for (size_t index = 0; index < records.size(); ++index) {
+        const size_t offset = records_base + index * kRelocationRecordBytes;
+        records[index].source_byte_offset = load_u32(bytes, offset);
+        records[index].guest_address = load_u64(bytes, offset + 8u);
+        records[index].byte_count = load_u32(bytes, offset + 16u);
+    }
+    return parse_indirect_buffer_relocation(
+        source, bytes, byte_count, layout, records, info);
+}
+
+bool build_indirect_buffer_relocation(
+        const ShaderResource& source, const uint8_t* source_bytes,
+        const IndirectBufferRelocationLayout& layout,
+        std::span<const IndirectBufferRelocationRecord> records,
+        std::span<const uint32_t> witness_words,
+        std::shared_ptr<std::vector<uint8_t>>& owner,
+        IndirectBufferRelocationInfo& info) {
+    owner.reset();
+    info = {};
+    if (!source_bytes || !relocation_layout_valid(source, layout, records.size()) ||
+        witness_words.size() != layout.witness_word_count)
+        return false;
+
+    uint64_t prior_source_end = 0;
+    for (const auto& record : records) {
+        if (record.source_byte_offset > source.size ||
+            sizeof(uint64_t) > source.size - record.source_byte_offset ||
+            record.source_byte_offset < prior_source_end)
+            return false;
+        prior_source_end = static_cast<uint64_t>(record.source_byte_offset) + sizeof(uint64_t);
+        uint64_t source_pointer = 0;
+        std::memcpy(&source_pointer, source_bytes + record.source_byte_offset,
+                    sizeof(source_pointer));
+        if (source_pointer != record.guest_address) return false;
+        if (!record.byte_count) continue; // retain nonzero inactive pointers as source witnesses
+        if (!record.guest_address) return false;
+        uint64_t end = 0;
+        if (!interval_end(record.guest_address, record.byte_count, end) ||
+            !guest_readable(record.guest_address, record.byte_count))
+            return false;
+    }
+    std::vector<RelocationInterval> merged;
+    if (!canonical_relocation_intervals(records, merged)) return false;
+    if (merged.size() > layout.max_segments) return false;
+
+    const uint64_t record_bytes = static_cast<uint64_t>(records.size()) * kRelocationRecordBytes;
+    const uint64_t segment_bytes = static_cast<uint64_t>(merged.size()) * kRelocationSegmentBytes;
+    const uint64_t witness_bytes = static_cast<uint64_t>(witness_words.size()) * sizeof(uint32_t);
+    const uint64_t payload_offset64 = source.size + kRelocationHeaderBytes + record_bytes +
+        segment_bytes + witness_bytes;
+    uint64_t payload_bytes64 = 0;
+    for (const auto& interval : merged) {
+        const uint64_t bytes = interval.end - interval.begin;
+        if (bytes > UINT64_MAX - payload_bytes64) return false;
+        payload_bytes64 += bytes;
+    }
+    if (payload_offset64 > UINT32_MAX || payload_bytes64 > UINT32_MAX ||
+        payload_offset64 > layout.max_binding_bytes ||
+        payload_bytes64 > layout.max_binding_bytes - payload_offset64)
+        return false;
+    const uint32_t payload_offset = static_cast<uint32_t>(payload_offset64);
+    const uint32_t payload_bytes = static_cast<uint32_t>(payload_bytes64);
+    owner = std::make_shared<std::vector<uint8_t>>(
+        static_cast<size_t>(payload_offset) + payload_bytes);
+    std::memcpy(owner->data(), source_bytes, static_cast<size_t>(source.size));
+    const size_t header = static_cast<size_t>(source.size);
+    store_u32(owner->data(), header, layout.tag);
+    store_u32(owner->data(), header + 4u, layout.version);
+    store_u32(owner->data(), header + 8u, layout.tag);
+    store_u32(owner->data(), header + 12u, static_cast<uint32_t>(source.size));
+    store_u32(owner->data(), header + 16u, static_cast<uint32_t>(records.size()));
+    store_u32(owner->data(), header + 20u, static_cast<uint32_t>(merged.size()));
+    store_u32(owner->data(), header + 24u, static_cast<uint32_t>(witness_words.size()));
+    store_u32(owner->data(), header + 28u, payload_offset);
+    store_u32(owner->data(), header + 32u, payload_bytes);
+    store_u32(owner->data(), header + 36u,
+              layout.tag ^ static_cast<uint32_t>(source.size) ^
+                  static_cast<uint32_t>(records.size()) ^
+                  static_cast<uint32_t>(merged.size()) ^ payload_offset ^ payload_bytes);
+
+    const size_t records_base = header + kRelocationHeaderBytes;
+    for (size_t index = 0; index < records.size(); ++index) {
+        const auto& record = records[index];
+        const size_t offset = records_base + index * kRelocationRecordBytes;
+        uint32_t segment_index = UINT32_MAX;
+        if (record.byte_count) {
+            auto segment = std::find_if(merged.begin(), merged.end(), [&](const auto& candidate) {
+                return record.guest_address >= candidate.begin &&
+                       record.guest_address <= candidate.end &&
+                       record.byte_count <= candidate.end - record.guest_address;
+            });
+            if (segment == merged.end()) return false;
+            segment_index = static_cast<uint32_t>(segment - merged.begin());
+        }
+        store_u32(owner->data(), offset, record.source_byte_offset);
+        store_u32(owner->data(), offset + 4u, segment_index);
+        store_u64(owner->data(), offset + 8u, record.guest_address);
+        store_u32(owner->data(), offset + 16u, record.byte_count);
+        store_u32(owner->data(), offset + 20u, 0u);
+    }
+
+    const size_t segments_base = records_base + static_cast<size_t>(record_bytes);
+    uint32_t packed_offset = payload_offset;
+    for (size_t index = 0; index < merged.size(); ++index) {
+        const size_t offset = segments_base + index * kRelocationSegmentBytes;
+        const uint32_t bytes = static_cast<uint32_t>(merged[index].end - merged[index].begin);
+        store_u64(owner->data(), offset, merged[index].begin);
+        store_u32(owner->data(), offset + 8u, bytes);
+        store_u32(owner->data(), offset + 12u, packed_offset);
+        store_u64(owner->data(), offset + 16u, 0u);
+        std::memcpy(owner->data() + packed_offset,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(merged[index].begin)),
+                    bytes);
+        packed_offset += bytes;
+    }
+    const size_t witness_base = segments_base + static_cast<size_t>(segment_bytes);
+    for (size_t index = 0; index < witness_words.size(); ++index)
+        store_u32(owner->data(), witness_base + index * sizeof(uint32_t), witness_words[index]);
+
+    return parse_indirect_buffer_relocation(
+        source, owner->data(), owner->size(), layout, records, info);
+}
+
+bool current_indirect_buffer_relocation_matches(
+        const ShaderResourceTable& table, const ShaderResource& source,
+        const IndirectBufferRelocationLayout& layout,
+        std::span<const IndirectBufferRelocationRecord> expected_records) {
+    IndirectBufferRelocationInfo info;
+    if (!parse_indirect_buffer_relocation(
+            source, source.host_data, source.host_data_size, layout, expected_records, info))
+        return false;
+    if (!source.host_data || !table_owns(table, source.host_data))
+        return source.host_data != nullptr;
+    if (!guest_readable(source.gpu_addr, static_cast<uint32_t>(source.size))) return false;
+    const auto* live_source = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(source.gpu_addr));
+    if (std::memcmp(source.host_data, live_source, static_cast<size_t>(source.size)) != 0)
+        return false;
+    for (const auto& segment : info.segments) {
+        if (!guest_readable(segment.guest_address, segment.byte_count) ||
+            std::memcmp(source.host_data + segment.packed_byte_offset,
+                        reinterpret_cast<const void*>(
+                            static_cast<uintptr_t>(segment.guest_address)),
+                        segment.byte_count) != 0)
+            return false;
+    }
+    return true;
 }
 
 } // namespace prosper::gpu

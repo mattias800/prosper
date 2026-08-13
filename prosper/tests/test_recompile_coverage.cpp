@@ -897,6 +897,38 @@ int main() {
                             b64_kill_config).empty(),
           "a low-half-only B32 write does not kill live VCC_HI at the merge");
 
+    // A GLOBAL packet's only scalar input is its optional SADDR pair. Failure 27's null-SADDR
+    // loads sit after a guarded VCC scratch write and before a complete VOPC replacement; they do
+    // not observe the old VCC value and must be transparent to post-merge scalar liveness.
+    const uint32_t flat_vcc_scratch_guard[] = {
+        0x7daa0481u,                 // 0: v_cmpx_ne_u32 1,v2; narrows EXEC
+        0xbf880001u,                 // 1: s_cbranch_execz -> pc 3
+        0x87ea0e6au,                 // 2: s_and_b64 vcc,vcc,s[14:15] (guarded scratch write)
+        0xdc308018u, 0x027d0018u,   // 3: global_load_dword ...,v[24:25],off,+24
+        0x7d8a0080u,                 // 5: v_cmp_ne_u32 vcc,0,v0 (complete replacement)
+        0xbf810000u,
+    };
+    CHECK(has(structured_execz_branches_for_test(flat_vcc_scratch_guard,
+                                                  std::size(flat_vcc_scratch_guard)), 1u),
+          "a null-SADDR GLOBAL is transparent to post-merge VCC liveness");
+
+    // Same-site mutation: changing that exact GLOBAL packet from NULL SADDR to the VCC pair makes
+    // the guarded write observable, so the structurizer must keep rejecting the branch.
+    uint32_t flat_reads_vcc[std::size(flat_vcc_scratch_guard)];
+    std::copy(std::begin(flat_vcc_scratch_guard), std::end(flat_vcc_scratch_guard),
+              std::begin(flat_reads_vcc));
+    flat_reads_vcc[4] = 0x026a0018u;
+    CHECK(!has(structured_execz_branches_for_test(flat_reads_vcc,
+                                                   std::size(flat_reads_vcc)), 1u),
+          "a GLOBAL SADDR overlapping VCC keeps the guarded scalar write live");
+
+    std::copy(std::begin(flat_vcc_scratch_guard), std::end(flat_vcc_scratch_guard),
+              std::begin(flat_reads_vcc));
+    flat_reads_vcc[3] = 0xdc30a018u; // same pc3 GLOBAL with LDS transfer (implicit M0 read)
+    CHECK(!has(structured_execz_branches_for_test(flat_reads_vcc,
+                                                   std::size(flat_reads_vcc)), 1u),
+          "a GLOBAL LDS-transfer remains fail-closed in scalar liveness");
+
     // Wave32 kernels use one-word mask instructions around EXEC: compare into VCC_LO, invert that
     // mask, copy it to EXEC_LO, then restore EXEC_LO. These are mask-domain operations, not scalar
     // reads of an unrepresentable VCC dword.
