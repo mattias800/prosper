@@ -934,6 +934,13 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         }
         GpuCapturedResource c;
         c.resource = r;
+        // Captures own their bytes through blob references, never through the caller's live backing
+        // pointers. Arrays return early below, so clear the parent and metadata pointers before the
+        // branch just as the scalar path has always done.
+        c.resource.host_data = nullptr;
+        c.resource.host_data_size = 0;
+        c.resource.dcc_metadata_host_data = nullptr;
+        c.resource.dcc_metadata_host_data_size = 0;
         if (r.table_index_count) {
             c.table_entry_blobs.resize(r.table_entries.size());
             for (size_t index = 0; index < r.table_entries.size(); ++index) {
@@ -970,9 +977,6 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
             c.resource.linear_row_pitch_bytes = resolved_linear_row_pitch(
                 r, pitch_width, bpt);
         }
-        c.resource.host_data = nullptr; c.resource.host_data_size = 0;
-        c.resource.dcc_metadata_host_data = nullptr;
-        c.resource.dcc_metadata_host_data_size = 0;
         c.metadata_size = dcc_metadata_footprint(r);
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);

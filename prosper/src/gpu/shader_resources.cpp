@@ -217,10 +217,22 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
             : static_cast<uint64_t>(entry.vsharp[2]);
         const uint32_t decoded_size = decoded_size64 > UINT32_MAX
             ? UINT32_MAX : static_cast<uint32_t>(decoded_size64);
-        // Conventional buffer descriptors use TYPE=0. Keeping that input word beside the normalized
-        // values is useful only if the two representations are checked independently here.
-        if ((entry.vsharp[3] >> 28u) != 0u || entry.gpu_addr != decoded_addr ||
+        const bool null_descriptor = entry.gpu_addr == 0u && entry.size == 0u &&
+                                     entry.host_data == nullptr;
+        DataFormat decoded_format = DataFormat::Unknown;
+        uint32_t decoded_components = 0;
+        rdna2_buffer_format((entry.vsharp[3] >> 12u) & 0x7fu,
+                            &decoded_format, &decoded_components);
+        // The normalized entry retains none of swizzled addressing, INDEX_STRIDE, ADD_TID,
+        // RESOURCE_LEVEL, OOB_SELECT, TYPE, or the reserved controls. Admit only the conventional
+        // linear zero-valued form; otherwise the Vulkan backing would not reproduce the raw V#.
+        if ((entry.vsharp[1] & 0xc0000000u) != 0u ||
+            (entry.vsharp[3] & 0xfff80000u) != 0u ||
+            entry.gpu_addr != decoded_addr ||
             entry.stride != decoded_stride || entry.size != decoded_size ||
+            (!null_descriptor &&
+             (decoded_format != resource.format ||
+              decoded_components != resource.num_components)) ||
             (!entry.host_data && entry.host_data_size != 0u) ||
             (entry.host_data && entry.host_data_size < entry.size))
             return false;

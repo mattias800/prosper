@@ -764,6 +764,10 @@ int main(int argc, char** argv) {
     descriptor_array.table_selector_mode =
         BufferTableSelectorMode::DynamicSbufferByteOffset;
     descriptor_array.table_load_pc = 202;
+    descriptor_array.host_data = memory.data();
+    descriptor_array.host_data_size = memory.size();
+    descriptor_array.dcc_metadata_host_data = memory.data();
+    descriptor_array.dcc_metadata_host_data_size = memory.size();
     for (uint64_t address : {0x1000ull, 0x1010ull}) {
         ShaderBufferTableEntry entry;
         entry.gpu_addr = address;
@@ -773,7 +777,7 @@ int main(int argc, char** argv) {
             static_cast<uint32_t>(address),
             static_cast<uint32_t>(address >> 32u) | (entry.stride << 16u),
             2u,
-            0x00016204u,
+            0x00014204u,
         };
         descriptor_array.table_entries.push_back(entry);
     }
@@ -791,8 +795,16 @@ int main(int argc, char** argv) {
                                meta, reader, descriptor_array_capture, error) &&
               descriptor_array_capture.blobs.size() == 2 &&
               descriptor_array_capture.computes[0].resources.resources[0]
-                      .table_entry_blobs.size() == 2,
-          "descriptor-array capture retains one exact backing reference per V#");
+                      .table_entry_blobs.size() == 2 &&
+              descriptor_array_capture.computes[0].resources.resources[0]
+                      .resource.host_data == nullptr &&
+              descriptor_array_capture.computes[0].resources.resources[0]
+                      .resource.host_data_size == 0 &&
+              descriptor_array_capture.computes[0].resources.resources[0]
+                      .resource.dcc_metadata_host_data == nullptr &&
+              descriptor_array_capture.computes[0].resources.resources[0]
+                      .resource.dcc_metadata_host_data_size == 0,
+          "descriptor-array capture retains per-V# blobs without live parent backing pointers");
     std::vector<uint8_t> descriptor_array_bytes;
     GpuCaptureFile descriptor_array_loaded;
     GpuReplayFrame descriptor_array_replay;

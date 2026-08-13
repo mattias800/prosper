@@ -350,7 +350,7 @@ int main() {
             static_cast<uint32_t>(address),
             static_cast<uint32_t>(address >> 32u) | (entry.stride << 16u),
             1u,
-            0x00016204u,
+            0x00014204u,
         };
         descriptor_array.table_entries.push_back(entry);
     }
