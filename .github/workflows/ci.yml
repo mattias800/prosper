@@ -129,6 +129,48 @@ jobs:
         run: |
           python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-ci
 
+  contribution-shape:
+    name: Contribution shape
+    runs-on: ubuntu-latest
+    steps:
+      # Its own job, like Docs and for the same reason: it needs nothing built, finishes in seconds,
+      # and a false positive here must not cost the build-and-test signal from an unrelated job.
+      #
+      # It answers two questions no other job in this pipeline can, because both are about what a
+      # PR ADDS rather than about what the build produces:
+      #
+      #   1. Did this PR add a file OUTSIDE the build tree? Every job here builds prosper, and
+      #      prosper globs `prosper/src/*.cpp`. A file added at the repository root is compiled by
+      #      nothing -- so every job goes green while certifying the absence of the code rather than
+      #      its correctness. Measured on #2507-#2510 (2026-08-12): 4,541 added lines in six headers
+      #      at the repository root, three PRs reporting 8 SUCCESS, and not one line compiled by any
+      #      job. Instrument-trap 151's family, one level further out.
+      #
+      #   2. Did this PR add a new source file and touch no test at all? A new .cpp is picked up
+      #      automatically by the CONFIGURE_DEPENDS glob, so it can arrive fully built and entirely
+      #      unexercised -- the #2492 shape, where "it compiles" was the only checkable claim.
+      #
+      # fetch-depth: 0 because the check is a diff against the base branch, and a shallow clone has
+      # no merge base to diff against.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Runs before the check itself: the selftest holds hand-written violating AND compliant inputs,
+      # so a gate that has silently stopped discriminating fails here rather than passing everything
+      # downstream. A checker that cannot show it still fires is indistinguishable from one that was
+      # disabled.
+      - name: Verify the checker still discriminates
+        run: python3 prosper/tools/ci/check_contribution_shape.py --selftest
+
+      - name: Check the contribution shape of this PR
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=0 origin "${{ github.base_ref }}"
+          python3 prosper/tools/ci/check_contribution_shape.py --github \
+            --base "origin/${{ github.base_ref }}"
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
