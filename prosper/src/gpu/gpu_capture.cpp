@@ -4811,6 +4811,25 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 if (!r.u32(resource.scalar_buffer_dword_count))
                     return false;
                 if (resource.scalar_buffer_dword_count) {
+                    // #2528: the scalar bound IS the V#'s byte footprint, so this field is fully
+                    // derivable from `size` and carries no independent authority — it can only ever
+                    // be a marker plus a checksum. Captures written before that correction stored
+                    // NUM_RECORDS (or one dword for STRIDE==0) here, which disagrees with `size` and
+                    // would otherwise make every retained v54 capsule permanently unreadable. Derive
+                    // the authoritative value rather than trusting the stored one; a disagreement
+                    // cannot widen a binding, because the derived span is exactly `size` either way.
+                    // The WRITER stays strict, so prosper never emits an inconsistent bound itself.
+                    const uint32_t derived =
+                        static_cast<uint32_t>(resource.size / sizeof(uint32_t));
+                    if (resource.scalar_buffer_dword_count != derived) {
+                        if (std::getenv("PROSPER_DBG"))
+                            std::fprintf(stderr,
+                                         "[capture] scalar-buffer bound %u disagrees with the V# "
+                                         "footprint (size=%u); using the derived %u (#2528)\n",
+                                         resource.scalar_buffer_dword_count, resource.size, derived);
+                        resource.scalar_buffer_dword_count = derived;
+                    }
+                    if (!resource.scalar_buffer_dword_count) continue;
                     const uint64_t binding_bytes =
                         shader_resource_buffer_binding_bytes(resource);
                     if (!binding_bytes || captured.captured_size < binding_bytes)
