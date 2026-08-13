@@ -12590,6 +12590,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // (src[0]) is the V#: resolve it by an earlier s_load's SRT tag (indirect) or directly by its
             // user-data SGPR index (the V# was placed in SGPRs by the driver). Default binding 2.
             uint32_t binding = 2; bool cbuf_resolved = false;
+            const ShaderResource* cbuf_resource = nullptr;
             if (rt) { const ShaderResource* res = nullptr;
                 // Descriptor-table folding emits pc-only entries when a V# has no stable SRT key
                 // (or that key collides). Exact per-use provenance must win, as it does for MUBUF/MIMG.
@@ -12602,7 +12603,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
                 if (!res && !sreg_range_written(rs, in.src[0].value, 4))
                     res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
-                if (res) { binding = res->binding; cbuf_resolved = true; } }
+                if (res) {
+                    binding = res->binding;
+                    cbuf_resolved = true;
+                    cbuf_resource = res;
+                }
+            }
             if (getenv("PROSPER_CBUFLOG"))
                 fprintf(stderr, "[cbuf] pc=%u s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
                         in.pc, n, in.src[0].value, in.literal, base_idx, (int)soff_dyn, binding,
@@ -12645,12 +12651,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // this path legitimately; PS tables start at 32, where keeping the fallback would emit an
             // interface the renderer cannot satisfy (#719).
             if (rt && !cbuf_resolved) {
-                const bool fallback_bound = std::any_of(
+                const auto fallback = std::find_if(
                     rt->resources.begin(), rt->resources.end(), [](const ShaderResource& resource) {
                         return resource.binding == 2 &&
                                (resource.cls == ResourceClass::ConstantBuffer ||
                                 resource.cls == ResourceClass::VertexBuffer);
                     });
+                const bool fallback_bound = fallback != rt->resources.end();
                 if (!fallback_bound) {
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
@@ -12659,20 +12666,50 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 in.pc, in.opcode, in.src[0].value, (int)soff_dyn);
                     ok = false; return true;
                 }
+                cbuf_resource = &*fallback;
             }
+            // RDNA2 scalar-buffer loads use m_size=(STRIDE==0 ? 1 : NUM_RECORDS) dwords. STRIDE is
+            // only a bounds-mode selector here; it does not scale scalar addresses. Preserve the
+            // explicit scalar count: size/stride cannot reconstruct it after the binding is staged
+            // to the independent dword-addressable span (and is outright shorter when STRIDE < 4).
+            // For every component select index zero before OpAccessChain, then select architectural
+            // zero after the safe load; OpSelect does not make an already-OOB Vulkan load harmless.
+            const bool scalar_buffer_load = in.opcode >= 0x8u && in.opcode <= 0xCu;
+            const uint32_t scalar_bound_dwords =
+                scalar_buffer_load && cbuf_resource
+                    ? cbuf_resource->scalar_buffer_dword_count : 0u;
+            const bool scalar_bound_known = scalar_bound_dwords != 0u;
+            if (scalar_bound_known &&
+                shader_resource_buffer_binding_bytes(*cbuf_resource) <
+                    static_cast<uint64_t>(scalar_bound_dwords) * sizeof(uint32_t)) {
+                ok = false;
+                return true;
+            }
+            auto bounded_cbuf_load = [&](uint32_t dword_index) {
+                if (!scalar_bound_known)
+                    return b.cbuf_load(dword_index, binding);
+                if (scalar_bound_dwords == 0u)
+                    return b.uconst(0u);
+                const uint32_t in_bounds = b.ucmp(
+                    Op_ULessThan, dword_index, b.uconst(scalar_bound_dwords));
+                const uint32_t safe_index = b.sel(in_bounds, dword_index, b.uconst(0u));
+                const uint32_t loaded = b.cbuf_load(safe_index, binding);
+                return b.sel(in_bounds, loaded, b.uconst(0u));
+            };
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
                 uint32_t idx0 = b.ibin(Op_ShiftRightLogical,
                                        b.ibin(Op_IAdd, soff_bits, b.uconst(in.literal)), b.uconst(2));
                 for (uint32_t k = 0; k < n; k++) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx0, b.uconst(k)) : idx0;
-                    rs.sreg[in.dst.value + (int)k] = b.cbuf_load(kidx, binding);
+                    rs.sreg[in.dst.value + (int)k] = bounded_cbuf_load(kidx);
                     rs.sreg_srt.erase(in.dst.value + (int)k);   // data load: drop any stale descriptor tag
                 }
                 return true;
             }
             for (uint32_t k = 0; k < n; k++)
-                rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), binding);
+                rs.sreg[in.dst.value + (int)k] =
+                    bounded_cbuf_load(b.uconst(base_idx + k));
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
             // later buffer/image op using them resolves to the right resource (provenance). x4 = V#/S#
             // (buffers, samplers), x8 = T# (textures, 8 dwords).

@@ -457,6 +457,12 @@ struct ShaderResource {
     // fields would make a generic relocation enter the legacy title-specific validator before its
     // independent proof could be re-established.
     IndirectPointerRelocationBinding indirect_pointer_relocation{};
+
+    // Exact RDNA2 S_BUFFER M_SIZE in dwords. Zero means this resource has no scalar-buffer bound
+    // metadata. Kept separate from `size`: the ordinary V# footprint is NUM_RECORDS*STRIDE, but
+    // scalar-buffer addresses advance four bytes and use NUM_RECORDS only as their dword bound.
+    // Appended so historical positional aggregate initializers retain their field mapping.
+    uint32_t scalar_buffer_dword_count = 0;
 };
 
 inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& resource) {
@@ -843,9 +849,13 @@ struct StorageBufferMaterializationPlan {
     bool valid = false;
 };
 
-// Derive the exact host binding range from reflected shader semantics plus the runtime V#. The only
-// range expansion currently admitted is a read-only one-record scalar Uint16/Float16 FORMAT load
-// (2 -> 4 bytes).
+// Validate an explicitly-carried scalar S_BUFFER bound and return the complete byte span its dword
+// addresses may read. Ordinary resources return `size`; malformed scalar metadata returns zero.
+uint64_t shader_resource_buffer_binding_bytes(const ShaderResource& resource);
+
+// Derive the exact host binding range from reflected shader semantics plus the runtime V#. Admitted
+// expansions are the read-only one-record Uint16/Float16 FORMAT tail (zero-padded 2 -> 4 bytes), and
+// a read-only scalar S_BUFFER whose dword-addressable span exceeds its ordinary V# byte footprint.
 // Any marker/runtime mismatch fails closed. Ordinary buffers keep logical==binding==resource.size.
 StorageBufferMaterializationPlan plan_storage_buffer_materialization(
     const SpirvDescriptorBinding& descriptor,

@@ -74,7 +74,10 @@ uint64_t resource_size(const ShaderResource& resource) {
     // bytes following the source table's address. Dependency closure remains on the logical table.
     if (is_gta5_packed_pointer_resource(resource)) return resource.size;
     if (is_indirect_pointer_relocation_resource(resource)) return resource.size;
-    if (resource.host_data_size) return resource.host_data_size;
+    const uint64_t scalar_bytes = resource.scalar_buffer_dword_count
+        ? shader_resource_buffer_binding_bytes(resource) : 0u;
+    if (resource.host_data_size) return std::max(resource.host_data_size, scalar_bytes);
+    if (scalar_bytes) return scalar_bytes;
     if (resource.size) return resource.size;
     if (resource.width && resource.height)
         return static_cast<uint64_t>(resource.width) * resource.height * 4;
@@ -88,6 +91,11 @@ bool append_accesses(const ShaderResourceTable* table, const char* stage,
     for (const auto& resource : table->resources) {
         if (!valid_shader_buffer_table_contract(resource)) {
             error = "resource has an invalid buffer descriptor-table dependency contract";
+            return false;
+        }
+        if (resource.scalar_buffer_dword_count &&
+            !shader_resource_buffer_binding_bytes(resource)) {
+            error = "resource has invalid scalar-buffer dependency metadata";
             return false;
         }
         if (resource.table_index_count) {
@@ -140,6 +148,11 @@ bool append_compute_accesses(const ComputeItem& compute,
     for (const ShaderResource& resource : table->resources) {
         if (!valid_shader_buffer_table_contract(resource)) {
             error = "resource has an invalid buffer descriptor-table dependency contract";
+            return false;
+        }
+        if (resource.scalar_buffer_dword_count &&
+            !shader_resource_buffer_binding_bytes(resource)) {
+            error = "resource has invalid scalar-buffer dependency metadata";
             return false;
         }
     }
