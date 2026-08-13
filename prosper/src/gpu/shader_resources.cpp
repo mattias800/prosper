@@ -611,10 +611,9 @@ uint64_t reflection_entry_bytes(const DescriptorReflectionCacheEntry& entry) {
 uint64_t shader_resource_buffer_binding_bytes(const ShaderResource& resource) {
     if (!resource.scalar_buffer_dword_count) return resource.size;
 
-    // This metadata is authority to expose bytes beyond the ordinary V# footprint. Accept only the
-    // normalized shape produced for a real bounded S_BUFFER consumer; a manually-built table or a
-    // hostile capture must not turn an unrelated generic constant-buffer load into zeros/in-bounds
-    // memory by setting one integer.
+    // This metadata authenticates the emitted per-component scalar bound. Accept only the normalized
+    // shape produced for a real bounded S_BUFFER consumer; a manually-built table or a hostile
+    // capture must not reinterpret an unrelated generic constant-buffer load by setting one integer.
     if (resource.cls != ResourceClass::ConstantBuffer || resource.gpu_addr == 0u ||
         resource.table_index_count != 0u ||
         (resource.srt_offset == UINT32_MAX && resource.sgpr_base == UINT32_MAX &&
@@ -628,17 +627,13 @@ uint64_t shader_resource_buffer_binding_bytes(const ShaderResource& resource) {
         resource.size > kMaximumScalarBufferBytes)
         return 0u;
 
-    // For strided V#s, size retains the independent vector footprint and therefore authenticates
-    // NUM_RECORDS exactly. STRIDE=0 deliberately ignores NUM_RECORDS for scalar bounds and always
-    // exposes one dword, so its byte-size field cannot provide the same cross-check.
-    if (resource.stride) {
-        if (!resource.size || resource.size % resource.stride != 0u ||
-            resource.size / resource.stride != resource.scalar_buffer_dword_count)
-            return 0u;
-    } else if (resource.scalar_buffer_dword_count != 1u) {
+    // #2528: the scalar span IS the descriptor's byte footprint, so it can never exceed `size` and
+    // this function never widens a binding. `size` authenticates the carried dword count exactly,
+    // for strided and unstrided V#s alike — the two no longer need separate cross-checks, because
+    // there is no longer a second bound for them to disagree about.
+    if (resource.size / sizeof(uint32_t) != resource.scalar_buffer_dword_count)
         return 0u;
-    }
-    return std::max<uint64_t>(resource.size, scalar_bytes);
+    return resource.size;
 }
 
 StorageBufferMaterializationPlan plan_storage_buffer_materialization(

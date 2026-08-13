@@ -2572,10 +2572,11 @@ int main() {
                   sizeof(bounded_sbuffer_outer),
           "scalar SOFFSET plus OFFSET wraps in 32 bits before bounds evaluation");
 
-    // STRIDE participates in S_BUFFER bounds mode but never scales its address. Four stride-1
-    // records therefore retain a four-byte vector footprint while exposing four scalar dwords at
-    // byte offsets 0, 4, 8 and 12. The explicit count must drive both safe emission and the staged
-    // backing span; deriving either value from size/4 would collapse the legal last three reads.
+    // STRIDE never scales an S_BUFFER address, but it does scale the BOUND: the addressable span is
+    // `(stride ? stride : 1) * num_records` bytes, which is the V#'s own footprint (#2528). Four
+    // stride-1 records are therefore four bytes total — exactly one addressable scalar dword, not
+    // four. Reading NUM_RECORDS as a dword count instead stages 16 bytes and turns the three
+    // architecturally-zero reads at byte offsets 4, 8 and 12 into unrelated host memory.
     alignas(16) static uint32_t narrow_stride_sbuffer_backing[4] = {
         0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
     };
@@ -2620,18 +2621,18 @@ int main() {
                   *narrow_stride_sbuffer_descriptor, *narrow_stride_sbuffer_resource)
             : StorageBufferMaterializationPlan{};
     CHECK(narrow_stride_sbuffer_uses.size() == 1u &&
-              narrow_stride_sbuffer_uses[0].scalar_buffer_dword_count == 4u &&
+              narrow_stride_sbuffer_uses[0].scalar_buffer_dword_count == 1u &&
               narrow_stride_sbuffer_resource && narrow_stride_sbuffer_resource->size == 4u &&
               narrow_stride_sbuffer_resource->stride == 1u &&
-              narrow_stride_sbuffer_resource->scalar_buffer_dword_count == 4u &&
-              shader_resource_buffer_binding_bytes(*narrow_stride_sbuffer_resource) == 16u &&
+              narrow_stride_sbuffer_resource->scalar_buffer_dword_count == 1u &&
+              shader_resource_buffer_binding_bytes(*narrow_stride_sbuffer_resource) == 4u &&
               !narrow_stride_sbuffer_spirv.empty() && narrow_stride_sbuffer_report.ok() &&
               count_spirv_opcode(narrow_stride_sbuffer_spirv,
                                  176u /* OpULessThan */) >= 4u &&
               narrow_stride_sbuffer_plan.valid &&
-              narrow_stride_sbuffer_plan.logical_bytes == 16u &&
-              narrow_stride_sbuffer_plan.binding_bytes == 16u,
-          "stride-1 S_BUFFER retains four scalar dwords without changing its V# footprint");
+              narrow_stride_sbuffer_plan.logical_bytes == 4u &&
+              narrow_stride_sbuffer_plan.binding_bytes == 4u,
+          "stride-1 S_BUFFER bounds its scalar dwords by the V# byte footprint");
 
     // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
     // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
