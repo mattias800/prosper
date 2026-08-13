@@ -72,6 +72,28 @@ enum class VertexFetchIndexMode : uint32_t {
     Instance = 3,
 };
 
+// How a descriptor-array element is selected. Keep the selector shape separate from the declared
+// array arity: `table_index_count` describes the Vulkan binding, while this enum describes the
+// guest value that chooses one element at execution time.
+enum class BufferTableSelectorMode : uint32_t {
+    None = 0,
+    UserSgprIndex = 1,
+    DynamicSbufferByteOffset = 2,
+};
+
+// One concrete V# in a runtime-selected buffer descriptor table. The raw words are the input-side
+// descriptor identity; the normalized fields are the exact backing contract used by capture,
+// dependency analysis, and the Vulkan backend. Replay fills host_data from the entry's captured
+// blob while preserving gpu_addr as its logical guest identity.
+struct ShaderBufferTableEntry {
+    std::array<uint32_t, 4> vsharp{};
+    uint64_t gpu_addr = 0;
+    uint32_t size = 0;
+    uint32_t stride = 0;
+    uint8_t* host_data = nullptr;
+    uint64_t host_data_size = 0;
+};
+
 // Decode an RDNA2 (GFX10/PS5) combined seven-bit buffer FORMAT field, used by both V# descriptors
 // and MTBUF instructions, into the recompiler's data-format contract. Unknown values stay explicit.
 void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components);
@@ -204,11 +226,9 @@ struct ShaderResource {
     // is not table-indexed and the stride below is inert, so existing resources are unaffected by
     // construction. When non-zero, `binding` names the ARRAY and the shader supplies the element.
     //
-    // Nothing produces these yet. This stage is representation only; the following stages teach
-    // reflection and validation to see an array, emit the indexed access, and materialise the entries.
-    // The count is carried here first so those stages have something to agree about, and so a
-    // half-finished lift cannot be mistaken for a working one: a resource with a count but no
-    // reflection support must be REJECTED, not bound.
+    // Producers must supply the complete concrete payload below. Reflection, validation, SPIR-V
+    // emission and the live compute backend all agree on this exact arity; a partial lift is rejected
+    // rather than silently binding element zero.
     uint32_t      table_index_count = 0;
 
     // Byte stride between consecutive descriptors in the guest table. 16 for a V#, 32 for a T#; kept
@@ -228,6 +248,17 @@ struct ShaderResource {
     // remaining step. Keeping the two apart matters: a wrong index reads a valid descriptor from the
     // wrong slot, which renders confidently wrong content rather than failing.
     uint32_t      table_index_sgpr = 0xFFFFFFFFu;
+
+    // Selector contract for this array. A user-SGPR selector names `table_index_sgpr`; a dynamic
+    // scalar-buffer selector names the exact descriptor-load instruction in `table_load_pc` and
+    // interprets its runtime scalar value as a byte offset through `table_entry_stride`.
+    BufferTableSelectorMode table_selector_mode = BufferTableSelectorMode::None;
+    uint32_t      table_load_pc = 0xFFFFFFFFu;
+
+    // Concrete buffer descriptors available to this dispatch. `table_index_count` remains the
+    // declared descriptor-set arity and is intentionally not derived from this payload; every
+    // production boundary requires exact equality so a partially populated table fails visibly.
+    std::vector<ShaderBufferTableEntry> table_entries;
 
     // Exact input-side origin for a DIRECT four-dword V# in the PM4 SH register file. This is
     // runtime realization provenance only; it does not affect descriptor binding or shader-cache
@@ -415,6 +446,7 @@ inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& reso
 inline constexpr uint32_t kGtaSelectedSbufferRecord4Soffset = 480u;
 inline constexpr uint32_t kGtaSelectedSbufferZeroChainSoffset = UINT32_MAX - 1u;
 inline constexpr uint32_t kGtaSelectedSbufferAllOobSoffset = UINT32_MAX - 2u;
+inline constexpr uint32_t kGtaSelectedSbufferNullRecord4Soffset = UINT32_MAX - 3u;
 
 inline bool is_gta5_selected_sbuffer_descriptor(const ShaderResource& resource) {
     if (resource.cls != ResourceClass::ConstantBuffer || resource.fetch_pc != 153u)
@@ -428,6 +460,12 @@ inline bool is_gta5_selected_sbuffer_descriptor(const ShaderResource& resource) 
                            resource.selected_sbuffer_words.end(),
                            [](uint32_t word) { return word == 0u; });
     if (resource.selected_sbuffer_soffset == kGtaSelectedSbufferAllOobSoffset)
+        return resource.gpu_addr > 0x10000u && resource.stride == 120u &&
+               resource.size == 600u &&
+               std::all_of(resource.selected_sbuffer_words.begin(),
+                           resource.selected_sbuffer_words.end(),
+                           [](uint32_t word) { return word == 0u; });
+    if (resource.selected_sbuffer_soffset == kGtaSelectedSbufferNullRecord4Soffset)
         return resource.gpu_addr > 0x10000u && resource.stride == 120u &&
                resource.size == 600u &&
                std::all_of(resource.selected_sbuffer_words.begin(),
@@ -647,6 +685,12 @@ struct ShaderResourceTable {
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };
+
+// Validate the generic runtime-selected buffer-array representation. Scalar resources are valid
+// only with an inert table payload; array resources require a coherent selector and one raw,
+// normalized entry per declared element. This does not require host backing -- live resources use
+// guest memory -- but any provided host backing must cover the complete normalized entry.
+bool valid_shader_buffer_table_contract(const ShaderResource& resource);
 
 // Descriptor interface reflected from generated SPIR-V. This deliberately models only descriptor
 // classes emitted by prosper's recompiler; I/O variables and inactive declarations are excluded.

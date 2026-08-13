@@ -389,6 +389,27 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Float32;
       vb.num_components=2; vb.binding=3; vb.stride=8; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "vertex_fetch", recompile_vertex(c, sizeof(c)/4, &rt)); }
+    // A compute fetch through a bounded, non-uniform descriptor array. This representative is kept in
+    // the strict corpus because capability-number mistakes can pass the emitter's word-level tests and
+    // even some drivers while spirv-val correctly rejects the module.
+    { const uint32_t c[] = {0x7e060280u,0x7e0802f2u,0xe0300000u,0x80020100u,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer; vb.format=DataFormat::Uint32;
+      vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8;
+      vb.table_index_count=4; vb.table_entry_stride=16; vb.table_index_sgpr=6;
+      vb.table_selector_mode=BufferTableSelectorMode::UserSgprIndex;
+      for (uint32_t index=0; index<vb.table_index_count; ++index) {
+          ShaderBufferTableEntry entry;
+          entry.gpu_addr=0x200000u+index*0x1000u; entry.size=16; entry.stride=4;
+          entry.vsharp={static_cast<uint32_t>(entry.gpu_addr),
+                        static_cast<uint32_t>(entry.gpu_addr>>32u)|(4u<<16u),
+                        4u,(20u<<12u)|0xfacu};
+          vb.table_entries.push_back(entry);
+      }
+      rt.resources.push_back(vb);
+      ComputeShaderConfig config; config.user_sgprs.resize(12);
+      config.local_x=config.local_y=config.local_z=1;
+      dump(dir, "compute_fetch_descriptor_array",
+           recompile_compute(c, std::size(c), &rt, config)); }
     // Fragment: image_sample a texture (T# in s[8:15]).
     { const uint32_t c[] = {0x7e0002ffu,0x3e800000u,0x7e0202ffu,0x3e800000u,0xf0800f08u,0x00820000u,0xf800000fu,0x03020100u,0xbf810000u};
       ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Float32;

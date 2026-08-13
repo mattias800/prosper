@@ -381,6 +381,58 @@ int main() {
     CHECK(!depth_frag.empty() && depth_frag[0] == 0x07230203u,
           "recompiled Sonic Origins' MRTZ-only fragment shader");
 
+    // GTA V exports sample coverage through MRTZ with EN=4: VSRC2 is the sample-mask word. Preserve
+    // the exact live export packet and verify both sides of its Vulkan SampleMask[0] lowering on a
+    // single-sample target. A zero mask removes the covered sample; bit zero keeps it.
+    auto sample_mask_ps = [](uint32_t mask_mov) {
+        return std::vector<uint32_t>{
+            0x7e0002f2u, 0x7e0202f2u, 0x7e0402f2u, 0x7e0602f2u, // v0..v3 = 1.0
+            mask_mov,                                          // v9 = sample mask
+            0xf8000084u, 0x00090000u,                          // exp mrtz off,off,v9,off
+            0xf800180fu, 0x03020100u,                          // exp mrt0 v0,v1,v2,v3 done vm
+            0xbf810000u,
+        };
+    };
+    std::vector<uint32_t> sample_on_ps = sample_mask_ps(0x7e120281u);  // v9 = 1
+    std::vector<uint32_t> sample_off_ps = sample_mask_ps(0x7e120280u); // v9 = 0
+    std::vector<uint32_t> sample_on_frag = recompile_fragment(
+        sample_on_ps.data(), sample_on_ps.size());
+    std::vector<uint32_t> sample_off_frag = recompile_fragment(
+        sample_off_ps.data(), sample_off_ps.size());
+    CHECK(!sample_on_frag.empty() && !sample_off_frag.empty(),
+          "recompiled MRTZ sample-mask export at GTA V's live EN=4 site");
+    if (!sample_on_frag.empty() && !sample_off_frag.empty()) {
+        std::vector<uint8_t> sample_on_px = prosper::test::render_triangle_rgba(
+            vert, sample_on_frag, W, H);
+        std::vector<uint8_t> sample_off_px = prosper::test::render_triangle_rgba(
+            vert, sample_off_frag, W, H);
+        const uint8_t* sample_on_center =
+            sample_on_px.size() == static_cast<size_t>(W) * H * 4
+                ? &sample_on_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+        const uint8_t* sample_off_center =
+            sample_off_px.size() == static_cast<size_t>(W) * H * 4
+                ? &sample_off_px[((static_cast<size_t>(H) / 2) * W + W / 2) * 4] : nullptr;
+        CHECK(sample_on_center && sample_on_center[0] > 0x80 && sample_on_center[1] > 0x80 &&
+                  sample_on_center[2] > 0x80,
+              "MRTZ sample-mask bit zero preserves the covered sample");
+        CHECK(sample_off_center && sample_off_center[2] > 0x80 && sample_off_center[0] < 0x40 &&
+                  sample_off_center[1] < 0x40,
+              "zero MRTZ sample mask removes the covered sample");
+    }
+
+    // Mutation arm: perturb the same live MRTZ instruction from sample-mask EN=4 to unsupported
+    // stencil-reference EN=2. It must fail visibly rather than proving only the surrounding fixture.
+    std::vector<uint32_t> stencil_mutation_ps = sample_on_ps;
+    stencil_mutation_ps[5] = 0xf8000082u;
+    CHECK(recompile_fragment(stencil_mutation_ps.data(), stencil_mutation_ps.size()).empty(),
+          "same-site MRTZ stencil mutation remains fail-visible");
+
+    const uint32_t sample_mask_only_ps[] = {
+        0x7e120281u, 0xf8001884u, 0x00090000u, 0xbf810000u,
+    };
+    CHECK(!recompile_fragment(sample_mask_only_ps, std::size(sample_mask_only_ps)).empty(),
+          "MRTZ sample-mask-only fragment passes the supported-export gate");
+
     // Sonic's bloom combine detects NaNs with `v_cmp_u_f32 vcc, v6, v6`. Opcode 0x08 is the
     // unordered predicate (true when either source is NaN), distinct from the six ordered compares.
     const uint32_t unordered_compare_ps[] = {

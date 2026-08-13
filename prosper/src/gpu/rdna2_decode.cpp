@@ -88,7 +88,7 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::SOP1 &&
         ((in.opcode >= 0x24u && in.opcode <= 0x2bu) ||
          in.opcode == 0x37u || in.opcode == 0x38u ||
-         in.opcode == 0x3cu || in.opcode == 0x40u || in.opcode == 0x44u))
+         sop1_opcode_writes_exec_b32(in.opcode)))
         return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&

@@ -321,6 +321,65 @@ int main() {
               ordinary_graph.external_leaves[1].access.addr == resolve.color1_base,
           "the same zero-MRT1 state without MODE=RESOLVE does not invent a destination write");
 
+    DrawItem table_producer;
+    table_producer.draw_index = 90;
+    table_producer.command_order = 90;
+    table_producer.color0_base = 0xd000;
+    table_producer.color0_width = table_producer.color0_height = 1;
+    table_producer.ps.color_write_mask = 0xf;
+    DrawItem table_consumer;
+    table_consumer.draw_index = 91;
+    table_consumer.command_order = 91;
+    table_consumer.vrt = std::make_shared<ShaderResourceTable>();
+    ShaderResource descriptor_array;
+    descriptor_array.cls = ResourceClass::ConstantBuffer;
+    descriptor_array.format = DataFormat::Uint32;
+    descriptor_array.num_components = 1;
+    descriptor_array.stride = 4;
+    descriptor_array.binding = 2;
+    descriptor_array.table_index_count = 2;
+    descriptor_array.table_entry_stride = 120;
+    descriptor_array.table_selector_mode =
+        BufferTableSelectorMode::DynamicSbufferByteOffset;
+    descriptor_array.table_load_pc = 202;
+    for (uint64_t address : {0xd000ull, 0xe000ull}) {
+        ShaderBufferTableEntry entry;
+        entry.gpu_addr = address;
+        entry.size = 4;
+        entry.stride = 4;
+        entry.vsharp = {
+            static_cast<uint32_t>(address),
+            static_cast<uint32_t>(address >> 32u) | (entry.stride << 16u),
+            1u,
+            0x00014facu,
+        };
+        descriptor_array.table_entries.push_back(entry);
+    }
+    table_consumer.vrt->resources.push_back(descriptor_array);
+    GpuReplayFrame table_replay;
+    table_replay.items = {table_producer, table_consumer};
+    table_replay.operations = {
+        {SubmitOperationKind::Draw, 90, 90, true},
+        {SubmitOperationKind::Draw, 91, 91, true},
+    };
+    GpuDependencyGraph table_graph;
+    CHECK(build_gpu_dependency_graph(table_replay, table_graph, error) &&
+              table_graph.edges.size() == 1 &&
+              table_graph.edges[0].producer_operation == 0 &&
+              table_graph.edges[0].consumer_operation == 1 &&
+              table_graph.edges[0].access.addr == 0xd000 &&
+              table_graph.external_leaves.size() == 1 &&
+              table_graph.external_leaves[0].access.addr == 0xe000,
+          "dependency closure enumerates every concrete descriptor-array backing");
+
+    GpuReplayFrame short_table_replay = table_replay;
+    short_table_replay.items[1].vrt = std::make_shared<ShaderResourceTable>(
+        *table_replay.items[1].vrt);
+    short_table_replay.items[1].vrt->resources[0].table_entries.pop_back();
+    CHECK(!build_gpu_dependency_graph(short_table_replay, table_graph, error) &&
+              error == "resource has an invalid buffer descriptor-table dependency contract",
+          "same-resource mutation: dependency analysis rejects a short descriptor-array payload");
+
     replay.operations[4].realized = true;
     CHECK(!build_gpu_dependency_graph(replay, graph, error) &&
           error.find("no materialized item") != std::string::npos,

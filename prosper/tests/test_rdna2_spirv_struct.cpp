@@ -1634,6 +1634,98 @@ int main() {
     }
     printf("  [ok]   fragment private spill/fill emits structurally valid Function storage\n");
 
+    // GTA V's material PS saves EXEC as a B64 scalar pair, writes the two physical words into
+    // fixed lanes of v20, crosses a non-lexical CFG region, and restores them near the export.
+    // Fragment shaders establish their exact Wave64 contract through module metadata rather than
+    // native_subgroup_size, so the save must materialize the same ballot dwords already supported by
+    // the compute path. Read both lanes as ordinary scalar data after the dispatcher to ensure the
+    // low word does not accidentally stay in the Bool-slot domain or disappear at a block boundary.
+    const uint32_t fragment_exec_ballot_lane_spill[] = {
+        0xbeac047eu,                         // pc0: s_mov_b64 s[44:45], exec
+        0xd7610014u, 0x0001022du,            // pc1: exact GTA pc28 v_writelane v20,s45,1
+        0xd7610014u, 0x0001002cu,            // pc3: exact GTA pc43 v_writelane v20,s44,0
+        0x7e040280u,                         // pc5:  v_mov_b32 v2,0
+        0x7e060280u,                         // pc6:  v_mov_b32 v3,0
+        0x7e080280u,                         // pc7:  v_mov_b32 v4,0
+        0x7e0a0280u,                         // pc8:  v_mov_b32 v5,0
+        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc,v0,v1
+        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc,v0,v1
+        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crosses pc10 region)
+        0x7e040281u,                         // pc13: v_mov_b32 v2,1
+        0x7e060281u,                         // pc14: v_mov_b32 v3,1
+        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc,v0,v1
+        0xbf860002u,                         // pc16: s_cbranch_vccz -> pc19
+        0x7e080281u,                         // pc17: v_mov_b32 v4,1
+        0xbf820001u,                         // pc18: s_branch -> pc20
+        0x7e0a0281u,                         // pc19: v_mov_b32 v5,1
+        0xd7600006u, 0x00010114u,            // pc20: v_readlane_b32 s6,v20,0
+        0xd7600007u, 0x00010314u,            // pc22: v_readlane_b32 s7,v20,1
+        0x7e000206u,                         // pc24: v_mov_b32 v0,s6
+        0x7e020207u,                         // pc25: v_mov_b32 v1,s7
+        0xbefe0406u,                         // pc26: exact GTA pc660 s_mov_b64 exec,s[6:7]
+        0x7e040280u, 0x7e0602f2u,
+        0xf800000fu, 0x03020100u,             // exp mrt0 v0,v1,v2,v3
+        0xbf810000u,
+    };
+    const auto fragment_exec_ballot_lane_spill_spv = recompile_fragment(
+        fragment_exec_ballot_lane_spill, std::size(fragment_exec_ballot_lane_spill));
+    if (fragment_exec_ballot_lane_spill_spv.empty() ||
+        !has_opcode(fragment_exec_ballot_lane_spill_spv, 251) ||
+        !has_opcode(fragment_exec_ballot_lane_spill_spv, 339) ||
+        fragment_spirv_required_subgroup_size(fragment_exec_ballot_lane_spill_spv) != 64 ||
+        !(fragment_spirv_required_subgroup_reasons(fragment_exec_ballot_lane_spill_spv) &
+          prosper::gpu::kFragmentWaveReasonWaveBallot) ||
+        !(fragment_spirv_required_subgroup_features(fragment_exec_ballot_lane_spill_spv) &
+          prosper::gpu::kFragmentSubgroupBallot) ||
+        fragment_subgroup_features_supported(
+            fragment_spirv_required_subgroup_features(fragment_exec_ballot_lane_spill_spv),
+            prosper::gpu::kFragmentSubgroupVote |
+                prosper::gpu::kFragmentSubgroupArithmetic |
+                prosper::gpu::kFragmentSubgroupShuffle) ||
+        !type_result_ids_are_nonzero(fragment_exec_ballot_lane_spill_spv, nullptr) ||
+        !phi_ids_are_nonzero(fragment_exec_ballot_lane_spill_spv)) {
+        printf("  [FAIL] fragment EXEC ballot words did not survive the exact V_WRITELANE sites\n");
+        return 1;
+    }
+
+    // Same producer site, but M0 has neither mask nor scalar provenance here. This mutation must
+    // remain fail-visible instead of granting every S_MOV_B64 source a fragment ballot spelling.
+    uint32_t fragment_exec_ballot_lane_spill_mutated[
+        std::size(fragment_exec_ballot_lane_spill)];
+    std::copy(std::begin(fragment_exec_ballot_lane_spill),
+              std::end(fragment_exec_ballot_lane_spill),
+              std::begin(fragment_exec_ballot_lane_spill_mutated));
+    fragment_exec_ballot_lane_spill_mutated[0] = 0xbeac047cu; // s_mov_b64 s[44:45],m0
+    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
+                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+        printf("  [FAIL] same-site unproven S_MOV_B64 source received a fragment ballot\n");
+        return 1;
+    }
+
+    std::copy(std::begin(fragment_exec_ballot_lane_spill),
+              std::end(fragment_exec_ballot_lane_spill),
+              std::begin(fragment_exec_ballot_lane_spill_mutated));
+    fragment_exec_ballot_lane_spill_mutated[2] =
+        0x0001027cu; // exact GTA pc28 site: v_writelane_b32 v20,m0,1
+    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
+                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+        printf("  [FAIL] exact V_WRITELANE site accepted an unproven scalar source\n");
+        return 1;
+    }
+
+    std::copy(std::begin(fragment_exec_ballot_lane_spill),
+              std::end(fragment_exec_ballot_lane_spill),
+              std::begin(fragment_exec_ballot_lane_spill_mutated));
+    fragment_exec_ballot_lane_spill_mutated[26] =
+        0xbefe0408u; // exact restore site: s_mov_b64 exec,s[8:9]
+    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
+                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+        printf("  [FAIL] exact EXEC restore site accepted an absent scalar pair\n");
+        return 1;
+    }
+    printf("  [ok]   fragment EXEC ballot pair round-trips through exact V_WRITELANE sites\n");
+
     // #2441: the fragment skip diagnostic must say WHICH cross-lane form raised the wave64 contract,
     // because the two have opposite prospects under a wave32 lowering. A vote MAY be width-agnostic
     // (two 32-lane votes union to the same executed-pixel set); a ballot never is, since its bits

@@ -730,6 +730,30 @@ int main() {
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
 
+    // GTA V also supplies a direct T# as eight exact zero entry SGPRs. MIMG proves the register
+    // class, and the sampled-image materializer gives that architectural null state zero-sample
+    // semantics. The normal seed plausibility gate must not discard it before materialization.
+    uint32_t direct_null_seed[12]{};
+    std::copy(seed5d + 8, seed5d + 12, direct_null_seed + 8);
+    std::vector<SrtUse> direct_null_uses;
+    resolve_dynamic_fetch(k5d, std::size(k5d), direct_null_seed,
+                          std::size(direct_null_seed), 0, &direct_null_uses);
+    CHECK(direct_null_uses.size() == 1 && direct_null_uses[0].kind == 0 &&
+              direct_null_uses[0].key == 0xffffffffu &&
+              direct_null_uses[0].use_pc == 0 &&
+              std::all_of(direct_null_uses[0].t8.begin(), direct_null_uses[0].t8.end(),
+                          [](uint32_t word) { return word == 0; }),
+          "exact-null direct user-SGPR T# reaches sampled-image materialization");
+
+    // Same instruction and same base-zero descriptor, but one non-base word is nonzero. This must
+    // fail the exact-null exception rather than broadening it to malformed base-zero T# values.
+    direct_null_seed[2] = 1;
+    std::vector<SrtUse> mutated_direct_null_uses;
+    resolve_dynamic_fetch(k5d, std::size(k5d), direct_null_seed,
+                          std::size(direct_null_seed), 0, &mutated_direct_null_uses);
+    CHECK(mutated_direct_null_uses.empty(),
+          "nonzero word at the same direct T# site fails the exact-null exception");
+
     // Astro Bot's world-map kernel uses IMAGE_BVH_INTERSECT_RAY with a compact four-dword BVH
     // descriptor in s[16:19]. It must not be mistaken for an eight-dword texture descriptor.
     alignas(256) static uint32_t astro_bvh_backing[1024]{};
@@ -869,6 +893,71 @@ int main() {
                                 std::size(shader_constant_dead_fetch),
                                 constant_branch_seed.data(), constant_branch_seed.size(), 0).empty(),
           "dynamic resource discovery ignores the provably dead buffer fetch");
+
+    // Scalar ALU opcodes the constant folder did not model. Every word below was produced by
+    // `llvm-mc -arch=amdgcn -mcpu=gfx1030 -show-encoding`, not by reading this repo's own tables --
+    // prosper's decoder is upstream of those tables, so it cannot check them, and #2481 records a
+    // mnemonic error that survived three internally consistent internal anchors and inverted a
+    // frontier conclusion.
+    //
+    // These arms discriminate: without the corresponding fold entry, `shader_constant_operand`
+    // reports the shifted value unknown, `shader_constant_compare` declines, and the specializer
+    // returns 0 with the dead block retained. Verified by removing case 0x1e and re-running --
+    // the first arm reports 0 rather than 1.
+    const uint32_t shifted_dead_fetch[] = {
+        0xBE800381u,             // pc0: s_mov_b32 s0, 1
+        0x8F018300u,             // pc1: s_lshl_b32 s1, s0, 3   -> 8
+        0xBF078801u,             // pc2: s_cmp_lg_u32 s1, 8     -> SCC = (8 != 8) = false
+        0xBF840002u,             // pc3: s_cbranch_scc0 +2      -> taken, skips pc4..5
+        0xE0002000u, 0x80030100u,// pc4: dead buffer_load_format_x
+        0xBF810000u,             // pc6: s_endpgm
+    };
+    std::vector<Rdna2Inst> shifted_branch;
+    rdna2_walk(shifted_dead_fetch, std::size(shifted_dead_fetch), shifted_branch);
+    CHECK(rdna2_specialize_shader_constant_branches(shifted_branch) == 1 &&
+              std::none_of(shifted_branch.begin(), shifted_branch.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 4; }),
+          "s_lshl_b32 folds, so its SCC branch prunes the dead resource block");
+
+    // The two right shifts, each pinned against the OTHER one. The shifted value has bit 31 set,
+    // which is the whole point: an operand with bit 31 clear cannot separate them, because
+    // `8 >> 3` is 1 under both a logical and an arithmetic shift. A first version of this arm used
+    // 8 and would have passed with 0x20 and 0x22 swapped -- and since both entries arrived in one
+    // commit, nothing else pinned them apart. Same failure as comparing against 8 instead of 1 at
+    // the left-vs-right level, one level deeper.
+    //
+    // 0x80000000 >> 28 is 0x8 logically and 0xFFFFFFF8 arithmetically, so each arm's compare
+    // constant is the OTHER opcode's wrong answer's complement: the logical arm compares against 8
+    // and the arithmetic arm against -8. Mutation-verified in both directions.
+    const uint32_t logical_shift_fetch[] = {
+        0xBE8003FFu, 0x80000000u,// pc0: s_mov_b32 s0, 0x80000000
+        0x90019C00u,             // pc2: s_lshr_b32 s1, s0, 28  -> 0x00000008
+        0xBF078801u,             // pc3: s_cmp_lg_u32 s1, 8     -> SCC = (8 != 8) = false
+        0xBF840002u,             // pc4: s_cbranch_scc0 +2      -> taken, skips pc5..6
+        0xE0002000u, 0x80030100u,// pc5: dead buffer_load_format_x
+        0xBF810000u,             // pc7: s_endpgm
+    };
+    std::vector<Rdna2Inst> logical_shift;
+    rdna2_walk(logical_shift_fetch, std::size(logical_shift_fetch), logical_shift);
+    CHECK(rdna2_specialize_shader_constant_branches(logical_shift) == 1 &&
+              std::none_of(logical_shift.begin(), logical_shift.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 5; }),
+          "s_lshr_b32 folds LOGICALLY -- 0x80000000 >> 28 is 8, not -8");
+
+    const uint32_t arithmetic_shift_fetch[] = {
+        0xBE8003FFu, 0x80000000u,// pc0: s_mov_b32 s0, 0x80000000
+        0x91019C00u,             // pc2: s_ashr_i32 s1, s0, 28  -> 0xFFFFFFF8
+        0xBF07C801u,             // pc3: s_cmp_lg_u32 s1, -8    -> SCC = (-8 != -8) = false
+        0xBF840002u,             // pc4: s_cbranch_scc0 +2      -> taken, skips pc5..6
+        0xE0002000u, 0x80030100u,// pc5: dead buffer_load_format_x
+        0xBF810000u,             // pc7: s_endpgm
+    };
+    std::vector<Rdna2Inst> arithmetic_shift;
+    rdna2_walk(arithmetic_shift_fetch, std::size(arithmetic_shift_fetch), arithmetic_shift);
+    CHECK(rdna2_specialize_shader_constant_branches(arithmetic_shift) == 1 &&
+              std::none_of(arithmetic_shift.begin(), arithmetic_shift.end(),
+                           [](const Rdna2Inst& in) { return in.pc == 5; }),
+          "s_ashr_i32 folds ARITHMETICALLY -- 0x80000000 >> 28 is -8, not 8");
 
     // Exact instruction words and PCs from the live traversal loop. The loop-selected BVH sites at
     // PC968/1007 can write work into v59/v60 and return through PC1671/1674, so shader-constant
@@ -2144,8 +2233,29 @@ int main() {
     CHECK(abs_adjacent_uses.size() == 1 && abs_adjacent_uses[0].kind == 0 &&
               abs_adjacent_uses[0].use_pc == 3 &&
               abs_adjacent_uses[0].is_storage_image &&
-              abs_adjacent_uses[0].t8 == expected_atomic_t8,
-          "Astro s_abs_i32 preserves the adjacent x8 image-table pointer");
+              abs_adjacent_uses[0].t8 == expected_atomic_t8 &&
+              abs_adjacent_uses[0].descriptor_source_addr == abs_adjacent_image_addr,
+          "Astro s_abs_i32 preserves the adjacent x8 image and its exact table source");
+
+    // Mutate the exact provenance path after the same x8 load: duplicate source lane zero into
+    // lane one. The live T# remains fully known and all words descend from the same load window,
+    // but it no longer equals the contiguous 32 bytes at that address. A window-only origin would
+    // make the post-submit probe report a false change even when memory stayed untouched.
+    const uint32_t reordered_image_load[] = {
+        0xf40c0907u, 0xfa000000u,   // s_load_dwordx8 s[36:43], s[14:15], 0
+        0xbea50324u,                // s_mov_b32 s37, s36 (duplicate/reorder one source lane)
+        0xf0200108u, 0x00090600u,   // image_store v6, v0, s[36:43] dmask:x 2D
+        0xbf810000u,
+    };
+    std::vector<SrtUse> reordered_image_uses;
+    resolve_dynamic_fetch(reordered_image_load, std::size(reordered_image_load),
+                          abs_adjacent_seed, std::size(abs_adjacent_seed), 0,
+                          &reordered_image_uses);
+    CHECK(reordered_image_uses.size() == 1 && reordered_image_uses[0].kind == 0 &&
+              reordered_image_uses[0].use_pc == 3 &&
+              reordered_image_uses[0].t8[1] == reordered_image_uses[0].t8[0] &&
+              reordered_image_uses[0].descriptor_source_addr == 0,
+          "same-window lane reorder drops contiguous image-source provenance");
 
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
@@ -4111,6 +4221,32 @@ int main() {
           direct_copy_uses[0].v4[0] == direct_copy_seed[4],
           "#636: Dead Cells s4 destination resolves only at its format-store instruction");
 
+    // A Wave32 B32 SAVEEXEC writes only its explicit one-word SDST. GTA V places that saved mask in
+    // s3 immediately before a still-live V# in s[4:7]; pair-erasing the unmodeled SOP1 falsely
+    // invalidated the descriptor before its final stores.
+    const std::array<uint32_t, 4> adjacent_b32_saveexec = {
+        0xBE833C6Bu,                // s_and_saveexec_b32 s3, vcc_hi
+        0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> adjacent_b32_saveexec_uses;
+    resolve_dynamic_fetch(adjacent_b32_saveexec.data(), adjacent_b32_saveexec.size(),
+                          direct_copy_seed, std::size(direct_copy_seed), 0,
+                          &adjacent_b32_saveexec_uses);
+    CHECK(adjacent_b32_saveexec_uses.size() == 1 &&
+              adjacent_b32_saveexec_uses[0].use_pc == 1 &&
+              adjacent_b32_saveexec_uses[0].v4[0] == direct_copy_seed[4],
+          "B32 SAVEEXEC preserves the adjacent descriptor's first word");
+
+    auto overlapping_b32_saveexec = adjacent_b32_saveexec;
+    overlapping_b32_saveexec[0] = 0xBE843C6Bu; // same SAVEEXEC site, now SDST=s4
+    std::vector<SrtUse> overlapping_b32_saveexec_uses;
+    resolve_dynamic_fetch(overlapping_b32_saveexec.data(), overlapping_b32_saveexec.size(),
+                          direct_copy_seed, std::size(direct_copy_seed), 0,
+                          &overlapping_b32_saveexec_uses);
+    CHECK(overlapping_b32_saveexec_uses.empty(),
+          "same-site SAVEEXEC destination mutation invalidates the overlapped descriptor");
+
     ShaderResourceTable direct_copy_table;
     add_compute_buffer_resources(direct_copy_table, direct_copy,
                                  sizeof(direct_copy) / sizeof(direct_copy[0]),
@@ -5055,6 +5191,36 @@ int main() {
     }
     CHECK(tagged_tex && tagged_cbuf,
           "tagged scalar Base48 pointer canonicalizes to the mapped descriptor table");
+
+    // Some dispatch tables first normalize the high address dword with s_pack_ll_b32_b16. Keep the
+    // low 16 address bits from s9 and clear the aperture bits in its upper half before interpreting
+    // s[8:9] as a scalar-load base. This exercises the production instruction walk and mapped-memory
+    // read, not a standalone ALU helper.
+    const uint32_t packed_tagged_k5[] = {
+        0x99098009u,                // s_pack_ll_b32_b16 s9, s9, 0
+        0xF40C0304u, 0xFA000040u,   // s_load_dwordx8 s[12:19], s[8:9], 0x40
+        0xF4080504u, 0xFA000080u,   // s_load_dwordx4 s[20:23], s[8:9], 0x80
+        0xF0800F08u, 0x00A30000u,   // image_sample v[0:3], v[0:1], s[12:19], s[20:23]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> packed_tagged_uses;
+    resolve_dynamic_fetch(packed_tagged_k5, std::size(packed_tagged_k5), tagged_seed5, 2, 8,
+                          &packed_tagged_uses);
+    bool packed_tagged_tex = false;
+    for (const auto& u : packed_tagged_uses)
+        if (u.kind == 0 && u.key == 0x40 && u.t8[0] == table[16]) packed_tagged_tex = true;
+    CHECK(packed_tagged_tex,
+          "s_pack_ll-normalized scalar pointer resolves its mapped descriptor table");
+
+    std::array<uint32_t, std::size(packed_tagged_k5)> packed_zero_high{};
+    std::copy(std::begin(packed_tagged_k5), std::end(packed_tagged_k5),
+              packed_zero_high.begin());
+    packed_zero_high[0] = 0x9909807Cu; // same pack site, but untracked m0 supplies its low half
+    std::vector<SrtUse> packed_zero_high_uses;
+    resolve_dynamic_fetch(packed_zero_high.data(), packed_zero_high.size(), tagged_seed5, 2, 8,
+                          &packed_zero_high_uses);
+    CHECK(packed_zero_high_uses.empty(),
+          "an untracked low-half source at the pack site does not fabricate a descriptor mapping");
 
     // Kernel 5m (#398): same as k5 but the T# s_load uses m0 as SOFFSET (field 124), a special register
     // the fold does not track. It must NOT be folded to offset 0 and snapshotted — that would decode a T#

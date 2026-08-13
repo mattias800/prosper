@@ -181,6 +181,82 @@ int main() {
               error.find("has no captured bytes") != std::string::npos,
           "resource without captured bytes fails visibly");
 
+    tools::ComputeResourceOverrideSelector compute_selector;
+    CHECK(tools::parse_compute_resource_override_selector("0x1:040", compute_selector) &&
+              compute_selector.compute_index == 1 && compute_selector.binding == 32,
+          "compute resource override uses strict explicit-base index and binding grammar");
+    CHECK(!tools::parse_compute_resource_override_selector("1", compute_selector) &&
+              !tools::parse_compute_resource_override_selector("1:2:3", compute_selector) &&
+              !tools::parse_compute_resource_override_selector("-1:32", compute_selector) &&
+              !tools::parse_compute_resource_override_selector("1:-32", compute_selector) &&
+              !tools::parse_compute_resource_override_selector("1junk:32", compute_selector) &&
+              !tools::parse_compute_resource_override_selector("1:0x100000000", compute_selector),
+          "malformed compute resource selectors fail closed");
+
+    gpu::GpuReplayFrame compute_replay;
+    gpu::ComputeItem earlier_compute;
+    earlier_compute.resources = shared_table;
+    gpu::ComputeItem selected_compute;
+    selected_compute.resources = shared_table;
+    gpu::ComputeItem sibling_compute;
+    sibling_compute.resources = shared_table;
+    compute_replay.computes = {earlier_compute, selected_compute, sibling_compute};
+    CHECK(tools::parse_compute_resource_override_selector("1:32", compute_selector),
+          "decimal compute resource selector parses");
+    tools::AppliedComputeResourceOverride applied_compute;
+    CHECK(tools::apply_compute_resource_override(
+              compute_replay, compute_selector, replacement, applied_compute, error),
+          "compute-scoped resource override installs into a captured replay");
+    const auto& changed_compute = compute_replay.computes[1].resources->resources[0];
+    CHECK(compute_replay.computes[1].resources.get() != original_table &&
+              changed_compute.host_data == applied_compute.replacement_bytes->data() &&
+              std::memcmp(changed_compute.host_data, replacement.data(), replacement.size()) == 0 &&
+              applied_compute.original_hash == original_hash &&
+              applied_compute.replacement_hash == expected_replacement_hash &&
+              applied_compute.target.compute_index == 1 &&
+              applied_compute.target.resource_index == 0 &&
+              applied_compute.target.gpu_addr == 0x12345000 &&
+              applied_compute.target.captured_size == 4,
+          "selected compute bytes, hashes, and exact target identity change");
+    CHECK(compute_replay.computes[0].resources.get() == original_table &&
+              compute_replay.computes[2].resources.get() == original_table &&
+              compute_replay.computes[2].resources->resources[0].host_data ==
+                  original_selected_pointer &&
+              captured == captured_expected,
+          "shared sibling computes remain byte-identical after selected override");
+
+    // Mutation arm: perturb the replacement byte consumed by the exact compute table entry installed
+    // above. A second isolated override must expose the new byte/hash without touching either sibling.
+    auto mutated_replacement = replacement;
+    mutated_replacement[0] ^= 0xffu;
+    tools::AppliedComputeResourceOverride mutated_compute;
+    CHECK(tools::apply_compute_resource_override(
+              compute_replay, compute_selector, mutated_replacement, mutated_compute, error) &&
+              compute_replay.computes[1].resources->resources[0].host_data[0] ==
+                  mutated_replacement[0] &&
+              mutated_compute.replacement_hash != expected_replacement_hash &&
+              compute_replay.computes[2].resources->resources[0].host_data ==
+                  original_selected_pointer,
+          "same-site compute replacement mutation changes only the selected dispatch table");
+
+    auto missing_compute = compute_selector;
+    missing_compute.compute_index = 99;
+    tools::AppliedComputeResourceOverride rejected_compute;
+    CHECK(!tools::apply_compute_resource_override(
+              compute_replay, missing_compute, replacement, rejected_compute, error) &&
+              error.find("compute index 99 not found") != std::string::npos,
+          "missing compute index fails visibly");
+    auto missing_compute_binding = compute_selector;
+    missing_compute_binding.binding = 99;
+    CHECK(!tools::apply_compute_resource_override(
+              compute_replay, missing_compute_binding, replacement, rejected_compute, error) &&
+              error.find("binding 99 not found") != std::string::npos,
+          "missing compute binding fails visibly");
+    CHECK(!tools::apply_compute_resource_override(
+              compute_replay, compute_selector, {1, 2, 3}, rejected_compute, error) &&
+              error.find("selected captured compute span is 4 bytes") != std::string::npos,
+          "compute replacement size mismatch fails before changing replay state");
+
     std::printf("%s\n", fails ? "FAILED" : "ALL TESTS PASSED");
     return fails ? 1 : 0;
 }

@@ -1042,6 +1042,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_gta5_cf9200 PRIVATE prosper_core)
   add_test(NAME gta5_cf9200_no_backing COMMAND test_gta5_cf9200)
 
+  add_executable(test_compute_parent_walk tests/test_compute_parent_walk.cpp)
+  target_link_libraries(test_compute_parent_walk PRIVATE prosper_core)
+  add_test(NAME compute_parent_walk COMMAND test_compute_parent_walk)
+
   # Cross-submit readability reuse is valid only while the HLE mapping generation is unchanged.
   add_executable(test_guest_memory_map tests/test_guest_memory_map.cpp)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
@@ -1541,6 +1545,11 @@ if(TARGET prosper_core)
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
+
+      add_executable(test_live_compute_descriptor_array
+                     tests/test_live_compute_descriptor_array.cpp)
+      target_link_libraries(test_live_compute_descriptor_array PRIVATE prosper_live_renderer)
+      add_test(NAME live_compute_descriptor_array COMMAND test_live_compute_descriptor_array)
 
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/test_spirv_builder.cpp)

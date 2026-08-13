@@ -1,13 +1,12 @@
 // test_descriptor_array_emit — the emitter declares an indexed descriptor ARRAY for a table-indexed
 // resource, with the capability set and the OpExtension that SPIR-V 1.3 requires (#2412 stage 4b).
 //
-// Nothing in the guest path sets `table_index_count` yet, so without this test the entire array-emission
-// path is structurally inexpressible in the suite: every other test would pass whether or not the code
-// existed. Same hole test_descriptor_array_render closes on the backend side.
+// The runtime producer remains under proof, so this synthetic resource keeps the bounded array-emission
+// path directly expressible in the suite. The live compute test closes the backend side.
 //
 // What each arm establishes:
 //
-//   1. A table-indexed resource emits OpExtension "SPV_EXT_descriptor_indexing" plus the three
+//   1. A table-indexed resource emits OpExtension "SPV_EXT_descriptor_indexing" plus the two
 //      capabilities. They are core only from SPIR-V 1.5 and this emitter writes 1.3 (0x00010300), so
 //      the extension is mandatory, not optional.
 //   2. The extension is emitted in the RIGHT PLACE. SPIR-V requires OpExtension after every
@@ -69,12 +68,34 @@ static size_t last_index_of(const std::vector<uint32_t>& m, uint32_t op) {
     return found;
 }
 
+static ShaderBufferTableEntry float2_entry(uint64_t address) {
+    ShaderBufferTableEntry entry;
+    entry.gpu_addr = address;
+    entry.size = 16;
+    entry.stride = 8;
+    entry.vsharp = {
+        static_cast<uint32_t>(address),
+        static_cast<uint32_t>(address >> 32u) | (8u << 16u),
+        2u,
+        (64u << 12u) | 0xfacu,
+    };
+    return entry;
+}
+
 int main() {
     printf("== test_descriptor_array_emit ==\n");
 
-    // The vertex-fetch VS used across the render tests: fetches (x,y) from the buffer at binding 3.
-    const uint32_t vs[] = {
-        0x7e060280u, 0x7e0802f2u, 0xe0042000u, 0x80020100u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
+    // A compute fetch of (x,y) from the V# in s[8:11], which maps to binding 3 below. Compute is the
+    // shell that carries guest user SGPRs through push constants; graphics deliberately rejects this
+    // selector mode until it has an equivalent runtime source.
+    const uint32_t cs[] = {
+        0x7e060280u, 0x7e0802f2u, 0xe0300000u, 0x80020100u, 0xbf810000u,
+    };
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);
+    config.local_x = config.local_y = config.local_z = 1;
+    auto recompile = [&](const ShaderResourceTable& table) {
+        return recompile_compute(cs, std::size(cs), &table, config);
     };
 
     auto table_with_arity = [](uint32_t arity) {
@@ -83,12 +104,14 @@ int main() {
         vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32; vb.num_components = 2;
         vb.binding = 3; vb.stride = 8; vb.sgpr_base = 8;
         if (arity) {
-            // Binding 3 -- the binding this shader actually READS. Before #2472 bindings 2 and 3 could
-            // not be arrays, so this had to sit on binding 4 where nothing loaded from it and the access
-            // chain was unreachable. Now the arity goes on the read binding and the selector is testable.
+            // Binding 3 is the binding this shader actually reads, so the selector is testable.
             vb.table_index_count = arity;
             vb.table_entry_stride = 16;
             vb.table_index_sgpr = 6;   // the descriptor index arrives in user SGPR 6
+            vb.table_selector_mode = BufferTableSelectorMode::UserSgprIndex;
+            if (arity <= 4096u)
+                for (uint32_t index = 0; index < arity; ++index)
+                    vb.table_entries.push_back(float2_entry(0x200000u + index * 0x1000u));
         }
         rt.resources.push_back(vb);
         return rt;
@@ -96,26 +119,33 @@ int main() {
 
     // --- Arm 4 first: the CONTROL. An ordinary resource must emit none of this. -------------------
     ShaderResourceTable plain = table_with_arity(0);
-    std::vector<uint32_t> m_plain = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &plain);
+    std::vector<uint32_t> m_plain = recompile(plain);
     CHECK(!m_plain.empty(), "control: ordinary resource still recompiles");
     if (m_plain.empty()) { printf("== FAIL ==\n"); return 1; }
     CHECK(!has_op(m_plain, 10u), "control: an ordinary resource emits NO OpExtension");
     CHECK(!has_capability(m_plain, 5301u) && !has_capability(m_plain, 5302u) &&
-              !has_capability(m_plain, 5306u),
+              !has_capability(m_plain, 5308u),
           "control: an ordinary resource declares NO descriptor-indexing capability");
 
     // --- Arms 1-3: a table-indexed resource ------------------------------------------------------
     ShaderResourceTable indexed = table_with_arity(8);
-    std::vector<uint32_t> m_arr = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &indexed);
+    std::vector<uint32_t> m_arr = recompile(indexed);
     CHECK(!m_arr.empty(), "a table-indexed resource recompiles");
     if (m_arr.empty()) { printf("== FAIL ==\n"); return 1; }
+
+    ShaderResourceTable out_of_range_sgpr = indexed;
+    out_of_range_sgpr.resources[0].table_index_sgpr =
+        static_cast<uint32_t>(config.user_sgprs.size());
+    CHECK(recompile(out_of_range_sgpr).empty(),
+          "same selector-site mutation: an SGPR outside the compute push constants rejects");
 
     CHECK(m_arr[1] == 0x00010300u, "the module is SPIR-V 1.3, which is why the extension is required");
     CHECK(extension_name(m_arr) == "SPV_EXT_descriptor_indexing",
           "OpExtension SPV_EXT_descriptor_indexing is emitted");
     CHECK(has_capability(m_arr, 5301u), "ShaderNonUniform capability declared");
-    CHECK(has_capability(m_arr, 5302u), "RuntimeDescriptorArray capability declared");
-    CHECK(has_capability(m_arr, 5306u), "StorageBufferArrayNonUniformIndexing capability declared");
+    CHECK(!has_capability(m_arr, 5302u),
+          "a bounded fixed array does not request RuntimeDescriptorArray");
+    CHECK(has_capability(m_arr, 5308u), "StorageBufferArrayNonUniformIndexing capability declared");
 
     // Layout: every OpCapability precedes OpExtension, which precedes OpExtInstImport.
     const size_t last_cap = last_index_of(m_arr, 17u);
@@ -133,21 +163,15 @@ int main() {
     // "no runtime array in the module" is false for every module and an assertion on it would either be
     // vacuous or wrong. The fixed-vs-runtime distinction is asserted below on the arity instead.
 
-    // --- An absurd count must not be emitted as a fixed array of that length ----------------------
-    // #2463 gives an unreadable length the sentinel UINT32_MAX. Emitting OpTypeArray with that length
-    // would ask a driver for a 4-billion-descriptor binding, so the emitter degrades to a runtime
-    // array instead. Asserted here so the guard cannot be removed silently once #2463 merges.
+    // --- An absurd count must fail before it can become an unbounded descriptor access ------------
+    // #2463 gives an unreadable length the sentinel UINT32_MAX. A runtime descriptor array would avoid
+    // the impossible fixed declaration, but it cannot provide the concrete upper bound needed to keep
+    // the selector in range. Reject the module instead of turning unreadable metadata into the most
+    // permissive descriptor shape.
     ShaderResourceTable absurd = table_with_arity(0xFFFFFFFFu);
-    std::vector<uint32_t> m_absurd = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &absurd);
-    CHECK(!m_absurd.empty(), "an implausible arity still recompiles");
-    if (!m_absurd.empty()) {
-        bool huge_literal = false;
-        for (auto& e : walk(m_absurd))
-            if (e.first == 43u && e.second + 3 < m_absurd.size() && m_absurd[e.second + 3] == 0xFFFFFFFFu)
-                huge_literal = true;   // OpConstant with the sentinel as its value
-        CHECK(!huge_literal,
-              "an implausible arity is NOT emitted as a fixed array of 4294967295 descriptors");
-    }
+    std::vector<uint32_t> m_absurd = recompile(absurd);
+    CHECK(m_absurd.empty(),
+          "an implausible arity is rejected rather than emitted as an unbounded descriptor access");
 
     // --- The access chain SELECTS an entry, and the selection is decorated NonUniform ---------------
     // These two arms could not exist before #2472: the table-indexed resource had to live on a binding
@@ -202,13 +226,16 @@ int main() {
             vb.num_components = 2;
             vb.binding = 3; vb.stride = 8; vb.sgpr_base = 8;
             vb.table_index_count = 3; vb.table_entry_stride = 16; vb.table_index_sgpr = 6;
+            vb.table_selector_mode = BufferTableSelectorMode::UserSgprIndex;
+            for (uint32_t index = 0; index < vb.table_index_count; ++index)
+                vb.table_entries.push_back(float2_entry(0x300000u + index * 0x1000u));
             rt.resources.push_back(vb);
             return rt;
         };
         ShaderResourceTable decoy_lo = table_with_decoy(9);
         ShaderResourceTable decoy_hi = table_with_decoy(11);
-        std::vector<uint32_t> m_lo = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &decoy_lo);
-        std::vector<uint32_t> m_hi = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &decoy_hi);
+        std::vector<uint32_t> m_lo = recompile(decoy_lo);
+        std::vector<uint32_t> m_hi = recompile(decoy_hi);
         CHECK(!m_lo.empty() && !m_hi.empty(),
               "a binding shared by two resource classes still recompiles");
         CHECK(m_lo == m_hi,
@@ -220,11 +247,33 @@ int main() {
         // the VERTEX BUFFER's own index SGPR must change the module.
         ShaderResourceTable moved = table_with_decoy(9);
         moved.resources[1].table_index_sgpr = 7;
-        std::vector<uint32_t> m_moved = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &moved);
+        std::vector<uint32_t> m_moved = recompile(moved);
         CHECK(!m_moved.empty() && m_moved != m_lo,
               "positive control: moving the VERTEX BUFFER's index SGPR does change the module, so the "
               "equality above is the decoy being ignored rather than the SGPR being unused");
     }
+
+    const uint32_t vs[] = {
+        0x7e060280u, 0x7e0802f2u, 0xe0042000u, 0x80020100u,
+        0xf80008cfu, 0x04030201u, 0xbf810000u,
+    };
+    CHECK(recompile_vertex(vs, std::size(vs), &indexed).empty(),
+          "a graphics user-SGPR array rejects until that shell has a runtime selector source");
+
+    std::vector<uint32_t> typed_array(std::begin(cs), std::end(cs));
+    typed_array[2] = 0xe0042000u; // buffer_load_format_xy through the same s[8:11] descriptor
+    CHECK(recompile_compute(typed_array.data(), typed_array.size(), &indexed, config).empty(),
+          "a typed array access rejects until selected-entry swizzle/default-fill is modeled");
+
+    std::vector<uint32_t> array_store(std::begin(cs), std::end(cs));
+    array_store[2] = 0xe0700000u; // buffer_store_dword through the same descriptor
+    CHECK(recompile_compute(array_store.data(), array_store.size(), &indexed, config).empty(),
+          "an array store remains fail-closed without writeback authority");
+
+    std::vector<uint32_t> array_atomic(std::begin(cs), std::end(cs));
+    array_atomic[2] = 0xe0c80000u; // buffer_atomic_add through the same descriptor
+    CHECK(recompile_compute(array_atomic.data(), array_atomic.size(), &indexed, config).empty(),
+          "an array atomic remains fail-closed without writeback authority");
 
     printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
     return fails ? 1 : 0;

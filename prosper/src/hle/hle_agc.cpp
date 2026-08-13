@@ -2236,7 +2236,13 @@ static void report_submit_order(const char* who, const SubmitCallStamp& st, uint
                     (unsigned long long)fold_seq, (unsigned long long)st.thread,
                     (unsigned long long)(st.ns / 1000ull), dw_num, draws);
     }
-    if (n <= 20 || (n % 20000) == 0) {
+    // Census cadence. The interval was 20000 with no other trigger, and a 165 s GTA V route folds
+    // about 15200 submits -- so after the opening 20 lines the census NEVER FIRED, and the only
+    // surviving evidence of out-of-order folding was the 32 capped event prints above. Two readers
+    // (an author and a reviewer) then reasoned about "31-32 inversions per run" as if it were a
+    // measurement; it was the print cap. Decade triggers make the true count visible on a run of any
+    // realistic length, which is the whole point of counting it.
+    if (n <= 20 || n == 100 || n == 1000 || n == 5000 || n == 10000 || (n % 20000) == 0) {
         // #2192: the guard was `o < 100` against a 128-byte buffer while one entry can reach 45
         // bytes (" t%d=%llu/%llu" with two 20-digit counters), so an admitted iteration could
         // truncate mid-entry and silently drop the threads after it. Append-then-check instead:

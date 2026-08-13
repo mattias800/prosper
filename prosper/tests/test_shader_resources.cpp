@@ -593,6 +593,21 @@ int main() {
     ShaderResource table_indexed = good;
     table_indexed.table_index_count = 8;
     table_indexed.table_entry_stride = 16;
+    table_indexed.table_index_sgpr = 6;
+    table_indexed.table_selector_mode = BufferTableSelectorMode::UserSgprIndex;
+    for (uint32_t index = 0; index < table_indexed.table_index_count; ++index) {
+        ShaderBufferTableEntry entry;
+        entry.gpu_addr = good.gpu_addr + index * 0x100u;
+        entry.size = good.size;
+        entry.stride = good.stride;
+        entry.vsharp = {
+            static_cast<uint32_t>(entry.gpu_addr),
+            static_cast<uint32_t>(entry.gpu_addr >> 32u) | (entry.stride << 16u),
+            entry.size / entry.stride,
+            (22u << 12u) | 0xfacu,
+        };
+        table_indexed.table_entries.push_back(entry);
+    }
     ShaderResourceTable arity; arity.resources.push_back(table_indexed);
     auto arr = validate_spirv_descriptor_interface(spv, &arity, 0, SpirvShaderStage::Vertex);
     CHECK(!arr.ok() && has_issue(arr, DescriptorIssueCode::ArrayBindingArityMismatch),
@@ -636,11 +651,79 @@ int main() {
           "an ordinary non-array binding still reflects exactly one descriptor");
 
     // And the matched pair validates: eight declared against eight supplied raises no arity issue.
-    ShaderResource eight = good; eight.table_index_count = 8; eight.table_entry_stride = 16;
+    ShaderResource eight = table_indexed;
     ShaderResourceTable matched; matched.resources.push_back(eight);
     auto mar = validate_spirv_descriptor_interface(array_spv, &matched, 0, SpirvShaderStage::Vertex);
-    CHECK(!has_issue(mar, DescriptorIssueCode::ArrayBindingArityMismatch),
-          "eight declared descriptors against eight supplied table entries is not an arity mismatch");
+    CHECK(mar.ok(),
+          "eight declared descriptors against eight complete table entries validate");
+
+    ShaderResource controlled_null = eight;
+    controlled_null.table_entries[3].gpu_addr = 0u;
+    controlled_null.table_entries[3].size = 0u;
+    controlled_null.table_entries[3].stride = 4u;
+    controlled_null.table_entries[3].vsharp = {
+        0u, 4u << 16u, 0u, 20u << 12u,
+    };
+    ShaderResourceTable controlled_null_table;
+    controlled_null_table.resources.push_back(controlled_null);
+    const auto controlled_null_report = validate_spirv_descriptor_interface(
+        array_spv, &controlled_null_table, 0, SpirvShaderStage::Vertex);
+    CHECK(controlled_null_report.ok(),
+          "a non-all-zero zero-record V# remains a valid null table entry");
+
+    ShaderResource missing_payload = eight;
+    missing_payload.table_entries.pop_back();
+    ShaderResourceTable missing_payload_table;
+    missing_payload_table.resources.push_back(missing_payload);
+    const auto missing_payload_report = validate_spirv_descriptor_interface(
+        array_spv, &missing_payload_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!missing_payload_report.ok() &&
+              has_issue(missing_payload_report, DescriptorIssueCode::InvalidBufferMetadata),
+          "a declared array whose concrete payload is short rejects at the runtime boundary");
+
+    ShaderResource stale_raw = eight;
+    stale_raw.table_entries[3].vsharp[2] += 1u;
+    ShaderResourceTable stale_raw_table;
+    stale_raw_table.resources.push_back(stale_raw);
+    const auto stale_raw_report = validate_spirv_descriptor_interface(
+        array_spv, &stale_raw_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!stale_raw_report.ok() &&
+              has_issue(stale_raw_report, DescriptorIssueCode::InvalidBufferMetadata),
+          "an entry whose normalized byte span disagrees with its raw V# rejects");
+
+    ShaderResource stale_format = eight;
+    stale_format.table_entries[3].vsharp[3] =
+        (stale_format.table_entries[3].vsharp[3] & ~(0x7fu << 12u)) |
+        (20u << 12u);
+    ShaderResourceTable stale_format_table;
+    stale_format_table.resources.push_back(stale_format);
+    const auto stale_format_report = validate_spirv_descriptor_interface(
+        array_spv, &stale_format_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!stale_format_report.ok() &&
+              has_issue(stale_format_report, DescriptorIssueCode::InvalidBufferMetadata),
+          "an entry whose raw V# format disagrees with the parent binding rejects");
+
+    ShaderResource unsupported_control = eight;
+    unsupported_control.table_entries[3].vsharp[3] |= 1u << 19u;
+    ShaderResourceTable unsupported_control_table;
+    unsupported_control_table.resources.push_back(unsupported_control);
+    const auto unsupported_control_report = validate_spirv_descriptor_interface(
+        array_spv, &unsupported_control_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!unsupported_control_report.ok() &&
+              has_issue(unsupported_control_report,
+                        DescriptorIssueCode::InvalidBufferMetadata),
+          "an array V# using an unrepresented control bit rejects at the shared contract");
+
+    ShaderResource unsupported_dst_sel = eight;
+    unsupported_dst_sel.table_entries[3].vsharp[3] ^= 1u;
+    ShaderResourceTable unsupported_dst_sel_table;
+    unsupported_dst_sel_table.resources.push_back(unsupported_dst_sel);
+    const auto unsupported_dst_sel_report = validate_spirv_descriptor_interface(
+        array_spv, &unsupported_dst_sel_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!unsupported_dst_sel_report.ok() &&
+              has_issue(unsupported_dst_sel_report,
+                        DescriptorIssueCode::InvalidBufferMetadata),
+          "same-entry mutation: an array V# using an unrepresented DST_SEL rejects");
 
     // An UNREADABLE array length is its own value, not folded onto 0 (which means OpTypeRuntimeArray and
     // is treated as compatible with any table size). Reported as a review finding on #2463: collapsing

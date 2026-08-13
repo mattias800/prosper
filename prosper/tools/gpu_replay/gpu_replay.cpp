@@ -75,6 +75,7 @@ void usage(const char* argv0) {
                          "[--retry-failed-chain FAILURE] "
                          "[--retry-failed-stage FAILURE:STAGE] "
                          "[--dump-compute-resource N:BINDING PATH] "
+                         "[--override-compute-resource N:BINDING PATH] "
                          "[--dump-post-compute-resource N:BINDING PATH] "
                          "[--require-post-change] [--expect-post-hash HASH] "
                          "[--legacy-htile-before-stencil] "
@@ -364,9 +365,40 @@ std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
 
 const char* class_name(prosper::gpu::ResourceClass c);
 
-void print_graph(const prosper::gpu::GpuDependencyGraph& graph) {
-    std::printf("dependency-graph operations=%zu edges=%zu external-leaves=%zu\n",
-                graph.nodes.size(), graph.edges.size(), graph.external_leaves.size());
+// Map a graph operation index to the compute program it runs, so producer/consumer questions can be
+// answered without guessing. The graph identifies operations by INDEX only; asking "which shader is
+// writer 1453" previously meant correlating by hand against a separate inspect dump, and getting it
+// wrong is the adjacency-attribution mistake #2481 records twice.
+//
+// `command_order` is the join key rather than `source_index`: both the node and the captured compute
+// carry it, it is a single global ordering, and it does not depend on the two containers agreeing on
+// what their own indices mean. Draws resolve to 0 and print as `-`.
+std::unordered_map<uint32_t, uint64_t> graph_operation_programs(
+        const prosper::gpu::GpuReplayFrame& replay,
+        const prosper::gpu::GpuDependencyGraph& graph) {
+    std::unordered_map<uint64_t, uint64_t> program_by_order;
+    for (const auto& compute : replay.computes)
+        program_by_order.emplace(compute.command_order, compute.code_addr);
+    std::unordered_map<uint32_t, uint64_t> program_by_operation;
+    for (const auto& node : graph.nodes) {
+        const auto it = program_by_order.find(node.command_order);
+        if (it != program_by_order.end()) program_by_operation.emplace(node.operation_index, it->second);
+    }
+    return program_by_operation;
+}
+
+void print_graph(const prosper::gpu::GpuDependencyGraph& graph,
+                 const prosper::gpu::GpuReplayFrame& replay) {
+    const auto programs = graph_operation_programs(replay, graph);
+    const auto program_of = [&](uint32_t operation) -> std::string {
+        const auto it = programs.find(operation);
+        if (it == programs.end()) return "-";
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(it->second));
+        return buf;
+    };
+    std::printf("dependency-graph operations=%zu edges=%zu external-leaves=%zu programs-resolved=%zu\n",
+                graph.nodes.size(), graph.edges.size(), graph.external_leaves.size(), programs.size());
     for (const auto& node : graph.nodes)
         if (!node.realized)
             std::printf("missing operation=%u kind=%s source=%llu order=%llu\n",
@@ -375,15 +407,21 @@ void print_graph(const prosper::gpu::GpuDependencyGraph& graph) {
                         static_cast<unsigned long long>(node.source_index),
                         static_cast<unsigned long long>(node.command_order));
     for (const auto& edge : graph.edges)
-        std::printf("edge producer=%u consumer=%u stage=%s binding=%u addr=%016llx bytes=%llu dims=%ux%u\n",
-                    edge.producer_operation, edge.consumer_operation, edge.access.stage.c_str(),
+        std::printf("edge producer=%u producer-program=%s consumer=%u consumer-program=%s "
+                    "stage=%s binding=%u addr=%016llx bytes=%llu dims=%ux%u\n",
+                    edge.producer_operation, program_of(edge.producer_operation).c_str(),
+                    edge.consumer_operation, program_of(edge.consumer_operation).c_str(),
+                    edge.access.stage.c_str(),
                     edge.access.binding, static_cast<unsigned long long>(edge.access.addr),
                     static_cast<unsigned long long>(edge.access.size), edge.access.width, edge.access.height);
     for (const auto& leaf : graph.external_leaves)
-        std::printf("external consumers=%zu first=%u future-writer=%lld stage=%s binding=%u class=%s "
+        std::printf("external consumers=%zu first=%u first-program=%s future-writer=%lld "
+                    "writer-program=%s stage=%s binding=%u class=%s "
                     "addr=%016llx bytes=%llu dims=%ux%u\n",
                     leaf.consumer_operations.size(), leaf.consumer_operations.front(),
+                    program_of(leaf.consumer_operations.front()).c_str(),
                     leaf.first_future_writer == UINT32_MAX ? -1ll : static_cast<long long>(leaf.first_future_writer),
+                    leaf.first_future_writer == UINT32_MAX ? "-" : program_of(leaf.first_future_writer).c_str(),
                     leaf.access.stage.c_str(), leaf.access.binding,
                     class_name(leaf.access.resource_class),
                     static_cast<unsigned long long>(leaf.access.addr),
@@ -442,6 +480,27 @@ const char* class_name(prosper::gpu::ResourceClass c) {
     case RC::Texture: return "TEX"; case RC::Sampler: return "SAMP"; case RC::StorageImage: return "STORAGE";
     }
     return "?";
+}
+
+// Dispatch-entry user SGPR VALUES. A dispatch-constant entry SGPR decides scalar control flow, so
+// these decide which intervals of a kernel can execute at all -- and the capture has always carried
+// them while --inspect-only printed only the count.
+//
+// `realized` distinguishes the two populations, and the distinction is load-bearing: the failed set
+// is selected on the very failure under investigation, so a statistic over it is near-tautological
+// (a healthy dispatch cannot appear in it). Only the two together support a claim about a program.
+// Each line repeats program= so a stanza is greppable on its own -- attributing these by adjacency
+// to the nearest program= header five lines up is a mistake that has already been made once here.
+void print_user_sgprs(uint64_t program_addr, const char* realized,
+                      const std::vector<uint32_t>& user_sgprs) {
+    for (size_t i = 0; i < user_sgprs.size(); ++i) {
+        if (i % 8 == 0)
+            std::printf("    user-sgpr program=%016llx %s [%2zu..]",
+                        static_cast<unsigned long long>(program_addr), realized, i);
+        std::printf(" %08x", user_sgprs[i]);
+        if (i % 8 == 7 || i + 1 == user_sgprs.size())
+            std::printf("\n");
+    }
 }
 
 void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* table,
@@ -838,6 +897,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
                     raw_available ? "yes" : "no");
+        if (c.recompile_config_available)
+            print_user_sgprs(c.code_addr, "realized", c.recompile_config.user_sgprs);
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);
     }
     for (size_t i = 0; i < replay.dma_copies.size(); ++i) {
@@ -970,6 +1031,14 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                             config.local_z, config.threads_x, config.threads_y,
                             config.threads_z, config.wave_size, config.lds_bytes,
                             config.native_subgroup_size);
+                // The VALUES, not just the count. A dispatch-constant entry SGPR decides scalar
+                // control flow -- s10==0 is what proves GTA V 0x413ce6000's pc35 branch untaken and
+                // its pc62..179 interval (and the pc70/153/156/158 resources in it) dead. The
+                // capture has always retained these; printing only `.size()` sent one investigation
+                // through a live GPU probe and a reverted per-lane predicate to reach a fact that
+                // was already sitting in the artifact. Eight per line, indexed, so a specific sN is
+                // greppable.
+                print_user_sgprs(stage.program_addr, "failed", config.user_sgprs);
             }
             for (size_t resource_index = 0;
                  resource_index < stage.resource_table.resources.size(); ++resource_index) {
@@ -1810,6 +1879,9 @@ int main(int argc, char** argv) {
     bool resource_override_requested = false;
     prosper::tools::ResourceOverrideSelector resource_override_selector;
     std::string resource_override_path;
+    bool compute_resource_override_requested = false;
+    prosper::tools::ComputeResourceOverrideSelector compute_resource_override_selector;
+    std::string compute_resource_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string post_compute_resource_spec, post_compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
@@ -1981,6 +2053,22 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-compute-resource" && i + 2 < argc) {
             compute_resource_spec = argv[++i]; compute_resource_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--override-compute-resource" && i + 2 < argc) {
+            if (compute_resource_override_requested) {
+                std::fprintf(stderr, "gpu_replay: duplicate --override-compute-resource\n");
+                return 2;
+            }
+            const char* selector = argv[++i];
+            if (!prosper::tools::parse_compute_resource_override_selector(
+                    selector, compute_resource_override_selector)) {
+                std::fprintf(stderr,
+                             "gpu_replay: invalid compute resource override selector %s\n",
+                             selector);
+                return 2;
+            }
+            compute_resource_override_path = argv[++i];
+            compute_resource_override_requested = true;
+        }
         else if (std::string(argv[i]) == "--dump-post-compute-resource" && i + 2 < argc) {
             post_compute_resource_spec = argv[++i];
             post_compute_resource_path = argv[++i];
@@ -2025,6 +2113,7 @@ int main(int argc, char** argv) {
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             resource_override_requested ||
+            compute_resource_override_requested ||
             !compute_resource_spec.empty() || !post_compute_resource_spec.empty() ||
             require_post_change || expected_post_hash_set || !failed_shader_spec.empty() ||
             !retry_failed_chain_spec.empty() ||
@@ -2125,6 +2214,29 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(target.captured_size),
                      static_cast<unsigned long long>(applied_resource_override.original_hash),
                      static_cast<unsigned long long>(applied_resource_override.replacement_hash));
+    }
+    prosper::tools::AppliedComputeResourceOverride applied_compute_resource_override;
+    if (compute_resource_override_requested) {
+        if (!prosper::tools::apply_compute_resource_override_file(
+                replay, compute_resource_override_selector, compute_resource_override_path,
+                applied_compute_resource_override, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot override compute resource: %s\n",
+                         error.c_str());
+            return 2;
+        }
+        const auto& selector = applied_compute_resource_override.selector;
+        const auto& target = applied_compute_resource_override.target;
+        std::fprintf(stderr,
+                     "[compute-resource-override] compute=%zu binding=%u addr=%016llx "
+                     "size=%llu original-hash=%016llx new-hash=%016llx\n",
+                     selector.compute_index, selector.binding,
+                     static_cast<unsigned long long>(target.gpu_addr),
+                     static_cast<unsigned long long>(target.captured_size),
+                     static_cast<unsigned long long>(
+                         applied_compute_resource_override.original_hash),
+                     static_cast<unsigned long long>(
+                         applied_compute_resource_override.replacement_hash));
+        allow_mismatch = true;
     }
     prosper::gpu::GpuCaptureFile prepend_capture;
     prosper::gpu::GpuReplayFrame prepend;
@@ -2508,7 +2620,7 @@ int main(int argc, char** argv) {
         if (!prosper::gpu::build_gpu_dependency_graph(replay, graph, error)) {
             std::fprintf(stderr, "gpu_replay: cannot build dependency graph: %s\n", error.c_str()); return 2;
         }
-        if (graph_json_path.empty()) print_graph(graph);
+        if (graph_json_path.empty()) print_graph(graph, replay);
         else if (!write_graph_json(graph_json_path, graph)) {
             std::fprintf(stderr, "gpu_replay: cannot write graph JSON %s\n", graph_json_path.c_str()); return 2;
         }

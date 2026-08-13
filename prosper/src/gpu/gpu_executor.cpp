@@ -8,6 +8,7 @@
 #include "gpu_capture.hpp"
 #include "gpu_timeline.hpp"
 #include "capture_compute_policy.hpp"
+#include "compute_parent_walk.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -96,6 +97,138 @@ struct GuestGpuWriteJournal {
 thread_local GuestGpuWriteJournal g_guest_gpu_writes;
 std::atomic<uint64_t> g_next_guest_gpu_submit_serial{0};
 std::atomic<uint64_t> g_next_shader_analysis_identity{0};
+
+// PROSPER_NULL_IMAGE_SOURCE_PROBE=<hex-program-address> pairs an exactly-null sampled T# with the
+// mapped bytes that produced it, then reads those bytes again after the retained submit executes.
+// This answers whether eager graphics realization sampled a descriptor before an earlier ordered
+// producer in the same submit. Program + MIMG pc + source address travel as one record: neither a
+// numeric SRT offset nor adjacent log lines identify a descriptor uniquely (#2422, trap 156).
+struct NullImageSourceProbe {
+    uint64_t submit_no = 0;
+    uint64_t program_addr = 0;
+    uint64_t source_addr = 0;
+    uint64_t draw_order = 0;
+    uint64_t initial_writer_sequence = 0;
+    uint32_t use_pc = UINT32_MAX;
+    std::array<uint32_t, 8> initial{};
+};
+std::mutex g_null_image_source_probe_mutex;
+std::mutex g_null_image_source_probe_run_mutex;
+std::vector<NullImageSourceProbe> g_null_image_source_probes;
+std::atomic<uint64_t> g_collect_null_image_source_probe_submit{0};
+
+uint64_t null_image_source_probe_program() {
+    static const uint64_t program = [] {
+        const char* value = std::getenv("PROSPER_NULL_IMAGE_SOURCE_PROBE");
+        if (!value || !*value) return uint64_t{0};
+        return static_cast<uint64_t>(std::strtoull(value, nullptr, 16));
+    }();
+    return program;
+}
+
+void record_null_image_source_probe(uint64_t program_addr, uint32_t use_pc,
+                                    uint64_t source_addr, uint64_t draw_order,
+                                    const std::array<uint32_t, 8>& initial) {
+    const uint64_t filter = null_image_source_probe_program();
+    const uint64_t submit_no =
+        g_collect_null_image_source_probe_submit.load(std::memory_order_relaxed);
+    if (!submit_no ||
+        !filter || program_addr != filter || !source_addr || !draw_order) return;
+    static std::once_flag banner;
+    std::call_once(banner, [filter] {
+        std::fprintf(stderr,
+                     "[null-source] armed program=0x%llx; exact-null x8 sources will be "
+                     "re-read after their eager submit (writer history %s)\n",
+                     static_cast<unsigned long long>(filter),
+                     writer_provenance_enabled() ? "armed" : "NOT armed");
+    });
+    const auto initial_writer = last_guest_write_overlap(source_addr, sizeof(initial));
+    std::lock_guard lock(g_null_image_source_probe_mutex);
+    const auto same = [&](const NullImageSourceProbe& probe) {
+        return probe.submit_no == submit_no && probe.program_addr == program_addr &&
+               probe.use_pc == use_pc &&
+               probe.source_addr == source_addr && probe.draw_order == draw_order;
+    };
+    if (std::none_of(g_null_image_source_probes.begin(),
+                     g_null_image_source_probes.end(), same)) {
+        g_null_image_source_probes.push_back({
+            submit_no, program_addr, source_addr, draw_order,
+            initial_writer ? initial_writer->sequence : 0u, use_pc, initial});
+    }
+}
+
+std::vector<NullImageSourceProbe> take_null_image_source_probes(
+        const std::vector<DrawItem>& draws, uint64_t submit_no) {
+    if (!null_image_source_probe_program()) return {};
+    std::unordered_set<uint64_t> orders;
+    orders.reserve(draws.size());
+    for (const DrawItem& draw : draws) orders.insert(draw.command_order);
+    std::vector<NullImageSourceProbe> result;
+    std::lock_guard lock(g_null_image_source_probe_mutex);
+    auto it = g_null_image_source_probes.begin();
+    while (it != g_null_image_source_probes.end()) {
+        if (it->submit_no != submit_no) {
+            ++it;
+            continue;
+        }
+        if (orders.count(it->draw_order)) result.push_back(*it);
+        // A stage table may have been built before a later pipeline failure prevented DrawItem
+        // publication. Retire every record from this completed collection generation so a reused
+        // command-order value in another submit cannot pick up stale provenance.
+        it = g_null_image_source_probes.erase(it);
+    }
+    return result;
+}
+
+void check_null_image_source_probes(const std::vector<NullImageSourceProbe>& probes,
+                                    uint64_t submit_no) {
+    if (probes.empty()) return;
+    size_t checked = 0, changed = 0, unreadable = 0;
+    for (const NullImageSourceProbe& probe : probes) {
+        if (!guest_readable(probe.source_addr, sizeof(probe.initial))) {
+            ++unreadable;
+            continue;
+        }
+        std::array<uint32_t, 8> current{};
+        std::memcpy(current.data(), reinterpret_cast<const void*>(probe.source_addr),
+                    sizeof(current));
+        ++checked;
+        if (current == probe.initial) continue;
+        ++changed;
+        const auto writer = last_guest_write_overlap(probe.source_addr, sizeof(current));
+        std::fprintf(stderr,
+                     "[null-source] CHANGED submit=%llu draw-order=%llu program=0x%llx pc=%u "
+                     "source=0x%llx now=",
+                     static_cast<unsigned long long>(submit_no),
+                     static_cast<unsigned long long>(probe.draw_order),
+                     static_cast<unsigned long long>(probe.program_addr), probe.use_pc,
+                     static_cast<unsigned long long>(probe.source_addr));
+        for (uint32_t word : current) std::fprintf(stderr, "%08x ", word);
+        if (writer) {
+            const bool new_writer = writer->sequence > probe.initial_writer_sequence;
+            const bool ordered_predecessor = new_writer && writer->order < probe.draw_order &&
+                writer->kind != GuestWriterKind::ColorTarget;
+            std::fprintf(stderr,
+                         "writer=%s writer-submit=%llu writer-order=%llu identity=0x%llx seq=%llu%s%s\n",
+                         guest_writer_kind_name(writer->kind),
+                         static_cast<unsigned long long>(writer->submit),
+                         static_cast<unsigned long long>(writer->order),
+                         static_cast<unsigned long long>(writer->identity),
+                         static_cast<unsigned long long>(writer->sequence),
+                         new_writer ? " NEW-SINCE-FOLD" : "",
+                         ordered_predecessor ? " ORDERED-BEFORE-DRAW" : "");
+        } else {
+            std::fprintf(stderr,
+                         "writer=none (history=%zu recorded: %s)%s\n",
+                         guest_write_history_size(), guest_write_recorder_summary(),
+                         guest_write_history_size() ? "" : " HISTORY-EMPTY");
+        }
+    }
+    std::fprintf(stderr,
+                 "[null-source] submit=%llu probes=%zu checked=%zu changed=%zu unreadable=%zu\n",
+                 static_cast<unsigned long long>(submit_no), probes.size(), checked, changed,
+                 unreadable);
+}
 
 void dispatch_compute_authority_boundary(const ComputeAuthorityBoundary& boundary) {
     // Default path: one relaxed load and no mutex/std::function copy when the opt-in diagnostic is
@@ -273,6 +406,149 @@ bool dyntrace_failed_shader_enabled(uint64_t code_addr) {
     return errno == 0 && end != filter && *end == '\0' && parsed == code_addr;
 }
 
+// PROSPER_COMPUTE_MEMPROBE — read the SAME guest dwords twice for one dispatch: once when the
+// CPU-side const-fold resolves its descriptors, and once at command-ordered realization, just before
+// the dispatch executes. It answers one question and only that one:
+//
+//     did the bytes this dispatch's descriptor was derived from change in between?
+//
+// Same bytes at both points means fold-time staleness cannot explain a wrong descriptor, whatever
+// else might. Different bytes means it demonstrably can, for that dispatch, by observation rather
+// than by a ratio over runs. It therefore fails informatively in both directions, which a
+// success-rate comparison across routed runs does not: those runs reach different game state and
+// their rates are computed over different populations (#2516).
+//
+// The address is derived per dispatch rather than fixed, because the interesting slot is at a
+// constant offset from a POINTER the guest passes in. Format, all fields hex except the dword count:
+//
+//     PROSPER_COMPUTE_MEMPROBE=<code_addr>:<user_sgpr_index>:<byte_offset>:<dwords>
+//     e.g. 413ce6000:0:a8:4   -> (user_sgprs[0] | user_sgprs[1]<<32) + 0xa8, 4 dwords
+//
+// Read-only and opt-in; a malformed value disables the probe rather than probing something else.
+struct ComputeMemProbeSpec {
+    bool on = false;
+    uint64_t code_addr = 0;
+    uint32_t sgpr_index = 0;
+    uint64_t offset = 0;
+    uint32_t dwords = 0;
+};
+
+const ComputeMemProbeSpec& compute_memprobe_spec() {
+    static const ComputeMemProbeSpec spec = [] {
+        ComputeMemProbeSpec s;
+        const char* raw = std::getenv("PROSPER_COMPUTE_MEMPROBE");
+        if (!raw || !*raw) return s;
+        unsigned long long code = 0, off = 0;
+        unsigned idx = 0, n = 0;
+        if (std::sscanf(raw, "%llx:%u:%llx:%u", &code, &idx, &off, &n) != 4 || n == 0 || n > 64) {
+            std::fprintf(stderr, "[memprobe] malformed PROSPER_COMPUTE_MEMPROBE=\"%s\" "
+                                 "(want <code_addr>:<sgpr_index>:<byte_offset>:<dwords>) — probe disabled\n",
+                         raw);
+            return s;
+        }
+        s.on = true; s.code_addr = code; s.sgpr_index = idx; s.offset = off; s.dwords = n;
+        std::fprintf(stderr, "[memprobe] armed: program=0x%llx addr=(user_sgprs[%u..%u])+0x%llx dwords=%u\n",
+                     code, idx, idx + 1, off, n);
+        return s;
+    }();
+    return spec;
+}
+
+struct ComputeMemProbeSample {
+    uint64_t addr = 0;
+    std::vector<uint32_t> words;
+    bool readable = false;
+};
+
+// Keyed by dispatch identity, not by address: two dispatches of one program have different base
+// pointers, and pairing them by address would silently compare different structures.
+std::mutex g_memprobe_mu;
+std::map<uint64_t /*addr*/, ComputeMemProbeSample> g_memprobe_fold;
+
+bool compute_memprobe_read(const std::vector<uint32_t>& user_sgprs, ComputeMemProbeSample& out) {
+    const ComputeMemProbeSpec& spec = compute_memprobe_spec();
+    if (user_sgprs.size() <= spec.sgpr_index + 1) return false;
+    const uint64_t base = static_cast<uint64_t>(user_sgprs[spec.sgpr_index]) |
+                          (static_cast<uint64_t>(user_sgprs[spec.sgpr_index + 1]) << 32);
+    if (!base) return false;
+    out.addr = base + spec.offset;
+    const uint32_t bytes = spec.dwords * 4u;
+    out.readable = guest_readable(out.addr, bytes);
+    out.words.assign(spec.dwords, 0u);
+    if (out.readable)
+        std::memcpy(out.words.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(out.addr)), bytes);
+    return true;
+}
+
+std::string compute_memprobe_words(const ComputeMemProbeSample& s) {
+    if (!s.readable) return "<unreadable>";
+    std::string out;
+    char buf[16];
+    for (size_t i = 0; i < s.words.size(); ++i) {
+        std::snprintf(buf, sizeof buf, "%s%08x", i ? ":" : "", s.words[i]);
+        out += buf;
+    }
+    return out;
+}
+
+void compute_memprobe_flush(const char* whence);
+
+void compute_memprobe_at_fold(uint64_t code_addr, uint64_t dispatch_index,
+                              const std::vector<uint32_t>& user_sgprs) {
+    const ComputeMemProbeSpec& spec = compute_memprobe_spec();
+    if (!spec.on || code_addr != spec.code_addr) return;
+    compute_memprobe_flush("next-fold");
+    ComputeMemProbeSample s;
+    if (!compute_memprobe_read(user_sgprs, s)) {
+        // Fail visibly. A probe that records nothing looks identical to a probe whose subject never
+        // ran, and distinguishing those by absence of output is exactly the silent-instrument trap.
+        std::fprintf(stderr, "[memprobe] program=0x%llx dispatch=%llu SKIPPED "
+                             "(user_sgprs=%zu need>%u, base=%s)\n",
+                     (unsigned long long)code_addr, (unsigned long long)dispatch_index,
+                     user_sgprs.size(), compute_memprobe_spec().sgpr_index + 1,
+                     user_sgprs.size() > compute_memprobe_spec().sgpr_index + 1 ? "zero" : "n/a");
+        return;
+    }
+    std::fprintf(stderr, "[memprobe] program=0x%llx dispatch=%llu addr=0x%llx FOLD %s\n",
+                 (unsigned long long)code_addr, (unsigned long long)dispatch_index,
+                 (unsigned long long)s.addr, compute_memprobe_words(s).c_str());
+    std::lock_guard<std::mutex> lock(g_memprobe_mu);
+    g_memprobe_fold.emplace(s.addr, s);   // first fold of an address wins; later folds compare against it
+}
+
+// Re-read every recorded fold sample at its OWN address and report which changed.
+//
+// This is called at the ordered-execution boundary rather than from the dispatch path, and that is
+// the whole point: a dispatch whose descriptors failed to resolve is SKIPPED before execution, so a
+// re-read hung off the dispatch itself can only ever observe dispatches that succeeded -- exactly
+// the population the question is not about. Keying on the address recorded at fold time keeps the
+// comparison per dispatch while removing any need for the dispatch to run.
+void compute_memprobe_flush(const char* whence) {
+    const ComputeMemProbeSpec& spec = compute_memprobe_spec();
+    if (!spec.on) return;
+    std::map<uint64_t, ComputeMemProbeSample> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_memprobe_mu);
+        pending.swap(g_memprobe_fold);
+    }
+    const uint32_t bytes = spec.dwords * 4u;
+    for (const auto& [key, folded] : pending) {
+        (void)key;
+        ComputeMemProbeSample now;
+        now.addr = folded.addr;
+        now.readable = guest_readable(now.addr, bytes);
+        now.words.assign(spec.dwords, 0u);
+        if (now.readable)
+            std::memcpy(now.words.data(),
+                        reinterpret_cast<const void*>(static_cast<uintptr_t>(now.addr)), bytes);
+        const bool changed = folded.readable != now.readable || folded.words != now.words;
+        std::fprintf(stderr, "[memprobe] program=0x%llx addr=0x%llx %s at=%s fold=%s later=%s\n",
+                     (unsigned long long)compute_memprobe_spec().code_addr,
+                     (unsigned long long)now.addr, changed ? "CHANGED" : "SAME", whence,
+                     compute_memprobe_words(folded).c_str(), compute_memprobe_words(now).c_str());
+    }
+}
+
 namespace {
 
 struct ShaderResourceCompileKey {
@@ -296,6 +572,12 @@ struct ShaderResourceCompileKey {
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
+    uint32_t table_index_count = 0;
+    uint32_t table_entry_stride = 0;
+    uint32_t table_index_sgpr = UINT32_MAX;
+    uint32_t table_selector_mode = 0;
+    uint32_t table_load_pc = UINT32_MAX;
+    bool table_contract_valid = true;
     uint32_t flat_base_sgpr = 0;
     uint32_t bvh_box_grow = 0;
     bool bvh_sort_enabled = false;
@@ -501,6 +783,12 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.fetch_index_mode);
+            hash = hash_mix(hash, resource.table_index_count);
+            hash = hash_mix(hash, resource.table_entry_stride);
+            hash = hash_mix(hash, resource.table_index_sgpr);
+            hash = hash_mix(hash, resource.table_selector_mode);
+            hash = hash_mix(hash, resource.table_load_pc);
+            hash = hash_mix(hash, resource.table_contract_valid);
             hash = hash_mix(hash, resource.flat_base_sgpr);
             hash = hash_mix(hash, resource.bvh_box_grow);
             hash = hash_mix(hash, resource.bvh_sort_enabled);
@@ -1255,6 +1543,13 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.sgpr_base = resource.sgpr_base;
             compiled.fetch_pc = resource.fetch_pc;
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
+            compiled.table_index_count = resource.table_index_count;
+            compiled.table_entry_stride = resource.table_entry_stride;
+            compiled.table_index_sgpr = resource.table_index_sgpr;
+            compiled.table_selector_mode =
+                static_cast<uint32_t>(resource.table_selector_mode);
+            compiled.table_load_pc = resource.table_load_pc;
+            compiled.table_contract_valid = valid_shader_buffer_table_contract(resource);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
             compiled.bvh_box_grow = resource.bvh_box_grow;
             compiled.bvh_sort_enabled = resource.bvh_sort_enabled;
@@ -2328,6 +2623,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::bitset<kFoldSgprs> descr8_known;
     std::array<uint32_t, kFoldSgprs> descr8_key{};
     std::bitset<kFoldSgprs> descr8_key_known;
+    // Exact source address of each CURRENT scalar word from a successful mapped x8/x16 load. The
+    // address follows only bit-preserving scalar moves and is cleared by every other write. A live
+    // T# receives one contiguous source only when word k still comes from base + 4*k; reorders and
+    // duplicates therefore fail closed even when every word came from the same load window.
+    std::array<uint64_t, kFoldSgprs> descriptor_word_source_addr{};
+    std::bitset<kFoldSgprs> descriptor_word_source_known;
     // Exact null-pointer dataflow for guarded BVHs. Each mapped zero qword load receives a unique
     // origin; failed dereferences and scalar address/descriptor ALU retain that origin. A null BVH is
     // published only when all four live descriptor words carry the SAME origin, so an unrelated
@@ -2431,6 +2732,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.set((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            descriptor_word_source_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             optional_null_role[(size_t)r] = OptionalNullRole::None;
             bvh_build_origin[(size_t)r] = 0;
@@ -2446,6 +2748,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            descriptor_word_source_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             optional_null_role[(size_t)r] = OptionalNullRole::None;
             bvh_build_origin[(size_t)r] = 0;
@@ -2591,6 +2894,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr8_known;
         std::array<uint32_t, kFoldSgprs> descr8_key;
         std::bitset<kFoldSgprs> descr8_key_known;
+        std::array<uint64_t, kFoldSgprs> descriptor_word_source_addr;
+        std::bitset<kFoldSgprs> descriptor_word_source_known;
         std::array<uint32_t, kFoldSgprs> null_chain_origin;
         std::bitset<kFoldSgprs> null_chain_known;
         std::array<OptionalNullRole, kFoldSgprs> optional_null_role;
@@ -2634,6 +2939,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.descr_key = descr_key; s.descr_key_known = descr_key_known;
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
+        s.descriptor_word_source_addr = descriptor_word_source_addr;
+        s.descriptor_word_source_known = descriptor_word_source_known;
         s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
         s.optional_null_role = optional_null_role;
         s.null_count_carry_origin = null_count_carry_origin;
@@ -2652,6 +2959,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         descr_key = s.descr_key; descr_key_known = s.descr_key_known;
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
+        descriptor_word_source_addr = s.descriptor_word_source_addr;
+        descriptor_word_source_known = s.descriptor_word_source_known;
         null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
         optional_null_role = s.optional_null_role;
         null_count_carry_origin = s.null_count_carry_origin;
@@ -2927,6 +3236,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             case Rdna2Format::SOP1:
                 if (in.opcode == kSop1OpcodeMovB32) {            // s_mov_b32
                     uint32_t v, source_key = 0;
+                    uint64_t source_descriptor_word_addr = 0;
                     const uint32_t source_null_origin = operand_null_origin(in.src[0]);
                     const bool source_key_known =
                         in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
@@ -2937,6 +3247,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
                         val_seed_origin_known.test((size_t)in.src[0].value) &&
                         (source_origin = val_seed_origin[(size_t)in.src[0].value], true);
+                    const bool source_descriptor_word_known =
+                        in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
+                        descriptor_word_source_known.test((size_t)in.src[0].value) &&
+                        (source_descriptor_word_addr =
+                             descriptor_word_source_addr[(size_t)in.src[0].value], true);
                     if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v)) {
                         set_value(in.dst.value, v);
                         if (source_key_known && valid_reg(in.dst.value)) {
@@ -2946,6 +3261,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (source_origin_known && valid_reg(in.dst.value)) {
                             val_seed_origin[(size_t)in.dst.value] = source_origin;
                             val_seed_origin_known.set((size_t)in.dst.value);
+                        }
+                        if (source_descriptor_word_known && valid_reg(in.dst.value)) {
+                            descriptor_word_source_addr[(size_t)in.dst.value] =
+                                source_descriptor_word_addr;
+                            descriptor_word_source_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
                     mark_null_origin(in.dst.value, source_null_origin);
@@ -3013,9 +3333,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     std::array<uint32_t, 2> source_values{};
                     std::array<uint32_t, 2> source_keys{};
                     std::array<uint32_t, 2> source_origins{};
+                    std::array<uint64_t, 2> source_descriptor_word_addrs{};
                     std::array<uint32_t, 2> source_null_origins{};
                     std::array<bool, 2> source_key_known{};
                     std::array<bool, 2> source_origin_known{};
+                    std::array<bool, 2> source_descriptor_word_known{};
                     bool source_known = true;
                     for (int k = 0; k < 2; ++k) {
                         const int src = in.src[0].value + k;
@@ -3028,6 +3350,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.test((size_t)src);
                         if (source_origin_known[(size_t)k])
                             source_origins[(size_t)k] = val_seed_origin[(size_t)src];
+                        source_descriptor_word_known[(size_t)k] = valid_reg(src) &&
+                            descriptor_word_source_known.test((size_t)src);
+                        if (source_descriptor_word_known[(size_t)k])
+                            source_descriptor_word_addrs[(size_t)k] =
+                                descriptor_word_source_addr[(size_t)src];
                         source_null_origins[(size_t)k] = null_origin(src);
                     }
                     for (int k = 0; k < 2; ++k) {
@@ -3044,6 +3371,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (source_origin_known[(size_t)k] && valid_reg(dst)) {
                             val_seed_origin[(size_t)dst] = source_origins[(size_t)k];
                             val_seed_origin_known.set((size_t)dst);
+                        }
+                        if (source_descriptor_word_known[(size_t)k] && valid_reg(dst)) {
+                            descriptor_word_source_addr[(size_t)dst] =
+                                source_descriptor_word_addrs[(size_t)k];
+                            descriptor_word_source_known.set((size_t)dst);
                         }
                         mark_null_origin(dst, source_null_origins[(size_t)k]);
                     }
@@ -3085,6 +3417,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     forget(in.dst.value + 1);
                     if (valid_reg(in.dst.value))
                         mask_state[(size_t)in.dst.value] = FoldMask::All;
+                } else if (in.dst.kind == OperandKind::SGPR &&
+                           sop1_opcode_writes_exec_b32(in.opcode)) {
+                    // The Wave32 SAVEEXEC/WREXEC encodings write exactly one physical SGPR.
+                    // Treating every unmodeled SOP1 as a possible pair write erased an untouched
+                    // descriptor word when the destination immediately preceded its SRSRC. The
+                    // scalar mask value remains outside this fold, but only SDST is unknown.
+                    forget(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
                     // (s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
@@ -3230,6 +3569,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         next_scc = sum >= (uint64_t{1} << 32);
                         break;
                     }
+                    case kSop2OpcodePackLlB32B16:                           // s_pack_ll_b32_b16
+                        r = (a & 0xffffu) | ((c & 0xffffu) << 16);
+                        break;
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1)));
                                  next_scc = r != 0; break; }
@@ -3810,6 +4152,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         mark_optional_null_role(sdst + 1, OptionalNullRole::BaseHi);
                     }
                 }
+                if (n == 8 || n == 16) {
+                    // The per-register tags were cleared by set_value(); install exact lanes only
+                    // after this successful mapped read. Aligned x8 windows inside x16 loads then
+                    // naturally retain distinct contiguous base addresses.
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const int reg_value = sdst + static_cast<int>(k);
+                        if (!valid_reg(reg_value)) continue;
+                        descriptor_word_source_addr[(size_t)reg_value] =
+                            addr + k * sizeof(uint32_t);
+                        descriptor_word_source_known.set((size_t)reg_value);
+                    }
+                }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
                     const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
                     for (uint32_t k = 0; k < n; ++k) {
@@ -4027,8 +4381,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             d.width <= 16384 && d.height <= 16384 &&
                             d.type >= 8 && d.type <= 15;
                     }
+                    // An all-zero direct T# is architectural null state, not a malformed image that
+                    // needs to pass the ordinary descriptor plausibility gate. Preserve it as an
+                    // exact-PC use just like an all-zero table-loaded T#: build_stage_table applies
+                    // the operation-class rule and admits only sampled reads as null Textures, while
+                    // stores and atomics remain fail-visible. A partially-zero/nonzero seed still has
+                    // to satisfy the normal image checks and cannot enter through this exception.
+                    const bool exact_null_seed = seed_provenance && live_t8_known &&
+                        std::all_of(live_t8.begin(), live_t8.end(),
+                                    [](uint32_t word) { return word == 0; });
                     const std::array<uint32_t, 8>* t8 =
-                        live_t8_known && (have_t8 || (seed_provenance && plausible_seed))
+                        live_t8_known &&
+                                (have_t8 || (seed_provenance &&
+                                             (plausible_seed || exact_null_seed)))
                             ? &live_t8 : nullptr;
                     uint32_t tkey = 0xFFFFFFFFu;
                     if (t8 && have_key) {
@@ -4047,6 +4412,27 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             }
                         }
                         if (common_key_known) tkey = common_key;
+                    }
+                    uint64_t t8_source_addr = 0;
+                    if (t8) {
+                        bool contiguous_source_known = true;
+                        for (int k = 0; k < 8; ++k) {
+                            const int reg_value = tbase + k;
+                            if (!valid_reg(reg_value) ||
+                                !descriptor_word_source_known.test((size_t)reg_value)) {
+                                contiguous_source_known = false;
+                                break;
+                            }
+                            const uint64_t word_addr =
+                                descriptor_word_source_addr[(size_t)reg_value];
+                            if (k == 0) t8_source_addr = word_addr;
+                            else if (word_addr != t8_source_addr +
+                                                    static_cast<uint64_t>(k) * sizeof(uint32_t)) {
+                                contiguous_source_known = false;
+                                break;
+                            }
+                        }
+                        if (!contiguous_source_known) t8_source_addr = 0;
                     }
                     const bool from_seed = t8 && seed_provenance;
                     if (trc) {
@@ -4067,6 +4453,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                     if (t8) {
                         SrtUse u; u.kind = 0; u.t8 = *t8;
+                        u.descriptor_source_addr = t8_source_addr;
                         u.key = tkey;
                         u.use_pc = in.pc;
                         // image_store plus EVERY integer image atomic -- an atomic is a read-modify-write, so a
@@ -4301,6 +4688,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                              (int)optional_null_raw_load,
                                              (int)proven_null_guarded_raw_store);
                             srt_uses->push_back(u);
+                        } else if (trc) {
+                            // Fail-visible: say WHY a raw buffer use was not published. Without this
+                            // the site simply vanishes from the trace, which reads as "the fold never
+                            // walked it" and sends the reader upstream to control flow. Three separate
+                            // static derivations of why GTA V 0x413ce6000's pc70 is missing were wrong
+                            // before this line existed (#2481).
+                            fprintf(stderr,
+                                    "[dyntrace] MUBUF pc=%u NOT-PUBLISHED s%d v4=%08x:%08x:%08x:%08x "
+                                    "base=0x%llx stride=%u records=%u size=%u "
+                                    "fmt-load=%d raw=%d base>64k=%d size!=0=%d size<=256M=%d "
+                                    "stride-ok=%d format-ok=%d\n",
+                                    in.pc, srsrc, u.v4[0], u.v4[1], u.v4[2], u.v4[3],
+                                    (unsigned long long)d.base, d.stride, d.num_records, d.size_bytes,
+                                    (int)format_load_use, (int)raw_buffer_use,
+                                    (int)(d.base > 0x10000), (int)(d.size_bytes != 0),
+                                    (int)(d.size_bytes <= 0x10000000u),
+                                    (int)stride_supported, (int)format_supported);
                         }
                     }
                 }
@@ -5144,7 +5548,8 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 }
 
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
-                                                       bool is_ps, uint32_t draw_vertex_count) {
+                                                       bool is_ps, uint32_t draw_vertex_count,
+                                                       uint64_t draw_command_order) {
     if (!code_addr) return nullptr;
     const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
@@ -5824,6 +6229,51 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.type, d.base_array, d.format, d.tile_mode,
                                 reject ? reject : "materialize");
+                    // An EXACTLY all-zero eight-dword T# is not garbage: it is the guest explicitly
+                    // binding a null image, and `validate_shader_resources` already calls that valid
+                    // state -- "Explicit null descriptors are valid guest state: resource reads return
+                    // zero and the backend binds a zero-filled dummy. An absent table entry is still an
+                    // error above." (shader_resources.cpp). Dropping it here made the entry ABSENT,
+                    // which is the error case, so the consuming MIMG found nothing by fetch_pc and the
+                    // whole shader was rejected.
+                    //
+                    // Measured on GTA V routed gameplay: 11 of the 18 terminal-MIMG fragment pairs
+                    // reach this line with an exactly-known `t8 = 00000000 x8`, carrying 1,328 of the
+                    // rejected-draw occurrences (#2422).
+                    //
+                    // Deliberately narrow, and each clause is load-bearing:
+                    //   * EXACTLY zero, all eight dwords -- a nonzero-but-implausible base stays
+                    //     fail-visible, which is what the base-zero/low-base screen exists for.
+                    //   * proven descriptor provenance only -- either one table load or exact direct
+                    //     user-data provenance. An UNKNOWN T# must not be silently turned into a
+                    //     null bind.
+                    //   * sampled reads only. A storage image or atomic reaching a null descriptor is
+                    //     a WRITE to nowhere; that stays rejected rather than being made to look
+                    //     handled.
+                    const bool exact_null_t8 =
+                        reject && std::string_view(reject) == "base-zero" && !u.is_storage_image &&
+                        std::all_of(u.t8.begin(), u.t8.end(), [](uint32_t w) { return w == 0u; });
+                    if (exact_null_t8) {
+                        ShaderResource rn;
+                        rn.cls      = ResourceClass::Texture;
+                        rn.gpu_addr = 0;            // the three fields validate_shader_resources reads
+                        rn.size     = 0;            // to recognise an explicit null descriptor
+                        rn.fetch_pc = u.use_pc;     // exact-PC provenance: only THIS use resolves to it
+                        rn.srt_offset = 0xFFFFFFFFu;
+                        rn.sgpr_base  = 0xFFFFFFFFu;
+                        // Gated on PROSPER_DBG, not PROSPER_GFXLOG: GFXLOG must not be added to the
+                        // timing-dependent GTA V route without re-establishing its baseline, so an
+                        // instrument only visible under it cannot be read in the run being measured.
+                        // Publishing a null image is rare and consequential enough to say so.
+                        if (std::getenv("PROSPER_DBG"))
+                            fprintf(stderr, "[srt] %s null-image pc=%u key=0x%x (exact all-zero T#)\n",
+                                    is_ps ? "PS" : "VS", u.use_pc, u.key);
+                        record_null_image_source_probe(
+                            code_addr, u.use_pc, u.descriptor_source_addr,
+                            draw_command_order, u.t8);
+                        t.resources.push_back(rn);
+                        continue;
+                    }
                     if (reject) continue;                                    // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
@@ -6747,6 +7197,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
         assign_convention_bindings(*table, 2);
 
         ComputeItem item;
+        // Fold-time half of the paired read: the descriptors this dispatch will use were just
+        // resolved from guest memory, so sample that memory NOW, before anything else runs.
+        compute_memprobe_at_fold(code_addr, dispatch_index, config.user_sgprs);
         item.spirv = recompile_compute_shader_cached(
             (const uint32_t*)(uintptr_t)code_addr, 0x10000, table.get(), config, nullptr,
             recompile_diagnostic);
@@ -8091,6 +8544,164 @@ bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_
     item.dispatch_index = index;
     return true;
 }
+
+struct LiveComputeParentWalkPreflight {
+    bool selected = false;
+    bool available = false;
+    bool suspicious = false;
+    uint64_t resource_addr = 0;
+    uint32_t resource_bytes = 0;
+    uint64_t resource_hash = 0;
+    ComputeParentWalkReport report;
+};
+
+const std::optional<ComputeParentWalkSelector>& compute_parent_walk_selector() {
+    static const auto selector = [] {
+        const char* value = std::getenv("PROSPER_COMPUTE_PARENT_WALK");
+        auto parsed = parse_compute_parent_walk_selector(value);
+        if (value && *value && !parsed)
+            std::fprintf(stderr,
+                         "[compute-parent-walk] invalid selector '%s'; expected "
+                         "PROGRAM:FETCH_PC:SHIFT:MASK[:DEEP]\n",
+                         value);
+        return parsed;
+    }();
+    return selector;
+}
+
+void dump_suspicious_parent_walk(const ComputeItem& item, uint64_t hash,
+                                 const std::vector<uint32_t>& words) {
+    const char* root = std::getenv("PROSPER_COMPUTE_PARENT_WALK_DUMP");
+    if (!root || !*root) return;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        std::fprintf(stderr, "[compute-parent-walk] dump directory failed: %s\n",
+                     error.message().c_str());
+        return;
+    }
+    char leaf[192] = {};
+    std::snprintf(leaf, sizeof(leaf),
+                  "parent-walk-s%llu-d%llu-o%llu-%016llx.bin",
+                  static_cast<unsigned long long>(item.submit_no),
+                  static_cast<unsigned long long>(item.dispatch_index),
+                  static_cast<unsigned long long>(item.command_order),
+                  static_cast<unsigned long long>(hash));
+    const std::filesystem::path path = std::filesystem::path(root) / leaf;
+    FILE* file = std::fopen(path.string().c_str(), "wb");
+    if (!file) {
+        std::fprintf(stderr, "[compute-parent-walk] dump open failed: %s\n",
+                     path.string().c_str());
+        return;
+    }
+    const size_t written = std::fwrite(
+        words.data(), sizeof(uint32_t), words.size(), file);
+    const int close_result = std::fclose(file);
+    if (written != words.size() || close_result != 0) {
+        std::fprintf(stderr, "[compute-parent-walk] dump write failed: %s\n",
+                     path.string().c_str());
+        return;
+    }
+    std::fprintf(stderr, "[compute-parent-walk] dumped %zu bytes to %s\n",
+                 words.size() * sizeof(uint32_t), path.string().c_str());
+}
+
+LiveComputeParentWalkPreflight preflight_compute_parent_walk(
+        const ComputeItem& item, uint64_t previous_code,
+        bool previous_realized, bool previous_executed) {
+    LiveComputeParentWalkPreflight result;
+    const auto& selected = compute_parent_walk_selector();
+    if (!selected || item.code_addr != selected->program_addr) return result;
+    result.selected = true;
+
+    const ShaderResource* resource = nullptr;
+    if (item.resources) {
+        for (const ShaderResource& candidate : item.resources->resources) {
+            if (candidate.fetch_pc != selected->fetch_pc) continue;
+            if (resource) {
+                std::fprintf(stderr,
+                             "[compute-parent-walk] code=0x%llx fetch-pc=%u "
+                             "unavailable=ambiguous-resource\n",
+                             static_cast<unsigned long long>(item.code_addr),
+                             selected->fetch_pc);
+                return result;
+            }
+            resource = &candidate;
+        }
+    }
+    constexpr uint32_t kMaximumDiagnosticRecords = 1u << 20u;
+    if (!resource || !resource->size || (resource->size % sizeof(uint32_t)) != 0u ||
+        resource->stride != sizeof(uint32_t) ||
+        resource->size / sizeof(uint32_t) > kMaximumDiagnosticRecords) {
+        std::fprintf(stderr,
+                     "[compute-parent-walk] code=0x%llx fetch-pc=%u "
+                     "unavailable=resource-shape addr=0x%llx bytes=%u stride=%u\n",
+                     static_cast<unsigned long long>(item.code_addr), selected->fetch_pc,
+                     static_cast<unsigned long long>(resource ? resource->gpu_addr : 0u),
+                     resource ? resource->size : 0u, resource ? resource->stride : 0u);
+        return result;
+    }
+
+    const uint8_t* source = nullptr;
+    if (resource->host_data && resource->host_data_size >= resource->size) {
+        source = resource->host_data;
+    } else if (!resource->host_data && resource->host_data_size == 0u &&
+               guest_readable(resource->gpu_addr, resource->size)) {
+        source = reinterpret_cast<const uint8_t*>(
+            static_cast<uintptr_t>(resource->gpu_addr));
+    }
+    if (!source) {
+        std::fprintf(stderr,
+                     "[compute-parent-walk] code=0x%llx fetch-pc=%u "
+                     "unavailable=unreadable addr=0x%llx bytes=%u\n",
+                     static_cast<unsigned long long>(item.code_addr), selected->fetch_pc,
+                     static_cast<unsigned long long>(resource->gpu_addr), resource->size);
+        return result;
+    }
+
+    std::vector<uint32_t> words(resource->size / sizeof(uint32_t));
+    std::memcpy(words.data(), source, resource->size);
+    const uint64_t launched = std::min<uint64_t>(
+        static_cast<uint64_t>(item.launch.threads_x) * item.launch.threads_y *
+            item.launch.threads_z,
+        UINT32_MAX);
+    result.available = true;
+    result.resource_addr = resource->gpu_addr;
+    result.resource_bytes = resource->size;
+    result.resource_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(words.data()), resource->size);
+    result.report = analyze_compute_parent_walk(
+        words, static_cast<uint32_t>(launched), selected->index_shift,
+        selected->index_mask);
+    result.suspicious = compute_parent_walk_suspicious(
+        result.report, selected->deep_threshold);
+    std::fprintf(stderr,
+                 "[compute-parent-walk] submit=%llu dispatch=%llu order=%llu "
+                 "code=0x%llx fetch-pc=%u addr=0x%llx bytes=%u hash=%016llx "
+                 "groups=%ux%ux%u local=%ux%ux%u records=%u roots=%u "
+                 "cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u "
+                 "max-root=%u deep-threshold=%u suspicious=%u "
+                 "previous-code=0x%llx previous-realized=%u previous-executed=%u\n",
+                 static_cast<unsigned long long>(item.submit_no),
+                 static_cast<unsigned long long>(item.dispatch_index),
+                 static_cast<unsigned long long>(item.command_order),
+                 static_cast<unsigned long long>(item.code_addr), selected->fetch_pc,
+                 static_cast<unsigned long long>(result.resource_addr),
+                 result.resource_bytes,
+                 static_cast<unsigned long long>(result.resource_hash),
+                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z,
+                 item.launch.local_x, item.launch.local_y, item.launch.local_z,
+                 result.report.records, result.report.roots,
+                 result.report.distinct_cycles, result.report.cyclic_roots,
+                 result.report.oob_roots, result.report.max_depth,
+                 result.report.max_depth_root, selected->deep_threshold,
+                 static_cast<unsigned>(result.suspicious),
+                 static_cast<unsigned long long>(previous_code),
+                 static_cast<unsigned>(previous_realized),
+                 static_cast<unsigned>(previous_executed));
+    if (result.suspicious) dump_suspicious_parent_walk(item, result.resource_hash, words);
+    return result;
+}
 } // namespace
 
 std::vector<ComputeAuthorityBoundary> compute_authority_draw_resource_boundaries(
@@ -8217,6 +8828,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     bool producer_epoch_ok = true;
     bool indirect_dependencies_ok = true;
     bool final_callback_sent = false;
+    uint64_t previous_compute_code = 0;
+    bool previous_compute_realized = false;
+    bool previous_compute_executed = false;
     std::vector<DrawItem> span;
     auto flush_span = [&](bool authoritative_readback = false) {
         if (span.empty() || !render) return;
@@ -8301,6 +8915,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             }
             case RetainedSubmitKind::Dispatch: {
                 flush_span();
+                const uint64_t current_compute_code = compute_dispatch_code_addr(
+                    st, st.dispatches[operation.index]);
                 const bool indirect = st.dispatches[operation.index].indirect;
                 if (indirect && (!indirect_dependencies_ok || !producer_epoch_ok)) {
                     notify_compute_authority_unknown(
@@ -8313,6 +8929,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             RealizationFailureReason::IndirectDependencies});
                     }
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                     break;
                 }
                 if (!compute) {
@@ -8325,6 +8944,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             operation.command_order, RealizationFailureReason::Unknown});
                     }
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                     break;
                 }
                 ComputeItem item;
@@ -8332,6 +8954,31 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 if (realize_retained_compute(
                         st, operation.index, submit_no, item,
                         capture_trace ? &failure : nullptr)) {
+                    const LiveComputeParentWalkPreflight preflight =
+                        preflight_compute_parent_walk(
+                            item, previous_compute_code, previous_compute_realized,
+                            previous_compute_executed);
+                    if (preflight.selected && preflight.available && preflight.suspicious) {
+                        std::fprintf(stderr,
+                                     "[compute-parent-walk] DIAGNOSTIC-ONLY skip suspicious "
+                                     "dispatch submit=%llu dispatch=%zu order=%llu code=0x%llx\n",
+                                     static_cast<unsigned long long>(submit_no), operation.index,
+                                     static_cast<unsigned long long>(operation.command_order),
+                                     static_cast<unsigned long long>(item.code_addr));
+                        notify_compute_authority_unknown(
+                            ComputeAuthorityBoundaryKind::Compute,
+                            submit_no, operation.command_order);
+                        if (capture_trace) {
+                            capture_trace->failures.push_back({
+                                SubmitOperationKind::Dispatch, operation.index,
+                                operation.command_order, RealizationFailureReason::Unknown});
+                        }
+                        producer_epoch_ok = false;
+                        previous_compute_code = current_compute_code;
+                        previous_compute_realized = true;
+                        previous_compute_executed = false;
+                        break;
+                    }
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
                     if (capture_trace && executed)
@@ -8343,17 +8990,26 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     }
                     result.compute_executed |= executed;
                     producer_epoch_ok &= executed;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = true;
+                    previous_compute_executed = executed;
                 } else if (capture_trace && failure.reason != RealizationFailureReason::None) {
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
                     capture_trace->failures.push_back(std::move(failure));
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                 } else {
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
                     producer_epoch_ok = false;
+                    previous_compute_code = current_compute_code;
+                    previous_compute_realized = false;
+                    previous_compute_executed = false;
                 }
                 break;
             }
@@ -8695,7 +9351,12 @@ std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
     return frame.storage ? *frame.storage : std::vector<uint8_t>{};
 }
 bool execute_compute_items(const std::vector<ComputeItem>& items) {
-    return g_compute && !items.empty() && g_compute(items);
+    // Realization-time half of the paired read, taken at command-ordered execution rather than at
+    // fold. Deliberately before the dispatch runs, so the comparison isolates what happened BETWEEN
+    // resolution and execution and not what this dispatch itself wrote.
+    const bool ok = g_compute && !items.empty() && g_compute(items);
+    compute_memprobe_flush("post-compute-submit");
+    return ok;
 }
 
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
@@ -8740,9 +9401,21 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // submit can write a pointer or descriptor consumed by the next dispatch (Astro Bot's BVH root
     // is one such dependency). Pre-realizing every compute snapshots stale guest bytes.
     const bool can_eagerly_realize_draws = !has_ordered_dma && !has_indirect;
-    std::vector<DrawItem> draws = can_eagerly_realize_draws && g_live && width && height
-        ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
-        : std::vector<DrawItem>{};
+    // The normal AGC path is serialized, but execute_ordered_and_present is public and tests may
+    // call it concurrently. The active collection generation is process-global because eager draw
+    // workers need to see it, so serialize armed executions only; the default path never locks.
+    std::unique_lock<std::mutex> null_image_source_probe_run_lock(
+        g_null_image_source_probe_run_mutex, std::defer_lock);
+    if (null_image_source_probe_program()) null_image_source_probe_run_lock.lock();
+    std::vector<DrawItem> draws;
+    if (can_eagerly_realize_draws && g_live && width && height) {
+        g_collect_null_image_source_probe_submit.store(
+            null_image_source_probe_program() ? submit_no : 0u, std::memory_order_relaxed);
+        draws = realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true);
+        g_collect_null_image_source_probe_submit.store(0, std::memory_order_relaxed);
+    }
+    std::vector<NullImageSourceProbe> null_image_source_probes =
+        take_null_image_source_probes(draws, submit_no);
     const ShaderRecompileCacheStats shader_after = timing_enabled
         ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
     const ShaderDecodeCacheStats decode_after = timing_enabled
@@ -8775,6 +9448,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                                    pending_capture ? &capture_trace : nullptr,
                                    can_eagerly_realize_draws ? &draws : nullptr)
         : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
+    check_null_image_source_probes(null_image_source_probes, submit_no);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
 

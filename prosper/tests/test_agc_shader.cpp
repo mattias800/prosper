@@ -323,6 +323,131 @@ int main() {
               prosper::gpu::ShaderResource::kDirectVSharpOriginAmbiguous,
           "shader-constructed pixel V# keeps its resource but no fabricated raw SH origin");
 
+    // An exactly-zero T# recovered from a descriptor table is an explicit null sampled image, not
+    // a missing resource. Exercise build_stage_table itself: the production fix lives in its dynamic
+    // image materialization loop, after resolve_dynamic_fetch has recovered the eight descriptor
+    // words. The two mutations change the inputs at that same branch -- one T# word and the consuming
+    // MIMG operation class -- so a helper-only or broad base-zero relaxation cannot satisfy the arm.
+    alignas(256) static uint32_t null_image_table[20]{};
+    const uint32_t null_image_sample_shader[] = {
+        0xF40C0304u, 0xFA000020u,   // s_load_dwordx8 s[12:19], s[8:9], 0x20
+        0xF4080504u, 0xFA000040u,   // s_load_dwordx4 s[20:23], s[8:9], 0x40
+        0xF0800F08u, 0x00A30000u,   // pc=4: image_sample ..., s[12:19], s[20:23]
+        0xBF810000u,
+    };
+    Shader null_image_sample{};
+    null_image_sample.file_header = 0x34333231u;
+    null_image_sample.version = 0x18u;
+    null_image_sample.shader_size = sizeof(null_image_sample_shader);
+    null_image_sample.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&null_image_sample),
+                       reinterpret_cast<uint64_t>(null_image_sample_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &null_image_sample,
+          "null-image sample shader enters the AGC registry");
+    prosper::gpu::GpuState null_image_state;
+    constexpr uint32_t kNullImagePsUser = prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0;
+    const uint64_t null_image_table_addr = reinterpret_cast<uint64_t>(null_image_table);
+    null_image_state.sh[kNullImagePsUser + 8] =
+        static_cast<uint32_t>(null_image_table_addr);
+    null_image_state.sh[kNullImagePsUser + 9] =
+        static_cast<uint32_t>(null_image_table_addr >> 32);
+    auto null_image_resources = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
+    const prosper::gpu::ShaderResource* null_image =
+        null_image_resources ? null_image_resources->by_fetch_pc(4) : nullptr;
+    CHECK(null_image && null_image->cls == prosper::gpu::ResourceClass::Texture &&
+              null_image->gpu_addr == 0 && null_image->size == 0 &&
+              null_image->srt_offset == UINT32_MAX,
+          "exact all-zero table T# materializes as an exact-PC null sampled image");
+
+    // T# word 2, not the base words: the decoder still reports `base-zero`, so only the
+    // production all-eight-words predicate distinguishes this from the admitted descriptor.
+    null_image_table[10] = 1u;
+    auto nonzero_base_zero_resources = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_sample_shader), true, 3);
+    CHECK(!nonzero_base_zero_resources || !nonzero_base_zero_resources->by_fetch_pc(4),
+          "one nonzero T# word keeps a malformed low-base image fail-visible");
+    null_image_table[10] = 0u;
+
+    const uint32_t null_image_store_shader[] = {
+        0xF40C0304u, 0xFA000020u,   // same exact all-zero T# load
+        0xF4080504u, 0xFA000040u,
+        0xF0200F08u, 0x00030004u,   // pc=4: image_store ..., s[12:19]
+        0xBF810000u,
+    };
+    Shader null_image_store{};
+    null_image_store.file_header = 0x34333231u;
+    null_image_store.version = 0x18u;
+    null_image_store.shader_size = sizeof(null_image_store_shader);
+    null_image_store.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&null_image_store),
+                       reinterpret_cast<uint64_t>(null_image_store_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &null_image_store,
+          "null-image storage mutation enters the AGC registry");
+    auto null_store_resources = prosper::gpu::build_stage_table(
+        null_image_state, reinterpret_cast<uint64_t>(null_image_store_shader), true, 3);
+    CHECK(!null_store_resources || !null_store_resources->by_fetch_pc(4),
+          "same-site image_store mutation does not turn a null write into a sampled-image bind");
+
+    // The same null-image semantics apply when MIMG consumes an unchanged direct user-SGPR T#.
+    // Exercise the complete production path added for GTA V: fold admission and exact-PC
+    // materialization, plus same-site descriptor-word and operation-class mutations.
+    const uint32_t direct_null_sample_shader[] = {
+        0xF0800F08u, 0x00400000u,   // pc=0: image_sample ..., s[0:7], s[8:11]
+        0xBF810000u,
+    };
+    Shader direct_null_sample{};
+    direct_null_sample.file_header = 0x34333231u;
+    direct_null_sample.version = 0x18u;
+    direct_null_sample.shader_size = sizeof(direct_null_sample_shader);
+    direct_null_sample.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&direct_null_sample),
+                       reinterpret_cast<uint64_t>(direct_null_sample_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &direct_null_sample,
+          "direct null-image sample shader enters the AGC registry");
+    prosper::gpu::GpuState direct_null_state;
+    auto direct_null_resources = prosper::gpu::build_stage_table(
+        direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
+    const prosper::gpu::ShaderResource* direct_null_image =
+        direct_null_resources ? direct_null_resources->by_fetch_pc(0) : nullptr;
+    CHECK(direct_null_image &&
+              direct_null_image->cls == prosper::gpu::ResourceClass::Texture &&
+              direct_null_image->gpu_addr == 0 && direct_null_image->size == 0,
+          "exact all-zero direct T# materializes as an exact-PC null sampled image");
+
+    direct_null_state.sh[kNullImagePsUser + 2] = 1u;
+    auto mutated_direct_null_resources = prosper::gpu::build_stage_table(
+        direct_null_state, reinterpret_cast<uint64_t>(direct_null_sample_shader), true, 3);
+    CHECK(!mutated_direct_null_resources || !mutated_direct_null_resources->by_fetch_pc(0),
+          "one nonzero direct T# word keeps the same base-zero sample fail-visible");
+    direct_null_state.sh.erase(kNullImagePsUser + 2);
+
+    const uint32_t direct_null_store_shader[] = {
+        0xF0200F08u, 0x00000000u,   // pc=0: image_store ..., s[0:7]
+        0xBF810000u,
+    };
+    Shader direct_null_store{};
+    direct_null_store.file_header = 0x34333231u;
+    direct_null_store.version = 0x18u;
+    direct_null_store.shader_size = sizeof(direct_null_store_shader);
+    direct_null_store.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&direct_null_store),
+                       reinterpret_cast<uint64_t>(direct_null_store_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &direct_null_store,
+          "direct null-image storage shader enters the AGC registry");
+    auto direct_null_store_resources = prosper::gpu::build_stage_table(
+        direct_null_state, reinterpret_cast<uint64_t>(direct_null_store_shader), true, 3);
+    CHECK(!direct_null_store_resources || !direct_null_store_resources->by_fetch_pc(0),
+          "same-site direct image_store does not materialize a null sampled image");
+
     // The instruction proof is not complete until the real graphics resource builder has paired it
     // with this exact one-level uncompressed descriptor. Exercise build_stage_table itself so
     // deleting its marker assignment cannot be hidden by helper-only tests.

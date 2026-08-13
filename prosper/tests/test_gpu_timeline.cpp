@@ -377,7 +377,10 @@ static int run_selector_env_child(const std::string& mode) {
                  bundle, 1, second_bundle_capture, error) &&
              first_bundle_capture.ds_seeds.size() == 1 &&
              first_bundle_capture.ds_seeds[0].depth == expected_ds_seed.depth &&
-             second_bundle_capture.ds_seeds.empty() && ds_snapshots == 3;
+             second_bundle_capture.ds_seeds.empty() &&
+             // The two phase-boundary snapshots remain mandatory. The standalone endpoint has no
+             // realized DS-using draw, so capture_referenced_gpu_ds_seeds correctly omits a third.
+             ds_snapshots == 2;
     } else {
         GpuCaptureFile capture;
         const auto zero_lower_bound = [&](const auto& entry) {

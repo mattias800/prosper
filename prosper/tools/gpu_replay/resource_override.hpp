@@ -43,6 +43,28 @@ struct AppliedResourceOverride {
     std::shared_ptr<std::vector<uint8_t>> replacement_bytes;
 };
 
+struct ComputeResourceOverrideSelector {
+    size_t compute_index = SIZE_MAX;
+    uint32_t binding = 0;
+};
+
+struct ComputeResourceOverrideTarget {
+    size_t compute_index = SIZE_MAX;
+    size_t resource_index = SIZE_MAX;
+    uint64_t gpu_addr = 0;
+    uint64_t captured_size = 0;
+};
+
+// Compute dispatches can share one captured table just like draws. Keep replacement ownership next
+// to the exact cloned dispatch table so a diagnostic override cannot contaminate a sibling dispatch.
+struct AppliedComputeResourceOverride {
+    ComputeResourceOverrideSelector selector;
+    ComputeResourceOverrideTarget target;
+    uint64_t original_hash = 0;
+    uint64_t replacement_hash = 0;
+    std::shared_ptr<std::vector<uint8_t>> replacement_bytes;
+};
+
 inline const char* resource_override_stage_name(ResourceOverrideStage stage) {
     return stage == ResourceOverrideStage::Vertex ? "vs" : "ps";
 }
@@ -69,6 +91,24 @@ inline bool parse_resource_override_selector(std::string_view text,
     selector.draw_index = draw_index;
     selector.stage = stage == "vs" ? ResourceOverrideStage::Vertex
                                     : ResourceOverrideStage::Pixel;
+    selector.binding = static_cast<uint32_t>(binding);
+    return true;
+}
+
+inline bool parse_compute_resource_override_selector(
+        std::string_view text, ComputeResourceOverrideSelector& selector) {
+    const size_t colon = text.find(':');
+    if (colon == std::string_view::npos || text.find(':', colon + 1) != std::string_view::npos)
+        return false;
+
+    uint64_t compute_index = 0;
+    uint64_t binding = 0;
+    if (!gpu::parse_diagnostic_uint64(text.substr(0, colon), compute_index) ||
+        !gpu::parse_diagnostic_uint64(text.substr(colon + 1), binding) ||
+        compute_index > std::numeric_limits<size_t>::max() ||
+        binding > std::numeric_limits<uint32_t>::max())
+        return false;
+    selector.compute_index = static_cast<size_t>(compute_index);
     selector.binding = static_cast<uint32_t>(binding);
     return true;
 }
@@ -210,6 +250,100 @@ inline bool apply_resource_override_file(gpu::GpuReplayFrame& replay,
     if (!read_exact_resource_override_file(path, target.captured_size, replacement, error))
         return false;
     return apply_resource_override(replay, selector, std::move(replacement), applied, error);
+}
+
+inline bool find_compute_resource_override_target(
+        const gpu::GpuReplayFrame& replay, const ComputeResourceOverrideSelector& selector,
+        ComputeResourceOverrideTarget& target, std::string& error) {
+    if (selector.compute_index >= replay.computes.size()) {
+        error = "compute index " + std::to_string(selector.compute_index) + " not found";
+        return false;
+    }
+    const auto& table = replay.computes[selector.compute_index].resources;
+    if (!table) {
+        error = "compute " + std::to_string(selector.compute_index) +
+                " resource table is absent";
+        return false;
+    }
+
+    size_t resource_index = SIZE_MAX;
+    for (size_t index = 0; index < table->resources.size(); ++index) {
+        if (table->resources[index].binding != selector.binding) continue;
+        if (resource_index != SIZE_MAX) {
+            error = "compute " + std::to_string(selector.compute_index) + " binding " +
+                    std::to_string(selector.binding) + " is ambiguous";
+            return false;
+        }
+        resource_index = index;
+    }
+    if (resource_index == SIZE_MAX) {
+        error = "compute " + std::to_string(selector.compute_index) + " binding " +
+                std::to_string(selector.binding) + " not found";
+        return false;
+    }
+
+    const auto& resource = table->resources[resource_index];
+    if (!resource.host_data || resource.host_data_size == 0) {
+        error = "compute " + std::to_string(selector.compute_index) + " binding " +
+                std::to_string(selector.binding) + " has no captured bytes";
+        return false;
+    }
+    if (resource.host_data_size > std::numeric_limits<size_t>::max()) {
+        error = "selected captured compute resource span is too large for this host";
+        return false;
+    }
+
+    target.compute_index = selector.compute_index;
+    target.resource_index = resource_index;
+    target.gpu_addr = resource.gpu_addr;
+    target.captured_size = resource.host_data_size;
+    error.clear();
+    return true;
+}
+
+inline bool apply_compute_resource_override(
+        gpu::GpuReplayFrame& replay, const ComputeResourceOverrideSelector& selector,
+        std::vector<uint8_t> replacement, AppliedComputeResourceOverride& applied,
+        std::string& error) {
+    ComputeResourceOverrideTarget target;
+    if (!find_compute_resource_override_target(replay, selector, target, error)) return false;
+    if (replacement.size() != target.captured_size) {
+        error = "replacement has " + std::to_string(replacement.size()) +
+                " bytes; selected captured compute span is " +
+                std::to_string(target.captured_size) + " bytes";
+        return false;
+    }
+
+    auto& selected_table = replay.computes[target.compute_index].resources;
+    const auto& original_resource = selected_table->resources[target.resource_index];
+
+    AppliedComputeResourceOverride result;
+    result.selector = selector;
+    result.target = target;
+    result.original_hash = gpu::gpu_capture_hash(
+        original_resource.host_data, static_cast<size_t>(original_resource.host_data_size));
+    result.replacement_bytes =
+        std::make_shared<std::vector<uint8_t>>(std::move(replacement));
+    result.replacement_hash = gpu::gpu_capture_hash(*result.replacement_bytes);
+
+    auto copied_table = std::make_shared<gpu::ShaderResourceTable>(*selected_table);
+    copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
+    selected_table = std::move(copied_table);
+    applied = std::move(result);
+    error.clear();
+    return true;
+}
+
+inline bool apply_compute_resource_override_file(
+        gpu::GpuReplayFrame& replay, const ComputeResourceOverrideSelector& selector,
+        const std::string& path, AppliedComputeResourceOverride& applied, std::string& error) {
+    ComputeResourceOverrideTarget target;
+    if (!find_compute_resource_override_target(replay, selector, target, error)) return false;
+    std::vector<uint8_t> replacement;
+    if (!read_exact_resource_override_file(path, target.captured_size, replacement, error))
+        return false;
+    return apply_compute_resource_override(
+        replay, selector, std::move(replacement), applied, error);
 }
 
 } // namespace prosper::tools

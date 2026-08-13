@@ -266,6 +266,8 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --compute-only 0 --override-compute-spv 0 /tmp/reduced.spv \
   /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --compute-only 0 --override-compute-resource 0:2 ~/captures/storage.bin \
+  /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-post-compute-resource 12:14 ~/captures/storage-linear.bin \
   --require-post-change ~/captures/submit.prgcap
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
@@ -512,10 +514,11 @@ that dispatch has complete current-translator replay state. The resource selecto
 the exact specialized SPIR-V executed by replay (the rebuilt module when combined with `--recompile-raw`).
 `--dump-post-compute-resource COMPUTE:BINDING PATH` instead executes the retained mixed-operation prefix
 through exactly one selected realized dispatch, waits for its Vulkan writeback, and writes the selected
-storage image in descriptor-visible linear texel order. It rejects an ambiguous operation selector, a failed
-prefix dispatch, or a selected dispatch that did not execute exactly once. The diagnostic keeps the captured
-seed separate, snapshots the selected binding immediately before its dispatch, and prints immediate-before to
-synchronous-after raw/backing and linear hashes; R11G11B10F images also report finite, zero,
+storage buffer as exact descriptor bytes or the selected storage image in descriptor-visible linear texel
+order. It rejects an ambiguous operation selector, a failed prefix dispatch, or a selected dispatch that did
+not execute exactly once. The diagnostic keeps the captured seed separate, snapshots the selected binding
+immediately before its dispatch, and prints immediate-before to synchronous-after raw/backing and linear
+hashes; R11G11B10F images also report finite, zero,
 greater-than-one, infinity, NaN, range, and mean counts. `--require-post-change` makes an unchanged
 descriptor-visible linear hash fail, while `--expect-post-hash HASH` requires an exact post-dispatch
 raw/backing hash. Those gates prove the requested execution and observation lever moved; the output file
@@ -569,6 +572,13 @@ prove the replacement was installed without initializing Vulkan; the selected ta
 `hash=` field will equal the reported `new-hash`. A rendering replay still enforces the capture's
 output oracle, so add the explicit `--allow-mismatch` diagnostic option when an intentional input
 change is expected to alter the final image.
+
+`--override-compute-resource N:BINDING PATH` provides the matching dispatch-scoped operation for
+compute replay. The file must exactly match the selected captured span. The tool clones only compute
+N's resource table, owns the replacement bytes, and reports the original/replacement hashes, so a
+shared sibling dispatch remains untouched. Pair it with `--compute-only N` to reproduce a data-dependent
+shader failure without executing unrelated operations; like a SPIR-V override, this is a diagnostic input
+change and disables the capture pixel oracle.
 
 `--draw-with-compute-prefix` retains every compute operation before the selected draw while discarding the
 other graphics draws. This isolates geometry whose vertex/indirect buffers are produced earlier in the same

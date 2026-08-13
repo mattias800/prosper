@@ -804,12 +804,8 @@ struct RenderVkCtx {
     // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback for final clip-space positions.
     bool transform_feedback_enabled = false;
     bool subgroup_size_control = false;
-    // Runtime-selected descriptors (#2412, stage 1 of the descriptor lift). True only when EVERY feature
-    // the design needs is present, because a partially-available set is not a usable capability: a shader
-    // emitted against an unsized array is invalid without `runtimeDescriptorArray`, and an index that
-    // varies between waves of one workgroup is undefined without the matching non-uniform feature. So
-    // this is deliberately all-or-nothing rather than a bag of independent flags — a caller can treat it
-    // as "may I emit an indexed descriptor array" and be right.
+    // Runtime-selected storage buffers (#2412). Successful contracts are bounded fixed arrays, so the
+    // only descriptor-indexing feature they require is non-uniform storage-buffer array indexing.
     //
     // Measured available on both lanes' hardware: RADV STRIX_HALO and RTX 4090 report all of them true.
     // The AMD device additionally reports `…NonUniformIndexingNative = false`, which is a performance
@@ -1002,31 +998,20 @@ inline const RenderVkCtx& render_vk_ctx() {
                   }
               }
               if (!strcmp(de[i].extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
-                  // Stage 1 of the runtime-selected-descriptor lift (#2412). Enabled ONLY when every
-                  // feature the design needs is present -- see `descriptor_indexing` for why this is
-                  // all-or-nothing. Nothing consumes the capability yet; this stage exists so the
-                  // later stages have a device that can express an indexed descriptor array, and so
-                  // that a device which cannot is discovered here rather than at pipeline creation.
+                  // Runtime-selected storage buffers use bounded fixed arrays. Request only the one
+                  // descriptor-indexing feature their non-uniform access chains require.
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
                   f2.pNext = &di_features;
                   vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-                  const bool have_all =
-                      di_features.runtimeDescriptorArray &&
-                      di_features.descriptorBindingPartiallyBound &&
-                      di_features.shaderStorageBufferArrayNonUniformIndexing &&
-                      di_features.shaderSampledImageArrayNonUniformIndexing &&
-                      di_features.shaderStorageImageArrayNonUniformIndexing;
-                  if (have_all) {
-                      // Request exactly the five, not the whole struct as queried. Enabling a feature
+                  const bool have_ssbo_arrays =
+                      di_features.shaderStorageBufferArrayNonUniformIndexing;
+                  if (have_ssbo_arrays) {
+                      // Request exactly the feature in use, not the whole struct as queried. Enabling a feature
                       // the design does not use widens the driver contract for no benefit, and a
                       // later reader cannot tell which ones are load-bearing.
                       VkPhysicalDeviceDescriptorIndexingFeaturesEXT want{
                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-                      want.runtimeDescriptorArray = VK_TRUE;
-                      want.descriptorBindingPartiallyBound = VK_TRUE;
                       want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
-                      want.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-                      want.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
                       di_features = want;
                       di_features.pNext = const_cast<void*>(dci.pNext);
                       dci.pNext = &di_features;
@@ -1039,20 +1024,14 @@ inline const RenderVkCtx& render_vk_ctx() {
                       // to confirm the capability was actually acquired rather than merely compiled.
                       if (getenv("PROSPER_GFXLOG"))
                           fprintf(stderr, "[vk] descriptor indexing ENABLED "
-                                          "(runtimeArray+partiallyBound+nonUniform ssbo/sampled/image)\n");
+                                          "(nonUniform ssbo)\n");
                   } else if (getenv("PROSPER_GFXLOG")) {
                       // Report the SHORTFALL, not merely "unavailable": which feature is missing decides
                       // whether a fallback is possible at all, and a bare "not supported" would send the
                       // next reader to the extension list when the extension is present.
                       fprintf(stderr,
-                              "[vk] VK_EXT_descriptor_indexing present but incomplete: "
-                              "runtimeArray=%d partiallyBound=%d ssboNonUniform=%d "
-                              "sampledNonUniform=%d storageImgNonUniform=%d\n",
-                              (int)di_features.runtimeDescriptorArray,
-                              (int)di_features.descriptorBindingPartiallyBound,
-                              (int)di_features.shaderStorageBufferArrayNonUniformIndexing,
-                              (int)di_features.shaderSampledImageArrayNonUniformIndexing,
-                              (int)di_features.shaderStorageImageArrayNonUniformIndexing);
+                              "[vk] VK_EXT_descriptor_indexing lacks "
+                              "shaderStorageBufferArrayNonUniformIndexing\n");
                   }
               }
               if (!strcmp(de[i].extensionName, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)) {
@@ -1168,9 +1147,9 @@ inline const RenderVkCtx& render_vk_ctx() {
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
             shared.compute_subgroup_arithmetic =
                 (r.subgroup_operations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
-            // Publish the descriptor-indexing capability enabled on this device, under the contract stated
-            // above: `r.descriptor_indexing` is set only where the five features were actually requested at
-            // device creation, never from `supported`.
+            // Publish the descriptor-indexing capability enabled on this device: the flag is set only
+            // where non-uniform storage-buffer indexing was actually requested at device creation,
+            // never from `supported`.
             shared.descriptor_indexing = r.descriptor_indexing;
             shared.storage_buffer_int64_atomics =
                 r.storage_buffer_int64_atomics && feats.shaderInt64;
@@ -4530,6 +4509,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupArithmetic;
         if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
+        if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_BALLOT_BIT)
+            available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupBallot;
         const bool uses_internal_gds =
             fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
         if (required_fragment_subgroup_size &&
@@ -4549,7 +4530,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::lock_guard<std::mutex> lock(log_mutex);
             if (logged.insert(shader_key).second) {
                 // WHY the width was required, decoded (#2147). `required-ops` cannot answer it:
-                // those are Vote/Arithmetic/Shuffle CAPABILITY bits, and the lane-id path declares
+                // those are Vote/Arithmetic/Shuffle/Ballot CAPABILITY bits, and the lane-id path declares
                 // none of them — so a shader needing 64 for lane IDENTITY (which can never run at
                 // 32, since SubgroupLocalInvocationId IS the guest lane id) printed identically to
                 // one needing it only for a branch-guard vote (which may be width-agnostic). Those

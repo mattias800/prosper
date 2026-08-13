@@ -50,6 +50,18 @@ inline constexpr uint32_t kSop1OpcodeQuadmaskB64 = 0x2d;
 inline constexpr uint32_t kSop1OpcodeAbsI32 = 0x34;
 inline constexpr uint32_t kSop1OpcodeAndn1SaveexecB64 = 0x37;
 inline constexpr uint32_t kSop1OpcodeOrn1SaveexecB64 = 0x38;
+inline constexpr uint32_t kSop1OpcodeAndSaveexecB32 = 0x3c;
+inline constexpr uint32_t kSop1OpcodeOrSaveexecB32 = 0x3d;
+inline constexpr uint32_t kSop1OpcodeXorSaveexecB32 = 0x3e;
+inline constexpr uint32_t kSop1OpcodeAndn2SaveexecB32 = 0x3f;
+inline constexpr uint32_t kSop1OpcodeOrn2SaveexecB32 = 0x40;
+inline constexpr uint32_t kSop1OpcodeNandSaveexecB32 = 0x41;
+inline constexpr uint32_t kSop1OpcodeNorSaveexecB32 = 0x42;
+inline constexpr uint32_t kSop1OpcodeXnorSaveexecB32 = 0x43;
+inline constexpr uint32_t kSop1OpcodeAndn1SaveexecB32 = 0x44;
+inline constexpr uint32_t kSop1OpcodeOrn1SaveexecB32 = 0x45;
+inline constexpr uint32_t kSop1OpcodeAndn1WrexecB32 = 0x46;
+inline constexpr uint32_t kSop1OpcodeAndn2WrexecB32 = 0x47;
 inline constexpr uint32_t kSop2OpcodeCselectB32 = 0x0a;
 inline constexpr uint32_t kSop2OpcodeAddI32 = 0x02;
 inline constexpr uint32_t kSop1OpcodeMovreldB32 = 0x30;
@@ -70,6 +82,7 @@ inline constexpr uint32_t kSop2OpcodeXnorB32 = 0x1c;
 inline constexpr uint32_t kSop2OpcodeBfmB32 = 0x24;
 inline constexpr uint32_t kSop2OpcodeBfmB64 = 0x25;
 inline constexpr uint32_t kSop2OpcodeBfeU64 = 0x29;
+inline constexpr uint32_t kSop2OpcodePackLlB32B16 = 0x32;
 inline constexpr uint32_t kSopkOpcodeMovkI32 = 0x00;
 inline constexpr uint32_t kSopkOpcodeCmovkI32 = 0x02;
 inline constexpr uint32_t kSopkOpcodeCmpkFirst = 0x03;
@@ -96,6 +109,28 @@ inline constexpr uint32_t kSoppOpcodeCbranchCdbgsysAndUser = 0x1a;
 inline constexpr bool sopp_opcode_is_direct_branch(uint32_t opcode) {
     return opcode == kSoppOpcodeBranch ||
            (opcode >= kSoppOpcodeCbranchScc0 && opcode <= kSoppOpcodeCbranchExecnz);
+}
+
+inline constexpr bool sop1_opcode_is_saveexec_b32(uint32_t opcode) {
+    return opcode >= kSop1OpcodeAndSaveexecB32 &&
+           opcode <= kSop1OpcodeOrn1SaveexecB32;
+}
+
+inline constexpr bool sop1_opcode_is_wrexec_b32(uint32_t opcode) {
+    return opcode >= kSop1OpcodeAndn1WrexecB32 &&
+           opcode <= kSop1OpcodeAndn2WrexecB32;
+}
+
+inline constexpr bool sop1_opcode_writes_exec_b32(uint32_t opcode) {
+    return sop1_opcode_is_saveexec_b32(opcode) || sop1_opcode_is_wrexec_b32(opcode);
+}
+
+// The emitter currently implements only the three B32 forms observed in guest shaders. Width and
+// EXEC lifetime analysis still classify the complete architectural SAVEEXEC/WREXEC families above.
+inline constexpr bool sop1_opcode_is_emitted_saveexec_b32(uint32_t opcode) {
+    return opcode == kSop1OpcodeAndSaveexecB32 ||
+           opcode == kSop1OpcodeOrn2SaveexecB32 ||
+           opcode == kSop1OpcodeAndn1SaveexecB32;
 }
 
 // GFX10.3 scalar-memory load opcodes shared by provenance analysis and emission. These are

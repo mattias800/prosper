@@ -162,8 +162,9 @@ falls back to `v_cbuf`. The access chains themselves are built at the call sites
 decorated `NonUniform`.
 
 Capability set required, emitted only when such a binding exists so that every module that does not
-use one stays byte-identical: `ShaderNonUniform` (5301), `RuntimeDescriptorArray` (5302) for the
-runtime-array form, and `StorageBufferArrayNonUniformIndexing` (5306).
+use one stays byte-identical: `ShaderNonUniform` (5301) and
+`StorageBufferArrayNonUniformIndexing` (5308). Successful contracts are bounded fixed arrays, so they
+do not request `RuntimeDescriptorArray` or `descriptorBindingPartiallyBound`.
 
 **Why `NonUniform` is unconditional rather than reasoned about per site**, measured on `PPSA04263`:
 of 51 compute launches, 29 are `local=64x1x1`, 7 are `8x8x1`, 7 are `32x1x1`, and **5 are
@@ -204,11 +205,11 @@ So arity participates in layout identity and an array layout cannot be wrongly r
 binding of the same number. This is a pre-existing correct property, recorded so nobody "fixes" it and
 so a reviewer does not have to suspect stale-layout reuse.
 
-**5. `descriptorBindingPartiallyBound` is already enabled** — stage 1 requires all five descriptor
-indexing features together, so the backend may leave a junk table slot **unwritten** rather than
-inventing a dummy descriptor for every unreadable entry. That is what makes per-entry validation
-practical: run each entry through the existing `image_descriptor_reject_reason` equivalent, write the
-ones that pass, leave the rest unbound, and let the shader's own bounds discipline handle the gap.
+**5. `descriptorBindingPartiallyBound` is not required.** The implemented fixed-array buffer path does
+not use that feature to hide incomplete input. Every declared slot must have a validated concrete V#;
+normalized null V#s are represented explicitly by a small zero source, while unreadable non-null
+entries reject the dispatch. This preserves robust zero-read semantics without making a missing table
+entry indistinguishable from a deliberate guest null descriptor.
 
 **Materialisation must be lazy or generation-invalidated, and that is measured rather than assumed.**
 Stage 0 (`PROSPER_DESCR_COHERENCE`, #2456) found **8.5% of distinct V#-relative descriptor addresses
@@ -237,9 +238,36 @@ rather than as a crash. Size the run table before the loop, or store offsets and
 a second pass after the vector is final. Same constraint applies to `dii` for image arrays.
 
 **Sequencing consequence.** This makes the backend half a change to the *shared* renderer's descriptor
-sizing and indexing semantics, which the charter lists as requiring independent review, and it cannot be
-verified end-to-end until a producer sets `table_index_count` — so it should land with a synthetic
-multi-entry test plus an explicit statement that the N>0 path has no live producer yet. Landing
+sizing and indexing semantics, which the charter lists as requiring independent review. Landing
 pool-sizing or layout arity *without* the matching write arity is worse than landing neither: a layout
 declaring N against a write supplying 1 is a validation error the moment a producer appears, so these
 four sites (pool, layout, write, and this run table) must change together.
+
+## Runtime-selected V# arrays — implemented foundation (2026-08-13)
+
+The representation and backend stages above are now one fail-closed path:
+
+1. `ShaderResource` carries the declared arity, guest record stride, selector provenance and a complete
+   concrete V# payload. Capture/replay stores one backing reference per entry, and dependency closure
+   enumerates the same entries independently.
+2. The shared resource contract requires exact arity, agreement between raw and normalized V# fields,
+   uniform stride/format/component semantics, representable controls and identity `DST_SEL` on non-null
+   entries. Incomplete, unreadable or differently interpreted entries reject the dispatch.
+3. The compute user-SGPR selector emitter declares the correct descriptor-indexing capabilities, marks both the
+   bounded selector and access-chain pointer `NonUniform`, clamps the host access to descriptor zero,
+   and selects architectural zero for an out-of-range guest index. Array stores and atomics remain a
+   compile-time rejection. Graphics rejects this selector mode until its shell has an equivalent
+   runtime user-data source. This checkpoint admits raw reads only; typed accesses need selected-entry
+   default-fill/swizzle semantics, and writes/atomics need writeback authority.
+4. Live compute derives pool demand, layout arity, write arity and per-binding offsets from one plan. It
+   binds every concrete entry, supplies an explicit zero backing for guest null V#s, and retains each
+   entry's own cache identity, lifetime and guest-authority bookkeeping. Arrays are read-only until an
+   equivalent writeback contract exists.
+
+The production test executes every concrete/null slot and an index equal to the declared arity through
+the Vulkan backend. Same-entry mutations cover stride, format, unrepresented controls and `DST_SEL`.
+
+This checkpoint does **not** claim GTA V's GPU-derived scalar-buffer selector. That producer still needs
+a whole-CFG MUST-proof that the multiplying definition reaches the descriptor load and that every
+runtime value denotes a snapshotted record start; treating a wrapped off-record byte offset as zero would
+not match RDNA2. The capture/backend foundation stays useful while that proof is completed.
