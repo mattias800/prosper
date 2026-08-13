@@ -155,7 +155,7 @@ int main() {
         0x6400, 4, 2, ResourceClass::ConstantBuffer);
     short_scalar.stride = 1;
     short_scalar.srt_offset = 0x20;
-    short_scalar.scalar_buffer_dword_count = 4;
+    short_scalar.scalar_buffer_dword_count = 1;
     scalar_bound_draw.prt->resources = {short_scalar};
     GpuReplayFrame scalar_bound_replay;
     scalar_bound_replay.items = {scalar_bound_draw};
@@ -163,10 +163,20 @@ int main() {
         {SubmitOperationKind::Draw, 638, 638, true},
     };
     GpuDependencyGraph scalar_bound_graph;
+    // #2528: four stride-1 records are four BYTES, so the closure is four bytes. Reading
+    // NUM_RECORDS as a dword count would both accept this resource with a count of 4 and close over
+    // 16 bytes, pulling three dwords of unrelated host memory into the dependency span.
     CHECK(build_gpu_dependency_graph(scalar_bound_replay, scalar_bound_graph, error) &&
               scalar_bound_graph.external_leaves.size() == 1 &&
-              scalar_bound_graph.external_leaves[0].access.size == 16,
-          "scalar-buffer dependency closure is never truncated to a short host snapshot");
+              scalar_bound_graph.external_leaves[0].access.size == 4,
+          "scalar-buffer dependency closure spans exactly the V# byte footprint");
+    // Mutation at the authenticating site. A count that disagrees with the footprint does not name
+    // a wider span; it is malformed metadata, and the whole graph must fail closed rather than
+    // silently choosing one of the two numbers.
+    scalar_bound_replay.items[0].prt->resources[0].scalar_buffer_dword_count = 4;
+    CHECK(!build_gpu_dependency_graph(scalar_bound_replay, scalar_bound_graph, error) &&
+              error == "resource has invalid scalar-buffer dependency metadata",
+          "a scalar bound inconsistent with the V# footprint fails the dependency graph closed");
     scalar_bound_replay.items[0].prt->resources[0].scalar_buffer_dword_count = 0;
     CHECK(build_gpu_dependency_graph(scalar_bound_replay, scalar_bound_graph, error) &&
               scalar_bound_graph.external_leaves.size() == 1 &&

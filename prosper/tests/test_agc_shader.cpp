@@ -323,11 +323,13 @@ int main() {
               prosper::gpu::ShaderResource::kDirectVSharpOriginAmbiguous,
           "shader-constructed pixel V# keeps its resource but no fabricated raw SH origin");
 
-    // A scalar S_BUFFER's bound is independent of the ordinary V# byte footprint. Exercise the
-    // graphics build_stage_table mirror with the smallest shape that exposes the difference: four
-    // stride-1 records occupy four vector bytes but permit four scalar dword addresses (16 bytes).
+    // A scalar S_BUFFER addresses BYTES inside the V#'s own footprint, so its bound can never
+    // exceed it (#2528). Exercise the graphics build_stage_table mirror with the shape that used to
+    // be read the other way: four stride-1 records are four bytes total, so exactly ONE scalar dword
+    // is addressable and the staged binding stays four bytes. Reading NUM_RECORDS as a dword count
+    // would stage 16 bytes here and let the next three dword addresses read unrelated host memory.
     // Keeping this on the real stage-table path prevents compute-only metadata from passing tests
-    // while graphics silently stages the short range.
+    // while graphics silently stages a different range.
     alignas(16) static uint32_t narrow_scalar_backing[4] = {
         0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
     };
@@ -359,10 +361,10 @@ int main() {
         ? narrow_scalar_table->by_fetch_pc(6u) : nullptr;
     CHECK(narrow_scalar_resource && narrow_scalar_resource->size == 4u &&
               narrow_scalar_resource->stride == 1u &&
-              narrow_scalar_resource->scalar_buffer_dword_count == 4u &&
+              narrow_scalar_resource->scalar_buffer_dword_count == 1u &&
               prosper::gpu::shader_resource_buffer_binding_bytes(
-                  *narrow_scalar_resource) == 16u,
-          "graphics stage table carries the independent scalar dword span");
+                  *narrow_scalar_resource) == 4u,
+          "graphics stage table bounds scalar dwords by the V# byte footprint");
 
     // An exactly-zero T# recovered from a descriptor table is an explicit null sampled image, not
     // a missing resource. Exercise build_stage_table itself: the production fix lives in its dynamic
