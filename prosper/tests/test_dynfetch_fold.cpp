@@ -4221,6 +4221,32 @@ int main() {
           direct_copy_uses[0].v4[0] == direct_copy_seed[4],
           "#636: Dead Cells s4 destination resolves only at its format-store instruction");
 
+    // A Wave32 B32 SAVEEXEC writes only its explicit one-word SDST. GTA V places that saved mask in
+    // s3 immediately before a still-live V# in s[4:7]; pair-erasing the unmodeled SOP1 falsely
+    // invalidated the descriptor before its final stores.
+    const std::array<uint32_t, 4> adjacent_b32_saveexec = {
+        0xBE833C6Bu,                // s_and_saveexec_b32 s3, vcc_hi
+        0xE01C2000u, 0x80010101u,   // buffer_store_format_xyzw v[1:4], v1, s[4:7]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> adjacent_b32_saveexec_uses;
+    resolve_dynamic_fetch(adjacent_b32_saveexec.data(), adjacent_b32_saveexec.size(),
+                          direct_copy_seed, std::size(direct_copy_seed), 0,
+                          &adjacent_b32_saveexec_uses);
+    CHECK(adjacent_b32_saveexec_uses.size() == 1 &&
+              adjacent_b32_saveexec_uses[0].use_pc == 1 &&
+              adjacent_b32_saveexec_uses[0].v4[0] == direct_copy_seed[4],
+          "B32 SAVEEXEC preserves the adjacent descriptor's first word");
+
+    auto overlapping_b32_saveexec = adjacent_b32_saveexec;
+    overlapping_b32_saveexec[0] = 0xBE843C6Bu; // same SAVEEXEC site, now SDST=s4
+    std::vector<SrtUse> overlapping_b32_saveexec_uses;
+    resolve_dynamic_fetch(overlapping_b32_saveexec.data(), overlapping_b32_saveexec.size(),
+                          direct_copy_seed, std::size(direct_copy_seed), 0,
+                          &overlapping_b32_saveexec_uses);
+    CHECK(overlapping_b32_saveexec_uses.empty(),
+          "same-site SAVEEXEC destination mutation invalidates the overlapped descriptor");
+
     ShaderResourceTable direct_copy_table;
     add_compute_buffer_resources(direct_copy_table, direct_copy,
                                  sizeof(direct_copy) / sizeof(direct_copy[0]),

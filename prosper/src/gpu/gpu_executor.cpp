@@ -3398,6 +3398,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     forget(in.dst.value + 1);
                     if (valid_reg(in.dst.value))
                         mask_state[(size_t)in.dst.value] = FoldMask::All;
+                } else if (in.dst.kind == OperandKind::SGPR &&
+                           sop1_opcode_writes_exec_b32(in.opcode)) {
+                    // The Wave32 SAVEEXEC/WREXEC encodings write exactly one physical SGPR.
+                    // Treating every unmodeled SOP1 as a possible pair write erased an untouched
+                    // descriptor word when the destination immediately preceded its SRSRC. The
+                    // scalar mask value remains outside this fold, but only SDST is unknown.
+                    forget(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not a modeled scalar move -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
                     // (s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
