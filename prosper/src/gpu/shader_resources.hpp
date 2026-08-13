@@ -914,6 +914,12 @@ struct DescriptorValidationReport {
     bool ok() const;
 };
 
+// Reflection remains complete when a valid module disagrees with its runtime table (for example an
+// undersized binding). Consumers that only need the module's statically-used binding set may still
+// use descriptors in that case; malformed SPIR-V is the one fail-closed condition where the list can
+// be partial.
+bool spirv_descriptor_reflection_complete(const DescriptorValidationReport& report);
+
 // Reflect the statically-used descriptor interface and validate it against one stage's runtime
 // table. `expected_set`/`expected_stage` catch stage visibility mistakes (VS=set 0, PS=set 1).
 // Unused runtime resources are warnings; every other issue rejects strict mode.

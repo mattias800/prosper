@@ -694,6 +694,14 @@ bool DescriptorValidationReport::ok() const {
     return true;
 }
 
+bool spirv_descriptor_reflection_complete(const DescriptorValidationReport& report) {
+    return std::none_of(
+        report.issues.begin(), report.issues.end(),
+        [](const DescriptorValidationIssue& issue) {
+            return issue.code == DescriptorIssueCode::MalformedSpirv;
+        });
+}
+
 const SpirvDescriptorBinding* find_spirv_descriptor_binding(
     const DescriptorValidationReport& report, uint32_t set, uint32_t binding) {
     const auto found = std::find_if(

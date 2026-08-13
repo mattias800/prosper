@@ -793,7 +793,7 @@ bool capture_reflected_bindings(const std::vector<uint32_t>& spirv,
     if (spirv.empty()) return false;
     const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
         spirv, table, expected_set, expected_stage, false);
-    if (!reflected.ok()) return false;
+    if (!spirv_descriptor_reflection_complete(reflected)) return false;
     for (const SpirvDescriptorBinding& descriptor : reflected.descriptors)
         bindings.insert(descriptor.binding);
     return true;
