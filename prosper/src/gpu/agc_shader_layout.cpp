@@ -818,7 +818,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
         // identical to "the shader never declared it" — which is a completely different bug in a
         // completely different file (#1590). Deduped per (user-data block, slot) so it costs one
         // line per stage, not one per draw.
-        auto tex_drop = [&](uint16_t slot, uint32_t off, const char* why) {
+        auto tex_drop = [&](uint16_t slot, uint32_t off, uint32_t decl_size, const char* why) {
             if (!sharplog_on) return;
             static std::mutex mx;
             static std::set<std::tuple<const void*, uint32_t, std::string>> seen;
@@ -831,13 +831,18 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             if (!seen.insert({(const void*)ud, slot, std::string(why)}).second) return;
             // `ud=` on every line: the header is emitted once and concurrent stages interleave,
             // so a drop line reached on a later draw can appear with no header in front of it.
-            fprintf(stderr, "[sharp]   ud=%p ro[%u] offset_dw=%u DROPPED as texture: %s\n",
-                    (const void*)ud, slot, off, why);
+            // `size` is the guest's own declared descriptor width for the slot: 1 = four dwords
+            // (V#), 0 = eight dwords (T#). It is printed because the V#-claiming loop above never
+            // reads it, so a slot the guest declared as an 8-dword texture can still be claimed as a
+            // buffer on a four-dword shape heuristic. Whether that is what happens is the open
+            // question behind #2422's 93 "claimed by the V# path" drops; this field answers it.
+            fprintf(stderr, "[sharp]   ud=%p ro[%u] offset_dw=%u size=%u DROPPED as texture: %s\n",
+                    (const void*)ud, slot, off, decl_size, why);
         };
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
             const AgcShaderSharp& s = texs[slot];
             if (s.empty()) continue;
-            if (readonly_buffer_slots[slot]) { tex_drop(slot, s.offset_dw(), "claimed by the V# path"); continue; }
+            if (readonly_buffer_slots[slot]) { tex_drop(slot, s.offset_dw(), s.size(), "claimed by the V# path"); continue; }
             uint32_t off = s.offset_dw();
             // A T# may live in the user-SGPR block OR spill into the EUD, exactly like the cbuf path
             // (#257/#382) — the old hard `continue` for off+8 > num_user_sgprs silently DROPPED any
@@ -846,7 +851,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // that path stays byte-identical) and decode from that buffer.
             uint32_t tv[8]; uint32_t tsrt = load_sharp(off, 8, tv);
             if (tsrt == 0xFFFFFFFFu) {                          // out of block / EUD absent / unreadable
-                tex_drop(slot, off, "load_sharp failed (out of block / EUD absent / unreadable)"); continue; }
+                tex_drop(slot, off, s.size(), "load_sharp failed (out of block / EUD absent / unreadable)"); continue; }
             const bool tex_in_eud = (uint64_t)off + 8 > num_user_sgprs;
             DecodedImageDescriptor d = decode_image_descriptor(tv);
             if (const char* reject = image_descriptor_reject_reason(d)) {   // garbage/degenerate T#
@@ -872,7 +877,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                  w, w + 1, (unsigned long long)candidate, where.c_str());
                         why += note;
                     }
-                    tex_drop(slot, off, why.c_str());
+                    tex_drop(slot, off, s.size(), why.c_str());
                 }
                 continue;
             }
@@ -947,7 +952,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
                         fprintf(stderr, "[t#] UNMAPPED Gen5 IMG_FMT %u (%ux%u T#) -> skipping texture binding "
                                         "(extend gen5_image_format)\n", d.format, d.width, d.height); }
-                    tex_drop(slot, off, "unmapped Gen5 IMG_FMT");
+                    tex_drop(slot, off, s.size(), "unmapped Gen5 IMG_FMT");
                     continue;
                 }
                 fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
@@ -964,14 +969,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                     "wired; skipping texture binding\n", d.format,
                             fi.format == DataFormat::Bc6 ? "BC6H SF16" : "SNORM BCn",
                             d.width, d.height); }
-                tex_drop(slot, off, "signed block-compressed format (decode not wired)");
+                tex_drop(slot, off, s.size(), "signed block-compressed format (decode not wired)");
                 continue;
             }
             ShaderResource r;
             const DecodedImageView view = image_base_level_view(d, fi);
             if (!view.supported) {
                 warn_unsupported_image_view(d);
-                tex_drop(slot, off, "unsupported image view (mip/array layout)");
+                tex_drop(slot, off, s.size(), "unsupported image view (mip/array layout)");
                 continue;
             }
             r.cls           = ResourceClass::Texture;
@@ -1020,10 +1025,10 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
                 : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
             if (!d.sample_count || backing_bytes_per_sample > UINT32_MAX / d.sample_count) {
-                tex_drop(slot, off, "implausible multisample backing byte size"); continue; }
+                tex_drop(slot, off, s.size(), "implausible multisample backing byte size"); continue; }
             const uint64_t backing_bytes = backing_bytes_per_sample * d.sample_count;
             if (!backing_bytes || backing_bytes > UINT32_MAX) {
-                tex_drop(slot, off, "implausible backing byte size"); continue; }
+                tex_drop(slot, off, s.size(), "implausible backing byte size"); continue; }
             r.size = static_cast<uint32_t>(backing_bytes);
             // SGPR-resident T#: DIRECT provenance (image_sample SRSRC SGPR). EUD-resident T#: INDIRECT
             // (the s_load immediate = tsrt), and sgpr_base must be invalid so a stray by_sgpr_base for an
