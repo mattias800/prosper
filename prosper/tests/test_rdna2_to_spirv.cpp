@@ -5439,9 +5439,11 @@ int main() {
     const auto lane0_exec = std::find(
         skipped_ds_fmin_lane0.begin(), skipped_ds_fmin_lane0.end(), 0xbefe0481u);
     skipped_ds_fmin_lane0.insert(lane0_exec, 0xbf840001u); // branch over EXEC=1 only
-    CHECK(recompile_valu(
-              skipped_ds_fmin_lane0.data(), skipped_ds_fmin_lane0.size(), 2, 10).empty(),
-          "branch entering after GTA's lane-zero EXEC writer invalidates the single-writer proof");
+    const std::vector<uint32_t> skipped_ds_fmin_lane0_spv = recompile_valu(
+        skipped_ds_fmin_lane0.data(), skipped_ds_fmin_lane0.size(), 2, 10);
+    CHECK(!skipped_ds_fmin_lane0_spv.empty() &&
+              count_spirv_opcode(skipped_ds_fmin_lane0_spv, 229) == 4,
+          "branch entering after the lane-zero writer uses the synchronized store mailbox");
     std::vector<uint32_t> crossed_ds_fmin_completion = build_ds_fminmax(
         0xd8480000u, 0x00000900u, 0x7f800000u);
     const auto completion_first_fmin = std::find(
@@ -5489,23 +5491,135 @@ int main() {
     CHECK(restore != bad_ds_fmin_restore.end(),
           "GTA LDS initializer regression contains the exact full-EXEC restore");
     if (restore != bad_ds_fmin_restore.end()) *restore ^= 1u;
-    CHECK(recompile_valu(bad_ds_fmin_restore.data(), bad_ds_fmin_restore.size(), 2, 10).empty(),
-          "GTA LDS initializer restore mutation cannot bypass the publication proof");
+    const std::vector<uint32_t> bad_ds_fmin_restore_spv = recompile_valu(
+        bad_ds_fmin_restore.data(), bad_ds_fmin_restore.size(), 2, 10);
+    CHECK(!bad_ds_fmin_restore_spv.empty() &&
+              count_spirv_opcode(bad_ds_fmin_restore_spv, 229) == 4,
+          "unproved initializer restore uses the synchronized store mailbox before publication");
     const uint32_t unproved_ds_fmin_store[] = {
         0x7e000280u, 0x7e0402ffu, 0x7f800000u,
         0xd8340000u, 0x00000200u,
         0xd8480000u, 0x00000900u, 0xbf810000u,
     };
-    CHECK(recompile_valu(unproved_ds_fmin_store, std::size(unproved_ds_fmin_store), 10, 0).empty(),
-          "ordinary LDS store before DS_MIN_F32 stays rejected without a uniform publication proof");
-    const uint32_t unproved_ds_write2_b64_fmin[] = {
-        0x7e000280u,
-        0xd9380000u, 0x00030100u, // ds_write2_b64 v0, v[1:2], v[3:4]
-        0xd8480000u, 0x00000900u, 0xbf810000u,
+    const std::vector<uint32_t> unproved_ds_fmin_store_spv = recompile_valu(
+        unproved_ds_fmin_store, std::size(unproved_ds_fmin_store), 10, 0);
+    CHECK(!unproved_ds_fmin_store_spv.empty() &&
+              count_spirv_opcode(unproved_ds_fmin_store_spv, 229) == 4,
+          "one-wave ordinary LDS store uses the synchronized store mailbox before DS_MIN_F32");
+
+    // GTA V exec_cs_413dd7300 pc375/379 writes a six-dword bounds record from every active lane,
+    // rejoins the wave, then reduces that record at pc384..395. RDNA serializes indexed LDS bank
+    // conflicts; the Vulkan lowering must therefore exchange all six initializer words atomically
+    // before the dispatcher's publication barrier. These are the exact two production store packets.
+    const uint32_t multi_lane_record_fmin[] = {
+        0x7e1c0280u,                         // v14 = record byte address 0
+        0x7e1402ffu, 0x7f800000u,            // v10 = +inf
+        0x7e1602ffu, 0x7f800000u,            // v11 = +inf
+        0x7e1002ffu, 0x7f800000u,            // v8 = +inf
+        0x7e1202ffu, 0xff800000u,            // v9 = -inf
+        0xd9380100u, 0x00080a0eu,            // pc375 ds_write2_b64 v14,v[10:11],v[8:9]
+        0x7e1002ffu, 0xff800000u,            // v8 = -inf
+        0xd9340010u, 0x0000080eu,            // pc379 ds_write_b64 v14,v[8:9] offset:16
+        0x7e100280u,                         // v8 = reduction byte address 0
+        0x7e0202ffu, 0x40400000u,            // v1 = 3
+        0x7e0402ffu, 0x40000000u,            // v2 = 2
+        0x7e0602ffu, 0x3f800000u,            // v3 = 1
+        0x7e0802ffu, 0xbf800000u,            // v4 = -1
+        0x7e0c02ffu, 0xc0000000u,            // v6 = -2
+        0x7e0e02ffu, 0xc0400000u,            // v7 = -3
+        0xd8480000u, 0x00000108u,
+        0xd8480004u, 0x00000208u,
+        0xd8480008u, 0x00000308u,
+        0xd84c000cu, 0x00000408u,
+        0xd84c0010u, 0x00000608u,
+        0xd84c0014u, 0x00000708u,
+        0xd8d80000u, 0x0c000008u,            // read reduced first word to v12
+        0xbf810000u,
     };
+    const std::vector<uint32_t> multi_lane_record_fmin_spv = recompile_valu(
+        multi_lane_record_fmin, std::size(multi_lane_record_fmin), 0, 12);
+    const std::vector<float> multi_lane_record_fmin_got = multi_lane_record_fmin_spv.empty()
+        ? std::vector<float>{}
+        : prosper::test::run_compute(
+              multi_lane_record_fmin_spv, std::vector<float>(WG), WG, WG);
+    CHECK(!multi_lane_record_fmin_spv.empty(),
+          "#2481: captured six-word bounds initializer recompiles");
+    CHECK(count_spirv_opcode(multi_lane_record_fmin_spv, 229) == 4,
+          "#2481: two initializer packets share the four-word synchronized store mailbox");
+    CHECK(count_spirv_opcode(multi_lane_record_fmin_spv, 230) == 2,
+          "#2481: six float events share the dispatcher's min/max compare-exchange pair");
+    CHECK(count_spirv_opcode(multi_lane_record_fmin_spv, 224) == 9,
+          "#2481: ordered store mailbox and float publication retain all uniform barriers");
+    CHECK(multi_lane_record_fmin_got.size() == WG &&
+              std::all_of(multi_lane_record_fmin_got.begin(),
+                          multi_lane_record_fmin_got.end(),
+                          [](float value) { return value == 3.0f; }),
+          "#2481: captured six-word bounds initializer publishes and reduces the first field");
+    std::vector<uint32_t> multi_lane_record_fmin_tail(
+        std::begin(multi_lane_record_fmin), std::end(multi_lane_record_fmin));
+    const auto final_read = std::find(
+        multi_lane_record_fmin_tail.begin(), multi_lane_record_fmin_tail.end(), 0xd8d80000u);
+    CHECK(final_read != multi_lane_record_fmin_tail.end(),
+          "#2481: bounds regression contains the final first-field LDS read");
+    if (final_read != multi_lane_record_fmin_tail.end()) *final_read = 0xd8d80010u;
+    const std::vector<uint32_t> multi_lane_record_fmin_tail_spv = recompile_valu(
+        multi_lane_record_fmin_tail.data(), multi_lane_record_fmin_tail.size(), 0, 12);
+    const std::vector<float> multi_lane_record_fmin_tail_got =
+        multi_lane_record_fmin_tail_spv.empty() ? std::vector<float>{}
+        : prosper::test::run_compute(
+              multi_lane_record_fmin_tail_spv, std::vector<float>(WG), WG, WG);
+    CHECK(multi_lane_record_fmin_tail_got.size() == WG &&
+              std::all_of(multi_lane_record_fmin_tail_got.begin(),
+                          multi_lane_record_fmin_tail_got.end(),
+                          [](float value) { return value == -2.0f; }),
+          "#2481: second initializer packet publishes and reduces the fifth field");
+    ComputeShaderConfig multiwave_record_fmin_config;
+    multiwave_record_fmin_config.local_x = WG * 2u;
+    multiwave_record_fmin_config.wave_size = WG;
+    CHECK(recompile_compute(multi_lane_record_fmin, std::size(multi_lane_record_fmin), nullptr,
+                            multiwave_record_fmin_config).empty(),
+          "#2481: synthesized bounds publication remains limited to one guest wave");
+    std::vector<uint32_t> gds_record_fmin(
+        std::begin(multi_lane_record_fmin), std::end(multi_lane_record_fmin));
+    const auto record_store = std::find(
+        gds_record_fmin.begin(), gds_record_fmin.end(), 0xd9380100u);
+    CHECK(record_store != gds_record_fmin.end(),
+          "#2481: bounds regression contains exact pc375 DS_WRITE2_B64 packet");
+    if (record_store != gds_record_fmin.end()) *record_store ^= 0x00020000u;
     CHECK(recompile_valu(
-              unproved_ds_write2_b64_fmin, std::size(unproved_ds_write2_b64_fmin), 10, 0).empty(),
-          "DS_WRITE2_B64 before DS_MIN_F32 remains an inventoried unsynchronized store");
+              gds_record_fmin.data(), gds_record_fmin.size(), 0, 12).empty(),
+          "#2481: same-site pc375 LDS-to-GDS mutation stays fail-visible");
+    std::vector<uint32_t> varying_record_fmin(
+        std::begin(multi_lane_record_fmin), std::end(multi_lane_record_fmin));
+    const auto varying_store_data = std::find(
+        varying_record_fmin.begin(), varying_record_fmin.end(), 0x00080a0eu);
+    CHECK(varying_store_data != varying_record_fmin.end(),
+          "#2481: bounds regression contains exact pc375 DATA0 source field");
+    if (varying_store_data != varying_record_fmin.end())
+        *varying_store_data = 0x00080c0eu; // DATA0 v10 -> unproved per-lane v12
+    CHECK(recompile_valu(
+              varying_record_fmin.data(), varying_record_fmin.size(), 0, 12).empty(),
+          "#2481: same-site pc375 nonuniform-data mutation cannot borrow atomic publication");
+    std::vector<uint32_t> varying_tail_record_fmin(
+        std::begin(multi_lane_record_fmin), std::end(multi_lane_record_fmin));
+    const auto varying_tail_store_data = std::find(
+        varying_tail_record_fmin.begin(), varying_tail_record_fmin.end(), 0x0000080eu);
+    CHECK(varying_tail_store_data != varying_tail_record_fmin.end(),
+          "#2481: bounds regression contains exact pc379 DATA0 source field");
+    if (varying_tail_store_data != varying_tail_record_fmin.end())
+        *varying_tail_store_data = 0x00000c0eu; // DATA0 v8 -> unproved per-lane v12
+    CHECK(recompile_valu(
+              varying_tail_record_fmin.data(), varying_tail_record_fmin.size(), 0, 12).empty(),
+          "#2481: same-site pc379 nonuniform-data mutation cannot borrow atomic publication");
+    const uint32_t partial_sdwa_store_fmin[] = {
+        0x7e000280u,                         // v0 = LDS address 0
+        0x7e0202f9u, 0x00051480u,            // v_mov_b32_sdwa v1,0 WORD_0/PRESERVE
+        0xd8340000u, 0x00000100u,            // ds_write_b32 v0,v1
+        0xd8480000u, 0x00000900u,             // ds_min_f32 v0,v9
+        0xbf810000u,
+    };
+    CHECK(recompile_valu(partial_sdwa_store_fmin, std::size(partial_sdwa_store_fmin), 10, 0).empty(),
+          "#2481: partial SDWA initializer cannot prove identical full-dword LDS values");
 
     // GTA V exec_cs_413cf9d00 separates its lane-zero initializer at pc1/15/17 from the six float
     // atomics at pc275 with a large trap-bearing CFG. Preserve those production PCs in a compact
