@@ -5984,6 +5984,47 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.type, d.base_array, d.format, d.tile_mode,
                                 reject ? reject : "materialize");
+                    // An EXACTLY all-zero eight-dword T# is not garbage: it is the guest explicitly
+                    // binding a null image, and `validate_shader_resources` already calls that valid
+                    // state -- "Explicit null descriptors are valid guest state: resource reads return
+                    // zero and the backend binds a zero-filled dummy. An absent table entry is still an
+                    // error above." (shader_resources.cpp). Dropping it here made the entry ABSENT,
+                    // which is the error case, so the consuming MIMG found nothing by fetch_pc and the
+                    // whole shader was rejected.
+                    //
+                    // Measured on GTA V routed gameplay: 11 of the 18 terminal-MIMG fragment pairs
+                    // reach this line with an exactly-known `t8 = 00000000 x8`, carrying 1,328 of the
+                    // rejected-draw occurrences (#2422).
+                    //
+                    // Deliberately narrow, and each clause is load-bearing:
+                    //   * EXACTLY zero, all eight dwords -- a nonzero-but-implausible base stays
+                    //     fail-visible, which is what the base-zero/low-base screen exists for.
+                    //   * `have_t8` only -- an UNKNOWN T# is a different frontier (the other 7 pairs)
+                    //     and must not be silently turned into a null bind.
+                    //   * sampled reads only. A storage image or atomic reaching a null descriptor is
+                    //     a WRITE to nowhere; that stays rejected rather than being made to look
+                    //     handled.
+                    const bool exact_null_t8 =
+                        reject && std::string_view(reject) == "base-zero" && !u.is_storage_image &&
+                        std::all_of(u.t8.begin(), u.t8.end(), [](uint32_t w) { return w == 0u; });
+                    if (exact_null_t8) {
+                        ShaderResource rn;
+                        rn.cls      = ResourceClass::Texture;
+                        rn.gpu_addr = 0;            // the three fields validate_shader_resources reads
+                        rn.size     = 0;            // to recognise an explicit null descriptor
+                        rn.fetch_pc = u.use_pc;     // exact-PC provenance: only THIS use resolves to it
+                        rn.srt_offset = 0xFFFFFFFFu;
+                        rn.sgpr_base  = 0xFFFFFFFFu;
+                        // Gated on PROSPER_DBG, not PROSPER_GFXLOG: GFXLOG must not be added to the
+                        // timing-dependent GTA V route without re-establishing its baseline, so an
+                        // instrument only visible under it cannot be read in the run being measured.
+                        // Publishing a null image is rare and consequential enough to say so.
+                        if (std::getenv("PROSPER_DBG"))
+                            fprintf(stderr, "[srt] %s null-image pc=%u key=0x%x (exact all-zero T#)\n",
+                                    is_ps ? "PS" : "VS", u.use_pc, u.key);
+                        t.resources.push_back(rn);
+                        continue;
+                    }
                     if (reject) continue;                                    // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
