@@ -10,6 +10,7 @@
 //   s_endpgm
 // => out = ((a0+a1)*a2)*a3 + a1
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/rdna2_decode.hpp"
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
@@ -1123,6 +1124,46 @@ int main() {
            got15d.size() == N ? bits_of(got15d[8]) : 0u);
     CHECK(got15d.size() == N && bad15d == 0,
           "recompiled kernel 15d aligns all byte offsets with zero fill bit-exactly");
+
+    // Kernel 15f: V_ALIGNBIT_B32 (VOP3 0x14e). This is the bit-granular sibling of 15d and
+    // exercises the complete masked 0..31 shift-count domain. The same S0-high/S1-low ordering is
+    // used by the live Wave64 compute frontier.
+    const uint32_t code15f[] = {
+        0xd54e0000u, 0x040a0300u, // v_alignbit_b32 v0, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv15f = recompile_valu(
+        code15f, std::size(code15f), /*num_inputs*/3, /*out_vgpr*/0);
+    CHECK(!spv15f.empty(), "recompiled kernel 15f (v_alignbit_b32) -> SPIR-V");
+    std::vector<float> in15f(N * 3);
+    std::vector<uint32_t> exp15f(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t s0 = 0xa1b2c3d4u ^ (i * 0x01010101u);
+        const uint32_t s1 = 0x11223344u ^ (i * 0x00010001u);
+        const uint32_t bit = i & 31u;
+        in15f[i * 3 + 0] = std::bit_cast<float>(s0);
+        in15f[i * 3 + 1] = std::bit_cast<float>(s1);
+        in15f[i * 3 + 2] = std::bit_cast<float>(bit);
+        exp15f[i] = bit == 0u ? s1 : (s1 >> bit) | (s0 << (32u - bit));
+    }
+    const std::vector<float> got15f = spv15f.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spv15f, in15f, N, N);
+    uint32_t bad15f = 0;
+    for (uint32_t i = 0; i < N && got15f.size() == N; ++i)
+        if (bits_of(got15f[i]) != exp15f[i]) ++bad15f;
+    CHECK(got15f.size() == N && bad15f == 0,
+          "recompiled kernel 15f aligns every masked bit offset bit-exactly");
+    std::vector<uint32_t> changed15f(std::begin(code15f), std::end(code15f));
+    changed15f[0] = (changed15f[0] & ~(0x3ffu << 16u)) |
+        (kVop3OpcodeAlignbyteB32 << 16u);
+    const std::vector<uint32_t> changed_spv15f = recompile_valu(
+        changed15f.data(), changed15f.size(), /*num_inputs*/3, /*out_vgpr*/0);
+    const std::vector<float> changed_got15f = changed_spv15f.empty()
+        ? std::vector<float>()
+        : prosper::test::run_compute(changed_spv15f, in15f, N, N);
+    CHECK(changed_got15f.size() == N &&
+              bits_of(changed_got15f[1]) != exp15f[1],
+          "same-site ALIGNBYTE opcode mutation keeps its distinct byte-shift semantics");
 
     // Kernel 15e: exact first GTA V packet, including literal placement and v5 byte offset.
     // The captured src0 is zero, so offsets 0..3 select successive bytes of 0x3024240c and

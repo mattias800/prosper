@@ -1042,6 +1042,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_indirect_buffer_shadow PRIVATE prosper_core)
   add_test(NAME indirect_buffer_shadow COMMAND test_indirect_buffer_shadow)
 
+  add_executable(test_indirect_pointer_static_footprint
+    tests/test_indirect_pointer_static_footprint.cpp)
+  target_link_libraries(test_indirect_pointer_static_footprint PRIVATE prosper_core)
+  add_test(NAME indirect_pointer_static_footprint
+    COMMAND test_indirect_pointer_static_footprint)
+
+  add_executable(test_indirect_pointer_descriptor_range
+    tests/test_indirect_pointer_descriptor_range.cpp)
+  target_link_libraries(test_indirect_pointer_descriptor_range PRIVATE prosper_core)
+  add_test(NAME indirect_pointer_descriptor_range
+    COMMAND test_indirect_pointer_descriptor_range)
+
   add_executable(test_gta5_cf9200 tests/test_gta5_cf9200.cpp)
   target_link_libraries(test_gta5_cf9200 PRIVATE prosper_core)
   add_test(NAME gta5_cf9200_no_backing COMMAND test_gta5_cf9200)

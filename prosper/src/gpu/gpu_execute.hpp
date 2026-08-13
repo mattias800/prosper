@@ -222,6 +222,16 @@ struct SrtUse {
     // "unbounded" and required_size supplies the proven access span. Only resolve_dynamic_fetch may set
     // this after decoding all four live descriptor words at the exact consuming instruction.
     bool zero_record_raw = false;
+    // A known-SOFFSET scalar load may prove the same empty V# wholly OOB even when its immediate
+    // alone does not. Preserve the exact effective byte offset so materialization can independently
+    // re-check the producer's proof; irrelevant for ordinary RAW/format/atomic zero-record uses.
+    bool scalar_oob_offset_known = false;
+    uint32_t scalar_oob_byte_offset = 0;
+    // Exact RDNA2 S_BUFFER M_SIZE in dwords for this consuming instruction. Zero means this use did
+    // not come from an ordinary bounded scalar-buffer descriptor (or has the zero-record marker
+    // handled above). The value cannot be reconstructed from size_bytes when STRIDE is below four:
+    // scalar addresses advance by dwords, while the ordinary V# footprint is records*stride.
+    uint32_t scalar_buffer_dword_count = 0;
     // GTA V's dispatch table carries an optional buffer pointer at byte offset 0x58. Before the
     // guest's later WRITE_DATA initializes that entry, its mapped qword is genuinely zero while the
     // separately-built V# still has a nonzero record count. This flag is admitted only when exact

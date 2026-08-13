@@ -185,6 +185,21 @@ enum class ResourceClass : uint32_t {
                      // use float texels and Vulkan's descriptor conversion.
 };
 
+// Derived, dispatch-owned binding for a generic indirect-pointer relocation proof. The scalar
+// marker is cache/capture metadata only: authority is re-derived from the raw shader, launch, source
+// records, and version-2 carrier at every compile boundary.
+struct IndirectPointerRelocationBinding {
+    uint32_t carrier_version = 0;
+    uint32_t proof_schema = 0;
+    uint32_t binding_bytes = 0;
+    uint32_t record_count = 0;
+    uint32_t segment_count = 0;
+    uint32_t segment_directory_byte_offset = 0;
+    uint64_t proof_fingerprint = 0;
+
+    bool operator==(const IndirectPointerRelocationBinding&) const = default;
+};
+
 // One resource a shader accesses. FILLED BY THE FRONT-HALF from the game's real descriptors (the
 // V#/T#/S# words in the shader's user_data / SRT, resolved against the game's bound resources and
 // guest memory). CONSUMED BY THE RECOMPILER: it uses `format`/`num_components` to emit correct
@@ -437,6 +452,17 @@ struct ShaderResource {
     uint32_t       indirect_buffer_slot_count = 0;
     uint32_t       indirect_buffer_header_bytes = 0;
     uint32_t       indirect_buffer_slot_bytes = 0;
+
+    // Version-2 carrier metadata stays separate from the fixed-slot v1 marker above. Reusing those
+    // fields would make a generic relocation enter the legacy title-specific validator before its
+    // independent proof could be re-established.
+    IndirectPointerRelocationBinding indirect_pointer_relocation{};
+
+    // Exact RDNA2 S_BUFFER M_SIZE in dwords. Zero means this resource has no scalar-buffer bound
+    // metadata. Kept separate from `size`: the ordinary V# footprint is NUM_RECORDS*STRIDE, but
+    // scalar-buffer addresses advance four bytes and use NUM_RECORDS only as their dword bound.
+    // Appended so historical positional aggregate initializers retain their field mapping.
+    uint32_t scalar_buffer_dword_count = 0;
 };
 
 inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& resource) {
@@ -823,9 +849,13 @@ struct StorageBufferMaterializationPlan {
     bool valid = false;
 };
 
-// Derive the exact host binding range from reflected shader semantics plus the runtime V#. The only
-// range expansion currently admitted is a read-only one-record scalar Uint16/Float16 FORMAT load
-// (2 -> 4 bytes).
+// Validate an explicitly-carried scalar S_BUFFER bound and return the complete byte span its dword
+// addresses may read. Ordinary resources return `size`; malformed scalar metadata returns zero.
+uint64_t shader_resource_buffer_binding_bytes(const ShaderResource& resource);
+
+// Derive the exact host binding range from reflected shader semantics plus the runtime V#. Admitted
+// expansions are the read-only one-record Uint16/Float16 FORMAT tail (zero-padded 2 -> 4 bytes), and
+// a read-only scalar S_BUFFER whose dword-addressable span exceeds its ordinary V# byte footprint.
 // Any marker/runtime mismatch fails closed. Ordinary buffers keep logical==binding==resource.size.
 StorageBufferMaterializationPlan plan_storage_buffer_materialization(
     const SpirvDescriptorBinding& descriptor,
@@ -893,6 +923,12 @@ struct DescriptorValidationReport {
     std::vector<DescriptorValidationIssue> issues;
     bool ok() const;
 };
+
+// Reflection remains complete when a valid module disagrees with its runtime table (for example an
+// undersized binding). Consumers that only need the module's statically-used binding set may still
+// use descriptors in that case; malformed SPIR-V is the one fail-closed condition where the list can
+// be partial.
+bool spirv_descriptor_reflection_complete(const DescriptorValidationReport& report);
 
 // Reflect the statically-used descriptor interface and validate it against one stage's runtime
 // table. `expected_set`/`expected_stage` catch stage visibility mistakes (VS=set 0, PS=set 1).

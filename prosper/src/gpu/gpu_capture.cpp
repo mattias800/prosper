@@ -15,6 +15,7 @@
 #include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 #include "rdna2_to_spirv.hpp"
 #include "tile.hpp"
 #include "videoout_present.hpp"
@@ -125,7 +126,12 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v52: retain the complete generic runtime-selected buffer descriptor-array contract. Each resource
 // carries its declared arity/selector and every raw V# plus a separate captured backing reference;
 // the legacy resource prefix stays byte-exact.
-constexpr uint32_t kVersion = 52;
+// v53 (#2481): internal compute bytes may carry the generic static-footprint indirect-pointer
+// relocation snapshot. The proof marker is deliberately reconstructed from raw shader, launch,
+// source records, and carrier witnesses instead of being trusted as serialized authority.
+// v54: retain the explicit scalar S_BUFFER dword bound. The ordinary resource size remains the V#'s
+// independent vector footprint; replay cannot reconstruct one from the other when STRIDE < 4.
+constexpr uint32_t kVersion = 54;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -643,7 +649,13 @@ uint32_t resolved_linear_row_pitch(const ShaderResource& r, uint32_t width, uint
 
 uint64_t resource_footprint_impl(const ShaderResource& r, bool legacy_linear_tight) {
     uint64_t result = r.size;
-    if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return result;
+    if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) {
+        if (r.scalar_buffer_dword_count) {
+            const uint64_t scalar_bytes = shader_resource_buffer_binding_bytes(r);
+            if (scalar_bytes) result = scalar_bytes;
+        }
+        return result;
+    }
     const uint64_t layers = r.img_dim == 3u ? 6u
         : ((r.img_dim == 2u || r.img_dim == 5u) ? std::max(r.depth, 1u) : 1u);
     uint32_t w = r.width ? r.width : 4, h = r.height ? r.height : 4;
@@ -757,6 +769,44 @@ bool is_compute_internal_gds(const ShaderResource& r) {
            r.cls == ResourceClass::ConstantBuffer && r.size == 64u * 1024u && r.stride == 4;
 }
 
+bool is_capture_authority_resource(const ShaderResource& resource) {
+    return is_compute_internal_gds(resource) ||
+           is_gta5_packed_pointer_marker_candidate(resource) ||
+           is_indirect_pointer_relocation_marker_candidate(resource) ||
+           is_nullable_raw_buffer_marker_candidate(resource) ||
+           is_gta5_selected_sbuffer_marker_candidate(resource) ||
+           is_gta5_cf9200_no_backing_marker_candidate(resource);
+}
+
+bool capture_authority_requires_backing(const ShaderResourceTable* table,
+                                        const ShaderResource& resource) {
+    if (is_capture_authority_resource(resource)) return true;
+    if (!table || !resource.gpu_addr) return false;
+    const uint64_t footprint = resource_footprint(resource);
+    return footprint && std::any_of(
+        table->resources.begin(), table->resources.end(),
+        [&](const ShaderResource& candidate) {
+            return is_capture_authority_resource(candidate) &&
+                   candidate.gpu_addr == resource.gpu_addr &&
+                   resource_footprint(candidate) == footprint;
+        });
+}
+
+bool capture_reflected_bindings(const std::vector<uint32_t>& spirv,
+                                const ShaderResourceTable* table,
+                                uint32_t expected_set,
+                                SpirvShaderStage expected_stage,
+                                std::set<uint32_t>& bindings) {
+    bindings.clear();
+    if (spirv.empty()) return false;
+    const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
+        spirv, table, expected_set, expected_stage, false);
+    if (!spirv_descriptor_reflection_complete(reflected)) return false;
+    for (const SpirvDescriptorBinding& descriptor : reflected.descriptors)
+        bindings.insert(descriptor.binding);
+    return true;
+}
+
 constexpr uint32_t kCaptureDmaSelGds = 1u;
 constexpr uint32_t kCaptureDmaSelMemory = 3u;
 bool captured_dma_destination_is_gds(uint32_t sels) {
@@ -799,14 +849,25 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                        uint64_t resource_limit_bytes,
                        std::vector<Interval>& intervals, std::string& error) {
     uint64_t total = 0;
-    auto add_table = [&](const ShaderResourceTable* t) -> bool {
+    auto add_table = [&](const ShaderResourceTable* t,
+                         const std::set<uint32_t>* used_bindings) -> bool {
         if (!t) return true;
         for (const auto& r : t->resources) {
             if (!valid_shader_buffer_table_contract(r)) {
                 error = "resource has an invalid buffer descriptor-table contract";
                 return false;
             }
-            if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) continue;
+            if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
+                is_indirect_pointer_relocation_resource(r))
+                continue;
+            // Runtime tables intentionally retain candidates recovered while folding the guest
+            // shader even when the final SPIR-V does not reference them. The Vulkan backend and
+            // dependency graph both follow reflection at this boundary; capture must do the same.
+            // Otherwise one unused V# with a multi-gigabyte declared range can make an exact
+            // submit impossible to retain even though no emitted instruction can read it.
+            if (used_bindings && !used_bindings->contains(r.binding) &&
+                !capture_authority_requires_backing(t, r))
+                continue;
             if (r.table_index_count) {
                 for (const ShaderBufferTableEntry& entry : r.table_entries) {
                     const uint64_t n = entry.size;
@@ -861,8 +922,31 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
         }
         return true;
     };
-    for (const auto& d : draws) if (!add_table(d.vrt.get()) || !add_table(d.prt.get())) return false;
-    for (const auto& c : computes) if (!add_table(c.resources.get())) return false;
+    for (const auto& d : draws)
+        if (!add_table(d.vrt.get(), nullptr) || !add_table(d.prt.get(), nullptr))
+            return false;
+    for (const auto& c : computes) {
+        std::set<uint32_t> compute_bindings;
+        const bool compute_reflected = capture_reflected_bindings(
+            c.spirv, c.resources.get(), 0u, SpirvShaderStage::Compute,
+            compute_bindings);
+        if (!add_table(c.resources.get(),
+                       compute_reflected ? &compute_bindings : nullptr)) {
+            const std::string cause = error;
+            if (cause.find("resource capture range is invalid or exceeds") ==
+                std::string::npos)
+                return false;
+            char context[768];
+            std::snprintf(
+                context, sizeof(context),
+                "compute program=0x%llx reflection=%s reflected-bindings=%zu: %s",
+                static_cast<unsigned long long>(c.code_addr),
+                compute_reflected ? "complete" : "incomplete",
+                compute_bindings.size(), cause.c_str());
+            error = context;
+            return false;
+        }
+    }
     for (const auto& copy : dma_copies) {
         const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
         const bool source_gds = captured_dma_source_is_gds(copy.sels);
@@ -920,7 +1004,8 @@ bool assign_blob_range(const std::vector<Interval>& intervals, uint64_t addr, ui
 
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
                    bool include_resource_data, bool allow_packed_pointer,
-                   GpuCapturedTable& dst, std::string& error) {
+                   GpuCapturedTable& dst, std::string& error,
+                   const std::set<uint32_t>* used_bindings = nullptr) {
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
@@ -928,7 +1013,9 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
             error = "resource has an invalid buffer descriptor-table contract";
             return false;
         }
-        if (!allow_packed_pointer && is_gta5_packed_pointer_marker_candidate(r)) {
+        if (!allow_packed_pointer &&
+            (is_gta5_packed_pointer_marker_candidate(r) ||
+             is_indirect_pointer_relocation_marker_candidate(r))) {
             error = "packed-pointer state is only valid for a compute dispatch";
             return false;
         }
@@ -941,6 +1028,11 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.host_data_size = 0;
         c.resource.dcc_metadata_host_data = nullptr;
         c.resource.dcc_metadata_host_data_size = 0;
+        if (!include_resource_data)
+            c.resource.indirect_pointer_relocation = {};
+        const bool capture_backing = !used_bindings ||
+            used_bindings->contains(r.binding) ||
+            capture_authority_requires_backing(src, r);
         if (r.table_index_count) {
             c.table_entry_blobs.resize(r.table_entries.size());
             for (size_t index = 0; index < r.table_entries.size(); ++index) {
@@ -948,7 +1040,7 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
                 ShaderBufferTableEntry& captured = c.resource.table_entries[index];
                 captured.host_data = nullptr;
                 captured.host_data_size = 0;
-                if (source.size && include_resource_data &&
+                if (source.size && include_resource_data && capture_backing &&
                     !assign_blob_range(intervals, source.gpu_addr, source.size,
                                        c.table_entry_blobs[index].blob_index,
                                        c.table_entry_blobs[index].blob_offset,
@@ -981,21 +1073,25 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);
         c.captured_size = n;
-        if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) &&
+        if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
+             is_indirect_pointer_relocation_resource(r)) &&
             include_resource_data) {
             const uint64_t internal_size = is_compute_internal_gds(r) ? n : r.host_data_size;
             if (!r.host_data || r.host_data_size < internal_size ||
                 (is_gta5_packed_pointer_resource(r) &&
                  !is_gta5_packed_pointer_serialized_shadow(
+                     r, r.host_data, r.host_data_size)) ||
+                (is_indirect_pointer_relocation_resource(r) &&
+                 !is_indirect_pointer_relocation_serialized(
                      r, r.host_data, r.host_data_size))) {
                 error = "compute internal resource has no complete host backing";
                 return false;
             }
             c.internal_bytes.assign(r.host_data, r.host_data + internal_size);
-        } else if (n && include_resource_data &&
+        } else if (n && include_resource_data && capture_backing &&
             !assign_blob_range(intervals, r.gpu_addr, n, c.blob_index, c.blob_offset,
                                "resource was not assigned to a capture blob", error)) return false;
-        if (c.metadata_size && include_resource_data &&
+        if (c.metadata_size && include_resource_data && capture_backing &&
             !assign_blob_range(intervals, r.metadata_addr, c.metadata_size,
                                c.metadata_blob_index, c.metadata_blob_offset,
                                "DCC metadata was not assigned to a capture blob", error)) return false;
@@ -1631,13 +1727,27 @@ bool captured_resource_has_packed_pointer_state(const GpuCapturedResource& captu
            !is_compute_internal_gds(captured.resource);
 }
 
+bool captured_resource_has_indirect_pointer_state(
+        const GpuCapturedResource& captured) {
+    return !captured.internal_bytes.empty() &&
+           is_indirect_pointer_relocation_serialized(
+               captured.resource, captured.internal_bytes.data(),
+               captured.internal_bytes.size());
+}
+
+bool captured_resource_has_gta5_packed_pointer_candidate(
+        const GpuCapturedResource& captured) {
+    return captured_resource_has_packed_pointer_state(captured) &&
+           !captured_resource_has_indirect_pointer_state(captured);
+}
+
 bool validate_captured_gta5_packed_pointer(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
     const size_t candidates = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
-        captured_resource_has_packed_pointer_state));
+        captured_resource_has_gta5_packed_pointer_candidate));
     if (!candidates) return true;
     if (capture.format_version < 51u || candidates != 1u ||
         !compute.recompile_config_available ||
@@ -1665,7 +1775,7 @@ bool validate_captured_gta5_packed_pointer(
         resource.indirect_buffer_slot_bytes = 0u;
         resource.host_data = nullptr;
         resource.host_data_size = 0u;
-        if (captured_resource_has_packed_pointer_state(captured)) {
+        if (captured_resource_has_gta5_packed_pointer_candidate(captured)) {
             if (!is_gta5_packed_pointer_serialized_shadow(
                     resource, captured.internal_bytes.data(), captured.internal_bytes.size())) {
                 error = "packed-pointer state has malformed internal bytes";
@@ -1691,6 +1801,79 @@ bool validate_captured_gta5_packed_pointer(
         !discover_rdna2_gta5_packed_pointer(
             raw.data(), raw.size(), config, validated_resources)) {
         error = "packed-pointer state has stale shader, launch, or table provenance";
+        return false;
+    }
+    return true;
+}
+
+bool validate_captured_indirect_pointer_relocations(
+        const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
+        std::string& error) {
+    if (!compute.resources.present) return true;
+    const size_t marked = static_cast<size_t>(std::count_if(
+        compute.resources.resources.begin(), compute.resources.resources.end(),
+        [](const GpuCapturedResource& captured) {
+            return is_indirect_pointer_relocation_marker_candidate(captured.resource);
+        }));
+    const size_t candidates = static_cast<size_t>(std::count_if(
+        compute.resources.resources.begin(), compute.resources.resources.end(),
+        captured_resource_has_indirect_pointer_state));
+    if (!candidates) {
+        if (!marked) return true;
+        error = "indirect-pointer relocation marker has no complete carrier";
+        return false;
+    }
+    if (marked && marked != candidates) {
+        error = "indirect-pointer relocation marker/carrier count mismatch";
+        return false;
+    }
+    if (capture.format_version < 53u || candidates != 1u ||
+        !compute.recompile_config_available ||
+        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        error = "indirect-pointer relocation lacks exact compute provenance";
+        return false;
+    }
+    const auto& config = compute.recompile_config;
+    const uint64_t groups_x =
+        (static_cast<uint64_t>(config.threads_x) + config.local_x - 1u) /
+        config.local_x;
+    if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
+        compute.launch.groups_z != 1u) {
+        error = "indirect-pointer relocation has stale captured launch provenance";
+        return false;
+    }
+
+    ShaderResourceTable validated_resources;
+    validated_resources.resources.reserve(compute.resources.resources.size());
+    for (const GpuCapturedResource& captured : compute.resources.resources) {
+        ShaderResource resource = captured.resource;
+        resource.indirect_pointer_relocation = {};
+        resource.host_data = nullptr;
+        resource.host_data_size = 0u;
+        if (captured_resource_has_indirect_pointer_state(captured)) {
+            resource.host_data = const_cast<uint8_t*>(captured.internal_bytes.data());
+            resource.host_data_size = captured.internal_bytes.size();
+        } else if (captured.blob_index != UINT32_MAX) {
+            if (captured.blob_index >= capture.blobs.size() ||
+                captured.blob_offset >
+                    capture.blobs[captured.blob_index].bytes.size()) {
+                error = "indirect-pointer relocation references an invalid resource blob";
+                return false;
+            }
+            const auto& blob = capture.blobs[captured.blob_index].bytes;
+            resource.host_data = const_cast<uint8_t*>(
+                blob.data() + captured.blob_offset);
+            resource.host_data_size = blob.size() - captured.blob_offset;
+        }
+        validated_resources.resources.push_back(resource);
+    }
+
+    const auto& raw = capture.raw_shader_versions[compute.raw_shader_index].words;
+    if (!discover_rdna2_indirect_pointer_relocations(
+            raw.data(), raw.size(), config, validated_resources) ||
+        !validate_rdna2_indirect_pointer_relocations(
+            raw.data(), raw.size(), config, validated_resources)) {
+        error = "indirect-pointer relocation has stale shader, launch, source, or proof state";
         return false;
     }
     return true;
@@ -1743,6 +1926,8 @@ bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& er
         if (!validate_captured_gta5_cf9200_no_backing(capture, compute, error))
             return false;
         if (!validate_captured_gta5_packed_pointer(capture, compute, error))
+            return false;
+        if (!validate_captured_indirect_pointer_relocations(capture, compute, error))
             return false;
         if (compute.raw_shader_index != 0xFFFFFFFFu)
             raw_referenced[compute.raw_shader_index] = true;
@@ -2088,8 +2273,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.system_inputs = d.system_inputs;
         c.has_pixel_inputs = d.has_pixel_inputs;
         c.has_system_inputs = d.has_system_inputs;
-        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false, c.vrt, error) ||
-            !capture_table(d.prt.get(), intervals, include_resource_data, false, c.prt, error))
+        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
+                           c.vrt, error) ||
+            !capture_table(d.prt.get(), intervals, include_resource_data, false,
+                           c.prt, error))
             return false;
         out.draws.push_back(std::move(c));
     }
@@ -2108,8 +2295,14 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             !capture_raw_shader_version(compute.code_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
                                         c.raw_shader_index, error)) return false;
+        std::set<uint32_t> compute_bindings;
+        const bool compute_reflected = capture_reflected_bindings(
+            compute.spirv, compute.resources.get(), 0u,
+            SpirvShaderStage::Compute, compute_bindings);
         if (!capture_table(compute.resources.get(), intervals, include_resource_data, true,
-                           c.resources, error)) return false;
+                           c.resources, error,
+                           compute_reflected ? &compute_bindings : nullptr))
+            return false;
         out.computes.push_back(std::move(c));
     }
     uint32_t gds_snapshot_blob_index = 0xFFFFFFFFu;
@@ -2670,13 +2863,20 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             const bool packed = is_gta5_packed_pointer_serialized_shadow(
                 captured.resource, captured.internal_bytes.data(),
                 captured.internal_bytes.size());
+            const bool relocated = is_indirect_pointer_relocation_serialized(
+                captured.resource, captured.internal_bytes.data(),
+                captured.internal_bytes.size());
             const bool expected_packed =
                 is_gta5_packed_pointer_marker_candidate(captured.resource);
-            if ((!allow_packed_pointer && (packed || expected_packed)) ||
-                (!gds && !packed && !captured.internal_bytes.empty()) ||
+            const bool expected_relocated =
+                is_indirect_pointer_relocation_marker_candidate(captured.resource);
+            if ((!allow_packed_pointer &&
+                 (packed || expected_packed || relocated || expected_relocated)) ||
+                (!gds && !packed && !relocated && !captured.internal_bytes.empty()) ||
                 (gds && !captured.internal_bytes.empty() &&
                  captured.internal_bytes.size() != resource_footprint(captured.resource)) ||
-                (expected_packed && !captured.internal_bytes.empty() && !packed)) {
+                (expected_packed && !captured.internal_bytes.empty() && !packed) ||
+                (expected_relocated && !captured.internal_bytes.empty() && !relocated)) {
                 error = "invalid compute internal capture state";
                 return false;
             }
@@ -3231,6 +3431,37 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             if (!write_buffer_tables(stage.resource_table)) return false;
+    // v54 appends one scalar-buffer dword count per resource. Zero is the ordinary/no-metadata
+    // value; a nonzero value is serialized only after its normalized resource shape independently
+    // authenticates the bound.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_scalar_buffer_bounds = [&](const GpuCapturedTable& table) {
+        for (const GpuCapturedResource& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            if (resource.scalar_buffer_dword_count) {
+                const uint64_t binding_bytes =
+                    shader_resource_buffer_binding_bytes(resource);
+                if (!binding_bytes) {
+                    error = "invalid scalar-buffer bound metadata";
+                    return false;
+                }
+                if (captured.captured_size < binding_bytes) {
+                    error = "scalar-buffer captured span is shorter than its bound";
+                    return false;
+                }
+            }
+            w.u32(resource.scalar_buffer_dword_count);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_scalar_buffer_bounds(draw.vrt) ||
+            !write_scalar_buffer_bounds(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_scalar_buffer_bounds(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_scalar_buffer_bounds(stage.resource_table)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -3774,8 +4005,12 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     is_gta5_packed_pointer_serialized_shadow(
                         captured.resource, captured.internal_bytes.data(),
                         captured.internal_bytes.size());
-                if ((!allow_packed_pointer && packed) ||
-                    (!gds && !packed && !captured.internal_bytes.empty()) ||
+                const bool relocated = version >= 53u &&
+                    is_indirect_pointer_relocation_serialized(
+                        captured.resource, captured.internal_bytes.data(),
+                        captured.internal_bytes.size());
+                if ((!allow_packed_pointer && (packed || relocated)) ||
+                    (!gds && !packed && !relocated && !captured.internal_bytes.empty()) ||
                     (gds && !captured.internal_bytes.empty() &&
                      captured.internal_bytes.size() != resource_footprint(captured.resource))) {
                     error = "invalid compute internal capture state";
@@ -4556,6 +4791,52 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     return false;
                 }
     }
+    if (version >= 54) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid scalar-buffer bound resource count";
+            return false;
+        }
+        auto read_scalar_buffer_bounds = [&](GpuCapturedTable& table) {
+            for (GpuCapturedResource& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                if (!r.u32(resource.scalar_buffer_dword_count))
+                    return false;
+                if (resource.scalar_buffer_dword_count) {
+                    const uint64_t binding_bytes =
+                        shader_resource_buffer_binding_bytes(resource);
+                    if (!binding_bytes || captured.captured_size < binding_bytes)
+                        return false;
+                }
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_scalar_buffer_bounds(draw.vrt) ||
+                !read_scalar_buffer_bounds(draw.prt)) {
+                error = "invalid scalar-buffer bound state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_scalar_buffer_bounds(compute.resources)) {
+                error = "invalid scalar-buffer bound state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_scalar_buffer_bounds(stage.resource_table)) {
+                    error = "invalid scalar-buffer bound state";
+                    return false;
+                }
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -4643,6 +4924,13 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             }
             const uint64_t captured_footprint = x.captured_size ? x.captured_size
                 : (c.format_version >= 28 ? resource_footprint(r) : legacy_resource_footprint(r));
+            if (r.scalar_buffer_dword_count) {
+                const uint64_t binding_bytes = shader_resource_buffer_binding_bytes(r);
+                if (!binding_bytes || x.captured_size < binding_bytes) {
+                    error = "scalar-buffer replay span is shorter than its bound";
+                    return false;
+                }
+            }
             // v1-v27 captured linear images tightly. Preserve that bounded backing so old files stay
             // readable, but derive the real guest pitch for best-effort replay of every retained row.
             if (c.format_version < 28 && r.cls == ResourceClass::Texture && r.img_dim == 1u &&
@@ -4664,12 +4952,16 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                 const bool packed = c.format_version >= 51u &&
                     is_gta5_packed_pointer_serialized_shadow(
                         r, x.internal_bytes.data(), x.internal_bytes.size());
-                if ((!allow_packed_pointer && packed) || (!gds && !packed)) {
+                const bool relocated = c.format_version >= 53u &&
+                    is_indirect_pointer_relocation_serialized(
+                        r, x.internal_bytes.data(), x.internal_bytes.size());
+                if ((!allow_packed_pointer && (packed || relocated)) ||
+                    (!gds && !packed && !relocated)) {
                     error = "invalid compute internal replay state";
                     return false;
                 }
                 size_t instance_index = 0;
-                if (packed) {
+                if (packed || relocated) {
                     instance_index = out.resource_instances.size();
                     out.resource_instances.push_back({0, 0xFFFFFFFFu, x.internal_bytes});
                 } else {
@@ -4736,6 +5028,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
         if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
         if (!validate_captured_gta5_cf9200_no_backing(c, x, error)) return false;
+        if (!validate_captured_indirect_pointer_relocations(c, x, error)) return false;
         ComputeItem compute;
         compute.spirv = x.spirv;
         compute.launch = x.launch;
@@ -4761,6 +5054,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                     resource.resource, resource.internal_bytes.data(),
                     resource.internal_bytes.size());
             });
+        const bool has_indirect_pointer_state = c.format_version >= 53u &&
+            std::any_of(x.resources.resources.begin(), x.resources.resources.end(),
+                        captured_resource_has_indirect_pointer_state);
         if (!table(x.resources, true, compute.resources)) return false;
         const bool has_cf9200_no_backing =
             captured_compute_has_gta5_cf9200_no_backing(x);
@@ -4777,6 +5073,12 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             (!compute.resources || !compute.recompile_config_available ||
              compute.raw_shader_index >= c.raw_shader_versions.size())) {
             error = "packed-pointer replay lacks exact raw shader or launch state";
+            return false;
+        }
+        if (has_indirect_pointer_state &&
+            (!compute.resources || !compute.recompile_config_available ||
+             compute.raw_shader_index >= c.raw_shader_versions.size())) {
+            error = "indirect-pointer replay lacks exact raw shader or launch state";
             return false;
         }
         if (compute.resources && compute.recompile_config_available &&
@@ -4799,6 +5101,13 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                  !discover_rdna2_gta5_packed_pointer(
                      raw.data(), raw.size(), compute.recompile_config, *compute.resources))) {
                 error = "packed-pointer replay failed exact dispatch validation";
+                return false;
+            }
+            if (has_indirect_pointer_state &&
+                !discover_rdna2_indirect_pointer_relocations(
+                    raw.data(), raw.size(), compute.recompile_config,
+                    *compute.resources)) {
+                error = "indirect-pointer replay failed exact dispatch validation";
                 return false;
             }
         }

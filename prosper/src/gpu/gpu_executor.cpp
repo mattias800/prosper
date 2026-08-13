@@ -16,6 +16,7 @@
 #include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
 #include "../host/guest_memory_map.hpp"
@@ -568,6 +569,8 @@ struct ShaderResourceCompileKey {
     uint32_t stride = 0;
     uint32_t one_record_tail_semantic = 0;
     uint32_t atomic_x2_record_count = 0;
+    uint32_t scalar_buffer_dword_count = 0;
+    bool scalar_buffer_contract_valid = true;
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
@@ -594,6 +597,13 @@ struct ShaderResourceCompileKey {
     uint32_t indirect_buffer_slot_count = 0;
     uint32_t indirect_buffer_header_bytes = 0;
     uint32_t indirect_buffer_slot_bytes = 0;
+    uint32_t indirect_pointer_carrier_version = 0;
+    uint32_t indirect_pointer_proof_schema = 0;
+    uint32_t indirect_pointer_binding_bytes = 0;
+    uint32_t indirect_pointer_record_count = 0;
+    uint32_t indirect_pointer_segment_count = 0;
+    uint32_t indirect_pointer_segment_directory_byte_offset = 0;
+    uint64_t indirect_pointer_proof_fingerprint = 0;
     bool srgb = false;
     bool depth_compare = false;
     uint32_t depth_compare_func = 0;
@@ -779,6 +789,8 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.stride);
             hash = hash_mix(hash, resource.one_record_tail_semantic);
             hash = hash_mix(hash, resource.atomic_x2_record_count);
+            hash = hash_mix(hash, resource.scalar_buffer_dword_count);
+            hash = hash_mix(hash, resource.scalar_buffer_contract_valid);
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
@@ -806,6 +818,14 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.indirect_buffer_slot_count);
             hash = hash_mix(hash, resource.indirect_buffer_header_bytes);
             hash = hash_mix(hash, resource.indirect_buffer_slot_bytes);
+            hash = hash_mix(hash, resource.indirect_pointer_carrier_version);
+            hash = hash_mix(hash, resource.indirect_pointer_proof_schema);
+            hash = hash_mix(hash, resource.indirect_pointer_binding_bytes);
+            hash = hash_mix(hash, resource.indirect_pointer_record_count);
+            hash = hash_mix(hash, resource.indirect_pointer_segment_count);
+            hash = hash_mix(
+                hash, resource.indirect_pointer_segment_directory_byte_offset);
+            hash = hash_mix(hash, resource.indirect_pointer_proof_fingerprint);
             hash = hash_mix(hash, resource.srgb);
             hash = hash_mix(hash, resource.depth_compare);
             hash = hash_mix(hash, resource.depth_compare_func);
@@ -1539,6 +1559,10 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 (resource.gpu_addr & 7u) == 0u && resource.table_index_count == 0u;
             compiled.atomic_x2_record_count =
                 atomic_x2_exact_admission ? resource.atomic_x2_record_count : 0u;
+            compiled.scalar_buffer_dword_count = resource.scalar_buffer_dword_count;
+            compiled.scalar_buffer_contract_valid =
+                !resource.scalar_buffer_dword_count ||
+                shader_resource_buffer_binding_bytes(resource) != 0u;
             compiled.srt_offset = resource.srt_offset;
             compiled.sgpr_base = resource.sgpr_base;
             compiled.fetch_pc = resource.fetch_pc;
@@ -1580,6 +1604,18 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 compiled.indirect_buffer_slot_count = resource.indirect_buffer_slot_count;
                 compiled.indirect_buffer_header_bytes = resource.indirect_buffer_header_bytes;
                 compiled.indirect_buffer_slot_bytes = resource.indirect_buffer_slot_bytes;
+            }
+            if (is_indirect_pointer_relocation_resource(resource)) {
+                const auto& relocation = resource.indirect_pointer_relocation;
+                compiled.indirect_pointer_carrier_version = relocation.carrier_version;
+                compiled.indirect_pointer_proof_schema = relocation.proof_schema;
+                compiled.indirect_pointer_binding_bytes = relocation.binding_bytes;
+                compiled.indirect_pointer_record_count = relocation.record_count;
+                compiled.indirect_pointer_segment_count = relocation.segment_count;
+                compiled.indirect_pointer_segment_directory_byte_offset =
+                    relocation.segment_directory_byte_offset;
+                compiled.indirect_pointer_proof_fingerprint =
+                    relocation.proof_fingerprint;
             }
             compiled.srgb = storage_image && resource.srgb;
             compiled.depth_compare = (manual_compare || storage_image) && resource.depth_compare;
@@ -1885,6 +1921,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const bool has_gta5_packed_pointer = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_packed_pointer_marker_candidate);
+    const bool has_indirect_pointer_relocation = resources &&
+        std::any_of(resources->resources.begin(), resources->resources.end(),
+                    is_indirect_pointer_relocation_marker_candidate);
     const bool has_gta5_cf9200_no_backing = resources &&
         std::any_of(resources->resources.begin(), resources->resources.end(),
                     is_gta5_cf9200_no_backing_marker_candidate);
@@ -1903,6 +1942,10 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         return {};
     if (has_gta5_packed_pointer &&
         !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *resources))
+        return {};
+    if (has_indirect_pointer_relocation &&
+        !validate_rdna2_indirect_pointer_relocations(
+            code, dwords, config, *resources))
         return {};
     if (has_gta5_cf9200_no_backing &&
         !rdna2_gta5_cf9200_no_backing_dispatch(code, dwords, config, *resources))
@@ -2447,19 +2490,53 @@ bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructio
 // value that would depend on a VGPR/lane is left unknown (the op's dest becomes unknown), so we never
 // fabricate a per-lane-dependent descriptor. CONFIDENCE: MED (covers this game's fetch-shader shape).
 // External linkage (DynFetch + declaration in gpu_execute.hpp) so the fold is unit-testable.
-static bool zero_record_sbuffer_access_is_oob(const Rdna2Inst& in,
-                                              const DecodedBufferDescriptor& descriptor) {
-    if (in.fmt != Rdna2Format::SMEM || in.opcode < 0x8u || in.opcode > 0xCu ||
-        descriptor.num_records != 0u || descriptor.size_bytes != 0u ||
-        static_cast<int32_t>(in.literal) < 0)
+static uint64_t scalar_buffer_dword_count(const DecodedBufferDescriptor& descriptor) {
+    // AMD's scalar-memory contract is exact here: m_size is one dword for STRIDE=0, otherwise it is
+    // NUM_RECORDS dwords. STRIDE participates only in selecting that bound and never scales the
+    // scalar address. This deliberately differs from decode_buffer_descriptor::size_bytes, which is
+    // the vector/capture backing footprint NUM_RECORDS*STRIDE.
+    return descriptor.stride == 0u ? 1ull : static_cast<uint64_t>(descriptor.num_records);
+}
+
+static bool sbuffer_access_is_fully_oob(const Rdna2Inst& in,
+                                        const DecodedBufferDescriptor& descriptor,
+                                        bool exact_byte_offset_known = false,
+                                        uint32_t exact_byte_offset = 0u) {
+    if (in.fmt != Rdna2Format::SMEM || in.opcode < 0x8u || in.opcode > 0xCu)
         return false;
 
-    // Scalar-buffer bounds differ from vector-buffer bounds when STRIDE=0: hardware substitutes a
-    // one-dword M_SIZE instead of using NUM_RECORDS directly. SOFFSET is unsigned, so the immediate
-    // names the minimum possible dword. Only specialize when even that minimum begins out of range.
-    const uint32_t scalar_dwords = descriptor.stride == 0u ? 1u : descriptor.num_records;
-    const uint32_t minimum_dword = in.literal >> 2;
-    return minimum_dword >= scalar_dwords;
+    const uint64_t scalar_dwords = scalar_buffer_dword_count(descriptor);
+    if (exact_byte_offset_known) {
+        // The fold already preserved the 32-bit SOFFSET+OFFSET result. Scalar memory converts that
+        // effective byte offset to its first dword index.
+        const uint32_t first_dword = exact_byte_offset >> 2u;
+        return static_cast<uint64_t>(first_dword) >= scalar_dwords;
+    }
+
+    // An unknown SOFFSET can only be specialized by the established empty-descriptor proof. SOFFSET
+    // is unsigned, so a non-negative immediate names its minimum possible dword. Do not generalize
+    // this minimum argument to a non-empty descriptor: the exact-offset and emitted dynamic paths
+    // below handle those without assuming a runtime value.
+    if (static_cast<int32_t>(in.literal) < 0 || descriptor.num_records != 0u ||
+        descriptor.size_bytes != 0u)
+        return false;
+    return static_cast<uint64_t>(in.literal >> 2u) >= scalar_dwords;
+}
+
+static uint32_t validated_scalar_buffer_dword_count(
+        const SrtUse& use, const DecodedBufferDescriptor& descriptor,
+        const uint32_t* code, size_t dwords) {
+    if (!use.scalar_buffer_dword_count) return 0u;
+    if (use.kind != 1 || use.instruction_format != UINT32_MAX || use.use_pc >= dwords)
+        return 0u;
+    const Rdna2Inst consumer = rdna2_decode_one(code + use.use_pc, dwords - use.use_pc);
+    if (consumer.fmt != Rdna2Format::SMEM || consumer.opcode < 0x8u ||
+        consumer.opcode > 0xCu ||
+        scalar_buffer_dword_count(descriptor) != use.scalar_buffer_dword_count)
+        return 0u;
+    const uint64_t backing_bytes =
+        static_cast<uint64_t>(use.scalar_buffer_dword_count) * sizeof(uint32_t);
+    return backing_bytes <= 0x10000000ull ? use.scalar_buffer_dword_count : 0u;
 }
 
 static bool zero_record_format_selectors_are_zero(const Rdna2Inst& in,
@@ -3831,10 +3908,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // instruction, never only on an older descriptor snapshot. Callers that do not
                 // request SRT uses still need the known-zero result to propagate to later consumers.
                 std::array<uint32_t, 4> live_sbase_vsharp{};
+                DecodedBufferDescriptor live_sbase_descriptor{};
                 if (is_buffer) {
                     live_sbase_vsharp_known = true;
                     for (int k = 0; k < 4; ++k)
                         live_sbase_vsharp_known &= known(sbase + k, live_sbase_vsharp[(size_t)k]);
+                    if (live_sbase_vsharp_known) {
+                        live_sbase_descriptor =
+                            decode_buffer_descriptor(live_sbase_vsharp.data());
+                        if (have_pending_srt_use) {
+                            const uint64_t scalar_dwords =
+                                scalar_buffer_dword_count(live_sbase_descriptor);
+                            if (scalar_dwords <= UINT32_MAX)
+                                pending_srt_use.scalar_buffer_dword_count =
+                                    static_cast<uint32_t>(scalar_dwords);
+                        }
+                    }
                 }
                 // RAW-POINTER scalar load (#2412). `s_load_dword`/`x2` (op < 8) take SBASE as a plain
                 // 64-bit pointer rather than a V#, and no use was recorded for them at all — the
@@ -3904,9 +3993,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                  is_buffer ? "bufload" : "load", sdst, sbase, (unsigned long long)base, base_ok,
                                  soff_field, soff_val, soff_ok, in.literal, n);
                 if (n != 0 && live_sbase_vsharp_known) {
-                    const DecodedBufferDescriptor d =
-                        decode_buffer_descriptor(live_sbase_vsharp.data());
-                    if (zero_record_sbuffer_access_is_oob(in, d)) {
+                    if (sbuffer_access_is_fully_oob(in, live_sbase_descriptor)) {
                         // This exact scalar access begins beyond the descriptor's effective M_SIZE,
                         // including at the minimum value of a wave-derived SOFFSET. Publish the outer
                         // descriptor at this pc so the SPIR-V emitter can remove the memory access,
@@ -3946,14 +4033,64 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 // in.literal is the SIGN-EXTENDED 21-bit immediate (#149) — add it as signed so a
                 // negative offset subtracts from the base instead of wrapping to a huge address.
-                const int64_t byte_off = (int64_t)(int32_t)in.literal + (int64_t)soff_val;
+                const uint32_t scalar_byte_off = soff_val + in.literal;
+                const int64_t byte_off = is_buffer
+                    ? static_cast<int64_t>(scalar_byte_off)
+                    : (int64_t)(int32_t)in.literal + (int64_t)soff_val;
                 uint64_t addr = (base + (uint64_t)byte_off) & ~3ull;
+                uint32_t scalar_in_range_dwords = n;
+                if (is_buffer && live_sbase_vsharp_known) {
+                    const uint64_t scalar_dwords =
+                        scalar_buffer_dword_count(live_sbase_descriptor);
+                    const uint32_t first_dword = scalar_byte_off >> 2u;
+                    scalar_in_range_dwords = static_cast<uint64_t>(first_dword) >= scalar_dwords
+                        ? 0u
+                        : static_cast<uint32_t>(std::min<uint64_t>(
+                              n, scalar_dwords - static_cast<uint64_t>(first_dword)));
+                }
                 if (have_pending_srt_use) {
                     const int64_t required = byte_off + (int64_t)n * 4;
+                    bool measured_required_size = false;
                     if (required > 0 && required <= (int64_t)UINT32_MAX) {
                         pending_srt_use.required_size = (uint32_t)required;
+                        measured_required_size = true;
+                    }
+                    // A bounded V# is publishable from its own declaration even when the requested
+                    // scalar offset lies past it. An unbounded raw-pointer convention still requires
+                    // the measured access span before it can acquire backing.
+                    if (live_sbase_vsharp_known && live_sbase_descriptor.size_bytes != 0u) {
+                        srt_uses->push_back(pending_srt_use);
+                    } else if (measured_required_size) {
                         srt_uses->push_back(pending_srt_use);
                     }
+                }
+                if (is_buffer && scalar_in_range_dwords == 0u &&
+                    live_sbase_vsharp_known) {
+                    // The complete scalar result is architectural zero even if base+offset happens
+                    // to name mapped memory. Retain a real bounded resource for a non-empty V# so the
+                    // emitted dynamic path can implement the same bound; only the established empty
+                    // V# shape uses the no-backing marker.
+                    if (srt_uses && have_pending_srt_use &&
+                        live_sbase_descriptor.num_records == 0u &&
+                        live_sbase_descriptor.size_bytes == 0u) {
+                        if (!srt_uses->empty() &&
+                            srt_uses->back().use_pc == pending_srt_use.use_pc)
+                            srt_uses->pop_back();
+                        pending_srt_use.zero_record_raw = true;
+                        pending_srt_use.scalar_oob_offset_known = true;
+                        pending_srt_use.scalar_oob_byte_offset = scalar_byte_off;
+                        pending_srt_use.required_size = 0u;
+                        srt_uses->push_back(pending_srt_use);
+                    }
+                    for (uint32_t k = 0; k < n; ++k)
+                        set_value(sdst + static_cast<int>(k), 0u);
+                    if (n == 4 && valid_reg(sdst) && valid_reg(sdst + 3)) {
+                        descr[(size_t)sdst] = {0u, 0u, 0u, 0u};
+                        descr_known.set((size_t)sdst);
+                        descr_key[(size_t)sdst] = 0xFFFFFFFFu;
+                        descr_key_known.set((size_t)sdst);
+                    }
+                    break;
                 }
                 // AGC scalar-pointer user data can carry aperture/tag bits above the title's usable
                 // GPU VA. Real GFX10 S_LOAD addresses are canonicalized by the memory system; a raw
@@ -3976,15 +4113,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         }
                     }
                 }
-                if (is_buffer) addr_readable = readable(addr, n * 4);
+                if (is_buffer)
+                    addr_readable = scalar_in_range_dwords != 0u &&
+                                    readable(addr, scalar_in_range_dwords * 4u);
                 if (!addr_readable) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
                                       for (uint32_t k = 0; k < n; k++) {
-                                          forget(sdst + (int)k);
-                                          mark_null_origin(sdst + (int)k, null_base_origin);
+                                          if (is_buffer && k >= scalar_in_range_dwords)
+                                              set_value(sdst + (int)k, 0u);
+                                          else {
+                                              forget(sdst + (int)k);
+                                              mark_null_origin(sdst + (int)k, null_base_origin);
+                                          }
                                       }
                                       break; }
                 if (trc && writer_provenance_enabled()) {
-                    const auto writer = last_guest_write_overlap(addr, n * 4);
+                    const uint32_t observed_bytes = is_buffer
+                        ? scalar_in_range_dwords * 4u : n * 4u;
+                    const auto writer = last_guest_write_overlap(addr, observed_bytes);
                     if (writer) {
                         fprintf(stderr,
                                 "[dyntrace]   latest GPU writer kind=%s seq=%llu "
@@ -4023,7 +4168,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         fprintf(stderr,
                                 "[dyntrace]   no recorded GPU writer overlaps [0x%llx,+0x%x) "
                                 "(history=%zu recorded: %s)%s\n",
-                                (unsigned long long)addr, n * 4,
+                                (unsigned long long)addr, observed_bytes,
                                 guest_write_history_size(), guest_write_recorder_summary(),
                                 guest_write_history_size() ? ""
                                     : "  <- HISTORY EMPTY: this is VOID, not negative");
@@ -4077,7 +4222,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         fprintf(stderr, "[dyntrace]   buffer body not readable -> dump skipped\n");
                     }
                 }
+                std::array<uint32_t, 16> bounded_scalar_words{};
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
+                if (is_buffer && scalar_in_range_dwords < n) {
+                    std::memcpy(bounded_scalar_words.data(), mem,
+                                scalar_in_range_dwords * sizeof(uint32_t));
+                    mem = bounded_scalar_words.data();
+                }
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 const bool optional_table_source =
                     !is_buffer && in.opcode == kSmemOpcodeLoadDwordX2 && n == 2u &&
@@ -4152,7 +4303,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         mark_optional_null_role(sdst + 1, OptionalNullRole::BaseHi);
                     }
                 }
-                if (n == 8 || n == 16) {
+                if ((n == 8 || n == 16) && scalar_in_range_dwords == n) {
                     // The per-register tags were cleared by set_value(); install exact lanes only
                     // after this successful mapped read. Aligned x8 windows inside x16 loads then
                     // naturally retain distinct contiguous base addresses.
@@ -4201,7 +4352,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // is far broader than "descriptor tables", and the design question is specifically about
                 // table slots. Narrowing costs one run and makes the answer actionable instead of
                 // suggestive.
-                if (descr_coherence_enabled() && n == 4 && is_buffer) {
+                if (descr_coherence_enabled() && n == 4 && is_buffer &&
+                    scalar_in_range_dwords == n) {
                     uint64_t h = 1469598103934665603ull;              // FNV-1a over the four dwords
                     for (int k = 0; k < 4; ++k) {
                         h ^= mem[k]; h *= 1099511628211ull;
@@ -5374,7 +5526,9 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             const Rdna2Inst marker_consumer =
                 rdna2_decode_one(code + u.use_pc, dwords - u.use_pc);
             if (marker_consumer.fmt == Rdna2Format::SMEM &&
-                !zero_record_sbuffer_access_is_oob(marker_consumer, d))
+                !sbuffer_access_is_fully_oob(marker_consumer, d,
+                                             u.scalar_oob_offset_known,
+                                             u.scalar_oob_byte_offset))
                 continue;
             if (marker_consumer.fmt == Rdna2Format::MUBUF && marker_consumer.opcode <= 0x3u &&
                 !zero_record_format_selectors_are_zero(marker_consumer, u.v4.data()))
@@ -5395,6 +5549,9 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             continue;
         }
         if (d.base <= 0x10000 || d.size_bytes > 0x10000000u) continue;
+        const uint32_t scalar_buffer_dwords = validated_scalar_buffer_dword_count(
+            u, d, code, dwords);
+        if (u.scalar_buffer_dword_count && !scalar_buffer_dwords) continue;
         // A scalar consumer whose base is a RAW POINTER has no bounded V# size to report, so
         // `size_bytes == 0` here means "unbounded", not "empty" (#2412). The graphics builder already
         // makes exactly this distinction and documents it — *"Scalar SMEM only needs V#.Base plus the
@@ -5404,19 +5561,23 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         // one: key-less only, a real measured span, and the same 1 MiB ceiling.
         uint32_t scalar_size = d.size_bytes;
         uint32_t scalar_stride = d.stride;
-        if (scalar_size == 0) {
+        if (scalar_size == 0 && !scalar_buffer_dwords) {
             if (u.key != 0xFFFFFFFFu || u.required_size == 0 || u.required_size > (1u << 20))
                 continue;
             scalar_size = u.required_size;
             scalar_stride = 0;
-        } else if (scalar_size < u.required_size) {
-            scalar_size = u.required_size;
+        } else {
+            // A bounded V# remains authoritative even when a scalar request lies beyond M_SIZE.
+            // Widening it to required_size turns an architectural zero into an unrelated host read
+            // and was the source of GTA V's spurious 3.70/3.44 GiB compute bindings.
+            scalar_size = d.size_bytes;
         }
         if (clash && !exact_mtbuf && !u.atomic_x2_record_count) {
             bool piggybacked = false;
             for (auto& r0 : table.resources) {
                 if (r0.cls != ResourceClass::ConstantBuffer || r0.gpu_addr != d.base ||
-                    r0.size != scalar_size)
+                    r0.size != scalar_size ||
+                    r0.scalar_buffer_dword_count != scalar_buffer_dwords)
                     continue;
                 if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
                 piggybacked = r0.fetch_pc == u.use_pc;
@@ -5443,7 +5604,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         r.gpu_addr = d.base;
         r.size = scalar_size;
         r.stride = scalar_stride;
-        if (d.size_bytes == 0u && u.key == UINT32_MAX)
+        r.scalar_buffer_dword_count = scalar_buffer_dwords;
+        if (d.size_bytes == 0u && u.key == UINT32_MAX && !scalar_buffer_dwords)
             r.scalar_raw_pointer_word_hi = u.v4[1];
         r.atomic_x2_record_count = u.atomic_x2_record_count;
         r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
@@ -6176,9 +6338,19 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         ((u.v4[3] >> 12) & 0x7Fu) == 0)
                         continue;
                     if (d.base <= 0x10000) continue;
+                    const uint32_t scalar_buffer_dwords =
+                        validated_scalar_buffer_dword_count(
+                            u, d,
+                            reinterpret_cast<const uint32_t*>(
+                                static_cast<uintptr_t>(code_addr)),
+                            shader_dwords);
+                    if (u.scalar_buffer_dword_count && !scalar_buffer_dwords) continue;
                     uint32_t resource_size = d.size_bytes;
                     uint32_t resource_stride = d.stride;
-                    if (resource_size == 0 || resource_size > 0x10000000u) {
+                    if (scalar_buffer_dwords && resource_size > 0x10000000u) {
+                        continue;
+                    } else if (!scalar_buffer_dwords &&
+                               (resource_size == 0 || resource_size > 0x10000000u)) {
                         // Scalar SMEM only needs V#.Base plus the consuming load's exact byte span.
                         // DOLL uses base-valid sharps whose other words do not describe a conventional
                         // bounded buffer. Cap the pc-keyed upload to the observed access; the renderer's
@@ -6187,8 +6359,6 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                             u.required_size > (1u << 20)) continue;
                         resource_size = u.required_size;
                         resource_stride = 0;
-                    } else if (resource_size < u.required_size) {
-                        resource_size = u.required_size;
                     }
                     // A keyed use whose key already resolves keeps the existing resource; a key-less
                     // (or key-clashed) use still needs a pc-provenance entry — piggyback the pc onto
@@ -6197,7 +6367,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         bool piggybacked = false;
                         for (auto& r0 : t.resources)
                             if ((r0.cls == ResourceClass::ConstantBuffer || r0.cls == ResourceClass::VertexBuffer) &&
-                                r0.gpu_addr == d.base && r0.size == resource_size && r0.stride == resource_stride) {
+                                r0.gpu_addr == d.base && r0.size == resource_size &&
+                                r0.stride == resource_stride &&
+                                r0.scalar_buffer_dword_count == scalar_buffer_dwords) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu && r0.cls == ResourceClass::ConstantBuffer)
                                     r0.fetch_pc = u.use_pc;
                                 piggybacked = r0.fetch_pc == u.use_pc || r0.cls == ResourceClass::VertexBuffer;
@@ -6215,6 +6387,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         r.num_components = d.num_components ? d.num_components : 1;
                     }
                     r.gpu_addr = d.base; r.size = resource_size; r.stride = resource_stride;
+                    r.scalar_buffer_dword_count = scalar_buffer_dwords;
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
                     if (clash) r.fetch_pc = u.use_pc;    // pc-only provenance (key-less/collided V#)
                     if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x pc=%u base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
@@ -7190,6 +7363,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
                          static_cast<unsigned long long>(source ? source->size : 0u),
                          static_cast<unsigned long long>(source ? source->host_data_size : 0u),
                          source ? source->indirect_buffer_slot_count : 0u);
+        }
+
+        // Generic dispatch-indexed pointer proofs preserve the source records verbatim and append
+        // only the selector-/consumer-bounded pointee intervals. Discovery happens at the same
+        // command-ordered realization point as the fixed-slot predecessor: preceding GPU producers
+        // are complete, and convention bindings have not yet hidden fetch provenance.
+        const bool indirect_pointer_valid = discover_rdna2_indirect_pointer_relocations(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+            shader_dwords, config, *table);
+        if (indirect_pointer_valid && std::getenv("PROSPER_DBG")) {
+            const auto source_it = std::find_if(
+                table->resources.begin(), table->resources.end(),
+                is_indirect_pointer_relocation_resource);
+            const ShaderResource* source = source_it == table->resources.end()
+                ? nullptr : &*source_it;
+            const auto marker = source
+                ? source->indirect_pointer_relocation
+                : IndirectPointerRelocationBinding{};
+            std::fprintf(stderr,
+                         "[indirect-pointer-relocation] valid=1 records=%u segments=%u "
+                         "source-bytes=%llu binding-bytes=%u\n",
+                         marker.record_count, marker.segment_count,
+                         static_cast<unsigned long long>(source ? source->size : 0u),
+                         marker.binding_bytes);
         }
 
         // GTA V 0x413cf9200 overlays descriptor-shaped root fields with application records for
