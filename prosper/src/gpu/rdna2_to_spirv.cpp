@@ -8,6 +8,7 @@
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
 #include "rdna2_indirect_buffer_shadow.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
 #include <bit>
@@ -445,6 +446,27 @@ struct SpirvCompute {
     uint32_t indirect_buffer_slot_bytes = 0;
     uint32_t indirect_buffer_atomic_binding = UINT32_MAX;
     uint32_t indirect_buffer_atomic_byte_offset = 0;
+    // Dispatch/compiler-boundary authority for generic pointer relocation. The proof identifies
+    // exact GLOBAL consumers; the remaining fields describe the already-validated carrier bound at
+    // `indirect_pointer_binding`. Version 2's StaticFootprint path needs only the segment directory.
+    // Version 3's DescriptorRange path additionally preserves the dynamic source-record identity
+    // and Base48 root in per-invocation Function variables across CFG dispatcher cases.
+    // Every field deliberately defaults to no authority so a caller which has not repeated the
+    // complete proof cannot activate either lowering.
+    const IndirectPointerRelocationProof* indirect_pointer_proof = nullptr;
+    uint32_t indirect_pointer_binding = UINT32_MAX;
+    uint32_t indirect_pointer_source_bytes = 0;
+    uint32_t indirect_pointer_record_count = 0;
+    uint32_t indirect_pointer_record_directory_byte_offset = 0;
+    uint32_t indirect_pointer_segment_count = 0;
+    uint32_t indirect_pointer_segment_directory_byte_offset = 0;
+    uint32_t indirect_pointer_payload_byte_offset = 0;
+    uint32_t indirect_pointer_carrier_bytes = 0;
+    uint32_t indirect_pointer_source_stride = 0;
+    uint32_t indirect_pointer_source_pointer_byte_offset = 0;
+    uint32_t indirect_pointer_source_record_var = 0;
+    uint32_t indirect_pointer_source_root_lo_var = 0;
+    uint32_t indirect_pointer_source_root_hi_var = 0;
     // S_CSELECT_B64 normally needs both scalar source dwords. A captured GTA V kernel consumes
     // only the selected VCC_LO word and leaves VCC_HI dead on every successor path; the whole-stream
     // liveness proof records that exact exception before emission. Keep it builder-local so recursive
@@ -2312,6 +2334,332 @@ struct SpirvCompute {
     uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
         return cbuf_load_impl(idx, binding, coherent_access);
+    }
+    struct U64PairAdd {
+        uint32_t lo = 0;
+        uint32_t hi = 0;
+        uint32_t overflow = 0;
+    };
+    U64PairAdd add_u64_pair_u32(uint32_t lo, uint32_t hi, uint32_t addend) {
+        U64PairAdd result;
+        result.lo = ibin(Op_IAdd, lo, addend);
+        const uint32_t carry = ucmp(Op_ULessThan, result.lo, lo);
+        result.hi = ibin(Op_IAdd, hi, sel(carry, uconst(1), uconst(0)));
+        result.overflow = ucmp(Op_ULessThan, result.hi, hi);
+        return result;
+    }
+    uint32_t u64_pair_ule(uint32_t lhs_lo, uint32_t lhs_hi,
+                          uint32_t rhs_lo, uint32_t rhs_hi) {
+        const uint32_t high_less = ucmp(Op_ULessThan, lhs_hi, rhs_hi);
+        const uint32_t high_equal = ucmp(Op_IEqual, lhs_hi, rhs_hi);
+        const uint32_t low_less_equal = ucmp(Op_ULessThanEqual, lhs_lo, rhs_lo);
+        return lor(high_less, land(high_equal, low_less_equal));
+    }
+    void declare_indirect_pointer_descriptor_capture() {
+        uint32_t pointer_type = 0;
+        indirect_pointer_source_record_var = function_var(t_u32, pointer_type);
+        indirect_pointer_source_root_lo_var = function_var(t_u32, pointer_type);
+        indirect_pointer_source_root_hi_var = function_var(t_u32, pointer_type);
+        // UINT32_MAX cannot name a record in the validated source table. It is also the safe
+        // fail-closed state for a lane which reaches a consumer without executing the producer.
+        store_function(indirect_pointer_source_record_var, uconst(UINT32_MAX));
+        store_function(indirect_pointer_source_root_lo_var, uconst(0));
+        store_function(indirect_pointer_source_root_hi_var, uconst(0));
+    }
+    void capture_indirect_pointer_descriptor_source(
+            uint32_t record_index, uint32_t root_lo, uint32_t descriptor_word1,
+            bool predicated, uint32_t predicate) {
+        if (!indirect_pointer_source_record_var ||
+            !indirect_pointer_source_root_lo_var ||
+            !indirect_pointer_source_root_hi_var)
+            return;
+        uint32_t root_hi = ibin(
+            Op_BitwiseAnd, descriptor_word1, uconst(0xffffu));
+        if (predicated) {
+            const uint32_t old_record = load_function(
+                t_u32, indirect_pointer_source_record_var);
+            const uint32_t old_root_lo = load_function(
+                t_u32, indirect_pointer_source_root_lo_var);
+            const uint32_t old_root_hi = load_function(
+                t_u32, indirect_pointer_source_root_hi_var);
+            record_index = sel(predicate, record_index, old_record);
+            root_lo = sel(predicate, root_lo, old_root_lo);
+            root_hi = sel(predicate, root_hi, old_root_hi);
+        }
+        // Preserve one atomic provenance tuple across EXEC masking. The source MUBUF's inactive
+        // destination values may have been recycled since an earlier capture; they must not replace
+        // only the root while the old record identity survives.
+        store_function(indirect_pointer_source_record_var, record_index);
+        store_function(indirect_pointer_source_root_lo_var, root_lo);
+        store_function(indirect_pointer_source_root_hi_var, root_hi);
+    }
+    uint32_t relocated_indirect_carrier_dword(uint32_t selected_byte,
+                                               uint32_t valid) {
+        // OpSelect does not short-circuit an OpLoad. Select a known in-range carrier address before
+        // either load, and avoid index+1 for an aligned dword at the physical end of the binding.
+        const uint32_t safe_byte = sel(valid, selected_byte, uconst(0));
+        const uint32_t index0 = ibin(Op_ShiftRightLogical, safe_byte, uconst(2));
+        const uint32_t shift = ibin(
+            Op_ShiftLeftLogical,
+            ibin(Op_BitwiseAnd, safe_byte, uconst(3)), uconst(3));
+        const uint32_t needs_second = ucmp(Op_INotEqual, shift, uconst(0));
+        const uint32_t index1 = sel(
+            needs_second, ibin(Op_IAdd, index0, uconst(1)), index0);
+        const uint32_t dword0 = cbuf_load(index0, indirect_pointer_binding);
+        const uint32_t dword1 = cbuf_load(index1, indirect_pointer_binding);
+        const uint32_t lower = ibin(Op_ShiftRightLogical, dword0, shift);
+        const uint32_t inverse_shift = ibin(
+            Op_BitwiseAnd, ibin(Op_ISub, uconst(32), shift), uconst(31));
+        const uint32_t upper = ibin(Op_ShiftLeftLogical, dword1, inverse_shift);
+        const uint32_t joined = ibin(
+            Op_BitwiseOr, lower, sel(needs_second, upper, uconst(0)));
+        return sel(valid, joined, uconst(0));
+    }
+    // Relocate one proven guest GLOBAL dword through the version-2 carrier. Segment byte_count is
+    // the exact guest interval; carrier_bytes includes only the physical zero padding needed for a
+    // safe unaligned dword join. An invalid, ambiguous, overflowing, or padding-only address first
+    // selects carrier byte zero for memory safety and then returns architectural zero.
+    uint32_t relocated_indirect_load_dword(uint32_t address_lo, uint32_t address_hi,
+                                            uint32_t immediate_byte_offset) {
+        const U64PairAdd access_begin =
+            add_u64_pair_u32(address_lo, address_hi, uconst(immediate_byte_offset));
+        const U64PairAdd access_end =
+            add_u64_pair_u32(access_begin.lo, access_begin.hi, uconst(sizeof(uint32_t)));
+        uint32_t selected_byte = uconst(0);
+        uint32_t match_count = uconst(0);
+        const uint32_t directory_dword =
+            indirect_pointer_segment_directory_byte_offset / sizeof(uint32_t);
+        constexpr uint32_t kSegmentDwords =
+            kIndirectBufferRelocationSegmentBytes / sizeof(uint32_t);
+        for (uint32_t segment = 0; segment < indirect_pointer_segment_count; ++segment) {
+            const uint32_t entry = directory_dword + segment * kSegmentDwords;
+            const uint32_t guest_lo = cbuf_load(
+                uconst(entry), indirect_pointer_binding);
+            const uint32_t guest_hi = cbuf_load(
+                uconst(entry + 1u), indirect_pointer_binding);
+            const uint32_t byte_count = cbuf_load(
+                uconst(entry + 2u), indirect_pointer_binding);
+            const uint32_t packed_byte = cbuf_load(
+                uconst(entry + 3u), indirect_pointer_binding);
+
+            const U64PairAdd guest_end =
+                add_u64_pair_u32(guest_lo, guest_hi, byte_count);
+            uint32_t guest_contains = logical_not(access_begin.overflow);
+            guest_contains = land(guest_contains, logical_not(access_end.overflow));
+            guest_contains = land(guest_contains, logical_not(guest_end.overflow));
+            guest_contains = land(
+                guest_contains, ucmp(Op_INotEqual, byte_count, uconst(0)));
+            guest_contains = land(
+                guest_contains,
+                u64_pair_ule(guest_lo, guest_hi, access_begin.lo, access_begin.hi));
+            guest_contains = land(
+                guest_contains,
+                u64_pair_ule(access_end.lo, access_end.hi, guest_end.lo, guest_end.hi));
+
+            // Once containment is true, the interval is at most UINT32_MAX bytes, so the low-word
+            // subtraction is the exact residual even when the guest interval crosses 4 GiB.
+            const uint32_t residual = ibin(Op_ISub, access_begin.lo, guest_lo);
+            const uint32_t candidate = ibin(Op_IAdd, packed_byte, residual);
+            const uint32_t candidate_wrapped = ucmp(Op_ULessThan, candidate, packed_byte);
+            const uint32_t candidate_end =
+                ibin(Op_IAdd, candidate, uconst(sizeof(uint32_t)));
+            const uint32_t candidate_end_wrapped =
+                ucmp(Op_ULessThan, candidate_end, candidate);
+            const uint32_t packed_end = ibin(Op_IAdd, packed_byte, byte_count);
+            const uint32_t packed_end_wrapped = ucmp(Op_ULessThan, packed_end, packed_byte);
+            uint32_t packed_valid = logical_not(candidate_wrapped);
+            packed_valid = land(packed_valid, logical_not(candidate_end_wrapped));
+            packed_valid = land(packed_valid, logical_not(packed_end_wrapped));
+            packed_valid = land(
+                packed_valid,
+                ucmp(Op_UGreaterThanEqual, packed_byte,
+                     uconst(indirect_pointer_payload_byte_offset)));
+            packed_valid = land(
+                packed_valid,
+                ucmp(Op_ULessThanEqual, packed_end,
+                     uconst(indirect_pointer_carrier_bytes)));
+            packed_valid = land(
+                packed_valid, ucmp(Op_ULessThanEqual, candidate_end, packed_end));
+
+            const uint32_t match = land(guest_contains, packed_valid);
+            selected_byte = sel(match, candidate, selected_byte);
+            match_count = ibin(
+                Op_IAdd, match_count, sel(match, uconst(1), uconst(0)));
+        }
+
+        const uint32_t unique = ucmp(Op_IEqual, match_count, uconst(1));
+        return relocated_indirect_carrier_dword(selected_byte, unique);
+    }
+    // DescriptorRange differs from StaticFootprint in one essential way: adjacent source records
+    // may describe adjacent or overlapping guest intervals, but an address derived from record A
+    // must never borrow record B's authority. Match the captured producer identity against one
+    // record-directory entry first, prove the final dword lies in that exact record, and only then
+    // translate it through the segment named by that record. All arithmetic is an explicit u32 pair;
+    // this path intentionally does not require ShaderInt64.
+    uint32_t relocated_indirect_descriptor_load_dword(
+            uint32_t address_lo, uint32_t address_hi,
+            uint32_t immediate_byte_offset) {
+        const U64PairAdd access_begin =
+            add_u64_pair_u32(address_lo, address_hi, uconst(immediate_byte_offset));
+        const U64PairAdd access_end =
+            add_u64_pair_u32(access_begin.lo, access_begin.hi, uconst(sizeof(uint32_t)));
+        const uint32_t captured_record = load_function(
+            t_u32, indirect_pointer_source_record_var);
+        const uint32_t captured_root_lo = load_function(
+            t_u32, indirect_pointer_source_root_lo_var);
+        const uint32_t captured_root_hi = load_function(
+            t_u32, indirect_pointer_source_root_hi_var);
+
+        const uint32_t max_source_index =
+            (UINT32_MAX - indirect_pointer_source_pointer_byte_offset) /
+            indirect_pointer_source_stride;
+        const uint32_t source_index_valid = ucmp(
+            Op_ULessThanEqual, captured_record, uconst(max_source_index));
+        const uint32_t expected_source_offset = ibin(
+            Op_IAdd,
+            ibin(Op_IMul, captured_record, uconst(indirect_pointer_source_stride)),
+            uconst(indirect_pointer_source_pointer_byte_offset));
+
+        uint32_t selected_byte = uconst(0);
+        uint32_t matching_records = uconst(0);
+        uint32_t selected_segment_valid = bfalse();
+        const uint32_t records_dword =
+            indirect_pointer_record_directory_byte_offset / sizeof(uint32_t);
+        const uint32_t segments_dword =
+            indirect_pointer_segment_directory_byte_offset / sizeof(uint32_t);
+        constexpr uint32_t kRecordDwords =
+            kIndirectBufferRelocationRecordBytes / sizeof(uint32_t);
+        constexpr uint32_t kSegmentDwords =
+            kIndirectBufferRelocationSegmentBytes / sizeof(uint32_t);
+        for (uint32_t record = 0; record < indirect_pointer_record_count; ++record) {
+            const uint32_t entry = records_dword + record * kRecordDwords;
+            const uint32_t source_offset = cbuf_load(
+                uconst(entry), indirect_pointer_binding);
+            const uint32_t segment_index = cbuf_load(
+                uconst(entry + 1u), indirect_pointer_binding);
+            const uint32_t guest_lo = cbuf_load(
+                uconst(entry + 2u), indirect_pointer_binding);
+            const uint32_t guest_hi = cbuf_load(
+                uconst(entry + 3u), indirect_pointer_binding);
+            const uint32_t byte_count = cbuf_load(
+                uconst(entry + 4u), indirect_pointer_binding);
+            const uint32_t address_kind = cbuf_load(
+                uconst(entry + 5u), indirect_pointer_binding);
+
+            const U64PairAdd record_end = add_u64_pair_u32(
+                guest_lo, guest_hi, byte_count);
+            uint32_t record_contains = logical_not(access_begin.overflow);
+            record_contains = land(record_contains, logical_not(access_end.overflow));
+            record_contains = land(record_contains, logical_not(record_end.overflow));
+            record_contains = land(
+                record_contains, ucmp(Op_INotEqual, byte_count, uconst(0)));
+            record_contains = land(
+                record_contains,
+                u64_pair_ule(guest_lo, guest_hi, access_begin.lo, access_begin.hi));
+            record_contains = land(
+                record_contains,
+                u64_pair_ule(access_end.lo, access_end.hi, record_end.lo, record_end.hi));
+
+            uint32_t record_match = source_index_valid;
+            record_match = land(
+                record_match,
+                ucmp(Op_IEqual, source_offset, expected_source_offset));
+            record_match = land(
+                record_match, ucmp(Op_IEqual, guest_lo, captured_root_lo));
+            record_match = land(
+                record_match, ucmp(Op_IEqual, guest_hi, captured_root_hi));
+            record_match = land(
+                record_match,
+                ucmp(Op_IEqual, address_kind,
+                     uconst(static_cast<uint32_t>(
+                         IndirectBufferRelocationRecord::SourceAddressKind::
+                             BufferDescriptorBase48))));
+            record_match = land(record_match, record_contains);
+            matching_records = ibin(
+                Op_IAdd, matching_records,
+                sel(record_match, uconst(1), uconst(0)));
+
+            const uint32_t segment_index_valid = ucmp(
+                Op_ULessThan, segment_index, uconst(indirect_pointer_segment_count));
+            const uint32_t safe_segment = sel(
+                segment_index_valid, segment_index, uconst(0));
+            const uint32_t segment_entry = ibin(
+                Op_IAdd, uconst(segments_dword),
+                ibin(Op_IMul, safe_segment, uconst(kSegmentDwords)));
+            const uint32_t segment_guest_lo = cbuf_load(
+                segment_entry, indirect_pointer_binding);
+            const uint32_t segment_guest_hi = cbuf_load(
+                ibin(Op_IAdd, segment_entry, uconst(1)),
+                indirect_pointer_binding);
+            const uint32_t segment_bytes = cbuf_load(
+                ibin(Op_IAdd, segment_entry, uconst(2)),
+                indirect_pointer_binding);
+            const uint32_t packed_byte = cbuf_load(
+                ibin(Op_IAdd, segment_entry, uconst(3)),
+                indirect_pointer_binding);
+            const uint32_t reserved_lo = cbuf_load(
+                ibin(Op_IAdd, segment_entry, uconst(4)),
+                indirect_pointer_binding);
+            const uint32_t reserved_hi = cbuf_load(
+                ibin(Op_IAdd, segment_entry, uconst(5)),
+                indirect_pointer_binding);
+
+            const U64PairAdd segment_end = add_u64_pair_u32(
+                segment_guest_lo, segment_guest_hi, segment_bytes);
+            uint32_t segment_valid = segment_index_valid;
+            segment_valid = land(
+                segment_valid, ucmp(Op_INotEqual, segment_bytes, uconst(0)));
+            segment_valid = land(segment_valid, logical_not(segment_end.overflow));
+            segment_valid = land(
+                segment_valid,
+                u64_pair_ule(segment_guest_lo, segment_guest_hi, guest_lo, guest_hi));
+            segment_valid = land(
+                segment_valid,
+                u64_pair_ule(record_end.lo, record_end.hi,
+                             segment_end.lo, segment_end.hi));
+            segment_valid = land(
+                segment_valid, ucmp(Op_IEqual, reserved_lo, uconst(0)));
+            segment_valid = land(
+                segment_valid, ucmp(Op_IEqual, reserved_hi, uconst(0)));
+
+            // The record is contained by this segment, so low-word subtraction is the exact byte
+            // residual. Validate the packed representation independently before selecting it.
+            const uint32_t residual = ibin(
+                Op_ISub, access_begin.lo, segment_guest_lo);
+            const uint32_t candidate = ibin(Op_IAdd, packed_byte, residual);
+            const uint32_t candidate_wrapped = ucmp(
+                Op_ULessThan, candidate, packed_byte);
+            const uint32_t candidate_end = ibin(
+                Op_IAdd, candidate, uconst(sizeof(uint32_t)));
+            const uint32_t candidate_end_wrapped = ucmp(
+                Op_ULessThan, candidate_end, candidate);
+            const uint32_t packed_end = ibin(
+                Op_IAdd, packed_byte, segment_bytes);
+            const uint32_t packed_end_wrapped = ucmp(
+                Op_ULessThan, packed_end, packed_byte);
+            segment_valid = land(segment_valid, logical_not(candidate_wrapped));
+            segment_valid = land(segment_valid, logical_not(candidate_end_wrapped));
+            segment_valid = land(segment_valid, logical_not(packed_end_wrapped));
+            segment_valid = land(
+                segment_valid,
+                ucmp(Op_UGreaterThanEqual, packed_byte,
+                     uconst(indirect_pointer_payload_byte_offset)));
+            segment_valid = land(
+                segment_valid,
+                ucmp(Op_ULessThanEqual, packed_end,
+                     uconst(indirect_pointer_carrier_bytes)));
+            segment_valid = land(
+                segment_valid,
+                ucmp(Op_ULessThanEqual, candidate_end, packed_end));
+
+            const uint32_t select_record = land(record_match, segment_valid);
+            selected_byte = sel(select_record, candidate, selected_byte);
+            selected_segment_valid = lor(selected_segment_valid, select_record);
+        }
+
+        const uint32_t unique = land(
+            ucmp(Op_IEqual, matching_records, uconst(1)), selected_segment_valid);
+        return relocated_indirect_carrier_dword(selected_byte, unique);
     }
     uint32_t cbuf_load_zero_padded_tail(uint32_t binding,
                                         StorageBufferTailSemantic semantic,
@@ -11681,14 +12029,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t t1 = b.ibin(Op_BitwiseAnd, s0, val(in.src[1]));
                 uint32_t t2 = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, s0), val(in.src[2]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t1, t2);
-            } else if (in.opcode == 0x14F) {                          // v_alignbyte_b32
-                // RDNA2 defines D = ({S0,S1} >> (8 * S2[4:0])) & 0xffffffff, where
-                // S0 is the high dword and S1 the low dword.  Keep every SPIR-V shift
-                // below 32: OpSelect is not short-circuiting, so an apparently unused
-                // shift by 32 would still be undefined.  GTA V's live compute packets
-                // use the plain integer form; LLVM rejects ABS/NEG/OMOD for this opcode
-                // and CLAMP is not part of the documented operation, so those shapes
-                // remain fail-visible rather than silently ignoring their modifier bits.
+            } else if (in.opcode == kVop3OpcodeAlignbitB32 ||
+                       in.opcode == kVop3OpcodeAlignbyteB32) {
+                // RDNA2 defines ALIGNBIT as
+                //   D = ({S0,S1} >> S2.u[4:0]) & 0xffffffff
+                // and ALIGNBYTE as the same 64-bit join shifted by 8*S2.u[4:0]. S0 is the high
+                // dword and S1 the low dword. Keep every emitted SPIR-V shift below 32:
+                // OpSelect is not short-circuiting, so even an apparently unused shift by 32 would
+                // be undefined. ALIGNBIT's masked bit count always remains in the joined low-dword
+                // domain; ALIGNBYTE additionally has the high-dword and zero-fill domains.
                 const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
                                       in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
                                       in.clamp || in.omod;
@@ -11697,24 +12046,35 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else {
                     const uint32_t s0 = val(in.src[0]);
                     const uint32_t s1 = val(in.src[1]);
-                    const uint32_t byte = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
-                    const uint32_t shift = b.ibin(
-                        Op_BitwiseAnd, b.ibin(Op_ShiftLeftLogical, byte, b.uconst(3)),
-                        b.uconst(31));
+                    const uint32_t count = b.ibin(
+                        Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
+                    const uint32_t shift = in.opcode == kVop3OpcodeAlignbitB32
+                        ? count
+                        : b.ibin(Op_BitwiseAnd,
+                                 b.ibin(Op_ShiftLeftLogical, count, b.uconst(3)),
+                                 b.uconst(31));
                     const uint32_t inv_shift = b.ibin(
-                        Op_BitwiseAnd, b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
+                        Op_BitwiseAnd, b.ibin(Op_ISub, b.uconst(32), shift),
+                        b.uconst(31));
                     const uint32_t joined = b.ibin(
                         Op_BitwiseOr, b.ibin(Op_ShiftRightLogical, s1, shift),
                         b.ibin(Op_ShiftLeftLogical, s0, inv_shift));
-                    const uint32_t low = b.sel(b.ucmp(Op_IEqual, byte, b.uconst(0)), s1, joined);
-                    const uint32_t upper_byte = b.ibin(Op_ISub, byte, b.uconst(4));
-                    const uint32_t upper_shift = b.ibin(
-                        Op_BitwiseAnd, b.ibin(Op_ShiftLeftLogical, upper_byte, b.uconst(3)),
-                        b.uconst(31));
-                    const uint32_t upper = b.ibin(Op_ShiftRightLogical, s0, upper_shift);
-                    vreg[in.dst.value] = b.sel(
-                        b.ucmp(Op_ULessThan, byte, b.uconst(4)), low,
-                        b.sel(b.ucmp(Op_ULessThan, byte, b.uconst(8)), upper, b.uconst(0)));
+                    const uint32_t low = b.sel(
+                        b.ucmp(Op_IEqual, count, b.uconst(0)), s1, joined);
+                    if (in.opcode == kVop3OpcodeAlignbitB32) {
+                        vreg[in.dst.value] = low;
+                    } else {
+                        const uint32_t upper_byte = b.ibin(Op_ISub, count, b.uconst(4));
+                        const uint32_t upper_shift = b.ibin(
+                            Op_BitwiseAnd,
+                            b.ibin(Op_ShiftLeftLogical, upper_byte, b.uconst(3)),
+                            b.uconst(31));
+                        const uint32_t upper = b.ibin(Op_ShiftRightLogical, s0, upper_shift);
+                        vreg[in.dst.value] = b.sel(
+                            b.ucmp(Op_ULessThan, count, b.uconst(4)), low,
+                            b.sel(b.ucmp(Op_ULessThan, count, b.uconst(8)), upper,
+                                  b.uconst(0)));
+                    }
                 }
             } else if (in.opcode == kVop3OpcodeLshlrevB64) {         // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
@@ -12230,6 +12590,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // (src[0]) is the V#: resolve it by an earlier s_load's SRT tag (indirect) or directly by its
             // user-data SGPR index (the V# was placed in SGPRs by the driver). Default binding 2.
             uint32_t binding = 2; bool cbuf_resolved = false;
+            const ShaderResource* cbuf_resource = nullptr;
             if (rt) { const ShaderResource* res = nullptr;
                 // Descriptor-table folding emits pc-only entries when a V# has no stable SRT key
                 // (or that key collides). Exact per-use provenance must win, as it does for MUBUF/MIMG.
@@ -12242,7 +12603,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
                 if (!res && !sreg_range_written(rs, in.src[0].value, 4))
                     res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
-                if (res) { binding = res->binding; cbuf_resolved = true; } }
+                if (res) {
+                    binding = res->binding;
+                    cbuf_resolved = true;
+                    cbuf_resource = res;
+                }
+            }
             if (getenv("PROSPER_CBUFLOG"))
                 fprintf(stderr, "[cbuf] pc=%u s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
                         in.pc, n, in.src[0].value, in.literal, base_idx, (int)soff_dyn, binding,
@@ -12285,12 +12651,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // this path legitimately; PS tables start at 32, where keeping the fallback would emit an
             // interface the renderer cannot satisfy (#719).
             if (rt && !cbuf_resolved) {
-                const bool fallback_bound = std::any_of(
+                const auto fallback = std::find_if(
                     rt->resources.begin(), rt->resources.end(), [](const ShaderResource& resource) {
                         return resource.binding == 2 &&
                                (resource.cls == ResourceClass::ConstantBuffer ||
                                 resource.cls == ResourceClass::VertexBuffer);
                     });
+                const bool fallback_bound = fallback != rt->resources.end();
                 if (!fallback_bound) {
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
@@ -12299,20 +12666,50 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 in.pc, in.opcode, in.src[0].value, (int)soff_dyn);
                     ok = false; return true;
                 }
+                cbuf_resource = &*fallback;
             }
+            // RDNA2 scalar-buffer loads use m_size=(STRIDE==0 ? 1 : NUM_RECORDS) dwords. STRIDE is
+            // only a bounds-mode selector here; it does not scale scalar addresses. Preserve the
+            // explicit scalar count: size/stride cannot reconstruct it after the binding is staged
+            // to the independent dword-addressable span (and is outright shorter when STRIDE < 4).
+            // For every component select index zero before OpAccessChain, then select architectural
+            // zero after the safe load; OpSelect does not make an already-OOB Vulkan load harmless.
+            const bool scalar_buffer_load = in.opcode >= 0x8u && in.opcode <= 0xCu;
+            const uint32_t scalar_bound_dwords =
+                scalar_buffer_load && cbuf_resource
+                    ? cbuf_resource->scalar_buffer_dword_count : 0u;
+            const bool scalar_bound_known = scalar_bound_dwords != 0u;
+            if (scalar_bound_known &&
+                shader_resource_buffer_binding_bytes(*cbuf_resource) <
+                    static_cast<uint64_t>(scalar_bound_dwords) * sizeof(uint32_t)) {
+                ok = false;
+                return true;
+            }
+            auto bounded_cbuf_load = [&](uint32_t dword_index) {
+                if (!scalar_bound_known)
+                    return b.cbuf_load(dword_index, binding);
+                if (scalar_bound_dwords == 0u)
+                    return b.uconst(0u);
+                const uint32_t in_bounds = b.ucmp(
+                    Op_ULessThan, dword_index, b.uconst(scalar_bound_dwords));
+                const uint32_t safe_index = b.sel(in_bounds, dword_index, b.uconst(0u));
+                const uint32_t loaded = b.cbuf_load(safe_index, binding);
+                return b.sel(in_bounds, loaded, b.uconst(0u));
+            };
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
                 uint32_t idx0 = b.ibin(Op_ShiftRightLogical,
                                        b.ibin(Op_IAdd, soff_bits, b.uconst(in.literal)), b.uconst(2));
                 for (uint32_t k = 0; k < n; k++) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx0, b.uconst(k)) : idx0;
-                    rs.sreg[in.dst.value + (int)k] = b.cbuf_load(kidx, binding);
+                    rs.sreg[in.dst.value + (int)k] = bounded_cbuf_load(kidx);
                     rs.sreg_srt.erase(in.dst.value + (int)k);   // data load: drop any stale descriptor tag
                 }
                 return true;
             }
             for (uint32_t k = 0; k < n; k++)
-                rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), binding);
+                rs.sreg[in.dst.value + (int)k] =
+                    bounded_cbuf_load(b.uconst(base_idx + k));
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
             // later buffer/image op using them resolves to the right resource (provenance). x4 = V#/S#
             // (buffers, samplers), x8 = T# (textures, 8 dwords).
@@ -12326,6 +12723,89 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::FLAT: {
             const FlatAccessInfo access = flat_access_info(in.opcode);
+            const IndirectPointerAccessProof* relocated_access =
+                b.indirect_pointer_proof
+                    ? rdna2_indirect_pointer_access(*b.indirect_pointer_proof, in)
+                    : nullptr;
+            if (relocated_access) {
+                const bool static_footprint =
+                    b.indirect_pointer_proof->bound_kind ==
+                        IndirectPointerBoundKind::StaticFootprint &&
+                    b.indirect_pointer_proof->guard_kind ==
+                        IndirectPointerGuardKind::Full64NonZero;
+                const bool descriptor_range =
+                    b.indirect_pointer_proof->bound_kind ==
+                        IndirectPointerBoundKind::DescriptorRange &&
+                    b.indirect_pointer_proof->guard_kind ==
+                        IndirectPointerGuardKind::None;
+                const uint64_t directory_end =
+                    static_cast<uint64_t>(b.indirect_pointer_segment_directory_byte_offset) +
+                    static_cast<uint64_t>(b.indirect_pointer_segment_count) *
+                        kIndirectBufferRelocationSegmentBytes;
+                const uint64_t record_directory_end =
+                    static_cast<uint64_t>(b.indirect_pointer_record_directory_byte_offset) +
+                    static_cast<uint64_t>(b.indirect_pointer_record_count) *
+                        kIndirectBufferRelocationRecordBytes;
+                if (!access.valid || access.store || access.bits != 32u ||
+                    access.components != 1u || in.flat_segment != 2u || in.flat_lds ||
+                    in.flat_glc || in.flat_slc || in.flat_dlc ||
+                    in.dst.kind != OperandKind::VGPR || in.dst.value < 0 ||
+                    in.src[0].kind != OperandKind::VGPR ||
+                    in.src[0].value < 0 ||
+                    static_cast<uint32_t>(in.src[0].value) !=
+                        relocated_access->address_vgpr ||
+                    relocated_access->address_vgpr >= 255u ||
+                    in.src[1].kind != OperandKind::Special || in.src[1].value != 125 ||
+                    in.literal != relocated_access->immediate_byte_offset ||
+                    relocated_access->component_bytes != sizeof(uint32_t) ||
+                    relocated_access->components != 1u ||
+                    b.indirect_pointer_proof->schema_version != 1u ||
+                    (!static_footprint && !descriptor_range) ||
+                    b.indirect_pointer_binding == UINT32_MAX ||
+                    b.indirect_pointer_segment_directory_byte_offset % sizeof(uint32_t) != 0u ||
+                    b.indirect_pointer_payload_byte_offset % sizeof(uint32_t) != 0u ||
+                    b.indirect_pointer_carrier_bytes % sizeof(uint32_t) != 0u ||
+                    b.indirect_pointer_carrier_bytes < sizeof(uint32_t) ||
+                    directory_end > b.indirect_pointer_payload_byte_offset ||
+                    b.indirect_pointer_payload_byte_offset >
+                        b.indirect_pointer_carrier_bytes) {
+                    ok = false;
+                    return true;
+                }
+                if (descriptor_range &&
+                    (!b.indirect_pointer_record_count ||
+                     !b.indirect_pointer_source_stride ||
+                     !b.indirect_pointer_source_record_var ||
+                     !b.indirect_pointer_source_root_lo_var ||
+                     !b.indirect_pointer_source_root_hi_var ||
+                     b.indirect_pointer_record_directory_byte_offset % sizeof(uint32_t) != 0u ||
+                     b.indirect_pointer_record_directory_byte_offset <
+                         b.indirect_pointer_source_bytes ||
+                     record_directory_end !=
+                         b.indirect_pointer_segment_directory_byte_offset ||
+                     b.indirect_pointer_proof->source_address_kind !=
+                         IndirectBufferRelocationRecord::SourceAddressKind::
+                             BufferDescriptorBase48)) {
+                    ok = false;
+                    return true;
+                }
+                const int address_vgpr =
+                    static_cast<int>(relocated_access->address_vgpr);
+                const uint32_t address_lo = vreg_old(b, rs, address_vgpr);
+                const uint32_t address_hi = vreg_old(b, rs, address_vgpr + 1);
+                const uint32_t value = descriptor_range
+                    ? b.relocated_indirect_descriptor_load_dword(
+                          address_lo, address_hi,
+                          relocated_access->immediate_byte_offset)
+                    : b.relocated_indirect_load_dword(
+                          address_lo, address_hi,
+                          relocated_access->immediate_byte_offset);
+                const int reg = in.dst.value;
+                const uint32_t old_value = vreg_old(b, rs, reg);
+                rs.vreg[reg] = value;
+                predicate_write(b, rs, reg, old_value);
+                return true;
+            }
             IndirectBufferShadowAccess packed_access{};
             if (b.indirect_buffer_dispatch_validated &&
                 rdna2_gta5_packed_pointer_access(in, packed_access)) {
@@ -12558,6 +13038,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+            const bool indirect_pointer_descriptor_source_candidate =
+                b.indirect_pointer_proof &&
+                rdna2_indirect_pointer_source(*b.indirect_pointer_proof, in);
             // GLC/DLC ordinary loads must observe device-visible writes rather than a cached value;
             // GLC ordinary stores publish through the device cache. Atomics retain their existing
             // Device/AcquireRelease operands and GLC's separate return-pre-op-value contract below.
@@ -12634,6 +13117,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             bool folded_vfetch = false; // by-fetch V# base already includes OFFSET/SOFFSET
             const ShaderResource* resolved_buffer = nullptr;
             bool gta5_selected_sbuffer_consumer = false;
+            bool indirect_pointer_descriptor_source = false;
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
@@ -12782,6 +13266,43 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 sreg_range_written(rs, in.src[1].value, 4), rt->resources.size());
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
+                }
+                if (indirect_pointer_descriptor_source_candidate) {
+                    const bool zero_soffset =
+                        (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                        (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                    const bool exact_source =
+                        b.indirect_pointer_proof->bound_kind ==
+                            IndirectPointerBoundKind::DescriptorRange &&
+                        b.indirect_pointer_proof->guard_kind ==
+                            IndirectPointerGuardKind::None &&
+                        b.indirect_pointer_proof->source_address_kind ==
+                            IndirectBufferRelocationRecord::SourceAddressKind::
+                                BufferDescriptorBase48 &&
+                        in.fmt == Rdna2Format::MUBUF && !is_format && !is_store &&
+                        !is_atomic && !raw_subword && n == 2u && idxen && !offen &&
+                        offset == b.indirect_pointer_proof->pointer_byte_offset &&
+                        zero_soffset && in.dst.kind == OperandKind::VGPR &&
+                        in.dst.value >= 0 &&
+                        static_cast<uint32_t>(in.dst.value) ==
+                            b.indirect_pointer_proof->source_result_vgpr &&
+                        in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 &&
+                        static_cast<uint32_t>(in.src[0].value) ==
+                            b.indirect_pointer_proof->source_record_index_vgpr &&
+                        res->fetch_pc == b.indirect_pointer_proof->source_fetch_pc &&
+                        is_indirect_pointer_relocation_resource(*res) &&
+                        res->binding == b.indirect_pointer_binding &&
+                        res->size == b.indirect_pointer_source_bytes &&
+                        res->stride == b.indirect_pointer_source_stride &&
+                        b.indirect_pointer_source_bytes % sizeof(uint32_t) == 0u &&
+                        b.indirect_pointer_source_record_var &&
+                        b.indirect_pointer_source_root_lo_var &&
+                        b.indirect_pointer_source_root_hi_var;
+                    if (!exact_source) {
+                        ok = false;
+                        return true;
+                    }
+                    indirect_pointer_descriptor_source = true;
                 }
                 if (is_gta5_cf9200_no_backing_marker_candidate(*res)) {
                     const GtaCf9200NoBackingAccess access =
@@ -13105,6 +13626,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // typed, packed, and dynamically addressed component below consumes dwords through this
             // wrapper, so adding another format shape cannot accidentally drop GLC/DLC semantics.
             auto load_dword = [&](uint32_t dword_idx) {
+                if (indirect_pointer_descriptor_source) {
+                    // The relocation carrier appends directories and packed segments after the
+                    // original source table. The guest V# still ends at `source_bytes`; an OOB
+                    // source-record fetch must return zero rather than accidentally reading the
+                    // carrier metadata. Clamp the physical load first because OpSelect does not
+                    // short-circuit it, then select the architectural OOB zero.
+                    const uint32_t in_source = b.ucmp(
+                        Op_ULessThan, dword_idx,
+                        b.uconst(b.indirect_pointer_source_bytes / sizeof(uint32_t)));
+                    const uint32_t safe_idx = b.sel(
+                        in_source, dword_idx, b.uconst(0));
+                    const uint32_t value = b.cbuf_load(
+                        safe_idx, binding, coherent_load);
+                    return b.sel(in_source, value, b.uconst(0));
+                }
                 if (gta5_selected_sbuffer_consumer) {
                     const auto soff = rs.sreg.find(106);
                     if (soff == rs.sreg.end()) {
@@ -13367,6 +13903,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 rs.vreg[d] = value;
                 predicate_write(b, rs, d, old);
+            }
+            if (indirect_pointer_descriptor_source) {
+                const auto root_lo = rs.vreg.find(in.dst.value);
+                const auto word1 = rs.vreg.find(in.dst.value + 1);
+                if (root_lo == rs.vreg.end() || word1 == rs.vreg.end()) {
+                    ok = false;
+                    return true;
+                }
+                b.capture_indirect_pointer_descriptor_source(
+                    val(in.src[0]), root_lo->second, word1->second,
+                    rs.exec_narrowed, rs.exec);
             }
             return true;
         }
@@ -22005,6 +22552,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const bool has_gta5_packed_pointer = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_gta5_packed_pointer_marker_candidate);
+    const bool has_indirect_pointer_relocation = rt &&
+        std::any_of(rt->resources.begin(), rt->resources.end(),
+                    is_indirect_pointer_relocation_marker_candidate);
     const bool has_gta5_cf9200_no_backing = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_gta5_cf9200_no_backing_marker_candidate);
@@ -22025,6 +22575,13 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         return {};
     if (has_gta5_packed_pointer &&
         !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *rt))
+        return {};
+    IndirectPointerRelocationProof indirect_pointer_proof;
+    IndirectBufferRelocationInfo indirect_pointer_info;
+    if (has_indirect_pointer_relocation &&
+        !validate_rdna2_indirect_pointer_relocations(
+            code, dwords, config, *rt,
+            &indirect_pointer_proof, &indirect_pointer_info))
         return {};
     if (has_gta5_cf9200_no_backing &&
         !rdna2_gta5_cf9200_no_backing_dispatch(code, dwords, config, *rt))
@@ -22075,6 +22632,52 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         b.indirect_buffer_atomic_binding = atomic->binding;
         b.indirect_buffer_atomic_byte_offset = kGta5PackedPointerAtomicByteOffset;
     }
+    if (has_indirect_pointer_relocation) {
+        const ShaderResource* relocated = rt->by_fetch_pc(
+            indirect_pointer_proof.source_fetch_pc);
+        const auto& marker = relocated
+            ? relocated->indirect_pointer_relocation
+            : IndirectPointerRelocationBinding{};
+        const uint32_t expected_carrier_version =
+            indirect_pointer_proof.bound_kind ==
+                    IndirectPointerBoundKind::StaticFootprint
+                ? kIndirectPointerStaticFootprintLayout.version
+                : indirect_pointer_proof.bound_kind ==
+                        IndirectPointerBoundKind::DescriptorRange
+                    ? kIndirectPointerDescriptorRangeLayout.version
+                    : 0u;
+        const uint64_t record_directory_offset =
+            static_cast<uint64_t>(indirect_pointer_info.source_bytes) +
+            kIndirectBufferRelocationHeaderBytes;
+        const uint64_t segment_directory_offset = record_directory_offset +
+            static_cast<uint64_t>(indirect_pointer_info.records.size()) *
+                kIndirectBufferRelocationRecordBytes;
+        if (!relocated || !is_indirect_pointer_relocation_resource(*relocated) ||
+            !expected_carrier_version || marker.carrier_version != expected_carrier_version ||
+            marker.record_count != indirect_pointer_info.records.size() ||
+            marker.record_count != indirect_pointer_proof.record_count ||
+            marker.segment_count != indirect_pointer_info.segments.size() ||
+            indirect_pointer_info.source_bytes != relocated->size ||
+            record_directory_offset > UINT32_MAX ||
+            segment_directory_offset > UINT32_MAX ||
+            marker.segment_directory_byte_offset != segment_directory_offset)
+            return {};
+        b.indirect_pointer_proof = &indirect_pointer_proof;
+        b.indirect_pointer_binding = relocated->binding;
+        b.indirect_pointer_source_bytes = indirect_pointer_info.source_bytes;
+        b.indirect_pointer_record_count = marker.record_count;
+        b.indirect_pointer_record_directory_byte_offset =
+            static_cast<uint32_t>(record_directory_offset);
+        b.indirect_pointer_segment_count = marker.segment_count;
+        b.indirect_pointer_segment_directory_byte_offset =
+            marker.segment_directory_byte_offset;
+        b.indirect_pointer_payload_byte_offset =
+            indirect_pointer_info.payload_byte_offset;
+        b.indirect_pointer_carrier_bytes = marker.binding_bytes;
+        b.indirect_pointer_source_stride = indirect_pointer_proof.source_stride;
+        b.indirect_pointer_source_pointer_byte_offset =
+            indirect_pointer_proof.pointer_byte_offset;
+    }
     if (config.lds_bytes) {
         uint32_t dw = (config.lds_bytes + 3) / 4;
         b.lds_dwords = std::min(16384u, std::max(1u, dw));
@@ -22085,14 +22688,15 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
     const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
         barrier_phases.found && !barrier_phases.guarded;
-    const bool gta5_exact_partial_dispatcher = config.exact_thread_extent &&
+    const bool exact_partial_dispatcher = config.exact_thread_extent &&
         has_partial_workgroup && (b.gta5_selected_sbuffer_dispatch_validated ||
-                                  b.indirect_buffer_dispatch_validated);
+                                  b.indirect_buffer_dispatch_validated ||
+                                  has_indirect_pointer_relocation);
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
-    if (partial_barrier_phases || gta5_exact_partial_dispatcher)
+    if (partial_barrier_phases || exact_partial_dispatcher)
         b.native_subgroup_size = 0;
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
@@ -22173,9 +22777,13 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.allow_b32_masks = wave_size == 32;
+    if (has_indirect_pointer_relocation &&
+        indirect_pointer_proof.bound_kind ==
+            IndirectPointerBoundKind::DescriptorRange)
+        b.declare_indirect_pointer_descriptor_capture();
     b.declare_guest_scratch(scratch);
     uint32_t initial_dispatch_active = 0;
-    if (partial_barrier_phases || gta5_exact_partial_dispatcher)
+    if (partial_barrier_phases || exact_partial_dispatcher)
         initial_dispatch_active = b.invocation_within_extent(
             config.threads_x, config.threads_y, config.threads_z);
     else if (config.exact_thread_extent && has_partial_workgroup)
@@ -22224,11 +22832,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
-    // Both exact GTA contracts execute their partial final wave through the CFG dispatcher's ACTIVE
+    // Exact dispatch contracts execute their partial final wave through the CFG dispatcher's ACTIVE
     // bit. Padded Vulkan lanes stay in the dispatcher and its synthesized workgroup barriers, but
     // cannot execute guest memory effects. The full program, launch, and resource proof above is the
     // authority boundary for extending the selected-SBUFFER path to the packed-pointer program.
-    if (gta5_exact_partial_dispatcher && b.uses_barrier)
+    if (exact_partial_dispatcher && b.uses_barrier)
         b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the

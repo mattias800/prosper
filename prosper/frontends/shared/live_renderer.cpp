@@ -4764,7 +4764,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // guest_readable page probes, so it must stay bounded), and make any
                         // truncation that does happen FAIL-VISIBLE. PROSPER_MAX_BUFFER_UPLOAD_MB
                         // lowers the ceiling for a same-build A/B of this exact defect.
-                        const uint32_t requested_bytes = r.size ? r.size : 256u;
+                        const uint32_t requested_bytes = materialization.binding_bytes
+                            ? static_cast<uint32_t>(materialization.binding_bytes) : 256u;
                         uint32_t nb = materialization.zero_padded_tail
                             ? static_cast<uint32_t>(materialization.binding_bytes)
                             : prosper::frontend::buffer_upload_bytes(requested_bytes);

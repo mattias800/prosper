@@ -2,6 +2,8 @@
 
 #include "gpu/gpu_capture.hpp"
 
+#include <algorithm>
+
 namespace prosper::tools {
 
 // gpu_replay has several one-capsule diagnostic modes that return before renderer execution. Keep
@@ -28,6 +30,31 @@ inline bool replay_will_render(const ReplayRenderIntent& intent) {
         (intent.realized_shader_dump || intent.failed_shader_dump ||
          intent.retry_failed_chain || intent.retry_failed_stage);
     return !terminal_one_capsule_diagnostic;
+}
+
+// Exact captures may omit backing for runtime-table candidates that the stored module does not
+// reference. A newer translator is allowed to change the implementation, but it must not enlarge
+// that captured descriptor domain: those newly-live guest bytes are absent by construction. When
+// the stored interface is malformed, capture used its conservative capture-all path, so preserve
+// the historical raw-recompile behavior for old/diagnostic modules.
+inline bool recompiled_compute_preserves_capture_descriptor_domain(
+    const std::vector<uint32_t>& stored_spirv,
+    const std::vector<uint32_t>& recompiled_spirv,
+    const gpu::ShaderResourceTable* resources) {
+    const gpu::DescriptorValidationReport stored =
+        gpu::validate_spirv_descriptor_interface(
+            stored_spirv, resources, 0u, gpu::SpirvShaderStage::Compute, false);
+    if (!gpu::spirv_descriptor_reflection_complete(stored)) return true;
+    const gpu::DescriptorValidationReport recompiled =
+        gpu::validate_spirv_descriptor_interface(
+            recompiled_spirv, resources, 0u, gpu::SpirvShaderStage::Compute, false);
+    if (!recompiled.ok()) return false;
+    return std::all_of(
+        recompiled.descriptors.begin(), recompiled.descriptors.end(),
+        [&](const gpu::SpirvDescriptorBinding& descriptor) {
+            return gpu::find_spirv_descriptor_binding(
+                       stored, descriptor.set, descriptor.binding) != nullptr;
+        });
 }
 
 // Replace one capture v39 compute module with output from the current translator. A rendering
@@ -67,6 +94,9 @@ inline bool recompile_captured_compute(
     std::vector<uint32_t> spirv = gpu::recompile_compute_shader_cached(
         raw.words.data(), raw.words.size(), compute.resources.get(), config, nullptr, diagnostic);
     if (spirv.empty()) return false;
+    if (!recompiled_compute_preserves_capture_descriptor_domain(
+            compute.spirv, spirv, compute.resources.get()))
+        return false;
 
     compute.spirv = std::move(spirv);
     compute.user_sgprs = config.user_sgprs;

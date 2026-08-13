@@ -323,6 +323,47 @@ int main() {
               prosper::gpu::ShaderResource::kDirectVSharpOriginAmbiguous,
           "shader-constructed pixel V# keeps its resource but no fabricated raw SH origin");
 
+    // A scalar S_BUFFER's bound is independent of the ordinary V# byte footprint. Exercise the
+    // graphics build_stage_table mirror with the smallest shape that exposes the difference: four
+    // stride-1 records occupy four vector bytes but permit four scalar dword addresses (16 bytes).
+    // Keeping this on the real stage-table path prevents compute-only metadata from passing tests
+    // while graphics silently stages the short range.
+    alignas(16) static uint32_t narrow_scalar_backing[4] = {
+        0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+    };
+    const uint64_t narrow_scalar_base =
+        reinterpret_cast<uint64_t>(narrow_scalar_backing);
+    uint32_t narrow_scalar_shader[] = {
+        0xBE9803FFu, static_cast<uint32_t>(narrow_scalar_base),
+        0xBE9903FFu,
+        (static_cast<uint32_t>(narrow_scalar_base >> 32) & 0xffffu) | (1u << 16),
+        0xBE9A0384u,                // s_mov_b32 s26, 4 records
+        0xBE9B0380u,                // s_mov_b32 s27, 0
+        0xF428000Cu, 0xFA000000u,   // pc6: s_buffer_load_dwordx4 s[0:3],s[24:27],0
+        0xBF810000u,
+    };
+    Shader narrow_scalar{};
+    narrow_scalar.file_header = 0x34333231u;
+    narrow_scalar.version = 0x18u;
+    narrow_scalar.shader_size = sizeof(narrow_scalar_shader);
+    narrow_scalar.type = 2;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&narrow_scalar),
+                       reinterpret_cast<uint64_t>(narrow_scalar_shader), 0, 0, 0);
+    CHECK(rc == 0 && dst == &narrow_scalar,
+          "stride-1 scalar-buffer shader enters the AGC registry");
+    auto narrow_scalar_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(narrow_scalar_shader), false, 1);
+    const prosper::gpu::ShaderResource* narrow_scalar_resource = narrow_scalar_table
+        ? narrow_scalar_table->by_fetch_pc(6u) : nullptr;
+    CHECK(narrow_scalar_resource && narrow_scalar_resource->size == 4u &&
+              narrow_scalar_resource->stride == 1u &&
+              narrow_scalar_resource->scalar_buffer_dword_count == 4u &&
+              prosper::gpu::shader_resource_buffer_binding_bytes(
+                  *narrow_scalar_resource) == 16u,
+          "graphics stage table carries the independent scalar dword span");
+
     // An exactly-zero T# recovered from a descriptor table is an explicit null sampled image, not
     // a missing resource. Exercise build_stage_table itself: the production fix lives in its dynamic
     // image materialization loop, after resolve_dynamic_fetch has recovered the eight descriptor

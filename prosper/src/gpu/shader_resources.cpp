@@ -1,6 +1,7 @@
 // shader_resources.cpp — see shader_resources.hpp. Pure lookups + format sizing; no Vulkan, no state.
 #include "shader_resources.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_pointer_analysis.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -607,12 +608,56 @@ uint64_t reflection_entry_bytes(const DescriptorReflectionCacheEntry& entry) {
 
 } // namespace
 
+uint64_t shader_resource_buffer_binding_bytes(const ShaderResource& resource) {
+    if (!resource.scalar_buffer_dword_count) return resource.size;
+
+    // This metadata is authority to expose bytes beyond the ordinary V# footprint. Accept only the
+    // normalized shape produced for a real bounded S_BUFFER consumer; a manually-built table or a
+    // hostile capture must not turn an unrelated generic constant-buffer load into zeros/in-bounds
+    // memory by setting one integer.
+    if (resource.cls != ResourceClass::ConstantBuffer || resource.gpu_addr == 0u ||
+        resource.table_index_count != 0u ||
+        (resource.srt_offset == UINT32_MAX && resource.sgpr_base == UINT32_MAX &&
+         resource.fetch_pc == UINT32_MAX))
+        return 0u;
+
+    constexpr uint64_t kMaximumScalarBufferBytes = 0x10000000ull;
+    const uint64_t scalar_bytes =
+        static_cast<uint64_t>(resource.scalar_buffer_dword_count) * sizeof(uint32_t);
+    if (!scalar_bytes || scalar_bytes > kMaximumScalarBufferBytes ||
+        resource.size > kMaximumScalarBufferBytes)
+        return 0u;
+
+    // For strided V#s, size retains the independent vector footprint and therefore authenticates
+    // NUM_RECORDS exactly. STRIDE=0 deliberately ignores NUM_RECORDS for scalar bounds and always
+    // exposes one dword, so its byte-size field cannot provide the same cross-check.
+    if (resource.stride) {
+        if (!resource.size || resource.size % resource.stride != 0u ||
+            resource.size / resource.stride != resource.scalar_buffer_dword_count)
+            return 0u;
+    } else if (resource.scalar_buffer_dword_count != 1u) {
+        return 0u;
+    }
+    return std::max<uint64_t>(resource.size, scalar_bytes);
+}
+
 StorageBufferMaterializationPlan plan_storage_buffer_materialization(
     const SpirvDescriptorBinding& descriptor,
     const ShaderResource& resource) {
     StorageBufferMaterializationPlan plan;
     plan.logical_bytes = resource.size;
     plan.binding_bytes = resource.size;
+
+    if (resource.scalar_buffer_dword_count) {
+        const uint64_t scalar_bytes = shader_resource_buffer_binding_bytes(resource);
+        if (!scalar_bytes || descriptor.kind != SpirvDescriptorKind::StorageBuffer ||
+            !descriptor.readable || descriptor.writable || descriptor.atomic_access)
+            return plan;
+        plan.logical_bytes = scalar_bytes;
+        plan.binding_bytes = scalar_bytes;
+        plan.valid = true;
+        return plan;
+    }
 
     if (is_gta5_packed_pointer_marker_candidate(resource)) {
         if (!is_gta5_packed_pointer_resource(resource) ||
@@ -621,6 +666,18 @@ StorageBufferMaterializationPlan plan_storage_buffer_materialization(
             descriptor.required_bytes > resource.indirect_buffer_binding_bytes)
             return plan;
         plan.binding_bytes = resource.indirect_buffer_binding_bytes;
+        plan.valid = true;
+        return plan;
+    }
+
+    if (is_indirect_pointer_relocation_marker_candidate(resource)) {
+        if (!is_indirect_pointer_relocation_resource(resource) ||
+            descriptor.kind != SpirvDescriptorKind::StorageBuffer ||
+            !descriptor.readable || descriptor.writable || descriptor.atomic_access ||
+            descriptor.required_bytes > resource.indirect_pointer_relocation.binding_bytes)
+            return plan;
+        plan.logical_bytes = resource.indirect_pointer_relocation.binding_bytes;
+        plan.binding_bytes = resource.indirect_pointer_relocation.binding_bytes;
         plan.valid = true;
         return plan;
     }
@@ -679,6 +736,14 @@ bool materialize_storage_buffer_bytes(
 bool DescriptorValidationReport::ok() const {
     for (const auto& issue : issues) if (issue.error) return false;
     return true;
+}
+
+bool spirv_descriptor_reflection_complete(const DescriptorValidationReport& report) {
+    return std::none_of(
+        report.issues.begin(), report.issues.end(),
+        [](const DescriptorValidationIssue& issue) {
+            return issue.code == DescriptorIssueCode::MalformedSpirv;
+        });
 }
 
 const SpirvDescriptorBinding* find_spirv_descriptor_binding(
