@@ -593,6 +593,21 @@ int main() {
     ShaderResource table_indexed = good;
     table_indexed.table_index_count = 8;
     table_indexed.table_entry_stride = 16;
+    table_indexed.table_index_sgpr = 6;
+    table_indexed.table_selector_mode = BufferTableSelectorMode::UserSgprIndex;
+    for (uint32_t index = 0; index < table_indexed.table_index_count; ++index) {
+        ShaderBufferTableEntry entry;
+        entry.gpu_addr = good.gpu_addr + index * 0x100u;
+        entry.size = good.size;
+        entry.stride = good.stride;
+        entry.vsharp = {
+            static_cast<uint32_t>(entry.gpu_addr),
+            static_cast<uint32_t>(entry.gpu_addr >> 32u) | (entry.stride << 16u),
+            entry.size / entry.stride,
+            22u << 12u,
+        };
+        table_indexed.table_entries.push_back(entry);
+    }
     ShaderResourceTable arity; arity.resources.push_back(table_indexed);
     auto arr = validate_spirv_descriptor_interface(spv, &arity, 0, SpirvShaderStage::Vertex);
     CHECK(!arr.ok() && has_issue(arr, DescriptorIssueCode::ArrayBindingArityMismatch),
@@ -636,11 +651,31 @@ int main() {
           "an ordinary non-array binding still reflects exactly one descriptor");
 
     // And the matched pair validates: eight declared against eight supplied raises no arity issue.
-    ShaderResource eight = good; eight.table_index_count = 8; eight.table_entry_stride = 16;
+    ShaderResource eight = table_indexed;
     ShaderResourceTable matched; matched.resources.push_back(eight);
     auto mar = validate_spirv_descriptor_interface(array_spv, &matched, 0, SpirvShaderStage::Vertex);
-    CHECK(!has_issue(mar, DescriptorIssueCode::ArrayBindingArityMismatch),
-          "eight declared descriptors against eight supplied table entries is not an arity mismatch");
+    CHECK(mar.ok(),
+          "eight declared descriptors against eight complete table entries validate");
+
+    ShaderResource missing_payload = eight;
+    missing_payload.table_entries.pop_back();
+    ShaderResourceTable missing_payload_table;
+    missing_payload_table.resources.push_back(missing_payload);
+    const auto missing_payload_report = validate_spirv_descriptor_interface(
+        array_spv, &missing_payload_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!missing_payload_report.ok() &&
+              has_issue(missing_payload_report, DescriptorIssueCode::InvalidBufferMetadata),
+          "a declared array whose concrete payload is short rejects at the runtime boundary");
+
+    ShaderResource stale_raw = eight;
+    stale_raw.table_entries[3].vsharp[2] += 1u;
+    ShaderResourceTable stale_raw_table;
+    stale_raw_table.resources.push_back(stale_raw);
+    const auto stale_raw_report = validate_spirv_descriptor_interface(
+        array_spv, &stale_raw_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!stale_raw_report.ok() &&
+              has_issue(stale_raw_report, DescriptorIssueCode::InvalidBufferMetadata),
+          "an entry whose normalized byte span disagrees with its raw V# rejects");
 
     // An UNREADABLE array length is its own value, not folded onto 0 (which means OpTypeRuntimeArray and
     // is treated as compatible with any table size). Reported as a review finding on #2463: collapsing

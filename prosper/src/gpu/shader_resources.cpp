@@ -173,6 +173,61 @@ void unorm2_10_10_10_to_rgba8(uint32_t packed, uint8_t rgba[4]) {
     rgba[3] = (uint8_t)(((packed >> 30) & 0x3u) * 85u);
 }
 
+bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
+    constexpr uint32_t kMaxDescriptorArrayEntries = 4096u;
+    const bool array = resource.table_index_count != 0u;
+    if (!array) {
+        return resource.table_entry_stride == 0u &&
+               resource.table_index_sgpr == UINT32_MAX &&
+               resource.table_entries.empty() &&
+               resource.table_selector_mode == BufferTableSelectorMode::None &&
+               resource.table_load_pc == UINT32_MAX;
+    }
+    if ((resource.cls != ResourceClass::ConstantBuffer &&
+         resource.cls != ResourceClass::VertexBuffer) ||
+        resource.table_index_count > kMaxDescriptorArrayEntries ||
+        resource.table_entries.size() != resource.table_index_count ||
+        resource.table_entry_stride < 16u || (resource.table_entry_stride & 3u))
+        return false;
+
+    switch (resource.table_selector_mode) {
+        case BufferTableSelectorMode::UserSgprIndex:
+            if (resource.table_index_sgpr == UINT32_MAX ||
+                resource.table_load_pc != UINT32_MAX)
+                return false;
+            break;
+        case BufferTableSelectorMode::DynamicSbufferByteOffset:
+            if (resource.table_index_sgpr != UINT32_MAX ||
+                resource.table_load_pc == UINT32_MAX)
+                return false;
+            break;
+        case BufferTableSelectorMode::None:
+        default:
+            return false;
+    }
+
+    for (const ShaderBufferTableEntry& entry : resource.table_entries) {
+        const uint64_t decoded_addr =
+            (static_cast<uint64_t>(entry.vsharp[0]) |
+             (static_cast<uint64_t>(entry.vsharp[1]) << 32u)) &
+            0x0000FFFFFFFFFFFFull;
+        const uint32_t decoded_stride = (entry.vsharp[1] >> 16u) & 0x3fffu;
+        const uint64_t decoded_size64 = decoded_stride
+            ? static_cast<uint64_t>(entry.vsharp[2]) * decoded_stride
+            : static_cast<uint64_t>(entry.vsharp[2]);
+        const uint32_t decoded_size = decoded_size64 > UINT32_MAX
+            ? UINT32_MAX : static_cast<uint32_t>(decoded_size64);
+        // Conventional buffer descriptors use TYPE=0. Keeping that input word beside the normalized
+        // values is useful only if the two representations are checked independently here.
+        if ((entry.vsharp[3] >> 28u) != 0u || entry.gpu_addr != decoded_addr ||
+            entry.stride != decoded_stride || entry.size != decoded_size ||
+            (!entry.host_data && entry.host_data_size != 0u) ||
+            (entry.host_data && entry.host_data_size < entry.size))
+            return false;
+    }
+    return true;
+}
+
 const ShaderResource* ShaderResourceTable::by_srt_offset(uint32_t srt_offset) const {
     if (srt_offset == 0xFFFFFFFFu) return nullptr;
     for (const auto& r : resources) if (r.srt_offset == srt_offset) return &r;
@@ -1176,6 +1231,67 @@ DescriptorValidationReport validate_spirv_descriptor_interface(
             arity.shader_count = shader_count;
             arity.runtime_count = runtime_count;
             report.issues.push_back(arity);
+            continue;
+        }
+        if (!valid_shader_buffer_table_contract(r)) {
+            report.issues.push_back({DescriptorIssueCode::InvalidBufferMetadata, true, d.set,
+                                     d.binding, d.kind, actual});
+            continue;
+        }
+        if (runtime_is_array) {
+            // Every array slot is a separate V# and therefore a separate byte-range promise. The
+            // parent ShaderResource describes the binding, not an arbitrary representative entry;
+            // validating only its legacy scalar address would leave all other selected slots unchecked.
+            bool invalid_address = false;
+            bool invalid_metadata = d.kind != SpirvDescriptorKind::StorageBuffer;
+            bool undersized = false;
+            uint64_t smallest_available = UINT64_MAX;
+            for (const ShaderBufferTableEntry& table_entry : r.table_entries) {
+                const bool null_entry = table_entry.gpu_addr == 0u && table_entry.size == 0u &&
+                                        table_entry.host_data == nullptr;
+                if (!null_entry && table_entry.gpu_addr == 0u && !table_entry.host_data) {
+                    invalid_address = true;
+                    break;
+                }
+                ShaderResource entry_resource = r;
+                entry_resource.gpu_addr = table_entry.gpu_addr;
+                entry_resource.size = table_entry.size;
+                entry_resource.stride = table_entry.stride;
+                entry_resource.host_data = table_entry.host_data;
+                entry_resource.host_data_size = table_entry.host_data_size;
+                entry_resource.table_index_count = 0u;
+                entry_resource.table_entry_stride = 0u;
+                entry_resource.table_index_sgpr = UINT32_MAX;
+                entry_resource.table_selector_mode = BufferTableSelectorMode::None;
+                entry_resource.table_load_pc = UINT32_MAX;
+                entry_resource.table_entries.clear();
+                const StorageBufferMaterializationPlan materialization =
+                    plan_storage_buffer_materialization(d, entry_resource);
+                if (!materialization.valid) {
+                    invalid_metadata = true;
+                    break;
+                }
+                const uint64_t minimum = materialization.zero_padded_tail
+                    ? materialization.logical_bytes
+                    : std::max<uint64_t>(d.required_bytes, 4u);
+                uint64_t available = materialization.binding_bytes;
+                if (table_entry.host_data)
+                    available = std::min<uint64_t>(available, table_entry.host_data_size);
+                smallest_available = std::min(smallest_available, available);
+                if (!null_entry && available < minimum) undersized = true;
+            }
+            if (invalid_address)
+                report.issues.push_back({DescriptorIssueCode::InvalidAddress, true, d.set,
+                                         d.binding, d.kind, actual});
+            else if (invalid_metadata)
+                report.issues.push_back({DescriptorIssueCode::InvalidBufferMetadata, true, d.set,
+                                         d.binding, d.kind, actual});
+            else if (undersized)
+                report.issues.push_back({DescriptorIssueCode::UndersizedBuffer, true, d.set,
+                                         d.binding, d.kind, actual,
+                                         std::max<uint64_t>(d.required_bytes, 4u),
+                                         smallest_available == UINT64_MAX ? 0u
+                                                                         : smallest_available});
             continue;
         }
         // Explicit null descriptors are valid guest state: resource reads return zero and the backend

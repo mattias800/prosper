@@ -79,29 +79,65 @@ uint64_t resource_size(const ShaderResource& resource) {
     return 0;
 }
 
-void append_accesses(const ShaderResourceTable* table, const char* stage,
-                     std::vector<GpuDependencyAccess>& accesses) {
-    if (!table) return;
+bool append_accesses(const ShaderResourceTable* table, const char* stage,
+                     std::vector<GpuDependencyAccess>& accesses,
+                     std::string& error) {
+    if (!table) return true;
     for (const auto& resource : table->resources) {
+        if (!valid_shader_buffer_table_contract(resource)) {
+            error = "resource has an invalid buffer descriptor-table dependency contract";
+            return false;
+        }
+        if (resource.table_index_count) {
+            for (const ShaderBufferTableEntry& entry : resource.table_entries) {
+                const uint64_t size = entry.size;
+                if (!entry.gpu_addr || !size) continue;
+                accesses.push_back({entry.gpu_addr, size, 0, 0, resource.binding,
+                                    resource.cls, stage, resource.format,
+                                    resource.num_components, resource.srgb});
+            }
+            continue;
+        }
         const uint64_t size = resource_size(resource);
         if (!resource.gpu_addr || !size || resource.cls == ResourceClass::Sampler) continue;
         accesses.push_back({resource.gpu_addr, size, resource.width, resource.height,
                             resource.binding, resource.cls, stage, resource.format,
                             resource.num_components, resource.srgb});
     }
+    return true;
 }
 
-void append_compute_accesses(const ComputeItem& compute,
+bool append_compute_accesses(const ComputeItem& compute,
                              std::vector<GpuDependencyAccess>& reads,
-                             std::vector<Writer>& writes) {
+                             std::vector<Writer>& writes,
+                             std::string& error) {
     const ShaderResourceTable* table = compute.resources.get();
-    if (!table) return;
+    if (!table) return true;
+    for (const ShaderResource& resource : table->resources) {
+        if (!valid_shader_buffer_table_contract(resource)) {
+            error = "resource has an invalid buffer descriptor-table dependency contract";
+            return false;
+        }
+    }
     const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
         compute.spirv, table, 0, SpirvShaderStage::Compute, false);
     if (!compute.spirv.empty() && reflected.ok()) {
         for (const auto& descriptor : reflected.descriptors) {
             const ShaderResource* resource = table->by_binding(descriptor.binding);
             if (!resource) continue;  // reflected.ok() normally makes this unreachable
+            if (resource->table_index_count) {
+                for (const ShaderBufferTableEntry& entry : resource->table_entries) {
+                    const uint64_t size = entry.size;
+                    if (!entry.gpu_addr || !size) continue;
+                    if (descriptor.readable)
+                        reads.push_back({entry.gpu_addr, size, 0, 0, resource->binding,
+                                         resource->cls, "cs", resource->format,
+                                         resource->num_components, resource->srgb});
+                    if (descriptor.writable)
+                        writes.push_back({0, entry.gpu_addr, size, 0, 0, false});
+                }
+                continue;
+            }
             const uint64_t size = resource_size(*resource);
             if (!resource->gpu_addr || !size) continue;
             if (descriptor.readable)
@@ -113,15 +149,16 @@ void append_compute_accesses(const ComputeItem& compute,
                                   resource->height,
                                   resource->cls == ResourceClass::StorageImage});
         }
-        return;
+        return true;
     }
 
     // Hand-built fixtures and legacy diagnostic captures may not carry a reflectable module.
     // Preserve their historical conservative graph instead of hiding every resource.
-    append_accesses(table, "cs", reads);
+    if (!append_accesses(table, "cs", reads, error)) return false;
     for (const auto& access : reads)
         writes.push_back({0, access.addr, access.size, access.width, access.height,
                           access.resource_class == ResourceClass::StorageImage});
+    return true;
 }
 
 } // namespace
@@ -214,8 +251,9 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                 }
                 append_target(destination.base, destination.width, destination.height, 0xf);
             } else {
-                append_accesses(draw.vrt.get(), "vs", reads);
-                append_accesses(draw.prt.get(), "ps", reads);
+                if (!append_accesses(draw.vrt.get(), "vs", reads, error) ||
+                    !append_accesses(draw.prt.get(), "ps", reads, error))
+                    return false;
                 for (size_t slot = 0; slot < draw.color_targets.size(); ++slot) {
                     const auto target = color_binding(slot);
                     append_target(target.base, target.width, target.height,
@@ -232,7 +270,7 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                 error = "realized dispatch operation has no materialized item";
                 return false;
             }
-            append_compute_accesses(*it->second, reads, writes);
+            if (!append_compute_accesses(*it->second, reads, writes, error)) return false;
         } else {
             if (operation.source_index >= replay.dma_copies.size()) {
                 error = "realized DMA operation has no materialized copy";

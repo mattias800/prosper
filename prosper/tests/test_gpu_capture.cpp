@@ -425,14 +425,30 @@ int main(int argc, char** argv) {
     auto v49_tail = [&](const GpuCaptureFile& f) -> size_t {
         return 4u + (resource_bool_tail(f) - 4u) * sizeof(uint32_t);
     };
-    auto v50_tail = [](const GpuCaptureFile& f) -> size_t {
+    auto v52_tail = [](const GpuCaptureFile& f) -> size_t {
+        size_t resources = 0;
+        size_t entries = 0;
+        auto add = [&](const GpuCapturedTable& table) {
+            resources += table.resources.size();
+            for (const auto& resource : table.resources)
+                entries += resource.resource.table_entries.size();
+        };
+        for (const auto& draw : f.draws) { add(draw.vrt); add(draw.prt); }
+        for (const auto& compute : f.computes) add(compute.resources);
+        for (const auto& diagnostic : f.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages) add(stage.resource_table);
+        return 4u + resources * 24u + entries * 44u;
+    };
+    // Every fixture that truncates "the v50 tail" is recovering a pre-v50 prefix from a CURRENT
+    // file. Include the later v52 suffix here so the existing downgrade arithmetic stays exact.
+    auto v50_tail = [&](const GpuCaptureFile& f) -> size_t {
         size_t configs = 0;
         for (const auto& compute : f.computes)
             configs += compute.recompile_config_available;
         for (const auto& diagnostic : f.failure_diagnostics)
             for (const auto& stage : diagnostic.stages)
                 configs += stage.recompile_config_available;
-        return 4u + configs * sizeof(uint32_t);
+        return 4u + configs * sizeof(uint32_t) + v52_tail(f);
     };
 
     // The fixed v46 tail is 4 bytes of count plus 100 bytes per selected witness. Mutate the
@@ -733,6 +749,113 @@ int main(int argc, char** argv) {
               scalar_capture.computes.size() == 1 &&
               scalar_capture.computes[0].resources.resources.empty(),
           "#636: capture ignores unconsumed descriptor-looking scalar arguments");
+
+    // v52: a runtime-selected buffer binding owns one independently captured backing per raw V#.
+    // Keep the two ranges disjoint so this proves parallel blob references, not only the merged-range
+    // behavior already covered by the scalar resources above.
+    auto descriptor_array_table = std::make_shared<ShaderResourceTable>();
+    ShaderResource descriptor_array;
+    descriptor_array.cls = ResourceClass::ConstantBuffer;
+    descriptor_array.format = DataFormat::Uint32;
+    descriptor_array.num_components = 1;
+    descriptor_array.binding = 2;
+    descriptor_array.table_index_count = 2;
+    descriptor_array.table_entry_stride = 120;
+    descriptor_array.table_selector_mode =
+        BufferTableSelectorMode::DynamicSbufferByteOffset;
+    descriptor_array.table_load_pc = 202;
+    for (uint64_t address : {0x1000ull, 0x1010ull}) {
+        ShaderBufferTableEntry entry;
+        entry.gpu_addr = address;
+        entry.size = 8;
+        entry.stride = 4;
+        entry.vsharp = {
+            static_cast<uint32_t>(address),
+            static_cast<uint32_t>(address >> 32u) | (entry.stride << 16u),
+            2u,
+            0x00016204u,
+        };
+        descriptor_array.table_entries.push_back(entry);
+    }
+    descriptor_array_table->resources.push_back(descriptor_array);
+    ComputeItem descriptor_array_compute;
+    descriptor_array_compute.spirv = {0x07230203u};
+    descriptor_array_compute.resources = descriptor_array_table;
+    descriptor_array_compute.dispatch_index = 912;
+    descriptor_array_compute.command_order = 912;
+    const std::vector<SubmitOperation> descriptor_array_operations = {
+        {SubmitOperationKind::Dispatch, 912, 912},
+    };
+    GpuCaptureFile descriptor_array_capture;
+    CHECK(capture_submit_items({}, {descriptor_array_compute}, descriptor_array_operations,
+                               meta, reader, descriptor_array_capture, error) &&
+              descriptor_array_capture.blobs.size() == 2 &&
+              descriptor_array_capture.computes[0].resources.resources[0]
+                      .table_entry_blobs.size() == 2,
+          "descriptor-array capture retains one exact backing reference per V#");
+    std::vector<uint8_t> descriptor_array_bytes;
+    GpuCaptureFile descriptor_array_loaded;
+    GpuReplayFrame descriptor_array_replay;
+    CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
+              deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
+              descriptor_array_loaded.format_version == 52 &&
+              materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
+              descriptor_array_replay.computes.size() == 1 &&
+              descriptor_array_replay.computes[0].resources &&
+              descriptor_array_replay.computes[0].resources->resources.size() == 1,
+          "v52 descriptor-array metadata and backing materialize through standalone replay");
+    const ShaderResource* replay_array = descriptor_array_replay.computes.empty() ||
+            !descriptor_array_replay.computes[0].resources
+        ? nullptr : &descriptor_array_replay.computes[0].resources->resources[0];
+    CHECK(replay_array && replay_array->table_index_count == 2 &&
+              replay_array->table_selector_mode ==
+                  BufferTableSelectorMode::DynamicSbufferByteOffset &&
+              replay_array->table_load_pc == 202 &&
+              replay_array->table_entries[0].host_data &&
+              replay_array->table_entries[1].host_data &&
+              replay_array->table_entries[0].host_data[0] == memory[0] &&
+              replay_array->table_entries[1].host_data[0] == memory[16],
+          "replay preserves selector identity and maps each table entry to its captured bytes");
+
+    ComputeItem short_descriptor_array = descriptor_array_compute;
+    short_descriptor_array.resources = std::make_shared<ShaderResourceTable>(
+        *descriptor_array_compute.resources);
+    short_descriptor_array.resources->resources[0].table_entries.pop_back();
+    GpuCaptureFile rejected_descriptor_array;
+    CHECK(!capture_submit_items({}, {short_descriptor_array}, descriptor_array_operations,
+                                meta, reader, rejected_descriptor_array, error) &&
+              error == "resource has an invalid buffer descriptor-table contract",
+          "same-resource mutation: capture rejects a payload shorter than its declared arity");
+
+    const size_t descriptor_array_v52_tail = v52_tail(descriptor_array_capture);
+    std::vector<uint8_t> malformed_descriptor_array = descriptor_array_bytes;
+    if (malformed_descriptor_array.size() >= descriptor_array_v52_tail + 28u) {
+        const size_t entry_count_offset =
+            malformed_descriptor_array.size() - descriptor_array_v52_tail + 24u;
+        malformed_descriptor_array[entry_count_offset] = 1u;
+        malformed_descriptor_array[entry_count_offset + 1u] = 0u;
+        malformed_descriptor_array[entry_count_offset + 2u] = 0u;
+        malformed_descriptor_array[entry_count_offset + 3u] = 0u;
+    }
+    CHECK(!deserialize_gpu_capture(malformed_descriptor_array,
+                                   descriptor_array_loaded, error) &&
+              error == "invalid captured buffer descriptor-table state",
+          "v52 reader rejects an entry count that disagrees with the declared arity");
+
+    std::vector<uint8_t> legacy_scalar_array = descriptor_array_bytes;
+    if (legacy_scalar_array.size() >= descriptor_array_v52_tail + 12u) {
+        legacy_scalar_array.resize(legacy_scalar_array.size() - descriptor_array_v52_tail);
+        legacy_scalar_array[8] = 51u;
+        legacy_scalar_array[9] = legacy_scalar_array[10] = legacy_scalar_array[11] = 0u;
+    }
+    GpuCaptureFile legacy_scalar_array_loaded;
+    CHECK(deserialize_gpu_capture(legacy_scalar_array, legacy_scalar_array_loaded, error) &&
+              legacy_scalar_array_loaded.format_version == 51 &&
+              legacy_scalar_array_loaded.computes[0].resources.resources[0]
+                      .resource.table_index_count == 0 &&
+              legacy_scalar_array_loaded.computes[0].resources.resources[0]
+                      .resource.table_entries.empty(),
+          "v51 and older prefixes reopen with the historical scalar resource contract");
 
     // v29 (#1349): byte length of the depth-bias tail (u8 enable + three u32 per pipeline).
     auto v29_tail = [](const GpuCaptureFile& f) -> size_t {
@@ -1052,7 +1175,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 51 &&
+              msaa_loaded.format_version == 52 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1166,7 +1289,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 51 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 52 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1177,7 +1300,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 51 &&
+              video_loaded.format_version == 52 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1220,7 +1343,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 51 &&
+              upgraded_video.format_version == 52 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1302,7 +1425,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 51 &&
+              array_layout_loaded.format_version == 52 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -2822,7 +2945,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 51 &&
+              failed_compute_loaded.format_version == 52 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3061,7 +3184,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 51 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 52 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -3347,9 +3470,9 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 52;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 53;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 52",
+          error == "unsupported capture version 53",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

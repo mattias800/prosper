@@ -144,6 +144,15 @@ struct GpuCapturedResource {
     // GPU-internal resources have no guest address. Capture their initial contents explicitly;
     // ordered replay materializes one shared instance so mutations remain visible to later work.
     std::vector<uint8_t> internal_bytes;
+
+    struct BufferTableEntryBlob {
+        uint32_t blob_index = 0xFFFFFFFFu;
+        uint64_t blob_offset = 0;
+    };
+    // Capture-blob references parallel to ShaderResource::table_entries. The descriptor words and
+    // normalized identity remain in ShaderResource; these records bind each entry to its own exact
+    // pre-submit backing without putting capture-only indices into the live resource contract.
+    std::vector<BufferTableEntryBlob> table_entry_blobs;
 };
 
 struct GpuCapturedTable {

@@ -122,7 +122,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // and LDS atomics consume its denormal mode; older artifacts leave the state explicitly unknown.
 // v51 (#2481): internal resource bytes may also carry GTA V's exact pc26 packed-pointer shadow.
 // Unlike shared GDS state, every dispatch owns a distinct snapshot even when bindings coincide.
-constexpr uint32_t kVersion = 51;
+// v52: retain the complete generic runtime-selected buffer descriptor-array contract. Each resource
+// carries its declared arity/selector and every raw V# plus a separate captured backing reference;
+// the legacy resource prefix stays byte-exact.
+constexpr uint32_t kVersion = 52;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -799,7 +802,25 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     auto add_table = [&](const ShaderResourceTable* t) -> bool {
         if (!t) return true;
         for (const auto& r : t->resources) {
+            if (!valid_shader_buffer_table_contract(r)) {
+                error = "resource has an invalid buffer descriptor-table contract";
+                return false;
+            }
             if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r)) continue;
+            if (r.table_index_count) {
+                for (const ShaderBufferTableEntry& entry : r.table_entries) {
+                    const uint64_t n = entry.size;
+                    if (!n) continue;
+                    if (n > max_blob_bytes() || !entry.gpu_addr ||
+                        entry.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
+                        error = "buffer descriptor-table entry capture range is invalid or exceeds "
+                                "the per-resource ceiling";
+                        return false;
+                    }
+                    intervals.push_back({entry.gpu_addr, entry.gpu_addr + n});
+                }
+                continue;
+            }
             uint64_t n = resource_footprint(r);
             if (n) {
                 if (n > max_blob_bytes() || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
@@ -903,12 +924,34 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
+        if (!valid_shader_buffer_table_contract(r)) {
+            error = "resource has an invalid buffer descriptor-table contract";
+            return false;
+        }
         if (!allow_packed_pointer && is_gta5_packed_pointer_marker_candidate(r)) {
             error = "packed-pointer state is only valid for a compute dispatch";
             return false;
         }
         GpuCapturedResource c;
         c.resource = r;
+        if (r.table_index_count) {
+            c.table_entry_blobs.resize(r.table_entries.size());
+            for (size_t index = 0; index < r.table_entries.size(); ++index) {
+                const ShaderBufferTableEntry& source = r.table_entries[index];
+                ShaderBufferTableEntry& captured = c.resource.table_entries[index];
+                captured.host_data = nullptr;
+                captured.host_data_size = 0;
+                if (source.size && include_resource_data &&
+                    !assign_blob_range(intervals, source.gpu_addr, source.size,
+                                       c.table_entry_blobs[index].blob_index,
+                                       c.table_entry_blobs[index].blob_offset,
+                                       "buffer descriptor-table entry was not assigned to a capture blob",
+                                       error))
+                    return false;
+            }
+            dst.resources.push_back(std::move(c));
+            continue;
+        }
         if (r.cls == ResourceClass::Texture &&
             (r.img_dim == 1u || (r.img_dim == 5u && r.layer_stride_bytes)) &&
             r.tile_mode == static_cast<uint32_t>(TileMode::Linear) &&
@@ -3134,6 +3177,56 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const auto& stage : diagnostic.stages)
             if (stage.recompile_config_available)
                 w.u32(stage.recompile_config.compute_pgm_rsrc1);
+    // v52 appends the complete buffer descriptor-array payload. The base resource record remains
+    // byte-identical for every prior version; old captures therefore reopen as ordinary scalar
+    // resources, while a v52 file must carry one concrete V# and backing reference per declared slot.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_buffer_tables = [&](const GpuCapturedTable& table) {
+        for (const GpuCapturedResource& captured : table.resources) {
+            const ShaderResource& resource = captured.resource;
+            if (!valid_shader_buffer_table_contract(resource) ||
+                (resource.table_index_count == 0u && !captured.table_entry_blobs.empty()) ||
+                (resource.table_index_count != 0u &&
+                 captured.table_entry_blobs.size() != resource.table_entries.size())) {
+                error = "invalid captured buffer descriptor-table contract";
+                return false;
+            }
+            w.u32(resource.table_index_count);
+            w.u32(resource.table_entry_stride);
+            w.u32(resource.table_index_sgpr);
+            w.u32(static_cast<uint32_t>(resource.table_selector_mode));
+            w.u32(resource.table_load_pc);
+            w.u32(static_cast<uint32_t>(resource.table_entries.size()));
+            for (size_t index = 0; index < resource.table_entries.size(); ++index) {
+                const ShaderBufferTableEntry& entry = resource.table_entries[index];
+                const auto& backing = captured.table_entry_blobs[index];
+                if ((backing.blob_index == UINT32_MAX && backing.blob_offset != 0u) ||
+                    (backing.blob_index != UINT32_MAX &&
+                     (backing.blob_index >= c.blobs.size() ||
+                      (!capture_blob_payload_omitted(c.blobs[backing.blob_index]) &&
+                       (backing.blob_offset > c.blobs[backing.blob_index].bytes.size() ||
+                        entry.size > c.blobs[backing.blob_index].bytes.size() -
+                                         backing.blob_offset))))) {
+                    error = "invalid captured buffer descriptor-table backing";
+                    return false;
+                }
+                for (const uint32_t word : entry.vsharp) w.u32(word);
+                w.u64(entry.gpu_addr);
+                w.u32(entry.size);
+                w.u32(entry.stride);
+                w.u32(backing.blob_index);
+                w.u64(backing.blob_offset);
+            }
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_buffer_tables(draw.vrt) || !write_buffer_tables(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_buffer_tables(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_buffer_tables(stage.resource_table)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -4389,6 +4482,76 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     !r.u32(stage.recompile_config.compute_pgm_rsrc1))
                     return false;
     }
+    if (version >= 52) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid buffer descriptor-table resource count";
+            return false;
+        }
+        auto read_buffer_tables = [&](GpuCapturedTable& table) {
+            for (GpuCapturedResource& captured : table.resources) {
+                ShaderResource& resource = captured.resource;
+                uint32_t selector_mode = 0;
+                uint32_t entry_count = 0;
+                if (!r.u32(resource.table_index_count) ||
+                    !r.u32(resource.table_entry_stride) ||
+                    !r.u32(resource.table_index_sgpr) || !r.u32(selector_mode) ||
+                    selector_mode > static_cast<uint32_t>(
+                        BufferTableSelectorMode::DynamicSbufferByteOffset) ||
+                    !r.u32(resource.table_load_pc) || !r.u32(entry_count) ||
+                    entry_count > 4096u || entry_count != resource.table_index_count)
+                    return false;
+                resource.table_selector_mode =
+                    static_cast<BufferTableSelectorMode>(selector_mode);
+                resource.table_entries.resize(entry_count);
+                captured.table_entry_blobs.resize(entry_count);
+                for (uint32_t index = 0; index < entry_count; ++index) {
+                    ShaderBufferTableEntry& entry = resource.table_entries[index];
+                    auto& backing = captured.table_entry_blobs[index];
+                    for (uint32_t& word : entry.vsharp)
+                        if (!r.u32(word)) return false;
+                    if (!r.u64(entry.gpu_addr) || !r.u32(entry.size) ||
+                        !r.u32(entry.stride) || !r.u32(backing.blob_index) ||
+                        !r.u64(backing.blob_offset))
+                        return false;
+                    if ((backing.blob_index == UINT32_MAX && backing.blob_offset != 0u) ||
+                        (backing.blob_index != UINT32_MAX &&
+                         (backing.blob_index >= c.blobs.size() ||
+                          (!capture_blob_payload_omitted(c.blobs[backing.blob_index]) &&
+                           (backing.blob_offset > c.blobs[backing.blob_index].bytes.size() ||
+                            entry.size > c.blobs[backing.blob_index].bytes.size() -
+                                             backing.blob_offset)))))
+                        return false;
+                }
+                if (!valid_shader_buffer_table_contract(resource)) return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_buffer_tables(draw.vrt) || !read_buffer_tables(draw.prt)) {
+                error = "invalid captured buffer descriptor-table state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_buffer_tables(compute.resources)) {
+                error = "invalid captured buffer descriptor-table state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_buffer_tables(stage.resource_table)) {
+                    error = "invalid captured buffer descriptor-table state";
+                    return false;
+                }
+    }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)
         restore_legacy_color_target_aliases(diagnostic);
@@ -4413,9 +4576,12 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
     size_t resource_reference_count = 0;
     for (const auto& draw : c.draws)
-        resource_reference_count += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const GpuCapturedTable* table : {&draw.vrt, &draw.prt})
+            for (const auto& resource : table->resources)
+                resource_reference_count += 1u + resource.resource.table_entries.size();
     for (const auto& compute : c.computes)
-        resource_reference_count += compute.resources.resources.size();
+        for (const auto& resource : compute.resources.resources)
+            resource_reference_count += 1u + resource.resource.table_entries.size();
     resource_reference_count += c.dma_copies.size() * 2;
     out.resource_instances.reserve(resource_reference_count * 2);
     std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
@@ -4447,6 +4613,30 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         dst = std::make_shared<ShaderResourceTable>();
         for (const auto& x : src.resources) {
             ShaderResource r = x.resource; r.host_data = nullptr; r.host_data_size = 0;
+            for (ShaderBufferTableEntry& entry : r.table_entries) {
+                entry.host_data = nullptr;
+                entry.host_data_size = 0;
+            }
+            if (r.table_index_count) {
+                if (!valid_shader_buffer_table_contract(r) ||
+                    x.table_entry_blobs.size() != r.table_entries.size()) {
+                    error = "invalid buffer descriptor-table replay contract";
+                    return false;
+                }
+                for (size_t index = 0; index < r.table_entries.size(); ++index) {
+                    ShaderBufferTableEntry& entry = r.table_entries[index];
+                    const auto& backing = x.table_entry_blobs[index];
+                    if (!bind_range(
+                            backing.blob_index, backing.blob_offset, entry.gpu_addr,
+                            entry.size, entry.host_data, entry.host_data_size,
+                            "buffer descriptor-table entry references an invalid capture blob",
+                            "buffer descriptor-table entry exceeds its capture blob",
+                            "buffer descriptor-table entry blob offset exceeds its logical address"))
+                        return false;
+                }
+                dst->resources.push_back(std::move(r));
+                continue;
+            }
             const uint64_t captured_footprint = x.captured_size ? x.captured_size
                 : (c.format_version >= 28 ? resource_footprint(r) : legacy_resource_footprint(r));
             // v1-v27 captured linear images tightly. Preserve that bounded backing so old files stay
