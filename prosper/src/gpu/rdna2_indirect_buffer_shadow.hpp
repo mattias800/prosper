@@ -35,11 +35,15 @@ struct IndirectBufferShadowAccess {
     uint32_t components = 0;
 };
 
-// Version-2 relocation shadows preserve the source bytes verbatim. Each proven source record names
-// one bounded guest interval; overlapping intervals are normalized into disjoint packed segments.
+// Relocation shadows preserve the source bytes verbatim. Each proven source record names one
+// bounded guest interval; overlapping intervals are normalized into disjoint packed segments.
 // Each segment starts at a dword boundary and its exact bytes are followed by deterministic zero
 // padding to the next boundary. Padding is physical SSBO safety for an unaligned final dword; it is
 // never included in the segment's guest interval or record authority.
+//
+// Version 2 stores only literal 64-bit pointers and keeps the final record dword reserved/zero.
+// Version 3 types that dword so a record can derive the address from an RDNA2 buffer descriptor's
+// Base48 fields without rewriting the descriptor bytes.
 // The translated shader keeps computing the original guest address and relocates only at a proven
 // GLOBAL consumer, so guest pointer arithmetic (including high-word canonicalization) stays intact.
 struct IndirectBufferRelocationLayout {
@@ -52,9 +56,15 @@ struct IndirectBufferRelocationLayout {
 };
 
 struct IndirectBufferRelocationRecord {
+    enum class SourceAddressKind : uint32_t {
+        RawU64 = 0,
+        BufferDescriptorBase48 = 1,
+    };
+
     uint32_t source_byte_offset = 0;
     uint64_t guest_address = 0;
     uint32_t byte_count = 0;
+    SourceAddressKind source_address_kind = SourceAddressKind::RawU64;
 
     bool operator==(const IndirectBufferRelocationRecord&) const = default;
 };

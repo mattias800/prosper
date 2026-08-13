@@ -47,11 +47,54 @@ bool align_relocation_payload(uint32_t value, uint32_t& aligned) {
 bool relocation_layout_valid(const ShaderResource& source,
                              const IndirectBufferRelocationLayout& layout,
                              size_t record_count) {
-    return layout.tag && layout.version == 2u && layout.max_records &&
+    return layout.tag && (layout.version == 2u || layout.version == 3u) &&
+           layout.max_records &&
            layout.max_segments && layout.max_binding_bytes &&
            record_count && record_count <= layout.max_records &&
            source.size && source.size <= UINT32_MAX &&
            source.size % kRelocationPayloadAlignment == 0u;
+}
+
+bool relocation_source_address(
+        const uint8_t* source_bytes, const ShaderResource& source,
+        uint32_t source_byte_offset,
+        IndirectBufferRelocationRecord::SourceAddressKind kind,
+        uint64_t& guest_address) {
+    guest_address = 0;
+    if (!source_bytes || source_byte_offset > source.size ||
+        sizeof(uint64_t) > source.size - source_byte_offset)
+        return false;
+    switch (kind) {
+    case IndirectBufferRelocationRecord::SourceAddressKind::RawU64:
+        guest_address = load_u64(source_bytes, source_byte_offset);
+        return true;
+    case IndirectBufferRelocationRecord::SourceAddressKind::BufferDescriptorBase48: {
+        if (source_byte_offset % sizeof(uint32_t) != 0u) return false;
+        const uint32_t word0 = load_u32(source_bytes, source_byte_offset);
+        const uint32_t word1 = load_u32(source_bytes, source_byte_offset + sizeof(uint32_t));
+        guest_address = static_cast<uint64_t>(word0) |
+            (static_cast<uint64_t>(word1 & 0xffffu) << 32u);
+        // The carrier and guest mapping model currently represent the low canonical half. A Base48
+        // value with bit 47 set would require a separately proved high-half canonicalization rule.
+        return (guest_address & (UINT64_C(1) << 47u)) == 0u;
+    }
+    }
+    return false;
+}
+
+bool relocation_record_kind(uint32_t version, uint32_t serialized,
+                            IndirectBufferRelocationRecord::SourceAddressKind& kind) {
+    if (version == 2u) {
+        if (serialized != 0u) return false;
+        kind = IndirectBufferRelocationRecord::SourceAddressKind::RawU64;
+        return true;
+    }
+    if (version != 3u ||
+        serialized > static_cast<uint32_t>(
+            IndirectBufferRelocationRecord::SourceAddressKind::BufferDescriptorBase48))
+        return false;
+    kind = static_cast<IndirectBufferRelocationRecord::SourceAddressKind>(serialized);
+    return true;
 }
 
 bool interval_end(uint64_t address, uint32_t bytes, uint64_t& end) {
@@ -322,14 +365,21 @@ bool parse_indirect_buffer_relocation(
         const uint32_t segment = load_u32(bytes, offset + 4u);
         record.guest_address = load_u64(bytes, offset + 8u);
         record.byte_count = load_u32(bytes, offset + 16u);
-        if (load_u32(bytes, offset + 20u) != 0u ||
+        uint64_t source_address = 0;
+        if (!relocation_record_kind(
+                layout.version, load_u32(bytes, offset + 20u),
+                record.source_address_kind) ||
             record.source_byte_offset != expected_records[index].source_byte_offset ||
             record.guest_address != expected_records[index].guest_address ||
             record.byte_count != expected_records[index].byte_count ||
+            record.source_address_kind != expected_records[index].source_address_kind ||
             record.source_byte_offset > source.size ||
             sizeof(uint64_t) > source.size - record.source_byte_offset ||
             record.source_byte_offset < prior_source_end ||
-            load_u64(bytes, record.source_byte_offset) != record.guest_address)
+            !relocation_source_address(
+                bytes, source, record.source_byte_offset,
+                record.source_address_kind, source_address) ||
+            source_address != record.guest_address)
             return false;
         prior_source_end = static_cast<uint64_t>(record.source_byte_offset) + sizeof(uint64_t);
         if (!record.byte_count) {
@@ -426,6 +476,10 @@ bool inspect_indirect_buffer_relocation(
         records[index].source_byte_offset = load_u32(bytes, offset);
         records[index].guest_address = load_u64(bytes, offset + 8u);
         records[index].byte_count = load_u32(bytes, offset + 16u);
+        if (!relocation_record_kind(
+                layout.version, load_u32(bytes, offset + 20u),
+                records[index].source_address_kind))
+            return false;
     }
     return parse_indirect_buffer_relocation(
         source, bytes, byte_count, layout, records, info);
@@ -446,14 +500,20 @@ bool build_indirect_buffer_relocation(
 
     uint64_t prior_source_end = 0;
     for (const auto& record : records) {
+        if (layout.version == 2u &&
+            record.source_address_kind !=
+                IndirectBufferRelocationRecord::SourceAddressKind::RawU64)
+            return false;
         if (record.source_byte_offset > source.size ||
             sizeof(uint64_t) > source.size - record.source_byte_offset ||
             record.source_byte_offset < prior_source_end)
             return false;
         prior_source_end = static_cast<uint64_t>(record.source_byte_offset) + sizeof(uint64_t);
         uint64_t source_pointer = 0;
-        std::memcpy(&source_pointer, source_bytes + record.source_byte_offset,
-                    sizeof(source_pointer));
+        if (!relocation_source_address(
+                source_bytes, source, record.source_byte_offset,
+                record.source_address_kind, source_pointer))
+            return false;
         if (source_pointer != record.guest_address) return false;
         if (!record.byte_count) continue; // retain nonzero inactive pointers as source witnesses
         if (!record.guest_address) return false;
@@ -529,7 +589,10 @@ bool build_indirect_buffer_relocation(
         store_u32(owner->data(), offset + 4u, segment_index);
         store_u64(owner->data(), offset + 8u, record.guest_address);
         store_u32(owner->data(), offset + 16u, record.byte_count);
-        store_u32(owner->data(), offset + 20u, 0u);
+        store_u32(owner->data(), offset + 20u,
+                  layout.version == 3u
+                      ? static_cast<uint32_t>(record.source_address_kind)
+                      : 0u);
     }
 
     const size_t segments_base = records_base + static_cast<size_t>(record_bytes);
