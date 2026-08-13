@@ -219,6 +219,7 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
             ? UINT32_MAX : static_cast<uint32_t>(decoded_size64);
         const bool null_descriptor = entry.gpu_addr == 0u && entry.size == 0u &&
                                      entry.host_data == nullptr;
+        const uint32_t dst_sel = entry.vsharp[3] & 0xfffu;
         DataFormat decoded_format = DataFormat::Unknown;
         uint32_t decoded_components = 0;
         rdna2_buffer_format((entry.vsharp[3] >> 12u) & 0x7fu,
@@ -233,7 +234,9 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
             (!null_descriptor &&
              (entry.stride != resource.stride ||
               decoded_format != resource.format ||
-              decoded_components != resource.num_components)) ||
+              decoded_components != resource.num_components ||
+              dst_sel != 0xfacu)) ||
+            (null_descriptor && dst_sel != 0u && dst_sel != 0xfacu) ||
             (!entry.host_data && entry.host_data_size != 0u) ||
             (entry.host_data && entry.host_data_size < entry.size))
             return false;

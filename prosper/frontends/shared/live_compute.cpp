@@ -72,8 +72,7 @@ LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
             ? resource->table_index_count : 1u;
         const bool array = resource->table_index_count != 0u;
         if (descriptor.descriptor_count == kDescriptorArityUnknown ||
-            (array && descriptor.descriptor_count != 0u &&
-             descriptor.descriptor_count != runtime_count) ||
+            (array && descriptor.descriptor_count != runtime_count) ||
             (!array && descriptor.descriptor_count != 1u) ||
             (array && (!descriptor_indexing_support || descriptor.writable ||
                        descriptor.atomic_access)))
@@ -2315,9 +2314,8 @@ struct VulkanComputeContext {
         // to adopt a device from (the shared case logs "adopted the renderer's device"), but it must
         // acquire the same capability: otherwise a compute-only run would gate on a flag the graphics
         // device set and emit indexed-array SPIR-V against a device that cannot execute it — silent
-        // undefined behaviour rather than a clean failure. All-or-nothing for the same reason as the
-        // graphics side, and the SUCCESS is logged as well as the shortfall so the working case is not
-        // indistinguishable from code that never ran.
+        // undefined behaviour rather than a clean failure. Successful contracts are fixed storage-
+        // buffer arrays, so only their non-uniform indexing feature is requested.
         VkPhysicalDeviceDescriptorIndexingFeaturesEXT di_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
         bool di_ext_advertised = false;
@@ -2330,20 +2328,12 @@ struct VulkanComputeContext {
               VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
               f2.pNext = &di_features;
               vkGetPhysicalDeviceFeatures2(physical, &f2);
-              const bool have_all =
-                  di_features.runtimeDescriptorArray &&
-                  di_features.descriptorBindingPartiallyBound &&
-                  di_features.shaderStorageBufferArrayNonUniformIndexing &&
-                  di_features.shaderSampledImageArrayNonUniformIndexing &&
-                  di_features.shaderStorageImageArrayNonUniformIndexing;
-              if (have_all) {
+              const bool have_ssbo_arrays =
+                  di_features.shaderStorageBufferArrayNonUniformIndexing;
+              if (have_ssbo_arrays) {
                   VkPhysicalDeviceDescriptorIndexingFeaturesEXT want{
                       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
-                  want.runtimeDescriptorArray = VK_TRUE;
-                  want.descriptorBindingPartiallyBound = VK_TRUE;
                   want.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
-                  want.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-                  want.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
                   di_features = want;
                   di_features.pNext = const_cast<void*>(dci.pNext);
                   dci.pNext = &di_features;
@@ -2352,14 +2342,8 @@ struct VulkanComputeContext {
                   std::fprintf(stderr, "[compute] descriptor indexing ENABLED (own device)\n");
               } else {
                   std::fprintf(stderr,
-                               "[compute] VK_EXT_descriptor_indexing present but incomplete: "
-                               "runtimeArray=%d partiallyBound=%d ssboNonUniform=%d "
-                               "sampledNonUniform=%d storageImgNonUniform=%d\n",
-                               (int)di_features.runtimeDescriptorArray,
-                               (int)di_features.descriptorBindingPartiallyBound,
-                               (int)di_features.shaderStorageBufferArrayNonUniformIndexing,
-                               (int)di_features.shaderSampledImageArrayNonUniformIndexing,
-                               (int)di_features.shaderStorageImageArrayNonUniformIndexing);
+                               "[compute] VK_EXT_descriptor_indexing lacks "
+                               "shaderStorageBufferArrayNonUniformIndexing\n");
               }
               break;
           } }

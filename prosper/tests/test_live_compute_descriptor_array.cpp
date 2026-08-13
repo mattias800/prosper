@@ -36,7 +36,7 @@ static ShaderBufferTableEntry table_entry(std::array<uint32_t, 4>& words) {
         static_cast<uint32_t>(entry.gpu_addr),
         static_cast<uint32_t>(entry.gpu_addr >> 32u) | (entry.stride << 16u),
         entry.size / entry.stride,
-        20u << 12u,
+        (20u << 12u) | 0xfacu,
     };
     return entry;
 }
@@ -113,6 +113,11 @@ int main() {
     CHECK(!prosper::frontend::plan_live_compute_buffer_descriptors(
                report.descriptors, &resources, false).valid,
           "the same array rejects when descriptor indexing is unavailable");
+    std::vector<SpirvDescriptorBinding> runtime_sized = report.descriptors;
+    runtime_sized[0].descriptor_count = 0;
+    CHECK(!prosper::frontend::plan_live_compute_buffer_descriptors(
+               runtime_sized, &resources, true).valid,
+          "a runtime-sized shader array rejects against the fixed-array backend contract");
     std::vector<SpirvDescriptorBinding> writable = report.descriptors;
     writable[0].writable = true;
     CHECK(!prosper::frontend::plan_live_compute_buffer_descriptors(
@@ -150,6 +155,11 @@ int main() {
     CHECK(rejected_contract(unsupported_control),
           "one entry with an unrepresented V# control rejects in validation and the backend plan");
 
+    ShaderResourceTable unsupported_dst_sel = resources;
+    unsupported_dst_sel.resources[0].table_entries[1].vsharp[3] ^= 1u;
+    CHECK(rejected_contract(unsupported_dst_sel),
+          "same-entry mutation: a descriptor swizzle the flattened backend cannot preserve rejects");
+
     prosper::gpu::ComputeItem item;
     item.spirv = spirv;
     item.user_sgprs = config.user_sgprs;
@@ -161,7 +171,7 @@ int main() {
     item.recompile_config = config;
     item.recompile_config_available = true;
 
-    const uint32_t expected[] = {entry0[0], entry1[0], entry2[0], 0u};
+    const uint32_t expected[] = {entry0[0], entry1[0], entry2[0], 0u, 0u};
     bool every_entry_selected = true;
     for (uint32_t index = 0; index < std::size(expected); ++index) {
         result = 0xdeadbeefu;
@@ -170,7 +180,7 @@ int main() {
             prosper::frontend::execute_live_compute_items({item}) && result == expected[index];
     }
     CHECK(every_entry_selected,
-          "the production backend binds every concrete and null entry at its selected slot");
+          "the production backend binds every entry and returns zero for null or out-of-range slots");
 
     // Scalar control through the same backend: no table payload, one reflected descriptor, and the
     // historical one-descriptor plan remains unchanged.

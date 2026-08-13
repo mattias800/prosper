@@ -226,11 +226,9 @@ struct ShaderResource {
     // is not table-indexed and the stride below is inert, so existing resources are unaffected by
     // construction. When non-zero, `binding` names the ARRAY and the shader supplies the element.
     //
-    // Nothing produces these yet. This stage is representation only; the following stages teach
-    // reflection and validation to see an array, emit the indexed access, and materialise the entries.
-    // The count is carried here first so those stages have something to agree about, and so a
-    // half-finished lift cannot be mistaken for a working one: a resource with a count but no
-    // reflection support must be REJECTED, not bound.
+    // Producers must supply the complete concrete payload below. Reflection, validation, SPIR-V
+    // emission and the live compute backend all agree on this exact arity; a partial lift is rejected
+    // rather than silently binding element zero.
     uint32_t      table_index_count = 0;
 
     // Byte stride between consecutive descriptors in the guest table. 16 for a V#, 32 for a T#; kept

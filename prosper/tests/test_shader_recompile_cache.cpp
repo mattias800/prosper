@@ -1562,7 +1562,7 @@ int main() {
               misaligned_swap_x2.empty() && indexed_swap_x2.empty() &&
               unsupported_swap_x2.empty() && unproved_swap_x2.empty() &&
               swap_x2_again == swap_x2 && two_record_swap_x2_again == two_record_swap_x2 &&
-              stats.misses == 4 && stats.hits == 6 && stats.entries == 4,
+              stats.misses == 5 && stats.hits == 5 && stats.entries == 5,
           "swap_x2 cache separates record count, capability, and every admission gate");
 
     // BVH BOX_GROW is embedded as the slab-test far-edge multiplier. A descriptor change must
@@ -1800,6 +1800,68 @@ int main() {
               capture_identity == repeated_capture_identity &&
               stats.misses == 2 && stats.hits == 1 && stats.entries == 2,
           "geometry-probe vertex capture has a distinct, reusable cache identity");
+
+    // A buffer-array selector is compiled into the access chain. Warm-cache hits must therefore
+    // partition on its exact arity/source and on shared-contract admission; otherwise a mutated
+    // selector or invalid entry can borrow the already-valid module without reaching the emitter.
+    clear_shader_recompile_cache();
+    static const uint32_t kArrayCompute[] = {
+        0xe0300000u, 0x80000100u, // buffer_load_dword v1, off, s[0:3]
+        0xbf810000u,
+    };
+    ShaderResource array_resource;
+    array_resource.cls = ResourceClass::ConstantBuffer;
+    array_resource.format = DataFormat::Uint32;
+    array_resource.num_components = 1;
+    array_resource.binding = 2;
+    array_resource.stride = 4;
+    array_resource.sgpr_base = 0;
+    array_resource.table_index_count = 2;
+    array_resource.table_entry_stride = 16;
+    array_resource.table_index_sgpr = 8;
+    array_resource.table_selector_mode = BufferTableSelectorMode::UserSgprIndex;
+    auto array_entry = [](uint64_t address) {
+        ShaderBufferTableEntry entry;
+        entry.gpu_addr = address;
+        entry.size = 16;
+        entry.stride = 4;
+        entry.vsharp = {
+            static_cast<uint32_t>(address),
+            static_cast<uint32_t>(address >> 32u) | (4u << 16u),
+            4u,
+            (20u << 12u) | 0xfacu,
+        };
+        return entry;
+    };
+    array_resource.table_entries = {array_entry(0x200000u), array_entry(0x201000u)};
+    ShaderResourceTable array_table;
+    array_table.resources.push_back(array_resource);
+    ComputeShaderConfig array_config;
+    array_config.user_sgprs.resize(9);
+    array_config.local_x = array_config.local_y = array_config.local_z = 1;
+    const auto array_s8 = recompile_compute_shader_cached(
+        kArrayCompute, std::size(kArrayCompute), &array_table, array_config);
+    ShaderResourceTable array_s7_table = array_table;
+    array_s7_table.resources[0].table_index_sgpr = 7;
+    const auto array_s7 = recompile_compute_shader_cached(
+        kArrayCompute, std::size(kArrayCompute), &array_s7_table, array_config);
+    ShaderResourceTable array_three_table = array_table;
+    array_three_table.resources[0].table_index_count = 3;
+    array_three_table.resources[0].table_entries.push_back(array_entry(0x202000u));
+    const auto array_three = recompile_compute_shader_cached(
+        kArrayCompute, std::size(kArrayCompute), &array_three_table, array_config);
+    ShaderResourceTable invalid_array_table = array_table;
+    invalid_array_table.resources[0].table_entries[1].vsharp[3] |= 1u << 19u;
+    const auto invalid_array = recompile_compute_shader_cached(
+        kArrayCompute, std::size(kArrayCompute), &invalid_array_table, array_config);
+    const auto array_s8_again = recompile_compute_shader_cached(
+        kArrayCompute, std::size(kArrayCompute), &array_table, array_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!array_s8.empty() && !array_s7.empty() && !array_three.empty() &&
+              array_s8 != array_s7 && array_s8 != array_three && invalid_array.empty() &&
+              array_s8_again == array_s8 && stats.misses == 4 && stats.hits == 1 &&
+              stats.entries == 4,
+          "buffer-array cache separates arity, selector source, and same-entry admission mutations");
 
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);

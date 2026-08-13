@@ -604,7 +604,7 @@ int main() {
             static_cast<uint32_t>(entry.gpu_addr),
             static_cast<uint32_t>(entry.gpu_addr >> 32u) | (entry.stride << 16u),
             entry.size / entry.stride,
-            22u << 12u,
+            (22u << 12u) | 0xfacu,
         };
         table_indexed.table_entries.push_back(entry);
     }
@@ -713,6 +713,17 @@ int main() {
               has_issue(unsupported_control_report,
                         DescriptorIssueCode::InvalidBufferMetadata),
           "an array V# using an unrepresented control bit rejects at the shared contract");
+
+    ShaderResource unsupported_dst_sel = eight;
+    unsupported_dst_sel.table_entries[3].vsharp[3] ^= 1u;
+    ShaderResourceTable unsupported_dst_sel_table;
+    unsupported_dst_sel_table.resources.push_back(unsupported_dst_sel);
+    const auto unsupported_dst_sel_report = validate_spirv_descriptor_interface(
+        array_spv, &unsupported_dst_sel_table, 0, SpirvShaderStage::Vertex);
+    CHECK(!unsupported_dst_sel_report.ok() &&
+              has_issue(unsupported_dst_sel_report,
+                        DescriptorIssueCode::InvalidBufferMetadata),
+          "same-entry mutation: an array V# using an unrepresented DST_SEL rejects");
 
     // An UNREADABLE array length is its own value, not folded onto 0 (which means OpTypeRuntimeArray and
     // is treated as compatible with any table size). Reported as a review finding on #2463: collapsing

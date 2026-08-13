@@ -572,6 +572,12 @@ struct ShaderResourceCompileKey {
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t fetch_index_mode = 0;
+    uint32_t table_index_count = 0;
+    uint32_t table_entry_stride = 0;
+    uint32_t table_index_sgpr = UINT32_MAX;
+    uint32_t table_selector_mode = 0;
+    uint32_t table_load_pc = UINT32_MAX;
+    bool table_contract_valid = true;
     uint32_t flat_base_sgpr = 0;
     uint32_t bvh_box_grow = 0;
     bool bvh_sort_enabled = false;
@@ -777,6 +783,12 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.fetch_index_mode);
+            hash = hash_mix(hash, resource.table_index_count);
+            hash = hash_mix(hash, resource.table_entry_stride);
+            hash = hash_mix(hash, resource.table_index_sgpr);
+            hash = hash_mix(hash, resource.table_selector_mode);
+            hash = hash_mix(hash, resource.table_load_pc);
+            hash = hash_mix(hash, resource.table_contract_valid);
             hash = hash_mix(hash, resource.flat_base_sgpr);
             hash = hash_mix(hash, resource.bvh_box_grow);
             hash = hash_mix(hash, resource.bvh_sort_enabled);
@@ -1531,6 +1543,13 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.sgpr_base = resource.sgpr_base;
             compiled.fetch_pc = resource.fetch_pc;
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
+            compiled.table_index_count = resource.table_index_count;
+            compiled.table_entry_stride = resource.table_entry_stride;
+            compiled.table_index_sgpr = resource.table_index_sgpr;
+            compiled.table_selector_mode =
+                static_cast<uint32_t>(resource.table_selector_mode);
+            compiled.table_load_pc = resource.table_load_pc;
+            compiled.table_contract_valid = valid_shader_buffer_table_contract(resource);
             compiled.flat_base_sgpr = resource.flat_base_sgpr;
             compiled.bvh_box_grow = resource.bvh_box_grow;
             compiled.bvh_sort_enabled = resource.bvh_sort_enabled;
