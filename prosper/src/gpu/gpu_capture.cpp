@@ -1726,10 +1726,23 @@ bool validate_captured_indirect_pointer_relocations(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
+    const size_t marked = static_cast<size_t>(std::count_if(
+        compute.resources.resources.begin(), compute.resources.resources.end(),
+        [](const GpuCapturedResource& captured) {
+            return is_indirect_pointer_relocation_marker_candidate(captured.resource);
+        }));
     const size_t candidates = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
         captured_resource_has_indirect_pointer_state));
-    if (!candidates) return true;
+    if (!candidates) {
+        if (!marked) return true;
+        error = "indirect-pointer relocation marker has no complete carrier";
+        return false;
+    }
+    if (marked && marked != candidates) {
+        error = "indirect-pointer relocation marker/carrier count mismatch";
+        return false;
+    }
     if (capture.format_version < 53u || candidates != 1u ||
         !compute.recompile_config_available ||
         compute.raw_shader_index >= capture.raw_shader_versions.size()) {

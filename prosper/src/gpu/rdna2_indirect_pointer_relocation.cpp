@@ -24,24 +24,72 @@ bool marker_directory_offset(const ShaderResource& source, uint32_t record_count
 }
 
 bool proof_witnesses_match(const IndirectPointerRelocationProof& proof,
+                           const IndirectBufferRelocationLayout& layout,
                            const IndirectBufferRelocationInfo& info) {
     return proof.witness_words == info.witness_words &&
-           proof.witness_words.size() ==
-               kIndirectPointerStaticFootprintLayout.witness_word_count;
+           proof.witness_words.size() == layout.witness_word_count;
 }
 
 bool serialized_witnesses_valid(const IndirectBufferRelocationInfo& info,
+                                const IndirectBufferRelocationLayout& layout,
                                 uint64_t* fingerprint = nullptr) {
     if (info.witness_words.size() != 4u ||
         info.witness_words[0] != kIndirectPointerProofSchema ||
         info.witness_words[3] !=
-            (kIndirectPointerStaticFootprintTag ^ info.witness_words[0] ^
+            (layout.tag ^ info.witness_words[0] ^
              info.witness_words[1] ^ info.witness_words[2]))
         return false;
     if (fingerprint)
         *fingerprint = static_cast<uint64_t>(info.witness_words[1]) |
             (static_cast<uint64_t>(info.witness_words[2]) << 32u);
     return true;
+}
+
+const IndirectBufferRelocationLayout* layout_for_proof(
+        const IndirectPointerRelocationProof& proof) {
+    switch (proof.bound_kind) {
+    case IndirectPointerBoundKind::StaticFootprint:
+        return proof.source_address_kind ==
+                IndirectBufferRelocationRecord::SourceAddressKind::RawU64
+            ? &kIndirectPointerStaticFootprintLayout : nullptr;
+    case IndirectPointerBoundKind::DescriptorRange:
+        return proof.source_address_kind ==
+                IndirectBufferRelocationRecord::SourceAddressKind::BufferDescriptorBase48
+            ? &kIndirectPointerDescriptorRangeLayout : nullptr;
+    case IndirectPointerBoundKind::None:
+        return nullptr;
+    }
+    return nullptr;
+}
+
+const IndirectBufferRelocationLayout* layout_for_serialized_resource(
+        const ShaderResource& resource, IndirectBufferRelocationInfo* output = nullptr) {
+    const auto& marker = resource.indirect_pointer_relocation;
+    for (const IndirectBufferRelocationLayout* layout : {
+             &kIndirectPointerStaticFootprintLayout,
+             &kIndirectPointerDescriptorRangeLayout}) {
+        if (marker.carrier_version && marker.carrier_version != layout->version) continue;
+        IndirectBufferRelocationInfo info;
+        if (!inspect_indirect_buffer_relocation(
+                resource, resource.host_data, resource.host_data_size, *layout, info) ||
+            !serialized_witnesses_valid(info, *layout))
+            continue;
+        if (output) *output = std::move(info);
+        return layout;
+    }
+    return nullptr;
+}
+
+bool analyze_indirect_pointer_relocations(
+        const uint32_t* code, size_t dwords,
+        const ComputeShaderConfig& config,
+        const ShaderResourceTable& resources,
+        IndirectPointerRelocationProof& proof) {
+    if (analyze_rdna2_static_pointer_footprint(
+            code, dwords, config, resources, proof))
+        return true;
+    return analyze_rdna2_descriptor_pointer_range(
+        code, dwords, config, resources, proof);
 }
 
 ShaderResource* unique_resource_at(ShaderResourceTable& resources, uint32_t fetch_pc) {
@@ -72,16 +120,18 @@ void clear_marker(ShaderResource& resource) {
 
 bool install_marker(ShaderResource& source,
                     const IndirectPointerRelocationProof& proof,
+                    const IndirectBufferRelocationLayout& layout,
                     const IndirectBufferRelocationInfo& info) {
     if (!source.host_data || source.host_data_size > UINT32_MAX ||
         proof.record_count != proof.records.size() ||
         info.records.size() != proof.records.size() ||
-        info.segments.size() > UINT32_MAX || !proof_witnesses_match(proof, info))
+        info.segments.size() > UINT32_MAX ||
+        !proof_witnesses_match(proof, layout, info))
         return false;
     uint32_t directory_offset = 0;
     if (!marker_directory_offset(source, proof.record_count, directory_offset)) return false;
     source.indirect_pointer_relocation = {
-        kIndirectPointerStaticFootprintLayout.version,
+        layout.version,
         proof.schema_version,
         static_cast<uint32_t>(source.host_data_size),
         proof.record_count,
@@ -105,17 +155,15 @@ bool is_indirect_pointer_relocation_marker_candidate(const ShaderResource& resou
 
 bool is_indirect_pointer_relocation_serialized(
         const ShaderResource& resource, const uint8_t* bytes, size_t byte_count) {
-    IndirectBufferRelocationInfo info;
-    return inspect_indirect_buffer_relocation(
-               resource, bytes, byte_count,
-               kIndirectPointerStaticFootprintLayout, info) &&
-           serialized_witnesses_valid(info);
+    ShaderResource serialized = resource;
+    serialized.host_data = const_cast<uint8_t*>(bytes);
+    serialized.host_data_size = byte_count;
+    return layout_for_serialized_resource(serialized) != nullptr;
 }
 
 bool is_indirect_pointer_relocation_resource(const ShaderResource& resource) {
     const auto& marker = resource.indirect_pointer_relocation;
-    if (marker.carrier_version != kIndirectPointerStaticFootprintLayout.version ||
-        marker.proof_schema != kIndirectPointerProofSchema ||
+    if (marker.proof_schema != kIndirectPointerProofSchema ||
         marker.binding_bytes != resource.host_data_size ||
         marker.record_count == 0u || !resource.host_data ||
         resource.host_data_size > UINT32_MAX)
@@ -123,10 +171,10 @@ bool is_indirect_pointer_relocation_resource(const ShaderResource& resource) {
     IndirectBufferRelocationInfo info;
     uint64_t fingerprint = 0;
     uint32_t directory_offset = 0;
-    return inspect_indirect_buffer_relocation(
-               resource, resource.host_data, resource.host_data_size,
-               kIndirectPointerStaticFootprintLayout, info) &&
-           serialized_witnesses_valid(info, &fingerprint) &&
+    const IndirectBufferRelocationLayout* layout =
+        layout_for_serialized_resource(resource, &info);
+    return layout && marker.carrier_version == layout->version &&
+           serialized_witnesses_valid(info, *layout, &fingerprint) &&
            marker.record_count == info.records.size() &&
            marker.segment_count == info.segments.size() &&
            marker_directory_offset(resource, marker.record_count, directory_offset) &&
@@ -144,9 +192,11 @@ bool validate_rdna2_indirect_pointer_relocations(
     if (validated_info) *validated_info = {};
 
     IndirectPointerRelocationProof proof;
-    if (!analyze_rdna2_static_pointer_footprint(
+    if (!analyze_indirect_pointer_relocations(
             code, dwords, config, resources, proof))
         return false;
+    const IndirectBufferRelocationLayout* layout = layout_for_proof(proof);
+    if (!layout) return false;
     const ShaderResource* source = unique_resource_at(resources, proof.source_fetch_pc);
     if (!source || !is_indirect_pointer_relocation_resource(*source)) return false;
     size_t markers = 0;
@@ -161,11 +211,11 @@ bool validate_rdna2_indirect_pointer_relocations(
     IndirectBufferRelocationInfo info;
     if (!parse_indirect_buffer_relocation(
             *source, source->host_data, source->host_data_size,
-            kIndirectPointerStaticFootprintLayout, proof.records, info) ||
-        !proof_witnesses_match(proof, info) ||
+            *layout, proof.records, info) ||
+        !proof_witnesses_match(proof, *layout, info) ||
         source->indirect_pointer_relocation.proof_fingerprint != proof.fingerprint ||
         !current_indirect_buffer_relocation_matches(
-            resources, *source, kIndirectPointerStaticFootprintLayout, proof.records))
+            resources, *source, *layout, proof.records))
         return false;
 
     if (validated_proof) *validated_proof = std::move(proof);
@@ -180,17 +230,20 @@ bool discover_rdna2_indirect_pointer_relocations(
     for (ShaderResource& resource : resources.resources) clear_marker(resource);
 
     IndirectPointerRelocationProof proof;
-    if (!analyze_rdna2_static_pointer_footprint(
+    if (!analyze_indirect_pointer_relocations(
             code, dwords, config, resources, proof))
         return false;
+    const IndirectBufferRelocationLayout* layout = layout_for_proof(proof);
+    if (!layout) return false;
     ShaderResource* source = unique_resource_at(resources, proof.source_fetch_pc);
     if (!source) return false;
 
     IndirectBufferRelocationInfo info;
     if (parse_indirect_buffer_relocation(
             *source, source->host_data, source->host_data_size,
-            kIndirectPointerStaticFootprintLayout, proof.records, info)) {
-        if (!proof_witnesses_match(proof, info) || !install_marker(*source, proof, info))
+            *layout, proof.records, info)) {
+        if (!proof_witnesses_match(proof, *layout, info) ||
+            !install_marker(*source, proof, *layout, info))
             return false;
         if (validate_rdna2_indirect_pointer_relocations(
                 code, dwords, config, resources))
@@ -203,7 +256,7 @@ bool discover_rdna2_indirect_pointer_relocations(
     if (!original) return false;
     std::shared_ptr<std::vector<uint8_t>> owner;
     if (!build_indirect_buffer_relocation(
-            *source, original, kIndirectPointerStaticFootprintLayout,
+            *source, original, *layout,
             proof.records, proof.witness_words, owner, info) || !owner)
         return false;
 
@@ -212,7 +265,7 @@ bool discover_rdna2_indirect_pointer_relocations(
     source->host_data = owner->data();
     source->host_data_size = owner->size();
     resources.owned_host_data.push_back(owner);
-    if (install_marker(*source, proof, info) &&
+    if (install_marker(*source, proof, *layout, info) &&
         validate_rdna2_indirect_pointer_relocations(
             code, dwords, config, resources))
         return true;

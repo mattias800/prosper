@@ -88,6 +88,16 @@ int main() {
           "normalized segment copies the exact bounded pointee bytes");
     CHECK(info.witness_words == std::vector<uint32_t>(witnesses.begin(), witnesses.end()),
           "proof witnesses survive the serialized carrier");
+    const uint8_t* packed_middle = indirect_buffer_relocation_payload_bytes(
+        owner->data(), owner->size(), info, pointer0 + 12u, 8u);
+    CHECK(packed_middle && std::memcmp(packed_middle, pointee.data() + 12u, 8u) == 0,
+          "parsed relocation directory resolves an exact interior payload interval");
+    CHECK(!indirect_buffer_relocation_payload_bytes(
+              owner->data(), owner->size(), info, pointer0 + 44u, 8u) &&
+              !indirect_buffer_relocation_payload_bytes(
+                  owner->data(), info.payload_byte_offset + 4u,
+                  info, pointer0, 8u),
+          "payload resolver rejects guest and carrier boundary crossings");
     const size_t records_base = source_bytes.size() + kIndirectBufferRelocationHeaderBytes;
     CHECK(info.records[0].source_address_kind == SourceAddressKind::RawU64 &&
               load_u32(owner->data(), records_base + 20u) == 0u,

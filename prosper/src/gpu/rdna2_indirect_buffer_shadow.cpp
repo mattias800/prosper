@@ -485,6 +485,35 @@ bool inspect_indirect_buffer_relocation(
         source, bytes, byte_count, layout, records, info);
 }
 
+const uint8_t* indirect_buffer_relocation_payload_bytes(
+        const uint8_t* carrier, size_t carrier_bytes,
+        const IndirectBufferRelocationInfo& info,
+        uint64_t guest_address, uint32_t byte_count) {
+    if (!carrier || !guest_address || !byte_count ||
+        guest_address > UINT64_MAX - byte_count)
+        return nullptr;
+    const uint64_t guest_end = guest_address + byte_count;
+    for (const IndirectBufferRelocationSegment& segment : info.segments) {
+        if (guest_address < segment.guest_address ||
+            guest_address - segment.guest_address > segment.byte_count)
+            continue;
+        const uint64_t relative = guest_address - segment.guest_address;
+        if (byte_count > segment.byte_count - relative ||
+            segment.guest_address > UINT64_MAX - segment.byte_count ||
+            guest_end > segment.guest_address + segment.byte_count ||
+            relative > SIZE_MAX - segment.packed_byte_offset)
+            return nullptr;
+        const size_t packed_offset =
+            static_cast<size_t>(segment.packed_byte_offset) +
+            static_cast<size_t>(relative);
+        if (packed_offset > carrier_bytes ||
+            byte_count > carrier_bytes - packed_offset)
+            return nullptr;
+        return carrier + packed_offset;
+    }
+    return nullptr;
+}
+
 bool build_indirect_buffer_relocation(
         const ShaderResource& source, const uint8_t* source_bytes,
         const IndirectBufferRelocationLayout& layout,

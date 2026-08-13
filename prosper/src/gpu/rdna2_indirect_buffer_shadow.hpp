@@ -120,6 +120,14 @@ bool inspect_indirect_buffer_relocation(
     const IndirectBufferRelocationLayout& layout,
     IndirectBufferRelocationInfo& info);
 
+// Resolve an exact guest interval through a previously parsed relocation directory. This grants no
+// authority by itself: callers must pass `info` produced by parsing against independently derived
+// expected records. The returned pointer is bounded to one canonical packed segment.
+const uint8_t* indirect_buffer_relocation_payload_bytes(
+    const uint8_t* carrier, size_t carrier_bytes,
+    const IndirectBufferRelocationInfo& info,
+    uint64_t guest_address, uint32_t byte_count);
+
 bool build_indirect_buffer_relocation(
     const ShaderResource& source, const uint8_t* source_bytes,
     const IndirectBufferRelocationLayout& layout,

@@ -119,9 +119,17 @@ bool append_compute_accesses(const ComputeItem& compute,
         for (const ShaderResource& resource : table->resources) {
             if (!is_indirect_pointer_relocation_resource(resource)) continue;
             IndirectBufferRelocationInfo info;
-            if (!inspect_indirect_buffer_relocation(
+            const IndirectBufferRelocationLayout* layout =
+                resource.indirect_pointer_relocation.carrier_version ==
+                        kIndirectPointerStaticFootprintLayout.version
+                    ? &kIndirectPointerStaticFootprintLayout
+                    : resource.indirect_pointer_relocation.carrier_version ==
+                            kIndirectPointerDescriptorRangeLayout.version
+                        ? &kIndirectPointerDescriptorRangeLayout
+                        : nullptr;
+            if (!layout || !inspect_indirect_buffer_relocation(
                     resource, resource.host_data, resource.host_data_size,
-                    kIndirectPointerStaticFootprintLayout, info))
+                    *layout, info))
                 continue;
             for (const auto& segment : info.segments)
                 reads.push_back({segment.guest_address, segment.byte_count, 0, 0,
