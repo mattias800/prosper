@@ -207,6 +207,11 @@ struct SrtUse {
                                      // 0xFFFFFFFF = key-less (direct entry V#, register-SOFFSET, or
                                      // negative-imm load; resolve by the exact instruction pc instead)
     std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
+    // Exact mapped source of the eight live T# dwords, when every word still descends from the
+    // same successful x8/x16 scalar load. Zero means the live descriptor was seeded directly,
+    // assembled from unrelated loads, or modified by scalar ALU, so no source identity is claimed.
+    // This is diagnostic provenance only; resource lookup and materialization never consume it.
+    uint64_t descriptor_source_addr = 0;
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     std::array<uint32_t, 4> bvh4{};  // BVH descriptor dwords live at IMAGE_BVH_INTERSECT_RAY (kind 2)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
@@ -377,7 +382,8 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 // indexed draws are grown to their decoded max-index range later in realize_draw_item. Implemented in
 // gpu_executor.cpp (needs the AGC registry + descriptor decode).
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
-                                                       bool is_ps, uint32_t draw_vertex_count = 0);
+                                                       bool is_ps, uint32_t draw_vertex_count = 0,
+                                                       uint64_t draw_command_order = 0);
 
 // PROSPER_COMPUTELOG diagnostic: resolve every skipped DispatchDirect packet's compute shader and
 // AGC resource table from its retained register snapshot. PROSPER_COMPUTELOG_DIM=WxH restricts output
@@ -1214,11 +1220,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         : rs.es_addr;
     const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
     std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(
-        ds, vertex_chain ? rs.es_addr : vs_program_addr, false, vcount_hint);
+        ds, vertex_chain ? rs.es_addr : vs_program_addr, false, vcount_hint,
+        draw ? draw->command_order : 0);
     std::shared_ptr<ShaderResourceTable> chain_vrt;
     if (vertex_chain) {
         const size_t prolog_resource_count = vrt ? vrt->resources.size() : 0;
-        chain_vrt = build_stage_table(ds, chain_addr, false, vcount_hint);
+        chain_vrt = build_stage_table(ds, chain_addr, false, vcount_hint,
+                                      draw ? draw->command_order : 0);
         vrt = merge_vertex_chain_resource_tables(vrt, chain_vrt,
                                                   static_cast<uint32_t>(vertex_prolog.prefix_dwords));
         if (getenv("PROSPER_DBG")) {
@@ -1234,7 +1242,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                         vertex_lds_dwords);
             }
     }
-    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true, vcount_hint);
+    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(
+        ds, rs.ps_addr, true, vcount_hint, draw ? draw->command_order : 0);
     const auto table_done = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // PROSPER_RTLOG: correlate this draw's render-target address (CB_COLOR0_BASE) with the addresses of
@@ -1405,7 +1414,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
                         (unsigned long long)vs_program_addr);
                 g_dyntrace_force = true;
-                (void)build_stage_table(ds, vs_program_addr, false, vcount_hint);
+                (void)build_stage_table(ds, vs_program_addr, false, vcount_hint,
+                                        draw ? draw->command_order : 0);
                 g_dyntrace_force = false;
             }
         }
@@ -1416,7 +1426,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, "[dynfail] replaying PS 0x%llx resource build with trace:\n",
                         (unsigned long long)rs.ps_addr);
                 g_dyntrace_force = true;
-                (void)build_stage_table(ds, rs.ps_addr, true, vcount_hint);
+                (void)build_stage_table(ds, rs.ps_addr, true, vcount_hint,
+                                        draw ? draw->command_order : 0);
                 g_dyntrace_force = false;
             }
         }

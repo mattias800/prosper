@@ -97,6 +97,138 @@ thread_local GuestGpuWriteJournal g_guest_gpu_writes;
 std::atomic<uint64_t> g_next_guest_gpu_submit_serial{0};
 std::atomic<uint64_t> g_next_shader_analysis_identity{0};
 
+// PROSPER_NULL_IMAGE_SOURCE_PROBE=<hex-program-address> pairs an exactly-null sampled T# with the
+// mapped bytes that produced it, then reads those bytes again after the retained submit executes.
+// This answers whether eager graphics realization sampled a descriptor before an earlier ordered
+// producer in the same submit. Program + MIMG pc + source address travel as one record: neither a
+// numeric SRT offset nor adjacent log lines identify a descriptor uniquely (#2422, trap 156).
+struct NullImageSourceProbe {
+    uint64_t submit_no = 0;
+    uint64_t program_addr = 0;
+    uint64_t source_addr = 0;
+    uint64_t draw_order = 0;
+    uint64_t initial_writer_sequence = 0;
+    uint32_t use_pc = UINT32_MAX;
+    std::array<uint32_t, 8> initial{};
+};
+std::mutex g_null_image_source_probe_mutex;
+std::mutex g_null_image_source_probe_run_mutex;
+std::vector<NullImageSourceProbe> g_null_image_source_probes;
+std::atomic<uint64_t> g_collect_null_image_source_probe_submit{0};
+
+uint64_t null_image_source_probe_program() {
+    static const uint64_t program = [] {
+        const char* value = std::getenv("PROSPER_NULL_IMAGE_SOURCE_PROBE");
+        if (!value || !*value) return uint64_t{0};
+        return static_cast<uint64_t>(std::strtoull(value, nullptr, 16));
+    }();
+    return program;
+}
+
+void record_null_image_source_probe(uint64_t program_addr, uint32_t use_pc,
+                                    uint64_t source_addr, uint64_t draw_order,
+                                    const std::array<uint32_t, 8>& initial) {
+    const uint64_t filter = null_image_source_probe_program();
+    const uint64_t submit_no =
+        g_collect_null_image_source_probe_submit.load(std::memory_order_relaxed);
+    if (!submit_no ||
+        !filter || program_addr != filter || !source_addr || !draw_order) return;
+    static std::once_flag banner;
+    std::call_once(banner, [filter] {
+        std::fprintf(stderr,
+                     "[null-source] armed program=0x%llx; exact-null x8 sources will be "
+                     "re-read after their eager submit (writer history %s)\n",
+                     static_cast<unsigned long long>(filter),
+                     writer_provenance_enabled() ? "armed" : "NOT armed");
+    });
+    const auto initial_writer = last_guest_write_overlap(source_addr, sizeof(initial));
+    std::lock_guard lock(g_null_image_source_probe_mutex);
+    const auto same = [&](const NullImageSourceProbe& probe) {
+        return probe.submit_no == submit_no && probe.program_addr == program_addr &&
+               probe.use_pc == use_pc &&
+               probe.source_addr == source_addr && probe.draw_order == draw_order;
+    };
+    if (std::none_of(g_null_image_source_probes.begin(),
+                     g_null_image_source_probes.end(), same)) {
+        g_null_image_source_probes.push_back({
+            submit_no, program_addr, source_addr, draw_order,
+            initial_writer ? initial_writer->sequence : 0u, use_pc, initial});
+    }
+}
+
+std::vector<NullImageSourceProbe> take_null_image_source_probes(
+        const std::vector<DrawItem>& draws, uint64_t submit_no) {
+    if (!null_image_source_probe_program()) return {};
+    std::unordered_set<uint64_t> orders;
+    orders.reserve(draws.size());
+    for (const DrawItem& draw : draws) orders.insert(draw.command_order);
+    std::vector<NullImageSourceProbe> result;
+    std::lock_guard lock(g_null_image_source_probe_mutex);
+    auto it = g_null_image_source_probes.begin();
+    while (it != g_null_image_source_probes.end()) {
+        if (it->submit_no != submit_no) {
+            ++it;
+            continue;
+        }
+        if (orders.count(it->draw_order)) result.push_back(*it);
+        // A stage table may have been built before a later pipeline failure prevented DrawItem
+        // publication. Retire every record from this completed collection generation so a reused
+        // command-order value in another submit cannot pick up stale provenance.
+        it = g_null_image_source_probes.erase(it);
+    }
+    return result;
+}
+
+void check_null_image_source_probes(const std::vector<NullImageSourceProbe>& probes,
+                                    uint64_t submit_no) {
+    if (probes.empty()) return;
+    size_t checked = 0, changed = 0, unreadable = 0;
+    for (const NullImageSourceProbe& probe : probes) {
+        if (!guest_readable(probe.source_addr, sizeof(probe.initial))) {
+            ++unreadable;
+            continue;
+        }
+        std::array<uint32_t, 8> current{};
+        std::memcpy(current.data(), reinterpret_cast<const void*>(probe.source_addr),
+                    sizeof(current));
+        ++checked;
+        if (current == probe.initial) continue;
+        ++changed;
+        const auto writer = last_guest_write_overlap(probe.source_addr, sizeof(current));
+        std::fprintf(stderr,
+                     "[null-source] CHANGED submit=%llu draw-order=%llu program=0x%llx pc=%u "
+                     "source=0x%llx now=",
+                     static_cast<unsigned long long>(submit_no),
+                     static_cast<unsigned long long>(probe.draw_order),
+                     static_cast<unsigned long long>(probe.program_addr), probe.use_pc,
+                     static_cast<unsigned long long>(probe.source_addr));
+        for (uint32_t word : current) std::fprintf(stderr, "%08x ", word);
+        if (writer) {
+            const bool new_writer = writer->sequence > probe.initial_writer_sequence;
+            const bool ordered_predecessor = new_writer && writer->order < probe.draw_order &&
+                writer->kind != GuestWriterKind::ColorTarget;
+            std::fprintf(stderr,
+                         "writer=%s writer-submit=%llu writer-order=%llu identity=0x%llx seq=%llu%s%s\n",
+                         guest_writer_kind_name(writer->kind),
+                         static_cast<unsigned long long>(writer->submit),
+                         static_cast<unsigned long long>(writer->order),
+                         static_cast<unsigned long long>(writer->identity),
+                         static_cast<unsigned long long>(writer->sequence),
+                         new_writer ? " NEW-SINCE-FOLD" : "",
+                         ordered_predecessor ? " ORDERED-BEFORE-DRAW" : "");
+        } else {
+            std::fprintf(stderr,
+                         "writer=none (history=%zu recorded: %s)%s\n",
+                         guest_write_history_size(), guest_write_recorder_summary(),
+                         guest_write_history_size() ? "" : " HISTORY-EMPTY");
+        }
+    }
+    std::fprintf(stderr,
+                 "[null-source] submit=%llu probes=%zu checked=%zu changed=%zu unreadable=%zu\n",
+                 static_cast<unsigned long long>(submit_no), probes.size(), checked, changed,
+                 unreadable);
+}
+
 void dispatch_compute_authority_boundary(const ComputeAuthorityBoundary& boundary) {
     // Default path: one relaxed load and no mutex/std::function copy when the opt-in diagnostic is
     // absent. This hook sits on every ordered draw, so making an unarmed census measurable would
@@ -2471,6 +2603,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::bitset<kFoldSgprs> descr8_known;
     std::array<uint32_t, kFoldSgprs> descr8_key{};
     std::bitset<kFoldSgprs> descr8_key_known;
+    // Exact source address of each CURRENT scalar word from a successful mapped x8/x16 load. The
+    // address follows only bit-preserving scalar moves and is cleared by every other write. A live
+    // T# receives one contiguous source only when word k still comes from base + 4*k; reorders and
+    // duplicates therefore fail closed even when every word came from the same load window.
+    std::array<uint64_t, kFoldSgprs> descriptor_word_source_addr{};
+    std::bitset<kFoldSgprs> descriptor_word_source_known;
     // Exact null-pointer dataflow for guarded BVHs. Each mapped zero qword load receives a unique
     // origin; failed dereferences and scalar address/descriptor ALU retain that origin. A null BVH is
     // published only when all four live descriptor words carry the SAME origin, so an unrelated
@@ -2574,6 +2712,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.set((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            descriptor_word_source_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             optional_null_role[(size_t)r] = OptionalNullRole::None;
             bvh_build_origin[(size_t)r] = 0;
@@ -2589,6 +2728,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            descriptor_word_source_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             optional_null_role[(size_t)r] = OptionalNullRole::None;
             bvh_build_origin[(size_t)r] = 0;
@@ -2734,6 +2874,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr8_known;
         std::array<uint32_t, kFoldSgprs> descr8_key;
         std::bitset<kFoldSgprs> descr8_key_known;
+        std::array<uint64_t, kFoldSgprs> descriptor_word_source_addr;
+        std::bitset<kFoldSgprs> descriptor_word_source_known;
         std::array<uint32_t, kFoldSgprs> null_chain_origin;
         std::bitset<kFoldSgprs> null_chain_known;
         std::array<OptionalNullRole, kFoldSgprs> optional_null_role;
@@ -2777,6 +2919,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.descr_key = descr_key; s.descr_key_known = descr_key_known;
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
+        s.descriptor_word_source_addr = descriptor_word_source_addr;
+        s.descriptor_word_source_known = descriptor_word_source_known;
         s.null_chain_origin = null_chain_origin; s.null_chain_known = null_chain_known;
         s.optional_null_role = optional_null_role;
         s.null_count_carry_origin = null_count_carry_origin;
@@ -2795,6 +2939,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         descr_key = s.descr_key; descr_key_known = s.descr_key_known;
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
+        descriptor_word_source_addr = s.descriptor_word_source_addr;
+        descriptor_word_source_known = s.descriptor_word_source_known;
         null_chain_origin = s.null_chain_origin; null_chain_known = s.null_chain_known;
         optional_null_role = s.optional_null_role;
         null_count_carry_origin = s.null_count_carry_origin;
@@ -3070,6 +3216,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             case Rdna2Format::SOP1:
                 if (in.opcode == kSop1OpcodeMovB32) {            // s_mov_b32
                     uint32_t v, source_key = 0;
+                    uint64_t source_descriptor_word_addr = 0;
                     const uint32_t source_null_origin = operand_null_origin(in.src[0]);
                     const bool source_key_known =
                         in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
@@ -3080,6 +3227,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
                         val_seed_origin_known.test((size_t)in.src[0].value) &&
                         (source_origin = val_seed_origin[(size_t)in.src[0].value], true);
+                    const bool source_descriptor_word_known =
+                        in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
+                        descriptor_word_source_known.test((size_t)in.src[0].value) &&
+                        (source_descriptor_word_addr =
+                             descriptor_word_source_addr[(size_t)in.src[0].value], true);
                     if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v)) {
                         set_value(in.dst.value, v);
                         if (source_key_known && valid_reg(in.dst.value)) {
@@ -3089,6 +3241,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (source_origin_known && valid_reg(in.dst.value)) {
                             val_seed_origin[(size_t)in.dst.value] = source_origin;
                             val_seed_origin_known.set((size_t)in.dst.value);
+                        }
+                        if (source_descriptor_word_known && valid_reg(in.dst.value)) {
+                            descriptor_word_source_addr[(size_t)in.dst.value] =
+                                source_descriptor_word_addr;
+                            descriptor_word_source_known.set((size_t)in.dst.value);
                         }
                     } else forget(in.dst.value);
                     mark_null_origin(in.dst.value, source_null_origin);
@@ -3156,9 +3313,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     std::array<uint32_t, 2> source_values{};
                     std::array<uint32_t, 2> source_keys{};
                     std::array<uint32_t, 2> source_origins{};
+                    std::array<uint64_t, 2> source_descriptor_word_addrs{};
                     std::array<uint32_t, 2> source_null_origins{};
                     std::array<bool, 2> source_key_known{};
                     std::array<bool, 2> source_origin_known{};
+                    std::array<bool, 2> source_descriptor_word_known{};
                     bool source_known = true;
                     for (int k = 0; k < 2; ++k) {
                         const int src = in.src[0].value + k;
@@ -3171,6 +3330,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             val_seed_origin_known.test((size_t)src);
                         if (source_origin_known[(size_t)k])
                             source_origins[(size_t)k] = val_seed_origin[(size_t)src];
+                        source_descriptor_word_known[(size_t)k] = valid_reg(src) &&
+                            descriptor_word_source_known.test((size_t)src);
+                        if (source_descriptor_word_known[(size_t)k])
+                            source_descriptor_word_addrs[(size_t)k] =
+                                descriptor_word_source_addr[(size_t)src];
                         source_null_origins[(size_t)k] = null_origin(src);
                     }
                     for (int k = 0; k < 2; ++k) {
@@ -3187,6 +3351,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (source_origin_known[(size_t)k] && valid_reg(dst)) {
                             val_seed_origin[(size_t)dst] = source_origins[(size_t)k];
                             val_seed_origin_known.set((size_t)dst);
+                        }
+                        if (source_descriptor_word_known[(size_t)k] && valid_reg(dst)) {
+                            descriptor_word_source_addr[(size_t)dst] =
+                                source_descriptor_word_addrs[(size_t)k];
+                            descriptor_word_source_known.set((size_t)dst);
                         }
                         mark_null_origin(dst, source_null_origins[(size_t)k]);
                     }
@@ -3953,6 +4122,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         mark_optional_null_role(sdst + 1, OptionalNullRole::BaseHi);
                     }
                 }
+                if (n == 8 || n == 16) {
+                    // The per-register tags were cleared by set_value(); install exact lanes only
+                    // after this successful mapped read. Aligned x8 windows inside x16 loads then
+                    // naturally retain distinct contiguous base addresses.
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const int reg_value = sdst + static_cast<int>(k);
+                        if (!valid_reg(reg_value)) continue;
+                        descriptor_word_source_addr[(size_t)reg_value] =
+                            addr + k * sizeof(uint32_t);
+                        descriptor_word_source_known.set((size_t)reg_value);
+                    }
+                }
                 if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
                     const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
                     for (uint32_t k = 0; k < n; ++k) {
@@ -4191,6 +4372,27 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         }
                         if (common_key_known) tkey = common_key;
                     }
+                    uint64_t t8_source_addr = 0;
+                    if (t8) {
+                        bool contiguous_source_known = true;
+                        for (int k = 0; k < 8; ++k) {
+                            const int reg_value = tbase + k;
+                            if (!valid_reg(reg_value) ||
+                                !descriptor_word_source_known.test((size_t)reg_value)) {
+                                contiguous_source_known = false;
+                                break;
+                            }
+                            const uint64_t word_addr =
+                                descriptor_word_source_addr[(size_t)reg_value];
+                            if (k == 0) t8_source_addr = word_addr;
+                            else if (word_addr != t8_source_addr +
+                                                    static_cast<uint64_t>(k) * sizeof(uint32_t)) {
+                                contiguous_source_known = false;
+                                break;
+                            }
+                        }
+                        if (!contiguous_source_known) t8_source_addr = 0;
+                    }
                     const bool from_seed = t8 && seed_provenance;
                     if (trc) {
                         fprintf(stderr, "[dyntrace] MIMG pc=%u op=0x%x srsrc=s%d ssamp=s%d "
@@ -4210,6 +4412,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                     if (t8) {
                         SrtUse u; u.kind = 0; u.t8 = *t8;
+                        u.descriptor_source_addr = t8_source_addr;
                         u.key = tkey;
                         u.use_pc = in.pc;
                         // image_store plus EVERY integer image atomic -- an atomic is a read-modify-write, so a
@@ -5304,7 +5507,8 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 }
 
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
-                                                       bool is_ps, uint32_t draw_vertex_count) {
+                                                       bool is_ps, uint32_t draw_vertex_count,
+                                                       uint64_t draw_command_order) {
     if (!code_addr) return nullptr;
     const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
@@ -6022,6 +6226,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         if (std::getenv("PROSPER_DBG"))
                             fprintf(stderr, "[srt] %s null-image pc=%u key=0x%x (exact all-zero T#)\n",
                                     is_ps ? "PS" : "VS", u.use_pc, u.key);
+                        record_null_image_source_probe(
+                            code_addr, u.use_pc, u.descriptor_source_addr,
+                            draw_command_order, u.t8);
                         t.resources.push_back(rn);
                         continue;
                     }
@@ -8949,9 +9156,21 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // submit can write a pointer or descriptor consumed by the next dispatch (Astro Bot's BVH root
     // is one such dependency). Pre-realizing every compute snapshots stale guest bytes.
     const bool can_eagerly_realize_draws = !has_ordered_dma && !has_indirect;
-    std::vector<DrawItem> draws = can_eagerly_realize_draws && g_live && width && height
-        ? realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true)
-        : std::vector<DrawItem>{};
+    // The normal AGC path is serialized, but execute_ordered_and_present is public and tests may
+    // call it concurrently. The active collection generation is process-global because eager draw
+    // workers need to see it, so serialize armed executions only; the default path never locks.
+    std::unique_lock<std::mutex> null_image_source_probe_run_lock(
+        g_null_image_source_probe_run_mutex, std::defer_lock);
+    if (null_image_source_probe_program()) null_image_source_probe_run_lock.lock();
+    std::vector<DrawItem> draws;
+    if (can_eagerly_realize_draws && g_live && width && height) {
+        g_collect_null_image_source_probe_submit.store(
+            null_image_source_probe_program() ? submit_no : 0u, std::memory_order_relaxed);
+        draws = realize_gpustate_draws(st, 0x10000, sx, sy, nullptr, true);
+        g_collect_null_image_source_probe_submit.store(0, std::memory_order_relaxed);
+    }
+    std::vector<NullImageSourceProbe> null_image_source_probes =
+        take_null_image_source_probes(draws, submit_no);
     const ShaderRecompileCacheStats shader_after = timing_enabled
         ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
     const ShaderDecodeCacheStats decode_after = timing_enabled
@@ -8984,6 +9203,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                                    pending_capture ? &capture_trace : nullptr,
                                    can_eagerly_realize_draws ? &draws : nullptr)
         : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
+    check_null_image_source_probes(null_image_source_probes, submit_no);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
 

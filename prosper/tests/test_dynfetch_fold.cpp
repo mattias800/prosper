@@ -2209,8 +2209,29 @@ int main() {
     CHECK(abs_adjacent_uses.size() == 1 && abs_adjacent_uses[0].kind == 0 &&
               abs_adjacent_uses[0].use_pc == 3 &&
               abs_adjacent_uses[0].is_storage_image &&
-              abs_adjacent_uses[0].t8 == expected_atomic_t8,
-          "Astro s_abs_i32 preserves the adjacent x8 image-table pointer");
+              abs_adjacent_uses[0].t8 == expected_atomic_t8 &&
+              abs_adjacent_uses[0].descriptor_source_addr == abs_adjacent_image_addr,
+          "Astro s_abs_i32 preserves the adjacent x8 image and its exact table source");
+
+    // Mutate the exact provenance path after the same x8 load: duplicate source lane zero into
+    // lane one. The live T# remains fully known and all words descend from the same load window,
+    // but it no longer equals the contiguous 32 bytes at that address. A window-only origin would
+    // make the post-submit probe report a false change even when memory stayed untouched.
+    const uint32_t reordered_image_load[] = {
+        0xf40c0907u, 0xfa000000u,   // s_load_dwordx8 s[36:43], s[14:15], 0
+        0xbea50324u,                // s_mov_b32 s37, s36 (duplicate/reorder one source lane)
+        0xf0200108u, 0x00090600u,   // image_store v6, v0, s[36:43] dmask:x 2D
+        0xbf810000u,
+    };
+    std::vector<SrtUse> reordered_image_uses;
+    resolve_dynamic_fetch(reordered_image_load, std::size(reordered_image_load),
+                          abs_adjacent_seed, std::size(abs_adjacent_seed), 0,
+                          &reordered_image_uses);
+    CHECK(reordered_image_uses.size() == 1 && reordered_image_uses[0].kind == 0 &&
+              reordered_image_uses[0].use_pc == 3 &&
+              reordered_image_uses[0].t8[1] == reordered_image_uses[0].t8[0] &&
+              reordered_image_uses[0].descriptor_source_addr == 0,
+          "same-window lane reorder drops contiguous image-source provenance");
 
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
