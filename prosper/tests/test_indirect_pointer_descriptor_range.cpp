@@ -438,6 +438,47 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
               captured_unused->internal_bytes.empty(),
           "unused oversized descriptor remains inspectable without a fabricated backing");
 
+    ComputeItem invalid_runtime = compute;
+    invalid_runtime.resources =
+        std::make_shared<ShaderResourceTable>(*compute.resources);
+    ShaderResource duplicate_binding;
+    duplicate_binding.cls = ResourceClass::ConstantBuffer;
+    duplicate_binding.format = DataFormat::Uint32;
+    duplicate_binding.num_components = 1u;
+    duplicate_binding.binding = source_binding;
+    invalid_runtime.resources->resources.push_back(duplicate_binding);
+    const DescriptorValidationReport invalid_runtime_report =
+        validate_spirv_descriptor_interface(
+            invalid_runtime.spirv, invalid_runtime.resources.get(), 0u,
+            SpirvShaderStage::Compute, false);
+    GpuCaptureFile invalid_runtime_capture;
+    error.clear();
+    const bool invalid_runtime_captured = capture_submit_items(
+        {}, {invalid_runtime}, {{SubmitOperationKind::Dispatch, 0u, 1u}},
+        metadata, capture_reader, invalid_runtime_capture, error);
+    const GpuCapturedResource* invalid_runtime_unused = invalid_runtime_captured
+        ? captured_resource_at(invalid_runtime_capture, unused_large_pc) : nullptr;
+    CHECK(!invalid_runtime_report.ok() &&
+              spirv_descriptor_reflection_complete(invalid_runtime_report) &&
+              invalid_runtime_unused &&
+              invalid_runtime_unused->blob_index == UINT32_MAX,
+          "valid reflection still prunes unused candidates when the runtime table is invalid");
+    const DescriptorValidationReport malformed_report =
+        validate_spirv_descriptor_interface(
+            {0u}, invalid_runtime.resources.get(), 0u,
+            SpirvShaderStage::Compute, false);
+    ComputeItem malformed_compute = compute;
+    malformed_compute.spirv = {0u};
+    GpuCaptureFile malformed_capture;
+    error.clear();
+    CHECK(!spirv_descriptor_reflection_complete(malformed_report) &&
+              !capture_submit_items(
+                  {}, {malformed_compute},
+                  {{SubmitOperationKind::Dispatch, 0u, 1u}}, metadata,
+                  capture_reader, malformed_capture, error) &&
+              error.find("per-resource ceiling") != std::string::npos,
+          "malformed SPIR-V takes the conservative path and rejects the oversized candidate");
+
     ComputeItem used_oversized = compute;
     used_oversized.spirv = compute.spirv;
     GpuCaptureFile rejected_capture;

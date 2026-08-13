@@ -44,7 +44,7 @@ inline bool recompiled_compute_preserves_capture_descriptor_domain(
     const gpu::DescriptorValidationReport stored =
         gpu::validate_spirv_descriptor_interface(
             stored_spirv, resources, 0u, gpu::SpirvShaderStage::Compute, false);
-    if (!stored.ok()) return true;
+    if (!gpu::spirv_descriptor_reflection_complete(stored)) return true;
     const gpu::DescriptorValidationReport recompiled =
         gpu::validate_spirv_descriptor_interface(
             recompiled_spirv, resources, 0u, gpu::SpirvShaderStage::Compute, false);
