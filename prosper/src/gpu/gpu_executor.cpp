@@ -4351,8 +4351,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             d.width <= 16384 && d.height <= 16384 &&
                             d.type >= 8 && d.type <= 15;
                     }
+                    // An all-zero direct T# is architectural null state, not a malformed image that
+                    // needs to pass the ordinary descriptor plausibility gate. Preserve it as an
+                    // exact-PC use just like an all-zero table-loaded T#: build_stage_table applies
+                    // the operation-class rule and admits only sampled reads as null Textures, while
+                    // stores and atomics remain fail-visible. A partially-zero/nonzero seed still has
+                    // to satisfy the normal image checks and cannot enter through this exception.
+                    const bool exact_null_seed = seed_provenance && live_t8_known &&
+                        std::all_of(live_t8.begin(), live_t8.end(),
+                                    [](uint32_t word) { return word == 0; });
                     const std::array<uint32_t, 8>* t8 =
-                        live_t8_known && (have_t8 || (seed_provenance && plausible_seed))
+                        live_t8_known &&
+                                (have_t8 || (seed_provenance &&
+                                             (plausible_seed || exact_null_seed)))
                             ? &live_t8 : nullptr;
                     uint32_t tkey = 0xFFFFFFFFu;
                     if (t8 && have_key) {
@@ -6203,8 +6214,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     // Deliberately narrow, and each clause is load-bearing:
                     //   * EXACTLY zero, all eight dwords -- a nonzero-but-implausible base stays
                     //     fail-visible, which is what the base-zero/low-base screen exists for.
-                    //   * `have_t8` only -- an UNKNOWN T# is a different frontier (the other 7 pairs)
-                    //     and must not be silently turned into a null bind.
+                    //   * proven descriptor provenance only -- either one table load or exact direct
+                    //     user-data provenance. An UNKNOWN T# must not be silently turned into a
+                    //     null bind.
                     //   * sampled reads only. A storage image or atomic reaching a null descriptor is
                     //     a WRITE to nowhere; that stays rejected rather than being made to look
                     //     handled.

@@ -730,6 +730,30 @@ int main() {
           direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
           "direct user-SGPR T#/S# dwords are preserved");
 
+    // GTA V also supplies a direct T# as eight exact zero entry SGPRs. MIMG proves the register
+    // class, and the sampled-image materializer gives that architectural null state zero-sample
+    // semantics. The normal seed plausibility gate must not discard it before materialization.
+    uint32_t direct_null_seed[12]{};
+    std::copy(seed5d + 8, seed5d + 12, direct_null_seed + 8);
+    std::vector<SrtUse> direct_null_uses;
+    resolve_dynamic_fetch(k5d, std::size(k5d), direct_null_seed,
+                          std::size(direct_null_seed), 0, &direct_null_uses);
+    CHECK(direct_null_uses.size() == 1 && direct_null_uses[0].kind == 0 &&
+              direct_null_uses[0].key == 0xffffffffu &&
+              direct_null_uses[0].use_pc == 0 &&
+              std::all_of(direct_null_uses[0].t8.begin(), direct_null_uses[0].t8.end(),
+                          [](uint32_t word) { return word == 0; }),
+          "exact-null direct user-SGPR T# reaches sampled-image materialization");
+
+    // Same instruction and same base-zero descriptor, but one non-base word is nonzero. This must
+    // fail the exact-null exception rather than broadening it to malformed base-zero T# values.
+    direct_null_seed[2] = 1;
+    std::vector<SrtUse> mutated_direct_null_uses;
+    resolve_dynamic_fetch(k5d, std::size(k5d), direct_null_seed,
+                          std::size(direct_null_seed), 0, &mutated_direct_null_uses);
+    CHECK(mutated_direct_null_uses.empty(),
+          "nonzero word at the same direct T# site fails the exact-null exception");
+
     // Astro Bot's world-map kernel uses IMAGE_BVH_INTERSECT_RAY with a compact four-dword BVH
     // descriptor in s[16:19]. It must not be mistaken for an eight-dword texture descriptor.
     alignas(256) static uint32_t astro_bvh_backing[1024]{};
