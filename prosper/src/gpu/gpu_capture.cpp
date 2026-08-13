@@ -923,8 +923,21 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
             c.spirv, c.resources.get(), 0u, SpirvShaderStage::Compute,
             compute_bindings);
         if (!add_table(c.resources.get(),
-                       compute_reflected ? &compute_bindings : nullptr))
+                       compute_reflected ? &compute_bindings : nullptr)) {
+            const std::string cause = error;
+            if (cause.find("resource capture range is invalid or exceeds") ==
+                std::string::npos)
+                return false;
+            char context[768];
+            std::snprintf(
+                context, sizeof(context),
+                "compute program=0x%llx reflection=%s reflected-bindings=%zu: %s",
+                static_cast<unsigned long long>(c.code_addr),
+                compute_reflected ? "complete" : "incomplete",
+                compute_bindings.size(), cause.c_str());
+            error = context;
             return false;
+        }
     }
     for (const auto& copy : dma_copies) {
         const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
