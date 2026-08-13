@@ -35,6 +35,40 @@ struct IndirectBufferShadowAccess {
     uint32_t components = 0;
 };
 
+// Version-2 relocation shadows preserve the source bytes verbatim. Each proven source record names
+// one bounded guest interval; overlapping intervals are normalized into disjoint packed segments.
+// The translated shader keeps computing the original guest address and relocates only at a proven
+// GLOBAL consumer, so guest pointer arithmetic (including high-word canonicalization) stays intact.
+struct IndirectBufferRelocationLayout {
+    uint32_t tag = 0;
+    uint32_t version = 2;
+    uint32_t max_records = 0;
+    uint32_t max_segments = 0;
+    uint32_t max_binding_bytes = 0;
+    uint32_t witness_word_count = 0;
+};
+
+struct IndirectBufferRelocationRecord {
+    uint32_t source_byte_offset = 0;
+    uint64_t guest_address = 0;
+    uint32_t byte_count = 0;
+};
+
+struct IndirectBufferRelocationSegment {
+    uint64_t guest_address = 0;
+    uint32_t byte_count = 0;
+    uint32_t packed_byte_offset = 0;
+};
+
+struct IndirectBufferRelocationInfo {
+    uint32_t source_bytes = 0;
+    uint32_t payload_byte_offset = 0;
+    uint32_t payload_bytes = 0;
+    std::vector<IndirectBufferRelocationRecord> records;
+    std::vector<IndirectBufferRelocationSegment> segments;
+    std::vector<uint32_t> witness_words;
+};
+
 size_t indirect_buffer_shadow_header_bytes(const IndirectBufferShadowLayout& layout);
 
 bool parse_indirect_buffer_shadow(
@@ -51,5 +85,24 @@ bool build_indirect_buffer_shadow(
 bool current_indirect_buffer_shadow_matches(
     const ShaderResourceTable& table, const ShaderResource& source,
     const IndirectBufferShadowLayout& layout, std::span<const uint32_t> pointer_records);
+
+bool parse_indirect_buffer_relocation(
+    const ShaderResource& source, const uint8_t* bytes, size_t byte_count,
+    const IndirectBufferRelocationLayout& layout,
+    std::span<const IndirectBufferRelocationRecord> expected_records,
+    IndirectBufferRelocationInfo& info);
+
+bool build_indirect_buffer_relocation(
+    const ShaderResource& source, const uint8_t* source_bytes,
+    const IndirectBufferRelocationLayout& layout,
+    std::span<const IndirectBufferRelocationRecord> records,
+    std::span<const uint32_t> witness_words,
+    std::shared_ptr<std::vector<uint8_t>>& owner,
+    IndirectBufferRelocationInfo& info);
+
+bool current_indirect_buffer_relocation_matches(
+    const ShaderResourceTable& table, const ShaderResource& source,
+    const IndirectBufferRelocationLayout& layout,
+    std::span<const IndirectBufferRelocationRecord> expected_records);
 
 } // namespace prosper::gpu

@@ -1038,6 +1038,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_gta5_packed_pointer PRIVATE prosper_core)
   add_test(NAME gta5_packed_pointer COMMAND test_gta5_packed_pointer)
 
+  add_executable(test_indirect_buffer_shadow tests/test_indirect_buffer_shadow.cpp)
+  target_link_libraries(test_indirect_buffer_shadow PRIVATE prosper_core)
+  add_test(NAME indirect_buffer_shadow COMMAND test_indirect_buffer_shadow)
+
   add_executable(test_gta5_cf9200 tests/test_gta5_cf9200.cpp)
   target_link_libraries(test_gta5_cf9200 PRIVATE prosper_core)
   add_test(NAME gta5_cf9200_no_backing COMMAND test_gta5_cf9200)
