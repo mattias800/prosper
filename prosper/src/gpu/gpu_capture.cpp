@@ -761,6 +761,44 @@ bool is_compute_internal_gds(const ShaderResource& r) {
            r.cls == ResourceClass::ConstantBuffer && r.size == 64u * 1024u && r.stride == 4;
 }
 
+bool is_capture_authority_resource(const ShaderResource& resource) {
+    return is_compute_internal_gds(resource) ||
+           is_gta5_packed_pointer_marker_candidate(resource) ||
+           is_indirect_pointer_relocation_marker_candidate(resource) ||
+           is_nullable_raw_buffer_marker_candidate(resource) ||
+           is_gta5_selected_sbuffer_marker_candidate(resource) ||
+           is_gta5_cf9200_no_backing_marker_candidate(resource);
+}
+
+bool capture_authority_requires_backing(const ShaderResourceTable* table,
+                                        const ShaderResource& resource) {
+    if (is_capture_authority_resource(resource)) return true;
+    if (!table || !resource.gpu_addr) return false;
+    const uint64_t footprint = resource_footprint(resource);
+    return footprint && std::any_of(
+        table->resources.begin(), table->resources.end(),
+        [&](const ShaderResource& candidate) {
+            return is_capture_authority_resource(candidate) &&
+                   candidate.gpu_addr == resource.gpu_addr &&
+                   resource_footprint(candidate) == footprint;
+        });
+}
+
+bool capture_reflected_bindings(const std::vector<uint32_t>& spirv,
+                                const ShaderResourceTable* table,
+                                uint32_t expected_set,
+                                SpirvShaderStage expected_stage,
+                                std::set<uint32_t>& bindings) {
+    bindings.clear();
+    if (spirv.empty()) return false;
+    const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
+        spirv, table, expected_set, expected_stage, false);
+    if (!reflected.ok()) return false;
+    for (const SpirvDescriptorBinding& descriptor : reflected.descriptors)
+        bindings.insert(descriptor.binding);
+    return true;
+}
+
 constexpr uint32_t kCaptureDmaSelGds = 1u;
 constexpr uint32_t kCaptureDmaSelMemory = 3u;
 bool captured_dma_destination_is_gds(uint32_t sels) {
@@ -803,7 +841,8 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                        uint64_t resource_limit_bytes,
                        std::vector<Interval>& intervals, std::string& error) {
     uint64_t total = 0;
-    auto add_table = [&](const ShaderResourceTable* t) -> bool {
+    auto add_table = [&](const ShaderResourceTable* t,
+                         const std::set<uint32_t>* used_bindings) -> bool {
         if (!t) return true;
         for (const auto& r : t->resources) {
             if (!valid_shader_buffer_table_contract(r)) {
@@ -812,6 +851,14 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
             }
             if (is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
                 is_indirect_pointer_relocation_resource(r))
+                continue;
+            // Runtime tables intentionally retain candidates recovered while folding the guest
+            // shader even when the final SPIR-V does not reference them. The Vulkan backend and
+            // dependency graph both follow reflection at this boundary; capture must do the same.
+            // Otherwise one unused V# with a multi-gigabyte declared range can make an exact
+            // submit impossible to retain even though no emitted instruction can read it.
+            if (used_bindings && !used_bindings->contains(r.binding) &&
+                !capture_authority_requires_backing(t, r))
                 continue;
             if (r.table_index_count) {
                 for (const ShaderBufferTableEntry& entry : r.table_entries) {
@@ -867,8 +914,18 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
         }
         return true;
     };
-    for (const auto& d : draws) if (!add_table(d.vrt.get()) || !add_table(d.prt.get())) return false;
-    for (const auto& c : computes) if (!add_table(c.resources.get())) return false;
+    for (const auto& d : draws)
+        if (!add_table(d.vrt.get(), nullptr) || !add_table(d.prt.get(), nullptr))
+            return false;
+    for (const auto& c : computes) {
+        std::set<uint32_t> compute_bindings;
+        const bool compute_reflected = capture_reflected_bindings(
+            c.spirv, c.resources.get(), 0u, SpirvShaderStage::Compute,
+            compute_bindings);
+        if (!add_table(c.resources.get(),
+                       compute_reflected ? &compute_bindings : nullptr))
+            return false;
+    }
     for (const auto& copy : dma_copies) {
         const bool destination_gds = captured_dma_destination_is_gds(copy.sels);
         const bool source_gds = captured_dma_source_is_gds(copy.sels);
@@ -926,7 +983,8 @@ bool assign_blob_range(const std::vector<Interval>& intervals, uint64_t addr, ui
 
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
                    bool include_resource_data, bool allow_packed_pointer,
-                   GpuCapturedTable& dst, std::string& error) {
+                   GpuCapturedTable& dst, std::string& error,
+                   const std::set<uint32_t>* used_bindings = nullptr) {
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
@@ -949,6 +1007,11 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.host_data_size = 0;
         c.resource.dcc_metadata_host_data = nullptr;
         c.resource.dcc_metadata_host_data_size = 0;
+        if (!include_resource_data)
+            c.resource.indirect_pointer_relocation = {};
+        const bool capture_backing = !used_bindings ||
+            used_bindings->contains(r.binding) ||
+            capture_authority_requires_backing(src, r);
         if (r.table_index_count) {
             c.table_entry_blobs.resize(r.table_entries.size());
             for (size_t index = 0; index < r.table_entries.size(); ++index) {
@@ -956,7 +1019,7 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
                 ShaderBufferTableEntry& captured = c.resource.table_entries[index];
                 captured.host_data = nullptr;
                 captured.host_data_size = 0;
-                if (source.size && include_resource_data &&
+                if (source.size && include_resource_data && capture_backing &&
                     !assign_blob_range(intervals, source.gpu_addr, source.size,
                                        c.table_entry_blobs[index].blob_index,
                                        c.table_entry_blobs[index].blob_offset,
@@ -1004,10 +1067,10 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
                 return false;
             }
             c.internal_bytes.assign(r.host_data, r.host_data + internal_size);
-        } else if (n && include_resource_data &&
+        } else if (n && include_resource_data && capture_backing &&
             !assign_blob_range(intervals, r.gpu_addr, n, c.blob_index, c.blob_offset,
                                "resource was not assigned to a capture blob", error)) return false;
-        if (c.metadata_size && include_resource_data &&
+        if (c.metadata_size && include_resource_data && capture_backing &&
             !assign_blob_range(intervals, r.metadata_addr, c.metadata_size,
                                c.metadata_blob_index, c.metadata_blob_offset,
                                "DCC metadata was not assigned to a capture blob", error)) return false;
@@ -2189,8 +2252,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.system_inputs = d.system_inputs;
         c.has_pixel_inputs = d.has_pixel_inputs;
         c.has_system_inputs = d.has_system_inputs;
-        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false, c.vrt, error) ||
-            !capture_table(d.prt.get(), intervals, include_resource_data, false, c.prt, error))
+        if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
+                           c.vrt, error) ||
+            !capture_table(d.prt.get(), intervals, include_resource_data, false,
+                           c.prt, error))
             return false;
         out.draws.push_back(std::move(c));
     }
@@ -2209,8 +2274,14 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             !capture_raw_shader_version(compute.code_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
                                         c.raw_shader_index, error)) return false;
+        std::set<uint32_t> compute_bindings;
+        const bool compute_reflected = capture_reflected_bindings(
+            compute.spirv, compute.resources.get(), 0u,
+            SpirvShaderStage::Compute, compute_bindings);
         if (!capture_table(compute.resources.get(), intervals, include_resource_data, true,
-                           c.resources, error)) return false;
+                           c.resources, error,
+                           compute_reflected ? &compute_bindings : nullptr))
+            return false;
         out.computes.push_back(std::move(c));
     }
     uint32_t gds_snapshot_blob_index = 0xFFFFFFFFu;
