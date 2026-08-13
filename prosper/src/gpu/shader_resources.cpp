@@ -231,7 +231,8 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
             entry.gpu_addr != decoded_addr ||
             entry.stride != decoded_stride || entry.size != decoded_size ||
             (!null_descriptor &&
-             (decoded_format != resource.format ||
+             (entry.stride != resource.stride ||
+              decoded_format != resource.format ||
               decoded_components != resource.num_components)) ||
             (!entry.host_data && entry.host_data_size != 0u) ||
             (entry.host_data && entry.host_data_size < entry.size))

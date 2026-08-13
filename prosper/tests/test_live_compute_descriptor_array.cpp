@@ -36,7 +36,7 @@ static ShaderBufferTableEntry table_entry(std::array<uint32_t, 4>& words) {
         static_cast<uint32_t>(entry.gpu_addr),
         static_cast<uint32_t>(entry.gpu_addr >> 32u) | (entry.stride << 16u),
         entry.size / entry.stride,
-        22u << 12u,
+        20u << 12u,
     };
     return entry;
 }
@@ -123,6 +123,32 @@ int main() {
     CHECK(!prosper::frontend::plan_live_compute_buffer_descriptors(
                report.descriptors, &incomplete, true).valid,
           "the same plan rejects a table payload shorter than its declared arity");
+
+    auto rejected_contract = [&](const ShaderResourceTable& mutated) {
+        return !validate_spirv_descriptor_interface(
+                    spirv, &mutated, 0, SpirvShaderStage::Compute, false).ok() &&
+               !prosper::frontend::plan_live_compute_buffer_descriptors(
+                    report.descriptors, &mutated, true).valid;
+    };
+    ShaderResourceTable wrong_stride = resources;
+    ShaderBufferTableEntry& wrong_stride_entry =
+        wrong_stride.resources[0].table_entries[1];
+    wrong_stride_entry.stride = 8;
+    wrong_stride_entry.vsharp[1] =
+        (wrong_stride_entry.vsharp[1] & 0x0000ffffu) | (8u << 16u);
+    wrong_stride_entry.vsharp[2] = wrong_stride_entry.size / 8u;
+    CHECK(rejected_contract(wrong_stride),
+          "one entry with a different guest stride rejects in validation and the backend plan");
+
+    ShaderResourceTable wrong_format = resources;
+    wrong_format.resources[0].table_entries[1].vsharp[3] = 22u << 12u;
+    CHECK(rejected_contract(wrong_format),
+          "one entry with a different guest format rejects in validation and the backend plan");
+
+    ShaderResourceTable unsupported_control = resources;
+    unsupported_control.resources[0].table_entries[1].vsharp[3] |= 1u << 19u;
+    CHECK(rejected_contract(unsupported_control),
+          "one entry with an unrepresented V# control rejects in validation and the backend plan");
 
     prosper::gpu::ComputeItem item;
     item.spirv = spirv;

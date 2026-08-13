@@ -335,6 +335,7 @@ int main() {
     descriptor_array.cls = ResourceClass::ConstantBuffer;
     descriptor_array.format = DataFormat::Uint32;
     descriptor_array.num_components = 1;
+    descriptor_array.stride = 4;
     descriptor_array.binding = 2;
     descriptor_array.table_index_count = 2;
     descriptor_array.table_entry_stride = 120;
