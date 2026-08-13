@@ -2132,6 +2132,47 @@ int main() {
     }
     printf("  [ok]   Wave32 CFG admits exact two-source VOP3B carry packet at an s0 join\n");
 
+    // The exact GTA V pc576 VOP3 packet is v_mul_lo_u32, whose encoded SRC2 field is reserved.
+    // Join a scalar and mask lifetime in s0 before it, then force the portable dispatcher with the
+    // same irreducible tail used above. The two-source opcode must ignore SRC2; mutating only that
+    // opcode to a genuine three-source v_mad_u32_u24 must restore the ambiguous s0 rejection.
+    uint32_t wave32_compute_vop3_mul_two_source_join[] = {
+        0x7d8a06f9u, 0x06868080u,            // pc0: exact VOPC SDWA packet -> s0 mask
+        0xbf068008u,                         // pc2: independent scalar branch condition
+        0xbf840001u,                         // pc3: one edge retains the s0 mask
+        0xbe800380u,                         // pc4: other edge replaces s0 with scalar data
+        0xd5690001u, 0x00020302u,            // pc5: exact v_mul_lo_u32 v1,v2,v1
+        0x7e040280u,                         // pc7: irreducible crossing-CFG tail
+        0x7c020300u,                         // pc8: v_cmp_lt_u32_e32 vcc, v0, v1
+        0xbf860001u,                         // pc9: s_cbranch_vccz -> pc11
+        0x7e040281u,                         // pc10: v_mov_b32_e32 v2, 1
+        0x7d840100u,                         // pc11: v_cmp_eq_u32_e32 vcc, v0, v0
+        0xbf870001u,                         // pc12: s_cbranch_vccnz -> pc14
+        0xbf82fffdu,                         // pc13: s_branch -> pc11
+        0x7e040d02u,                         // pc14: v_mov_b32_e32 v2, v2
+        0xbf810000u,
+    };
+    const auto vop3_mul_two_source_join_spv = recompile_compute(
+        wave32_compute_vop3_mul_two_source_join,
+        std::size(wave32_compute_vop3_mul_two_source_join), nullptr,
+        wave32_vop3b_two_source_config);
+    if (vop3_mul_two_source_join_spv.empty() ||
+        !has_opcode(vop3_mul_two_source_join_spv, 251) ||
+        !type_result_ids_are_nonzero(vop3_mul_two_source_join_spv, nullptr) ||
+        !phi_ids_are_nonzero(vop3_mul_two_source_join_spv)) {
+        printf("  [FAIL] Wave32 CFG treated two-source VOP3 multiply as reading SRC2\n");
+        return 1;
+    }
+    wave32_compute_vop3_mul_two_source_join[5] = 0xd5430001u;
+    if (!recompile_compute(
+             wave32_compute_vop3_mul_two_source_join,
+             std::size(wave32_compute_vop3_mul_two_source_join), nullptr,
+             wave32_vop3b_two_source_config).empty()) {
+        printf("  [FAIL] genuine three-source mutation lost its ambiguous s0 dependency\n");
+        return 1;
+    }
+    printf("  [ok]   Wave32 VOP3 multiply arity survives exact-site three-source mutation\n");
+
     // GTA V's rejected Wave32 compute siblings produce a fresh VCC_LO carry at PC79 with the
     // no-carry-in VOP3B family, then consume it at PC83 through implicit VCC. A later crossing CFG
     // forces the portable arbitrary-CFG dispatcher, which must carry that one-word mask lifetime

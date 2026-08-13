@@ -395,6 +395,137 @@ int main() {
                             smem_x2_descriptor_fragment_config).empty(),
           "x2 fragment rejects a consumer lacking key-less exact-PC provenance");
 
+    // Program 0x413cf9a00 uses ordinary aligned descriptor-table offsets outside the two offsets
+    // that originally motivated this proof. Keep its exact pc3 load and pc11 consumer: the whole-CFG
+    // use proof, rather than an immediate-value allowlist, must establish that the pair is descriptor
+    // provenance and omit the fallback constant-buffer range.
+    const uint32_t smem_x2_aligned_immediate_fragment[] = {
+        0xbfa00003u,
+        0xd7460000u, 0x04010c07u,
+        0xf4040500u, 0xfa000090u,   // pc3: s_load_dwordx2 s[20:21], s[0:1], 0x90
+        0xbe960304u,
+        0xbe9703ffu, 0x00016204u,
+        0xbf8cc07fu,
+        0xbe951d92u,
+        0x816ac104u,
+        0xe0302000u, 0x80050100u,   // pc11: buffer_load_dword v1, v0, s[20:23], 0
+        0xbf810000u,
+    };
+    ShaderResourceTable smem_x2_aligned_immediate_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1; buffer.binding = 4;
+      buffer.gpu_addr = 0x240000u; buffer.size = 120; buffer.fetch_pc = 11;
+      smem_x2_aligned_immediate_rt.resources.push_back(buffer); }
+    ComputeShaderConfig smem_x2_aligned_immediate_config =
+        smem_x2_descriptor_fragment_config;
+    smem_x2_aligned_immediate_config.user_sgprs.resize(24);
+    const std::vector<uint32_t> smem_x2_aligned_immediate_spv = recompile_compute(
+        smem_x2_aligned_immediate_fragment,
+        std::size(smem_x2_aligned_immediate_fragment),
+        &smem_x2_aligned_immediate_rt, smem_x2_aligned_immediate_config);
+    const DescriptorValidationReport smem_x2_aligned_immediate_report =
+        validate_spirv_descriptor_interface(smem_x2_aligned_immediate_spv,
+                                            &smem_x2_aligned_immediate_rt, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(!smem_x2_aligned_immediate_spv.empty() &&
+              smem_x2_aligned_immediate_report.ok() &&
+              find_spirv_descriptor_binding(smem_x2_aligned_immediate_report, 0, 4) &&
+              !find_spirv_descriptor_binding(smem_x2_aligned_immediate_report, 0, 2),
+          "aligned immediate x2 fragment routes pc11 without an inflated fallback cbuf");
+    uint32_t smem_x2_aligned_immediate_wrong_dst[
+        std::size(smem_x2_aligned_immediate_fragment)];
+    std::copy(std::begin(smem_x2_aligned_immediate_fragment),
+              std::end(smem_x2_aligned_immediate_fragment),
+              std::begin(smem_x2_aligned_immediate_wrong_dst));
+    smem_x2_aligned_immediate_wrong_dst[3] = 0xf4040480u; // pc3: load s[18:19]
+    CHECK(recompile_compute(smem_x2_aligned_immediate_wrong_dst,
+                            std::size(smem_x2_aligned_immediate_wrong_dst),
+                            &smem_x2_aligned_immediate_rt,
+                            smem_x2_aligned_immediate_config).empty(),
+          "aligned immediate x2 same-site SDATA mutation remains fail-visible");
+
+    // Program 0x413dd6e00 loads its address fragment into physical VCC, then relocates it into the
+    // final V# with one carry pair. Keep the production pc23/26/29/34 packets and their exact PCs.
+    // The loaded VCC mask cannot be observed, the final carry is dead, and only the exact pc34
+    // resource consumes the derived words.
+    std::vector<uint32_t> smem_x2_relocated_fragment(23, 0xbf800000u);
+    const uint32_t smem_x2_relocated_tail[] = {
+        0xf4041a80u, 0xfa000050u,   // pc23: s_load_dwordx2 vcc, s[0:1], 0x50
+        0xbf8cc07fu,
+        0x8014006au,               // pc26: s_add_u32 s20, vcc_lo, s0
+        0xbe9703ffu, 0x00016204u,
+        0x8215016bu,               // pc29: s_addc_u32 s21, vcc_hi, s1
+        0xbe960380u,
+        0xbf800000u,
+        0xbe951d92u,
+        0xbf8cc07fu,
+        0xe0302000u, 0x80050201u,   // pc34: buffer_load_dword v2, v1, s[20:23], 0
+        0xbf810000u,
+    };
+    smem_x2_relocated_fragment.insert(smem_x2_relocated_fragment.end(),
+                                       std::begin(smem_x2_relocated_tail),
+                                       std::end(smem_x2_relocated_tail));
+    ShaderResourceTable smem_x2_relocated_rt;
+    { ShaderResource buffer{}; buffer.cls = ResourceClass::ConstantBuffer;
+      buffer.format = DataFormat::Uint32; buffer.num_components = 1; buffer.binding = 4;
+      buffer.gpu_addr = 0x280000u; buffer.size = 120; buffer.fetch_pc = 34;
+      smem_x2_relocated_rt.resources.push_back(buffer); }
+    ComputeShaderConfig smem_x2_relocated_config = smem_x2_descriptor_fragment_config;
+    smem_x2_relocated_config.user_sgprs.resize(24);
+    const std::vector<uint32_t> smem_x2_relocated_spv = recompile_compute(
+        smem_x2_relocated_fragment.data(), smem_x2_relocated_fragment.size(),
+        &smem_x2_relocated_rt, smem_x2_relocated_config);
+    const DescriptorValidationReport smem_x2_relocated_report =
+        validate_spirv_descriptor_interface(smem_x2_relocated_spv,
+                                            &smem_x2_relocated_rt, 0,
+                                            SpirvShaderStage::Compute, false);
+    CHECK(!smem_x2_relocated_spv.empty() && smem_x2_relocated_report.ok() &&
+              find_spirv_descriptor_binding(smem_x2_relocated_report, 0, 4) &&
+              !find_spirv_descriptor_binding(smem_x2_relocated_report, 0, 2),
+          "VCC x2 fragment relocates through its carry pair without a fallback cbuf");
+    std::vector<uint32_t> smem_x2_relocated_wrong_high = smem_x2_relocated_fragment;
+    smem_x2_relocated_wrong_high[29] = 0x82150169u; // pc29: high source s105, not vcc_hi
+    CHECK(recompile_compute(smem_x2_relocated_wrong_high.data(),
+                            smem_x2_relocated_wrong_high.size(),
+                            &smem_x2_relocated_rt,
+                            smem_x2_relocated_config).empty(),
+          "relocated x2 same-site high-source mutation remains fail-visible");
+    std::vector<uint32_t> smem_x2_relocated_reads_vcc = smem_x2_relocated_fragment;
+    smem_x2_relocated_reads_vcc[25] = 0x02020100u; // pc25: implicit VCC predicate
+    CHECK(recompile_compute(smem_x2_relocated_reads_vcc.data(),
+                            smem_x2_relocated_reads_vcc.size(),
+                            &smem_x2_relocated_rt,
+                            smem_x2_relocated_config).empty(),
+          "relocated x2 rejects an implicit VCC observation of the loaded pair");
+    std::vector<uint32_t> smem_x2_relocated_gap_scc = smem_x2_relocated_fragment;
+    smem_x2_relocated_gap_scc[27] = 0xbe9703fdu; // pc27: s_mov_b32 s23,scc
+    smem_x2_relocated_gap_scc[28] = 0xbf800000u;
+    CHECK(recompile_compute(smem_x2_relocated_gap_scc.data(),
+                            smem_x2_relocated_gap_scc.size(),
+                            &smem_x2_relocated_rt,
+                            smem_x2_relocated_config).empty(),
+          "relocated x2 rejects an SCC observation between low and high address adds");
+    std::vector<uint32_t> smem_x2_relocated_later_scc = smem_x2_relocated_fragment;
+    smem_x2_relocated_later_scc[30] = 0xbe960580u; // pc30: s_cmov_b32 s22,0
+    CHECK(recompile_compute(smem_x2_relocated_later_scc.data(),
+                            smem_x2_relocated_later_scc.size(),
+                            &smem_x2_relocated_rt,
+                            smem_x2_relocated_config).empty(),
+          "relocated x2 rejects a later observer of the final descriptor-add carry");
+    std::vector<uint32_t> smem_x2_relocated_wave32_high_read =
+        smem_x2_relocated_fragment;
+    smem_x2_relocated_wave32_high_read.back() = 0x7d840000u; // pc36: VOPC replaces VCC_LO only
+    smem_x2_relocated_wave32_high_read.push_back(0x7e02026bu); // pc37: read loaded VCC_HI
+    smem_x2_relocated_wave32_high_read.push_back(0xbf810000u);
+    ComputeShaderConfig smem_x2_relocated_wave32_config = smem_x2_relocated_config;
+    smem_x2_relocated_wave32_config.wave_size = 32;
+    smem_x2_relocated_wave32_config.native_subgroup_size = 32;
+    CHECK(recompile_compute(smem_x2_relocated_wave32_high_read.data(),
+                            smem_x2_relocated_wave32_high_read.size(),
+                            &smem_x2_relocated_rt,
+                            smem_x2_relocated_wave32_config).empty(),
+          "Wave32 VOPC does not hide a later read of loaded VCC_HI");
+
     // Program 0x413dc6700 has the same family at exact pc10, this time feeding the V# consumed by
     // S_BUFFER_LOAD at pc67. Keep both production packets at their original PCs; transparent NOPs
     // stand in for the unrelated body between descriptor construction and consumption.
