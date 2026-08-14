@@ -106,6 +106,10 @@ falsification.
   invocation iterates together. #2481.
 - **The hang is a non-uniform early exit.** The 14,370-line disassembled module contains exactly
   **one** `OpReturn`, at the end. No `OpKill`, none inside any of the three dispatcher loops. #2481.
+- **The hang is a cyclic traversal table (183 cyclic starts).** **RETRACTED — see the retraction
+  section above.** The 183 cycles are in `0x20f848417c`, the table read by the dispatch that
+  *completed*; the hanging dispatch reads `0x20f848a240`, which is acyclic with a longest chain of 11
+  steps. The measurement was taken from the wrong dispatch's binding. #2542.
 - **A lost atomic corrupts the traversal table.** The table that hangs `0x413dc6700` is a linked list
   whose corruption is 61 **two-cycles** (`i` and `i+2` pointing at each other), the classic signature
   of a non-atomic concurrent insertion — two threads each linking to the other because both read the
@@ -149,53 +153,43 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
-## The 183-cycle measurement is real but its PROVENANCE is not — read this before building on it
+## RETRACTED: the cyclic-table root cause. The hanging dispatch's table is ACYCLIC.
 
-Two facts that only make sense together, and their conflict is the most useful thing known about this
-defect.
+Earlier revisions of this file, and several comments on #2542 and #2481, stated that `0x413dc6700`
+hangs because its traversal table contains 183 cyclic start indices. **That is wrong**, and it was
+wrong in the most embarrassing way: I measured the wrong buffer.
 
-**Every start index is used.** The consumer's walk begins at `v1 = v68`, and `v68 = (s2 << 8) + v0`
-(`pc1`), i.e. the global thread index; `pc74`'s `v_cmpx_gt_i32_e32 s18, v68` masks it to `< 2063`. So
-threads 0..2062 walk the chain from their own index — **all 2063 starts, no exceptions**. The
-cycle census over every start index is therefore exactly the right measurement, and any cycle in the
-table is fatal rather than unreachable arena garbage. (This also kills the tempting hypothesis that
-the starts are wrong and the table is fine: the starts are the thread index, and cannot be wrong.)
+`0x413dc6700` runs many times per submit with **different tables**. Same program, same fetch PC,
+different resolved base:
 
-**But `compute[37]` completed on that table.** `compute[37]` (source 38, order 16836) is recorded as
-executed, and the hang is `source 39` at order 16841 with no operation between them. Both bind the
-same base. If the snapshotted table has 183 cyclic starts and every start is walked, source 38 must
-have hung too. It did not.
+| dispatch | binding 8 @ `pc=0x5b` | outcome | cycles | longest chain |
+| --- | --- | --- | --- | --- |
+| `compute[37]`, source 38, order 16836 | `0x20f848417c` | **completed** | **183** | 58 |
+| `failure[1]`, source 39, order 16841 | `0x20f848a240` | **HUNG** | **0** | **11** |
 
-**So the capsule's resource snapshot for `compute[37]` is not what `compute[37]` read.** The buffer is
-rebuilt many times per run (below), so a snapshot taken at realization can lag or lead the bytes the
-GPU actually consumed. That does not make the 183 cycles imaginary — the hang needs a cycle and
-nothing else explains it — but it does mean **the cycle count cannot currently be attributed to a
-specific dispatch**, and the live-vs-offline comparison built on it inherits that weakness.
+I dumped `--dump-compute-resource 37:8` believing it was the hanging dispatch's table. It is the
+*succeeding* one's. The whole cyclic-table chain was built on the buffer belonging to the dispatch
+that worked.
 
-Establishing snapshot provenance — when the capture reads a compute resource relative to the dispatch
-that consumes it — is the prerequisite for any further work on this defect. Without it, every number
-in this section is a measurement of an unknown moment.
+Two conclusions follow, and the second is the useful one:
 
-## The traversal table is rebuilt many times per run — compare only WITHIN one capsule
+- **The hanging dispatch's table is well-formed.** Zero cycles from all 2063 starts, longest chain
+  **11 steps**, 19,038 total steps across every start. That loop cannot hang on this data — it is
+  three orders of magnitude short of a watchdog timeout.
+- **A table WITH 183 cycles was walked by a dispatch that completed.** So a cycle in this structure
+  does not hang the shader either, and the loop model that predicted it must be incomplete — most
+  likely the per-dispatch `s18` bound means the cyclic region (indices 412..1238) is not reachable
+  from that dispatch's start set.
 
-Measured live with `PROSPER_COMPUTELOG_CODE=0x413ce3400` over a 120 s route: `0x413ce3400` writes
-`0x20f848a240` **at least 20 times**, each write changing 10,000-14,000 of the 16,508 bytes and
-producing a different content hash. One of those writes lands on `9c8a80d289972043` — the exact hash
-the offline replay produces — and the others do not.
+**So the cause of the hang is unknown again.** What survives is everything about the *consequence*:
+`0x413dc6700` hangs deterministically at the same dispatch index, RADV hard-recovers, live compute is
+disabled process-wide, the indirect latch drops every remaining draw, and skipping that one program
+yields zero device losses and the first real scene content this title has produced. The mechanism
+inside the shader is not established, and the "183 must become 0" oracle is void.
 
-So the buffer is a **per-frame structure**, not a stable one, and two consequences follow:
-
-- **A cross-run or cross-frame comparison of this table proves nothing.** Two hashes differing is the
-  normal case. The only valid comparison is within one capsule: the same submit's recorded
-  pre-producer, pre-consumer and offline-replayed states.
-- **The write-back is not missing.** An earlier framing of the defect as "the producer's result never
-  reaches the consumer" was reached before this was known. The write-back happens, changes ~11,000
-  bytes, and its first dwords (`0, 0x18, 0x40000018, 0x38, …`) match the offline-correct shape rather
-  than the cyclic one.
-
-What survives that correction, because it is a within-capsule measurement: in `cap-cls2`'s single
-submit, the live consumer's input contains **183 cyclic start indices** while the offline replay of
-that same submit's prefix produces **0**, and the two differ by 2,355 of 8,252 bytes.
+The pointer-chase loop is now *less* likely to be the hang: it is one of three dispatcher loops in the
+module, and it is the one just shown to be bounded at 11 iterations on the hanging dispatch's own
+data. The other two are unexamined.
 
 ## Other open defects
 
