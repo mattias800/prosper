@@ -123,6 +123,48 @@ def check(changes):
             % (len(new_sources), ", ".join(sorted(new_sources)[:5]))
         )
 
+    # Rule 3 -- new code under prosper/src/ with no call site.
+    #
+    # Every subject below already existed in prosper when it was submitted, and each was
+    # reimplemented as a self-contained island that nothing invoked:
+    #
+    #   #2524  path_case_resolution.hpp   vs  resolve_host_path_case()   (boot_program.hpp, #1226)
+    #   #2525  export_collision_*.cpp     vs  find_export_collision()    (linker.cpp, plus the
+    #                                        aliased-export tracking of #1635 and the handle-first
+    #                                        resolution of #147)
+    #   #2507  core/event_bus.hpp         vs  prosper/src/diagnostics/core/event_bus.hpp (#2495)
+    #
+    # The common shape is not "bad code" -- those PRs carried MORE test lines than source lines and
+    # read as finished work. It is that a contributor who cannot build or run prosper cannot discover
+    # what already exists, so they produce a well-tested component wired to nothing. Requiring a call
+    # site is the cheapest mechanical proxy for "this was integrated rather than invented beside".
+    #
+    # A modification anywhere prosper actually executes counts -- src, the frontends, or the tools --
+    # because a caller is a caller.
+    #
+    # Headers count as new files here, deliberately. #2524 is header-only (95 lines) plus 418 lines
+    # of test, and a header nothing includes is as unreachable as a .cpp nothing calls. An earlier
+    # draft of this rule exempted headers; the selftest rejected three arms and forced the question,
+    # which is what the arms are for.
+    new_under_src = [p for p in added if p.startswith("prosper/src/")]
+    modified_callers = [
+        p for s, p in changes
+        if s == "M" and (p.startswith("prosper/src/")
+                         or p.startswith("prosper/frontends/")
+                         or p.startswith("prosper/tools/"))
+    ]
+    if new_under_src and not modified_callers:
+        problems.append(
+            "adds %d new file(s) under prosper/src/ but modifies no existing file under "
+            "prosper/src/, prosper/frontends/ or prosper/tools/: %s. Nothing calls this, so no "
+            "behaviour it implements can be reached or observed -- and a facility with no caller "
+            "hides its own defects (an incompatible signature, an unreachable state, a broken "
+            "disabled-path stub). Check first whether prosper already does this: several "
+            "submissions have reimplemented resolve_host_path_case (#1226), find_export_collision "
+            "(linker.cpp) or the merged EventBus (#2495). Wire it to one real call site."
+            % (len(new_under_src), ", ".join(sorted(new_under_src)[:5]))
+        )
+
     return problems
 
 
@@ -149,19 +191,32 @@ def selftest():
         ("rule 1: a new top-level directory", [("A", "framework/thing.hpp")]),
         ("rule 2: new source, no test touched", [("A", "prosper/src/diagnostics/foo.cpp")]),
         ("both rules at once", [("A", "core/x.hpp"), ("A", "prosper/src/y.cpp")]),
+        ("rule 3: new src files, nothing modified (#2525)",
+         [("A", "prosper/src/loader/export_collision_diagnostics.cpp"),
+          ("A", "prosper/src/loader/export_collision_diagnostics.hpp"),
+          ("A", "prosper/tests/test_export_collision_diagnostics.cpp")]),
+        ("rule 3: source and test, no caller (was a must-pass arm before rule 3)",
+         [("A", "prosper/src/diagnostics/foo.cpp"), ("A", "prosper/tests/test_foo.cpp")]),
+        ("rule 3: new header island, tests only (#2524)",
+         [("A", "prosper/src/host/path_case_resolution.hpp"),
+          ("A", "prosper/tests/test_path_case_resolution.cpp")]),
     ]
     must_pass = [
-        ("source plus a test", [("A", "prosper/src/diagnostics/foo.cpp"),
-                                ("A", "prosper/tests/test_foo.cpp")]),
-        ("source plus a MODIFIED test", [("A", "prosper/src/foo.cpp"),
-                                         ("M", "prosper/tests/test_gpu_capture.cpp")]),
         ("modifying an existing source, no test", [("M", "prosper/src/gpu/gpu_capture.cpp")]),
         ("docs only", [("M", "prosper/docs/GAME_COMPAT_ORCHESTRATION.md")]),
         ("root-level markdown", [("A", "CONTRIBUTING.md")]),
         ("workflow change", [("M", ".github/workflows/ci.yml")]),
-        ("a new header under prosper/src (no .cpp)", [("A", "prosper/src/diagnostics/x.hpp")]),
         ("scripts and assets", [("A", "scripts/x.sh"), ("A", "assets/x.png")]),
         ("a deleted root file", [("D", "core/old.hpp")]),
+        ("new source WITH a call site (the #2495 shape)",
+         [("A", "prosper/src/diagnostics/core/context.cpp"),
+          ("M", "prosper/src/host/boot_program.cpp"),
+          ("A", "prosper/tests/test_diagnostics_enabled.cpp")]),
+        ("new source whose caller is a frontend",
+         [("A", "prosper/src/gpu/thing.cpp"),
+          ("M", "prosper/frontends/shared/live_compute.cpp"),
+          ("M", "prosper/tests/test_game_compute.cpp")]),
+        ("test-only change", [("M", "prosper/tests/test_gpu_capture.cpp")]),
     ]
 
     failures = 0
