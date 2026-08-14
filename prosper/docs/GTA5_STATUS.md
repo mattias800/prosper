@@ -153,7 +153,7 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
-## CONFIRMED: the hang is a non-terminating CFG DISPATCHER loop, and more than one program has it
+## STRONG BUT UNCONFIRMED: bounding one dispatcher phase is the only change that gets past the hang
 
 `PROSPER_CFG_TRIP_BOUND=N` (new, diagnostic) forces every dispatcher loop out after N iterations. With
 `N=100000` the run gets **past** `0x413dc6700` and dies much later at a **different** program:
@@ -179,8 +179,8 @@ single arm line naming that one program:
 Same instrumentation, same module perturbation, different constant. That removes the two alternatives
 an untargeted bound leaves open: it cannot be an *earlier* truncated shader feeding different data
 downstream (no other shader is touched), and it cannot be SPIR-V perturbation changing RADV code
-generation (both arms carry the identical counter). **`0x413dc6700`'s loop genuinely exceeds 4,096
-iterations.**
+generation (both arms carry the identical counter). This is targeted A/B evidence that phase 0's loop is implicated. It is **not** proof that the
+cap fired — see the witness section below.
 
 **Which phase spins — bisected.** `PROSPER_CFG_TRIP_BOUND_PHASE=K` bounds only the K-th dispatcher of
 the selected program. Three runs, everything else byte-identical:
@@ -191,7 +191,7 @@ the selected program. Three runs, everything else byte-identical:
 | 1 | 117..129 | dies at `0x413dc6700` dispatch 39 |
 | 2 | 130..902 | dies at `0x413dc6700` dispatch 39 |
 
-**Only bounding phase 0 saves the device.** Phase 0 covers guest pc 0..116, and the program's only
+**Only bounding phase 0 saves the device** (targeted A/B evidence, not proof of a cap hit). Phase 0 covers guest pc 0..116, and the program's only
 loop is at **pc 88..97** — inside it. That is the pointer chase:
 
 ```
@@ -228,6 +228,25 @@ LDS-reduction path for a barrier-phased dispatcher with a partial final workgrou
 subgroup path. Two things checked there and found correct: the vote mailboxes (`vote_pending_var`,
 `vote_value_var`, …) are reset at the top of every dispatcher iteration, so a stale vote cannot carry
 over; and each lane's LDS contribution is gated on its own `pending` bit.
+
+**The device-side hit witness is BUILT and DOES NOT WORK — its positive control fails.** The shader
+writes four dwords (hit flag, phase, last block, trip count) into the top of the internal GDS buffer
+when a cap runs out, and the host reports and clears them after each dispatch. At bound 4,096 it
+reported **zero hits**, which would read as "the cap was never reached".
+
+That reading is unavailable, because the positive control fails too: at **bound 2** — which a 15-block
+dispatcher phase cannot possibly satisfy — it also reports **zero hits**. The instrument cannot fire,
+so its silence carries no information at all, and the 4,096 null is void rather than negative.
+
+Until the witness is fixed, "the loop exceeds N iterations" rests only on targeted A/B survival, which
+**cannot distinguish a real cap hit from the bound's literal operand changing RADV code generation** —
+the constant is an `OpULessThan` operand, so every bound value is a different SPIR-V module. That
+objection stands and is the reason the heading above says "unconfirmed".
+
+Candidates for why the witness is inert, none yet checked: the internal GDS binding may not be
+injected for a program that uses no GDS of its own; the reflected descriptor may not be writable, so
+the backend never copies results back; or the module may be served from the shader cache without the
+instrumentation (the compile key omits both the program address and the trip-bound settings).
 
 **A cheap hit-witness attempt that does NOT work, recorded so nobody repeats it.** Idea: run the same
 phase-0 bound at 4,096 and 65,536 and compare the program's write-back hashes — if the loop terminates

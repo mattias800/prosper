@@ -16393,8 +16393,12 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // is gated by emit_body to complex compute CFGs without guest barriers. Ordinary LDS reads, writes,
 // and atomics remain valid while waves visit different cases. V_MBCNT is split into a dedicated
 // common phase so every workgroup invocation reaches its synthesized barriers in uniform control flow.
-// PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Bound EVERY emitted loop (the CFG dispatcher and both
-// structured loop forms) at N iterations.
+// PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Bound the CFG DISPATCHER's loop at N iterations, on
+// whichever back-edge it emits (direct or portable).
+//
+// It does NOT cover the two structured loop emitters. An earlier revision of this comment claimed it
+// did; it never called this helper from either, so the claim was false and would have made a null
+// result from a structured-loop program read as evidence.
 //
 // A loop that never terminates hangs the GPU into a driver reset, which costs the whole process its
 // compute backend and every later indirect draw — and from outside it is indistinguishable from a
@@ -16405,6 +16409,22 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // Unset, nothing is emitted and modules are byte-identical. It is NOT a fix: truncating a guest
 // program's control flow produces wrong results by construction, which is why it is opt-in and says
 // so when it arms.
+// See kComputeTripWitnessDword. Deliberately ignores the phase selector: if ANY phase of this program
+// will be bounded, the witness destination has to be bound for the whole dispatch.
+bool compute_trip_witness_active(uint64_t program_address) {
+    const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
+    if (!spec || !*spec) return false;
+    char* end = nullptr;
+    const unsigned long long parsed = strtoull(spec, &end, 0);
+    if (!end || *end || !parsed || parsed > 0xffffffffull) return false;
+    const char* only = getenv("PROSPER_CFG_TRIP_BOUND_PROGRAM");
+    if (!only || !*only) return true;
+    char* only_end = nullptr;
+    const unsigned long long wanted = strtoull(only, &only_end, 0);
+    if (!only_end || *only_end) return true;
+    return program_address == wanted;
+}
+
 uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
                                 uint32_t start_pc, uint32_t end_pc) {
     static const uint32_t bound = [] {
@@ -16455,8 +16475,8 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
     }
     if (first)
         fprintf(stderr,
-                "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..%u) bounded at %u "
-                "iterations (DIAGNOSTIC: truncates guest control flow)\n",
+                "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
+                "bounded at %u iterations (DIAGNOSTIC: truncates guest control flow)\n",
                 static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound);
     return bound;
 }
@@ -18446,6 +18466,9 @@ bool emit_cfg_state_machine(
     const uint32_t cfg_trip_bound =
         emitted_loop_trip_bound(b.diagnostic.program_address, cfg_phase,
                                 ins.empty() ? 0u : ins.front().pc,
+                                // END-EXCLUSIVE. `ins.back()` is an emitter-appended S_ENDPGM at the
+                                // barrier pc for a phased region, so reporting it names a synthetic
+                                // instruction as guest code. Report the boundary instead.
                                 ins.empty() ? 0u : ins.back().pc);
     const uint32_t trip_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
     if (trip_var) b.store_function(trip_var, b.uconst(0));
@@ -20116,12 +20139,36 @@ bool emit_cfg_state_machine(
         }
     }
 
+    // Apply the diagnostic trip bound to whichever back-edge this dispatcher actually emits.
+    //
+    // This used to live only in the portable branch below, while the arm was announced before the
+    // split — so a DIRECT dispatcher printed "bounded" and then emitted an unbounded loop. An
+    // announced-but-inert lever is worse than no lever: it invites exactly the reading that the
+    // instrument was applied, which is how a null result gets published as evidence.
+    auto apply_trip_bound = [&](uint32_t keep_going) {
+        if (!trip_var) return keep_going;
+        const uint32_t next_trip =
+            b.ibin(Op_IAdd, b.load_function(b.t_u32, trip_var), b.uconst(1));
+        b.store_function(trip_var, next_trip);
+        const uint32_t under_bound = b.ucmp(Op_ULessThan, next_trip, b.uconst(cfg_trip_bound));
+        // WITNESS. A cap that is armed but never reached proves nothing, so record the hit where the
+        // host can read it: the internal GDS buffer's top four dwords (kComputeTripWitnessDword).
+        // Predicated on "still nominally running AND the bound just ran out", so a loop that exits
+        // normally writes nothing and the ABSENCE of a record is itself an answer.
+        const uint32_t hit = b.land(keep_going, b.logical_not(under_bound));
+        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 0), b.uconst(1), true, hit);
+        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 1), b.uconst(cfg_phase), true, hit);
+        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 2),
+                            b.load_function(b.t_u32, pc_var), true, hit);
+        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 3), next_trip, true, hit);
+        return b.land(keep_going, under_bound);
+    };
     if (direct_dispatch) {
         // Native wave operations and votes were already resolved in the selected case.  PC and
         // ACTIVE are scalar guest-wave state, so every invocation in this exact-size subgroup has
         // the same value; another subgroup in the workgroup may still leave independently because
         // this path contains no workgroup barriers.
-        b.emit_condbranch(b.load_function(b.t_bool, active_var),
+        b.emit_condbranch(apply_trip_bound(b.load_function(b.t_bool, active_var)),
                           loop_header, loop_merge);
     } else {
     // Atomicized LDS-store common phase. Each guest DS_WRITE packet is one dispatcher event. The
@@ -20734,15 +20781,7 @@ bool emit_cfg_state_machine(
     b.store_function(pc_var, b.sel(write_pc, selected_pc, b.load_function(b.t_u32, pc_var)));
     uint32_t group_active = b.ucmp(
         Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
-    if (trip_var) {
-        // count++ ; continue only while count < bound. Placed on the back-edge so the bound counts
-        // dispatcher ITERATIONS, which is the quantity in question.
-        const uint32_t next_trip =
-            b.ibin(Op_IAdd, b.load_function(b.t_u32, trip_var), b.uconst(1));
-        b.store_function(trip_var, next_trip);
-        group_active = b.land(
-            group_active, b.ucmp(Op_ULessThan, next_trip, b.uconst(cfg_trip_bound)));
-    }
+    group_active = apply_trip_bound(group_active);
     b.emit_condbranch(group_active, loop_header, loop_merge);
     }
     b.emit_label(loop_merge);

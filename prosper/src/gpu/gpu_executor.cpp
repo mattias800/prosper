@@ -7509,7 +7509,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 return in.fmt == Rdna2Format::DS && in.ds_gds &&
                        (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
             });
-            if (uses_gds) {
+            // A bounded dispatcher needs the internal GDS buffer as its witness destination even when
+            // the guest program never touches GDS — see kComputeTripWitnessDword.
+            if (uses_gds || compute_trip_witness_active(code_addr)) {
                 ShaderResource gds;
                 gds.cls = ResourceClass::ConstantBuffer;
                 gds.format = DataFormat::Uint32;

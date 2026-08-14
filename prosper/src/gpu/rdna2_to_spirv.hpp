@@ -24,6 +24,20 @@ constexpr uint32_t kDefaultComputePgmRsrc1 = 3u << 16;
 
 inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 
+// PROSPER_CFG_TRIP_BOUND witness. When a dispatcher loop is bounded and the bound is REACHED, the
+// shader records what happened into the top of the internal GDS buffer, which is already host-backed
+// and read back after the dispatch. Arming a bound is not the same as hitting one, and until a run
+// can show a hit, "the loop exceeds N" rests on inference from device survival rather than evidence.
+//
+// Four dwords at the very top of a 16,384-dword buffer, chosen so a guest that genuinely uses GDS
+// cannot plausibly collide: hit flag, dispatcher phase, the lane's last block index, and the trip
+// count reached.
+inline constexpr uint32_t kComputeTripWitnessDword = 16380u;
+
+// True when any dispatcher loop in `program_address` will be bounded, so the executor knows it must
+// bind the internal GDS buffer even for a program that uses no GDS of its own.
+bool compute_trip_witness_active(uint64_t program_address);
+
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 

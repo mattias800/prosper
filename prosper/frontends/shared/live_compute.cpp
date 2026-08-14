@@ -8882,6 +8882,32 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
         });
 }
 
+// Report a PROSPER_CFG_TRIP_BOUND hit, and clear it.
+//
+// Arming a bound is not the same as reaching one. Without this, "the loop exceeds N iterations" is an
+// inference from the device surviving, and a reviewer is right to refuse it: the same survival is
+// equally consistent with the instrumented module simply compiling differently. The shader writes
+// four dwords at the top of the internal GDS buffer when the cap actually runs out, and this is the
+// only thing that turns that inference into a record.
+//
+// Cleared after reporting so each hit is attributable to the dispatch that produced it rather than
+// to whichever dispatch happens to read the slot next.
+void report_trip_bound_witness(const prosper::gpu::ComputeItem& item) {
+    uint8_t* gds = prosper::gpu::compute_gds_backing();
+    if (!gds) return;
+    uint32_t* witness = reinterpret_cast<uint32_t*>(gds) + prosper::gpu::kComputeTripWitnessDword;
+    if (!witness[0]) return;
+    std::fprintf(stderr,
+                 "[cfg-trip-bound] HIT program=0x%llx phase=%u last-block=%u trips=%u "
+                 "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
+                 static_cast<unsigned long long>(item.code_addr), witness[1], witness[2], witness[3],
+                 static_cast<unsigned long long>(item.submit_no),
+                 static_cast<unsigned long long>(item.dispatch_index),
+                 static_cast<unsigned long long>(item.command_order),
+                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+    witness[0] = witness[1] = witness[2] = witness[3] = 0;
+}
+
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
     auto fail_closed_items = [&]() {
         for (const auto& item : items)
@@ -8991,6 +9017,7 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             all_ok &= *cpu_result;
         } else {
             const bool item_ok = execute_item(context, item);
+            report_trip_bound_witness(item);
             all_ok &= item_ok;
             if (!item_ok)
                 prosper::gpu::notify_compute_authority_boundary({
