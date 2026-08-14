@@ -182,7 +182,32 @@ downstream (no other shader is touched), and it cannot be SPIR-V perturbation ch
 generation (both arms carry the identical counter). **`0x413dc6700`'s loop genuinely exceeds 4,096
 iterations.**
 
-What is still NOT established is *which* of its three emitted phases spins, and there is no
+**Which phase spins — bisected.** `PROSPER_CFG_TRIP_BOUND_PHASE=K` bounds only the K-th dispatcher of
+the selected program. Three runs, everything else byte-identical:
+
+| phase bounded | guest pc range | outcome |
+| --- | --- | --- |
+| **0** | **0..116** | **gets past `0x413dc6700`**, dies later at `0x413e14900` |
+| 1 | 117..129 | dies at `0x413dc6700` dispatch 39 |
+| 2 | 130..902 | dies at `0x413dc6700` dispatch 39 |
+
+**Only bounding phase 0 saves the device.** Phase 0 covers guest pc 0..116, and the program's only
+loop is at **pc 88..97** — inside it. That is the pointer chase:
+
+```
+ 88  v_mov_b32_e32     v2, s22
+ 89  v_cmpx_ne_u32_e32 0, v1        ; EXEC &= (v1 != 0), never restored in the loop
+ 90  s_cbranch_execz   7            ; exit when EXEC == 0
+ 91  buffer_load_dword v1, v1, s[0:3], 0 idxen
+ 95  v_bfe_u32         v1, v1, 3, 27
+ 97  s_branch          -10
+```
+
+So the runaway dispatcher is the one wrapping the EXEC-narrowing walk, and the walk's own data gives
+a maximum chain of 11 steps. The defect is named to a program, a phase and a 117-instruction guest pc
+range.
+
+What is still NOT established is, and there is no
 device-side witness that a cap was actually reached — the run log records that the feature armed, not
 that it fired. A hit witness (program, phase ordinal, workgroup, last `pc_var`, trip count, read back
 after the dispatch) is the next instrument, and it is what would turn this into a named

@@ -361,6 +361,10 @@ struct SpirvCompute {
     // spirv-val with a LAYOUT complaint that says nothing about descriptors.
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
     RecompileDiagnosticContext diagnostic{};
+    // Ordinal of the next CFG dispatcher emitted for THIS module. A barrier-phased compute program
+    // emits one dispatcher per barrier-free phase, and they are not interchangeable — each covers a
+    // different guest pc range. Numbering them lets a diagnostic name which one it means.
+    uint32_t cfg_phase_ordinal = 0;
     bool descriptor_indexing_declared = false;
     // Declare the capability set and extension for an indexed descriptor array, once per module and
     // only when one is actually declared, so every module that does not use one is byte-identical to
@@ -16401,7 +16405,8 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // Unset, nothing is emitted and modules are byte-identical. It is NOT a fix: truncating a guest
 // program's control flow produces wrong results by construction, which is why it is opt-in and says
 // so when it arms.
-uint32_t emitted_loop_trip_bound(uint64_t program_address) {
+uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
+                                uint32_t start_pc, uint32_t end_pc) {
     static const uint32_t bound = [] {
         const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
         if (!spec || !*spec) return 0u;
@@ -16424,20 +16429,35 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address) {
         const unsigned long long parsed = strtoull(spec, &end, 0);
         return (!end || *end) ? 0ull : parsed;
     }();
+    // PROSPER_CFG_TRIP_BOUND_PHASE=K — bound only the K-th dispatcher of the selected program.
+    //
+    // A barrier-phased compute program emits one dispatcher per barrier-free phase, each covering a
+    // different guest pc range. Bounding them together answers "does some loop in this program run
+    // away" but not which, and they are not equivalent: an acyclic phase that needs a bound is a CFG
+    // state-transition defect, while the phase containing the guest's own loop might merely be slow.
+    static const uint32_t only_phase = [] {
+        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND_PHASE");
+        if (!spec || !*spec) return 0xffffffffu;
+        char* end = nullptr;
+        const unsigned long long parsed = strtoull(spec, &end, 0);
+        return (!end || *end || parsed > 0xfffffffeull) ? 0xffffffffu
+                                                        : static_cast<uint32_t>(parsed);
+    }();
     if (!bound) return 0u;
     if (only_program && program_address != only_program) return 0u;
+    if (only_phase != 0xffffffffu && phase != only_phase) return 0u;
     static std::mutex announce_mutex;
-    static std::set<uint64_t> announced;
+    static std::set<std::pair<uint64_t, uint32_t>> announced;
     bool first = false;
     {
         std::lock_guard lock(announce_mutex);
-        first = announced.insert(program_address).second;
+        first = announced.insert({program_address, phase}).second;
     }
     if (first)
         fprintf(stderr,
-                "[cfg-trip-bound] program 0x%llx: every emitted loop bounded at %u iterations "
-                "(DIAGNOSTIC: truncates guest control flow)\n",
-                static_cast<unsigned long long>(program_address), bound);
+                "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..%u) bounded at %u "
+                "iterations (DIAGNOSTIC: truncates guest control flow)\n",
+                static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound);
     return bound;
 }
 
@@ -18422,7 +18442,11 @@ bool emit_cfg_state_machine(
     // Unset, nothing is emitted and the module is byte-identical. It is NOT a fix — truncating a
     // guest program's control flow produces wrong results by construction — which is why it is
     // opt-in and says so.
-    const uint32_t cfg_trip_bound = emitted_loop_trip_bound(b.diagnostic.program_address);
+    const uint32_t cfg_phase = b.cfg_phase_ordinal++;
+    const uint32_t cfg_trip_bound =
+        emitted_loop_trip_bound(b.diagnostic.program_address, cfg_phase,
+                                ins.empty() ? 0u : ins.front().pc,
+                                ins.empty() ? 0u : ins.back().pc);
     const uint32_t trip_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
     if (trip_var) b.store_function(trip_var, b.uconst(0));
     const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);
