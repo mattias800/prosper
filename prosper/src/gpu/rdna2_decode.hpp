@@ -458,6 +458,17 @@ bool rdna2_optional_null_raw_load_shape(const Rdna2Inst& in);
 // encoding, or the end of the buffer. Returns the number of dwords consumed.
 size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& out);
 
+// True when the guest program's entire body is a single terminating instruction — the shader ends
+// before executing anything. Such a dispatch completes architecturally with no memory effect
+// whatever its resource table declares, so it is a no-op by construction rather than by inference
+// about descriptors.
+//
+// This is deliberately the narrowest possible test. A program with ANY instruction before its
+// terminator is not covered, however trivially it may appear to do nothing: the point is to
+// separate "the guest asked for nothing" from "we recompiled something to nothing", and only the
+// first is safe to report as success.
+bool rdna2_program_is_terminator_only(const uint32_t* code, size_t dwords);
+
 // Exact IMAGE_LOAD_MIP / IMAGE_STORE_MIP packet subset whose mip operand may be specialized after
 // an independent value proof. Returns the dimension-specific mip VGPR when requested. This checks
 // only packet shape; callers must still prove that VGPR is zero and that the resource has one

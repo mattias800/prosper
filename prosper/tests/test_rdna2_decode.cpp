@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 using namespace prosper::gpu;
 
@@ -941,6 +942,53 @@ int main() {
     const uint32_t ds_gds[]   = { 0xd8020000u, 0x00000201u };
     CHECK(!rdna2_decode_one(ds_plain, 2).ds_gds && rdna2_decode_one(ds_gds, 2).ds_gds,
           "DS GDS flag (bit 17) decodes: ds_add_u32 vs ds_add_u32 gds");
+
+    // rdna2_program_is_terminator_only — the proof that a guest compute program does nothing at all.
+    //
+    // A dispatch of such a program has no memory effect whatever its resource table declares, so the
+    // live backend reports it as a successful no-op instead of a decline. That matters because a
+    // declined dispatch poisons `producer_epoch_ok` and, through the ParserStall latch, refuses every
+    // later indirect draw and dispatch in the submit — GTA V's `0x413cea300` is one `s_endpgm` with
+    // one declared raw buffer and blackened the world through exactly that path (#2481).
+    //
+    // Encodings from llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=gfx1030 --show-encoding:
+    //   s_endpgm        -> [0x00,0x00,0x81,0xbf]  = 0xbf810000
+    //   s_nop 0         -> [0x00,0x00,0x80,0xbf]  = 0xbf800000
+    //   s_mov_b32 s0,s1 -> [0x01,0x03,0x80,0xbe]  = 0xbe800301
+    {
+        const uint32_t endpgm_only[] = { 0xbf810000u };
+        CHECK(rdna2_program_is_terminator_only(endpgm_only, 1),
+              "a program that is exactly s_endpgm is proven terminator-only");
+        // The same word inside a larger buffer: the walk stops at the terminator, so trailing bytes
+        // beyond the program (constant tables, the next shader) must not defeat the proof.
+        const uint32_t endpgm_then_garbage[] = { 0xbf810000u, 0xdeadbeefu, 0x12345678u };
+        CHECK(rdna2_program_is_terminator_only(endpgm_then_garbage, 3),
+              "trailing words after s_endpgm do not defeat the proof");
+
+        // MUTATION ARMS. Each is one instruction away from the accepted case and must be rejected;
+        // without them the predicate is indistinguishable from `return true` for short programs.
+        //
+        // s_nop is a real instruction that does nothing observable, which is precisely the case the
+        // proof must NOT cover: the question is whether the guest asked for nothing, not whether we
+        // judge its work to be pointless.
+        const uint32_t nop_then_end[] = { 0xbf800000u, 0xbf810000u };
+        CHECK(!rdna2_program_is_terminator_only(nop_then_end, 2),
+              "s_nop before s_endpgm is NOT terminator-only, however inert it looks");
+        const uint32_t mov_then_end[] = { 0xbe800301u, 0xbf810000u };
+        CHECK(!rdna2_program_is_terminator_only(mov_then_end, 2),
+              "any instruction before s_endpgm defeats the proof");
+        // An undecodable first word also walks to exactly one entry. Only `is_end` separates it from
+        // the accepted case, so a proof keyed on instruction count alone would accept this.
+        const uint32_t undecodable[] = { 0xffffffffu };
+        std::vector<Rdna2Inst> walked;
+        rdna2_walk(undecodable, 1, walked);
+        CHECK(walked.size() == 1u && !walked.front().is_end &&
+              !rdna2_program_is_terminator_only(undecodable, 1),
+              "an undecodable first word walks to one instruction and is still NOT proven");
+        CHECK(!rdna2_program_is_terminator_only(nullptr, 0) &&
+              !rdna2_program_is_terminator_only(endpgm_only, 0),
+              "an empty or absent program is not a proof of anything");
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

@@ -1129,6 +1129,16 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
     return pc;
 }
 
+bool rdna2_program_is_terminator_only(const uint32_t* code, size_t dwords) {
+    if (!code || !dwords) return false;
+    std::vector<Rdna2Inst> instructions;
+    const size_t consumed = rdna2_walk(code, dwords, instructions);
+    // `rdna2_walk` also stops on an Unknown encoding, which decodes to a single entry exactly as a
+    // terminator does. Requiring `is_end` is what separates "the program ends here" from "we could
+    // not decode the first instruction" -- the second must keep failing loudly.
+    return consumed && instructions.size() == 1u && instructions.front().is_end;
+}
+
 bool rdna2_optional_null_raw_load_shape(const Rdna2Inst& in) {
     const bool zero_soffset =
         (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
