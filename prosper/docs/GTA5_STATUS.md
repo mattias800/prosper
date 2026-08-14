@@ -112,7 +112,7 @@ armed, a dispatcher loop must not be.
 
 | switch | default | what it does | the trap it avoids |
 | --- | --- | --- | --- |
-| `PROSPER_CFG_TRIP_BOUND[_PROGRAM,_PHASE]` | off | caps the CFG dispatcher's back edge for one program/phase, and records a device-side hit witness | covers **only** the CFG dispatcher; a null on a structurizer-accepted program means *not measured* |
+| `PROSPER_CFG_TRIP_BOUND` + `_PROGRAM` + **required** `_PHASE` | off | caps the CFG dispatcher's back edge for one program and phase, and records a device-side hit witness | covers **only** the CFG dispatcher, so a null on a structurizer-accepted program means *not measured*; without `_PHASE` nothing is emitted, because one record cannot describe two phases |
 | `PROSPER_COMPUTELOG_RAW` | off | writes a traced program's guest RDNA2 bytes for `tools/shader_inspect` | `PROSPER_SHADER_DUMP_SUCCESS` names files by hash, so recovering one program by address means hash-matching by hand |
 | `PROSPER_INDIRECT_APERTURE_RECOVERY` | **off** | rebuilds a base-less queue-2 indirect argument address from the last-seen SetBase aperture | changes execution: the aperture is learned from any SetBase on any queue, and *mapped* is not *this is the argument buffer* |
 | `PROSPER_INDIRECTLOG` | off | per-packet base/offset/queue, the three argument dwords, and an end-of-run outcome census | readability was probed and values were not, so a misread surfaced only as a `workgroup-count-limit` decline thousands of operations later |
@@ -494,8 +494,14 @@ post-submit snapshots and on the wrong dispatch's buffer, so it has to be redone
 
 ## CONFIRMED BY HIT RECORD: phase 0's dispatcher loop runs past 4,096 iterations on the hanging dispatch
 
-`PROSPER_CFG_TRIP_BOUND=N` (new, diagnostic) forces every dispatcher loop out after N iterations. With
+`PROSPER_CFG_TRIP_BOUND=N` (diagnostic) forces a dispatcher loop out after N iterations. With
 `N=100000` the run gets **past** `0x413dc6700` and dies much later at a **different** program:
+
+> **The switch has since changed and these runs predate it.** It now bounds only the program and
+> phase named by `PROSPER_CFG_TRIP_BOUND_PROGRAM` / `PROSPER_CFG_TRIP_BOUND_PHASE`, and **the phase
+> selector is required** — armed without one it emits nothing and says so. The table below was taken
+> when the bound applied to every dispatcher phase of the selected program, so reproduce it by naming
+> a phase explicitly. The maps every phase prints when the bound is armed list what is available.
 
 | run | device lost at |
 | --- | --- |

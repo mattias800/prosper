@@ -16415,7 +16415,10 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // and atomics remain valid while waves visit different cases. V_MBCNT is split into a dedicated
 // common phase so every workgroup invocation reaches its synthesized barriers in uniform control flow.
 // PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Bound the CFG DISPATCHER's loop at N iterations, on
-// whichever back-edge it emits (direct or portable).
+// whichever back-edge it emits (direct or portable). PROSPER_CFG_TRIP_BOUND_PROGRAM selects one
+// program; PROSPER_CFG_TRIP_BOUND_PHASE selects one phase and is REQUIRED — see
+// emitted_loop_trip_bound for why a record spanning two phases has no true reading. A program that
+// accesses GDS itself is refused, because the witness lives in guest-addressable storage.
 //
 // It does NOT cover the two structured loop emitters. An earlier revision of this comment claimed it
 // did; it never called this helper from either, so the claim was false and would have made a null
