@@ -18359,6 +18359,29 @@ bool emit_cfg_state_machine(
     const uint32_t exec_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t pc_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t active_var = b.function_var(b.t_bool, ptr_bool);
+    // PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Force the dispatcher out after N iterations.
+    //
+    // A dispatcher loop that never terminates hangs the GPU into a driver reset, which costs the
+    // whole process its compute backend and every later indirect draw. That failure is
+    // indistinguishable, from outside, from a shader that is merely slow or from a defect anywhere
+    // else in the submit. Bounding the loop turns "is this a non-terminating dispatcher?" into a
+    // one-run yes/no: if the device survives with a bound and dies without one, it is a loop.
+    //
+    // Unset, nothing is emitted and the module is byte-identical. It is NOT a fix — truncating a
+    // guest program's control flow produces wrong results by construction — which is why it is
+    // opt-in and says so.
+    static const uint32_t cfg_trip_bound = [] {
+        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
+        if (!spec || !*spec) return 0u;
+        char* end = nullptr;
+        const unsigned long long parsed = strtoull(spec, &end, 0);
+        if (!end || *end || !parsed || parsed > 0xffffffffull) return 0u;
+        fprintf(stderr, "[cfg-trip-bound] dispatcher loops bounded at %llu iterations "
+                        "(DIAGNOSTIC: truncates guest control flow)\n", parsed);
+        return static_cast<uint32_t>(parsed);
+    }();
+    const uint32_t trip_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
+    if (trip_var) b.store_function(trip_var, b.uconst(0));
     const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_value_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_invert_var = b.function_var(b.t_bool, ptr_bool);
@@ -20642,8 +20665,17 @@ bool emit_cfg_state_machine(
     const uint32_t write_pc = b.land(
         pending, b.land(b.logical_not(vote_to_scc), b.logical_not(vote_to_vcc)));
     b.store_function(pc_var, b.sel(write_pc, selected_pc, b.load_function(b.t_u32, pc_var)));
-    const uint32_t group_active = b.ucmp(
+    uint32_t group_active = b.ucmp(
         Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
+    if (trip_var) {
+        // count++ ; continue only while count < bound. Placed on the back-edge so the bound counts
+        // dispatcher ITERATIONS, which is the quantity in question.
+        const uint32_t next_trip =
+            b.ibin(Op_IAdd, b.load_function(b.t_u32, trip_var), b.uconst(1));
+        b.store_function(trip_var, next_trip);
+        group_active = b.land(
+            group_active, b.ucmp(Op_ULessThan, next_trip, b.uconst(cfg_trip_bound)));
+    }
     b.emit_condbranch(group_active, loop_header, loop_merge);
     }
     b.emit_label(loop_merge);

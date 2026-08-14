@@ -153,6 +153,42 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
+## CONFIRMED: the hang is a non-terminating CFG DISPATCHER loop, and more than one program has it
+
+`PROSPER_CFG_TRIP_BOUND=N` (new, diagnostic) forces every dispatcher loop out after N iterations. With
+`N=100000` the run gets **past** `0x413dc6700` and dies much later at a **different** program:
+
+| run | device lost at |
+| --- | --- |
+| default | `0x413dc6700` submit 4535 **dispatch 39** order 5642 |
+| + empty-kernel fix | `0x413dc6700` submit 5968 **dispatch 39** order 17056 |
+| + no buffer cache | `0x413dc6700` submit 5963 **dispatch 39** order 9755 |
+| + `PROSPER_WAIT_DEFER=1` | `0x413dc6700` submit 4643 **dispatch 39** order 1206 |
+| **+ `PROSPER_CFG_TRIP_BOUND=100000`** | **`0x413e14900`** submit 5954 **dispatch 52** order **24374** |
+
+Four independent configurations all die at the same program and the same dispatch index. Bounding the
+dispatcher is the only change that gets past it — so **the mechanism is a dispatcher loop that does
+not terminate**, and `0x413e14900` has the same defect further along.
+
+Strictly the bound proves the loop exceeds 100,000 iterations rather than that it is infinite. For a
+program whose only guest loop is bounded at **11** iterations on this dispatch's own data, either is a
+defect: the dispatcher iterates once per guest basic block executed, and nothing in that guest program
+justifies 100,000 of them.
+
+**The trip bound is NOT a fix** — truncating a guest program's control flow produces wrong results by
+construction. It is opt-in, says so when it arms, and exists to answer this one question.
+
+This also supersedes an earlier note in this investigation claiming that dispatcher bounds of 4,096
+and 2^20 "still lost the device". That note is contradicted by the table above and should not be
+relied on.
+
+### Where to look
+
+The dispatcher exits when the whole-workgroup liveness slot (scratch slot `padded_lanes +
+wave_count`) reads zero. Non-termination means at least one lane stays *active* forever — its
+`active_var` never clears, or its next-`pc` never reaches an exit block. That is a recompiler
+correctness question about `emit_cfg_state_machine`, independent of any resource or descriptor.
+
 ## RETRACTED: the cyclic-table root cause. The hanging dispatch's table is ACYCLIC.
 
 Earlier revisions of this file, and several comments on #2542 and #2481, stated that `0x413dc6700`
