@@ -5583,18 +5583,28 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 // full confidence. The RDNA2 out-of-range argument does not cover that case: an
                 // out-of-range index returns zero by hardware rule, but an in-range index into a
                 // descriptor we declined to decode is not out of range.
-                bool readable = guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)));
-                bool not_a_descriptor = !readable;
-                bool unsupported_descriptor = false;
-                if (readable) {
-                    std::memcpy(words.data(),
-                                reinterpret_cast<const void*>(static_cast<uintptr_t>(entry_addr)),
-                                sizeof(words));
-                    entry = decode_buffer_descriptor(words.data());
-                    not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
-                    unsupported_descriptor = !not_a_descriptor &&
-                        (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
+                // An unreadable record is NOT a record known not to be a descriptor -- we simply
+                // could not look at it. Nulling it would be the same fail-visible-to-silent-zero
+                // inversion as the unsupported case below, one category over, so it declines the
+                // whole table exactly as it did before this change.
+                if (!guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)))) {
+                    if (std::getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[srt] selected-table pc=%u REJECTED unreadable-record "
+                                     "index=%u addr=0x%llx\n",
+                                     u.use_pc, index, (unsigned long long)entry_addr);
+                    unsupported_record = true;
+                    break;
                 }
+                std::memcpy(words.data(),
+                            reinterpret_cast<const void*>(static_cast<uintptr_t>(entry_addr)),
+                            sizeof(words));
+                entry = decode_buffer_descriptor(words.data());
+                // Only a record we READ and that does not look like a descriptor at all may be
+                // nulled: a stale arena slot the guest never indexes.
+                const bool not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
+                const bool unsupported_descriptor = !not_a_descriptor &&
+                    (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
                 if (unsupported_descriptor) {
                     // Decline the WHOLE table, as before this change. A >256 MiB buffer or an
                     // unrepresentable DST_SEL / USCALED-SSCALED 2_10_10_10 is a descriptor the guest
