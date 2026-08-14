@@ -8032,6 +8032,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 buffer.after_hash = fnv1a(result, buffer.bytes);
                 for (size_t i = 0; i < buffer.bytes; i++)
                     buffer.changed_bytes += destination[i] != result[i];
+                // PROSPER_COMPUTELOG_CHANGED=N: the first N changed DWORD indices with old->new.
+                //
+                // `changed_bytes` says how much moved and nothing about where, which is the only
+                // question that separates a wrong VALUE from a wrong INDEX. For a structure written
+                // as adjacent pairs, the indices are the evidence: a head at k and its tail at k+1
+                // is correct, a head at k and a tail at k+2 is not, and neither is visible in a byte
+                // count or a hash.
+                if (const char* limit_env = std::getenv("PROSPER_COMPUTELOG_CHANGED")) {
+                    char* end = nullptr;
+                    const unsigned long limit = std::strtoul(limit_env, &end, 0);
+                    if (end && !*end && limit) {
+                        const size_t dwords = buffer.bytes / sizeof(uint32_t);
+                        const uint32_t* before = reinterpret_cast<const uint32_t*>(destination);
+                        const uint32_t* after = reinterpret_cast<const uint32_t*>(result);
+                        unsigned long shown = 0;
+                        for (size_t i = 0; i < dwords && shown < limit; ++i) {
+                            if (before[i] == after[i]) continue;
+                            std::fprintf(stderr,
+                                         "[compute]     changed binding=%u index=%zu "
+                                         "0x%08x -> 0x%08x (tag=%u bit30=%u next=%u)\n",
+                                         buffer.resource ? buffer.resource->binding : 0u, i,
+                                         before[i], after[i], after[i] & 7u,
+                                         (after[i] >> 30) & 1u, (after[i] >> 3) & 0x07FFFFFFu);
+                            ++shown;
+                        }
+                    }
+                }
             }
             // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
             // the values it already contains. Terminator 2D's startup kernel binds 8,847,360 bytes;
