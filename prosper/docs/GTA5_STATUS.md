@@ -81,6 +81,25 @@ negative case is the whole test. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc
 `PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64` and read the interleaved
 `parent-walk` / `execute` / `writeback` lines.
 
+### There are TWO writers, and the second one was never in the picture
+
+`PROSPER_COMPUTE_ADDRESS_WATCH=0x20f848417c` over a full route, 1,300 hits:
+
+| program | bindings on the table (fetch pc) |
+| --- | --- |
+| `0x413dc6700` | 53, 65, **91** (the loop's read), 618, 629, 641, 653, 665, 677 |
+| `0x413dc3400` | 597, 608, 620, 632, 644, 656 |
+
+**`0x413dc3400` also writes this table**, through six bindings, and nothing in the investigation had
+accounted for it. It is the program that runs immediately before the hanging dispatch — the walk
+lines say `previous-code=0x413dc3400 previous-realized=1 previous-executed=1` — and it is on the
+`role=terminal` list, so it is lowered through the CFG dispatcher as well.
+
+This is exactly why the single-transition "confirmation" was wrong: flips with no write from
+`0x413dc6700` are explained by a writer nobody was watching. On the one transition this run captured,
+**both** programs touched the table since the previous read, so the correlation cannot yet separate
+them — but the candidate set is now closed at two, which it was not before.
+
 ### FALSIFIED: our store INDICES are wrong
 
 Grouped strictly per `(submit, dispatch)` — the ungrouped form of this analysis is meaningless and
