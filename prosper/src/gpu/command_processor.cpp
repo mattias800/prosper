@@ -4937,6 +4937,22 @@ void GpuState::apply(const Pm4Command& c) {
                             (unsigned long long)lo, (unsigned long long)ap20,
                             (unsigned long long)hi64);
                 }
+                // Readable is not the question; PLAUSIBLE is. A recovered address can be mapped and
+                // still be the wrong bytes, and then the dispatch is declined much later for a
+                // workgroup-count limit with no way to tell a genuine huge launch from a misread
+                // one. Printing the three group-count dwords makes that distinction local to the
+                // packet: real counts are small, and a misread reports whatever happens to live
+                // there. Live GTA V evidence for why this matters — 0xff000000 in all three fields.
+                if (d.indirect_args_addr && guest_readable(d.indirect_args_addr, 12) &&
+                    logged.load() < 64) {
+                    const uint32_t* args =
+                        reinterpret_cast<const uint32_t*>(uintptr_t(d.indirect_args_addr));
+                    fprintf(stderr,
+                            "[agc-dispatchindirect]   args=[%u, %u, %u] (0x%08x 0x%08x 0x%08x)%s\n",
+                            args[0], args[1], args[2], args[0], args[1], args[2],
+                            (args[0] > 0xffffffu || args[1] > 0xffffffu || args[2] > 0xffffffu)
+                                ? "  IMPLAUSIBLE" : "");
+                }
             }
             dispatches.push_back(std::move(d));
             dispatch_count++;
