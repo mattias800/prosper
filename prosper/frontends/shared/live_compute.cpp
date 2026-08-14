@@ -42,6 +42,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -4411,12 +4412,30 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // Keep timing selection and the transfer/authority censuses above this return so investigations
     // still observe the proven no-op program. No Vulkan objects or queue submission are needed.
     if (all_proven_no_backing_noop || terminator_only_noop) {
+        const char* which = terminator_only_noop ? "terminator-only guest program"
+                                                 : "only proven no-backing resources";
+        // Announced once per program even without the trace selector. This path converts what used
+        // to be a loud decline into silence, and "prosper decided this dispatch does nothing" is
+        // exactly the claim a later investigation needs to see and be able to doubt — a wrong proof
+        // here would silently drop real work, which is the failure mode CLAUDE.md calls fatal.
+        // Once per program, so a kernel dispatched hundreds of times per frame costs one line.
+        {
+            static std::mutex mutex;
+            static std::set<uint64_t> announced;
+            bool first = false;
+            {
+                std::lock_guard lock(mutex);
+                first = announced.insert(item.code_addr).second;
+            }
+            if (first)
+                std::fprintf(stderr,
+                             "[compute] program 0x%llx is a proven no-op (%s) -> reported executed\n",
+                             static_cast<unsigned long long>(item.code_addr), which);
+        }
         if (trace)
             std::fprintf(stderr,
                          "[compute] program 0x%llx is a proven no-op (%s) -> executed\n",
-                         static_cast<unsigned long long>(item.code_addr),
-                         terminator_only_noop ? "terminator-only guest program"
-                                              : "only proven no-backing resources");
+                         static_cast<unsigned long long>(item.code_addr), which);
         return true;
     }
     if (has_storage_images && !ctx.image_support) {
