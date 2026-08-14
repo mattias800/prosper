@@ -17335,8 +17335,14 @@ bool emit_cfg_state_machine(
             return in.src[0].value;
         if (in.src[0].kind == OperandKind::Special && in.src[0].value == 106)
             return 106;
-        // Canonical EXEC is already resolved from architectural state by emit_alu.  No other
-        // special register or odd half is a complete B64 mask source.
+        // Architectural EXEC is a complete B64 mask source. emit_alu already materializes this
+        // reduction from EXEC directly, but the MUST dataflow below has to agree, or the result is
+        // a scalar the dispatcher erases at the next block entry -- see the note at the
+        // exact_mask_reduction use. The exactness precondition is emit_alu's own: the ballot equals
+        // the guest wave mask only when the native subgroup IS the guest wave.
+        if (in.src[0].kind == OperandKind::Special && in.src[0].value == 126 &&
+            b.native_subgroup_size == b.wave_size)
+            return 126;
         return -1;
     };
     auto wave64_mbcnt_mask_root = [&](const Rdna2Inst& in) -> int {
@@ -17530,9 +17536,12 @@ bool emit_cfg_state_machine(
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
 
             const int reduction_source = wave64_mask_reduction_source(in);
+            // EXEC needs no saved-mask lifetime: it is architectural state that always holds a
+            // live mask, so it is exact wherever the source helper admits it.
             const bool exact_mask_reduction =
-                reduction_source >= 0 && masks.contains(reduction_source);
-            if (record_compare && reduction_source >= 0 && masks.contains(reduction_source))
+                reduction_source == 126 ||
+                (reduction_source >= 0 && masks.contains(reduction_source));
+            if (record_compare && exact_mask_reduction)
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int mbcnt_root = wave64_mbcnt_mask_root(in);
             if (record_compare && mbcnt_root >= 0 && masks.contains(mbcnt_root))
@@ -19026,7 +19035,9 @@ bool emit_cfg_state_machine(
                 }
                 if (proven_wave64_mask_reduction_pcs.contains(in.pc)) {
                     const int source = wave64_mask_reduction_source(in);
-                    const bool mask_available = source == 106
+                    const bool mask_available = source == 126
+                        ? state.exec != 0
+                        : source == 106
                         ? state.vcc != 0
                         : state.sreg_bool.contains(source);
                     if (source < 0 || !mask_available)
