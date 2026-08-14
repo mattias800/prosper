@@ -4498,8 +4498,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     bool ok = false;
     bool submission_entered = false;
     bool completion_proven = false;
-    auto vk_ok = [&](VkResult result, const char* stage) {
-        if (result == VK_SUCCESS) return true;
+    // Shared failure handling for both the declining and the non-declining helpers below. A
+    // VK_ERROR_DEVICE_LOST is fatal wherever it happens, including in optional setup, so it is
+    // reported and latched here rather than in either caller.
+    auto vk_note_failure = [&](VkResult result, const char* stage) {
         if (result == VK_ERROR_DEVICE_LOST && !ctx.device_lost) {
             ctx.device_lost = true;
             std::fprintf(stderr,
@@ -4514,14 +4516,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=%d\n",
                                 stage, static_cast<int>(result));
-        // `stage` is a string literal at every call site. A Vulkan failure is already identified by
-        // the stage that produced it, so the stage name is the reason.
+    };
+    // Declining forms: the dispatch cannot proceed, so the census must name the refusal.
+    // `stage` is a string literal at every call site, and a Vulkan failure is already identified by
+    // the stage that produced it, so the stage name is the reason.
+    auto vk_ok = [&](VkResult result, const char* stage) {
+        if (result == VK_SUCCESS) return true;
+        vk_note_failure(result, stage);
         return decline(stage);
     };
     auto vk_handle_ok = [&](auto handle, const char* stage) {
         if (handle != VK_NULL_HANDLE) return true;
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=null-handle\n", stage);
         return decline(stage);
+    };
+    // NON-declining forms, for setup whose failure disables an OPTIONAL feature and lets the
+    // dispatch run anyway. The GPU result-comparison path is the only such caller: a false
+    // `compare_ready` merely clears `compare_targets` and drops each `compare_flag_index`, after
+    // which the dispatch proceeds and can succeed.
+    //
+    // Routing those through the declining form would make `[compute-decline]` fire — with a running
+    // count — for a dispatch that then executed, which is precisely the class of misread instrument
+    // this change exists to end. A census that names non-events is worse than no census, because the
+    // count is what invites trust.
+    auto vk_soft_ok = [&](VkResult result, const char* stage) {
+        if (result == VK_SUCCESS) return true;
+        vk_note_failure(result, stage);
+        return false;
+    };
+    auto vk_soft_handle_ok = [&](auto handle, const char* stage) {
+        if (handle != VK_NULL_HANDLE) return true;
+        if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=null-handle\n", stage);
+        return false;
     };
 
     auto cleanup = [&] {
@@ -7020,17 +7046,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bci.size = compare_targets.size() * sizeof(uint32_t);
             bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            compare_ready = vk_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &compare_flags),
-                                  "compare-flags-buffer");
+            compare_ready = vk_soft_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &compare_flags),
+                                       "compare-flags-buffer");
             VkMemoryRequirements requirements{};
             if (compare_ready) {
                 vkGetBufferMemoryRequirements(ctx.device, compare_flags, &requirements);
                 compare_flags_memory = ctx.allocate_memory(
                     requirements.size, ctx.host_memory_type(requirements.memoryTypeBits), true);
-                compare_ready = vk_handle_ok(compare_flags_memory, "compare-flags-memory") &&
-                    vk_ok(vkBindBufferMemory(ctx.device, compare_flags,
-                                            compare_flags_memory, 0),
-                          "compare-flags-bind");
+                compare_ready = vk_soft_handle_ok(compare_flags_memory, "compare-flags-memory") &&
+                    vk_soft_ok(vkBindBufferMemory(ctx.device, compare_flags,
+                                                 compare_flags_memory, 0),
+                               "compare-flags-bind");
             }
             if (compare_ready) {
                 VkDescriptorPoolSize size{
@@ -7040,7 +7066,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 dpci.maxSets = static_cast<uint32_t>(compare_targets.size());
                 dpci.poolSizeCount = 1;
                 dpci.pPoolSizes = &size;
-                compare_ready = vk_ok(vkCreateDescriptorPool(
+                compare_ready = vk_soft_ok(vkCreateDescriptorPool(
                     ctx.device, &dpci, nullptr, &compare_descriptor_pool),
                     "compare-descriptor-pool");
             }
@@ -7053,7 +7079,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 allocate.descriptorPool = compare_descriptor_pool;
                 allocate.descriptorSetCount = static_cast<uint32_t>(layouts.size());
                 allocate.pSetLayouts = layouts.data();
-                compare_ready = vk_ok(vkAllocateDescriptorSets(
+                compare_ready = vk_soft_ok(vkAllocateDescriptorSets(
                     ctx.device, &allocate, compare_descriptor_sets.data()),
                     "compare-descriptor-sets");
             }
@@ -7675,7 +7701,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (prosper::gpu::shared_present_active()) qlk.lock();
                 const VkResult drain_result = vkQueueWaitIdle(ctx.queue);
                 completion_proven = drain_result == VK_SUCCESS;
-                if (!vk_ok(drain_result, "queue-drain") && trace)
+                // Soft: this drain runs INSIDE the queue-wait failure path, which has already
+                // declined. Declining again would report one fence timeout as two refusals.
+                if (!vk_soft_ok(drain_result, "queue-drain") && trace)
                     std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
             }
             break;
