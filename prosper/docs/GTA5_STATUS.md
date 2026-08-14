@@ -36,10 +36,26 @@ As of 2026-08-14, established and each measured rather than inferred:
 **So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
 lower it correctly.
 
-**The writer is `0x413dc6700` itself.** Its own writeback line names the table it later reads
-(`writeback binding=4 addr=0x20f848a240 changed=2062`), it reads through one binding and writes
-through another, and the two tables swap roles between dispatches — a double-buffered union-find with
-path compression. So this is a self-corrupting kernel, not a missing or refused producer.
+5. **The table has TWO writers, and the corrupting one is `0x413dc3400`.** An address watch over a
+   full route finds `0x413dc6700` on nine bindings (including the loop's read at fetch pc 91) and
+   **`0x413dc3400` on six**. Scoring each of the latter's writes by malformed head/tail pairs
+   separates the outcomes without overlap across 180 reads: clean tables follow writes with 0..13,
+   cyclic tables follow writes with 19..106. `0x413dc6700` is the victim.
+6. **Its store path is lane-predicated.** All six of its table stores sit inside an
+   `s_and_saveexec_b64` / `s_cbranch_execz` region, so *which slots are written* is decided by a
+   per-lane mask — and the defect's character is membership, not arithmetic: every record is
+   individually well-formed, in the wrong combination.
+
+**So the open question is why `0x413dc3400`'s writes go bad**, on an identical module (same SPIR-V
+hash, launch and 38 buffers either side of the transition) with only different input data.
+
+**Not established, and explicitly tested:** that each malformed pair becomes a 2-cycle. On a same-run
+join only 14% of cycle nodes sit on malformed slots against a 4.4% base rate — real enrichment, not a
+mechanism. The dispatch-level correlation stands; the slot-level one does not.
+
+**Superseded:** the paragraph that used to sit here named `0x413dc6700` as the writer and called it a
+self-corrupting kernel. It does write the table, but flips also occur in submits where it writes
+nothing, which is what the second writer explains.
 
 `0x413ce3400` was an earlier attribution and is **superseded**: it is a writer of related state and it
 is never declined on a routed run, so the "producer was refused" hypothesis is dead — but it was never
