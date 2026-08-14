@@ -865,6 +865,39 @@ prints a per-submit no-match line while a dimension filter is active. Supported 
 Vulkan in retained PM4 order. `PROSPER_COMPUTELOG_CODE=0x...` and `PROSPER_COMPUTELOG_SIZE=N` restrict
 writeback before/after hashes to a matching program and/or storage-buffer size during long live runs.
 
+**`[compute-decline]` — why the live backend refused a dispatch.** Always on, no variable needed.
+`execute_item` has sixteen refusal paths (fifteen, plus the selector below); each names itself:
+
+```
+[compute-decline] program=0x413cea300 reason=no-bindable-descriptor count=128 submit=3958 dispatch=16 order=1041 groups=1x1x1
+```
+
+**Read the `count`.** The line is limited to the first 8 per `(program, reason)` and every 64th
+after, and the running count is printed precisely so the limiter cannot be mistaken for the rate —
+`[compute] skip unsupported program` prints once per program and has twice been quoted as a census.
+A refusal also clears `producer_epoch_ok`, which the next `ParserStall` latches into
+`indirect_dependencies_ok` for the rest of the submit, so one decline early in a submit drops every
+later **indirect** draw and dispatch untried. A single named decline can therefore account for a
+frame's worth of missing geometry.
+
+**`PROSPER_COMPUTE_SKIP_PROGRAM=0xADDR[,0xADDR...]` — decline named compute programs.** A bisection
+instrument: one dispatch can take down everything after it (a GPU hang costs the process its compute
+backend), so "which dispatch is responsible?" is worth asking directly instead of by rebuilding. It
+announces itself at parse time and reports each skip through the census above as
+`reason=skipped-by-selector`, so a log from a run made with it set cannot later be mistaken for a
+default run. Two things to know before reading a result:
+
+- **A skip is a decline**, so it poisons the submit's indirect latch exactly as a real refusal would.
+  The output is *not* "the frame minus that dispatch"; it is that frame minus the dispatch minus
+  every indirect operation after the next parser stall.
+- **A program taking the CPU fast path never reaches the selector**, so naming one has no effect and
+  produces no line.
+
+It is ordered **after** `trace_compute_item` and `maybe_dump_traced_compute_spirv`, which makes
+*dump the module, skip the dispatch* work — the only way to inspect what the recompiler produced for
+a program that hangs the GPU without losing the device. Combined with `PROSPER_COMPUTELOG_CODE` /
+`PROSPER_COMPUTELOG_SPIRV`, a recompiler change can be A/B'd by module hash at zero device cost.
+
 `PROSPER_PROVENANCE_DIM=WxH` retains every decoded `CB_COLOR0_BASE` write across submits, then reports
 the last matching writer whenever a draw samples an image of that size. Descriptor resolution can be
 limited to likely target submits with `PROSPER_PROVENANCE_MIN_DRAWS=N`; color-target history is still
