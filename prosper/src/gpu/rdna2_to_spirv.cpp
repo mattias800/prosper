@@ -17335,8 +17335,26 @@ bool emit_cfg_state_machine(
             return in.src[0].value;
         if (in.src[0].kind == OperandKind::Special && in.src[0].value == 106)
             return 106;
-        // Canonical EXEC is already resolved from architectural state by emit_alu.  No other
-        // special register or odd half is a complete B64 mask source.
+        // Architectural EXEC is a complete B64 mask source. emit_alu already materializes this
+        // reduction from EXEC directly, but the MUST dataflow below has to agree, or the result is
+        // a scalar the dispatcher erases at the next block entry -- see the note at the
+        // exact_mask_reduction use. The exactness precondition is emit_alu's own: the ballot equals
+        // the guest wave mask only when the native subgroup IS the guest wave.
+        //
+        // This covers BOTH opcodes admitted above, not only the population count: 0x10 is
+        // s_bcnt1_i32_b64 and 0x14 is s_ff1_i32_b64, and `s_ff1_i32_b64 <- exec` (find-first-set over
+        // the active mask) reaches this same return. The committed fixture exercises it at dword 336,
+        // immediately before the bcnt at 337, so the wider coverage is tested rather than incidental.
+        //
+        // CONFIDENCE: HIGH — EXEC as a B64 mask source for these two reductions is architectural
+        // (RDNA2 ISA 70648 §5.3/§12.2: both take a 64-bit scalar source, and EXEC is a legal SSRC),
+        // and the wave-size guard is the same precondition emit_alu already relies on rather than a
+        // new assumption. What is NOT covered is a 32-wide native subgroup, where the ballot is not
+        // the guest wave: that returns -1 and the dispatcher declines, loudly, via
+        // [subgroup-width] ... DISABLED. See #2429.
+        if (in.src[0].kind == OperandKind::Special && in.src[0].value == 126 &&
+            b.native_subgroup_size == b.wave_size)
+            return 126;
         return -1;
     };
     auto wave64_mbcnt_mask_root = [&](const Rdna2Inst& in) -> int {
@@ -17530,9 +17548,12 @@ bool emit_cfg_state_machine(
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
 
             const int reduction_source = wave64_mask_reduction_source(in);
+            // EXEC needs no saved-mask lifetime: it is architectural state that always holds a
+            // live mask, so it is exact wherever the source helper admits it.
             const bool exact_mask_reduction =
-                reduction_source >= 0 && masks.contains(reduction_source);
-            if (record_compare && reduction_source >= 0 && masks.contains(reduction_source))
+                reduction_source == 126 ||
+                (reduction_source >= 0 && masks.contains(reduction_source));
+            if (record_compare && exact_mask_reduction)
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int mbcnt_root = wave64_mbcnt_mask_root(in);
             if (record_compare && mbcnt_root >= 0 && masks.contains(mbcnt_root))
@@ -19026,7 +19047,9 @@ bool emit_cfg_state_machine(
                 }
                 if (proven_wave64_mask_reduction_pcs.contains(in.pc)) {
                     const int source = wave64_mask_reduction_source(in);
-                    const bool mask_available = source == 106
+                    const bool mask_available = source == 126
+                        ? state.exec != 0
+                        : source == 106
                         ? state.vcc != 0
                         : state.sreg_bool.contains(source);
                     if (source < 0 || !mask_available)
