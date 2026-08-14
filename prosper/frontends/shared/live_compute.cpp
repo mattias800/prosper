@@ -4289,6 +4289,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double image_cache_ms = 0.0;
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
+    // Per-resource table dump for a traced program. The writeback line names a BINDING and the
+    // disassembly names a fetch PC; without the mapping between them, attributing a buffer's contents
+    // to the instruction that wrote it is guesswork. Printing the table closes that gap, and it is
+    // the table AS REALIZED for this dispatch -- which matters here, because the same program address
+    // realizes materially different tables from one dispatch to the next (buffers 1..43 observed).
+    if (trace && std::getenv("PROSPER_COMPUTELOG_RESOURCES") && item.resources) {
+        std::fprintf(stderr, "[compute]   resource table program=0x%llx dispatch=%llu count=%zu\n",
+                     static_cast<unsigned long long>(item.code_addr),
+                     static_cast<unsigned long long>(item.dispatch_index),
+                     item.resources->resources.size());
+        for (const auto& r : item.resources->resources)
+            std::fprintf(stderr,
+                         "[compute]     binding=%u cls=%u fmt=%u comps=%u addr=0x%llx size=%u "
+                         "stride=%u fetch-pc=%u srt=0x%x sgpr=%u array=%u\n",
+                         r.binding, static_cast<unsigned>(r.cls), static_cast<unsigned>(r.format),
+                         r.num_components, static_cast<unsigned long long>(r.gpu_addr), r.size,
+                         r.stride, r.fetch_pc, r.srt_offset, r.sgpr_base, r.table_index_count);
+    }
     maybe_dump_traced_compute_spirv(item, trace);
     maybe_dump_traced_compute_raw(item, trace);
     // Deliberately below the trace and SPIR-V dump: a skipped dispatch must still be observable by

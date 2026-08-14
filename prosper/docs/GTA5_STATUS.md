@@ -67,6 +67,44 @@ program runs between them. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc6700` 
 `PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64` and read the interleaved
 `parent-walk` / `execute` / `writeback` lines.
 
+### The corruption has a SHAPE: overlapping pair writes, not garbage
+
+`PROSPER_COMPUTE_PARENT_WALK_DUMP` captured 138 cyclic tables. Every cycle in every one of them is a
+**2-cycle**, and the records involved are structurally valid — correct tag, plausible index:
+
+```text
+rec[452] = 0x00000e32   tag=2  bit30=0  next=454     <== cycle
+rec[453] = 0x40000e32   tag=2  bit30=1  next=454
+rec[454] = 0x40000e22   tag=2  bit30=1  next=452     <== cycle
+rec[455] = 0x00000e7a   tag=2  bit30=0  next=463
+```
+
+**The table is a sequence of PAIRS**: `rec[k+1] == rec[k] | 0x40000000`, same payload, bit 30 marking
+the second element. 920 such pairs across 2,063 records, and the pairing is not parity-locked (523
+begin at an even index, 397 at an odd one), so a pair is simply two consecutive slots.
+
+A `bit30=1` record must therefore be immediately preceded by its `bit30=0` twin. In every cycle it is
+not: above, slot 453 holds the *tail* of pair (452,453) while slot 454 holds a tail whose head is
+gone. **Two writers claimed slot 453** — one writing the tail of (452,453), one the head of
+(453,454) — and the survivor's orphaned partner at 454 points back at 452, closing the cycle.
+
+So this is an **overlapping-allocation / lost-update** signature, and the earlier "61 two-cycles" note
+was reading it correctly. What changes is that the falsification recorded against it was measured on
+`0x413ce3400`'s instruction footprint, and the writer is `0x413dc6700`. Re-opened against the actual
+writer.
+
+Two candidates for where two writers get overlapping slots, neither yet tested:
+
+- **The pair store itself.** The program contains 3 `buffer_store_dwordx2` and 5 `buffer_store_dwordx3`
+  among its 23 stores, and a `dwordx2` writes exactly two consecutive dwords — a pair. An addressing
+  error in the multi-dword store path (element versus byte, or an off-by-one base) shifts a pair by
+  one slot and produces precisely this.
+- **The slot allocator.** `ds_add_rtn_u32` at guest pc121 is a bump allocator: each thread atomically
+  adds its size to an LDS counter and takes the old value as its base. Overlapping bases would do it.
+  **Checked and currently NOT suspect:** the emitter lowers it to `OpAtomicIAdd` with
+  `Scope_Workgroup` / `MemSem_WGAcqRel`, which is correct for `local=256` (four 64-wide waves), and
+  the program has no global-memory atomics at all — 41 MUBUF ops, every one a plain load or store.
+
 ### What the same run also settles
 
 - **Most dispatches write nothing.** 52 of 64 writebacks are `changed=0`; the substantial ones are
