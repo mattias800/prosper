@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "trip_bound_witness.hpp"
 #include "compute_authority_live_census.hpp"
 #include "compute_timing_selector.hpp"
 #include "compute_transfer_gate_census.hpp"
@@ -14,6 +15,7 @@
 #include "gpu/bc_decode.hpp"
 #include "gpu/gpu_capture.hpp"
 #include "gpu/gpu_execute.hpp"
+#include "gpu/rdna2_decode.hpp"
 #include "gpu/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/shader_resources.hpp"
 #include "gpu/spirv_builder.hpp"
@@ -4033,6 +4035,58 @@ void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool
                  ok ? "written" : "failed");
 }
 
+// The raw-guest half of PROSPER_COMPUTELOG_SPIRV. That switch answers "what did we emit"; this one
+// answers "what did the guest actually write", which is the only ground truth for a control-flow
+// question and the exact input `tools/shader_inspect` decodes. Without it the guest ISA for a live
+// program can only be recovered by hash-matching a PROSPER_SHADER_DUMP_SUCCESS directory, because
+// those filenames carry no code address -- so the two halves of a divergence could not be compared.
+//
+// The length is re-derived here rather than trusted: read what guest memory will actually give us,
+// then let the decoder walk to the program's own terminator. A truncated tail is written as what it
+// is (the walk stops), never padded, so an inspect of the result cannot silently disassemble bytes
+// that were never proven readable. CONFIDENCE: HIGH.
+void maybe_dump_traced_compute_raw(const prosper::gpu::ComputeItem& item, bool trace) {
+    const char* path = std::getenv("PROSPER_COMPUTELOG_RAW");
+    if (!trace || !path || !*path || !item.code_addr) return;
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> dumped;
+    std::lock_guard lock(mutex);
+    if (dumped.contains(item.code_addr)) return;
+
+    // Probe downward so an unmapped tail costs a smaller window rather than the whole dump.
+    size_t readable_bytes = 0;
+    for (size_t candidate = 256u * 1024u; candidate >= 256u; candidate /= 2u) {
+        if (prosper::gpu::guest_readable(item.code_addr, static_cast<uint32_t>(candidate))) {
+            readable_bytes = candidate;
+            break;
+        }
+    }
+    if (!readable_bytes) {
+        std::fprintf(stderr, "[compute]   traced raw program=0x%llx result=unreadable\n",
+                     static_cast<unsigned long long>(item.code_addr));
+        dumped.insert(item.code_addr);
+        return;
+    }
+
+    const uint32_t* code = reinterpret_cast<const uint32_t*>(uintptr_t(item.code_addr));
+    std::vector<prosper::gpu::Rdna2Inst> instructions;
+    const size_t consumed = prosper::gpu::rdna2_walk(code, readable_bytes / sizeof(uint32_t),
+                                                     instructions);
+    const size_t bytes = consumed * sizeof(uint32_t);
+    bool ok = false;
+    if (bytes) {
+        FILE* file = std::fopen(path, "wb");
+        ok = file && std::fwrite(code, 1, bytes, file) == bytes;
+        if (file && std::fclose(file) != 0) ok = false;
+    }
+    if (ok) dumped.insert(item.code_addr);
+    std::fprintf(stderr,
+                 "[compute]   traced raw program=0x%llx dwords=%zu instructions=%zu window=%zu "
+                 "path=%s result=%s\n",
+                 static_cast<unsigned long long>(item.code_addr), consumed, instructions.size(),
+                 readable_bytes, path, ok ? "written" : "failed");
+}
+
 std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
     using prosper::gpu::ComputeCpuFastPath;
     using prosper::gpu::ResourceClass;
@@ -4236,6 +4290,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
     maybe_dump_traced_compute_spirv(item, trace);
+    maybe_dump_traced_compute_raw(item, trace);
     // Deliberately below the trace and SPIR-V dump: a skipped dispatch must still be observable by
     // the other instruments, so a run can answer "what would this program have been?" without also
     // running the dispatch that is under suspicion. That combination — dump the module, skip the
@@ -7765,8 +7820,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
+        const auto fence_wait_start = ComputeClock::now();
         const VkResult wait_result = vkWaitForFences(
             ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
+        // Report a LONG wait even when it succeeds.
+        //
+        // A zero timeout count was read as proof that no compute dispatch hangs. That inference has a
+        // hole: an amdgpu context reset SIGNALS pending fences, so a dispatch the kernel watchdog
+        // killed can return VK_SUCCESS here and look indistinguishable from one that finished in
+        // microseconds — with the loss surfacing only at the NEXT submit. Duration is what separates
+        // them: a killed job sits at roughly the kernel's timeout (~10 s), a real one is sub-millisecond.
+        {
+            const double waited_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - fence_wait_start).count();
+            if (waited_ms >= 100.0) {
+                static std::atomic<int> slow{0};
+                const int n = slow.fetch_add(1);
+                if (n < 24 || (n & 255) == 0)
+                    std::fprintf(stderr,
+                                 "[compute] SLOW fence wait %.1f ms result=%d program=0x%llx "
+                                 "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
+                                 waited_ms, static_cast<int>(wait_result),
+                                 static_cast<unsigned long long>(item.code_addr),
+                                 static_cast<unsigned long long>(item.submit_no),
+                                 static_cast<unsigned long long>(item.dispatch_index),
+                                 static_cast<unsigned long long>(item.command_order),
+                                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+            }
+        }
         if (!vk_ok(wait_result, "queue-wait")) {
             // cleanup() releases resources referenced by the command buffer, including a borrowed
             // renderer image's pin. With that image bound, in-flight work still references it and
@@ -8882,6 +8963,10 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
         });
 }
 
+
+// TripBoundWitnessScope lives in trip_bound_witness.hpp so its save/restore contract can be
+// exercised by a regression test rather than only by a routed run.
+
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
     auto fail_closed_items = [&]() {
         for (const auto& item : items)
@@ -8990,7 +9075,15 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             }
             all_ok &= *cpu_result;
         } else {
-            const bool item_ok = execute_item(context, item);
+            // Scope saves the guest's dwords, seeds ours, and restores on the way out, so the
+            // buffer is byte-identical afterwards for whatever dispatch uses GDS next. It no-ops
+            // entirely unless a witness was actually EMITTED for this program.
+            bool item_ok = false;
+            {
+                prosper::frontend::TripBoundWitnessScope witness(item);
+                item_ok = execute_item(context, item);
+                witness.report(item);
+            }
             all_ok &= item_ok;
             if (!item_ok)
                 prosper::gpu::notify_compute_authority_boundary({

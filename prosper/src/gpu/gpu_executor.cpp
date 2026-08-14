@@ -658,6 +658,14 @@ struct ShaderCompileKey {
     std::shared_ptr<const std::vector<uint32_t>> chain_code;
     uint64_t chain_code_hash = 0;
     std::vector<ShaderResourceCompileKey> resources;
+    // Diagnostic identity. All-default in production (PROSPER_CFG_TRIP_BOUND unset), which leaves
+    // every key byte-identical to what it was before this field existed -- so caching behaviour is
+    // provably unchanged unless the diagnostic is armed. When it IS armed, the emitted module depends
+    // on the program's ADDRESS and on the selector state, neither of which any other key field can
+    // see: the rest of the key is code bytes and launch shape, so a target and a non-target sharing
+    // a body would otherwise share one compiled module and defeat the targeting.
+    uint64_t trip_bound_program_address = 0;
+    ComputeTripBoundSettings trip_bound{};
     size_t cached_hash = 0;
 
     bool operator==(const ShaderCompileKey& other) const {
@@ -666,6 +674,10 @@ struct ShaderCompileKey {
         const bool same_chain_code = chain_code == other.chain_code ||
             (chain_code && other.chain_code && *chain_code == *other.chain_code);
         return stage == other.stage &&
+               trip_bound_program_address == other.trip_bound_program_address &&
+               trip_bound.bound == other.trip_bound.bound &&
+               trip_bound.only_program == other.trip_bound.only_program &&
+               trip_bound.only_phase == other.trip_bound.only_phase &&
                has_resource_table == other.has_resource_table &&
                force_position_w == other.force_position_w &&
                capture_position == other.capture_position &&
@@ -724,6 +736,10 @@ struct ShaderCompileKeyHash {
     static size_t compute(const ShaderCompileKey& key) {
         uint64_t hash = 1469598103934665603ull;
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
+        hash = hash_mix(hash, key.trip_bound_program_address);
+        hash = hash_mix(hash, key.trip_bound.bound);
+        hash = hash_mix(hash, key.trip_bound.only_program);
+        hash = hash_mix(hash, key.trip_bound.only_phase);
         hash = hash_mix(hash, key.has_resource_table);
         hash = hash_mix(hash, key.force_position_w);
         hash = hash_mix(hash, key.capture_position);
@@ -1953,6 +1969,13 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Compute, code, dwords, resources, nullptr, nullptr,
         nullptr, 0, 0, &config);
+    // Only meaningful while the trip-bound diagnostic is armed; disarmed it leaves the key exactly as
+    // it was. The program address is carried on the diagnostic context because nothing else in the
+    // key identifies WHICH program these code bytes belong to, and that is precisely the distinction
+    // the selector makes. Recompute the hash: make_shader_compile_key already cached one.
+    key.trip_bound = compute_trip_bound_settings();
+    if (key.trip_bound.bound) key.trip_bound_program_address = diagnostic.program_address;
+    key.cached_hash = ShaderCompileKeyHash::compute(key);
     auto compile = [&] {
         const uint32_t* owned_code = !key.code || key.code->empty() ? nullptr : key.code->data();
         const size_t owned_dwords = key.code ? key.code->size() : 0u;
@@ -7133,6 +7156,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
     std::vector<ComputeItem> items;
     items.reserve(st.dispatches.size());
     for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
+        // Set where the program's GDS usage is known (see uses_gds below); read where the item is
+        // finalized. Declared at loop scope because those two points are in different blocks.
+        // Set where the program's GDS usage is known (see uses_gds below); read where the item is
+        // finalized, alongside the post-translation emission result. Declared at loop scope because
+        // those two points are in different blocks.
+        bool program_uses_guest_gds_for_item = false;
         const auto& dispatch = st.dispatches[dispatch_index];
         if (direct_compute_dispatch_is_noop(dispatch)) continue;
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
@@ -7509,7 +7538,18 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 return in.fmt == Rdna2Format::DS && in.ds_gds &&
                        (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
             });
-            if (uses_gds) {
+            // A bounded dispatcher needs the internal GDS buffer as its witness destination even when
+            // the guest program never touches GDS — see kComputeTripWitnessDword.
+            //
+            // A program that uses GDS ITSELF is never instrumented: the witness would overwrite the
+            // guest's own data and so change the input to the behaviour under measurement. This is
+            // the only place both facts are known, so the decision is made here and carried on the
+            // item rather than re-derived by the host.
+            // Intent, used only to decide whether the buffer must be BOUND. Whether a witness was
+            // actually emitted is not knowable here -- translation has not run yet -- so the item's
+            // token is set after it, from spirv_writes_trip_witness() on the compiled module.
+            program_uses_guest_gds_for_item = uses_gds;
+            if (uses_gds || compute_trip_witness_active(code_addr)) {
                 ShaderResource gds;
                 gds.cls = ResourceClass::ConstantBuffer;
                 gds.format = DataFormat::Uint32;
@@ -7747,6 +7787,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 shader_dwords, config, *table);
         // Independent of the resource table by design: an `s_endpgm`-only program has no memory
         // effect no matter what its V#s declare, so this proof reads the code and nothing else.
+        // AFTER translation, so this is an emission result rather than an intention. A program the
+        // selectors accept can still emit nothing -- a structured loop, or a phase ordinal that does
+        // not exist -- and the host must not read or clear guest-visible dwords no shader writes.
+        // Read from the MODULE the backend will run, so it is this dispatch's answer rather than
+        // this address's history: a structured loop or a phase ordinal the program lacks compiles to
+        // a module with no witness, and a cache hit returns whichever module the key selected.
+        item.trip_witness_instrumented = !program_uses_guest_gds_for_item &&
+            spirv_writes_trip_witness(item.spirv);
         item.terminator_only_program_validated = rdna2_program_is_terminator_only(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.gta5_cf9200_no_backing_validated = item.spirv.size() &&
@@ -7755,6 +7803,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
             rdna2_gta5_cf9200_no_backing_dispatch(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords, config, *table);
+        // The trip-bound witness writes into the internal GDS buffer, so that binding must exist
+        // whenever the bound instruments this program — including for a program that uses no GDS of
+        // its own. Injected HERE, at table finalization, rather than beside the `uses_gds` test:
+        // that test sits inside a conditional resource-build region which a program can skip, and
+        // when it did, the emitted module declared binding 127 while the table did not carry it. The
+        // contract check then rejected the module and the dispatch was DECLINED — so the device
+        // survived because the program never ran, which is indistinguishable from "the bound worked"
+        // in every artifact except the one line that says `skip invalid descriptor contract`.
+        if (compute_trip_witness_active(code_addr) && table &&
+            std::none_of(table->resources.begin(), table->resources.end(),
+                         [](const ShaderResource& r) {
+                             return r.binding == kComputeInternalGdsBinding;
+                         })) {
+            ShaderResource witness;
+            witness.cls = ResourceClass::ConstantBuffer;
+            witness.format = DataFormat::Uint32;
+            witness.num_components = 1;
+            witness.binding = kComputeInternalGdsBinding;
+            witness.size = static_cast<uint32_t>(g_compute_gds.size());
+            witness.stride = 4;
+            witness.host_data = g_compute_gds.data();
+            witness.host_data_size = g_compute_gds.size();
+            table->resources.push_back(witness);
+        }
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
@@ -8966,12 +9038,52 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
 
 enum class DispatchArgumentResolution : uint8_t { Ready, Noop, Invalid };
 
+// Indirect dispatch outcome census, reported once at teardown.
+//
+// Why a census and not more log lines: PROSPER_INDIRECTLOG is rate-limited to its first 64 packets,
+// which on a GTA V route are all early-boot, and an early-boot sample of a GPU-driven pipeline says
+// nothing about the steady state. Worse, the all-zero case below returns Noop SILENTLY -- so a route
+// in which every indirect dispatch is dropped is externally indistinguishable from one in which none
+// are, which is exactly the ambiguity that let this path go unexamined.
+//
+// The counts are what make the reading falsifiable: `ready` versus `zero_args` over a whole route
+// answers "are the group counts ever actually produced", and a total that does not match the decoded
+// indirect-dispatch count means the census itself is mis-placed rather than the subject misbehaving.
+struct IndirectDispatchCensus {
+    std::atomic<uint64_t> total{0};
+    std::atomic<uint64_t> ready{0};
+    std::atomic<uint64_t> zero_args{0};
+    std::atomic<uint64_t> zero_groups{0};
+    std::atomic<uint64_t> unreadable{0};
+    std::atomic<uint64_t> direct_noop{0};
+    ~IndirectDispatchCensus() {
+        const uint64_t seen = total.load(std::memory_order_relaxed);
+        if (!seen || !std::getenv("PROSPER_INDIRECTLOG")) return;
+        std::fprintf(stderr,
+                     "[agc-indirect-census] indirect dispatches=%llu ready=%llu zero-args=%llu "
+                     "zero-groups=%llu unreadable=%llu (direct no-ops=%llu)\n",
+                     (unsigned long long)seen, (unsigned long long)ready.load(),
+                     (unsigned long long)zero_args.load(),
+                     (unsigned long long)zero_groups.load(),
+                     (unsigned long long)unreadable.load(),
+                     (unsigned long long)direct_noop.load());
+    }
+};
+IndirectDispatchCensus& indirect_dispatch_census() {
+    static IndirectDispatchCensus census;
+    return census;
+}
+
 DispatchArgumentResolution resolve_indirect_dispatch_arguments(
         const GpuState::Dispatch& source, GpuState::Dispatch& resolved) {
     resolved = source;
-    if (!source.indirect)
-        return direct_compute_dispatch_is_noop(source)
-            ? DispatchArgumentResolution::Noop : DispatchArgumentResolution::Ready;
+    if (!source.indirect) {
+        const bool noop = direct_compute_dispatch_is_noop(source);
+        if (noop) indirect_dispatch_census().direct_noop.fetch_add(1, std::memory_order_relaxed);
+        return noop ? DispatchArgumentResolution::Noop : DispatchArgumentResolution::Ready;
+    }
+    auto& census = indirect_dispatch_census();
+    census.total.fetch_add(1, std::memory_order_relaxed);
     constexpr uint32_t kArgumentBytes = 3u * sizeof(uint32_t);
     if (!source.indirect_args_addr || (source.indirect_args_addr & 3u) ||
         !guest_readable(source.indirect_args_addr, kArgumentBytes)) {
@@ -8979,12 +9091,15 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr, "[agc] indirect dispatch skipped: unreadable arguments at 0x%llx\n",
                          static_cast<unsigned long long>(source.indirect_args_addr));
+        census.unreadable.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Invalid;
     }
     uint32_t args[3] = {};
     std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
-    if (!args[0] || !args[1] || !args[2])
+    if (!args[0] || !args[1] || !args[2]) {
+        census.zero_args.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
+    }
     resolved.threads_x = args[0];
     resolved.threads_y = args[1];
     resolved.threads_z = args[2];
@@ -8998,6 +9113,7 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
                          "%ux%ux%u workgroups\n",
                          args[0], args[1], args[2], launch.groups_x, launch.groups_y,
                          launch.groups_z);
+        census.zero_groups.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
     }
     if (std::getenv("PROSPER_INDIRECTLOG")) {
@@ -9013,6 +9129,7 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
                          args[0], args[1], args[2], launch.groups_x, launch.groups_y,
                          launch.groups_z);
     }
+    census.ready.fetch_add(1, std::memory_order_relaxed);
     return DispatchArgumentResolution::Ready;
 }
 

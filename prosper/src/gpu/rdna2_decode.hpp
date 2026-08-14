@@ -313,6 +313,10 @@ struct Rdna2Inst {
     uint32_t    words[5] = {0, 0, 0, 0, 0}; // instruction dwords (not incl. a trailing literal); [2]..[4]
                                             // hold MIMG NSA address dwords (0 for every other encoding)
     uint32_t    len_dwords = 1;    // total length incl. any inline literal
+    // EMITTER-ONLY terminator, appended to close a barrier-split phase at the barrier's pc (see the
+    // phase splitter). It is not guest code: its pc is the boundary, not an instruction address, so
+    // anything reporting a phase's extent must exclude it rather than adding its length.
+    bool        synthetic_terminator = false;
     bool        has_literal = false;
     uint32_t    literal = 0;       // the inline 32-bit constant, if has_literal
     bool        is_end = false;    // S_ENDPGM

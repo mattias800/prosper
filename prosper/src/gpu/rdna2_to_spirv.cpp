@@ -361,6 +361,10 @@ struct SpirvCompute {
     // spirv-val with a LAYOUT complaint that says nothing about descriptors.
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
     RecompileDiagnosticContext diagnostic{};
+    // Ordinal of the next CFG dispatcher emitted for THIS module. A barrier-phased compute program
+    // emits one dispatcher per barrier-free phase, and they are not interchangeable — each covers a
+    // different guest pc range. Numbering them lets a diagnostic name which one it means.
+    uint32_t cfg_phase_ordinal = 0;
     bool descriptor_indexing_declared = false;
     // Declare the capability set and extension for an indexed descriptor array, once per module and
     // only when one is actually declared, so every module that does not use one is byte-identical to
@@ -1097,6 +1101,27 @@ struct SpirvCompute {
         put(types, Op_Variable, {block_ptr, v_internal_gds, SC_StorageBuffer});
         put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, set});
         put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, binding});
+    }
+    // Atomic publication for the diagnostic witness. Plain OpStore is wrong for a record every
+    // invocation that reaches the cap writes: with per-invocation values the host can read a record
+    // assembled from several invocations, and "last writer wins" silently discards the extremes that
+    // make the record mean anything. A device-scope atomic min/max makes the published pair the true
+    // extremes over every invocation and workgroup, which is the only reading the report claims.
+    void compute_gds_atomic_minmax(uint16_t opcode, uint32_t index, uint32_t value,
+                                   uint32_t pred) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+        uint32_t old = id();
+        put(code, opcode, {t_u32, old, pointer, uconst(Scope_Device),
+                           uconst(MemSem_UniformAcqRel), value});
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
     }
     void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred) {
         declare_internal_gds(0, kComputeInternalGdsBinding);
@@ -16389,6 +16414,265 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // is gated by emit_body to complex compute CFGs without guest barriers. Ordinary LDS reads, writes,
 // and atomics remain valid while waves visit different cases. V_MBCNT is split into a dedicated
 // common phase so every workgroup invocation reaches its synthesized barriers in uniform control flow.
+// PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Bound the CFG DISPATCHER's loop at N iterations, on
+// whichever back-edge it emits (direct or portable). PROSPER_CFG_TRIP_BOUND_PROGRAM selects one
+// program; PROSPER_CFG_TRIP_BOUND_PHASE selects one phase and is REQUIRED — see
+// emitted_loop_trip_bound for why a record spanning two phases has no true reading. A program that
+// accesses GDS itself is refused, because the witness lives in guest-addressable storage.
+//
+// It does NOT cover the two structured loop emitters. An earlier revision of this comment claimed it
+// did; it never called this helper from either, so the claim was false and would have made a null
+// result from a structured-loop program read as evidence.
+//
+// A loop that never terminates hangs the GPU into a driver reset, which costs the whole process its
+// compute backend and every later indirect draw — and from outside it is indistinguishable from a
+// slow shader or from a defect anywhere else in the submit. Bounding the dispatcher's loop turns
+// "is this a non-terminating loop at all?" into one run for the programs it covers.
+//
+// (This paragraph used to end "and covering all three emitters means the answer is not confined to
+// one lowering path" — the very claim the paragraph above corrects. The correction landed two lines
+// up and the boast survived underneath it, which is how a retracted statement keeps being read as
+// current. `tests/test_cfg_trip_bound.cpp` now pins both halves: a structured loop is unchanged when
+// armed, a dispatcher loop is not.)
+//
+// Unset, nothing is emitted and modules are byte-identical. It is NOT a fix: truncating a guest
+// program's control flow produces wrong results by construction, which is why it is opt-in and says
+// so when it arms.
+// See kComputeTripWitnessDword. Deliberately ignores the phase selector: if ANY phase of this program
+// will be bounded, the witness destination has to be bound for the whole dispatch.
+// The complete selector state, read fresh rather than cached in function-local statics.
+//
+// Two reasons it is a struct and not three scattered getenv sites. First, the shader cache is keyed
+// on the program's CODE BYTES and never on its address, so a target and a non-target with the same
+// body collide on one entry: whichever compiled first would serve the other, handing the bounded
+// module to an excluded program or the unbounded module to the target. Either direction silently
+// destroys the isolation that makes a bounded run evidence about ONE program. The cache key therefore
+// mixes this whole struct in (see gpu_executor.cpp), and a struct is what makes that complete by
+// construction — a future selector added here cannot be forgotten there.
+//
+// Second, function-local statics parse the environment exactly once per process, which makes the
+// selectors untestable in-process: no test could arm a bound, assert, then disarm and assert again.
+// Re-reading costs three getenv calls per emitted loop during RECOMPILATION only (never per draw or
+// per dispatch — cf. #2214, which removed per-resource-per-draw getenv from the live renderer), and
+// recompiles are cache-warm after the first. CONFIDENCE: HIGH.
+ComputeTripBoundSettings compute_trip_bound_settings() {
+    ComputeTripBoundSettings settings;
+    const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
+    if (!spec || !*spec) return settings;
+    char* end = nullptr;
+    const unsigned long long parsed = strtoull(spec, &end, 0);
+    if (!end || *end || !parsed || parsed > 0xffffffffull) return settings;
+    settings.bound = static_cast<uint32_t>(parsed);
+
+    // PROSPER_CFG_TRIP_BOUND_PROGRAM=0xADDR — restrict the bound to ONE program, leaving every other
+    // recompiled module byte-identical. Without it, a bound low enough to be interesting truncates
+    // MANY shaders, and any later change of behaviour has a second explanation: an earlier truncated
+    // shader fed different data downstream. Targeting one program removes that alternative, which is
+    // what turns "the run got further" into evidence about the program under test.
+    if (const char* only = getenv("PROSPER_CFG_TRIP_BOUND_PROGRAM"); only && *only) {
+        char* only_end = nullptr;
+        const unsigned long long wanted = strtoull(only, &only_end, 0);
+        if (only_end && !*only_end) settings.only_program = wanted;
+    }
+    // PROSPER_CFG_TRIP_BOUND_PHASE=K — bound only the K-th dispatcher of the selected program.
+    //
+    // A barrier-phased compute program emits one dispatcher per barrier-free phase, each covering a
+    // different guest pc range. Bounding them together answers "does some loop in this program run
+    // away" but not which, and they are not equivalent: an acyclic phase that needs a bound is a CFG
+    // state-transition defect, while the phase containing the guest's own loop might merely be slow.
+    if (const char* phase = getenv("PROSPER_CFG_TRIP_BOUND_PHASE"); phase && *phase) {
+        char* phase_end = nullptr;
+        const unsigned long long parsed_phase = strtoull(phase, &phase_end, 0);
+        if (phase_end && !*phase_end && parsed_phase <= 0xfffffffeull)
+            settings.only_phase = static_cast<uint32_t>(parsed_phase);
+    }
+    return settings;
+}
+
+bool compute_trip_witness_active(uint64_t program_address) {
+    const ComputeTripBoundSettings settings = compute_trip_bound_settings();
+    // Mirrors every arming rule that does not need the program's bytes. The GDS-use refusal is the
+    // one exception and lives with the caller that already decodes the program (see gpu_executor's
+    // uses_gds), so this must not be treated as the complete predicate.
+    if (!settings.bound) return false;
+    if (settings.only_phase == ComputeTripBoundSettings::kAllPhases) return false;
+    if (!settings.only_program) return true;
+    return program_address == settings.only_program;
+}
+
+// True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
+// buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
+// a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
+// test. Decoded from the whole program rather than one phase: a GDS access in any phase disqualifies
+// the program, and `ins` here is only the current phase's slice.
+bool program_touches_guest_gds(const uint32_t* code, size_t dwords) {
+    if (!code || !dwords) return false;
+    std::vector<Rdna2Inst> decoded;
+    if (!rdna2_walk(code, dwords, decoded)) return true;   // undecodable: refuse, fail closed
+    return std::any_of(decoded.begin(), decoded.end(), [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::DS && in.ds_gds;
+    });
+}
+
+uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
+                                uint32_t start_pc, uint32_t end_pc,
+                                const uint32_t* code, size_t dwords) {
+    const ComputeTripBoundSettings settings = compute_trip_bound_settings();
+    const uint32_t bound = settings.bound;
+    if (!bound) return 0u;
+    if (settings.only_program && program_address != settings.only_program) return 0u;
+
+    // A PHASE SELECTOR IS REQUIRED, and this is a coherence requirement rather than ergonomics.
+    //
+    // A barrier-phased program emits one dispatcher per phase, and each phase has its OWN dispatch
+    // table -- ordinal 9 means different guest pcs in phase 0 and phase 2. The witness is a single
+    // record: if two phases can hit during one dispatch, its phase field is whichever invocation
+    // stored last and its ordinal extrema are a mixture of two incompatible maps, which the host then
+    // prints as one phase's range. There is no reading of that record that is true.
+    //
+    // Discovery still works with the bound armed and no phase chosen: every phase prints its dispatch
+    // map (see the caller), so one run tells you how many phases exist and what each covers. Only the
+    // emission is withheld.
+    if (settings.only_phase == ComputeTripBoundSettings::kAllPhases) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            fprintf(stderr,
+                    "[cfg-trip-bound] PROSPER_CFG_TRIP_BOUND_PHASE is REQUIRED and is unset: no "
+                    "bound emitted. One witness record cannot describe two phases -- their dispatch "
+                    "ordinals index different tables. The dispatch maps below list every phase; "
+                    "re-run with PROSPER_CFG_TRIP_BOUND_PHASE=<k>.\n");
+        });
+        return 0u;
+    }
+    if (phase != settings.only_phase) return 0u;
+
+    // Refuse to instrument a program that uses GDS itself; see program_touches_guest_gds.
+    if (program_touches_guest_gds(code, dwords)) {
+        static std::mutex refused_mutex;
+        static std::set<uint64_t> refused;
+        bool first = false;
+        {
+            std::lock_guard lock(refused_mutex);
+            first = refused.insert(program_address).second;
+        }
+        if (first)
+            fprintf(stderr,
+                    "[cfg-trip-bound] program 0x%llx REFUSED: it accesses GDS itself, and the "
+                    "witness would overwrite its data. Not instrumented.\n",
+                    static_cast<unsigned long long>(program_address));
+        return 0u;
+    }
+
+    static std::mutex announce_mutex;
+    static std::set<std::pair<uint64_t, uint32_t>> announced;
+    bool first = false;
+    {
+        std::lock_guard lock(announce_mutex);
+        first = announced.insert({program_address, phase}).second;
+    }
+    if (first)
+        fprintf(stderr,
+                "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
+                "bounded at %u iterations (DIAGNOSTIC: truncates guest control flow)\n",
+                static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound);
+    return bound;
+}
+
+// Does THIS module write the trip-bound witness?
+//
+// Derived from the compiled artifact, not from process history. An earlier revision kept a global
+// set of program addresses that had ever emitted one, which cannot express the contract the host
+// needs: the set was monotonic and keyed only by address, so once a program emitted under one phase,
+// recompiling the SAME address under a phase it does not have still answered "instrumented" -- and
+// the host would then read and clear guest-visible dwords no shader in the current module writes.
+//
+// Reading the module removes the whole class: the answer is a property of the bytes the backend is
+// about to run, so it cannot be stale, cannot be defeated by a shader-cache hit, and needs no
+// invalidation. The witness's first field is published by an atomic through an OpAccessChain onto the
+// internal GDS binding at kComputeTripWitnessDword, which nothing else emits.
+bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv) {
+    // FAIL CLOSED, and "well formed" means the exact signature this function relies on -- not merely
+    // that the words parse. The result authorizes the host to write guest-visible GDS, so every step
+    // that could be true by accident has to be pinned:
+    //
+    //   * a decorated ID must actually name an OpVariable (a decoration can outlive its target);
+    //   * a candidate must not carry conflicting DescriptorSet/Binding values;
+    //   * the instructions consumed must have their EXACT operand counts -- a truncated OpAtomicUMax
+    //     whose declared length happens to end at the module boundary passes any `word + len` check;
+    //   * the access chain must have the shape the builder emits, not merely enough operands.
+    //
+    // This predicate consumes prosper's own generator output, so accepting exactly that canonical
+    // form and refusing everything else is both sufficient and the conservative choice. It does not
+    // attempt general SPIR-V validation, and it is not a substitute for spirv-val.
+    constexpr uint32_t kSpirvMagic = 0x07230203u;
+    if (spirv.size() < 5 || spirv[0] != kSpirvMagic) return false;
+
+    constexpr uint32_t OpDecorate = 71, OpVariable = 59, OpConstant = 43, OpAccessChain = 65,
+                       OpAtomicUMax = 239;
+    constexpr uint32_t DecorationBinding = 33, DecorationDescriptorSet = 34;
+    // Exact word counts for the forms consumed below (opcode word included).
+    constexpr uint32_t kDecorateLiteralWords = 4;      // OpDecorate target decoration literal
+    constexpr uint32_t kVariableWords = 4;             // result-type result storage-class, NO init
+    constexpr uint32_t kAccessChainWords = 6;          // result-type result base member-0 slot
+    constexpr uint32_t kAtomicUMaxWords = 7;           // result-type result pointer scope sem value
+
+    std::set<uint32_t> variables;
+    std::map<uint32_t, uint32_t> descriptor_set, binding;
+    std::set<uint32_t> conflicting;
+    for (size_t word = 5; word < spirv.size();) {
+        const uint32_t op = spirv[word] & 0xffffu, len = spirv[word] >> 16;
+        if (!len || word + len > spirv.size()) return false;   // truncated stream: fail closed
+        // EXACT, like every other instruction consumed as proof. The builder emits the internal-GDS
+        // variable as four words with no initializer; a longer OpVariable is a different declaration
+        // and this predicate has no business reasoning about it.
+        if (op == OpVariable && len == kVariableWords) {
+            variables.insert(spirv[word + 2]);
+        } else if (op == OpDecorate && len == kDecorateLiteralWords) {
+            const uint32_t target = spirv[word + 1], value = spirv[word + 3];
+            auto record = [&](std::map<uint32_t, uint32_t>& into) {
+                const auto existing = into.find(target);
+                if (existing == into.end()) into.emplace(target, value);
+                else if (existing->second != value) conflicting.insert(target);
+            };
+            if (spirv[word + 2] == DecorationDescriptorSet) record(descriptor_set);
+            else if (spirv[word + 2] == DecorationBinding) record(binding);
+        }
+        word += len;
+    }
+
+    std::set<uint32_t> witness_variables;
+    for (uint32_t id : variables) {
+        if (conflicting.count(id)) continue;
+        const auto set_it = descriptor_set.find(id);
+        const auto binding_it = binding.find(id);
+        if (set_it != descriptor_set.end() && set_it->second == 0u &&
+            binding_it != binding.end() && binding_it->second == kComputeInternalGdsBinding)
+            witness_variables.insert(id);
+    }
+    if (witness_variables.empty()) return false;
+
+    std::set<uint32_t> zero_constants, slot_constants, witness_pointers;
+    for (size_t word = 5; word < spirv.size();) {
+        const uint32_t op = spirv[word] & 0xffffu, len = spirv[word] >> 16;
+        if (!len || word + len > spirv.size()) return false;
+        if (op == OpConstant && len == 4) {
+            if (spirv[word + 3] == 0u) zero_constants.insert(spirv[word + 2]);
+            else if (spirv[word + 3] == kComputeTripWitnessDword)
+                slot_constants.insert(spirv[word + 2]);
+        } else if (op == OpAccessChain && len == kAccessChainWords &&
+                   witness_variables.count(spirv[word + 3]) &&
+                   zero_constants.count(spirv[word + 4]) &&
+                   slot_constants.count(spirv[word + 5])) {
+            witness_pointers.insert(spirv[word + 2]);
+        } else if (op == OpAtomicUMax && len == kAtomicUMaxWords &&
+                   witness_pointers.count(spirv[word + 3])) {
+            return true;
+        }
+        word += len;
+    }
+    return false;
+}
+
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -18359,6 +18643,80 @@ bool emit_cfg_state_machine(
     const uint32_t exec_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t pc_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t active_var = b.function_var(b.t_bool, ptr_bool);
+    // PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Force the dispatcher out after N iterations.
+    //
+    // A dispatcher loop that never terminates hangs the GPU into a driver reset, which costs the
+    // whole process its compute backend and every later indirect draw. That failure is
+    // indistinguishable, from outside, from a shader that is merely slow or from a defect anywhere
+    // else in the submit. Bounding the loop turns "is this a non-terminating dispatcher?" into a
+    // one-run yes/no: if the device survives with a bound and dies without one, it is a loop.
+    //
+    // Unset, nothing is emitted and the module is byte-identical. It is NOT a fix — truncating a
+    // guest program's control flow produces wrong results by construction — which is why it is
+    // opt-in and says so.
+    const uint32_t cfg_phase = b.cfg_phase_ordinal++;
+    // ONE end-exclusive boundary for this phase, derived once and used by every report below.
+    //
+    // The two consumers disagreed before: the announcement used `ins.back().pc` (right for a phase
+    // closed by the emitter's synthetic terminator, wrong for a real tail, where it drops the final
+    // instruction) while the dispatch map used `pc + len_dwords` (right for a real tail, wrong for a
+    // synthetic one, where it re-includes a boundary marker that is not guest code). The fixture made
+    // them contradict each other in adjacent lines: `phase 0 guest pc 0..<14` above `6:pc14..<15`.
+    const uint32_t cfg_phase_end =
+        ins.empty() ? 0u
+                    : (ins.back().synthetic_terminator ? ins.back().pc
+                                                       : ins.back().pc + ins.back().len_dwords);
+    const uint32_t cfg_trip_bound =
+        emitted_loop_trip_bound(b.diagnostic.program_address, cfg_phase,
+                                ins.empty() ? 0u : ins.front().pc, cfg_phase_end,
+                                code, dwords);
+    const uint32_t trip_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
+    if (trip_var) b.store_function(trip_var, b.uconst(0));
+    // Publish the ordinal -> guest pc map for this phase, once, when a bound arms.
+    //
+    // Every number the witness reports is a dispatch ordinal, and an ordinal means nothing on its
+    // own. Leaving the reader to reconstruct the mapping is not a documentation gap, it is a defect
+    // in the instrument: an ordinal that happens to fall inside the block COUNT reads as a plausible
+    // block index, and mapping it by hand onto a guest pc range is exactly how a wrong conclusion got
+    // published here (instrument trap 172). Emitting the map costs one line per ordinal, once.
+    if (compute_trip_bound_settings().bound) {
+        std::string map;
+        char entry[64];
+        for (uint32_t dispatch = 0; dispatch < dispatch_blocks.size(); ++dispatch) {
+            if (dispatch_blocks[dispatch].empty()) continue;
+            const uint32_t entry_block = dispatch_blocks[dispatch].front();
+            const uint32_t last_block = dispatch_blocks[dispatch].back();
+            const uint32_t lo = starts[entry_block];
+            // The final ordinal has no following block start to bound it. Use the phase's own end
+            // -- one dword past its last decoded instruction -- rather than UINT32_MAX, which is not
+            // a pc and made the last map entry unreadable. `len_dwords` is the decoded length, so
+            // this is exact for a variable-length ISA rather than assuming one dword.
+            const uint32_t hi = last_block + 1 < starts.size() ? starts[last_block + 1]
+                                                              : cfg_phase_end;
+            const int written = snprintf(entry, sizeof(entry), "%s%u:pc%u..<%u", dispatch ? " " : "",
+                                         dispatch, lo, hi);
+            if (written > 0) map.append(entry, static_cast<size_t>(
+                std::min<size_t>(static_cast<size_t>(written), sizeof(entry) - 1)));
+        }
+        fprintf(stderr, "[cfg-trip-bound] program 0x%llx phase %u dispatch map: %s\n",
+                static_cast<unsigned long long>(b.diagnostic.program_address), cfg_phase,
+                map.c_str());
+    }
+    // The span of DISPATCH ORDINALS the state machine actually visited, tracked only while a bound
+    // is armed.
+    //
+    // `pc_var` holds a dispatcher switch-case ordinal (`dispatch_for_block`), NOT a guest pc — read
+    // the store sites, not the variable's name. One ordinal at the instant the cap ran out is a
+    // single sample and cannot separate "spinning here" from "passing through here"; the extremes
+    // can, because a state machine confined to a few ordinals is cycling among them.
+    //
+    // Ordinals are only meaningful against the map this phase announces below, which is why that map
+    // is printed rather than left to be reconstructed by hand. Hand-mapping one of these numbers onto
+    // a guest pc range is precisely what produced a wrong published conclusion — instrument trap 172.
+    const uint32_t dispatch_min_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
+    const uint32_t dispatch_max_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
+    if (dispatch_min_var) b.store_function(dispatch_min_var, b.uconst(0xffffffffu));
+    if (dispatch_max_var) b.store_function(dispatch_max_var, b.uconst(0));
     const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_value_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_invert_var = b.function_var(b.t_bool, ptr_bool);
@@ -20026,12 +20384,63 @@ bool emit_cfg_state_machine(
         }
     }
 
+    // Apply the diagnostic trip bound to whichever back-edge this dispatcher actually emits.
+    //
+    // This used to live only in the portable branch below, while the arm was announced before the
+    // split — so a DIRECT dispatcher printed "bounded" and then emitted an unbounded loop. An
+    // announced-but-inert lever is worse than no lever: it invites exactly the reading that the
+    // instrument was applied, which is how a null result gets published as evidence.
+    auto apply_trip_bound = [&](uint32_t keep_going) {
+        if (!trip_var) return keep_going;
+        const uint32_t next_trip =
+            b.ibin(Op_IAdd, b.load_function(b.t_u32, trip_var), b.uconst(1));
+        b.store_function(trip_var, next_trip);
+        // Updated on EVERY back-edge traversal, not only on the hit, so the extremes describe the
+        // whole run rather than its final instant.
+        const uint32_t dispatch_now = b.load_function(b.t_u32, pc_var);
+        const uint32_t old_min = b.load_function(b.t_u32, dispatch_min_var);
+        b.store_function(dispatch_min_var,
+                         b.sel(b.ucmp(Op_ULessThan, dispatch_now, old_min), dispatch_now, old_min));
+        const uint32_t old_max = b.load_function(b.t_u32, dispatch_max_var);
+        b.store_function(dispatch_max_var,
+                         b.sel(b.ucmp(Op_UGreaterThan, dispatch_now, old_max), dispatch_now,
+                               old_max));
+        const uint32_t under_bound = b.ucmp(Op_ULessThan, next_trip, b.uconst(cfg_trip_bound));
+        // WITNESS. A cap that is armed but never reached proves nothing, so record the hit where the
+        // host can read it: the internal GDS buffer's top five dwords (kComputeTripWitnessDword),
+        // which the host prepares before this dispatch and only touches while armed.
+        // Predicated on "still nominally running AND the bound just ran out", so a loop that exits
+        // normally writes nothing and the ABSENCE of a record is itself an answer.
+        const uint32_t hit = b.land(keep_going, b.logical_not(under_bound));
+        // EVERY field is published with a device-scope atomic, including the two that are
+        // invocation-invariant. Concurrent non-atomic stores of the same value are still a data race
+        // by the memory model, and "they happen to agree" is not a publication protocol -- it is the
+        // same reasoning that made the last-writer range look coherent. Max is idempotent for a flag
+        // and for a compile-time constant, so this costs nothing and removes the exception.
+        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 0),
+                                    b.uconst(1), hit);
+        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 1),
+                                    b.uconst(cfg_phase), hit);
+        // Fields 2..4 are per-invocation and must be REDUCED, not overwritten. The deleted field
+        // here was the dispatcher ordinal at the instant one invocation hit the cap: a single
+        // sample, unusable for the question ("is it cycling?"), and the field whose label was
+        // published wrongly twice. The span it belonged to is what actually answers that, so only
+        // the span survives -- and as true extremes over every invocation rather than whichever
+        // wrote last.
+        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 2),
+                                    next_trip, hit);
+        b.compute_gds_atomic_minmax(Op_AtomicUMin, b.uconst(kComputeTripWitnessDword + 3),
+                                    b.load_function(b.t_u32, dispatch_min_var), hit);
+        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 4),
+                                    b.load_function(b.t_u32, dispatch_max_var), hit);
+        return b.land(keep_going, under_bound);
+    };
     if (direct_dispatch) {
         // Native wave operations and votes were already resolved in the selected case.  PC and
         // ACTIVE are scalar guest-wave state, so every invocation in this exact-size subgroup has
         // the same value; another subgroup in the workgroup may still leave independently because
         // this path contains no workgroup barriers.
-        b.emit_condbranch(b.load_function(b.t_bool, active_var),
+        b.emit_condbranch(apply_trip_bound(b.load_function(b.t_bool, active_var)),
                           loop_header, loop_merge);
     } else {
     // Atomicized LDS-store common phase. Each guest DS_WRITE packet is one dispatcher event. The
@@ -20642,8 +21051,9 @@ bool emit_cfg_state_machine(
     const uint32_t write_pc = b.land(
         pending, b.land(b.logical_not(vote_to_scc), b.logical_not(vote_to_vcc)));
     b.store_function(pc_var, b.sel(write_pc, selected_pc, b.load_function(b.t_u32, pc_var)));
-    const uint32_t group_active = b.ucmp(
+    uint32_t group_active = b.ucmp(
         Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
+    group_active = apply_trip_bound(group_active);
     b.emit_condbranch(group_active, loop_header, loop_merge);
     }
     b.emit_label(loop_merge);
@@ -21401,6 +21811,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     phase_end.opcode = 0x01u;
                     phase_end.len_dwords = 1;
                     phase_end.is_end = true;
+                    phase_end.synthetic_terminator = true;
                     phase.push_back(phase_end);
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
