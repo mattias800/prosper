@@ -7795,7 +7795,6 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // a module with no witness, and a cache hit returns whichever module the key selected.
         item.trip_witness_instrumented = !program_uses_guest_gds_for_item &&
             spirv_writes_trip_witness(item.spirv);
-        }
         item.terminator_only_program_validated = rdna2_program_is_terminator_only(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.gta5_cf9200_no_backing_validated = item.spirv.size() &&
