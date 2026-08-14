@@ -7468,6 +7468,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
             rdna2_gta5_nullable_output_dispatch(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords, config, *table);
+        // Independent of the resource table by design: an `s_endpgm`-only program has no memory
+        // effect no matter what its V#s declare, so this proof reads the code and nothing else.
+        item.terminator_only_program_validated = rdna2_program_is_terminator_only(
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.gta5_cf9200_no_backing_validated = item.spirv.size() &&
             table && std::any_of(table->resources.begin(), table->resources.end(),
                                  is_proven_gta5_cf9200_no_backing) &&

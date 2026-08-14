@@ -5064,6 +5064,14 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.nullable_output_raw_buffer_validated =
             captured_compute_has_nullable_output_raw_buffer(x);
         compute.gta5_cf9200_no_backing_validated = false;
+        // Re-proved here from the retained raw stream rather than trusted from any serialized flag,
+        // which is the same authority rule the three tokens above follow. A capture that carries no
+        // raw words for this dispatch simply does not get the proof.
+        compute.terminator_only_program_validated =
+            x.raw_shader_index < c.raw_shader_versions.size() &&
+            rdna2_program_is_terminator_only(
+                c.raw_shader_versions[x.raw_shader_index].words.data(),
+                c.raw_shader_versions[x.raw_shader_index].words.size());
         if (compute.recompile_config_available)
             compute.user_sgprs = compute.recompile_config.user_sgprs;
         const bool has_packed_pointer_state = c.format_version >= 51u &&

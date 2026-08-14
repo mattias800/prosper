@@ -42,6 +42,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -4348,7 +4349,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                is_proven_null_nullable_raw_buffer(resource) ||
                                is_proven_gta5_cf9200_no_backing(resource);
                     });
-    if (descriptors.empty() && image_descriptors.empty() && !all_proven_no_backing_noop)
+    // Fourth proven no-op contract, and the only one that does not reason about resources at all:
+    // the guest program is a single terminating instruction. Nothing runs, so nothing can be
+    // dropped, and the resource table is irrelevant to that conclusion.
+    //
+    // This case is why the distinction matters in practice rather than in principle. GTA V's
+    // `0x413cea300` is exactly one `s_endpgm` with one declared raw buffer, dispatched 1x1x1
+    // hundreds of times per frame. Declining it cleared `producer_epoch_ok`, which the next
+    // `ParserStall` latched into `indirect_dependencies_ok` for the rest of the submit
+    // (`gpu_executor.cpp`), after which every indirect draw and dispatch was refused untried — 128
+    // of them in one gameplay submit, and the world is GPU-driven, so those were the world. An
+    // empty guest kernel blackened the frame. See #2481.
+    const bool terminator_only_noop = descriptors.empty() && image_descriptors.empty() &&
+        item.terminator_only_program_validated;
+    if (descriptors.empty() && image_descriptors.empty() &&
+        !all_proven_no_backing_noop && !terminator_only_noop)
         return decline("no-bindable-descriptor");
     const bool has_storage_images = std::any_of(
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
@@ -4396,11 +4411,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         (!timing_trace_only || trace);
     // Keep timing selection and the transfer/authority censuses above this return so investigations
     // still observe the proven no-op program. No Vulkan objects or queue submission are needed.
-    if (all_proven_no_backing_noop) {
+    if (all_proven_no_backing_noop || terminator_only_noop) {
+        const char* which = terminator_only_noop ? "terminator-only guest program"
+                                                 : "only proven no-backing resources";
+        // Announced once per program even without the trace selector. This path converts what used
+        // to be a loud decline into silence, and "prosper decided this dispatch does nothing" is
+        // exactly the claim a later investigation needs to see and be able to doubt — a wrong proof
+        // here would silently drop real work, which is the failure mode CLAUDE.md calls fatal.
+        // Once per program, so a kernel dispatched hundreds of times per frame costs one line.
+        {
+            static std::mutex mutex;
+            static std::set<uint64_t> announced;
+            bool first = false;
+            {
+                std::lock_guard lock(mutex);
+                first = announced.insert(item.code_addr).second;
+            }
+            if (first)
+                std::fprintf(stderr,
+                             "[compute] program 0x%llx is a proven no-op (%s) -> reported executed\n",
+                             static_cast<unsigned long long>(item.code_addr), which);
+        }
         if (trace)
             std::fprintf(stderr,
-                         "[compute] program 0x%llx has only proven no-backing resources -> no-op\n",
-                         static_cast<unsigned long long>(item.code_addr));
+                         "[compute] program 0x%llx is a proven no-op (%s) -> executed\n",
+                         static_cast<unsigned long long>(item.code_addr), which);
         return true;
     }
     if (has_storage_images && !ctx.image_support) {
