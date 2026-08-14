@@ -121,6 +121,17 @@ falsification.
   misses LDS atomics entirely, because RDNA2 spells them `ds_max_f32`, not `ds_atomic_max` — the
   control's own `ds_min/max_f32` would not have been found by it. That gap is why the claim above
   rests on the absence of the whole DS family rather than on an atomic-shaped pattern. #2542.
+- **The producer/consumer ordering violation is `WAIT_REG_MEM` being barreled through.** The guest
+  issues waits prosper cannot satisfy (`[agc] WaitRegMem … dependency violated … LABEL-UNMAPPED`, 40
+  per route), and by default an unsatisfied wait does not pause the queue — which would let a
+  consumer run before its producer's results land, exactly the symptom. **Falsified** with the
+  opt-in barrier model `PROSPER_WAIT_DEFER=1` (#312): the device is still lost, at the same program
+  and the same dispatch index. **Lever verified before reading the result** (instrument trap 164):
+  the run logs 40 `pausing queue (deferred effects)` and the baseline logs 0, against 28 and 40
+  `dependency violated` respectively, so the model was genuinely active. Note the recorded #312
+  verdict against defaulting this ON was measured entirely on *Dragon Quest VII*'s heap corruption
+  and says nothing about GTA V — this is an independent falsification, not a re-derivation of it.
+  #2542.
 - **The hang is an unconditionally infinite loop.** The same program executes successfully at dispatch
   38 and hangs at dispatch 39 of the same submit. Whatever spins is data-dependent. #2481.
 - **Bounding the CFG dispatcher's trip count stops the hang.** Tried at 4096 and at 2^20; the device
