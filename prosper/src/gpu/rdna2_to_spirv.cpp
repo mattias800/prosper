@@ -16591,51 +16591,77 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
 // invalidation. The witness's first field is published by an atomic through an OpAccessChain onto the
 // internal GDS binding at kComputeTripWitnessDword, which nothing else emits.
 bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv) {
-    // FAIL CLOSED on anything that is not a well-formed module. This predicate decides whether the
-    // host may write to guest-visible memory, so "cannot tell" must mean "no".
+    // FAIL CLOSED, and "well formed" means the exact signature this function relies on -- not merely
+    // that the words parse. The result authorizes the host to write guest-visible GDS, so every step
+    // that could be true by accident has to be pinned:
+    //
+    //   * a decorated ID must actually name an OpVariable (a decoration can outlive its target);
+    //   * a candidate must not carry conflicting DescriptorSet/Binding values;
+    //   * the instructions consumed must have their EXACT operand counts -- a truncated OpAtomicUMax
+    //     whose declared length happens to end at the module boundary passes any `word + len` check;
+    //   * the access chain must have the shape the builder emits, not merely enough operands.
+    //
+    // This predicate consumes prosper's own generator output, so accepting exactly that canonical
+    // form and refusing everything else is both sufficient and the conservative choice. It does not
+    // attempt general SPIR-V validation, and it is not a substitute for spirv-val.
     constexpr uint32_t kSpirvMagic = 0x07230203u;
     if (spirv.size() < 5 || spirv[0] != kSpirvMagic) return false;
 
     constexpr uint32_t OpDecorate = 71, OpVariable = 59, OpConstant = 43, OpAccessChain = 65,
                        OpAtomicUMax = 239;
     constexpr uint32_t DecorationBinding = 33, DecorationDescriptorSet = 34;
+    // Exact word counts for the forms consumed below (opcode word included).
+    constexpr uint32_t kDecorateLiteralWords = 4;      // OpDecorate target decoration literal
+    constexpr uint32_t kAccessChainWords = 6;          // result-type result base member-0 slot
+    constexpr uint32_t kAtomicUMaxWords = 7;           // result-type result pointer scope sem value
 
-    // Identify the witness RESOURCE, not a numeric coincidence. An earlier revision accepted any
-    // atomic through any access chain whose last index was the constant kComputeTripWitnessDword --
-    // so an ordinary storage-buffer atomic-max at that element index reported as the diagnostic
-    // witness, and the host then cleared and restored five guest GDS dwords for a shader that writes
-    // no witness at all. The index is only meaningful relative to the internal-GDS variable.
-    std::set<uint32_t> in_set_zero, at_gds_binding, slot_constants, witness_pointers;
+    std::set<uint32_t> variables;
+    std::map<uint32_t, uint32_t> descriptor_set, binding;
+    std::set<uint32_t> conflicting;
     for (size_t word = 5; word < spirv.size();) {
         const uint32_t op = spirv[word] & 0xffffu, len = spirv[word] >> 16;
-        if (!len || word + len > spirv.size()) return false;   // truncated: fail closed
-        if (op == OpDecorate && len == 4) {
-            if (spirv[word + 2] == DecorationDescriptorSet && spirv[word + 3] == 0u)
-                in_set_zero.insert(spirv[word + 1]);
-            else if (spirv[word + 2] == DecorationBinding &&
-                     spirv[word + 3] == kComputeInternalGdsBinding)
-                at_gds_binding.insert(spirv[word + 1]);
+        if (!len || word + len > spirv.size()) return false;   // truncated stream: fail closed
+        if (op == OpVariable && len >= 4) {
+            variables.insert(spirv[word + 2]);
+        } else if (op == OpDecorate && len == kDecorateLiteralWords) {
+            const uint32_t target = spirv[word + 1], value = spirv[word + 3];
+            auto record = [&](std::map<uint32_t, uint32_t>& into) {
+                const auto existing = into.find(target);
+                if (existing == into.end()) into.emplace(target, value);
+                else if (existing->second != value) conflicting.insert(target);
+            };
+            if (spirv[word + 2] == DecorationDescriptorSet) record(descriptor_set);
+            else if (spirv[word + 2] == DecorationBinding) record(binding);
         }
         word += len;
     }
+
     std::set<uint32_t> witness_variables;
-    for (uint32_t id : at_gds_binding)
-        if (in_set_zero.count(id)) witness_variables.insert(id);
+    for (uint32_t id : variables) {
+        if (conflicting.count(id)) continue;
+        const auto set_it = descriptor_set.find(id);
+        const auto binding_it = binding.find(id);
+        if (set_it != descriptor_set.end() && set_it->second == 0u &&
+            binding_it != binding.end() && binding_it->second == kComputeInternalGdsBinding)
+            witness_variables.insert(id);
+    }
     if (witness_variables.empty()) return false;
 
+    std::set<uint32_t> zero_constants, slot_constants, witness_pointers;
     for (size_t word = 5; word < spirv.size();) {
         const uint32_t op = spirv[word] & 0xffffu, len = spirv[word] >> 16;
         if (!len || word + len > spirv.size()) return false;
-        if (op == OpVariable && len >= 4 && !witness_variables.count(spirv[word + 2])) {
-            // not a witness variable; nothing to do
-        } else if (op == OpConstant && len == 4 && spirv[word + 3] == kComputeTripWitnessDword) {
-            slot_constants.insert(spirv[word + 2]);
-        } else if (op == OpAccessChain && len >= 5 &&
+        if (op == OpConstant && len == 4) {
+            if (spirv[word + 3] == 0u) zero_constants.insert(spirv[word + 2]);
+            else if (spirv[word + 3] == kComputeTripWitnessDword)
+                slot_constants.insert(spirv[word + 2]);
+        } else if (op == OpAccessChain && len == kAccessChainWords &&
                    witness_variables.count(spirv[word + 3]) &&
-                   slot_constants.count(spirv[word + len - 1])) {
-            // Based on the internal-GDS variable AND indexed by the witness slot.
+                   zero_constants.count(spirv[word + 4]) &&
+                   slot_constants.count(spirv[word + 5])) {
             witness_pointers.insert(spirv[word + 2]);
-        } else if (op == OpAtomicUMax && len >= 4 && witness_pointers.count(spirv[word + 3])) {
+        } else if (op == OpAtomicUMax && len == kAtomicUMaxWords &&
+                   witness_pointers.count(spirv[word + 3])) {
             return true;
         }
         word += len;

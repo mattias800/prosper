@@ -628,12 +628,89 @@ int main() {
                 }
                 word += len;
             }
+            // Result ids of the witness access chains, so arm (c) below can find the atomic that
+            // actually targets one rather than any OpAtomicUMax in the module.
+            std::set<uint32_t> witness_pointers_seen;
+            for (size_t word = 5; word < emitted.size();) {
+                const uint32_t op = emitted[word] & 0xffffu, len = emitted[word] >> 16;
+                if (!len) break;
+                if (op == OpAccessChainOp && len >= 5 && emitted[word + 3] == witness_var &&
+                    slot_ids.count(emitted[word + len - 1]))
+                    witness_pointers_seen.insert(emitted[word + 2]);
+                word += len;
+            }
             CHECK(witness_var && other_var && repointed,
                   "the emitted module has a binding-127 variable, another variable, and a "
                   "witness-slot access chain (arm precondition)");
             CHECK(repointed && !spirv_writes_trip_witness(rebased),
                   "an atomic at the witness SLOT through a different variable is not the witness "
                   "(deleting the access-chain base check fails HERE, where wrong-binding does not)");
+
+            // FAIL-CLOSED ARMS. Each mutates the real emitted module so it stays well formed enough
+            // to parse, while breaking one thing the predicate relies on. All three were accepted
+            // before this commit; a predicate that authorizes writes to guest memory must refuse
+            // anything it cannot positively establish.
+            constexpr uint32_t OpAtomicUMaxOp = 239;
+
+            // (a) The decoration and the access chain still name the old id, but no OpVariable
+            //     defines it any more. A decoration can outlive its target; a scan that trusts
+            //     decoration targets alone cannot tell.
+            {
+                std::vector<uint32_t> orphan_decoration = emitted;
+                bool renamed = false;
+                for (size_t word = 5; word < orphan_decoration.size();) {
+                    const uint32_t op = orphan_decoration[word] & 0xffffu;
+                    const uint32_t len = orphan_decoration[word] >> 16;
+                    if (!len) break;
+                    if (op == OpVariableOp && len >= 4 &&
+                        orphan_decoration[word + 2] == witness_var) {
+                        orphan_decoration[word + 2] = 0u;
+                        renamed = true;
+                        break;
+                    }
+                    word += len;
+                }
+                CHECK(renamed, "the emitted module defines the witness variable (arm precondition)");
+                CHECK(renamed && !spirv_writes_trip_witness(orphan_decoration),
+                      "a decoration whose target is no longer an OpVariable is not the witness");
+            }
+
+            // (b) The same id carries Binding 127 AND Binding 126. Ambiguous resource identity must
+            //     be refused rather than resolved in the diagnostic's favour.
+            {
+                std::vector<uint32_t> conflicted = emitted;
+                const uint32_t decorate_header = (4u << 16) | 71u;
+                conflicted.insert(conflicted.end(),
+                                  {decorate_header, witness_var, 33u /*Binding*/,
+                                   kComputeInternalGdsBinding - 1u});
+                CHECK(!spirv_writes_trip_witness(conflicted),
+                      "a variable carrying two different Binding decorations is not the witness");
+            }
+
+            // (c) A genuinely truncated OpAtomicUMax whose declared length still ends exactly at the
+            //     module boundary — so a `word + len <= size` bounds test cannot see it. Only an
+            //     exact operand count can.
+            {
+                std::vector<uint32_t> truncated_atomic = emitted;
+                bool cut = false;
+                for (size_t word = 5; word < truncated_atomic.size();) {
+                    const uint32_t op = truncated_atomic[word] & 0xffffu;
+                    const uint32_t len = truncated_atomic[word] >> 16;
+                    if (!len) break;
+                    if (op == OpAtomicUMaxOp && len == 7 &&
+                        witness_pointers_seen.count(truncated_atomic[word + 3])) {
+                        truncated_atomic[word] = (4u << 16) | OpAtomicUMaxOp;
+                        truncated_atomic.resize(word + 4);
+                        cut = true;
+                        break;
+                    }
+                    word += len;
+                }
+                CHECK(cut, "the emitted module contains a 7-word witness atomic (arm precondition)");
+                CHECK(cut && !spirv_writes_trip_witness(truncated_atomic),
+                      "a truncated atomic that still ends at the module boundary is not the witness "
+                      "(an exact operand count catches what a bounds check cannot)");
+            }
         }
     }
 
