@@ -556,7 +556,49 @@ bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic);
 // subtraction is ordered after the `wanted >= base` test so it cannot wrap for any base, including
 // one near UINT64_MAX, and a zero-size range contains nothing.
 inline bool compute_address_range_contains(uint64_t base, uint64_t size, uint64_t wanted) {
-    return size != 0 && wanted >= base && (wanted - base) < size;
+    // No explicit `size != 0`: for unsigned operands `(wanted - base) < 0` is already false, so a
+    // zero-size interval is rejected by the comparison itself. An earlier revision carried the
+    // redundant test AND claimed mutation evidence for it; deleting it alone changes nothing, and
+    // the mutation that appeared to cover it had also flipped `<` to `<=`, so it isolated neither.
+    return wanted >= base && (wanted - base) < size;
+}
+
+// One match from an address watch: which resource, and whether it came from the scalar parent or a
+// realized array entry.
+struct ComputeAddressWatchHit {
+    uint32_t binding = 0;
+    uint32_t fetch_pc = 0;
+    uint32_t entry_index = 0xFFFFFFFFu;   // 0xFFFFFFFF for a scalar parent
+    uint64_t base = 0;
+    uint32_t size = 0;
+    bool from_array_entry = false;
+};
+
+// Collect every resource in `table` whose BACKING RANGE contains `wanted`.
+//
+// The scalar/array distinction is load-bearing and is the same one gpu_dependency_graph.cpp makes.
+// For a runtime-selected array the parent's `gpu_addr` is the DESCRIPTOR TABLE address and its
+// `size` is the widest element size — that pair is not a backing range at all, so testing it
+// unconditionally both fabricates matches against the descriptor table and double-reports an entry
+// whenever the parent and entry 0 happen to share an address. Branch, exactly as the graph does:
+// `table_index_count != 0` means the realized entries are the backing ranges and the parent is not.
+inline std::vector<ComputeAddressWatchHit> compute_address_watch_hits(
+        const ShaderResourceTable& table, uint64_t wanted) {
+    std::vector<ComputeAddressWatchHit> hits;
+    for (const ShaderResource& r : table.resources) {
+        if (r.table_index_count) {
+            for (size_t e = 0; e < r.table_entries.size(); ++e) {
+                const ShaderBufferTableEntry& entry = r.table_entries[e];
+                if (!compute_address_range_contains(entry.gpu_addr, entry.size, wanted)) continue;
+                hits.push_back({r.binding, r.fetch_pc, static_cast<uint32_t>(e), entry.gpu_addr,
+                                entry.size, true});
+            }
+            continue;
+        }
+        if (compute_address_range_contains(r.gpu_addr, r.size, wanted))
+            hits.push_back({r.binding, r.fetch_pc, 0xFFFFFFFFu, r.gpu_addr, r.size, false});
+    }
+    return hits;
 }
 SharedShaderWords recompile_vertex_chain_cached_shared(
     const uint32_t* prolog, size_t prolog_dwords,

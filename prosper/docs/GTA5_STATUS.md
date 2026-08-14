@@ -36,19 +36,27 @@ As of 2026-08-14, established and each measured rather than inferred:
 **So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
 lower it correctly.
 
-5. **At least two programs write the table, and `0x413dc3400`'s write quality tracks the damage.** An address watch over a
-   full route finds `0x413dc6700` on nine bindings (including the loop's read at fetch pc 91) and
-   **`0x413dc3400` on six**. Scoring each of the latter's writes by malformed head/tail pairs
-   separates the outcomes without overlap across 180 reads: clean tables follow writes with 0..13,
-   cyclic tables follow writes with 19..106. `0x413dc6700` is the victim.
-6. **Its store path is lane-predicated.** All six of its table stores sit inside an
+5. **Eight programs TOUCH the table; the writer set is UNKNOWN.** A containment census over a full
+   route names `0x413ce3400`, `0x413ce6000`, `0x413cea300`, `0x413cee500`, `0x413d88400`,
+   `0x413dc3400`, `0x413dc6700`, `0x413e1c300`. **"Touch" is a resource binding, not an access
+   direction** — the census cannot separate a reader from a writer, so it identifies no writer at
+   all. An earlier revision of this list said "at least two programs write the table"; that was a
+   matcher artifact (base equality, blind to a view whose base differs) and is withdrawn.
+6. **One program's write quality tracks the damage — a correlation, not an identification.**
+   `0x413dc3400`'s malformed-pair count separates 54 clean reads (0..13) from 126 cyclic ones
+   (19..106) with no overlap. Its slot-level causal test **failed**: 14% of cycle nodes sit on
+   malformed slots against a 4.4% base rate. It is one candidate among eight.
+7. **`0x413dc3400`'s store path is lane-predicated.** All six of its table stores sit inside an
    `s_and_saveexec_b64` / `s_cbranch_execz` region, so *which slots are written* is decided by a
    per-lane mask — and the defect's character is membership, not arithmetic: every record is
    individually well-formed, in the wrong combination.
 
-**So the open question is why `0x413dc3400`'s writes go bad**, on an identical module (same SPIR-V
-hash, launch and 38 buffers either side of the transition) with only different input data — stated as
-the correlation it is, not as established cause.
+**The gating question is which of the eight programs WRITE the table.** The census measures a
+resource binding, not an access direction, and every downstream narrowing depends on that
+distinction — including whether `0x413dc3400` is a writer at all. Only once the writer set is known
+does "why do its writes go bad" become answerable, and even then what exists today is a
+correlation on an identical module (same SPIR-V hash, launch and 38 buffers either side of the
+transition), not established cause.
 
 **Not established, and explicitly tested:** that each malformed pair becomes a 2-cycle. On a same-run
 join only 14% of cycle nodes sit on malformed slots against a 4.4% base rate — real enrichment, not a
@@ -141,7 +149,7 @@ Consequences, and they are large:
   readers from writers on this allocation is the next thing to measure, and it is now the gating
   question rather than a detail.
 
-### The corrupting writer is `0x413dc3400`, and malformed pair writes separate clean from cyclic
+### `0x413dc3400`'s write quality separates clean tables from cyclic ones — correlation, not cause
 
 Tracing the second writer with `PROSPER_COMPUTELOG_CODE=0x413dc3400` plus `PROSPER_COMPUTELOG_CHANGED`
 (its table is **binding 23** — binding indices are per-program, and reusing the consumer's numbers
@@ -319,7 +327,9 @@ was reading it correctly. What changes is that the falsification recorded agains
 `0x413ce3400`'s instruction footprint, and the writer is `0x413dc6700`. Re-opened against the actual
 writer.
 
-Two candidates for where two writers get overlapping slots, neither yet tested:
+Two candidates for how two concurrent STORES land on overlapping slots (a different sense of
+"two writers" from the program census above — this is about lanes racing within a dispatch),
+neither yet tested:
 
 - **The pair store itself.** The program contains 3 `buffer_store_dwordx2` and 5 `buffer_store_dwordx3`
   among its 23 stores, and a `dwordx2` writes exactly two consecutive dwords — a pair. An addressing

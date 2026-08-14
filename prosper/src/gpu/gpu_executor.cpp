@@ -9669,49 +9669,25 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         char* end = nullptr;
                         const uint64_t wanted = std::strtoull(watch, &end, 0);
                         if (end && !*end && wanted && item.resources) {
-                            // CONTAINMENT, not base equality, and array ENTRIES as well as parents.
-                            //
-                            // An earlier revision compared `r.gpu_addr == wanted` over top-level
-                            // resources only, and a census built on it cannot show that a candidate
-                            // set is closed: it misses any interior address or overlapping subview
-                            // whose base differs, and it misses runtime-selected buffer arrays
-                            // entirely, because those keep their realized addresses in
-                            // `table_entries` while the parent's `gpu_addr` is not an element (#2412,
-                            // a form GTA V exercises).
-                            //
-                            // The subtraction is ordered so it cannot overflow for any base/size,
-                            // including a base near UINT64_MAX: the `wanted >= base` test runs first,
-                            // so `wanted - base` is non-negative, and it is compared against `size`
-                            // widened to 64 bits. A zero-size resource matches nothing.
-                            const auto contains = [wanted](uint64_t base, uint64_t size) {
-                                return compute_address_range_contains(base, size, wanted);
-                            };
-                            const auto report = [&](const char* kind, uint32_t index, uint64_t base,
-                                                    uint32_t size, uint32_t binding,
-                                                    uint32_t fetch_pc) {
+                            // Traversal lives in compute_address_watch_hits so the scalar/array
+                            // branch is testable: a runtime-array parent's gpu_addr is the
+                            // DESCRIPTOR TABLE address, not a backing range, and testing it here
+                            // fabricated matches and double-reported entries.
+                            for (const ComputeAddressWatchHit& hit :
+                                     compute_address_watch_hits(*item.resources, wanted)) {
                                 std::fprintf(stderr,
                                              "[compute-address-watch] addr=0x%llx %s program=0x%llx "
                                              "submit=%llu dispatch=%zu order=%llu binding=%u "
                                              "fetch-pc=%u entry=%u base=0x%llx size=%u\n",
-                                             static_cast<unsigned long long>(wanted), kind,
+                                             static_cast<unsigned long long>(wanted),
+                                             hit.from_array_entry ? "array-entry" : "resource",
                                              static_cast<unsigned long long>(item.code_addr),
                                              static_cast<unsigned long long>(submit_no),
                                              operation.index,
                                              static_cast<unsigned long long>(
                                                  operation.command_order),
-                                             binding, fetch_pc, index,
-                                             static_cast<unsigned long long>(base), size);
-                            };
-                            for (const ShaderResource& r : item.resources->resources) {
-                                if (contains(r.gpu_addr, r.size))
-                                    report("resource", 0xffffffffu, r.gpu_addr, r.size, r.binding,
-                                           r.fetch_pc);
-                                for (size_t e = 0; e < r.table_entries.size(); ++e) {
-                                    const ShaderBufferTableEntry& entry = r.table_entries[e];
-                                    if (contains(entry.gpu_addr, entry.size))
-                                        report("array-entry", static_cast<uint32_t>(e),
-                                               entry.gpu_addr, entry.size, r.binding, r.fetch_pc);
-                                }
+                                             hit.binding, hit.fetch_pc, hit.entry_index,
+                                             static_cast<unsigned long long>(hit.base), hit.size);
                             }
                         }
                     }
