@@ -100,6 +100,40 @@ This is exactly why the single-transition "confirmation" was wrong: flips with n
 **both** programs touched the table since the previous read, so the correlation cannot yet separate
 them — but the candidate set is now closed at two, which it was not before.
 
+### The corrupting writer is `0x413dc3400`, and malformed pair writes separate clean from cyclic
+
+Tracing the second writer with `PROSPER_COMPUTELOG_CODE=0x413dc3400` plus `PROSPER_COMPUTELOG_CHANGED`
+(its table is **binding 23** — binding indices are per-program, and reusing the consumer's numbers
+here produced a confident wrong answer first), and scoring each write by how many heads it lands
+without a matching tail in the next slot:
+
+| reads | n | prior write's malformed pairs |
+| --- | --- | --- |
+| `cycles=0` | 54 | **0..13** |
+| `cycles>0` | 126 | **19..106** |
+
+**No overlap across 180 reads.** The writes are clean (`MISMATCHED=0`) through submit 7480 and then
+jump to 77, 66, 67, … 104, 106, and the tables go cyclic exactly when they do.
+
+That makes `0x413dc3400` the corrupting writer, `0x413dc6700` its victim, and the malformed-pair
+count a **quantitative oracle**: a fix must drive it to zero, and `cyclic-roots` should follow.
+
+**Stated as correlation, because that is what it is.** 180 reads with clean separation and a mechanism
+that explains the shape (a head whose tail is absent leaves an orphan tail from an older generation,
+and an orphan tail pointing back at its predecessor is exactly the observed 2-cycle) is strong, but no
+A/B has yet shown the cycles following the mismatches. The counter-example that would break it is a
+write with a high malformed count followed by a clean read; none occurred in 180 reads.
+
+One earlier inference is already dead by this data: **13 malformed pairs at submit 4162 produced no
+cycles at all**, so "any malformed pair corrupts the table" is false. There is a threshold between 13
+and 19, which is itself a clue — the structure tolerates some inconsistency.
+
+### Open: why does it start at submit 7898?
+
+`0x413dc3400` writes 2,061 slots with zero malformed pairs for nine consecutive dispatches, then
+never again. Whatever changes at that point is the proximate cause, and it is a much smaller question
+than the one this investigation started with.
+
 ### FALSIFIED: our store INDICES are wrong
 
 Grouped strictly per `(submit, dispatch)` — the ungrouped form of this analysis is meaningless and
