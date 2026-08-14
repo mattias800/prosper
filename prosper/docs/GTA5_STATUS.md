@@ -164,8 +164,9 @@ without a matching tail in the next slot:
 **No overlap across 180 reads.** The writes are clean (`MISMATCHED=0`) through submit 7480 and then
 jump to 77, 66, 67, … 104, 106, and the tables go cyclic exactly when they do.
 
-That makes `0x413dc3400` the corrupting writer, `0x413dc6700` its victim, and the malformed-pair
-count a **quantitative oracle**: a fix must drive it to zero, and `cyclic-roots` should follow.
+That makes `0x413dc3400`'s write quality a **quantitative oracle** — not an identification of the
+writer, since the census that produced this framing measured bindings rather than access direction
+and eight programs touch the allocation. The malformed-pair count: a fix must drive it to zero, and `cyclic-roots` should follow.
 
 **Stated as correlation, because that is what it is.** 180 reads with clean separation and a mechanism
 that explains the shape (a head whose tail is absent leaves an orphan tail from an older generation,
@@ -219,7 +220,7 @@ Recorded so nobody re-derives them. Both looked convincing on one dispatch:
 correlation with cyclicity is currently the only handle on it, and pattern-hunting on derived metrics
 has stopped paying.
 
-### The corrupting writer's table stores are LANE-PREDICATED
+### `0x413dc3400`'s table stores are LANE-PREDICATED
 
 `0x413dc3400` disassembles to 882 dwords / 765 instructions, and its six table stores share one
 shape — a store to the table and a store to a second buffer at the *same index*, both inside an
@@ -324,8 +325,9 @@ gone. **Two writers claimed slot 453** — one writing the tail of (452,453), on
 
 So this is an **overlapping-allocation / lost-update** signature, and the earlier "61 two-cycles" note
 was reading it correctly. What changes is that the falsification recorded against it was measured on
-`0x413ce3400`'s instruction footprint, and the writer is `0x413dc6700`. Re-opened against the actual
-writer.
+`0x413ce3400`'s instruction footprint, which is only one of eight programs binding this allocation.
+Re-opened: it falsifies a lost-atomic hypothesis for one program, and no program is established as
+the writer.
 
 Two candidates for how two concurrent STORES land on overlapping slots (a different sense of
 "two writers" from the program census above — this is about lanes racing within a dispatch),
