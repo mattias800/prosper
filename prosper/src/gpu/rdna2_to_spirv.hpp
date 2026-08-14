@@ -47,10 +47,18 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 // as a plausible block index, and hand-mapping is what published two contradictory conclusions from
 // the same correct number (instrument trap 172).
 //
-// The host must PREPARE these dwords before the selected dispatch (field +3 initialized to
-// UINT32_MAX so an atomic min is meaningful) and must only touch them while the diagnostic is armed
-// for that program -- this storage is guest-visible, so reading and clearing it unconditionally would
-// both invent hits from guest data and destroy it.
+// The host SAVES these dwords, prepares them (field +3 to UINT32_MAX, so an atomic min is
+// meaningful), reads them after the dispatch, and RESTORES the saved values -- see
+// frontends/shared/trip_bound_witness.hpp. Two rules that are easy to state too weakly:
+//
+//   * The gate is whether a witness was actually EMITTED for this program
+//     (compute_trip_witness_emitted), never whether the selectors accept it. A structured-loop
+//     program or a phase ordinal the program does not have satisfies every selector and emits
+//     nothing, and a host reading on that basis reports guest data as a measurement.
+//   * Restoring is not tidiness. This is ONE persistent allocation shared by every dispatch, so
+//     proving the instrumented program cannot read it says nothing about the program that runs next
+//     and does. Preservation, not exclusivity, is what keeps the diagnostic from perturbing the
+//     machine it measures. Instrument trap 174.
 inline constexpr uint32_t kComputeTripWitnessDword = 16379u;
 inline constexpr uint32_t kComputeTripWitnessDwordCount = 5u;
 

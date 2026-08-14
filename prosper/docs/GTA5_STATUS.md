@@ -598,8 +598,11 @@ over; and each lane's LDS contribution is gated on its own `pending` bit.
 
 **The device-side hit witness WORKS, and the cap fires — on the dispatch that hangs.** The shader
 writes into the top of the internal GDS buffer when a cap runs out; the host prepares those dwords
-before the selected dispatch and reports them after it, and touches them only while the diagnostic is
-armed for that program. **The current record is five dwords — hit flag, phase, highest trip count, and
+before the selected dispatch, reports them after it, and then RESTORES the guest's original values,
+so the shared GDS buffer is byte-identical afterwards for whatever dispatch uses it next. It touches
+them only when a witness was actually **emitted** for that program — not merely when the selectors
+accept it, since a structured loop or a phase ordinal the program lacks satisfies every selector and
+emits nothing. **The current record is five dwords — hit flag, phase, highest trip count, and
 the lowest and highest dispatcher switch-case ordinal visited — with the last three reduced across
 invocations by device-scope atomics.** The per-invocation "last block index" this line used to name
 no longer exists: it was one sample, it could not answer whether the dispatcher was cycling, and its
