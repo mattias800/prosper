@@ -97,14 +97,20 @@ falsification.
 - **The hang is a non-uniform early exit.** The 14,370-line disassembled module contains exactly
   **one** `OpReturn`, at the end. No `OpKill`, none inside any of the three dispatcher loops. #2481.
 - **A lost atomic corrupts the traversal table.** The table that hangs `0x413dc6700` is a linked list
-  whose corruption is 61 **two-cycles** (`i` and `i+2` pointing at each other), which is the classic
-  signature of a non-atomic concurrent insertion — two threads each linking to the other because both
-  read the head before either wrote. Its producer `0x413ce3400` contains **no atomic instructions at
-  all**: zero `OpAtomic*` in 3,881 lines of recompiled SPIR-V, and zero
-  `(buffer|global|flat|ds)_atomic_*` in its 507-dword guest stream (dumped with `--dump-compute-raw`).
-  **Positive control, from a different program in a different capsule**: the identical grep finds
-  **6 atomics** in `0x413ced900`'s guest stream, so the instrument does fire — the zero is a real
-  negative and not a broken pattern. #2542.
+  whose corruption is 61 **two-cycles** (`i` and `i+2` pointing at each other), the classic signature
+  of a non-atomic concurrent insertion — two threads each linking to the other because both read the
+  head before either wrote. Its producer `0x413ce3400` performs **no atomic operation of any kind**,
+  and the strong form of that is structural rather than grep-shaped: its entire memory footprint is
+  **29 buffer loads and stores** (`buffer_load_dword` x15, `buffer_load_dwordx2` x9,
+  `buffer_store_dword` x4, `buffer_store_dwordx3` x1) and **zero `ds_*` instructions**, so there is no
+  LDS family in which an atomic could hide. Zero `OpAtomic*` in its 3,881-line recompiled SPIR-V
+  agrees. **Positive control, a different program in a different capsule**: `0x413ced900` contains
+  `buffer_atomic_fmax` x3, `buffer_atomic_fmin` x3, `ds_max_f32` x3 and `ds_min_f32` x3 — so the
+  instrument fires on the buffer family *and* the LDS family, and the zero is a real negative.
+  **Note what the control also demonstrates:** a `(buffer|global|flat|ds)_atomic_*` pattern silently
+  misses LDS atomics entirely, because RDNA2 spells them `ds_max_f32`, not `ds_atomic_max` — the
+  control's own `ds_min/max_f32` would not have been found by it. That gap is why the claim above
+  rests on the absence of the whole DS family rather than on an atomic-shaped pattern. #2542.
 - **The hang is an unconditionally infinite loop.** The same program executes successfully at dispatch
   38 and hangs at dispatch 39 of the same submit. Whatever spins is data-dependent. #2481.
 - **Bounding the CFG dispatcher's trip count stops the hang.** Tried at 4096 and at 2^20; the device
