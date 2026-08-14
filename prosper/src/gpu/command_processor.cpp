@@ -39,6 +39,16 @@ namespace prosper::gpu {
 // space per process, so this is process state rather than per-fold state.
 std::atomic<uint32_t> g_indirect_va_aperture{0};
 
+// Opt-in gate for the indirect-argument aperture recovery below. Read once: this sits on the packet
+// decode path, and #2214 is the standing lesson about per-operation getenv in a hot loop.
+bool aperture_recovery_enabled() {
+    static const bool enabled = [] {
+        const char* spec = getenv("PROSPER_INDIRECT_APERTURE_RECOVERY");
+        return spec && *spec && *spec != '0';
+    }();
+    return enabled;
+}
+
 
 std::vector<RegWatchEntry> parse_reg_watch(const char* setting) {
     std::vector<RegWatchEntry> entries;
@@ -4883,11 +4893,24 @@ void GpuState::apply(const Pm4Command& c) {
             // a routed boot: 50 of 64 indirect compute dispatches, all on that queue, every one
             // skipped as "unreadable arguments".
             //
-            // Fail-closed by construction: the recovery is attempted ONLY when the address we would
-            // otherwise use is unreadable, and it is accepted ONLY if the recovered one is readable.
-            // A wrong aperture therefore leaves behaviour exactly as it is today. Probed on 49 of 49
-            // such dispatches: the raw low address is unmapped and `aperture | low` is mapped.
-            if (!indirect_compute_base && d.indirect_args_addr &&
+            // OPT-IN (PROSPER_INDIRECT_APERTURE_RECOVERY=1), and it must stay that way until the
+            // packet's real provenance is established.
+            //
+            // "Fail-closed" was claimed for this on the grounds that recovery is attempted only when
+            // the current address is unreadable and accepted only when the recovered one is readable.
+            // That argument does not hold: `g_indirect_va_aperture` learns the high 32 bits from ANY
+            // SetBase, on any queue, in any fold, and one process VA space can hold mapped
+            // allocations under several high-32 prefixes. Mapped is not the same as "this is the
+            // argument buffer" -- the failure it admits is reading group counts out of an unrelated
+            // live allocation and dispatching them, which is worse than the skip it replaces and is
+            // invisible at the point it happens.
+            //
+            // What it buys, measured on a routed boot, so the trade is recorded rather than implied:
+            // with it off, 50 of 64 indirect compute dispatches (all on the async-compute queue) are
+            // skipped as "unreadable arguments"; with it on, 0 are, and the probe found the raw low
+            // address unmapped and `aperture | low` mapped on 49 of 49. That is a real signal about
+            // where those arguments live, and it is still not provenance.
+            if (aperture_recovery_enabled() && !indirect_compute_base && d.indirect_args_addr &&
                 !guest_readable(d.indirect_args_addr, 3u * sizeof(uint32_t))) {
                 const uint64_t aperture = g_indirect_va_aperture.load(std::memory_order_relaxed);
                 const uint64_t recovered =

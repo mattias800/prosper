@@ -29,9 +29,12 @@
 // that caps an emitted back edge. Bounding a loop that terminates ANYWAY is what makes this test
 // safe to run in CI: a broken bound yields wrong depths, never a hung queue.
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
 
 #include <cmath>
+#include <set>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -66,7 +69,12 @@ static const uint32_t kExecWalk[] = {
 // PROSPER_CFG_TRIP_BOUND* are read fresh on every call (see compute_trip_bound_settings), which is
 // what lets one process arm, compile, disarm and compile again.
 static void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    // MinGW's UCRT has no setenv/unsetenv; _putenv_s with an empty value removes the variable.
+    _putenv_s(name, value ? value : "");
+#else
     if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
 }
 
 int main() {
@@ -197,8 +205,56 @@ int main() {
     CHECK(!dispatcher_bounded.empty(), "the overlapping-EXEC-loop kernel recompiles armed");
     CHECK(!dispatcher_plain.empty() && dispatcher_bounded != dispatcher_plain,
           "arming the bound changes the CFG dispatcher's emitted module");
-    CHECK(dispatcher_bounded.size() > dispatcher_plain.size(),
-          "the bounded dispatcher module is larger — a counter and a capped back edge were added");
+
+    // THE ARM THAT DISCRIMINATES. "The module changed" and "the module got bigger" do NOT: a
+    // reviewer deleted the portable back-edge cap, rebuilt, and both still passed, because the trip
+    // counter and the witness stores grow the module on their own. An assertion satisfied by the
+    // instrumentation surrounding a fix, rather than by the fix, is exactly the announced-but-inert
+    // shape this whole diagnostic exists to catch — so assert at the site.
+    //
+    // The back edge is an OpBranchConditional whose merge-block target and continue target are named
+    // by the enclosing OpLoopMerge. Capped, its CONDITION is the result of the trip comparison;
+    // uncapped it is the raw `active` value. Requiring an OpULessThan whose result feeds a
+    // conditional branch means deleting the cap fails this even though the counter still exists.
+    // Anchored on the one thing ONLY apply_trip_bound emits: an unsigned comparison against the
+    // bound's literal value. `trip_var` and its initialising store live outside that helper, so
+    // deleting the back-edge call leaves them (and the module still differs, and still grows) while
+    // this comparison disappears — which is precisely the mutation that slipped through before.
+    //
+    // Following the condition all the way to the OpBranchConditional was the first attempt and is
+    // wrong: the portable dispatcher routes it through a Function variable, so a store/load pair
+    // breaks any def-use walk that does not model memory. Matching the comparison against the bound
+    // CONSTANT keeps the anchor at the emitter's own site without needing that machinery.
+    auto compares_against_bound = [](const std::vector<uint32_t>& m, uint32_t bound) {
+        if (m.size() < 5) return false;
+        constexpr uint16_t OpConstant = 43, OpULessThan = 176;
+        std::set<uint32_t> bound_constants;
+        for (size_t word = 5; word < m.size();) {
+            const uint32_t op = m[word] & 0xffffu, len = m[word] >> 16;
+            if (len == 0 || word + len > m.size()) break;
+            if (op == OpConstant && len == 4 && m[word + 3] == bound)
+                bound_constants.insert(m[word + 2]);
+            else if (op == OpULessThan && len >= 5 && bound_constants.count(m[word + 4]))
+                return true;
+            word += len;
+        }
+        return false;
+    };
+    CHECK(!compares_against_bound(dispatcher_plain, kBound),
+          "unarmed, the dispatcher module contains no comparison against the bound");
+    CHECK(compares_against_bound(dispatcher_bounded, kBound),
+          "armed, the dispatcher compares the trip counter against the bound "
+          "(deleting the cap fails HERE, where module size and inequality do not)");
+
+    // Independent of the scan above: the bound's VALUE must reach the emitter, not merely its
+    // armed/disarmed state. Two different bounds must produce two different modules.
+    set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound + 1).c_str());
+    const std::vector<uint32_t> dispatcher_other_bound =
+        recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
+    CHECK(dispatcher_other_bound != dispatcher_bounded &&
+              compares_against_bound(dispatcher_other_bound, kBound + 1),
+          "the bound's value reaches the emitted comparison, not just its armed state");
+    set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
 
     // Targeting again, now on the emitter that actually honours it: a bound aimed elsewhere must
     // leave even a dispatcher module untouched. Without this arm, "arming changes the module" would
@@ -209,6 +265,55 @@ int main() {
     CHECK(dispatcher_other == dispatcher_plain,
           "a bound aimed at another program leaves the dispatcher module byte-identical");
     set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+
+    // --- through the real cache, in BOTH orderings ------------------------------------------------
+    //
+    // Everything above calls recompile_valu, which never consults the shader cache — so none of it
+    // can see the defect the cache key fix addresses. The key is blind to a program's ADDRESS while
+    // the selector chooses by address, so two programs with identical bodies collide, and WHICH one
+    // compiles first decides who gets the wrong module. Both orderings are exercised because a key
+    // that omitted the address would still pass one of them by luck.
+    {
+        ComputeShaderConfig config{};
+        config.local_x = 64; config.local_y = 1; config.local_z = 1;
+        config.wave_size = 64;
+        config.tgid_x_en = true;
+        ShaderResourceTable table{};
+        const uint64_t kTarget = 0x413dc6700ull, kOther = 0x413ce3400ull;
+
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", "0x413dc6700");
+
+        auto compile_as = [&](uint64_t program) {
+            return recompile_compute_shader_cached(
+                kDispatcherLoops, kDispatcherWords, &table, config, nullptr,
+                {RecompileDiagnosticStage::Compute, program});
+        };
+
+        clear_shader_recompile_cache();
+        const std::vector<uint32_t> target_first_target = compile_as(kTarget);
+        const std::vector<uint32_t> target_first_other  = compile_as(kOther);
+
+        clear_shader_recompile_cache();
+        const std::vector<uint32_t> other_first_other   = compile_as(kOther);
+        const std::vector<uint32_t> other_first_target  = compile_as(kTarget);
+
+        CHECK(!target_first_target.empty() && !other_first_other.empty(),
+              "both programs recompile through the cached entry point");
+        CHECK(target_first_target != target_first_other,
+              "target and non-target get DIFFERENT modules when the target compiles first");
+        CHECK(other_first_other != other_first_target,
+              "target and non-target get different modules when the non-target compiles first");
+        CHECK(target_first_target == other_first_target,
+              "the target's module does not depend on compile order");
+        CHECK(target_first_other == other_first_other,
+              "the non-target's module does not depend on compile order");
+        CHECK(compares_against_bound(target_first_target, kBound) &&
+                  !compares_against_bound(target_first_other, kBound),
+              "through the cache, only the SELECTED program's back edge is capped");
+        set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        clear_shader_recompile_cache();
+    }
 
     // Disarming must restore the original module exactly. Without this, "arming changes the module"
     // above could be satisfied by any nondeterminism in the emitter rather than by the bound.

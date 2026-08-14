@@ -29,18 +29,30 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 // and read back after the dispatch. Arming a bound is not the same as hitting one, and until a run
 // can show a hit, "the loop exceeds N" rests on inference from device survival rather than evidence.
 //
-// SIX dwords at the very top of a 16,384-dword buffer, chosen so a guest that genuinely uses GDS
-// cannot plausibly collide: hit flag, dispatcher phase, the NEXT GUEST PC the dispatcher was about
-// to run, the trip count reached, and the lowest and highest guest pc the dispatcher visited.
+// FIVE dwords, and every one of them is a DISPATCHER quantity, never a guest pc:
+//   +0  hit flag                                        (invariant; plain store)
+//   +1  dispatcher phase ordinal                        (invariant; plain store)
+//   +2  highest trip count reached                      (atomic max over invocations)
+//   +3  lowest dispatcher switch-case ordinal visited    (atomic min over invocations)
+//   +4  highest dispatcher switch-case ordinal visited   (atomic max over invocations)
 //
-// The base is 16378 rather than 16380 because the record grew and the buffer's top is fixed: the
-// last dword is 16383, so six dwords must start two lower. Widening in place would have written
-// past the end.
+// Fields 2..4 are per-invocation and are published with device-scope atomics rather than stores.
+// Every invocation that reaches the cap writes the same addresses, so a plain store publishes
+// whichever wrote last and silently discards the extremes -- a record the host could read as one
+// invocation's history when it is a mixture of several. The extremes are the whole claim, so they
+// are reduced on the device.
 //
-// The third field is a guest PC and is named that way everywhere it is reported. It was once
-// printed as a block ordinal, which inverted a conclusion — see instrument trap 172.
-inline constexpr uint32_t kComputeTripWitnessDword = 16378u;
-inline constexpr uint32_t kComputeTripWitnessDwordCount = 6u;
+// The ordinals index the phase's dispatch table, whose ordinal -> guest pc map that phase prints when
+// the bound arms. Do not map one by hand: a value that happens to fall inside the block count reads
+// as a plausible block index, and hand-mapping is what published two contradictory conclusions from
+// the same correct number (instrument trap 172).
+//
+// The host must PREPARE these dwords before the selected dispatch (field +3 initialized to
+// UINT32_MAX so an atomic min is meaningful) and must only touch them while the diagnostic is armed
+// for that program -- this storage is guest-visible, so reading and clearing it unconditionally would
+// both invent hits from guest data and destroy it.
+inline constexpr uint32_t kComputeTripWitnessDword = 16379u;
+inline constexpr uint32_t kComputeTripWitnessDwordCount = 5u;
 
 // True when any dispatcher loop in `program_address` will be bounded, so the executor knows it must
 // bind the internal GDS buffer even for a program that uses no GDS of its own.

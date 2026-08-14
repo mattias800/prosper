@@ -1102,6 +1102,27 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {v_internal_gds, Dec_DescriptorSet, set});
         put(deco, Op_Decorate, {v_internal_gds, Dec_Binding, binding});
     }
+    // Atomic publication for the diagnostic witness. Plain OpStore is wrong for a record every
+    // invocation that reaches the cap writes: with per-invocation values the host can read a record
+    // assembled from several invocations, and "last writer wins" silently discards the extremes that
+    // make the record mean anything. A device-scope atomic min/max makes the published pair the true
+    // extremes over every invocation and workgroup, which is the only reading the report claims.
+    void compute_gds_atomic_minmax(uint16_t opcode, uint32_t index, uint32_t value,
+                                   uint32_t pred) {
+        declare_internal_gds(0, kComputeInternalGdsBinding);
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        uint32_t pointer = id();
+        putv(code, Op_AccessChain,
+             {t_ptr_gds_u32, pointer, v_internal_gds, uconst(0), index});
+        uint32_t old = id();
+        put(code, opcode, {t_u32, old, pointer, uconst(Scope_Device),
+                           uconst(MemSem_UniformAcqRel), value});
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+    }
     void compute_gds_store(uint32_t index, uint32_t value, bool predicated, uint32_t pred) {
         declare_internal_gds(0, kComputeInternalGdsBinding);
         auto emit = [&]() {
@@ -18502,8 +18523,12 @@ bool emit_cfg_state_machine(
             const uint32_t entry_block = dispatch_blocks[dispatch].front();
             const uint32_t last_block = dispatch_blocks[dispatch].back();
             const uint32_t lo = starts[entry_block];
-            const uint32_t hi = last_block + 1 < starts.size() ? starts[last_block + 1]
-                                                              : UINT32_MAX;
+            // The final ordinal has no following block start to bound it. Use the phase's own end
+            // -- one dword past its last decoded instruction -- rather than UINT32_MAX, which is not
+            // a pc and made the last map entry unreadable. `len_dwords` is the decoded length, so
+            // this is exact for a variable-length ISA rather than assuming one dword.
+            const uint32_t phase_end = ins.empty() ? 0u : ins.back().pc + ins.back().len_dwords;
+            const uint32_t hi = last_block + 1 < starts.size() ? starts[last_block + 1] : phase_end;
             const int written = snprintf(entry, sizeof(entry), "%s%u:pc%u..<%u", dispatch ? " " : "",
                                          dispatch, lo, hi);
             if (written > 0) map.append(entry, static_cast<size_t>(
@@ -20218,19 +20243,27 @@ bool emit_cfg_state_machine(
                                old_max));
         const uint32_t under_bound = b.ucmp(Op_ULessThan, next_trip, b.uconst(cfg_trip_bound));
         // WITNESS. A cap that is armed but never reached proves nothing, so record the hit where the
-        // host can read it: the internal GDS buffer's top six dwords (kComputeTripWitnessDword).
+        // host can read it: the internal GDS buffer's top five dwords (kComputeTripWitnessDword),
+        // which the host prepares before this dispatch and only touches while armed.
         // Predicated on "still nominally running AND the bound just ran out", so a loop that exits
         // normally writes nothing and the ABSENCE of a record is itself an answer.
         const uint32_t hit = b.land(keep_going, b.logical_not(under_bound));
+        // Fields 0 and 1 are invocation-invariant (a constant and the compile-time phase), so a
+        // plain predicated store publishes them coherently however many invocations race.
         b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 0), b.uconst(1), true, hit);
         b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 1), b.uconst(cfg_phase), true, hit);
-        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 2),
-                            b.load_function(b.t_u32, pc_var), true, hit);
-        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 3), next_trip, true, hit);
-        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 4),
-                            b.load_function(b.t_u32, dispatch_min_var), true, hit);
-        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 5),
-                            b.load_function(b.t_u32, dispatch_max_var), true, hit);
+        // Fields 2..4 are per-invocation and must be REDUCED, not overwritten. The deleted field
+        // here was the dispatcher ordinal at the instant one invocation hit the cap: a single
+        // sample, unusable for the question ("is it cycling?"), and the field whose label was
+        // published wrongly twice. The span it belonged to is what actually answers that, so only
+        // the span survives -- and as true extremes over every invocation rather than whichever
+        // wrote last.
+        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 2),
+                                    next_trip, hit);
+        b.compute_gds_atomic_minmax(Op_AtomicUMin, b.uconst(kComputeTripWitnessDword + 3),
+                                    b.load_function(b.t_u32, dispatch_min_var), hit);
+        b.compute_gds_atomic_minmax(Op_AtomicUMax, b.uconst(kComputeTripWitnessDword + 4),
+                                    b.load_function(b.t_u32, dispatch_max_var), hit);
         return b.land(keep_going, under_bound);
     };
     if (direct_dispatch) {

@@ -78,6 +78,22 @@ saying the structured emitters are NOT covered was added directly above a surviv
 all three were. Both are now pinned by assertions — a structured loop must be byte-identical when
 armed, a dispatcher loop must not be.
 
+### Diagnostics this investigation added, and what each is safe to conclude from
+
+| switch | default | what it does | the trap it avoids |
+| --- | --- | --- | --- |
+| `PROSPER_CFG_TRIP_BOUND[_PROGRAM,_PHASE]` | off | caps the CFG dispatcher's back edge for one program/phase, and records a device-side hit witness | covers **only** the CFG dispatcher; a null on a structurizer-accepted program means *not measured* |
+| `PROSPER_COMPUTELOG_RAW` | off | writes a traced program's guest RDNA2 bytes for `tools/shader_inspect` | `PROSPER_SHADER_DUMP_SUCCESS` names files by hash, so recovering one program by address means hash-matching by hand |
+| `PROSPER_INDIRECT_APERTURE_RECOVERY` | **off** | rebuilds a base-less queue-2 indirect argument address from the last-seen SetBase aperture | changes execution: the aperture is learned from any SetBase on any queue, and *mapped* is not *this is the argument buffer* |
+| `PROSPER_INDIRECTLOG` | off | per-packet base/offset/queue, the three argument dwords, and an end-of-run outcome census | readability was probed and values were not, so a misread surfaced only as a `workgroup-count-limit` decline thousands of operations later |
+
+The aperture recovery is opt-in on purpose and the trade is recorded rather than implied: **off, 50 of
+64 indirect compute dispatches skip as "unreadable arguments"; on, 0 do**, and the probe found the raw
+low address unmapped and `aperture | low` mapped on 49 of 49. That is real evidence about where those
+arguments live and it is still not provenance — one process VA space can hold mapped allocations under
+several high-32 prefixes, so accepting an address because 12 bytes are readable admits dispatching
+group counts read out of an unrelated live allocation.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
@@ -212,7 +228,7 @@ attribution; only the "not compute's" conclusion drawn from it was wrong.
 
 ## Superseded: the earlier reframing
 
-### 
+###
 
 Counted across every routed run in this investigation:
 
@@ -487,9 +503,14 @@ loop is at **pc 88..97** — inside it. That is the pointer chase:
  97  s_branch          -10
 ```
 
-So the runaway dispatcher is the one wrapping the EXEC-narrowing walk, and the walk's own data gives
-a maximum chain of 11 steps. The defect is named to a program, a phase and a 117-instruction guest pc
-range.
+So the runaway dispatcher is the one wrapping the EXEC-narrowing walk. The defect is named to a
+program, a phase, and a guest **pc** range — pc is a dword offset and RDNA2 instructions are variable
+length, so an instruction count cannot be read off it; this line previously called the range
+"117-instruction", which it never was.
+
+(The "maximum chain of 11 steps" quoted here came from the capsule-timing measurement that the
+retraction above supersedes. The pre-dispatch census is the current figure: 806 of 1,782 reads receive
+a table in which 1,805-2,062 of 2,063 roots lead into a cycle.)
 
 **The spinning dispatcher is the PORTABLE one, and that also explains the earlier void result.** The
 emitted module for `0x413dc6700` contains **zero `OpGroupNonUniform*` instructions** — so
@@ -526,6 +547,9 @@ At bound **4,096**, on the same program and phase:
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=38
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=14 trips=4096 submit=5547 dispatch=39
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=40
+    ^ HISTORICAL TRANSCRIPT. `last-block` is the label this run printed; the field is a dispatcher
+      switch-case ordinal and the per-invocation form was removed rather than renamed again. The
+      current line reports `trips` and `dispatch-range` only. See the correction directly below.
 ```
 
 **Correction (2026-08-14): the third field is a dispatcher switch-case ORDINAL — `next-dispatch`.**
@@ -588,14 +612,15 @@ It is not. Comparing **all** of that dispatch's inputs, **three of six differ** 
 difference is fully explained without any truncation. The comparison cannot discriminate, and the
 apparent agreement on one binding was coincidence.
 
-A real witness has to be device-side, as originally specified: program, phase ordinal, workgroup, last
-`pc_var` and trip count, written by the shader on a cap hit and read back after the dispatch.
+A real witness has to be device-side, as originally specified: written by the shader on a cap hit and
+read back after the dispatch.
 
-What is still NOT established is, and there is no
-device-side witness that a cap was actually reached — the run log records that the feature armed, not
-that it fired. A hit witness (program, phase ordinal, workgroup, last `pc_var`, trip count, read back
-after the dispatch) is the next instrument, and it is what would turn this into a named
-CFG-state-transition defect rather than a bounded-loop observation.
+**That witness now EXISTS and has fired** — see the section above. This paragraph used to continue
+"there is no device-side witness that a cap was actually reached", which stopped being true when the
+witness landed and is struck here rather than left to contradict the evidence recorded higher up. Its
+fields are the dispatcher's, not the guest's: phase ordinal, highest trip count, and the span of
+dispatcher switch-case ordinals visited, the last two reduced across invocations with device-scope
+atomics so they are true extremes rather than whichever invocation wrote last.
 
 **Earlier, weaker control — the bound's value matters, not the counter's presence.** With the counter emitted
 but the bound set to 4,000,000,000 (effectively no bound), the device is lost at `0x413dc6700`
