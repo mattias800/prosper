@@ -4289,6 +4289,40 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     double image_cache_ms = 0.0;
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
+    // Per-resource table dump for a traced program. The writeback line names a BINDING and the
+    // disassembly names a fetch PC; without the mapping between them, attributing a buffer's contents
+    // to the instruction that wrote it is guesswork. Printing the table closes that gap, and it is
+    // the table AS REALIZED for this dispatch -- which matters here, because the same program address
+    // realizes materially different tables from one dispatch to the next (buffers 1..43 observed).
+    if (trace && std::getenv("PROSPER_COMPUTELOG_RESOURCES") && item.resources) {
+        std::fprintf(stderr, "[compute]   resource table program=0x%llx dispatch=%llu count=%zu\n",
+                     static_cast<unsigned long long>(item.code_addr),
+                     static_cast<unsigned long long>(item.dispatch_index),
+                     item.resources->resources.size());
+        for (const auto& r : item.resources->resources) {
+            std::fprintf(stderr,
+                         "[compute]     program=0x%llx submit=%llu dispatch=%llu binding=%u cls=%u "
+                         "fmt=%u comps=%u addr=0x%llx size=%u stride=%u fetch-pc=%u srt=0x%x "
+                         "sgpr=%u array=%u entries=%zu\n",
+                         static_cast<unsigned long long>(item.code_addr),
+                         static_cast<unsigned long long>(item.submit_no),
+                         static_cast<unsigned long long>(item.dispatch_index),
+                         r.binding, static_cast<unsigned>(r.cls), static_cast<unsigned>(r.format),
+                         r.num_components, static_cast<unsigned long long>(r.gpu_addr), r.size,
+                         r.stride, r.fetch_pc, r.srt_offset, r.sgpr_base, r.table_index_count,
+                         r.table_entries.size());
+            // A runtime-selected buffer array keeps its concrete addresses HERE; the parent's
+            // gpu_addr is not one of them. Printing only the parent and an array count claims to
+            // show the table "as realized" while omitting the realized part, which is exactly the
+            // shape an address census has to see (#2412).
+            for (size_t e = 0; e < r.table_entries.size(); ++e)
+                std::fprintf(stderr,
+                             "[compute]       entry[%zu] binding=%u addr=0x%llx size=%u stride=%u\n",
+                             e, r.binding,
+                             static_cast<unsigned long long>(r.table_entries[e].gpu_addr),
+                             r.table_entries[e].size, r.table_entries[e].stride);
+        }
+    }
     maybe_dump_traced_compute_spirv(item, trace);
     maybe_dump_traced_compute_raw(item, trace);
     // Deliberately below the trace and SPIR-V dump: a skipped dispatch must still be observable by
@@ -8014,6 +8048,66 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 buffer.after_hash = fnv1a(result, buffer.bytes);
                 for (size_t i = 0; i < buffer.bytes; i++)
                     buffer.changed_bytes += destination[i] != result[i];
+                // PROSPER_COMPUTELOG_CHANGED=N: the first N changed DWORD indices with old->new.
+                //
+                // `changed_bytes` says how much moved and nothing about where, which is the only
+                // question that separates a wrong VALUE from a wrong INDEX. For a structure written
+                // as adjacent pairs, the indices are the evidence: a head at k and its tail at k+1
+                // is correct, a head at k and a tail at k+2 is not, and neither is visible in a byte
+                // count or a hash.
+                // How many bindings collapsed onto this one Vulkan buffer. Exact aliases are
+                // merged and writability is ORed onto the first owner, so the owner's binding is
+                // NOT evidence that the owner performed the store: a read-only binding followed by
+                // a writable exact alias reports as though the first wrote, and with several
+                // writable aliases no single store site can be named at all. The changed indices
+                // below are allocation-level evidence and stand on their own; the binding is
+                // reported as `owner-binding` with the alias count beside it so a reader cannot
+                // mistake it for attribution.
+                size_t alias_count = 0;
+                for (const auto& other : buffers)
+                    if (other.alias_of != SIZE_MAX &&
+                        &buffers[other.alias_of] == &buffer) ++alias_count;
+                if (const char* limit_env = std::getenv("PROSPER_COMPUTELOG_CHANGED")) {
+                    char* end = nullptr;
+                    const unsigned long limit = std::strtoul(limit_env, &end, 0);
+                    if (end && !*end && limit) {
+                        // memcpy, not a reinterpret_cast: `destination` is guest-addressed byte
+                        // storage and `result` is mapped device memory, and neither contract
+                        // promises uint32_t alignment or a uint32_t object lifetime there. The byte
+                        // bound below deliberately ignores a partial trailing dword.
+                        const size_t dwords = buffer.bytes / sizeof(uint32_t);
+                        const auto load_dword = [](const uint8_t* bytes, size_t index) {
+                            uint32_t value = 0;
+                            std::memcpy(&value, bytes + index * sizeof(uint32_t), sizeof(value));
+                            return value;
+                        };
+                        unsigned long shown = 0;
+                        for (size_t i = 0; i < dwords && shown < limit; ++i) {
+                            const uint32_t before_value = load_dword(destination, i);
+                            const uint32_t after_value = load_dword(result, i);
+                            if (before_value == after_value) continue;
+                            // Carry submit/dispatch on EVERY line. Without them the lines from
+                            // consecutive dispatches concatenate into one stream that looks like a
+                            // single dispatch's writes -- and a per-dispatch structural claim built
+                            // on that stream is meaningless. The first analysis run here did exactly
+                            // that and reported one index changing twice in "one" dispatch.
+                            std::fprintf(stderr,
+                                         "[compute]     changed submit=%llu dispatch=%llu "
+                                         "addr=0x%llx owner-binding=%u aliases=%zu index=%zu "
+                                         "0x%08x -> 0x%08x (tag=%u bit30=%u next=%u)\n",
+                                         (unsigned long long)item.submit_no,
+                                         (unsigned long long)item.dispatch_index,
+                                         (unsigned long long)(buffer.resource
+                                             ? buffer.resource->gpu_addr : 0ull),
+                                         buffer.resource ? buffer.resource->binding : 0u,
+                                         alias_count, i,
+                                         before_value, after_value, after_value & 7u,
+                                         (after_value >> 30) & 1u,
+                                         (after_value >> 3) & 0x07FFFFFFu);
+                            ++shown;
+                        }
+                    }
+                }
             }
             // Synchronous Unity maintenance kernels commonly rewrite a large persistent buffer with
             // the values it already contains. Terminator 2D's startup kernel binds 8,847,360 bytes;
