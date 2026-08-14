@@ -18487,6 +18487,47 @@ bool emit_cfg_state_machine(
                                 ins.empty() ? 0u : ins.back().pc);
     const uint32_t trip_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
     if (trip_var) b.store_function(trip_var, b.uconst(0));
+    // Publish the ordinal -> guest pc map for this phase, once, when a bound arms.
+    //
+    // Every number the witness reports is a dispatch ordinal, and an ordinal means nothing on its
+    // own. Leaving the reader to reconstruct the mapping is not a documentation gap, it is a defect
+    // in the instrument: an ordinal that happens to fall inside the block COUNT reads as a plausible
+    // block index, and mapping it by hand onto a guest pc range is exactly how a wrong conclusion got
+    // published here (instrument trap 172). Emitting the map costs one line per ordinal, once.
+    if (cfg_trip_bound) {
+        std::string map;
+        char entry[64];
+        for (uint32_t dispatch = 0; dispatch < dispatch_blocks.size(); ++dispatch) {
+            if (dispatch_blocks[dispatch].empty()) continue;
+            const uint32_t entry_block = dispatch_blocks[dispatch].front();
+            const uint32_t last_block = dispatch_blocks[dispatch].back();
+            const uint32_t lo = starts[entry_block];
+            const uint32_t hi = last_block + 1 < starts.size() ? starts[last_block + 1]
+                                                              : UINT32_MAX;
+            const int written = snprintf(entry, sizeof(entry), "%s%u:pc%u..<%u", dispatch ? " " : "",
+                                         dispatch, lo, hi);
+            if (written > 0) map.append(entry, static_cast<size_t>(
+                std::min<size_t>(static_cast<size_t>(written), sizeof(entry) - 1)));
+        }
+        fprintf(stderr, "[cfg-trip-bound] program 0x%llx phase %u dispatch map: %s\n",
+                static_cast<unsigned long long>(b.diagnostic.program_address), cfg_phase,
+                map.c_str());
+    }
+    // The span of DISPATCH ORDINALS the state machine actually visited, tracked only while a bound
+    // is armed.
+    //
+    // `pc_var` holds a dispatcher switch-case ordinal (`dispatch_for_block`), NOT a guest pc — read
+    // the store sites, not the variable's name. One ordinal at the instant the cap ran out is a
+    // single sample and cannot separate "spinning here" from "passing through here"; the extremes
+    // can, because a state machine confined to a few ordinals is cycling among them.
+    //
+    // Ordinals are only meaningful against the map this phase announces below, which is why that map
+    // is printed rather than left to be reconstructed by hand. Hand-mapping one of these numbers onto
+    // a guest pc range is precisely what produced a wrong published conclusion — instrument trap 172.
+    const uint32_t dispatch_min_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
+    const uint32_t dispatch_max_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
+    if (dispatch_min_var) b.store_function(dispatch_min_var, b.uconst(0xffffffffu));
+    if (dispatch_max_var) b.store_function(dispatch_max_var, b.uconst(0));
     const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_value_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_invert_var = b.function_var(b.t_bool, ptr_bool);
@@ -20165,9 +20206,19 @@ bool emit_cfg_state_machine(
         const uint32_t next_trip =
             b.ibin(Op_IAdd, b.load_function(b.t_u32, trip_var), b.uconst(1));
         b.store_function(trip_var, next_trip);
+        // Updated on EVERY back-edge traversal, not only on the hit, so the extremes describe the
+        // whole run rather than its final instant.
+        const uint32_t dispatch_now = b.load_function(b.t_u32, pc_var);
+        const uint32_t old_min = b.load_function(b.t_u32, dispatch_min_var);
+        b.store_function(dispatch_min_var,
+                         b.sel(b.ucmp(Op_ULessThan, dispatch_now, old_min), dispatch_now, old_min));
+        const uint32_t old_max = b.load_function(b.t_u32, dispatch_max_var);
+        b.store_function(dispatch_max_var,
+                         b.sel(b.ucmp(Op_UGreaterThan, dispatch_now, old_max), dispatch_now,
+                               old_max));
         const uint32_t under_bound = b.ucmp(Op_ULessThan, next_trip, b.uconst(cfg_trip_bound));
         // WITNESS. A cap that is armed but never reached proves nothing, so record the hit where the
-        // host can read it: the internal GDS buffer's top four dwords (kComputeTripWitnessDword).
+        // host can read it: the internal GDS buffer's top six dwords (kComputeTripWitnessDword).
         // Predicated on "still nominally running AND the bound just ran out", so a loop that exits
         // normally writes nothing and the ABSENCE of a record is itself an answer.
         const uint32_t hit = b.land(keep_going, b.logical_not(under_bound));
@@ -20176,6 +20227,10 @@ bool emit_cfg_state_machine(
         b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 2),
                             b.load_function(b.t_u32, pc_var), true, hit);
         b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 3), next_trip, true, hit);
+        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 4),
+                            b.load_function(b.t_u32, dispatch_min_var), true, hit);
+        b.compute_gds_store(b.uconst(kComputeTripWitnessDword + 5),
+                            b.load_function(b.t_u32, dispatch_max_var), true, hit);
         return b.land(keep_going, under_bound);
     };
     if (direct_dispatch) {

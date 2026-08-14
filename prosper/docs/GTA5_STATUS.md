@@ -331,7 +331,7 @@ It closes the chain that every other measurement in this document constrains:
 4. the parent array degrades — **once, irreversibly** (each buffer transitions clean->cyclic exactly
    once and never recovers, which is what a half-applied union-find update looks like)
 5. `0x413dc6700` walks the cyclic chain and never terminates — recorded directly by the trip-bound
-   hit witness (its third field is a guest PC, not a block ordinal — see the correction below)
+   hit witness (its third field is a dispatch ordinal — see the correction below)
 6. GPU watchdog -> RADV hard recovery -> live compute disabled process-wide
 7. `producer_epoch_ok` cleared -> `indirect_dependencies_ok` latched -> every remaining indirect draw
    dropped untried -> **no world**
@@ -528,16 +528,39 @@ At bound **4,096**, on the same program and phase:
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=40
 ```
 
-**Correction (2026-08-14): the third field is `next-guest-pc`, and it was printed as `last-block`.**
-The shader stores the dispatcher's `pc_var` — the GUEST program counter it was about to run when the
-cap ran out. Reading `14` as "basic block 14" and mapping it by hand onto the block containing the
-guest's loop body produced the published claim that *the guest's loop is spinning*, which the numbers
-do not say. Guest pc 9 and pc 14 are both in the **prologue**:
+**Correction (2026-08-14): the third field is a dispatcher switch-case ORDINAL — `next-dispatch`.**
+It was first printed as `last-block`, then briefly "corrected" to `next-guest-pc`; both were wrong,
+in opposite directions, and the second was published on this branch before being caught. Every write
+to the emitter's `pc_var` stores `dispatch_for_block[...]`, so despite the variable's name it is
+neither a basic-block index nor a program counter. Instrument trap 172.
+
+**What this does and does not settle.** The numbers 9, 14, 9 are ordinals into phase 0's dispatch
+table. Whether ordinal 9 covers the guest's loop body at pc88..97 is a question about that table, not
+something derivable by hand from the value — and the hand-mapping is what produced both errors. Each
+phase now prints its map when a bound arms:
 
 ```text
-pc=0009  s_lshr_b32     s107, s107, 3
-pc=0014  s_load_dwordx4 s[8:11], s[22:23], s107
+[cfg-trip-bound] program 0x413dc6700 phase 0 dispatch map: 0:pc0..<N 1:pc... ...
 ```
+
+so the ordinal resolves against emitted evidence rather than by hand.
+
+**Resolved on a routed run, 2026-08-14 — and the original attribution was right.** Phase 0's map, and
+the witness with the ordinal span it now records:
+
+```text
+[cfg-trip-bound] program 0x413dc6700 phase 0 dispatch map:
+    0:pc0..<41  1:pc41..<50  2:pc50..<55  3:pc55..<61  4:pc61..<67  5:pc67..<73
+    6:pc73..<76  7:pc76..<88  8:pc88..<91  9:pc91..<98  10:pc98..<103 ...
+[cfg-trip-bound] HIT program=0x413dc6700 phase=0 next-dispatch=9 trips=4096 dispatch-range=6..9
+```
+
+Ordinal **8 is `pc88..91`** — the loop header, `v_mov` / `v_cmpx_ne_u32` / `s_cbranch_execz`. Ordinal
+**9 is `pc91..98`** — the loop body, `buffer_load_dword` / `s_add_i32` / `v_bfe_u32` / `s_branch`.
+Across all 4,096 iterations the state machine visited **only ordinals 6..9**, i.e. the loop and the
+block that falls into it. The guest's own loop is what spins, which is what the first reading of this
+witness said before either mislabelling. `dispatch-range` is what makes it a measurement rather than a
+one-sample inference: a span of four adjacent ordinals over 4,096 iterations is a cycle, not a pass.
 
 11 hits across dispatches 38..48 of one submit — **including dispatch 39, the exact dispatch that
 hangs on an unbounded build**. Last block is **14** on dispatch 39 and **9** on the other ten.

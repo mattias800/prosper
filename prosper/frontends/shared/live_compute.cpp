@@ -8977,22 +8977,26 @@ void report_trip_bound_witness(const prosper::gpu::ComputeItem& item) {
     if (!gds) return;
     uint32_t* witness = reinterpret_cast<uint32_t*>(gds) + prosper::gpu::kComputeTripWitnessDword;
     if (!witness[0]) return;
-    // `next-guest-pc`, not a block ordinal: witness[2] is the dispatcher's pc_var, the GUEST program
-    // counter it was about to dispatch when the cap ran out. This line used to call it `last-block`,
-    // and that one word cost a wrong conclusion — a value of 14 was read as "basic block 14", mapped
-    // onto the block containing the guest's loop body, and reported as "the guest's loop is spinning".
-    // Guest pc 14 is in the PROLOGUE. The number was right and the label made it mean the opposite of
-    // what it says: that the state machine is re-entering a pc it has already run, rather than
-    // iterating a loop the guest wrote.
+    // `next-dispatch` is the dispatcher's switch-case ORDINAL, and `dispatch-range` the span of
+    // ordinals visited. Every write to the emitter's `pc_var` stores `dispatch_for_block[...]`, so
+    // despite the variable's name it is not a guest pc; resolve an ordinal against the
+    // `[cfg-trip-bound] ... dispatch map:` line the same phase prints when the bound arms.
+    //
+    // This label has now been wrong TWICE, in opposite directions, which is why it is spelled out
+    // here. It began as `last-block`; that was corrected to `next-guest-pc` on the strength of the
+    // variable's NAME, without opening the store sites — and the store sites all write an ordinal.
+    // The first error made a dispatch ordinal read as a basic-block index, the second made it read as
+    // a program counter. See instrument trap 172.
     std::fprintf(stderr,
-                 "[cfg-trip-bound] HIT program=0x%llx phase=%u next-guest-pc=%u trips=%u "
-                 "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
+                 "[cfg-trip-bound] HIT program=0x%llx phase=%u next-dispatch=%u trips=%u "
+                 "dispatch-range=%u..%u submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
                  static_cast<unsigned long long>(item.code_addr), witness[1], witness[2], witness[3],
+                 witness[4], witness[5],
                  static_cast<unsigned long long>(item.submit_no),
                  static_cast<unsigned long long>(item.dispatch_index),
                  static_cast<unsigned long long>(item.command_order),
                  item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
-    witness[0] = witness[1] = witness[2] = witness[3] = 0;
+    for (uint32_t i = 0; i < prosper::gpu::kComputeTripWitnessDwordCount; ++i) witness[i] = 0;
 }
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {

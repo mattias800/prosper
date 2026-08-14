@@ -29,10 +29,18 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 // and read back after the dispatch. Arming a bound is not the same as hitting one, and until a run
 // can show a hit, "the loop exceeds N" rests on inference from device survival rather than evidence.
 //
-// Four dwords at the very top of a 16,384-dword buffer, chosen so a guest that genuinely uses GDS
-// cannot plausibly collide: hit flag, dispatcher phase, the lane's last block index, and the trip
-// count reached.
-inline constexpr uint32_t kComputeTripWitnessDword = 16380u;
+// SIX dwords at the very top of a 16,384-dword buffer, chosen so a guest that genuinely uses GDS
+// cannot plausibly collide: hit flag, dispatcher phase, the NEXT GUEST PC the dispatcher was about
+// to run, the trip count reached, and the lowest and highest guest pc the dispatcher visited.
+//
+// The base is 16378 rather than 16380 because the record grew and the buffer's top is fixed: the
+// last dword is 16383, so six dwords must start two lower. Widening in place would have written
+// past the end.
+//
+// The third field is a guest PC and is named that way everywhere it is reported. It was once
+// printed as a block ordinal, which inverted a conclusion — see instrument trap 172.
+inline constexpr uint32_t kComputeTripWitnessDword = 16378u;
+inline constexpr uint32_t kComputeTripWitnessDwordCount = 6u;
 
 // True when any dispatcher loop in `program_address` will be bounded, so the executor knows it must
 // bind the internal GDS buffer even for a program that uses no GDS of its own.
