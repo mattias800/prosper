@@ -4,6 +4,7 @@
 // Vulkan boilerplate lives in one place. Header-only; the including test links Vulkan::Vulkan.
 #pragma once
 #include <vulkan/vulkan.h>
+#include "../src/gpu/rdna2_to_spirv.hpp"   // kComputeInternalGdsBinding
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -89,7 +90,17 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
                                       const std::vector<uint32_t>& cbuf1 = {},
                                       std::vector<uint32_t>* cbuf1_out = nullptr,
                                       uint32_t local_size_x = 64,
-                                      std::vector<uint32_t>* cbuf_out = nullptr) {
+                                      std::vector<uint32_t>* cbuf_out = nullptr,
+                                      // Internal-GDS binding (kComputeInternalGdsBinding = 127).
+                                      // Declared and bound UNCONDITIONALLY below: a recompiled module
+                                      // that statically uses it -- anything carrying the
+                                      // PROSPER_CFG_TRIP_BOUND witness does -- is an invalid pipeline
+                                      // without it (VUID-VkComputePipelineCreateInfo-layout-07988 and
+                                      // VUID-vkCmdDispatch-None-08114), and a test that dispatches an
+                                      // invalid pipeline is measuring undefined behaviour however
+                                      // confidently its assertions print. Pass this to read the buffer
+                                      // back; leave it null to bind the storage and ignore it.
+                                      std::vector<uint32_t>* gds_out = nullptr) {
     const uint32_t IN_N = (uint32_t)input.size();
     if (invocations == 0) invocations = IN_N;
     if (out_count == 0)   out_count = IN_N;
@@ -167,7 +178,10 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     };
     const VkDeviceSize inBytes = (VkDeviceSize)IN_N * sizeof(float);
     const VkDeviceSize outBytes = (VkDeviceSize)out_count * sizeof(float);
-    VkBuffer inBuf, outBuf, cbBuf, cbBuf1; VkDeviceMemory inMem, outMem, cbMem, cbMem1;
+    VkBuffer inBuf, outBuf, cbBuf, cbBuf1, gdsBuf;
+    VkDeviceMemory inMem, outMem, cbMem, cbMem1, gdsMem;
+    // Matches the live backend's internal GDS allocation (gpu_executor.cpp's g_compute_gds).
+    constexpr VkDeviceSize kGdsBytes = 64 * 1024;
     auto makeBuf = [&](VkBuffer& b, VkDeviceMemory& m, VkDeviceSize sz) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = sz; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -200,13 +214,21 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     for (uint32_t i = 0; i < out_count; i++) ((float*)zp)[i] = 0.0f;
     vkUnmapMemory(dev, outMem);
 
-    VkDescriptorSetLayoutBinding binds[4]{};
+    makeBuf(gdsBuf, gdsMem, kGdsBytes);
+    void* gp = nullptr; vkMapMemory(dev, gdsMem, 0, kGdsBytes, 0, &gp);
+    std::memset(gp, 0, kGdsBytes);
+    vkUnmapMemory(dev, gdsMem);
+
+    VkDescriptorSetLayoutBinding binds[5]{};
     for (int i = 0; i < 4; i++) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1; binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
+    binds[4].binding = prosper::gpu::kComputeInternalGdsBinding;
+    binds[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binds[4].descriptorCount = 1; binds[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = 4; dslci.pBindings = binds;
+    dslci.bindingCount = 5; dslci.pBindings = binds;
     VkDescriptorSetLayout dsl; vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
-    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &psz;
     VkDescriptorPool dp; vkCreateDescriptorPool(dev, &dpci, nullptr, &dp);
@@ -214,8 +236,9 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     dsai.descriptorPool = dp; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl;
     VkDescriptorSet dset; vkAllocateDescriptorSets(dev, &dsai, &dset);
     VkDescriptorBufferInfo bi0{inBuf, 0, VK_WHOLE_SIZE}, bi1{outBuf, 0, VK_WHOLE_SIZE},
-                           bi2{cbBuf, 0, VK_WHOLE_SIZE}, bi3{cbBuf1, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[4]{};
+                           bi2{cbBuf, 0, VK_WHOLE_SIZE}, bi3{cbBuf1, 0, VK_WHOLE_SIZE},
+                           bi4{gdsBuf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[5]{};
     w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[0].dstSet = dset; w[0].dstBinding = 0;
     w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &bi0;
     w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[1].dstSet = dset; w[1].dstBinding = 1;
@@ -224,7 +247,10 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &bi2;
     w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[3].dstSet = dset; w[3].dstBinding = 3;
     w[3].descriptorCount = 1; w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[3].pBufferInfo = &bi3;
-    vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
+    w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[4].dstSet = dset;
+    w[4].dstBinding = prosper::gpu::kComputeInternalGdsBinding;
+    w[4].descriptorCount = 1; w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[4].pBufferInfo = &bi4;
+    vkUpdateDescriptorSets(dev, 5, w, 0, nullptr);
 
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smci.codeSize = spirv.size() * 4; smci.pCode = spirv.data();
@@ -261,6 +287,15 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     void* op = nullptr; vkMapMemory(dev, outMem, 0, outBytes, 0, &op);
     for (uint32_t i = 0; i < out_count; i++) out[i] = ((float*)op)[i];
     vkUnmapMemory(dev, outMem);
+    // Optional: read back the internal-GDS buffer, so a test can assert what a module wrote there
+    // (the PROSPER_CFG_TRIP_BOUND witness lives at its top). The binding itself is always declared
+    // and bound, whether or not anyone reads it back.
+    if (gds_out) {
+        void* g2 = nullptr; vkMapMemory(dev, gdsMem, 0, kGdsBytes, 0, &g2);
+        gds_out->assign(reinterpret_cast<const uint32_t*>(g2),
+                        reinterpret_cast<const uint32_t*>(g2) + kGdsBytes / sizeof(uint32_t));
+        vkUnmapMemory(dev, gdsMem);
+    }
     // Optional: read back binding-3 (cbuf1) contents — for verifying MUBUF stores that target it.
     if (cbuf1_out) {
         cbuf1_out->resize(CB1_N);
@@ -283,6 +318,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkDestroyBuffer(dev, outBuf, nullptr); vkFreeMemory(dev, outMem, nullptr);
     vkDestroyBuffer(dev, cbBuf, nullptr); vkFreeMemory(dev, cbMem, nullptr);
     vkDestroyBuffer(dev, cbBuf1, nullptr); vkFreeMemory(dev, cbMem1, nullptr);
+    vkDestroyBuffer(dev, gdsBuf, nullptr); vkFreeMemory(dev, gdsMem, nullptr);
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;
 }

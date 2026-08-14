@@ -24,6 +24,71 @@ constexpr uint32_t kDefaultComputePgmRsrc1 = 3u << 16;
 
 inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 
+// PROSPER_CFG_TRIP_BOUND witness. When a dispatcher loop is bounded and the bound is REACHED, the
+// shader records what happened into the top of the internal GDS buffer, which is already host-backed
+// and read back after the dispatch. Arming a bound is not the same as hitting one, and until a run
+// can show a hit, "the loop exceeds N" rests on inference from device survival rather than evidence.
+//
+// FIVE dwords, and every one of them is a DISPATCHER quantity, never a guest pc:
+//   +0  hit flag                                        (atomic max; idempotent)
+//   +1  dispatcher phase ordinal                        (atomic max; idempotent)
+//   +2  highest trip count reached                      (atomic max over invocations)
+//   +3  lowest dispatcher switch-case ordinal visited    (atomic min over invocations)
+//   +4  highest dispatcher switch-case ordinal visited   (atomic max over invocations)
+//
+// EVERY field is published with a device-scope atomic, including the two that are
+// invocation-invariant. Fields 2..4 must be reduced because every invocation reaching the cap writes
+// the same addresses: a plain store publishes whichever wrote last and silently discards the
+// extremes, which the host would then read as one invocation's history when it is a mixture of
+// several (instrument trap 173). Fields 0 and 1 are atomic too because concurrent non-atomic stores
+// of the same value are still a race, and "they happen to agree" is not a publication protocol --
+// max is idempotent for a flag and a compile-time constant, so it costs nothing to remove the
+// exception rather than document it.
+//
+// The ordinals index the phase's dispatch table, whose ordinal -> guest pc map that phase prints when
+// the bound arms. Do not map one by hand: a value that happens to fall inside the block count reads
+// as a plausible block index, and hand-mapping is what published two contradictory conclusions from
+// the same correct number (instrument trap 172).
+//
+// The host SAVES these dwords, prepares them (field +3 to UINT32_MAX, so an atomic min is
+// meaningful), reads them after the dispatch, and RESTORES the saved values -- see
+// frontends/shared/trip_bound_witness.hpp. Two rules that are easy to state too weakly:
+//
+//   * The gate is whether a witness was actually EMITTED for this program
+//     (spirv_writes_trip_witness, read from the compiled module), never whether the selectors
+//     accept it. A structured-loop
+//     program or a phase ordinal the program does not have satisfies every selector and emits
+//     nothing, and a host reading on that basis reports guest data as a measurement.
+//   * Restoring is not tidiness. This is ONE persistent allocation shared by every dispatch, so
+//     proving the instrumented program cannot read it says nothing about the program that runs next
+//     and does. Preservation, not exclusivity, is what keeps the diagnostic from perturbing the
+//     machine it measures. Instrument trap 174.
+inline constexpr uint32_t kComputeTripWitnessDword = 16379u;
+inline constexpr uint32_t kComputeTripWitnessDwordCount = 5u;
+
+// True when any dispatcher loop in `program_address` will be bounded, so the executor knows it must
+// bind the internal GDS buffer even for a program that uses no GDS of its own.
+bool compute_trip_witness_active(uint64_t program_address);
+
+// The complete PROSPER_CFG_TRIP_BOUND* selector state. Given a program's code bytes, this struct plus
+// the program's address fully determines whether a bound is emitted and where — which is exactly what
+// the shader cache key needs to mix in, since that key is otherwise blind to a program's address and
+// would let a target and a non-target with identical bodies share one compiled module.
+struct ComputeTripBoundSettings {
+    static constexpr uint32_t kAllPhases = 0xffffffffu;
+    uint32_t bound = 0;              // 0 = disarmed; nothing is emitted and modules are unchanged
+    uint64_t only_program = 0;       // 0 = every program
+    uint32_t only_phase = kAllPhases; // kAllPhases = every dispatcher phase
+};
+ComputeTripBoundSettings compute_trip_bound_settings();
+
+// Does THIS compiled module write the trip-bound witness? Distinct from compute_trip_witness_active,
+// which reports INTENT: a structured-loop program, or a selected phase the program does not have,
+// satisfies every selector and emits nothing. The host must gate reading and clearing the
+// guest-visible witness dwords on the artifact, never on the selectors -- and never on process
+// history, which cannot distinguish this module from an earlier one at the same address.
+bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv);
+
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 

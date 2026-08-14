@@ -1570,6 +1570,33 @@ public:
                          static_cast<int>(result.wait_result));
             std::fflush(stderr);
         }
+        // A GRAPHICS submission that fails to submit or fails to complete is reported
+        // unconditionally, not only under the backend trace.
+        //
+        // Until now this was silent: the 5-second fence wait falls through to a blocking
+        // queue-wait-idle and says nothing, so a hung or lost graphics submission left no record at
+        // all. The compute backend, by contrast, reports its refusals loudly — with the result that
+        // a device loss discovered at compute's NEXT submit was read for days as "a compute dispatch
+        // hung the GPU" purely because compute was the only side that spoke. See instrument trap 170:
+        // a loss at submit time names the submission that OBSERVES it, not the one that caused it.
+        //
+        // The sentence that used to end this paragraph -- "the hang was never compute's", argued from
+        // 705 of 705 fence waits completing with zero timeouts -- is WITHDRAWN, and trap 171 records
+        // why: the timeout is 30 seconds and the event is 2. Recording the wait DURATION found a
+        // single 2,045 ms compute dispatch in a whole route, immediately before the loss. A zero
+        // timeout count never meant a zero latency count. This reporting stands on its own merits:
+        // a graphics submission that fails or hangs must not be silent either.
+        if (result.submit_result != VK_SUCCESS || result.wait_result != VK_SUCCESS) {
+            static std::atomic<int> reported{0};
+            const int n = reported.fetch_add(1);
+            if (n < 16 || (n & 255) == 0)
+                std::fprintf(stderr,
+                             "[backend] GRAPHICS submission failed: submit=%d wait=%d "
+                             "command-buffers=%zu occurrence=%d\n",
+                             static_cast<int>(result.submit_result),
+                             static_cast<int>(result.wait_result),
+                             result.command_buffers, n + 1);
+        }
         const BackendSubmissionState state = backend_submission_state(
             result.submit_result == VK_SUCCESS,
             result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS);
