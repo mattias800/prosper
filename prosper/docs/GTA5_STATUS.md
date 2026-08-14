@@ -166,9 +166,24 @@ falsification.
 | + `PROSPER_WAIT_DEFER=1` | `0x413dc6700` submit 4643 **dispatch 39** order 1206 |
 | **+ `PROSPER_CFG_TRIP_BOUND=100000`** | **`0x413e14900`** submit 5954 **dispatch 52** order **24374** |
 
+**Control — the bound's VALUE is what matters, not the counter's presence.** With the counter emitted
+but the bound set to 4,000,000,000 (effectively no bound), the device is lost at `0x413dc6700`
+dispatch 39 again, exactly as in the four unbounded runs. So the result is not codegen perturbation
+from adding a Function variable to the loop:
+
+| bound | outcome |
+| --- | --- |
+| none (counter not emitted) | dies at `0x413dc6700` dispatch 39 |
+| **4,000,000,000** (counter emitted, never reached) | **dies at `0x413dc6700` dispatch 39** |
+| 100,000 | gets past it |
+| 4,096 | gets past it |
+
 Four independent configurations all die at the same program and the same dispatch index. Bounding the
 dispatcher is the only change that gets past it — so **the mechanism is a dispatcher loop that does
-not terminate**, and `0x413e14900` has the same defect further along.
+not terminate**, and `0x413e14900` hangs for a **different** reason — both 4,096 and 100,000 get past `0x413dc6700` and
+then die at `0x413e14900` dispatch 52, so a dispatcher bound does not save it. Either it is not
+dispatcher-emitted at all (a structured module's loops are unbounded by this switch), or its
+non-termination is elsewhere.
 
 Strictly the bound proves the loop exceeds 100,000 iterations rather than that it is infinite. For a
 program whose only guest loop is bounded at **11** iterations on this dispatch's own data, either is a
