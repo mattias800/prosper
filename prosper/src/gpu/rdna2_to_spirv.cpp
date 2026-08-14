@@ -402,6 +402,22 @@ struct SpirvCompute {
     // single descriptor, so an access chain for it takes no leading index. Kept beside `cbuf_var`
     // because every consumer of the variable also needs to know whether it is an array.
     std::map<uint32_t, uint32_t> cbuf_table_arity;
+    // #2481: a DynamicSbufferByteOffset table's element index is not in user data — it is whatever
+    // the producing `s_buffer_load_dwordx4` had in its SOFFSET at run time. The emitter stores that
+    // already-divided index here when it lowers the producer, so `cbuf_element_ptr` can select with
+    // a live SSA value instead of a push constant. Absent means no producer has executed on this
+    // path yet, which must keep failing visibly rather than silently selecting element zero.
+    std::map<uint32_t, uint32_t> cbuf_table_selector_value;
+    // Label id of the block that emitted each selector above. A raw SSA id is only usable where the
+    // producer DOMINATES the consumer, and nothing here guarantees that: the CFG dispatcher emits
+    // one switch case per guest block, and sibling switch cases do not dominate one another (a
+    // structured if/endif has the same problem). Consuming across that boundary would emit an
+    // OpAccessChain against an id outside its dominance region -- malformed SPIR-V that `spirv-val`
+    // does not catch here for want of a representative module, surfacing instead as a dropped
+    // dispatch. Requiring producer and consumer to be the SAME block is the conservative subset
+    // that is always sound; carrying the value through a Function variable would lift the
+    // restriction and is the right long-term shape.
+    std::map<uint32_t, uint32_t> cbuf_table_selector_block;
     // binding -> user SGPR holding the descriptor index, when one is available.
     std::map<uint32_t, uint32_t> cbuf_table_index_sgpr;
     // Set when an array access cannot be represented exactly. The backend already refuses writable
@@ -2289,20 +2305,38 @@ struct SpirvCompute {
         if (array_valid) *array_valid = 0;
         auto arity = cbuf_table_arity.find(binding);
         auto index_sgpr = cbuf_table_index_sgpr.find(binding);
+        auto live_selector = cbuf_table_selector_value.find(binding);
+        auto selector_block = cbuf_table_selector_block.find(binding);
         uint32_t ptr = id();
         if (arity != cbuf_table_arity.end()) {
+            // A live GPU-computed selector takes precedence over the user-SGPR convention: the two
+            // are different contracts, and a table whose index the guest derives on the GPU has no
+            // push-constant home at all.
+            const bool have_live_selector =
+                is_compute && arity->second <= 4096u &&
+                live_selector != cbuf_table_selector_value.end() && live_selector->second != 0 &&
+                // Dominance, see cbuf_table_selector_block. Failing this leaves `have_live_selector`
+                // false and, since this mode never sets `table_index_sgpr`, drops through to
+                // `invalid_cbuf_array_access` below -- the module is discarded. That is exactly what
+                // the same shader does WITHOUT this feature (its MUBUF cannot resolve), so the guard
+                // cannot regress anything: it can only decline a case that was never sound.
+                selector_block != cbuf_table_selector_block.end() &&
+                selector_block->second == cur_block;
             // Only the compute shell declares the user-SGPR push-constant block. Graphics paths do
             // not currently have a runtime source for this selector, so emitting an access there
             // would manufacture type/variable id zero and an invalid module.
-            if (!is_compute || arity->second > 4096u ||
+            if (!have_live_selector &&
+                (!is_compute || arity->second > 4096u ||
                 index_sgpr == cbuf_table_index_sgpr.end() ||
-                index_sgpr->second >= push_constant_dword_count) {
+                index_sgpr->second >= push_constant_dword_count)) {
                 invalid_cbuf_array_access = true;
                 putv(code, Op_AccessChain,
                      {t_ptr_sb_u32, ptr, buf, uconst(0), uconst(0), idx});
                 return ptr;
             }
-            const uint32_t selector = load_push_constant(index_sgpr->second);
+            const uint32_t selector = have_live_selector
+                ? live_selector->second
+                : load_push_constant(index_sgpr->second);
             const uint32_t valid = ucmp(Op_ULessThan, selector, uconst(arity->second));
             const uint32_t safe_selector = sel(valid, selector, uconst(0));
             if (array_valid) *array_valid = valid;
@@ -12696,6 +12730,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t loaded = b.cbuf_load(safe_index, binding);
                 return b.sel(in_bounds, loaded, b.uconst(0u));
             };
+            // #2481: this exact instruction is the producer of a runtime-selected descriptor table.
+            // Its SOFFSET is the byte offset of the chosen record, so the element index is
+            // SOFFSET / record-stride. Publish it as the live selector for that array binding before
+            // the consumer runs; the consumer is a later instruction on the same path, so the value
+            // dominates it. `cbuf_element_ptr` still range-checks the index against the declared
+            // arity, so an out-of-range runtime selector reads element zero rather than out of
+            // bounds -- and the front half proved every declared element is a valid descriptor.
+            if (rt && soff_dyn) {
+                for (const ShaderResource& resource : rt->resources) {
+                    if (resource.table_selector_mode !=
+                            BufferTableSelectorMode::DynamicSbufferByteOffset ||
+                        resource.table_load_pc != in.pc || resource.table_index_count == 0u ||
+                        resource.table_entry_stride == 0u)
+                        continue;
+                    b.cbuf_table_selector_value[resource.binding] =
+                        b.ibin(Op_UDiv, soff_bits, b.uconst(resource.table_entry_stride));
+                    b.cbuf_table_selector_block[resource.binding] = b.cur_block;
+                    if (getenv("PROSPER_DBG"))
+                        fprintf(stderr,
+                                "[selected-table] producer pc=%u binding=%u stride=%u arity=%u\n",
+                                in.pc, resource.binding, resource.table_entry_stride,
+                                resource.table_index_count);
+                }
+            }
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
                 uint32_t idx0 = b.ibin(Op_ShiftRightLogical,

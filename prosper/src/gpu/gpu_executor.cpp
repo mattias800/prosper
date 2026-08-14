@@ -2725,6 +2725,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::unordered_map<uint32_t, uint32_t> scalar_spill_slots; // (VGPR << 6) | lane -> scalar value
     std::array<std::array<uint32_t, 4>, kFoldSgprs> descr{}; // load-time V# snapshots by base SGPR
     std::bitset<kFoldSgprs> descr_known;
+    // RUNTIME-SELECTED descriptor table (#2481). A `s_buffer_load_dwordx4` whose scalar offset the
+    // fold cannot resolve still names a descriptor that is one OF a bounded table, because the outer
+    // V# it reads through is fully known. The selected element is not knowable here — GTA V derives
+    // it from `v_readfirstlane` inside a waterfall loop, so it genuinely varies per wave — but the
+    // TABLE is, and that is what a Vulkan descriptor array binds. Record the producer so a later
+    // MUBUF consumer of these SGPRs can publish the whole declared table plus the exact instruction
+    // whose live scalar value selects within it. Deliberately kept apart from `descr`: that promises
+    // "the descriptor IS these words", this promises "the descriptor is one of these N".
+    struct FoldTableSource {
+        uint32_t load_pc = 0xFFFFFFFFu;
+        uint64_t base = 0;
+        uint32_t stride = 0;
+        uint32_t records = 0;
+        uint32_t element_offset = 0;   // byte offset of the V# inside each table record
+    };
+    std::array<FoldTableSource, kFoldSgprs> table_source{};
+    std::bitset<kFoldSgprs> table_source_known;
     // Descriptor-TABLE provenance (#294): for each snapshotted 4/8-dword s_load, the load's IMMEDIATE
     // byte offset — the recompiler's sreg_srt/by_srt_offset key. 0xFFFFFFFF = not provenance-usable
     // (register-SOFFSET or negative-immediate load, which emit_alu doesn't tag).
@@ -2841,6 +2858,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         if (valid_reg(r)) {
             val[(size_t)r] = v;
             val_known.set((size_t)r);
+            table_source_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
             descriptor_word_source_known.reset((size_t)r);
@@ -2859,6 +2877,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             val_known.reset((size_t)r);
             val_srt_key_known.reset((size_t)r);
             val_seed_origin_known.reset((size_t)r);
+            table_source_known.reset((size_t)r);
             descriptor_word_source_known.reset((size_t)r);
             null_chain_known.reset((size_t)r);
             optional_null_role[(size_t)r] = OptionalNullRole::None;
@@ -2999,6 +3018,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::unordered_map<uint32_t, uint32_t> scalar_spill_slots;
         std::array<std::array<uint32_t, 4>, kFoldSgprs> descr;
         std::bitset<kFoldSgprs> descr_known;
+        std::array<FoldTableSource, kFoldSgprs> table_source;
+        std::bitset<kFoldSgprs> table_source_known;
         std::array<uint32_t, kFoldSgprs> descr_key;
         std::bitset<kFoldSgprs> descr_key_known;
         std::array<std::array<uint32_t, 8>, kFoldSgprs> descr8;
@@ -3047,6 +3068,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.val_srt_key = val_srt_key; s.val_srt_key_known = val_srt_key_known;
         s.scalar_spill_slots = scalar_spill_slots;
         s.descr = descr; s.descr_known = descr_known;
+        s.table_source = table_source; s.table_source_known = table_source_known;
         s.descr_key = descr_key; s.descr_key_known = descr_key_known;
         s.descr8 = descr8; s.descr8_known = descr8_known;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
@@ -3067,6 +3089,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         val_srt_key = s.val_srt_key; val_srt_key_known = s.val_srt_key_known;
         scalar_spill_slots = s.scalar_spill_slots;
         descr = s.descr; descr_known = s.descr_known;
+        table_source = s.table_source; table_source_known = s.table_source_known;
         descr_key = s.descr_key; descr_key_known = s.descr_key_known;
         descr8 = s.descr8; descr8_known = s.descr8_known;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
@@ -4063,6 +4086,43 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         forget(sdst + (int)k);
                         mark_null_origin(sdst + (int)k, null_base_origin);
                     }
+                    // #2481: the offset is unknown, but the OUTER V# is fully known and bounded, so
+                    // this x4 load names one entry of a declared descriptor table. Record that
+                    // provenance for the destination quad; a MUBUF consumer republishes it as a
+                    // table-indexed binding and the emitter selects with this instruction's own
+                    // runtime scalar value. `forget` above already cleared any stale entry, so this
+                    // runs after it. Every bound here is the guest's own declaration — never an
+                    // inferred one — and an element that does not fit its record rejects.
+                    if (is_buffer && n == 4u && live_sbase_vsharp_known &&
+                        valid_reg(sdst) && valid_reg(sdst + 3)) {
+                        const DecodedBufferDescriptor& outer = live_sbase_descriptor;
+                        const uint32_t element = in.literal;
+                        const bool bounded_table =
+                            outer.base > 0x10000u && outer.stride >= 16u &&
+                            outer.size_bytes != 0u &&
+                            outer.size_bytes % outer.stride == 0u &&
+                            static_cast<int32_t>(in.literal) >= 0 &&
+                            (element % 4u) == 0u &&
+                            static_cast<uint64_t>(element) + 16u <= outer.stride;
+                        const uint32_t records =
+                            bounded_table ? outer.size_bytes / outer.stride : 0u;
+                        if (bounded_table && records >= 1u && records <= kMaxSelectedTableRecords) {
+                            FoldTableSource source;
+                            source.load_pc = in.pc;
+                            source.base = outer.base;
+                            source.stride = outer.stride;
+                            source.records = records;
+                            source.element_offset = element;
+                            table_source[(size_t)sdst] = source;
+                            table_source_known.set((size_t)sdst);
+                            if (trc)
+                                fprintf(stderr,
+                                        "[dyntrace] selected-table pc=%u s%d base=0x%llx stride=%u "
+                                        "records=%u element=+0x%x\n",
+                                        in.pc, sdst, (unsigned long long)outer.base, outer.stride,
+                                        records, element);
+                        }
+                    }
                     break;
                 }
                 // in.literal is the SIGN-EXTENDED 21-bit immediate (#149) — add it as signed so a
@@ -4738,6 +4798,39 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                 unk_valid ? forget_pc[(size_t)unk_reg] : 0xffffffffu,
                                 unk_valid ? forget_w0[(size_t)unk_reg] : 0u,
                                 unk_valid ? forget_w1[(size_t)unk_reg] : 0u);
+                    }
+                    // #2481: the SRSRC words are NOT known, but the fold proved they were produced
+                    // by an x4 scalar load of one element of a bounded descriptor table. Publish the
+                    // table itself; the emitter resolves the element at run time. Restricted to the
+                    // untyped load family the table-indexed emitter already admits — a typed fetch,
+                    // store or atomic through a selected descriptor needs per-entry treatment that
+                    // does not exist yet, and must keep failing visibly rather than binding element
+                    // zero. Note this is checked BEFORE `current_known`, which is false here by
+                    // construction: `forget` cleared those words when the offset proved dynamic.
+                    if (!current_known && srt_uses && valid_reg(srsrc) &&
+                        table_source_known.test((size_t)srsrc) &&
+                        in.fmt == Rdna2Format::MUBUF && !is_mtbuf &&
+                        (in.opcode == kMubufOpcodeLoadDword ||
+                         in.opcode == kMubufOpcodeLoadDwordX2 ||
+                         in.opcode == kMubufOpcodeLoadDwordX3 ||
+                         in.opcode == kMubufOpcodeLoadDwordX4)) {
+                        const FoldTableSource& source = table_source[(size_t)srsrc];
+                        SrtUse u;
+                        u.kind = 1;
+                        u.key = 0xFFFFFFFFu;
+                        u.use_pc = in.pc;
+                        u.table_record_count = source.records;
+                        u.table_entry_stride = source.stride;
+                        u.table_element_offset = source.element_offset;
+                        u.table_load_pc = source.load_pc;
+                        u.table_base = source.base;
+                        srt_uses->push_back(u);
+                        if (trc)
+                            fprintf(stderr,
+                                    "[dyntrace] MUBUF pc=%u selected-table s%d producer=%u "
+                                    "records=%u stride=%u element=+0x%x\n",
+                                    in.pc, srsrc, source.load_pc, source.records, source.stride,
+                                    source.element_offset);
                     }
                     if (current_known) {
                         // MUBUF/MTBUF itself is definitive that its four SRSRC words are a V#. Publish
@@ -5446,6 +5539,124 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             continue;
         }
         if (u.kind != 1) continue;
+        if (u.table_record_count) {
+            // #2481: a runtime-selected descriptor table. The element is chosen on the GPU, so the
+            // binding declares every entry and the emitter indexes it. Re-derive the whole contract
+            // from guest memory here rather than trusting the use: a forged SrtUse must not be able
+            // to name an arbitrary address range as a descriptor array.
+            const uint64_t table_key = 0x8000000600000000ull | u.use_pc;
+            if (!seen.insert(table_key).second) continue;
+            if (u.instruction_format != UINT32_MAX || u.zero_record_raw ||
+                u.table_entry_stride < 16u || u.table_record_count == 0u ||
+                u.table_record_count > kMaxSelectedTableRecords ||
+                static_cast<uint64_t>(u.table_element_offset) + 16u > u.table_entry_stride ||
+                (u.table_element_offset % 4u) != 0u || u.table_base <= 0x10000u ||
+                u.table_load_pc == 0xFFFFFFFFu || u.table_load_pc >= dwords)
+                continue;
+            // Every element must be a readable, individually valid V#. One malformed entry rejects
+            // the whole table: binding a partially populated descriptor array would let the guest's
+            // own index select a slot prosper never resolved, which renders confidently wrong
+            // content instead of failing visibly.
+            std::vector<ShaderBufferTableEntry> entries;
+            entries.reserve(u.table_record_count);
+            bool table_ok = true;
+            for (uint32_t index = 0; index < u.table_record_count && table_ok; ++index) {
+                const uint64_t entry_addr =
+                    u.table_base + static_cast<uint64_t>(index) * u.table_entry_stride +
+                    u.table_element_offset;
+                std::array<uint32_t, 4> words{};
+                if (!guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)))) {
+                    table_ok = false;
+                    break;
+                }
+                std::memcpy(words.data(),
+                            reinterpret_cast<const void*>(static_cast<uintptr_t>(entry_addr)),
+                            sizeof(words));
+                const DecodedBufferDescriptor entry = decode_buffer_descriptor(words.data());
+                if (entry.base <= 0x10000u || entry.size_bytes == 0u ||
+                    entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback) {
+                    table_ok = false;
+                    break;
+                }
+                ShaderBufferTableEntry slot;
+                slot.vsharp = words;
+                slot.gpu_addr = entry.base;
+                slot.size = entry.size_bytes;
+                slot.stride = entry.stride;
+                entries.push_back(slot);
+            }
+            if (!table_ok || entries.size() != u.table_record_count) {
+                if (std::getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[srt] selected-table pc=%u REJECTED base=0x%llx stride=%u "
+                                 "records=%u resolved=%zu\n",
+                                 u.use_pc, (unsigned long long)u.table_base, u.table_entry_stride,
+                                 u.table_record_count, entries.size());
+                continue;
+            }
+            // A descriptor array is ONE Vulkan binding, so its declared element stride, format and
+            // component count are shared by every entry — `valid_shader_buffer_table_contract`
+            // requires exactly that. Derive them from the entries and reject a heterogeneous table
+            // rather than picking one entry's shape and binding the rest through it.
+            const DecodedBufferDescriptor first =
+                decode_buffer_descriptor(entries.front().vsharp.data());
+            bool homogeneous = true;
+            uint32_t widest = 0u;
+            for (const ShaderBufferTableEntry& slot : entries) {
+                const DecodedBufferDescriptor entry =
+                    decode_buffer_descriptor(slot.vsharp.data());
+                homogeneous &= entry.stride == first.stride &&
+                               entry.format == first.format &&
+                               entry.num_components == first.num_components;
+                widest = std::max(widest, slot.size);
+            }
+            if (!homogeneous) {
+                if (std::getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[srt] selected-table pc=%u REJECTED heterogeneous entries\n",
+                                 u.use_pc);
+                continue;
+            }
+            ShaderResource r;
+            r.cls = ResourceClass::ConstantBuffer;
+            r.format = first.format;
+            r.num_components = first.num_components ? first.num_components : 1u;
+            // `gpu_addr` names the table so dependency closure and capture see the guest range the
+            // selection reads through; `size`/`stride` describe the ELEMENTS, because that is what
+            // the binding's descriptors are.
+            r.gpu_addr = u.table_base;
+            r.size = widest;
+            r.stride = first.stride;
+            r.srt_offset = 0xFFFFFFFFu;
+            r.sgpr_base = 0xFFFFFFFFu;
+            r.fetch_pc = u.use_pc;
+            r.table_index_count = u.table_record_count;
+            r.table_entry_stride = u.table_entry_stride;
+            r.table_selector_mode = BufferTableSelectorMode::DynamicSbufferByteOffset;
+            r.table_load_pc = u.table_load_pc;
+            r.table_entries = std::move(entries);
+            // Publish only a table the whole pipeline can actually honour. An invalid contract makes
+            // `declare_cbufs` poison the ENTIRE shader (`invalid_cbuf_array_access`), so publishing
+            // one optimistically would turn shaders that compile today into silent empty modules.
+            // Failing to publish costs exactly what the previous behaviour cost: an unresolved
+            // descriptor at the consumer, fail-visible.
+            if (!valid_shader_buffer_table_contract(r)) {
+                if (std::getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[srt] selected-table pc=%u REJECTED contract stride=%u fmt=%u "
+                                 "comps=%u\n",
+                                 u.use_pc, r.stride, (unsigned)r.format, r.num_components);
+                continue;
+            }
+            if (std::getenv("PROSPER_DBG"))
+                std::fprintf(stderr,
+                             "[srt] selected-table pc=%u producer=%u base=0x%llx stride=%u "
+                             "records=%u element=+0x%x\n",
+                             u.use_pc, u.table_load_pc, (unsigned long long)u.table_base,
+                             u.table_entry_stride, u.table_record_count, u.table_element_offset);
+            table.resources.push_back(r);
+            continue;
+        }
         if (u.use_pc == proven_linear_store_pc) continue;
         if (u.instruction_format != UINT32_MAX && ((u.v4[3] >> 12) & 0x7Fu) == 0)
             continue;
