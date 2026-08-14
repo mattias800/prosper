@@ -203,13 +203,30 @@ This is a hypothesis, not a result: no measurement yet shows a lane storing when
 failing to. The next instrument would compare the set of slots written against the set the mask
 selects.
 
-### The test that would upgrade correlation to cause
+### The test was run, and it does NOT support cause
 
-Locate the 2-cycles in a resulting table and check whether they sit at slots the malformed writes
-touched. Same-run data is required — the cycle dumps and the changed-slot logs above come from
-different runs, which is exactly the kind of join that has produced wrong answers here. If the cycles
-land on malformed slots, the chain closes; if they land elsewhere, the malformed-pair metric is
-measuring something incidental and the correlation is a coincidence of magnitude.
+Same-run capture (120 dumped cyclic tables and 98,837 changed-slot records, so the join is valid),
+asking whether the 2-cycles sit at slots the malformed writes touched:
+
+```text
+write-submit=10308  malformed=91  cycle-nodes=178  on-malformed-slot=26  (14%)
+write-submit=10708  malformed=93  cycle-nodes=178  on-malformed-slot=26  (14%)
+```
+
+Stable at **14%** across ten tables. With 91 malformed slots in 2,063 the base rate is 4.4%, so this
+is roughly 3x enrichment — a real association, and far from the "cycles land on malformed slots"
+that would close the chain. **86% of the cycle nodes are somewhere else.**
+
+So the malformed-pair count remains a strong *dispatch-level* correlate (54 clean reads at 0..13
+versus 126 cyclic at 19..106, no overlap) while failing as a *slot-level* mechanism. Two readings
+survive, and this data does not choose between them:
+
+- the metric is a proxy for some other property of a bad write, and that property produces the
+  cycles; or
+- malformed pairs and cycles share an upstream cause and neither produces the other.
+
+**What it rules out:** "each malformed pair becomes a 2-cycle." That was the mechanism I expected
+and it is wrong.
 
 ### Open: why does it start at submit 7898?
 
