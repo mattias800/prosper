@@ -153,6 +153,48 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
+## THE TABLE IS CYCLIC AT DISPATCH TIME — measured with the right instrument at the right moment
+
+`PROSPER_COMPUTE_PARENT_WALK` reads the selected resource **immediately before `compute({item})`** —
+the timing the capsule's post-submit snapshots never had — and models this exact loop
+(`while (index != 0) index = (records[index] >> shift) & mask`), reporting cycles directly.
+
+```
+PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64
+```
+
+**1,782 resolved reads across one route:**
+
+| reads | cycles | cyclic roots (of 2,063) | oob roots | max depth |
+| --- | --- | --- | --- | --- |
+| 16 | 0 | 0 | 0 | 12..15 |
+| 960 | 0 | 0 | **1,894** | 19 |
+| **795** | **15** | **1,805** | 0 | 22 |
+| 5 | 17 | **2,062** | 0 | 20 |
+| 6 | 1 | 1,039 | 269 | — |
+
+**806 of 1,782 dispatches receive a table in which 1,805-2,062 of 2,063 roots lead into a cycle.** The
+guest loop cannot terminate on that data, so the dispatcher spinning past 4,096 iterations is the
+*correct* behaviour for what it was handed. Combined with the hit witness, the chain is closed: bad
+data in, non-terminating walk, GPU hang.
+
+The 960 reads with `oob-roots=1894` terminate by the RDNA2 rule that an out-of-range `idxen` load
+returns zero — those dispatches complete, which is why only some dispatches hang.
+
+**Read the whole distribution, not the first rows.** The first three log lines of this run show
+`cycles=0 cyclic-roots=0`, and stopping there gives exactly the opposite conclusion — "the data is
+fine, so the emulation is broken". The clean reads are a real minority of the population, and they
+come first.
+
+### What this settles, and what it reopens
+
+Settled: the defect is **upstream data**, not the dispatcher's lowering of this loop. The recompiler
+faithfully executes a walk that genuinely does not terminate.
+
+Reopened: **why is the table cyclic?** The earlier producer investigation was measured on
+post-submit snapshots and on the wrong dispatch's buffer, so it has to be redone against
+`PROSPER_COMPUTE_PARENT_WALK` timings. `0x413ce3400` remains the only writer identified so far.
+
 ## CONFIRMED BY HIT RECORD: phase 0's dispatcher loop runs past 4,096 iterations on the hanging dispatch
 
 `PROSPER_CFG_TRIP_BOUND=N` (new, diagnostic) forces every dispatcher loop out after N iterations. With
