@@ -149,6 +149,27 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
+## The traversal table is rebuilt many times per run — compare only WITHIN one capsule
+
+Measured live with `PROSPER_COMPUTELOG_CODE=0x413ce3400` over a 120 s route: `0x413ce3400` writes
+`0x20f848a240` **at least 20 times**, each write changing 10,000-14,000 of the 16,508 bytes and
+producing a different content hash. One of those writes lands on `9c8a80d289972043` — the exact hash
+the offline replay produces — and the others do not.
+
+So the buffer is a **per-frame structure**, not a stable one, and two consequences follow:
+
+- **A cross-run or cross-frame comparison of this table proves nothing.** Two hashes differing is the
+  normal case. The only valid comparison is within one capsule: the same submit's recorded
+  pre-producer, pre-consumer and offline-replayed states.
+- **The write-back is not missing.** An earlier framing of the defect as "the producer's result never
+  reaches the consumer" was reached before this was known. The write-back happens, changes ~11,000
+  bytes, and its first dwords (`0, 0x18, 0x40000018, 0x38, …`) match the offline-correct shape rather
+  than the cyclic one.
+
+What survives that correction, because it is a within-capsule measurement: in `cap-cls2`'s single
+submit, the live consumer's input contains **183 cyclic start indices** while the offline replay of
+that same submit's prefix produces **0**, and the two differ by 2,355 of 8,252 bytes.
+
 ## Other open defects
 
 - **#2445** — specific lowercase glyphs (`r`, `s`, `m`) dropped from UI text: "Ente ing Sto y Mode".
