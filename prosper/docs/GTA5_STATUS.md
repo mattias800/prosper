@@ -96,6 +96,15 @@ falsification.
   invocation iterates together. #2481.
 - **The hang is a non-uniform early exit.** The 14,370-line disassembled module contains exactly
   **one** `OpReturn`, at the end. No `OpKill`, none inside any of the three dispatcher loops. #2481.
+- **A lost atomic corrupts the traversal table.** The table that hangs `0x413dc6700` is a linked list
+  whose corruption is 61 **two-cycles** (`i` and `i+2` pointing at each other), which is the classic
+  signature of a non-atomic concurrent insertion — two threads each linking to the other because both
+  read the head before either wrote. Its producer `0x413ce3400` contains **no atomic instructions at
+  all**: zero `OpAtomic*` in 3,881 lines of recompiled SPIR-V, and zero
+  `(buffer|global|flat|ds)_atomic_*` in its 507-dword guest stream (dumped with `--dump-compute-raw`).
+  **Positive control, from a different program in a different capsule**: the identical grep finds
+  **6 atomics** in `0x413ced900`'s guest stream, so the instrument does fire — the zero is a real
+  negative and not a broken pattern. #2542.
 - **The hang is an unconditionally infinite loop.** The same program executes successfully at dispatch
   38 and hangs at dispatch 39 of the same submit. Whatever spins is data-dependent. #2481.
 - **Bounding the CFG dispatcher's trip count stops the hang.** Tried at 4096 and at 2^20; the device

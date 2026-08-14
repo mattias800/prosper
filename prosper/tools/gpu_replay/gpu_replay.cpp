@@ -2973,12 +2973,18 @@ int main(int argc, char** argv) {
         const auto& raw = replay.raw_shader_versions[compute.raw_shader_index];
         const size_t bytes = raw.words.size() * sizeof(uint32_t);
         FILE* f = std::fopen(compute_raw_path.c_str(), "wb");
-        if (!f || std::fwrite(raw.words.data(), 1, bytes, f) != bytes) {
-            if (f) std::fclose(f);
+        // fclose is CHECKED, unlike the sibling dumps. A guest stream is small enough to sit
+        // entirely inside stdio's buffer -- this one is 2 KiB against a 4 KiB default -- so nothing
+        // reaches the filesystem until the close, and ENOSPC/EDQUOT surfaces THERE and nowhere
+        // earlier. Ignoring it would print "dumped" and exit 0 over a truncated or empty file, on a
+        // machine whose scratch filesystem hits EDQUOT routinely. That is the exact shape this flag
+        // exists to avoid: an instrument that reports success while producing nothing.
+        const bool wrote = f && std::fwrite(raw.words.data(), 1, bytes, f) == bytes;
+        const bool closed = f && std::fclose(f) == 0;
+        if (!wrote || !closed) {
             std::fprintf(stderr, "gpu_replay: cannot write %s\n", compute_raw_path.c_str());
             return 2;
         }
-        std::fclose(f);
         std::fprintf(stderr,
                      "[gpureplay] dumped compute %ld raw guest stream code=0x%llx "
                      "(%zu dwords, %zu bytes, endpgm=%d) to %s\n",
