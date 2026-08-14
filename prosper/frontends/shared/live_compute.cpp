@@ -4209,8 +4209,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         report_compute_decline(item, reason);
         return false;
     };
-    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr))
-        return decline("skipped-by-selector");
     const auto phase_start = ComputeClock::now();
     auto phase_setup = phase_start;
     auto phase_pipeline = phase_start;
@@ -4230,6 +4228,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
     maybe_dump_traced_compute_spirv(item, trace);
+    // Deliberately below the trace and SPIR-V dump: a skipped dispatch must still be observable by
+    // the other instruments, so a run can answer "what would this program have been?" without also
+    // running the dispatch that is under suspicion. That combination — dump the module, skip the
+    // dispatch — is what lets a recompiler change be checked against a program that hangs the GPU.
+    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr))
+        return decline("skipped-by-selector");
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
