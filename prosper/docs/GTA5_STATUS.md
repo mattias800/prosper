@@ -10,6 +10,71 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## What the structure IS: an LBVH / binary-radix-tree parent table from Morton keys
+
+Identified by Codex from the retained ISA (#2542), and it reframes everything below.
+
+- **2,063 = 2 × 1,032 − 1** — exactly the node count of a full binary tree with 1,032 leaves and
+  1,031 internal nodes.
+- **Adjacent pairs are SIBLINGS** sharing one parent; bit 30 identifies the child side. The root is
+  the single unpaired node. That explains the count, the pairing, the parent chase and the depth
+  parity together, where "union-find with path compression" only explained the chase.
+- `0x413cee500` contains the standard 3D Morton bit-dilation constants `0x030000ff`, `0x0300f00f`,
+  `0x030c30c3` and **`0x09249249`**, then stores `buffer_store_dwordx3` at pc274 — Morton key
+  generation.
+- `0x413e1c300` loads two three-dword records, runs a 64-lane LDS compare/exchange loop, and stores
+  two three-dword records — a Morton sort/merge pass upstream of topology construction.
+
+**CORRECTION — `0x09249249` is NOT an empty-slot sentinel.** This document said it was. It is the
+Morton dilation mask, used as a literal by the key generator. In the captured parent view it happens
+to behave as an out-of-range terminator, but that may be an intentional empty value, a Morton key
+left in repurposed scratch, or another phase's encoding. Call it an **observed OOB/unused value**
+until its producing store is identified.
+
+**Naming:** the "malformed head/tail pair" score is measuring a real property, but the neutral name
+is **unpaired sibling records**. Keep it as a quantitative correlation and do NOT promote "must be
+zero" to a correctness rule: clean samples tolerate up to 13, and the slot-level causal test failed.
+A sharper check is whether the active-node count predicts exactly 1,031 sibling pairs.
+
+## Access direction: eight touchers, FIVE may-writers
+
+Codex joined the census's `fetch-pc` values to the retained guest instructions. MUBUF `0x0c..0x0e`
+are loads, `0x1c..0x1e` are stores:
+
+| program | watched instructions | direction |
+| --- | --- | --- |
+| `0x413ce3400` | pc35, 66, 68 … 421, all `buffer_load_dword{,x2}` | **read only** |
+| `0x413ce6000` | pc36 `buffer_load_dword` | **read only** |
+| `0x413cea300` | terminator-only, `fetch-pc=0xffffffff` | **no data access** |
+| `0x413cee500` | pc274 `buffer_store_dwordx3` | **write** |
+| `0x413d88400` | 18 watched pcs, all stores | **write** |
+| `0x413dc3400` | pc597/608/620/632/644/656 stores | **write** |
+| `0x413dc6700` | pc91 load; pc53/65 and 618..677 stores | **read/write** |
+| `0x413e1c300` | pc86/95 loads x3; pc166/176 stores x3 | **read/write** |
+
+So the may-write set is **`0x413cee500`, `0x413d88400`, `0x413dc3400`, `0x413dc6700`,
+`0x413e1c300`**. The two read-only programs and the terminator leave the writer investigation.
+
+**A statically writable descriptor whose range contains the address is a CANDIDATE writer**, not
+proof that a given invocation wrote that 4-byte slot; changed-byte pre/post evidence closes that.
+
+**Address-boundary caveat that must not be lost:** `0x413e1c300`'s observed view is
+`base=0x20f8482140 size=33024`, and `base + size == 0x20f848a240` **exactly**. It therefore may write
+the first table and proves nothing about the second. The census must be re-run for `0x20f848a240`
+before this eight-program set is carried across both ping-pong tables.
+
+## No guest-side escape makes a reachable cycle safe
+
+Checked by Codex against the retained ISA: the pre-loop bound only excludes padded threads (on the
+problematic shape `s18 = 2063` and the launch has 2,063 guest threads, so every active root is
+represented); the loop has no iteration count and no cycle detector; `v_cmpx_ne_u32` only retires
+lanes reaching index zero, so a lane inside a cycle stays active forever; and the `s24` comparison
+happens **after** the walk, so it cannot guard entry.
+
+A builder may hold transiently inconsistent parent links while constructing the hierarchy. Hardware
+still cannot launch this consumer on reachable cyclic links — they must be repaired before it,
+excluded from its active root set, or absent from the bytes it consumes.
+
 ## The current account — read this before anything below it
 
 This document is layered: it grew as an investigation log, and several sections below are historical
