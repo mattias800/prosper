@@ -16500,15 +16500,6 @@ bool compute_trip_witness_active(uint64_t program_address) {
     return program_address == settings.only_program;
 }
 
-std::mutex& trip_witness_emitted_mutex() {
-    static std::mutex mutex;
-    return mutex;
-}
-std::set<uint64_t>& trip_witness_emitted_programs() {
-    static std::set<uint64_t> programs;
-    return programs;
-}
-
 // True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
 // buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
 // a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
@@ -16584,24 +16575,37 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
                 "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
                 "bounded at %u iterations (DIAGNOSTIC: truncates guest control flow)\n",
                 static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound);
-    // Record that a witness was ACTUALLY EMITTED for this program. Every check above is a selector
-    // or a precondition -- "we intend to instrument" -- and the host needs the opposite: proof that a
-    // shader now writes those dwords. A structured-loop program, or a selected phase that does not
-    // exist, passes every selector and emits nothing, and a host that reads the witness on that
-    // basis is reading whatever was already in guest-visible memory.
-    {
-        std::lock_guard lock(trip_witness_emitted_mutex());
-        trip_witness_emitted_programs().insert(program_address);
-    }
     return bound;
 }
 
-// True only once some phase of this program has genuinely emitted a witness. Survives shader-cache
-// hits because it is keyed on the program rather than on a compilation: the cache key already carries
-// the trip-bound identity, so a hit implies the same selector state that produced the record.
-bool compute_trip_witness_emitted(uint64_t program_address) {
-    std::lock_guard lock(trip_witness_emitted_mutex());
-    return trip_witness_emitted_programs().contains(program_address);
+// Does THIS module write the trip-bound witness?
+//
+// Derived from the compiled artifact, not from process history. An earlier revision kept a global
+// set of program addresses that had ever emitted one, which cannot express the contract the host
+// needs: the set was monotonic and keyed only by address, so once a program emitted under one phase,
+// recompiling the SAME address under a phase it does not have still answered "instrumented" -- and
+// the host would then read and clear guest-visible dwords no shader in the current module writes.
+//
+// Reading the module removes the whole class: the answer is a property of the bytes the backend is
+// about to run, so it cannot be stale, cannot be defeated by a shader-cache hit, and needs no
+// invalidation. The witness's first field is published by an atomic through an OpAccessChain onto the
+// internal GDS binding at kComputeTripWitnessDword, which nothing else emits.
+bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv) {
+    if (spirv.size() < 5) return false;
+    constexpr uint32_t OpConstant = 43, OpAccessChain = 65, OpAtomicUMax = 239;
+    std::set<uint32_t> slot_constants, slot_pointers;
+    for (size_t word = 5; word < spirv.size();) {
+        const uint32_t op = spirv[word] & 0xffffu, len = spirv[word] >> 16;
+        if (!len || word + len > spirv.size()) break;
+        if (op == OpConstant && len == 4 && spirv[word + 3] == kComputeTripWitnessDword)
+            slot_constants.insert(spirv[word + 2]);
+        else if (op == OpAccessChain && len >= 5 && slot_constants.count(spirv[word + len - 1]))
+            slot_pointers.insert(spirv[word + 2]);
+        else if (op == OpAtomicUMax && len >= 4 && slot_pointers.count(spirv[word + 3]))
+            return true;
+        word += len;
+    }
+    return false;
 }
 
 bool emit_cfg_state_machine(

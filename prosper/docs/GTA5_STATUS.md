@@ -178,7 +178,14 @@ falsification.
   section above.** The 183 cycles are in `0x20f848417c`, the table read by the dispatch that
   *completed*; the hanging dispatch reads `0x20f848a240`, which is acyclic with a longest chain of 11
   steps. The measurement was taken from the wrong dispatch's binding. #2542.
-- **A lost atomic corrupts the traversal table.** The table that hangs `0x413dc6700` is a linked list
+- **A lost atomic corrupts the traversal table.** **VOID against the current writer — the evidence
+  below is about `0x413ce3400`, and the table's writer is `0x413dc6700` itself.** The corruption
+  signature (61 two-cycles) still stands as an observation, and so does the instrument note at the end
+  of this entry, which is why the entry is kept rather than deleted. What does not stand is the
+  falsification: showing that `0x413ce3400` performs no atomic cannot rule out a lost-atomic
+  write-path defect in a *different* program. To settle it, re-run the same footprint analysis on
+  `0x413dc6700`'s own stores. Everything from here to the end of this bullet is that superseded
+  argument. The table that hangs `0x413dc6700` is a linked list
   whose corruption is 61 **two-cycles** (`i` and `i+2` pointing at each other), the classic signature
   of a non-atomic concurrent insertion — two threads each linking to the other because both read the
   head before either wrote. Its producer `0x413ce3400` performs **no atomic operation of any kind**,

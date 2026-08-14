@@ -324,8 +324,10 @@ int main() {
         prosper::test::run_compute(dispatcher_plain, dispatcher_input, kLanes, kLanes);
     set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
     set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+    std::vector<uint32_t> witness_gds;
     const std::vector<float> ran_capped =
-        prosper::test::run_compute(dispatcher_bounded, dispatcher_input, kLanes, kLanes);
+        prosper::test::run_compute(dispatcher_bounded, dispatcher_input, kLanes, kLanes,
+                                   {}, {}, nullptr, 64, nullptr, &witness_gds);
 
     const bool free_ok = ran_free.size() == kLanes &&
         std::all_of(ran_free.begin(), ran_free.end(),
@@ -341,6 +343,24 @@ int main() {
     CHECK(capped_differs,
           "the cap CONTROLS the back edge: bounding truncates the run and changes the result "
           "(an inert cap fails HERE, where an emitted-but-unused comparison does not)");
+
+    // The witness is now a real bound buffer (binding 127), so what the shader wrote is readable
+    // rather than inferred. Before this, the armed module was dispatched with that binding absent
+    // from the pipeline layout -- VUID-VkComputePipelineCreateInfo-layout-07988 and
+    // VUID-vkCmdDispatch-None-08114 -- so every result above was undefined behaviour that happened
+    // to print "passed". Reading the record back is what turns the execution arm into evidence.
+    const size_t hit_slot = kComputeTripWitnessDword;
+    const bool witness_readable = witness_gds.size() > hit_slot + 4;
+    CHECK(witness_readable && witness_gds[hit_slot] == 1u,
+          "the device-side witness records a HIT when the cap is reached");
+    if (witness_readable)
+        printf("  witness: hit=%u phase=%u trips=%u range=%u..%u\n", witness_gds[hit_slot],
+               witness_gds[hit_slot + 1], witness_gds[hit_slot + 2], witness_gds[hit_slot + 3],
+               witness_gds[hit_slot + 4]);
+    CHECK(witness_readable && witness_gds[hit_slot + 2] >= kBound,
+          "and the trip count it reports reaches the bound");
+    CHECK(witness_readable && witness_gds[hit_slot + 3] <= witness_gds[hit_slot + 4],
+          "with a dispatch-range whose atomic minimum does not exceed its atomic maximum");
 
     // Independent of the scan above: the bound's VALUE must reach the emitter, not merely its
     // armed/disarmed state. Two different bounds must produce two different modules.
@@ -470,41 +490,58 @@ int main() {
               !witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 4, 237),
           "and neither slot carries the other's reduction");
 
-    // --- emission RESULT vs. selector INTENT, and guest-GDS preservation -------------------------
+    // --- emission RESULT vs. selector INTENT --------------------------------------------------
     //
     // The host decides whether to read and clear five guest-visible GDS dwords. Gating that on the
-    // selectors alone is wrong: a program the selectors accept can emit nothing -- a structured loop,
-    // or a phase ordinal that does not exist -- and the host would then report whatever guest data
-    // happened to be there and destroy it. compute_trip_witness_emitted() answers the other question.
+    // selectors is wrong: a program the selectors accept can emit nothing -- a structured loop, or a
+    // phase ordinal the program does not have -- and the host would then report whatever guest data
+    // occupied those dwords as a measurement, and destroy it.
+    //
+    // The predicate reads the COMPILED MODULE. An earlier revision kept a process-global set of
+    // addresses that had ever emitted, which cannot express this contract: it was monotonic, so the
+    // SAME address recompiled under a phase it does not have still answered "instrumented". The
+    // same-address sequence below is exactly that case, and it is the arm that revision failed.
     {
         ComputeShaderConfig config{};
         config.local_x = 64; config.local_y = 1; config.local_z = 1;
         config.wave_size = 64;
         config.tgid_x_en = true;
         ShaderResourceTable table{};
-        const uint64_t kNoSuchPhase = 0x900000001ull, kStructured = 0x900000002ull;
+        const uint64_t kAddress = 0x900000001ull;
+
+        auto compile_at = [&](const uint32_t* code, size_t words, uint64_t address) {
+            clear_shader_recompile_cache();
+            return recompile_compute_shader_cached(code, words, &table, config, nullptr,
+                                                   {RecompileDiagnosticStage::Compute, address});
+        };
 
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
         set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
 
-        // A phase ordinal this program does not have: every selector passes, nothing is emitted.
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        const std::vector<uint32_t> emitted =
+            compile_at(kDispatcherLoops, kDispatcherWords, kAddress);
+        CHECK(spirv_writes_trip_witness(emitted),
+              "the bounded dispatcher module writes the witness");
+
+        // SAME ADDRESS, phase the program does not have. Process history says "this address has
+        // emitted"; the module says otherwise, and the module is what the backend runs.
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "99");
-        clear_shader_recompile_cache();
-        (void)recompile_compute_shader_cached(kDispatcherLoops, kDispatcherWords, &table, config,
-                                              nullptr,
-                                              {RecompileDiagnosticStage::Compute, kNoSuchPhase});
-        CHECK(!compute_trip_witness_emitted(kNoSuchPhase),
-              "a phase ordinal the program does not have emits no witness (intent is not emission)");
+        const std::vector<uint32_t> not_emitted =
+            compile_at(kDispatcherLoops, kDispatcherWords, kAddress);
+        CHECK(!spirv_writes_trip_witness(not_emitted),
+              "recompiling the SAME address under a phase it does not have writes no witness "
+              "(an address-keyed emission record fails HERE)");
 
         // A structured loop: the diagnostic deliberately does not cover those emitters.
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
-        clear_shader_recompile_cache();
-        (void)recompile_compute_shader_cached(kExecWalk, kWords, &table, config, nullptr,
-                                              {RecompileDiagnosticStage::Compute, kStructured});
-        CHECK(!compute_trip_witness_emitted(kStructured),
-              "a structured-loop program emits no witness even with every selector satisfied");
+        CHECK(!spirv_writes_trip_witness(compile_at(kExecWalk, kWords, kAddress)),
+              "a structured-loop program writes no witness even with every selector satisfied");
+
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
+              "and disarmed, the same program writes none either");
         clear_shader_recompile_cache();
     }
 

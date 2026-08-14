@@ -30,17 +30,20 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 // can show a hit, "the loop exceeds N" rests on inference from device survival rather than evidence.
 //
 // FIVE dwords, and every one of them is a DISPATCHER quantity, never a guest pc:
-//   +0  hit flag                                        (invariant; plain store)
-//   +1  dispatcher phase ordinal                        (invariant; plain store)
+//   +0  hit flag                                        (atomic max; idempotent)
+//   +1  dispatcher phase ordinal                        (atomic max; idempotent)
 //   +2  highest trip count reached                      (atomic max over invocations)
 //   +3  lowest dispatcher switch-case ordinal visited    (atomic min over invocations)
 //   +4  highest dispatcher switch-case ordinal visited   (atomic max over invocations)
 //
-// Fields 2..4 are per-invocation and are published with device-scope atomics rather than stores.
-// Every invocation that reaches the cap writes the same addresses, so a plain store publishes
-// whichever wrote last and silently discards the extremes -- a record the host could read as one
-// invocation's history when it is a mixture of several. The extremes are the whole claim, so they
-// are reduced on the device.
+// EVERY field is published with a device-scope atomic, including the two that are
+// invocation-invariant. Fields 2..4 must be reduced because every invocation reaching the cap writes
+// the same addresses: a plain store publishes whichever wrote last and silently discards the
+// extremes, which the host would then read as one invocation's history when it is a mixture of
+// several (instrument trap 173). Fields 0 and 1 are atomic too because concurrent non-atomic stores
+// of the same value are still a race, and "they happen to agree" is not a publication protocol --
+// max is idempotent for a flag and a compile-time constant, so it costs nothing to remove the
+// exception rather than document it.
 //
 // The ordinals index the phase's dispatch table, whose ordinal -> guest pc map that phase prints when
 // the bound arms. Do not map one by hand: a value that happens to fall inside the block count reads
@@ -78,11 +81,12 @@ struct ComputeTripBoundSettings {
 };
 ComputeTripBoundSettings compute_trip_bound_settings();
 
-// True only once some phase of `program_address` has ACTUALLY emitted a trip-bound witness. Distinct
-// from compute_trip_witness_active, which reports intent: a structured-loop program or a selected
-// phase that does not exist satisfies every selector and emits nothing. The host must gate reading
-// and clearing the guest-visible witness dwords on this, not on intent.
-bool compute_trip_witness_emitted(uint64_t program_address);
+// Does THIS compiled module write the trip-bound witness? Distinct from compute_trip_witness_active,
+// which reports INTENT: a structured-loop program, or a selected phase the program does not have,
+// satisfies every selector and emits nothing. The host must gate reading and clearing the
+// guest-visible witness dwords on the artifact, never on the selectors -- and never on process
+// history, which cannot distinguish this module from an earlier one at the same address.
+bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv);
 
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
