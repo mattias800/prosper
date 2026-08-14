@@ -4417,9 +4417,29 @@ void GpuState::apply(const Pm4Command& c) {
                 uint64_t& current = c.indirect_shader_type == 0
                     ? indirect_graphics_base : indirect_compute_base;
                 uint64_t base = c.indirect_base;
-                if (base <= UINT32_MAX && current > UINT32_MAX)
+                const uint64_t previous = current;
+                const bool low_only = base <= UINT32_MAX;
+                const bool inherited = low_only && current > UINT32_MAX;
+                if (inherited)
                     base |= current & ~static_cast<uint64_t>(UINT32_MAX);
                 current = base;
+                // PROSPER_INDIRECTLOG: what the guest actually sends, because the fail-closed branch
+                // below it is silent. A low-only SetBase with no prior aperture leaves the base
+                // truncated, the executor then rejects the argument buffer as unreadable, and the
+                // indirect dispatch is skipped — with nothing in any log connecting the skip to the
+                // packet that caused it.
+                if (getenv("PROSPER_INDIRECTLOG")) {
+                    static std::atomic<int> logged{0};
+                    if (logged.fetch_add(1) < 64)
+                        fprintf(stderr,
+                                "[agc-setbase] %s packet=0x%llx low_only=%d prior=0x%llx "
+                                "inherited=%d -> base=0x%llx%s\n",
+                                c.indirect_shader_type == 0 ? "graphics" : "compute",
+                                (unsigned long long)c.indirect_base, (int)low_only,
+                                (unsigned long long)previous, (int)inherited,
+                                (unsigned long long)current,
+                                (low_only && !inherited) ? "  TRUNCATED-NO-APERTURE" : "");
+                }
             }
             break;
         case K::StallCommandBufferParser:
@@ -4842,6 +4862,20 @@ void GpuState::apply(const Pm4Command& c) {
             d.indirect = true;
             if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
                 d.indirect_args_addr = indirect_compute_base + c.indirect_offset;
+            // PROSPER_INDIRECTLOG: base and offset SEPARATELY, plus the queue. The executor's
+            // "unreadable arguments at 0x…" message prints only the sum, which cannot distinguish a
+            // bad offset from a base that was never set on this queue — and `indirect_compute_base`
+            // is one field shared by every queue the processor folds.
+            if (getenv("PROSPER_INDIRECTLOG")) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 64)
+                    fprintf(stderr,
+                            "[agc-dispatchindirect] q=%u base=0x%llx offset=0x%x -> args=0x%llx%s\n",
+                            (unsigned)c.queue_origin,
+                            (unsigned long long)indirect_compute_base, c.indirect_offset,
+                            (unsigned long long)d.indirect_args_addr,
+                            indirect_compute_base ? "" : "  BASE-UNSET");
+            }
             dispatches.push_back(std::move(d));
             dispatch_count++;
             break;

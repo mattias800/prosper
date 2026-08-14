@@ -153,6 +153,44 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
+## ROOT CAUSE CANDIDATE: indirect compute dispatches on queue 2 have NO argument base
+
+`SET_BASE_INDIRECT_ARGS` sets one shared `indirect_compute_base` in the command processor. Logging
+base, offset and queue separately at the `DispatchIndirect` site:
+
+| queue | dispatches | base | outcome |
+| --- | --- | --- | --- |
+| **1** | 14 | `0x205b690f80` | resolve and run |
+| **2** | **50** | **`0x0`** | `args = raw offset` -> unreadable -> **skipped** |
+
+The queue-2 offsets are `0xf8480120`, `0xf8480160`, `0xf84801a0`, `0xf84801e0`, `0xf8480220` … stepping
+by 0x40 — and the guest arena those dispatches belong to is at **`0x20f8480000`** (347,040 bytes; it is
+the buffer the `s_endpgm` kernel declares). So the intended address is almost certainly
+`0x20f8480120`, and what is missing is a `0x20_00000000` base that queue 2 never receives.
+
+**50 of 64 indirect compute dispatches in one route are therefore skipped entirely**, with only
+`[agc] indirect dispatch skipped: unreadable arguments at 0x…` to show for it — a message that prints
+the SUM, so it cannot distinguish a bad offset from a base that was never set.
+
+### Why this is very likely THE defect
+
+It closes the chain that every other measurement in this document constrains:
+
+1. `SET_BASE_INDIRECT_ARGS` for compute is seen only on queue 1; queue 2's folds start with base 0
+2. queue-2 indirect dispatches resolve to an unmapped address and are skipped
+3. the skipped dispatches are the maintenance passes for the traversal structure
+4. the parent array degrades — **once, irreversibly** (each buffer transitions clean->cyclic exactly
+   once and never recovers, which is what a half-applied union-find update looks like)
+5. `0x413dc6700` walks the cyclic chain and never terminates — recorded directly by the trip-bound
+   hit witness at block 9, the loop body
+6. GPU watchdog -> RADV hard recovery -> live compute disabled process-wide
+7. `producer_epoch_ok` cleared -> `indirect_dependencies_ok` latched -> every remaining indirect draw
+   dropped untried -> **no world**
+
+**Not yet proven**: that supplying the missing base makes the tables stay acyclic. That is the next
+experiment, and the cycle census is already the oracle for it — the number to move is
+`cyclic-roots`, per dispatch, at pre-dispatch timing.
+
 ## THE TABLE IS CYCLIC AT DISPATCH TIME — measured with the right instrument at the right moment
 
 `PROSPER_COMPUTE_PARENT_WALK` reads the selected resource **immediately before `compute({item})`** —
