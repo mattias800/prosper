@@ -7674,7 +7674,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const bool indirect_pointer_valid = discover_rdna2_indirect_pointer_relocations(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
             shader_dwords, config, *table);
-        if (indirect_pointer_valid && std::getenv("PROSPER_DBG")) {
+        // Report the DECLINE as well as the success, and name the program in both. Printing only
+        // successes made a declined proof indistinguishable from a program the analyzers were never
+        // offered, and the line carried no address, so a run's several hundred records could not be
+        // attributed to any shader at all. Both gaps cost real time on #2481: GTA V's
+        // `0x413d14100` is byte-for-byte the StaticFootprint analyzer's own 386-dword target and
+        // still rejects at its GLOBAL consumer, and nothing in the log said whether the analyzer
+        // had declined it or matched and failed during discovery.
+        if (std::getenv("PROSPER_DBG")) {
             const auto source_it = std::find_if(
                 table->resources.begin(), table->resources.end(),
                 is_indirect_pointer_relocation_resource);
@@ -7684,8 +7691,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 ? source->indirect_pointer_relocation
                 : IndirectPointerRelocationBinding{};
             std::fprintf(stderr,
-                         "[indirect-pointer-relocation] valid=1 records=%u segments=%u "
-                         "source-bytes=%llu binding-bytes=%u\n",
+                         "[indirect-pointer-relocation] program=0x%llx valid=%d records=%u "
+                         "segments=%u source-bytes=%llu binding-bytes=%u\n",
+                         static_cast<unsigned long long>(code_addr),
+                         static_cast<int>(indirect_pointer_valid),
                          marker.record_count, marker.segment_count,
                          static_cast<unsigned long long>(source ? source->size : 0u),
                          marker.binding_bytes);
@@ -9490,9 +9499,12 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
                     if (capture_trace) {
+                        // A dispatch's indirect arguments fail exactly as a draw's do; recording it
+                        // as Unknown was the documented gap in the reason enum, not a distinct case.
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
-                            operation.command_order, RealizationFailureReason::Unknown});
+                            operation.command_order,
+                            RealizationFailureReason::IndirectArguments});
                     }
                     producer_epoch_ok = false;
                     previous_compute_code = current_compute_code;
@@ -9505,9 +9517,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
                     if (capture_trace) {
+                        // The dispatch was ready and nothing about it failed: there is simply no
+                        // live compute backend. Recording that as Unknown makes a configuration
+                        // fact indistinguishable from a defect in the dispatch itself.
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
-                            operation.command_order, RealizationFailureReason::Unknown});
+                            operation.command_order,
+                            RealizationFailureReason::ComputeBackendUnavailable});
                     }
                     producer_epoch_ok = false;
                     previous_compute_code = current_compute_code;
@@ -9536,9 +9552,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             ComputeAuthorityBoundaryKind::Compute,
                             submit_no, operation.command_order);
                         if (capture_trace) {
+                            // A deliberate diagnostic skip, not a failure of the dispatch. Naming it
+                            // keeps the census honest about how much of a phase prosper chose not to
+                            // run versus could not.
                             capture_trace->failures.push_back({
                                 SubmitOperationKind::Dispatch, operation.index,
-                                operation.command_order, RealizationFailureReason::Unknown});
+                                operation.command_order,
+                                RealizationFailureReason::SuspiciousDispatchSkipped});
                         }
                         producer_epoch_ok = false;
                         previous_compute_code = current_compute_code;
@@ -9551,9 +9571,14 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     if (capture_trace && executed)
                         capture_trace->computes.push_back(std::move(item));
                     if (capture_trace && !executed) {
+                        // Everything about the dispatch resolved; the live backend refused to run
+                        // it. That is a different investigation from an unresolved argument or a
+                        // missing producer, and recording all three as Unknown hid which one a
+                        // phase was actually made of.
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
-                            operation.command_order, RealizationFailureReason::Unknown});
+                            operation.command_order,
+                            RealizationFailureReason::ComputeExecutionDeclined});
                     }
                     result.compute_executed |= executed;
                     producer_epoch_ok &= executed;

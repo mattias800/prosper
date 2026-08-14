@@ -599,13 +599,17 @@ enum class RealizationFailureReason : uint8_t {
     // Unknown because "nothing was attempted, and here is why" is the answer an investigation needs
     // (#1636) — collapsing them to Unknown is indistinguishable from the reason being lost.
     RetainedDrawNotSelected,   // the retained-submit policy did not select this draw index
-    IndirectArguments,         // indirect DRAW arguments could not be resolved. Dispatches
-                               // have the same failure but realize_retained_compute still
-                               // returns a bare false for it, so they remain Unknown.
+    IndirectArguments,         // indirect DRAW or DISPATCH arguments could not be resolved --
+                               // a null, misaligned or unreadable argument address
     IndirectDependencies,      // an indirect operation's producer had not landed for this submit
+    ComputeBackendUnavailable, // the dispatch was ready, but no live compute backend is installed
+    SuspiciousDispatchSkipped, // the parent-walk diagnostic deliberately skipped this dispatch
+    ComputeExecutionDeclined,  // realized and submitted, but the live compute backend declined it
+                               // (an unsupported format, an unresolved binding, a skipped image);
+                               // the backend's own reason is on its `[compute] skip` line
 };
 inline constexpr RealizationFailureReason kMaxRealizationFailureReason =
-    RealizationFailureReason::IndirectDependencies;
+    RealizationFailureReason::ComputeExecutionDeclined;
 
 // Capture-facing facts collected at the exact point an operation is dropped. These contain no raw
 // shader bytes; gpu_capture reads those through its fault-safe, size-bounded memory reader.

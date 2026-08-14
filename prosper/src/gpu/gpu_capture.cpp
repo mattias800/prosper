@@ -2065,7 +2065,16 @@ bool capture_failure_diagnostics(
             stage.first_descriptor_issue = runtime_stage.first_descriptor_issue;
             stage.recompile_config = runtime_stage.recompile_config;
             stage.recompile_config_available = runtime_stage.recompile_config_available;
-            if (!capture_table(runtime_stage.resources.get(), {}, false, false,
+            // A retained COMPUTE failure carries compute state, including any packed-pointer or
+            // indirect-relocation marker its table acquired before the dispatch failed. The guard
+            // exists to keep compute-only state out of GRAPHICS tables — its own message says
+            // "only valid for a compute dispatch" — and passing false unconditionally here rejected
+            // exactly the case it is meant to permit. GTA V's later 234-dispatch submit could not be
+            // captured at all because of it, which is the phase its remaining device loss lives in
+            // (#2481). The realized-compute table at the other call site already allows this.
+            const bool compute_stage =
+                runtime_stage.stage == ShaderProgramStage::Compute;
+            if (!capture_table(runtime_stage.resources.get(), {}, false, compute_stage,
                                stage.resource_table, error)) return false;
             if (!capture_raw_shader_version(stage.program_addr, reader, capture, raw_words,
                                             raw_shader_index_by_address,
@@ -2183,6 +2192,12 @@ const char* realization_failure_reason_name(RealizationFailureReason reason) {
         case RealizationFailureReason::RetainedDrawNotSelected: return "retained-draw-not-selected";
         case RealizationFailureReason::IndirectArguments: return "indirect-arguments";
         case RealizationFailureReason::IndirectDependencies: return "indirect-dependencies";
+        case RealizationFailureReason::ComputeBackendUnavailable:
+            return "compute-backend-unavailable";
+        case RealizationFailureReason::SuspiciousDispatchSkipped:
+            return "suspicious-dispatch-skipped";
+        case RealizationFailureReason::ComputeExecutionDeclined:
+            return "compute-execution-declined";
     }
     return "unknown";
 }
@@ -6006,6 +6021,34 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         if (candidate_draw_count < min_draws || candidate_draw_count > max_draws) return {};
         static std::atomic<uint64_t> sequence{0}; static std::atomic<bool> claimed{false};
         current = sequence.fetch_add(1);
+        // Enumerate every submit that PASSED the selectors, so `PROSPER_GPU_CAPTURE_AT` can be aimed
+        // at a specific phase instead of guessed. A title reruns one compute program across wildly
+        // different populations — GTA V's `0x413dc6700` appears in an early 2,735-dispatch submit and
+        // again in a later ~234-dispatch one — and `MIN_DRAWS`/`MAX_DRAWS` cannot separate them,
+        // because `candidate_draw_count` is the DRAW count and a compute-only submit has none. Before
+        // this line the only way to reach the later phase was to re-run with successive AT values and
+        // inspect each capsule, at one routed run apiece (#2481).
+        if (std::getenv("PROSPER_GPU_CAPTURE_LOG")) {
+            // The widest viewport any draw in this submit uses. A draw COUNT cannot tell a main-view
+            // pass from a shadow pass — shadow atlases have high draw counts and share the main
+            // target's dimensions, differing only in viewport — so a census without this cannot be
+            // aimed at "the submit that draws the world" (#2481).
+            float widest_w = 0.0f, widest_h = 0.0f;
+            for (const DrawItem& draw : draws) {
+                if (!draw.ps.has_viewport) continue;
+                const float w = draw.ps.viewport_w < 0.0f ? -draw.ps.viewport_w : draw.ps.viewport_w;
+                const float h = draw.ps.viewport_h < 0.0f ? -draw.ps.viewport_h : draw.ps.viewport_h;
+                if (w * h > widest_w * widest_h) { widest_w = w; widest_h = h; }
+            }
+            std::fprintf(stderr,
+                         "[gpucap] candidate at=%llu submit=%llu draws=%zu computes=%zu "
+                         "semantic-dispatches=%zu viewport=%.0fx%.0f%s\n",
+                         static_cast<unsigned long long>(current),
+                         static_cast<unsigned long long>(submit_no), draws.size(), computes.size(),
+                         semantic_state ? semantic_state->dispatches.size() : size_t{0},
+                         widest_w, widest_h,
+                         claimed.load() ? " (already claimed)" : "");
+        }
         if (!output_triggered) {
             uint64_t wanted = 0;
             if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
