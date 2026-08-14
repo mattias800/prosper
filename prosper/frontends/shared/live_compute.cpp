@@ -8049,9 +8049,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         unsigned long shown = 0;
                         for (size_t i = 0; i < dwords && shown < limit; ++i) {
                             if (before[i] == after[i]) continue;
+                            // Carry submit/dispatch on EVERY line. Without them the lines from
+                            // consecutive dispatches concatenate into one stream that looks like a
+                            // single dispatch's writes -- and a per-dispatch structural claim built
+                            // on that stream is meaningless. The first analysis run here did exactly
+                            // that and reported one index changing twice in "one" dispatch.
                             std::fprintf(stderr,
-                                         "[compute]     changed binding=%u index=%zu "
-                                         "0x%08x -> 0x%08x (tag=%u bit30=%u next=%u)\n",
+                                         "[compute]     changed submit=%llu dispatch=%llu "
+                                         "binding=%u index=%zu 0x%08x -> 0x%08x "
+                                         "(tag=%u bit30=%u next=%u)\n",
+                                         (unsigned long long)item.submit_no,
+                                         (unsigned long long)item.dispatch_index,
                                          buffer.resource ? buffer.resource->binding : 0u, i,
                                          before[i], after[i], after[i] & 7u,
                                          (after[i] >> 30) & 1u, (after[i] >> 3) & 0x07FFFFFFu);

@@ -50,7 +50,7 @@ What is NOT established: which of `0x413dc6700`'s own stores introduces a cycle,
 the guest algorithm behaving correctly on inputs we produced wrongly upstream, or a defect in how we
 execute its write-back path.
 
-## CONFIRMED 2026-08-14: the corrupting write is `0x413dc6700`'s own, caught before/after in one submit
+## RETRACTED 2026-08-14: "the corrupting write is `0x413dc6700`'s own" was one sample
 
 The self-corrupting account was previously inferred from a writeback trace. It is now a direct
 before/after on adjacent dispatches of the same program, in the same submit, on current master:
@@ -62,10 +62,38 @@ disp 38  writeback binding=4 addr=0x20f848a240 changed=2357
 disp 39  read  0x20f848a240  CYCLIC  cycles=6  cyclic-roots=2062  oob-roots=0     max-depth=32
 ```
 
-**Dispatch 38 writes the table that dispatch 39 then finds cyclic in 2,062 of 2,063 roots.** No other
-program runs between them. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc6700` plus
+**RETRACTION.** The transition above is real and reproducible, and it does NOT establish cause. Two
+observations from a wider census of the same instrumentation kill the inference:
+
+- **A complete rewrite left the table CLEAN.** Submit 4312 dispatch 764 wrote 2,061 of 2,063 slots,
+  and every read in that submit reports `cycles=0`. If this program's write corrupted the table, the
+  most complete write in the route was the best chance to show it.
+- **Tables flip to cyclic with NO write from this program.** Submit 4725 reads `0x20f848417c` with
+  986 cyclic roots, and `0x413dc6700` writes nothing to it in that submit at all.
+
+So a flip adjacent to its write is not evidence that the write caused it, because flips also happen
+without one. What the original evidence established is that the program **writes the table it later
+reads** — which was already known — plus one coincidence.
+
+The generalisable error: a transition was observed next to a candidate cause, and adjacency was
+treated as causation without checking whether the transition also occurs WITHOUT the cause. The
+negative case is the whole test. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc6700` plus
 `PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64` and read the interleaved
 `parent-walk` / `execute` / `writeback` lines.
+
+### FALSIFIED: our store INDICES are wrong
+
+Grouped strictly per `(submit, dispatch)` — the ungrouped form of this analysis is meaningless and
+produced a confident wrong answer first — every head a dispatch writes has its matching tail at the
+very next slot:
+
+```text
+submit 4312 dispatch 764: 2061 slots written, 1031 heads, MISMATCHED=0
+submit 5555 dispatch  38: 1721 slots written,  864 heads, MISMATCHED=0
+```
+
+So the pair-store index arithmetic is correct in our execution. Whatever produces an orphaned tail,
+it is not this program emitting a head and a tail at non-adjacent slots.
 
 ### The corruption has a SHAPE: overlapping pair writes, not garbage
 
