@@ -149,6 +149,33 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
+## The 183-cycle measurement is real but its PROVENANCE is not — read this before building on it
+
+Two facts that only make sense together, and their conflict is the most useful thing known about this
+defect.
+
+**Every start index is used.** The consumer's walk begins at `v1 = v68`, and `v68 = (s2 << 8) + v0`
+(`pc1`), i.e. the global thread index; `pc74`'s `v_cmpx_gt_i32_e32 s18, v68` masks it to `< 2063`. So
+threads 0..2062 walk the chain from their own index — **all 2063 starts, no exceptions**. The
+cycle census over every start index is therefore exactly the right measurement, and any cycle in the
+table is fatal rather than unreachable arena garbage. (This also kills the tempting hypothesis that
+the starts are wrong and the table is fine: the starts are the thread index, and cannot be wrong.)
+
+**But `compute[37]` completed on that table.** `compute[37]` (source 38, order 16836) is recorded as
+executed, and the hang is `source 39` at order 16841 with no operation between them. Both bind the
+same base. If the snapshotted table has 183 cyclic starts and every start is walked, source 38 must
+have hung too. It did not.
+
+**So the capsule's resource snapshot for `compute[37]` is not what `compute[37]` read.** The buffer is
+rebuilt many times per run (below), so a snapshot taken at realization can lag or lead the bytes the
+GPU actually consumed. That does not make the 183 cycles imaginary — the hang needs a cycle and
+nothing else explains it — but it does mean **the cycle count cannot currently be attributed to a
+specific dispatch**, and the live-vs-offline comparison built on it inherits that weakness.
+
+Establishing snapshot provenance — when the capture reads a compute resource relative to the dispatch
+that consumes it — is the prerequisite for any further work on this defect. Without it, every number
+in this section is a measurement of an unknown moment.
+
 ## The traversal table is rebuilt many times per run — compare only WITHIN one capsule
 
 Measured live with `PROSPER_COMPUTELOG_CODE=0x413ce3400` over a 120 s route: `0x413ce3400` writes
