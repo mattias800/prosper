@@ -50,6 +50,47 @@ What is NOT established: which of `0x413dc6700`'s own stores introduces a cycle,
 the guest algorithm behaving correctly on inputs we produced wrongly upstream, or a defect in how we
 execute its write-back path.
 
+## CONFIRMED 2026-08-14: the corrupting write is `0x413dc6700`'s own, caught before/after in one submit
+
+The self-corrupting account was previously inferred from a writeback trace. It is now a direct
+before/after on adjacent dispatches of the same program, in the same submit, on current master:
+
+```text
+disp 38  read  0x20f848417c  CLEAN   cycles=0  cyclic-roots=0     oob-roots=1385  max-depth=21
+disp 38  execute ok, buffers=43, spirv=61143/177420afa4fd9c50
+disp 38  writeback binding=4 addr=0x20f848a240 changed=2357
+disp 39  read  0x20f848a240  CYCLIC  cycles=6  cyclic-roots=2062  oob-roots=0     max-depth=32
+```
+
+**Dispatch 38 writes the table that dispatch 39 then finds cyclic in 2,062 of 2,063 roots.** No other
+program runs between them. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc6700` plus
+`PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64` and read the interleaved
+`parent-walk` / `execute` / `writeback` lines.
+
+### What the same run also settles
+
+- **Most dispatches write nothing.** 52 of 64 writebacks are `changed=0`; the substantial ones are
+  `changed=2357`, `2061`, and a few single-digit updates. So the corrupting event is rare and
+  identifiable, not a steady drift.
+- **Both tables can be cyclic**, contrary to the earlier per-address reading: `0x20f848417c` is
+  162 clean / 30 cyclic and `0x20f848a240` is 40 clean / 120 cyclic across 352 resolved reads. The
+  asymmetry is real but it is not a property of the address.
+- **The resource table varies per dispatch.** The same program address compiles to different modules
+  (`spirv=58649/…` several distinct hashes, `61143/177420afa4fd9c50` on the big-write dispatch), and
+  `buffers` ranges from 1 to 43. A single dispatch's resource picture is not the program's.
+
+### The open question, now narrow
+
+Why does that write produce cycles? Candidates, none yet tested:
+
+1. the stored VALUES are wrong (our lowering of the store path computes the wrong record);
+2. the stored INDICES are wrong (right values, wrong slots);
+3. a concurrency effect at `threads=2063 local=256 groups=9` that the guest's algorithm tolerates on
+   hardware and our lowering does not preserve.
+
+The oracle is in place either way: `cyclic-roots` on the read immediately after the write is the
+number to move, and dispatch 38 of a `0x413dc6700` pair is where to look.
+
 ## Where the world went
 
 As of 2026-08-14 the black world is **one compute program**, and that is established by A/B rather
