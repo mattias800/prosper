@@ -10,6 +10,36 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## The current account — read this before anything below it
+
+This document is layered: it grew as an investigation log, and several sections below are historical
+transcripts kept for the evidence beside them. **Where a lower section disagrees with this one, this
+one is current.** Each layer that was superseded now says so where it sits.
+
+As of 2026-08-14, established and each measured rather than inferred:
+
+1. **The missing world is one compute program.** `0x413dc6700` hangs the GPU into a RADV hard
+   recovery. That disables live compute for the whole process, so every later indirect draw is
+   dropped — and GTA V's world is GPU-driven, so those indirect operations *are* the world. Skipping
+   it (`PROSPER_COMPUTE_SKIP_PROGRAM`) gives 0 device losses and the first real scene content.
+2. **The hang is a non-terminating loop in that program.** Its 903-dword body contains exactly one
+   backward branch (guest pc97 → pc88). The trip-bound witness fires there and reports that no
+   invocation ever reached a dispatch ordinal past the loop body; the fence-wait duration
+   for that dispatch is ~2,045 ms against sub-millisecond for every other dispatch in the route; the
+   device loss follows on the next dispatch.
+3. **The loop's data is cyclic at dispatch time.** Pre-dispatch, 806 of 1,782 reads receive a table
+   in which 1,805–2,062 of 2,063 roots lead into a cycle. The guest loop cannot terminate on that.
+4. **Our lowering of that loop shape is correct.** A hand-built kernel with the same
+   `v_cmpx` / `s_cbranch_execz` / back-edge shape runs correctly on real Vulkan
+   (`tests/test_cfg_trip_bound.cpp`), so the recompiler is not what fails to exit.
+
+**So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
+lower it correctly. Its only identified writer is `0x413ce3400`, which is never declined on a routed
+run, so "the producer was refused" is already eliminated.
+
+What is NOT established: which write makes the table cyclic, and whether that write is the guest's
+own behaviour on inputs we produced wrongly upstream or a defect in how we execute the producer.
+
 ## Where the world went
 
 As of 2026-08-14 the black world is **one compute program**, and that is established by A/B rather
@@ -177,7 +207,11 @@ falsification.
   on trial. On real Vulkan, lane *i* walks exactly *i* steps for all 128 lanes — per-lane EXEC
   narrowing and the cross-lane `execz` vote are both correct. #2542.
 - **Bounding the CFG dispatcher's trip count stops the hang.** Tried at 4096 and at 2^20; the device
-  was lost both times. Note this cuts *against* the loop being unbounded rather than for it. #2481.
+  was lost both times, so a bound at those values does not rescue the frame. This is **not** in
+  tension with the hit witness firing at 4,096 further down: the witness says the loop *reaches* the
+  cap, and the cap then truncates that dispatch's control flow, which produces wrong results for
+  every later consumer rather than a working frame. "The bound does not fix the title" and "the loop
+  runs away" are both true. #2481.
 
 ### Void, not falsified — do not cite these as settled
 
@@ -206,9 +240,9 @@ dispatch every other instrument has named, immediately followed by the device lo
 dispatch.**
 
 Three independent instruments now converge on `0x413dc6700` dispatch 39: the trip-bound hit witness
-(`trips=4096`), the fence-wait duration, and the loss ordering. **The witness's third field is
-a guest PC, not a block ordinal** — see the correction below; it does not say the guest's loop
-is the thing spinning.
+(`trips=4096`, with no invocation ever reaching an ordinal past the loop body), the fence-wait
+duration, and the loss ordering. The witness's fields are dispatcher
+quantities; resolve an ordinal against the `dispatch map:` line the same phase prints.
 
 ### This corrects the section that used to be here
 
@@ -307,9 +341,14 @@ readable? low=0  aperture20=1  hi-dword=0
 ```
 
 The raw low address is unmapped; `aperture | low` is mapped; folding the modifier as an ADDR_HI is
-not. The recovery learns the aperture from any full indirect base and applies it **only** when the
-address we would otherwise use is unreadable and the recovered one is readable — so a wrong aperture
-leaves behaviour exactly as it was.
+not.
+
+**That is evidence about where the arguments live, and it is not provenance — which is why the
+recovery is opt-in.** This paragraph used to end "so a wrong aperture leaves behaviour exactly as it
+was", and that claim does not hold: the aperture is learned from *any* SetBase on *any* queue, and one
+process VA space can contain mapped allocations under several high-32 prefixes. A wrong aperture that
+happens to land on a mapped allocation is accepted, and the dispatch then reads group counts out of
+whatever lives there. Gated behind `PROSPER_INDIRECT_APERTURE_RECOVERY`, default off.
 
 ### What it does NOT fix
 
@@ -535,8 +574,13 @@ subgroup path. Two things checked there and found correct: the vote mailboxes (`
 over; and each lane's LDS contribution is gated on its own `pending` bit.
 
 **The device-side hit witness WORKS, and the cap fires — on the dispatch that hangs.** The shader
-writes hit flag, phase, last block index and trip count into the top of the internal GDS buffer when a
-cap runs out; the host reports and clears them per dispatch.
+writes into the top of the internal GDS buffer when a cap runs out; the host prepares those dwords
+before the selected dispatch and reports them after it, and touches them only while the diagnostic is
+armed for that program. **The current record is five dwords — hit flag, phase, highest trip count, and
+the lowest and highest dispatcher switch-case ordinal visited — with the last three reduced across
+invocations by device-scope atomics.** The per-invocation "last block index" this line used to name
+no longer exists: it was one sample, it could not answer whether the dispatcher was cycling, and its
+label was published wrongly twice (instrument trap 172).
 
 **Positive control first**: at bound **2** — which a 15-block dispatcher phase cannot satisfy — the
 witness produces **1,606 hit records**. It fires.
@@ -569,89 +613,32 @@ phase now prints its map when a bound arms:
 
 so the ordinal resolves against emitted evidence rather than by hand.
 
-**Resolved on a routed run, 2026-08-14 — and the original attribution was right.** Phase 0's map, and
-the witness with the ordinal span it now records:
+**Re-measured on a routed run, 2026-08-14, with the ATOMIC record — and the number changed.**
 
 ```text
 [cfg-trip-bound] program 0x413dc6700 phase 0 dispatch map:
     0:pc0..<41  1:pc41..<50  2:pc50..<55  3:pc55..<61  4:pc61..<67  5:pc67..<73
     6:pc73..<76  7:pc76..<88  8:pc88..<91  9:pc91..<98  10:pc98..<103 ...
-[cfg-trip-bound] HIT program=0x413dc6700 phase=0 next-dispatch=9 trips=4096 dispatch-range=6..9
+[cfg-trip-bound] HIT program=0x413dc6700 phase=0 trips=4096 dispatch-range=0..9   (5 hits, 1 loss)
 ```
 
-Ordinal **8 is `pc88..91`** — the loop header, `v_mov` / `v_cmpx_ne_u32` / `s_cbranch_execz`. Ordinal
-**9 is `pc91..98`** — the loop body, `buffer_load_dword` / `s_add_i32` / `v_bfe_u32` / `s_branch`.
-Across all 4,096 iterations the state machine visited **only ordinals 6..9**, i.e. the loop and the
-block that falls into it. The guest's own loop is what spins, which is what the first reading of this
-witness said before either mislabelling. `dispatch-range` is what makes it a measurement rather than a
-one-sample inference: a span of four adjacent ordinals over 4,096 iterations is a cycle, not a pass.
+**The earlier `dispatch-range=6..9` was an artifact of last-writer publication and is withdrawn.**
+That record was written with plain stores from every invocation reaching the cap, so it reported one
+invocation's local extremes; the reduction over all invocations is `0..9`. The claim built on it —
+"the state machine visited only ordinals 6..9, so it is cycling in the loop" — does not survive,
+because ordinal 0 is the program entry and every invocation passes through it. A ten-ordinal span is
+not evidence of a cycle.
 
-11 hits across dispatches 38..48 of one submit — **including dispatch 39, the exact dispatch that
-hangs on an unbounded build**. Last block is **14** on dispatch 39 and **9** on the other ten.
+**What the corrected record does establish is the CEILING, and it is stronger.** The maximum ordinal
+reached, over every invocation and workgroup, is **9** — the loop body at `pc91..98`. Ordinals 10..14
+(`pc98..116`, everything after the loop) were **never reached by any lane**. So no invocation ever
+left the loop, which is exactly the claim at issue, and it now rests on a true reduction rather than
+on whichever invocation happened to write last.
 
-That is a direct record that the loop runs past 4,096 dispatcher iterations, replacing the earlier
-inference from device survival. It also answers the reviewer's P1: the conclusion no longer rests on
-comparing two modules that differ by a literal operand.
+The lesson is worth keeping separate from the conclusion: the conclusion survived, and the derivation
+did not. A last-writer record produced a *narrower*, more striking span than the truth, and a narrower
+span is the direction that reads as stronger evidence — which is why nobody questioned it.
 
-**An earlier version of this witness was inert, and the reason is worth keeping.** The SPIR-V declared
-binding 127 while the resource table did not carry it, because the injection sat inside a conditional
-resource-build region this program skips. The contract check then rejected the module and the dispatch
-was **declined** — so the device survived because the program never ran, which is indistinguishable
-from "the bound worked" in every artifact except one line reading
-`skip invalid descriptor contract`. Its positive control at bound 2 produced zero hits, which is what
-exposed it. Injecting at table finalization fixed it.
-
-**A cheap hit-witness attempt that does NOT work, recorded so nobody repeats it.** Idea: run the same
-phase-0 bound at 4,096 and 65,536 and compare the program's write-back hashes — if the loop terminates
-naturally under both, identical inputs must give identical outputs, and a difference would witness
-truncation. One dispatch in each run did share binding 4's input hash (`b24dd1c1ba122e6d`) and their
-outputs differed (`514428f8…` vs `18c1fbdb…`), which looks like a hit.
-
-It is not. Comparing **all** of that dispatch's inputs, **three of six differ** between the two runs
-(bindings 3, 6 and 8) — the two runs are different live sessions on per-frame data, so the output
-difference is fully explained without any truncation. The comparison cannot discriminate, and the
-apparent agreement on one binding was coincidence.
-
-A real witness has to be device-side, as originally specified: written by the shader on a cap hit and
-read back after the dispatch.
-
-**That witness now EXISTS and has fired** — see the section above. This paragraph used to continue
-"there is no device-side witness that a cap was actually reached", which stopped being true when the
-witness landed and is struck here rather than left to contradict the evidence recorded higher up. Its
-fields are the dispatcher's, not the guest's: phase ordinal, highest trip count, and the span of
-dispatcher switch-case ordinals visited, the last two reduced across invocations with device-scope
-atomics so they are true extremes rather than whichever invocation wrote last.
-
-**Earlier, weaker control — the bound's value matters, not the counter's presence.** With the counter emitted
-but the bound set to 4,000,000,000 (effectively no bound), the device is lost at `0x413dc6700`
-dispatch 39 again, exactly as in the four unbounded runs. So the result is not codegen perturbation
-from adding a Function variable to the loop:
-
-| bound | outcome |
-| --- | --- |
-| none (counter not emitted) | dies at `0x413dc6700` dispatch 39 |
-| **4,000,000,000** (counter emitted, never reached) | **dies at `0x413dc6700` dispatch 39** |
-| 100,000 | gets past it |
-| 4,096 | gets past it |
-
-Four independent configurations all die at the same program and the same dispatch index. Bounding the
-dispatcher is the only change that gets past it — so **the mechanism is a dispatcher loop that does
-not terminate**, and `0x413e14900` hangs for a **different** reason — both 4,096 and 100,000 get past `0x413dc6700` and
-then die at `0x413e14900` dispatch 52, so a dispatcher bound does not save it. Either it is not
-dispatcher-emitted at all (a structured module's loops are unbounded by this switch), or its
-non-termination is elsewhere.
-
-Strictly the bound proves the loop exceeds 100,000 iterations rather than that it is infinite. For a
-program whose only guest loop is bounded at **11** iterations on this dispatch's own data, either is a
-defect: the dispatcher iterates once per guest basic block executed, and nothing in that guest program
-justifies 100,000 of them.
-
-**The trip bound is NOT a fix** — truncating a guest program's control flow produces wrong results by
-construction. It is opt-in, says so when it arms, and exists to answer this one question.
-
-This also supersedes an earlier note in this investigation claiming that dispatcher bounds of 4,096
-and 2^20 "still lost the device". That note is contradicted by the table above and should not be
-relied on.
 
 ### Where to look
 

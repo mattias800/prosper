@@ -33,6 +33,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
 
+#include <algorithm>
 #include <cmath>
 #include <set>
 #include <cstdint>
@@ -124,7 +125,16 @@ int main() {
 
     constexpr uint32_t kBound = 4;
     const uint64_t kSyntheticProgram = 0x413dc6700ull;   // the address the live investigation targets
+
+    // A PHASE SELECTOR IS REQUIRED. One witness record cannot describe two phases -- their dispatch
+    // ordinals index different tables -- so arming without one emits nothing at all. Assert that
+    // before anything else, because every arm below depends on the phase being set and would
+    // otherwise pass for the wrong reason.
     set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+    set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
+    CHECK(recompile_valu(kExecWalk, kWords, 2, 2) == unbounded,
+          "a bound with no phase selector emits nothing (the record could not be coherent)");
+    set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
 
     // recompile_valu has no diagnostic context, so its program address is 0. Selecting a DIFFERENT
     // program must therefore leave this module untouched — the negative arm for targeting.
@@ -139,7 +149,7 @@ int main() {
     {
         const ComputeTripBoundSettings armed = compute_trip_bound_settings();
         CHECK(armed.bound == kBound && armed.only_program == kSyntheticProgram &&
-                  armed.only_phase == ComputeTripBoundSettings::kAllPhases,
+                  armed.only_phase == 0u,
               "compute_trip_bound_settings reports the complete armed selector state");
     }
 
@@ -179,27 +189,31 @@ int main() {
         0xBE800380u,  //  0: s_mov_b32      s0, 0
         0x7E020284u,  //  1: v_mov_b32      v1, 4
         0x7DA20200u,  //  2: A: v_cmpx_lt_u32 exec, s0, v1
-        0xBF880008u,  //  3: s_cbranch_execz -> 12
+        0xBF880009u,  //  3: s_cbranch_execz -> 13
         0x7DA20200u,  //  4: B: v_cmpx_lt_u32 exec, s0, v1
-        0xBF880008u,  //  5: s_cbranch_execz -> 14
+        0xBF880009u,  //  5: s_cbranch_execz -> 15
         0x4a0202c1u,  //  6: v_add_nc_u32   v1, -1, v1
-        0x7E040200u,  //  7: v_mov_b32      v2, s0
+        0x7E040200u,  //  7: v_mov_b32      v2, s0      ; publishes the iteration reached
         0x81008100u,  //  8: s_add_i32      s0, s0, 1
-        0xBF82FFF8u,  //  9: s_branch       -> 2      ; A back edge
+        0xBF82FFF8u,  //  9: s_branch       -> 2        ; A back edge
         0x81008100u,  // 10: s_add_i32      s0, s0, 1
-        0xBF82FFF8u,  // 11: s_branch       -> 4      ; B back edge, overlaps A without nesting
+        0xBF82FFF8u,  // 11: s_branch       -> 4        ; B back edge, overlaps A without nesting
         0x7E040280u,  // 12: v_mov_b32      v2, 0
         0x7E040280u,  // 13: v_mov_b32      v2, 0
-        0xBF810000u,  // 14: s_endpgm
+        0xBEFE04C1u,  // 14: s_mov_b64      exec, -1    ; restore, so the epilogue store is live
+        0x7e040d02u,  // 15: v_cvt_f32_u32  v2, v2
+        0xBF810000u,  // 16: s_endpgm
     };
     const size_t kDispatcherWords = sizeof(kDispatcherLoops) / sizeof(kDispatcherLoops[0]);
 
     set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+    set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
     const std::vector<uint32_t> dispatcher_plain =
         recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
     CHECK(!dispatcher_plain.empty(), "the overlapping-EXEC-loop kernel recompiles unarmed");
 
     set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+    set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
     const std::vector<uint32_t> dispatcher_bounded =
         recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
     CHECK(!dispatcher_bounded.empty(), "the overlapping-EXEC-loop kernel recompiles armed");
@@ -225,6 +239,55 @@ int main() {
     // wrong: the portable dispatcher routes it through a Function variable, so a store/load pair
     // breaks any def-use walk that does not model memory. Matching the comparison against the bound
     // CONSTANT keeps the anchor at the emitter's own site without needing that machinery.
+    // Exact def-use walk, valid ONLY where the condition reaches the branch without passing through
+    // memory -- i.e. the direct/native dispatcher. SPIR-V is in SSA dominance order, so one forward
+    // pass resolves it.
+    auto condition_reaches_branch = [](const std::vector<uint32_t>& m, uint32_t bound) {
+        if (m.size() < 5) return false;
+        constexpr uint16_t OpConstant = 43, OpULessThan = 176, OpLogicalAnd = 167,
+                           OpBranchConditional = 250;
+        std::set<uint32_t> bound_constants, derived;
+        for (size_t word = 5; word < m.size();) {
+            const uint32_t op = m[word] & 0xffffu, len = m[word] >> 16;
+            if (len == 0 || word + len > m.size()) break;
+            if (op == OpConstant && len == 4 && m[word + 3] == bound)
+                bound_constants.insert(m[word + 2]);
+            else if (op == OpULessThan && len >= 5 && bound_constants.count(m[word + 4]))
+                derived.insert(m[word + 2]);
+            // OpLogicalAnd is `{result-type, result, a, b}` -- length FIVE. An earlier revision
+            // required >= 6 here, so this branch never fired and the walk silently reported "the
+            // condition never reaches a branch" for every module. A predicate that cannot return
+            // true is not a strict test, it is a broken one.
+            else if (op == OpLogicalAnd && len >= 5 &&
+                     (derived.count(m[word + 3]) || derived.count(m[word + 4])))
+                derived.insert(m[word + 2]);
+            else if (op == OpBranchConditional && len >= 4 && derived.count(m[word + 1]))
+                return true;
+            word += len;
+        }
+        return false;
+    };
+
+    // Does the module publish witness slot `slot` with atomic opcode `opcode`? The slot arrives as an
+    // OpConstant feeding the AccessChain that the atomic then targets.
+    auto witness_uses = [](const std::vector<uint32_t>& m, uint32_t slot, uint16_t opcode) {
+        if (m.size() < 5) return false;
+        constexpr uint16_t OpConstant = 43, OpAccessChain = 65;
+        std::set<uint32_t> slot_constants, slot_pointers;
+        for (size_t word = 5; word < m.size();) {
+            const uint32_t op = m[word] & 0xffffu, len = m[word] >> 16;
+            if (len == 0 || word + len > m.size()) break;
+            if (op == OpConstant && len == 4 && m[word + 3] == slot)
+                slot_constants.insert(m[word + 2]);
+            else if (op == OpAccessChain && len >= 5 && slot_constants.count(m[word + len - 1]))
+                slot_pointers.insert(m[word + 2]);
+            else if (op == opcode && len >= 4 && slot_pointers.count(m[word + 3]))
+                return true;
+            word += len;
+        }
+        return false;
+    };
+
     auto compares_against_bound = [](const std::vector<uint32_t>& m, uint32_t bound) {
         if (m.size() < 5) return false;
         constexpr uint16_t OpConstant = 43, OpULessThan = 176;
@@ -243,12 +306,45 @@ int main() {
     CHECK(!compares_against_bound(dispatcher_plain, kBound),
           "unarmed, the dispatcher module contains no comparison against the bound");
     CHECK(compares_against_bound(dispatcher_bounded, kBound),
-          "armed, the dispatcher compares the trip counter against the bound "
-          "(deleting the cap fails HERE, where module size and inequality do not)");
+          "armed, the dispatcher emits a comparison against the bound");
+
+    // EXECUTION, because emitting a comparison is not the same as that comparison CONTROLLING the
+    // loop. A reviewer changed `return land(keep_going, under_bound)` to `return keep_going` --
+    // counter, comparison and witness all still emitted, cap completely inert -- and every
+    // module-shaped assertion above still passed. Only running it can tell the difference.
+    //
+    // The fixture terminates on its own (s0 rises while v1 falls, so `s0 < v1` fails on the third
+    // pass), which is what makes this safe in CI: an inert cap yields a wrong VALUE, never a hung
+    // queue. Unbounded, every lane reports 1 -- the last iteration index reached at pc7. A bound of
+    // 4 dispatcher iterations cuts the run short of that.
+    std::vector<float> dispatcher_input(kLanes * 2, 0.0f);
+    set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+    const std::vector<float> ran_free =
+        prosper::test::run_compute(dispatcher_plain, dispatcher_input, kLanes, kLanes);
+    set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+    set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+    const std::vector<float> ran_capped =
+        prosper::test::run_compute(dispatcher_bounded, dispatcher_input, kLanes, kLanes);
+
+    const bool free_ok = ran_free.size() == kLanes &&
+        std::all_of(ran_free.begin(), ran_free.end(),
+                    [](float v) { return std::fabs(v - 1.0f) < 0.5f; });
+    CHECK(free_ok, "unbounded, the overlapping-EXEC-loop fixture runs to its natural end (every "
+                   "lane reports 1)");
+    const bool capped_differs = ran_capped.size() == kLanes && ran_free.size() == kLanes &&
+        std::any_of(ran_capped.begin(), ran_capped.end(),
+                    [](float v) { return std::fabs(v - 1.0f) >= 0.5f; });
+    if (ran_capped.size() == kLanes && ran_free.size() == kLanes)
+        printf("  dispatcher fixture: unbounded lane0=%g  bounded lane0=%g\n",
+               ran_free[0], ran_capped[0]);
+    CHECK(capped_differs,
+          "the cap CONTROLS the back edge: bounding truncates the run and changes the result "
+          "(an inert cap fails HERE, where an emitted-but-unused comparison does not)");
 
     // Independent of the scan above: the bound's VALUE must reach the emitter, not merely its
     // armed/disarmed state. Two different bounds must produce two different modules.
     set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound + 1).c_str());
+    set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
     const std::vector<uint32_t> dispatcher_other_bound =
         recompile_valu(kDispatcherLoops, kDispatcherWords, 2, 2);
     CHECK(dispatcher_other_bound != dispatcher_bounded &&
@@ -283,6 +379,7 @@ int main() {
 
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
         set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", "0x413dc6700");
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
 
         auto compile_as = [&](uint64_t program) {
             return recompile_compute_shader_cached(
@@ -314,6 +411,63 @@ int main() {
         set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
         clear_shader_recompile_cache();
     }
+
+    // --- the DIRECT / native-subgroup dispatcher -------------------------------------------------
+    //
+    // A separate emitter with its own back edge, and removing its apply_trip_bound call was shown to
+    // leave every assertion above passing: nothing here reaches it, because recompile_valu never sets
+    // a native subgroup size. `direct_dispatch` requires one, so this arm goes through the cached
+    // compute entry point with the size set.
+    //
+    // The direct path passes the capped condition STRAIGHT into emit_condbranch with no Function
+    // variable in between, so unlike the portable path a def-use walk to the OpBranchConditional is
+    // exact here and needs no memory modelling. That is why the two paths are checked differently:
+    // the shape of each lowering decides what can honestly be asserted about it.
+    {
+        ComputeShaderConfig direct{};
+        direct.local_x = 64; direct.local_y = 1; direct.local_z = 1;
+        direct.wave_size = 64;
+        direct.tgid_x_en = true;
+        direct.native_subgroup_size = 64;
+        ShaderResourceTable table{};
+        const uint64_t kTarget = 0x413dc6700ull;
+
+        auto compile_direct = [&] {
+            clear_shader_recompile_cache();
+            return recompile_compute_shader_cached(
+                kDispatcherLoops, kDispatcherWords, &table, direct, nullptr,
+                {RecompileDiagnosticStage::Compute, kTarget});
+        };
+
+        set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        const std::vector<uint32_t> direct_plain = compile_direct();
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", "0x413dc6700");
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        const std::vector<uint32_t> direct_bounded = compile_direct();
+
+        CHECK(!direct_plain.empty() && !direct_bounded.empty(),
+              "the native-subgroup dispatcher compiles both unarmed and armed");
+        CHECK(!condition_reaches_branch(direct_plain, kBound),
+              "unarmed, no branch in the native-subgroup module is gated on the bound comparison");
+        CHECK(condition_reaches_branch(direct_bounded, kBound),
+              "armed, the native-subgroup back edge BRANCHES on the bound comparison "
+              "(removing the direct apply_trip_bound call fails HERE)");
+        set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
+        clear_shader_recompile_cache();
+    }
+
+    // The witness's reduction DIRECTION is part of the contract: field +3 is a minimum and +4 a
+    // maximum, and swapping them still produced a plausible-looking record that every other
+    // assertion accepted. Pin each opcode to its slot.
+    CHECK(witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 3, 237 /*OpAtomicUMin*/),
+          "the low end of the dispatch range is published with an atomic MINIMUM");
+    CHECK(witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 4, 239 /*OpAtomicUMax*/),
+          "the high end of the dispatch range is published with an atomic MAXIMUM");
+    CHECK(!witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 3, 239) &&
+              !witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 4, 237),
+          "and neither slot carries the other's reduction");
 
     // Disarming must restore the original module exactly. Without this, "arming changes the module"
     // above could be satisfied by any nondeterminism in the emitter rather than by the bound.

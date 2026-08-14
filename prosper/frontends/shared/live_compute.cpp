@@ -8980,7 +8980,10 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // at UINT32_MAX or the minimum is whatever the slot happened to hold. Clearing to zero and hoping is
 // how an atomic-min record reads as "ordinal 0 was visited" forever.
 uint32_t* trip_bound_witness_slots(const prosper::gpu::ComputeItem& item) {
-    if (!prosper::gpu::compute_trip_witness_active(item.code_addr)) return nullptr;
+    // The item's flag is authoritative, not compute_trip_witness_active alone: a program that uses
+    // GDS itself is never instrumented, and only the realization path (which decodes the program)
+    // knows that. Touching these dwords for such a dispatch would overwrite the guest's own data.
+    if (!item.trip_witness_instrumented) return nullptr;
     uint8_t* gds = prosper::gpu::compute_gds_backing();
     if (!gds) return nullptr;
     return reinterpret_cast<uint32_t*>(gds) + prosper::gpu::kComputeTripWitnessDword;

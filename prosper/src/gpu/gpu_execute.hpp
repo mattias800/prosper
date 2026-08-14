@@ -475,6 +475,11 @@ struct ComputeItem {
     // shape, but only realization or replay may assert it, so a serialized flag can never talk the
     // backend into executing nothing on trust.
     bool terminator_only_program_validated = false;
+    // The trip-bound witness was actually instrumented for this dispatch. Decided where the program's
+    // GDS usage is known, and carried rather than re-derived: the host must not read or clear the
+    // witness dwords for a program that uses GDS itself, and re-decoding the program per dispatch to
+    // find that out would be both wasteful and a second place for the rule to drift.
+    bool trip_witness_instrumented = false;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };

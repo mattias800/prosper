@@ -7156,6 +7156,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
     std::vector<ComputeItem> items;
     items.reserve(st.dispatches.size());
     for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
+        // Set where the program's GDS usage is known (see uses_gds below); read where the item is
+        // finalized. Declared at loop scope because those two points are in different blocks.
+        bool witness_instrumented_for_item = false;
         const auto& dispatch = st.dispatches[dispatch_index];
         if (direct_compute_dispatch_is_noop(dispatch)) continue;
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
@@ -7534,7 +7537,15 @@ std::vector<ComputeItem> realize_compute_dispatches(
             });
             // A bounded dispatcher needs the internal GDS buffer as its witness destination even when
             // the guest program never touches GDS — see kComputeTripWitnessDword.
-            if (uses_gds || compute_trip_witness_active(code_addr)) {
+            //
+            // A program that uses GDS ITSELF is never instrumented: the witness would overwrite the
+            // guest's own data and so change the input to the behaviour under measurement. This is
+            // the only place both facts are known, so the decision is made here and carried on the
+            // item rather than re-derived by the host.
+            const bool trip_witness_instrumented =
+                !uses_gds && compute_trip_witness_active(code_addr);
+            witness_instrumented_for_item = trip_witness_instrumented;
+            if (uses_gds || trip_witness_instrumented) {
                 ShaderResource gds;
                 gds.cls = ResourceClass::ConstantBuffer;
                 gds.format = DataFormat::Uint32;
@@ -7772,6 +7783,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 shader_dwords, config, *table);
         // Independent of the resource table by design: an `s_endpgm`-only program has no memory
         // effect no matter what its V#s declare, so this proof reads the code and nothing else.
+        item.trip_witness_instrumented = witness_instrumented_for_item;
         item.terminator_only_program_validated = rdna2_program_is_terminator_only(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.gta5_cf9200_no_backing_validated = item.spirv.size() &&

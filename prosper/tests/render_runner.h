@@ -1577,9 +1577,15 @@ public:
         // queue-wait-idle and says nothing, so a hung or lost graphics submission left no record at
         // all. The compute backend, by contrast, reports its refusals loudly — with the result that
         // a device loss discovered at compute's NEXT submit was read for days as "a compute dispatch
-        // hung the GPU", while the compute queue had in fact completed 705 of 705 fence waits with
-        // zero timeouts. The hang was never compute's; nothing on the graphics side was able to say
-        // so. See instrument trap 170.
+        // hung the GPU" purely because compute was the only side that spoke. See instrument trap 170:
+        // a loss at submit time names the submission that OBSERVES it, not the one that caused it.
+        //
+        // The sentence that used to end this paragraph -- "the hang was never compute's", argued from
+        // 705 of 705 fence waits completing with zero timeouts -- is WITHDRAWN, and trap 171 records
+        // why: the timeout is 30 seconds and the event is 2. Recording the wait DURATION found a
+        // single 2,045 ms compute dispatch in a whole route, immediately before the loss. A zero
+        // timeout count never meant a zero latency count. This reporting stands on its own merits:
+        // a graphics submission that fails or hangs must not be silent either.
         if (result.submit_result != VK_SUCCESS || result.wait_result != VK_SUCCESS) {
             static std::atomic<int> reported{0};
             const int n = reported.fetch_add(1);
