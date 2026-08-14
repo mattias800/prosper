@@ -9,6 +9,7 @@
 #include "gpu_timeline.hpp"
 #include "capture_compute_policy.hpp"
 #include "compute_parent_walk.hpp"
+#include "compute_tree_watch.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -9207,6 +9208,205 @@ RetainedComputeRealization realize_retained_compute(
     return RetainedComputeRealization::Realized;
 }
 
+// ---------------------------------------------------------------------------------------------
+// PROSPER_COMPUTE_TREE_WATCH=ADDR:RECORDS[:SHIFT:MASK]
+//
+// Address-keyed, evaluated around EVERY realized dispatch. The program-keyed parent walk above
+// answers "was the table cyclic when its consumer started"; this answers "which dispatch made it
+// cyclic", which is a different question and the one the consumer's hang depends on.
+//
+// Two comparisons per dispatch, and they are deliberately not the same comparison:
+//   pre  -- current bytes against the LAST observation, whenever that was. A change here was made
+//           by something that is not a dispatch (guest CPU, a copy, a graphics write).
+//   post -- current bytes against this dispatch's own pre-image. A change here is attributable to
+//           this dispatch, by construction.
+// Reporting them separately is what keeps "some dispatch between these two wrote it" from being
+// recorded as "this dispatch wrote it".
+//
+// The watch runs on every dispatch, not only on the programs already known to bind a range
+// containing the address, and reports `toucher=0/1` for each change. A change from a non-toucher
+// is a finding rather than noise: it means an out-of-bounds write, or a binding path the resource
+// traversal does not model. An instrument restricted to the suspects it already has cannot
+// discover that it is looking at the wrong set.
+struct LiveComputeTreeWatchState {
+    bool have_previous = false;
+    std::vector<uint32_t> previous;
+    ComputeParentWalkReport previous_report;
+    uint64_t previous_submit = 0;
+    uint64_t previous_order = 0;
+    uint64_t previous_program = 0;
+    uint64_t observations = 0;
+    uint64_t reported_changes = 0;
+};
+
+const std::optional<ComputeTreeWatchSelector>& compute_tree_watch_selector() {
+    static const auto selector = [] {
+        const char* value = std::getenv("PROSPER_COMPUTE_TREE_WATCH");
+        auto parsed = parse_compute_tree_watch_selector(value);
+        if (value && *value && !parsed)
+            std::fprintf(stderr,
+                         "[compute-tree-watch] invalid selector '%s'; expected "
+                         "ADDR:RECORDS[:SHIFT:MASK]\n",
+                         value);
+        return parsed;
+    }();
+    return selector;
+}
+
+LiveComputeTreeWatchState& compute_tree_watch_state() {
+    static LiveComputeTreeWatchState state;
+    return state;
+}
+
+// The guest allocation is the authority for what a later CPU-side read of this table sees. Reading
+// the running program's staged resource copy instead would make a pre/post pair compare two
+// different sources, which manufactures changes that nobody wrote.
+bool read_compute_tree_watch_words(const ComputeTreeWatchSelector& selector,
+                                   std::vector<uint32_t>& out) {
+    const uint64_t bytes = static_cast<uint64_t>(selector.records) * sizeof(uint32_t);
+    if (!guest_readable(selector.addr, bytes)) return false;
+    out.resize(selector.records);
+    std::memcpy(out.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(selector.addr)),
+                static_cast<size_t>(bytes));
+    return true;
+}
+
+// Name the binding and fetch pc when the running program's own table reaches the watched address.
+// A change reported with toucher=0 is the interesting case -- an out-of-bounds write, or a binding
+// path the traversal does not model -- so it must stay distinguishable from a change made by a
+// program that legitimately binds the range. Computed before the dispatch, because the ComputeItem
+// carrying the resource table is moved into the backend.
+std::string describe_compute_tree_watch_touch(const ShaderResourceTable* resources,
+                                              uint64_t wanted) {
+    if (!resources) return "toucher=0";
+    const std::vector<ComputeAddressWatchHit> hits = compute_address_watch_hits(*resources, wanted);
+    if (hits.empty()) return "toucher=0";
+    std::string touch = "toucher=1 at=";
+    for (size_t i = 0; i < hits.size(); ++i) {
+        char one[64];
+        std::snprintf(one, sizeof(one), "%s%u:%u", i ? "," : "", hits[i].binding, hits[i].fetch_pc);
+        touch += one;
+    }
+    return touch;
+}
+
+void report_compute_tree_watch(const char* phase, const ComputeTreeWatchSelector& selector,
+                               uint64_t program, const std::string& touch, uint64_t submit_no,
+                               size_t dispatch_index,
+                               uint64_t order, const std::vector<uint32_t>& before,
+                               const ComputeParentWalkReport& before_report,
+                               const std::vector<uint32_t>& after, uint64_t previous_submit,
+                               uint64_t previous_order, uint64_t previous_program,
+                               ComputeParentWalkReport& after_report) {
+    constexpr uint32_t kReportedSlots = 12;
+    uint32_t changed = 0;
+    const std::vector<ComputeTreeWatchDelta> deltas =
+        compute_tree_watch_deltas(before, after, kReportedSlots, &changed);
+    if (!changed) return;
+
+    LiveComputeTreeWatchState& state = compute_tree_watch_state();
+    ++state.reported_changes;
+
+    after_report = analyze_compute_parent_walk(after, selector.records, selector.index_shift,
+                                               selector.index_mask);
+    const ComputeTreeSiblingReport before_siblings = analyze_compute_tree_siblings(before);
+    const ComputeTreeSiblingReport after_siblings = analyze_compute_tree_siblings(after);
+    const ComputeTreeWatchTransition transition =
+        classify_compute_tree_watch_transition(before_report, after_report, true);
+
+    std::fprintf(stderr,
+                 "[compute-tree-watch] addr=0x%llx phase=%s transition=%s program=0x%llx "
+                 "submit=%llu dispatch=%zu order=%llu %s changed=%u records=%u "
+                 "pre{cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u pairs=%u unpaired=%u} "
+                 "post{cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u pairs=%u unpaired=%u} "
+                 "since{submit=%llu order=%llu program=0x%llx}\n",
+                 static_cast<unsigned long long>(selector.addr), phase,
+                 compute_tree_watch_transition_name(transition),
+                 static_cast<unsigned long long>(program),
+                 static_cast<unsigned long long>(submit_no), dispatch_index,
+                 static_cast<unsigned long long>(order), touch.c_str(), changed, selector.records,
+                 before_report.distinct_cycles, before_report.cyclic_roots,
+                 before_report.oob_roots, before_report.max_depth, before_siblings.pairs,
+                 before_siblings.unpaired_side, after_report.distinct_cycles,
+                 after_report.cyclic_roots, after_report.oob_roots, after_report.max_depth,
+                 after_siblings.pairs, after_siblings.unpaired_side,
+                 static_cast<unsigned long long>(previous_submit),
+                 static_cast<unsigned long long>(previous_order),
+                 static_cast<unsigned long long>(previous_program));
+
+    for (const ComputeTreeWatchDelta& delta : deltas)
+        std::fprintf(stderr, "[compute-tree-watch]   slot %u 0x%08x -> 0x%08x\n", delta.index,
+                     delta.before, delta.after);
+    if (changed > kReportedSlots)
+        std::fprintf(stderr, "[compute-tree-watch]   ... %u further changed slots not listed\n",
+                     changed - kReportedSlots);
+}
+
+// Returns the pre-image so the caller can hand it back for the post comparison. Empty means the
+// window was unreadable and no post comparison should be attempted -- comparing against an empty
+// pre-image would report every slot as changed.
+std::vector<uint32_t> observe_compute_tree_watch_pre(const ComputeItem& item, uint64_t submit_no,
+                                                     size_t dispatch_index, uint64_t order,
+                                                     const std::string& touch) {
+    const auto& selected = compute_tree_watch_selector();
+    if (!selected) return {};
+    std::vector<uint32_t> current;
+    if (!read_compute_tree_watch_words(*selected, current)) return {};
+
+    LiveComputeTreeWatchState& state = compute_tree_watch_state();
+    ++state.observations;
+    ComputeParentWalkReport current_report;
+    if (!state.have_previous) {
+        current_report = analyze_compute_parent_walk(current, selected->records,
+                                                     selected->index_shift, selected->index_mask);
+        const ComputeTreeSiblingReport siblings = analyze_compute_tree_siblings(current);
+        std::fprintf(stderr,
+                     "[compute-tree-watch] addr=0x%llx phase=first submit=%llu dispatch=%zu "
+                     "order=%llu records=%u cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u "
+                     "pairs=%u unpaired=%u\n",
+                     static_cast<unsigned long long>(selected->addr),
+                     static_cast<unsigned long long>(submit_no), dispatch_index,
+                     static_cast<unsigned long long>(order), selected->records,
+                     current_report.distinct_cycles, current_report.cyclic_roots,
+                     current_report.oob_roots, current_report.max_depth, siblings.pairs,
+                     siblings.unpaired_side);
+    } else {
+        current_report = state.previous_report;
+        report_compute_tree_watch("pre", *selected, item.code_addr, touch, submit_no,
+                                  dispatch_index, order,
+                                  state.previous, state.previous_report, current,
+                                  state.previous_submit, state.previous_order,
+                                  state.previous_program, current_report);
+    }
+    state.have_previous = true;
+    state.previous = current;
+    state.previous_report = current_report;
+    state.previous_submit = submit_no;
+    state.previous_order = order;
+    state.previous_program = item.code_addr;
+    return current;
+}
+
+void observe_compute_tree_watch_post(uint64_t program, const std::string& touch,
+                                     uint64_t submit_no, size_t dispatch_index, uint64_t order,
+                                     const std::vector<uint32_t>& pre_image) {
+    const auto& selected = compute_tree_watch_selector();
+    if (!selected || pre_image.empty()) return;
+    std::vector<uint32_t> current;
+    if (!read_compute_tree_watch_words(*selected, current)) return;
+
+    LiveComputeTreeWatchState& state = compute_tree_watch_state();
+    ComputeParentWalkReport after_report = state.previous_report;
+    report_compute_tree_watch("post", *selected, program, touch, submit_no, dispatch_index, order,
+                              pre_image, state.previous_report, current, submit_no, order, program,
+                              after_report);
+    state.previous = current;
+    state.previous_report = after_report;
+    state.previous_submit = submit_no;
+    state.previous_order = order;
+    state.previous_program = program;
+}
+
 struct LiveComputeParentWalkPreflight {
     bool selected = false;
     bool available = false;
@@ -9720,8 +9920,23 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         previous_compute_executed = false;
                         break;
                     }
+                    // Pre/post around the dispatch, so a change to the watched table is
+                    // attributed to the dispatch that made it. Captured before the move: the
+                    // post observation needs the program address, and `item` is consumed below.
+                    const uint64_t tree_watch_program = item.code_addr;
+                    const std::string tree_watch_touch =
+                        compute_tree_watch_selector()
+                            ? describe_compute_tree_watch_touch(item.resources.get(),
+                                                                compute_tree_watch_selector()->addr)
+                            : std::string();
+                    const std::vector<uint32_t> tree_watch_pre =
+                        observe_compute_tree_watch_pre(item, submit_no, operation.index,
+                                                       operation.command_order, tree_watch_touch);
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
+                    observe_compute_tree_watch_post(tree_watch_program, tree_watch_touch, submit_no,
+                                                    operation.index, operation.command_order,
+                                                    tree_watch_pre);
                     if (capture_trace && executed)
                         capture_trace->computes.push_back(std::move(item));
                     if (capture_trace && !executed) {

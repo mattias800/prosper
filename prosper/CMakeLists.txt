@@ -1067,6 +1067,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_compute_parent_walk PRIVATE prosper_core)
   add_test(NAME compute_parent_walk COMMAND test_compute_parent_walk)
 
+  add_executable(test_compute_tree_watch tests/test_compute_tree_watch.cpp)
+  target_link_libraries(test_compute_tree_watch PRIVATE prosper_core)
+  add_test(NAME compute_tree_watch COMMAND test_compute_tree_watch)
+
   # Cross-submit readability reuse is valid only while the HLE mapping generation is unchanged.
   add_executable(test_guest_memory_map tests/test_guest_memory_map.cpp)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
