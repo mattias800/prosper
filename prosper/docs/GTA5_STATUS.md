@@ -207,6 +207,20 @@ So the runaway dispatcher is the one wrapping the EXEC-narrowing walk, and the w
 a maximum chain of 11 steps. The defect is named to a program, a phase and a 117-instruction guest pc
 range.
 
+**A cheap hit-witness attempt that does NOT work, recorded so nobody repeats it.** Idea: run the same
+phase-0 bound at 4,096 and 65,536 and compare the program's write-back hashes — if the loop terminates
+naturally under both, identical inputs must give identical outputs, and a difference would witness
+truncation. One dispatch in each run did share binding 4's input hash (`b24dd1c1ba122e6d`) and their
+outputs differed (`514428f8…` vs `18c1fbdb…`), which looks like a hit.
+
+It is not. Comparing **all** of that dispatch's inputs, **three of six differ** between the two runs
+(bindings 3, 6 and 8) — the two runs are different live sessions on per-frame data, so the output
+difference is fully explained without any truncation. The comparison cannot discriminate, and the
+apparent agreement on one binding was coincidence.
+
+A real witness has to be device-side, as originally specified: program, phase ordinal, workgroup, last
+`pc_var` and trip count, written by the shader on a cap hit and read back after the dispatch.
+
 What is still NOT established is, and there is no
 device-side witness that a cap was actually reached — the run log records that the feature armed, not
 that it fired. A hit witness (program, phase ordinal, workgroup, last `pc_var`, trip count, read back
