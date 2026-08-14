@@ -2192,6 +2192,12 @@ const char* realization_failure_reason_name(RealizationFailureReason reason) {
         case RealizationFailureReason::RetainedDrawNotSelected: return "retained-draw-not-selected";
         case RealizationFailureReason::IndirectArguments: return "indirect-arguments";
         case RealizationFailureReason::IndirectDependencies: return "indirect-dependencies";
+        case RealizationFailureReason::ComputeBackendUnavailable:
+            return "compute-backend-unavailable";
+        case RealizationFailureReason::SuspiciousDispatchSkipped:
+            return "suspicious-dispatch-skipped";
+        case RealizationFailureReason::ComputeExecutionDeclined:
+            return "compute-execution-declined";
     }
     return "unknown";
 }

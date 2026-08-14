@@ -1422,8 +1422,12 @@ int main() {
                   unresolved_failure->kind == SubmitOperationKind::Dispatch &&
                   unresolved_failure->source_index == 3 &&
                   unresolved_failure->command_order == unresolved_dispatch.command_order &&
+                  // #2481: an unresolvable indirect ARGUMENT address is now named, not collapsed
+                  // into the catch-all. GTA V's later compute phase is 67 root failures of this
+                  // family cascading into 128 dependency failures, and every one of them read as
+                  // "unknown" until these three sites were separated.
                   unresolved_failure->reason ==
-                      RealizationFailureReason::Unknown &&
+                      RealizationFailureReason::IndirectArguments &&
                   unresolved_failure->compute_launch.groups_x == 0 &&
                   unresolved_failure->compute_launch.groups_y == 0 &&
                   unresolved_failure->compute_launch.groups_z == 0 &&
