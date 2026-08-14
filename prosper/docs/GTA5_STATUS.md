@@ -209,6 +209,38 @@ Note this is the same address whose *post-submit* snapshot I measured as acyclic
 the cyclic-table hypothesis. At dispatch time it is cyclic. The original hypothesis was right in
 substance; the capsule's snapshot timing is what made it look wrong.
 
+### The writer is the CONSUMER ITSELF — this kernel corrupts its own structure
+
+`0x413dc6700` both walks the table and writes it. Its own write-back lines say so:
+
+```
+[compute] execute submit=4310 dispatch=776 code=0x413dc6700 threads=2063x1x1 local=256x1x1 buffers=43
+[compute]   writeback binding=4 addr=0x20f848a240 size=8252 changed=2062 hash=b24dd1c1…->514428f8…
+```
+
+It reads through one binding (`fetch=0x5b`, the loop load) and writes through another
+(`binding 4`/`binding 5`, `fetch=0x35`/`0x41`), and the two tables swap roles between dispatches — a
+double-buffered structure. Combined with the loop shape (chase a parent index to a root, then take the
+**parity of the depth**, `v_and_b32 v1, 1, v2` compared against `s24`), this is the shape of a
+**union-find with path compression**: walk to the root, then write compressed parents back.
+
+That reframes the defect entirely. There is no upstream producer to blame — **the corruption is
+produced by the same program that later chokes on it.** Dispatch N writes a malformed parent array;
+a later dispatch reads it, finds a cycle, and never terminates.
+
+It is consistent with the address split: `0x20f848a240` is the buffer this kernel *writes*, and it is
+the one that is cyclic on later reads (800 of 810); `0x20f848417c` is clean 966 of 972.
+
+**Correction to an attribution I nearly published.** I first read the trace as naming `0x413cf9a00`
+the writer — a program that is genuinely skipped (`[compute] skip unsupported program 0x413cf9a00`) and
+which sits on the recompiler-reject list, so it made a very attractive culprit. It was a parsing
+error: my attribution regex latched onto the nearest `program 0x…` text, which included the skip line
+itself. The real anchor is the `[compute] execute … code=…` line, and it says `0x413dc6700`.
+
+So the next question is not "who failed to write this" but **"why does this kernel's own output
+contain cycles"** — a store-path or algorithm-emulation question about `0x413dc6700`, not a missing
+producer.
+
 ### What this settles, and what it reopens
 
 Settled: the defect is **upstream data**, not the dispatcher's lowering of this loop. The recompiler
