@@ -200,6 +200,12 @@ struct DynFetch {
 // The recompiler tags such a load's dest SGPRs with the load IMMEDIATE (sreg_srt) and resolves the
 // consumer via by_srt_offset(imm) — so `key` here is exactly that immediate, and build_stage_table
 // turns each use into a ShaderResource with srt_offset = key.
+// A Vulkan descriptor array costs one descriptor per element and every element's backing has to be
+// resolved and bound, so cap a runtime-selected table's declared arity well below the emitter's own
+// 4096 guard (#2481). The observed GTA V tables are five records; a vastly larger count is far more
+// likely a misread V# than a real table, and rejecting keeps that fail-visible.
+inline constexpr uint32_t kMaxSelectedTableRecords = 256u;
+
 struct SrtUse {
     int kind = 0;                    // 0 = texture, 1 = constant buffer, 2 = BVH buffer,
                                      // 3 = proven guarded null BVH
@@ -213,6 +219,17 @@ struct SrtUse {
     // This is diagnostic provenance only; resource lookup and materialization never consume it.
     uint64_t descriptor_source_addr = 0;
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
+    // RUNTIME-SELECTED descriptor table (#2481). Non-zero record count means this consumer's SRSRC
+    // was produced by a `s_buffer_load_dwordx4` through a bounded outer V# with a scalar offset the
+    // CPU fold cannot resolve, so the descriptor is one OF a declared table rather than a known set
+    // of words. `v4` is therefore NOT populated for such a use: the selection happens on the GPU.
+    // The stage builder binds all `table_record_count` entries and the emitter takes the index from
+    // the producer instruction's own live scalar value, so `table_load_pc` is authority, not a hint.
+    uint32_t table_record_count = 0;
+    uint32_t table_entry_stride = 0;
+    uint32_t table_element_offset = 0;
+    uint32_t table_load_pc = 0xFFFFFFFFu;
+    uint64_t table_base = 0;
     std::array<uint32_t, 4> bvh4{};  // BVH descriptor dwords live at IMAGE_BVH_INTERSECT_RAY (kind 2)
     uint32_t instruction_format = UINT32_MAX; // MTBUF BUF_FMT override for kind 1
     // Fully-known V# whose NUM_RECORDS is zero. This covers scalar buffer loads proven to begin beyond
