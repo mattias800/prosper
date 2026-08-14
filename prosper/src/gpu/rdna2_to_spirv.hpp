@@ -55,7 +55,8 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 // frontends/shared/trip_bound_witness.hpp. Two rules that are easy to state too weakly:
 //
 //   * The gate is whether a witness was actually EMITTED for this program
-//     (compute_trip_witness_emitted), never whether the selectors accept it. A structured-loop
+//     (spirv_writes_trip_witness, read from the compiled module), never whether the selectors
+//     accept it. A structured-loop
 //     program or a phase ordinal the program does not have satisfies every selector and emits
 //     nothing, and a host reading on that basis reports guest data as a measurement.
 //   * Restoring is not tidiness. This is ONE persistent allocation shared by every dispatch, so

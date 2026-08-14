@@ -509,40 +509,132 @@ int main() {
         ShaderResourceTable table{};
         const uint64_t kAddress = 0x900000001ull;
 
+        // Cache-WARM on purpose. An earlier revision cleared the cache before every compilation,
+        // so the phase-0 -> phase-99 sequence was two cold compiles and proved nothing about the
+        // cache -- while the implementation and the PR both claimed hits were covered. The trip-bound
+        // identity is part of ShaderCompileKey, so changing the phase must MISS and recompile; the
+        // repeats around it must HIT and keep their answer.
         auto compile_at = [&](const uint32_t* code, size_t words, uint64_t address) {
-            clear_shader_recompile_cache();
             return recompile_compute_shader_cached(code, words, &table, config, nullptr,
                                                    {RecompileDiagnosticStage::Compute, address});
         };
 
         set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
         set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+        clear_shader_recompile_cache();
 
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
         const std::vector<uint32_t> emitted =
             compile_at(kDispatcherLoops, kDispatcherWords, kAddress);
         CHECK(spirv_writes_trip_witness(emitted),
-              "the bounded dispatcher module writes the witness");
+              "the bounded dispatcher module writes the witness (cold)");
+        CHECK(spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
+              "and an emitting CACHE HIT still writes it");
 
-        // SAME ADDRESS, phase the program does not have. Process history says "this address has
-        // emitted"; the module says otherwise, and the module is what the backend runs.
+        // SAME address, cache left warm, phase the program does not have.
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "99");
         const std::vector<uint32_t> not_emitted =
             compile_at(kDispatcherLoops, kDispatcherWords, kAddress);
         CHECK(!spirv_writes_trip_witness(not_emitted),
-              "recompiling the SAME address under a phase it does not have writes no witness "
-              "(an address-keyed emission record fails HERE)");
+              "the SAME address under a phase it does not have writes no witness, warm "
+              "(a process-history emission record fails HERE)");
+        CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
+              "and the non-emitting CACHE HIT still writes none");
 
-        // A structured loop: the diagnostic deliberately does not cover those emitters.
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
         CHECK(!spirv_writes_trip_witness(compile_at(kExecWalk, kWords, kAddress)),
               "a structured-loop program writes no witness even with every selector satisfied");
 
         set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
         set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        clear_shader_recompile_cache();
         CHECK(!spirv_writes_trip_witness(compile_at(kDispatcherLoops, kDispatcherWords, kAddress)),
               "and disarmed, the same program writes none either");
-        clear_shader_recompile_cache();
+
+        // IDENTITY, not coincidence. The predicate must recognise the witness RESOURCE -- the
+        // variable decorated set 0 / binding 127 -- not merely an atomic at the numeric slot index.
+        // Both arms mutate the REAL emitted module by one word, so they cannot pass for a reason
+        // unrelated to the property under test.
+        {
+            std::vector<uint32_t> wrong_binding = emitted;
+            constexpr uint32_t OpDecorate = 71, DecorationBinding = 33;
+            bool rebound = false;
+            for (size_t word = 5; word < wrong_binding.size();) {
+                const uint32_t op = wrong_binding[word] & 0xffffu, len = wrong_binding[word] >> 16;
+                if (!len) break;
+                if (op == OpDecorate && len == 4 &&
+                    wrong_binding[word + 2] == DecorationBinding &&
+                    wrong_binding[word + 3] == kComputeInternalGdsBinding) {
+                    wrong_binding[word + 3] = kComputeInternalGdsBinding - 1u;
+                    rebound = true;
+                    break;
+                }
+                word += len;
+            }
+            CHECK(rebound, "the emitted module decorates a binding-127 variable (arm precondition)");
+            CHECK(rebound && !spirv_writes_trip_witness(wrong_binding),
+                  "moving ONLY the binding decoration off 127 is no longer the witness "
+                  "(the predicate resolves the resource, not the slot number)");
+
+            std::vector<uint32_t> bad_magic = emitted;
+            bad_magic[0] = 0u;
+            CHECK(!spirv_writes_trip_witness(bad_magic),
+                  "and a module with a corrupt header is refused rather than scanned");
+
+            // THE ARM THAT ISOLATES THE BASE CHECK, and the reason it is separate from the one
+            // above. Moving the binding decoration off 127 leaves the module with NO witness
+            // variable, which the predicate's early "no such variable" exit already rejects -- so
+            // that arm passes whether or not the access chain's base is ever examined. I verified
+            // this by deleting the base check: the wrong-binding arm still passed.
+            //
+            // The false positive the predicate must actually refuse is a module that HAS a
+            // binding-127 variable and performs the witness-slot atomic through a DIFFERENT one --
+            // an ordinary storage buffer indexed at the same element number. Build exactly that by
+            // repointing the witness access chain's base, one word, in the real emitted module.
+            constexpr uint32_t OpDecorateOp = 71, OpVariableOp = 59, OpConstantOp = 43,
+                               OpAccessChainOp = 65;
+            constexpr uint32_t DecorationBindingId = 33, DecorationDescriptorSetId = 34;
+            std::set<uint32_t> bound127, set0, slot_ids, variables;
+            for (size_t word = 5; word < emitted.size();) {
+                const uint32_t op = emitted[word] & 0xffffu, len = emitted[word] >> 16;
+                if (!len) break;
+                if (op == OpDecorateOp && len == 4) {
+                    if (emitted[word + 2] == DecorationBindingId &&
+                        emitted[word + 3] == kComputeInternalGdsBinding) bound127.insert(emitted[word + 1]);
+                    if (emitted[word + 2] == DecorationDescriptorSetId && emitted[word + 3] == 0u)
+                        set0.insert(emitted[word + 1]);
+                } else if (op == OpVariableOp && len >= 4) {
+                    variables.insert(emitted[word + 2]);
+                } else if (op == OpConstantOp && len == 4 &&
+                           emitted[word + 3] == kComputeTripWitnessDword) {
+                    slot_ids.insert(emitted[word + 2]);
+                }
+                word += len;
+            }
+            uint32_t witness_var = 0;
+            for (uint32_t id : bound127) if (set0.count(id)) witness_var = id;
+            uint32_t other_var = 0;
+            for (uint32_t id : variables) if (id != witness_var) { other_var = id; break; }
+
+            std::vector<uint32_t> rebased = emitted;
+            bool repointed = false;
+            for (size_t word = 5; word < rebased.size();) {
+                const uint32_t op = rebased[word] & 0xffffu, len = rebased[word] >> 16;
+                if (!len) break;
+                if (op == OpAccessChainOp && len >= 5 && rebased[word + 3] == witness_var &&
+                    slot_ids.count(rebased[word + len - 1])) {
+                    rebased[word + 3] = other_var;
+                    repointed = true;
+                }
+                word += len;
+            }
+            CHECK(witness_var && other_var && repointed,
+                  "the emitted module has a binding-127 variable, another variable, and a "
+                  "witness-slot access chain (arm precondition)");
+            CHECK(repointed && !spirv_writes_trip_witness(rebased),
+                  "an atomic at the witness SLOT through a different variable is not the witness "
+                  "(deleting the access-chain base check fails HERE, where wrong-binding does not)");
+        }
     }
 
     // Guest GDS must be byte-identical after an instrumented dispatch. The witness buffer is ONE

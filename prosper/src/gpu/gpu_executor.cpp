@@ -7547,7 +7547,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
             // item rather than re-derived by the host.
             // Intent, used only to decide whether the buffer must be BOUND. Whether a witness was
             // actually emitted is not knowable here -- translation has not run yet -- so the item's
-            // token is set after it, from compute_trip_witness_emitted().
+            // token is set after it, from spirv_writes_trip_witness() on the compiled module.
             program_uses_guest_gds_for_item = uses_gds;
             if (uses_gds || compute_trip_witness_active(code_addr)) {
                 ShaderResource gds;
