@@ -128,7 +128,32 @@ One earlier inference is already dead by this data: **13 malformed pairs at subm
 cycles at all**, so "any malformed pair corrupts the table" is false. There is a threshold between 13
 and 19, which is itself a clue — the structure tolerates some inconsistency.
 
+### The shader does not change across the boundary — only its input does
+
+`0x413dc3400` compiles to the **same module** on both sides of the transition:
+
+```text
+submit 7480  groups=9x1x1  buffers=38  spirv=57537/8dbb56b7a4feea9c   MISMATCHED=0
+submit 7898  groups=9x1x1  buffers=38  spirv=57537/8dbb56b7a4feea9c   MISMATCHED=77
+```
+
+Same SPIR-V hash, same launch, same 38 buffers. So the divergence is **data-dependent**, not a
+recompilation difference — which rules out cache/key effects and points at how our execution handles
+one particular input.
+
+`0x09249249` is the guest's **empty-slot sentinel**, not a prosper fill (it appears nowhere in our
+source). Decoded as a record it yields `next = 19,158,153`, far past the 2,063 records, so a walk
+reaching it leaves the array and terminates by the RDNA2 out-of-range rule. Many of the slots the
+first dirty write touches held it beforehand, i.e. they were previously empty.
+
+**Falsified while forming it:** "clean tables terminate via those OOB sentinels, and cycles appear
+once the table fills up." All 204 clean reads in this run have `oob-roots=0`; the cyclic ones range
+0..1,690. The relationship runs the other way from the guess, so OOB termination is not what keeps a
+clean table acyclic.
+
 ### Open: why does it start at submit 7898?
+
+
 
 `0x413dc3400` writes 2,061 slots with zero malformed pairs for nine consecutive dispatches, then
 never again. Whatever changes at that point is the proximate cause, and it is a much smaller question
