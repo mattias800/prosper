@@ -153,6 +153,50 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
+## NO COMPUTE DISPATCH EVER HANGS — the hard recovery originates elsewhere
+
+Counted across every routed run in this investigation:
+
+| observation | count |
+| --- | --- |
+| compute dispatches that entered their fence wait | **705** |
+| compute dispatches that completed it | **705** |
+| `[compute-decline] reason=queue-wait` (a 30-second fence timeout) | **0** |
+| `[compute-decline] reason=queue-submit` (device ALREADY lost) | **28** |
+
+`execute_item` submits and then waits on a fence with a **30-second** timeout, and reports a timeout as
+`queue-wait`. That has never once fired. Every compute dispatch this title issues completes.
+
+The 28 losses are all `stage=queue-submit`, which means `vkQueueSubmit` returned
+`VK_ERROR_DEVICE_LOST` — the device was **already** dead when compute next submitted. The dispatch
+named in that message is the first one *after* the reset, not the one that caused it.
+
+**So the GPU hang is not caused by a compute dispatch.** It is almost certainly in the graphics
+submission path, and the compute backend is a victim that discovers the dead device and then disables
+itself process-wide — which is what drops every later indirect draw.
+
+### What this overturns
+
+- **"`0x413dc6700` hangs the GPU."** Its dispatcher loop genuinely runs past 4,096 iterations — the hit
+  witness recorded that directly, at `trips=4096`, on dispatch 39 — but it still *finishes* inside the
+  30-second fence. A long loop, not a hang.
+- **"`0x413e14900` is a second hanging program."** It is a 753-dword module with **zero loops** running
+  `threads=42x1x1 groups=1x1x1` with `result=ok`. It was never a candidate.
+- **The trip-bound A/B matrix.** Each cell was a single run of a failure that varies run to run — the
+  same build died at `0x413dc6700` dispatch 39 in one run and dispatch 40 in another, and reached
+  `0x413e14900` in a third. Single-run cells cannot support the causal reading I gave them.
+
+### What survives
+
+- The cyclic traversal tables are real and measured at the correct timing. They make that loop very
+  long. They do not, on this evidence, hang the GPU.
+- The queue-2 indirect-argument recovery is real and deterministic: 50 of 64 skipped dispatches now
+  execute.
+- The consequence chain from the loss onward — compute disabled process-wide, `producer_epoch_ok`
+  cleared, indirect latch, no world — is unchanged and still explains the black frame.
+
+**The next investigation is the graphics submit path**, not the recompiler and not compute resources.
+
 ## FIXED: indirect compute dispatches on queue 2 had no argument base — 50 of 64 were skipped
 
 **What the fix reliably changes:**
