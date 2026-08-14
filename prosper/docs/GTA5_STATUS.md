@@ -155,16 +155,23 @@ falsification.
 
 ## FIXED: indirect compute dispatches on queue 2 had no argument base — 50 of 64 were skipped
 
-**Result of the fix, default run, no forced skips and no trip bound:**
+**What the fix reliably changes:**
 
 | | before | after |
 | --- | --- | --- |
-| `indirect dispatch skipped: unreadable arguments` | 50 of 64 | **0** |
-| device lost at | `0x413dc6700` **dispatch 39** | `0x413e14900` dispatch 52 |
-| frame | black + HUD | **sun, anamorphic lens flare, radar with street geometry and blips** |
+| `indirect dispatch skipped: unreadable arguments` | **50 of 64** | **0** |
 
-The run now gets past the first hanging program **on a default build** — the same milestone the
-diagnostic trip bound reached, but by executing the guest's work rather than truncating it.
+That is deterministic and verifiable in every run: the skips are gone and those dispatches execute.
+
+**What it does NOT reliably change, corrected after a second run.** The first run with the fix got past
+`0x413dc6700` and died later at `0x413e14900` dispatch 52, and its frame showed sun, lens flare and
+radar. I wrote that up as a before/after improvement. **A second run with the same build died at
+`0x413dc6700` dispatch 40 again.** The hang is data-dependent, so a single run either side proves
+nothing about it, and the frame content had already appeared in earlier *skip* runs — so neither the
+survival nor the frame is attributable to this fix.
+
+The honest statement is: the fix removes a real and deterministic class of dropped work; whether that
+changes the hang is unmeasured, and would need repeated runs on both sides.
 
 ### The defect
 
