@@ -70,6 +70,12 @@ struct ComputeTripBoundSettings {
 };
 ComputeTripBoundSettings compute_trip_bound_settings();
 
+// True only once some phase of `program_address` has ACTUALLY emitted a trip-bound witness. Distinct
+// from compute_trip_witness_active, which reports intent: a structured-loop program or a selected
+// phase that does not exist satisfies every selector and emits nothing. The host must gate reading
+// and clearing the guest-visible witness dwords on this, not on intent.
+bool compute_trip_witness_emitted(uint64_t program_address);
+
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 

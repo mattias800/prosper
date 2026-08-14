@@ -16500,6 +16500,15 @@ bool compute_trip_witness_active(uint64_t program_address) {
     return program_address == settings.only_program;
 }
 
+std::mutex& trip_witness_emitted_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::set<uint64_t>& trip_witness_emitted_programs() {
+    static std::set<uint64_t> programs;
+    return programs;
+}
+
 // True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
 // buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
 // a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
@@ -16575,7 +16584,24 @@ uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
                 "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
                 "bounded at %u iterations (DIAGNOSTIC: truncates guest control flow)\n",
                 static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound);
+    // Record that a witness was ACTUALLY EMITTED for this program. Every check above is a selector
+    // or a precondition -- "we intend to instrument" -- and the host needs the opposite: proof that a
+    // shader now writes those dwords. A structured-loop program, or a selected phase that does not
+    // exist, passes every selector and emits nothing, and a host that reads the witness on that
+    // basis is reading whatever was already in guest-visible memory.
+    {
+        std::lock_guard lock(trip_witness_emitted_mutex());
+        trip_witness_emitted_programs().insert(program_address);
+    }
     return bound;
+}
+
+// True only once some phase of this program has genuinely emitted a witness. Survives shader-cache
+// hits because it is keyed on the program rather than on a compilation: the cache key already carries
+// the trip-bound identity, so a hit implies the same selector state that produced the record.
+bool compute_trip_witness_emitted(uint64_t program_address) {
+    std::lock_guard lock(trip_witness_emitted_mutex());
+    return trip_witness_emitted_programs().contains(program_address);
 }
 
 bool emit_cfg_state_machine(

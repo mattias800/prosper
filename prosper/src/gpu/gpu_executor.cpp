@@ -7158,7 +7158,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
     for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
         // Set where the program's GDS usage is known (see uses_gds below); read where the item is
         // finalized. Declared at loop scope because those two points are in different blocks.
-        bool witness_instrumented_for_item = false;
+        // Set where the program's GDS usage is known (see uses_gds below); read where the item is
+        // finalized, alongside the post-translation emission result. Declared at loop scope because
+        // those two points are in different blocks.
+        bool program_uses_guest_gds_for_item = false;
         const auto& dispatch = st.dispatches[dispatch_index];
         if (direct_compute_dispatch_is_noop(dispatch)) continue;
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
@@ -7542,10 +7545,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
             // guest's own data and so change the input to the behaviour under measurement. This is
             // the only place both facts are known, so the decision is made here and carried on the
             // item rather than re-derived by the host.
-            const bool trip_witness_instrumented =
-                !uses_gds && compute_trip_witness_active(code_addr);
-            witness_instrumented_for_item = trip_witness_instrumented;
-            if (uses_gds || trip_witness_instrumented) {
+            // Intent, used only to decide whether the buffer must be BOUND. Whether a witness was
+            // actually emitted is not knowable here -- translation has not run yet -- so the item's
+            // token is set after it, from compute_trip_witness_emitted().
+            program_uses_guest_gds_for_item = uses_gds;
+            if (uses_gds || compute_trip_witness_active(code_addr)) {
                 ShaderResource gds;
                 gds.cls = ResourceClass::ConstantBuffer;
                 gds.format = DataFormat::Uint32;
@@ -7783,7 +7787,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 shader_dwords, config, *table);
         // Independent of the resource table by design: an `s_endpgm`-only program has no memory
         // effect no matter what its V#s declare, so this proof reads the code and nothing else.
-        item.trip_witness_instrumented = witness_instrumented_for_item;
+        // AFTER translation, so this is an emission result rather than an intention. A program the
+        // selectors accept can still emit nothing -- a structured loop, or a phase ordinal that does
+        // not exist -- and the host must not read or clear guest-visible dwords no shader writes.
+        item.trip_witness_instrumented = !program_uses_guest_gds_for_item &&
+            compute_trip_witness_emitted(code_addr);
         item.terminator_only_program_validated = rdna2_program_is_terminator_only(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         item.gta5_cf9200_no_backing_validated = item.spirv.size() &&

@@ -1,4 +1,5 @@
 #include "live_compute.hpp"
+#include "trip_bound_witness.hpp"
 #include "compute_authority_live_census.hpp"
 #include "compute_timing_selector.hpp"
 #include "compute_transfer_gate_census.hpp"
@@ -8962,64 +8963,9 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
         });
 }
 
-// PROSPER_CFG_TRIP_BOUND witness, prepared before the selected dispatch and reported after it.
-//
-// Arming a bound is not the same as reaching one. Without this, "the loop exceeds N iterations" is an
-// inference from the device surviving, and a reviewer is right to refuse it: the same survival is
-// equally consistent with the instrumented module simply compiling differently.
-//
-// BOTH halves are gated on the diagnostic being armed FOR THIS PROGRAM, and that gate is a
-// correctness requirement rather than tidiness. The record lives in the internal GDS buffer, which is
-// GUEST-VISIBLE. Reading it unconditionally would let a legitimate guest GDS value be reported as a
-// hit that never happened; clearing it unconditionally would destroy guest data on every dispatch of
-// every title. An earlier revision did both, on the reasoning that the top of a 16,384-dword buffer
-// is an implausible place for a guest to write -- implausible is not a correctness boundary, and the
-// diagnostic is off by default precisely so it can cost nothing when unused.
-//
-// Preparation is not optional either: field +3 is published with an atomic MINIMUM, so it must start
-// at UINT32_MAX or the minimum is whatever the slot happened to hold. Clearing to zero and hoping is
-// how an atomic-min record reads as "ordinal 0 was visited" forever.
-uint32_t* trip_bound_witness_slots(const prosper::gpu::ComputeItem& item) {
-    // The item's flag is authoritative, not compute_trip_witness_active alone: a program that uses
-    // GDS itself is never instrumented, and only the realization path (which decodes the program)
-    // knows that. Touching these dwords for such a dispatch would overwrite the guest's own data.
-    if (!item.trip_witness_instrumented) return nullptr;
-    uint8_t* gds = prosper::gpu::compute_gds_backing();
-    if (!gds) return nullptr;
-    return reinterpret_cast<uint32_t*>(gds) + prosper::gpu::kComputeTripWitnessDword;
-}
 
-void prepare_trip_bound_witness(const prosper::gpu::ComputeItem& item) {
-    uint32_t* witness = trip_bound_witness_slots(item);
-    if (!witness) return;
-    witness[0] = 0;              // hit flag
-    witness[1] = 0;              // phase
-    witness[2] = 0;              // max trips        (atomic max)
-    witness[3] = UINT32_MAX;     // min ordinal      (atomic min -- must start at the identity)
-    witness[4] = 0;              // max ordinal      (atomic max)
-}
-
-void report_trip_bound_witness(const prosper::gpu::ComputeItem& item) {
-    uint32_t* witness = trip_bound_witness_slots(item);
-    if (!witness || !witness[0]) return;
-    // Every reported field is a DISPATCHER quantity. `dispatch-range` spans switch-case ordinals,
-    // which index the phase's dispatch table -- resolve one against the `dispatch map:` line the same
-    // phase prints when the bound arms, and never by hand: this record's per-invocation field was
-    // labelled wrongly twice, in opposite directions, from exactly that inference (trap 172). The
-    // field that invited it has been removed rather than renamed a third time; the extremes below are
-    // reduced on the device with atomics, so they describe every invocation instead of whichever
-    // happened to write last.
-    std::fprintf(stderr,
-                 "[cfg-trip-bound] HIT program=0x%llx phase=%u trips=%u dispatch-range=%u..%u "
-                 "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
-                 static_cast<unsigned long long>(item.code_addr), witness[1], witness[2],
-                 witness[3], witness[4],
-                 static_cast<unsigned long long>(item.submit_no),
-                 static_cast<unsigned long long>(item.dispatch_index),
-                 static_cast<unsigned long long>(item.command_order),
-                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
-    prepare_trip_bound_witness(item);
-}
+// TripBoundWitnessScope lives in trip_bound_witness.hpp so its save/restore contract can be
+// exercised by a regression test rather than only by a routed run.
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
     auto fail_closed_items = [&]() {
@@ -9129,12 +9075,15 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
             }
             all_ok &= *cpu_result;
         } else {
-            // Prepare BEFORE the dispatch so a hit is attributable to this dispatch and the atomic
-            // minimum starts at its identity. Both calls no-op unless the bound is armed for this
-            // program; the slots are guest-visible and must not be touched otherwise.
-            prepare_trip_bound_witness(item);
-            const bool item_ok = execute_item(context, item);
-            report_trip_bound_witness(item);
+            // Scope saves the guest's dwords, seeds ours, and restores on the way out, so the
+            // buffer is byte-identical afterwards for whatever dispatch uses GDS next. It no-ops
+            // entirely unless a witness was actually EMITTED for this program.
+            bool item_ok = false;
+            {
+                prosper::frontend::TripBoundWitnessScope witness(item);
+                item_ok = execute_item(context, item);
+                witness.report(item);
+            }
             all_ok &= item_ok;
             if (!item_ok)
                 prosper::gpu::notify_compute_authority_boundary({

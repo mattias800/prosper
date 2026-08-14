@@ -34,11 +34,21 @@ As of 2026-08-14, established and each measured rather than inferred:
    (`tests/test_cfg_trip_bound.cpp`), so the recompiler is not what fails to exit.
 
 **So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
-lower it correctly. Its only identified writer is `0x413ce3400`, which is never declined on a routed
-run, so "the producer was refused" is already eliminated.
+lower it correctly.
 
-What is NOT established: which write makes the table cyclic, and whether that write is the guest's
-own behaviour on inputs we produced wrongly upstream or a defect in how we execute the producer.
+**The writer is `0x413dc6700` itself.** Its own writeback line names the table it later reads
+(`writeback binding=4 addr=0x20f848a240 changed=2062`), it reads through one binding and writes
+through another, and the two tables swap roles between dispatches — a double-buffered union-find with
+path compression. So this is a self-corrupting kernel, not a missing or refused producer.
+
+`0x413ce3400` was an earlier attribution and is **superseded**: it is a writer of related state and it
+is never declined on a routed run, so the "producer was refused" hypothesis is dead — but it was never
+the question. Anything below that still reads as though an upstream producer must be found is
+historical; the sections concerned now say so.
+
+What is NOT established: which of `0x413dc6700`'s own stores introduces a cycle, and whether that is
+the guest algorithm behaving correctly on inputs we produced wrongly upstream, or a defect in how we
+execute its write-back path.
 
 ## Where the world went
 
@@ -490,7 +500,14 @@ faithfully executes a walk that genuinely does not terminate.
 
 Reopened: **why is the table cyclic?** The earlier producer investigation was measured on
 post-submit snapshots and on the wrong dispatch's buffer, so it has to be redone against
-`PROSPER_COMPUTE_PARENT_WALK` timings. `0x413ce3400` remains the only writer identified so far.
+`PROSPER_COMPUTE_PARENT_WALK` timings.
+
+**The sentence that used to close this paragraph — "`0x413ce3400` remains the only writer identified
+so far" — contradicted the section it sits in and is withdrawn.** The writeback evidence directly
+above names `0x413dc6700` as the writer of the table it later chokes on. Both readings were live in
+this document at once, which is worse than either being wrong: they imply different next experiments
+(find the producer vs. audit this kernel's own stores), and the reconciliation is at the top of the
+file.
 
 ## CONFIRMED BY HIT RECORD: phase 0's dispatcher loop runs past 4,096 iterations on the hanging dispatch
 

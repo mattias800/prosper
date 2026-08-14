@@ -29,6 +29,7 @@
 // that caps an emitted back edge. Bounding a loop that terminates ANYWAY is what makes this test
 // safe to run in CI: a broken bound yields wrong depths, never a hung queue.
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../frontends/shared/trip_bound_witness.hpp"
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
@@ -468,6 +469,83 @@ int main() {
     CHECK(!witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 3, 239) &&
               !witness_uses(dispatcher_bounded, kComputeTripWitnessDword + 4, 237),
           "and neither slot carries the other's reduction");
+
+    // --- emission RESULT vs. selector INTENT, and guest-GDS preservation -------------------------
+    //
+    // The host decides whether to read and clear five guest-visible GDS dwords. Gating that on the
+    // selectors alone is wrong: a program the selectors accept can emit nothing -- a structured loop,
+    // or a phase ordinal that does not exist -- and the host would then report whatever guest data
+    // happened to be there and destroy it. compute_trip_witness_emitted() answers the other question.
+    {
+        ComputeShaderConfig config{};
+        config.local_x = 64; config.local_y = 1; config.local_z = 1;
+        config.wave_size = 64;
+        config.tgid_x_en = true;
+        ShaderResourceTable table{};
+        const uint64_t kNoSuchPhase = 0x900000001ull, kStructured = 0x900000002ull;
+
+        set_env("PROSPER_CFG_TRIP_BOUND", std::to_string(kBound).c_str());
+        set_env("PROSPER_CFG_TRIP_BOUND_PROGRAM", nullptr);
+
+        // A phase ordinal this program does not have: every selector passes, nothing is emitted.
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "99");
+        clear_shader_recompile_cache();
+        (void)recompile_compute_shader_cached(kDispatcherLoops, kDispatcherWords, &table, config,
+                                              nullptr,
+                                              {RecompileDiagnosticStage::Compute, kNoSuchPhase});
+        CHECK(!compute_trip_witness_emitted(kNoSuchPhase),
+              "a phase ordinal the program does not have emits no witness (intent is not emission)");
+
+        // A structured loop: the diagnostic deliberately does not cover those emitters.
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", "0");
+        clear_shader_recompile_cache();
+        (void)recompile_compute_shader_cached(kExecWalk, kWords, &table, config, nullptr,
+                                              {RecompileDiagnosticStage::Compute, kStructured});
+        CHECK(!compute_trip_witness_emitted(kStructured),
+              "a structured-loop program emits no witness even with every selector satisfied");
+        set_env("PROSPER_CFG_TRIP_BOUND_PHASE", nullptr);
+        set_env("PROSPER_CFG_TRIP_BOUND", nullptr);
+        clear_shader_recompile_cache();
+    }
+
+    // Guest GDS must be byte-identical after an instrumented dispatch. The witness buffer is ONE
+    // persistent allocation shared by every dispatch, so proving the instrumented program does not
+    // read GDS says nothing about the program that runs next and does.
+    {
+        uint8_t* gds = compute_gds_backing();
+        uint32_t* slots = reinterpret_cast<uint32_t*>(gds) + kComputeTripWitnessDword;
+        const uint32_t sentinel[kComputeTripWitnessDwordCount] = {
+            0xA1A1A1A1u, 0xB2B2B2B2u, 0xC3C3C3C3u, 0xD4D4D4D4u, 0xE5E5E5E5u};
+
+        prosper::gpu::ComputeItem item{};
+        item.code_addr = 0x900000003ull;
+
+        // Not instrumented: the scope must not touch a single dword.
+        for (uint32_t i = 0; i < kComputeTripWitnessDwordCount; ++i) slots[i] = sentinel[i];
+        item.trip_witness_instrumented = false;
+        { prosper::frontend::TripBoundWitnessScope scope(item); }
+        bool untouched = true;
+        for (uint32_t i = 0; i < kComputeTripWitnessDwordCount; ++i)
+            untouched &= slots[i] == sentinel[i];
+        CHECK(untouched, "an uninstrumented dispatch leaves the guest's GDS dwords alone");
+
+        // Instrumented: seeded during the dispatch, restored exactly afterwards.
+        item.trip_witness_instrumented = true;
+        bool seeded_min_is_identity = false, seeded_hit_cleared = false;
+        {
+            prosper::frontend::TripBoundWitnessScope scope(item);
+            seeded_min_is_identity = slots[3] == UINT32_MAX;
+            seeded_hit_cleared = slots[0] == 0;
+        }
+        CHECK(seeded_hit_cleared && seeded_min_is_identity,
+              "an instrumented dispatch starts from a cleared flag and an atomic-min identity");
+        bool restored = true;
+        for (uint32_t i = 0; i < kComputeTripWitnessDwordCount; ++i)
+            restored &= slots[i] == sentinel[i];
+        CHECK(restored,
+              "and the guest's original GDS dwords are byte-identical afterwards, so a later GDS "
+              "consumer is unaffected");
+    }
 
     // Disarming must restore the original module exactly. Without this, "arming changes the module"
     // above could be satisfied by any nondeterminism in the emitter rather than by the bound.
