@@ -17340,6 +17340,18 @@ bool emit_cfg_state_machine(
         // a scalar the dispatcher erases at the next block entry -- see the note at the
         // exact_mask_reduction use. The exactness precondition is emit_alu's own: the ballot equals
         // the guest wave mask only when the native subgroup IS the guest wave.
+        //
+        // This covers BOTH opcodes admitted above, not only the population count: 0x10 is
+        // s_bcnt1_i32_b64 and 0x14 is s_ff1_i32_b64, and `s_ff1_i32_b64 <- exec` (find-first-set over
+        // the active mask) reaches this same return. The committed fixture exercises it at dword 336,
+        // immediately before the bcnt at 337, so the wider coverage is tested rather than incidental.
+        //
+        // CONFIDENCE: HIGH — EXEC as a B64 mask source for these two reductions is architectural
+        // (RDNA2 ISA 70648 §5.3/§12.2: both take a 64-bit scalar source, and EXEC is a legal SSRC),
+        // and the wave-size guard is the same precondition emit_alu already relies on rather than a
+        // new assumption. What is NOT covered is a 32-wide native subgroup, where the ballot is not
+        // the guest wave: that returns -1 and the dispatcher declines, loudly, via
+        // [subgroup-width] ... DISABLED. See #2429.
         if (in.src[0].kind == OperandKind::Special && in.src[0].value == 126 &&
             b.native_subgroup_size == b.wave_size)
             return 126;
