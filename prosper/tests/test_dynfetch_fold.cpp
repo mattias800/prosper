@@ -2634,6 +2634,95 @@ int main() {
               narrow_stride_sbuffer_plan.binding_bytes == 4u,
           "stride-1 S_BUFFER bounds its scalar dwords by the V# byte footprint");
 
+    // #2481: a RUNTIME-SELECTED descriptor table. GTA V's 0x413ce6000 picks a vertex buffer with
+    // `v_readfirstlane_b32 vcc_lo, v7` inside a waterfall loop, multiplies by the 120-byte record
+    // stride, and loads the chosen V# with `s_buffer_load_dwordx4 ..., vcc_lo offset:0x8`. The index
+    // is per-wave by construction, so the CPU fold cannot resolve it -- but the TABLE is fully
+    // declared by the outer V#, which is exactly what a Vulkan descriptor array binds. The MUBUF
+    // packet below is byte-identical to that title's pc156 consumer.
+    alignas(16) static uint32_t selected_table_payload[5][16]{};
+    for (uint32_t entry = 0; entry < 5u; ++entry)
+        for (uint32_t word = 0; word < 16u; ++word)
+            selected_table_payload[entry][word] = (entry << 16) | word;
+    alignas(16) static uint32_t selected_table_records[5][30]{};   // 5 records x 120 bytes
+    for (uint32_t entry = 0; entry < 5u; ++entry) {
+        const uint64_t payload = reinterpret_cast<uint64_t>(selected_table_payload[entry]);
+        // The selected V# lives at byte +8 of each record: base48, stride 16, four records.
+        selected_table_records[entry][2] = static_cast<uint32_t>(payload);
+        selected_table_records[entry][3] =
+            (static_cast<uint32_t>(payload >> 32) & 0xffffu) | (16u << 16);
+        selected_table_records[entry][4] = 4u;
+        // Conventional linear V#: DST_SEL identity (0xfac) and a Uint32 data format (code 20). The
+        // descriptor-array contract requires every entry to normalize back to exactly these words.
+        selected_table_records[entry][5] = 0xfacu | (20u << 12u);
+    }
+    const uint64_t selected_table_base = reinterpret_cast<uint64_t>(selected_table_records);
+    uint32_t selected_table_seed[16]{};
+    selected_table_seed[0] = static_cast<uint32_t>(selected_table_base);
+    selected_table_seed[1] =
+        (static_cast<uint32_t>(selected_table_base >> 32) & 0xffffu) | (120u << 16);
+    selected_table_seed[2] = 5u;                      // NUM_RECORDS -> a five-entry table
+    selected_table_seed[3] = 0u;
+    const std::array<uint32_t, 8> selected_table_shader = {
+        0x7ed40500u,               // pc0: v_readfirstlane_b32 vcc_lo, v0  (per-lane -> unknowable)
+        0xb86a0078u,               // pc1: s_mulk_i32 vcc_lo, 0x78         (index * record stride)
+        0xf4280200u, 0xd4000008u,  // pc2: s_buffer_load_dwordx4 s[8:11], s[0:3], vcc_lo offset:0x8
+        0xbf8cc07fu,               // pc4: s_waitcnt lgkmcnt(0)
+        0xe0382000u, 0x80020006u,  // pc5: buffer_load_dwordx4 v[0:3], v6, s[8:11], 0 idxen
+        0xbf810000u,               // pc7: s_endpgm
+    };
+    ShaderResourceTable selected_table_rt;
+    add_compute_buffer_resources(
+        selected_table_rt, selected_table_shader.data(), selected_table_shader.size(),
+        selected_table_seed, std::size(selected_table_seed));
+    assign_convention_bindings(selected_table_rt, 2);
+    const ShaderResource* selected_table_resource = selected_table_rt.by_fetch_pc(5u);
+    ComputeShaderConfig selected_table_config;
+    selected_table_config.user_sgprs.assign(
+        selected_table_seed, selected_table_seed + std::size(selected_table_seed));
+    selected_table_config.local_x = selected_table_config.local_y =
+        selected_table_config.local_z = 1;
+    const std::vector<uint32_t> selected_table_spirv = recompile_compute(
+        selected_table_shader.data(), selected_table_shader.size(), &selected_table_rt,
+        selected_table_config);
+    bool selected_table_entries_exact = selected_table_resource &&
+        selected_table_resource->table_entries.size() == 5u;
+    if (selected_table_entries_exact)
+        for (uint32_t entry = 0; entry < 5u; ++entry)
+            selected_table_entries_exact &=
+                selected_table_resource->table_entries[entry].gpu_addr ==
+                    reinterpret_cast<uint64_t>(selected_table_payload[entry]) &&
+                selected_table_resource->table_entries[entry].size == 64u &&
+                selected_table_resource->table_entries[entry].stride == 16u;
+    CHECK(selected_table_resource &&
+              selected_table_resource->table_index_count == 5u &&
+              selected_table_resource->table_entry_stride == 120u &&
+              selected_table_resource->table_selector_mode ==
+                  BufferTableSelectorMode::DynamicSbufferByteOffset &&
+              selected_table_resource->table_load_pc == 2u &&
+              selected_table_entries_exact && !selected_table_spirv.empty(),
+          "a dynamic scalar offset publishes its whole declared descriptor table");
+
+    // Same-site mutation: shrink the outer V# so the element at +8 no longer fits inside one
+    // record. The selection is then not expressible as an array index and must fail visibly rather
+    // than binding a differently-shaped table.
+    uint32_t selected_table_short_seed[16]{};
+    std::memcpy(selected_table_short_seed, selected_table_seed, sizeof(selected_table_seed));
+    selected_table_short_seed[1] =
+        (static_cast<uint32_t>(selected_table_base >> 32) & 0xffffu) | (16u << 16);
+    ShaderResourceTable selected_table_short_rt;
+    add_compute_buffer_resources(
+        selected_table_short_rt, selected_table_shader.data(), selected_table_shader.size(),
+        selected_table_short_seed, std::size(selected_table_short_seed));
+    const ShaderResource* selected_table_short_resource =
+        selected_table_short_rt.by_fetch_pc(5u);
+    // The producer's own outer-V# use must still be published, so this arm cannot pass merely
+    // because the fold stopped walking: it distinguishes "declined the table" from "saw nothing".
+    CHECK(selected_table_short_rt.by_fetch_pc(2u) != nullptr &&
+              (!selected_table_short_resource ||
+               selected_table_short_resource->table_index_count == 0u),
+          "an element that does not fit its record publishes no descriptor table");
+
     // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
     // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
     // has NUM_RECORDS=0, while the positive immediate begins beyond its effective scalar bound: publish
