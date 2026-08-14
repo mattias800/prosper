@@ -36,7 +36,7 @@ As of 2026-08-14, established and each measured rather than inferred:
 **So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
 lower it correctly.
 
-5. **The table has TWO writers, and the corrupting one is `0x413dc3400`.** An address watch over a
+5. **At least two programs write the table, and `0x413dc3400`'s write quality tracks the damage.** An address watch over a
    full route finds `0x413dc6700` on nine bindings (including the loop's read at fetch pc 91) and
    **`0x413dc3400` on six**. Scoring each of the latter's writes by malformed head/tail pairs
    separates the outcomes without overlap across 180 reads: clean tables follow writes with 0..13,
@@ -47,7 +47,8 @@ lower it correctly.
    individually well-formed, in the wrong combination.
 
 **So the open question is why `0x413dc3400`'s writes go bad**, on an identical module (same SPIR-V
-hash, launch and 38 buffers either side of the transition) with only different input data.
+hash, launch and 38 buffers either side of the transition) with only different input data — stated as
+the correlation it is, not as established cause.
 
 **Not established, and explicitly tested:** that each malformed pair becomes a 2-cycle. On a same-run
 join only 14% of cycle nodes sit on malformed slots against a 4.4% base rate — real enrichment, not a
@@ -62,9 +63,19 @@ is never declined on a routed run, so the "producer was refused" hypothesis is d
 the question. Anything below that still reads as though an upstream producer must be found is
 historical; the sections concerned now say so.
 
-What is NOT established: which of `0x413dc6700`'s own stores introduces a cycle, and whether that is
-the guest algorithm behaving correctly on inputs we produced wrongly upstream, or a defect in how we
-execute its write-back path.
+**What is NOT established**, stated precisely because the wording above is easy to over-read:
+
+- **That `0x413dc3400` causes the cycles.** What is measured is a *dispatch-level correlation*: the
+  malformed-pair count of its writes separates 54 clean reads (0..13) from 126 cyclic ones (19..106)
+  with no overlap. The slot-level test **failed** — only 14% of cycle nodes sit on malformed slots
+  against a 4.4% base rate — so a shared upstream cause is not excluded, and no A/B or
+  clean-before/bad-after has been run.
+- **That the writer set is closed at two.** The address watch that found `0x413dc3400` now matches by
+  containment over scalars *and* array entries, but the census behind the "two writers" statement was
+  taken with the earlier base-equality version, which cannot see an interior address or a
+  runtime-selected array element. **That census must be re-run before the set is treated as closed.**
+- **Which store introduces a cycle**, in either program, and whether the guest algorithm is behaving
+  correctly on inputs we produced wrongly upstream.
 
 ## RETRACTED 2026-08-14: "the corrupting write is `0x413dc6700`'s own" was one sample
 
@@ -97,24 +108,38 @@ negative case is the whole test. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc
 `PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64` and read the interleaved
 `parent-walk` / `execute` / `writeback` lines.
 
-### There are TWO writers, and the second one was never in the picture
+### EIGHT programs touch the traversal table — the "two writers" census was wrong
 
-`PROSPER_COMPUTE_ADDRESS_WATCH=0x20f848417c` over a full route, 1,300 hits:
+The first census matched `resource.gpu_addr == wanted` over top-level resources. Re-run with a
+containment matcher (`wanted >= base && wanted - base < size`, over scalars *and* `table_entries`),
+the same route reports **eight** programs, 3,931 hits:
 
-| program | bindings on the table (fetch pc) |
-| --- | --- |
-| `0x413dc6700` | 53, 65, **91** (the loop's read), 618, 629, 641, 653, 665, 677 |
-| `0x413dc3400` | 597, 608, 620, 632, 644, 656 |
+```text
+0x413ce3400   0x413ce6000   0x413cea300   0x413cee500
+0x413d88400   0x413dc3400   0x413dc6700   0x413e1c300
+```
 
-**`0x413dc3400` also writes this table**, through six bindings, and nothing in the investigation had
-accounted for it. It is the program that runs immediately before the hanging dispatch — the walk
-lines say `previous-code=0x413dc3400 previous-realized=1 previous-executed=1` — and it is on the
-`role=terminal` list, so it is lowered through the CFG dispatcher as well.
+`0x413dc6700` holds nine bindings including the loop's read at fetch pc 91; `0x413e1c300` is the most
+frequent of all (four bindings, 308 hits each); `0x413cea300` appears with `fetch-pc=0xffffffff` —
+that is the terminator-only program, whose whole body is one `s_endpgm`.
 
-This is exactly why the single-transition "confirmation" was wrong: flips with no write from
-`0x413dc6700` are explained by a writer nobody was watching. On the one transition this run captured,
-**both** programs touched the table since the previous read, so the correlation cannot yet separate
-them — but the candidate set is now closed at two, which it was not before.
+**Zero matches came from `table_entries`**, so on this allocation the array form is not exercised and
+the entire gain is base-equality → containment: six programs bind a view whose *base differs* while
+its range covers the address.
+
+Consequences, and they are large:
+
+- **"The table has two writers" is withdrawn.** It was an artifact of a matcher that could only see
+  an exact base.
+- **`0x413ce3400` is back in the picture.** This document marked it superseded on the grounds that it
+  was "a writer of related state"; it binds a range containing this table.
+- **The `0x413dc3400` correlation is unaffected but much less pointed.** Its malformed-pair count
+  still separates 54 clean reads from 126 cyclic ones with no overlap — that measurement stands —
+  but with seven other programs touching the allocation, "its writes are what go bad" is one
+  candidate among several rather than a narrowing to one.
+- **"Touches" is not "writes".** The census lists resources, not access direction. Distinguishing
+  readers from writers on this allocation is the next thing to measure, and it is now the gating
+  question rather than a detail.
 
 ### The corrupting writer is `0x413dc3400`, and malformed pair writes separate clean from cyclic
 

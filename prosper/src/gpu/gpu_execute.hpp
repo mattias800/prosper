@@ -547,6 +547,17 @@ std::vector<uint32_t> recompile_compute_shader_cached(
 // Report the final live consequence once per guest program address. Returns true only for the first
 // report so the caller can keep its adjacent resource-table dump on the same distinct-address gate.
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic);
+
+// Does the half-open range [base, base+size) contain `wanted`? The address-watch diagnostic's
+// matcher, exposed so its edge cases can be tested rather than reasoned about.
+//
+// Base equality is NOT sufficient for an address census: an interior address, an overlapping
+// subview, and a runtime-selected array element all live inside a range whose base differs. The
+// subtraction is ordered after the `wanted >= base` test so it cannot wrap for any base, including
+// one near UINT64_MAX, and a zero-size range contains nothing.
+inline bool compute_address_range_contains(uint64_t base, uint64_t size, uint64_t wanted) {
+    return size != 0 && wanted >= base && (wanted - base) < size;
+}
 SharedShaderWords recompile_vertex_chain_cached_shared(
     const uint32_t* prolog, size_t prolog_dwords,
     const uint32_t* main, size_t main_dwords,
