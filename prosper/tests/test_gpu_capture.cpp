@@ -1724,6 +1724,37 @@ int main(int argc, char** argv) {
                                    short_scalar_reader_loaded, error) &&
               error == "invalid scalar-buffer bound state",
           "v54 reader rejects a serialized scalar-buffer snapshot shorter than its bound");
+    // #2528: a v54 capsule written before the bound was corrected stores NUM_RECORDS here (4 records
+    // of stride 4 -> the pre-correction writer would have stored 4 for a 16-byte V#, and a
+    // pre-correction STRIDE=0 resource would have stored 1). The field is fully derivable from
+    // `size`, so the reader re-derives it instead of rejecting; otherwise every retained
+    // investigation capsule becomes permanently unreadable. Mutate the SERIALIZED dword, not the
+    // in-memory object, so this exercises the reader's own path.
+    std::vector<uint8_t> stale_bound_bytes;
+    CHECK(serialize_gpu_capture(captured, stale_bound_bytes, error) && !stale_bound_bytes.empty(),
+          "v54 stale scalar-buffer bound fixture serializes");
+    const size_t stale_tail = v54_tail(captured);
+    bool stale_patched = false;
+    if (stale_bound_bytes.size() >= stale_tail) {
+        // The v54 tail is `count` followed by one dword per resource, in table order; resource 1 of
+        // draw 0 is the second entry.
+        const size_t first = stale_bound_bytes.size() - stale_tail + 4u;
+        const size_t slot = first + sizeof(uint32_t);
+        if (slot + 4u <= stale_bound_bytes.size() &&
+            stale_bound_bytes[slot] == 4u) {          // the corrected value we wrote
+            stale_bound_bytes[slot] = 1u;             // what a pre-correction STRIDE=0 writer stored
+            stale_patched = true;
+        }
+    }
+    GpuCaptureFile stale_bound_loaded;
+    CHECK(stale_patched &&
+              deserialize_gpu_capture(stale_bound_bytes, stale_bound_loaded, error) &&
+              stale_bound_loaded.draws[0].vrt.resources[1].resource
+                      .scalar_buffer_dword_count == 4u &&
+              shader_resource_buffer_binding_bytes(
+                  stale_bound_loaded.draws[0].vrt.resources[1].resource) == 16u,
+          "v54 reader re-derives a stale pre-correction scalar-buffer bound");
+
     CHECK(serialize_gpu_capture(captured, malformed_scalar_bytes, error) &&
               !malformed_scalar_bytes.empty(),
           "v54 scalar-buffer truncation fixture serializes");
