@@ -408,6 +408,16 @@ struct SpirvCompute {
     // a live SSA value instead of a push constant. Absent means no producer has executed on this
     // path yet, which must keep failing visibly rather than silently selecting element zero.
     std::map<uint32_t, uint32_t> cbuf_table_selector_value;
+    // Label id of the block that emitted each selector above. A raw SSA id is only usable where the
+    // producer DOMINATES the consumer, and nothing here guarantees that: the CFG dispatcher emits
+    // one switch case per guest block, and sibling switch cases do not dominate one another (a
+    // structured if/endif has the same problem). Consuming across that boundary would emit an
+    // OpAccessChain against an id outside its dominance region -- malformed SPIR-V that `spirv-val`
+    // does not catch here for want of a representative module, surfacing instead as a dropped
+    // dispatch. Requiring producer and consumer to be the SAME block is the conservative subset
+    // that is always sound; carrying the value through a Function variable would lift the
+    // restriction and is the right long-term shape.
+    std::map<uint32_t, uint32_t> cbuf_table_selector_block;
     // binding -> user SGPR holding the descriptor index, when one is available.
     std::map<uint32_t, uint32_t> cbuf_table_index_sgpr;
     // Set when an array access cannot be represented exactly. The backend already refuses writable
@@ -2296,6 +2306,7 @@ struct SpirvCompute {
         auto arity = cbuf_table_arity.find(binding);
         auto index_sgpr = cbuf_table_index_sgpr.find(binding);
         auto live_selector = cbuf_table_selector_value.find(binding);
+        auto selector_block = cbuf_table_selector_block.find(binding);
         uint32_t ptr = id();
         if (arity != cbuf_table_arity.end()) {
             // A live GPU-computed selector takes precedence over the user-SGPR convention: the two
@@ -2303,7 +2314,14 @@ struct SpirvCompute {
             // push-constant home at all.
             const bool have_live_selector =
                 is_compute && arity->second <= 4096u &&
-                live_selector != cbuf_table_selector_value.end() && live_selector->second != 0;
+                live_selector != cbuf_table_selector_value.end() && live_selector->second != 0 &&
+                // Dominance, see cbuf_table_selector_block. Failing this leaves `have_live_selector`
+                // false and, since this mode never sets `table_index_sgpr`, drops through to
+                // `invalid_cbuf_array_access` below -- the module is discarded. That is exactly what
+                // the same shader does WITHOUT this feature (its MUBUF cannot resolve), so the guard
+                // cannot regress anything: it can only decline a case that was never sound.
+                selector_block != cbuf_table_selector_block.end() &&
+                selector_block->second == cur_block;
             // Only the compute shell declares the user-SGPR push-constant block. Graphics paths do
             // not currently have a runtime source for this selector, so emitting an access there
             // would manufacture type/variable id zero and an invalid module.
@@ -12728,6 +12746,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         continue;
                     b.cbuf_table_selector_value[resource.binding] =
                         b.ibin(Op_UDiv, soff_bits, b.uconst(resource.table_entry_stride));
+                    b.cbuf_table_selector_block[resource.binding] = b.cur_block;
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
                                 "[selected-table] producer pc=%u binding=%u stride=%u arity=%u\n",
