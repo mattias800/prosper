@@ -4118,9 +4118,65 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     return true;
 }
 
+// Name the reason a dispatch was refused.
+//
+// Every `return false` below used to be silent, trace-gated, or logged without saying which
+// dispatch it belonged to. Downstream, the executor records the refusal as
+// `RealizationFailureReason::Unknown` (gpu_executor.cpp) — and only when a capture trace is
+// active, so on a default run a refused dispatch left no record whatsoever.
+//
+// On GTA V's gameplay submit that is 59 of 196 realization failures, and each one clears
+// `producer_epoch_ok`, which the next `ParserStall` latches into `indirect_dependencies_ok` for
+// the rest of the submit, failing every later indirect draw and dispatch untried (128 more). The
+// dominant failure mode behind a black frame was unattributable by construction.
+//
+// The line carries a running count so the rate limit cannot be mistaken for the rate — the trap
+// that made `[compute] skip unsupported program` read as a 15-program census when 16 of 20 of those
+// programs recompile cleanly. On the run that motivated this, the count is what exposed a decline
+// firing 128+ times that the one-line-per-program diagnostic showed once.
+void report_compute_decline(const prosper::gpu::ComputeItem& item, const char* reason) {
+    struct DeclineKey {
+        uint64_t program;
+        // String literals only. Compared by pointer, not by content: the key exists to bound log
+        // volume, and if a compiler declines to pool two equal literals the effect is a split
+        // counter, never a suppressed line or a wrong reason.
+        const char* reason;
+        bool operator<(const DeclineKey& other) const {
+            // `std::less`, not raw `<`: relational comparison of pointers into different objects is
+            // unspecified, and these literals are unrelated objects. `std::less` is required to be a
+            // total order over any pointers of the same type, which is exactly what a map key needs.
+            return program != other.program ? program < other.program
+                                            : std::less<const char*>{}(reason, other.reason);
+        }
+    };
+    static std::mutex mutex;
+    static std::map<DeclineKey, uint64_t> counts;
+    uint64_t count = 0;
+    {
+        std::lock_guard lock(mutex);
+        count = ++counts[{item.code_addr, reason}];
+    }
+    // First 8 of each (program, reason), then every 64th. Both ends of the distribution stay visible
+    // without a long submit drowning the log.
+    if (count > 8 && count % 64 != 0) return;
+    std::fprintf(stderr,
+                 "[compute-decline] program=0x%llx reason=%s count=%llu submit=%llu "
+                 "dispatch=%llu order=%llu groups=%ux%ux%u\n",
+                 static_cast<unsigned long long>(item.code_addr), reason,
+                 static_cast<unsigned long long>(count),
+                 static_cast<unsigned long long>(item.submit_no),
+                 static_cast<unsigned long long>(item.dispatch_index),
+                 static_cast<unsigned long long>(item.command_order),
+                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
+    auto decline = [&item](const char* reason) {
+        report_compute_decline(item, reason);
+        return false;
+    };
     const auto phase_start = ComputeClock::now();
     auto phase_setup = phase_start;
     auto phase_pipeline = phase_start;
@@ -4148,7 +4204,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "[compute] program 0x%llx requires subgroup=%u on a context without "
                      "that enabled contract -> dispatch skipped\n",
                      (unsigned long long)item.code_addr, item.required_subgroup_size);
-        return false;
+        return decline("subgroup-contract-absent");
     }
     const uint32_t dispatch_groups[3] = {
         item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
@@ -4166,7 +4222,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          ctx.max_compute_workgroup_count[0],
                          ctx.max_compute_workgroup_count[1],
                          ctx.max_compute_workgroup_count[2]);
-        return false;
+        return decline("workgroup-count-limit");
     }
     const uint64_t image_validation_epoch = ++ctx.image_validation_clock;
     const uint32_t min_subgroup = compute_spirv_min_subgroup_size(item.spirv);
@@ -4181,7 +4237,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      "of at least %u lanes (host=%u stages=0x%x operations=0x%x)\n",
                      static_cast<unsigned long long>(item.code_addr), min_subgroup,
                      effective_subgroup, ctx.subgroup_stages, ctx.subgroup_operations);
-        return false;
+        return decline("subgroup-too-narrow");
     }
     // #1122 review B1: covers_extent (dispatch grid >= image extent) is NECESSARY but NOT SUFFICIENT
     // for skipping the seed. A write-only shader can store a subset of its grid (a masked composite:
@@ -4225,7 +4281,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const auto setup_validate_start = ComputeClock::now();
     auto report = validate_spirv_descriptor_interface(
         spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
-    if (!report.ok()) return false;
+    if (!report.ok()) return decline("descriptor-interface-invalid");
     const bool has_conditional_noop = item.resources &&
         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
                     is_proven_null_guarded_raw_store);
@@ -4233,7 +4289,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // compiler or replay materializer can mint this non-serialized token after checking raw bytes,
     // pc42 scalar dataflow, and the dispatch's user s2:s3.
     if (has_conditional_noop && !item.null_guarded_raw_store_validated)
-        return false;
+        return decline("null-guarded-raw-store-unproven");
     const bool has_nullable_output = item.resources &&
         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
                     is_nullable_raw_buffer_marker_candidate);
@@ -4245,7 +4301,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      [](const ShaderResource& resource) {
                          return is_nullable_raw_buffer_marker_candidate(resource) &&
                                 !is_proven_null_nullable_raw_buffer(resource);
-                     }))) return false;
+                     }))) return decline("nullable-output-raw-buffer-unproven");
     const bool has_cf9200_no_backing = item.resources &&
         std::any_of(item.resources->resources.begin(), item.resources->resources.end(),
                     is_gta5_cf9200_no_backing_marker_candidate);
@@ -4255,7 +4311,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                      [](const ShaderResource& resource) {
                          return is_gta5_cf9200_no_backing_marker_candidate(resource) &&
                                 !is_proven_gta5_cf9200_no_backing(resource);
-                     }))) return false;
+                     }))) return decline("cf9200-no-backing-unproven");
     double setup_validate_ms = std::chrono::duration<double, std::milli>(
         ComputeClock::now() - setup_validate_start).count();
     double setup_buffers_ms = 0.0;
@@ -4275,7 +4331,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::fprintf(stderr, "[compute] program 0x%llx uses unsupported %s binding %u\n",
                              (unsigned long long)item.code_addr,
                              spirv_descriptor_kind_name(descriptor.kind), descriptor.binding);
-                return false;
+                return decline("unsupported-descriptor-kind");
         }
     }
     // A compute program whose every external RAW access either has NUM_RECORDS=0 or is a proven
@@ -4293,7 +4349,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                is_proven_gta5_cf9200_no_backing(resource);
                     });
     if (descriptors.empty() && image_descriptors.empty() && !all_proven_no_backing_noop)
-        return false;
+        return decline("no-bindable-descriptor");
     const bool has_storage_images = std::any_of(
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
             return descriptor.kind == SpirvDescriptorKind::StorageImage;
@@ -4352,7 +4408,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!warned) { warned = true;
             std::fprintf(stderr, "[compute] device lacks shaderStorageImageRead/WriteWithoutFormat; "
                                  "image-binding dispatches are skipped\n"); }
-        return false;
+        return decline("device-lacks-storage-image");
     }
     std::sort(descriptors.begin(), descriptors.end(), [](const auto& a, const auto& b) {
         return a.binding < b.binding;
@@ -4371,7 +4427,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          "(descriptor-indexing=%u; arrays must be read-only)\n",
                          static_cast<unsigned long long>(item.code_addr),
                          ctx.descriptor_indexing_support ? 1u : 0u);
-        return false;
+        return decline("buffer-array-binding-unsupported");
     }
 
     // Flatten each reflected binding into the exact run of concrete resources Vulkan will receive.
@@ -4388,7 +4444,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     for (size_t descriptor_index = 0; descriptor_index < descriptors.size(); ++descriptor_index) {
         const ShaderResource* parent =
             item.resources->by_binding(descriptors[descriptor_index].binding);
-        if (!parent) return false; // validation and the plan above normally make this unreachable
+        // Validation and the plan above normally make this unreachable.
+        if (!parent) return decline("descriptor-binding-has-no-resource");
         if (!parent->table_index_count) {
             buffer_resources.push_back(*parent);
             buffer_descriptor_indices.push_back(descriptor_index);
@@ -4416,7 +4473,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             buffer_descriptor_indices.push_back(descriptor_index);
         }
     }
-    if (buffer_resources.size() != buffer_plan.total_descriptor_count) return false;
+    if (buffer_resources.size() != buffer_plan.total_descriptor_count) return decline("buffer-descriptor-count-mismatch");
 
     std::vector<BoundBuffer> buffers(buffer_plan.total_descriptor_count);
     for (size_t i = 0; i < buffers.size(); ++i)
@@ -4441,8 +4498,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     bool ok = false;
     bool submission_entered = false;
     bool completion_proven = false;
-    auto vk_ok = [&](VkResult result, const char* stage) {
-        if (result == VK_SUCCESS) return true;
+    // Shared failure handling for both the declining and the non-declining helpers below. A
+    // VK_ERROR_DEVICE_LOST is fatal wherever it happens, including in optional setup, so it is
+    // reported and latched here rather than in either caller.
+    auto vk_note_failure = [&](VkResult result, const char* stage) {
         if (result == VK_ERROR_DEVICE_LOST && !ctx.device_lost) {
             ctx.device_lost = true;
             std::fprintf(stderr,
@@ -4457,9 +4516,35 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=%d\n",
                                 stage, static_cast<int>(result));
-        return false;
+    };
+    // Declining forms: the dispatch cannot proceed, so the census must name the refusal.
+    // `stage` is a string literal at every call site, and a Vulkan failure is already identified by
+    // the stage that produced it, so the stage name is the reason.
+    auto vk_ok = [&](VkResult result, const char* stage) {
+        if (result == VK_SUCCESS) return true;
+        vk_note_failure(result, stage);
+        return decline(stage);
     };
     auto vk_handle_ok = [&](auto handle, const char* stage) {
+        if (handle != VK_NULL_HANDLE) return true;
+        if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=null-handle\n", stage);
+        return decline(stage);
+    };
+    // NON-declining forms, for setup whose failure disables an OPTIONAL feature and lets the
+    // dispatch run anyway. The GPU result-comparison path is the only such caller: a false
+    // `compare_ready` merely clears `compare_targets` and drops each `compare_flag_index`, after
+    // which the dispatch proceeds and can succeed.
+    //
+    // Routing those through the declining form would make `[compute-decline]` fire — with a running
+    // count — for a dispatch that then executed, which is precisely the class of misread instrument
+    // this change exists to end. A census that names non-events is worse than no census, because the
+    // count is what invites trust.
+    auto vk_soft_ok = [&](VkResult result, const char* stage) {
+        if (result == VK_SUCCESS) return true;
+        vk_note_failure(result, stage);
+        return false;
+    };
+    auto vk_soft_handle_ok = [&](auto handle, const char* stage) {
         if (handle != VK_NULL_HANDLE) return true;
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=null-handle\n", stage);
         return false;
@@ -6961,17 +7046,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bci.size = compare_targets.size() * sizeof(uint32_t);
             bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            compare_ready = vk_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &compare_flags),
-                                  "compare-flags-buffer");
+            compare_ready = vk_soft_ok(vkCreateBuffer(ctx.device, &bci, nullptr, &compare_flags),
+                                       "compare-flags-buffer");
             VkMemoryRequirements requirements{};
             if (compare_ready) {
                 vkGetBufferMemoryRequirements(ctx.device, compare_flags, &requirements);
                 compare_flags_memory = ctx.allocate_memory(
                     requirements.size, ctx.host_memory_type(requirements.memoryTypeBits), true);
-                compare_ready = vk_handle_ok(compare_flags_memory, "compare-flags-memory") &&
-                    vk_ok(vkBindBufferMemory(ctx.device, compare_flags,
-                                            compare_flags_memory, 0),
-                          "compare-flags-bind");
+                compare_ready = vk_soft_handle_ok(compare_flags_memory, "compare-flags-memory") &&
+                    vk_soft_ok(vkBindBufferMemory(ctx.device, compare_flags,
+                                                 compare_flags_memory, 0),
+                               "compare-flags-bind");
             }
             if (compare_ready) {
                 VkDescriptorPoolSize size{
@@ -6981,7 +7066,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 dpci.maxSets = static_cast<uint32_t>(compare_targets.size());
                 dpci.poolSizeCount = 1;
                 dpci.pPoolSizes = &size;
-                compare_ready = vk_ok(vkCreateDescriptorPool(
+                compare_ready = vk_soft_ok(vkCreateDescriptorPool(
                     ctx.device, &dpci, nullptr, &compare_descriptor_pool),
                     "compare-descriptor-pool");
             }
@@ -6994,7 +7079,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 allocate.descriptorPool = compare_descriptor_pool;
                 allocate.descriptorSetCount = static_cast<uint32_t>(layouts.size());
                 allocate.pSetLayouts = layouts.data();
-                compare_ready = vk_ok(vkAllocateDescriptorSets(
+                compare_ready = vk_soft_ok(vkAllocateDescriptorSets(
                     ctx.device, &allocate, compare_descriptor_sets.data()),
                     "compare-descriptor-sets");
             }
@@ -7616,7 +7701,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (prosper::gpu::shared_present_active()) qlk.lock();
                 const VkResult drain_result = vkQueueWaitIdle(ctx.queue);
                 completion_proven = drain_result == VK_SUCCESS;
-                if (!vk_ok(drain_result, "queue-drain") && trace)
+                // Soft: this drain runs INSIDE the queue-wait failure path, which has already
+                // declined. Declining again would report one fence timeout as two refusals.
+                if (!vk_soft_ok(drain_result, "queue-drain") && trace)
                     std::fprintf(stderr, "[compute]   queue drain after fence timeout failed\n");
             }
             break;
