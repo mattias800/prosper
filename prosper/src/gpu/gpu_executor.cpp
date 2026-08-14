@@ -7795,29 +7795,6 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // a module with no witness, and a cache hit returns whichever module the key selected.
         item.trip_witness_instrumented = !program_uses_guest_gds_for_item &&
             spirv_writes_trip_witness(item.spirv);
-        // PROSPER_COMPUTE_ADDRESS_WATCH=0xADDR: name every program whose realized resource table
-        // touches one guest allocation, with the binding and fetch pc that reach it.
-        //
-        // "Which dispatch corrupted this buffer" is unanswerable while only the suspected program is
-        // traced: a flip observed after ITS write reads as cause, and a flip with no write from it is
-        // simply invisible. Both happen here. This scans the table once per dispatch -- no per-op
-        // cost, and cheap enough to leave on for a whole route, unlike tracing every program.
-        if (const char* watch = std::getenv("PROSPER_COMPUTE_ADDRESS_WATCH")) {
-            char* end = nullptr;
-            const uint64_t wanted = std::strtoull(watch, &end, 0);
-            if (end && !*end && wanted && item.resources) {
-                for (const ShaderResource& r : item.resources->resources) {
-                    if (r.gpu_addr != wanted) continue;
-                    std::fprintf(stderr,
-                                 "[compute-address-watch] addr=0x%llx program=0x%llx submit=%llu "
-                                 "dispatch=%zu order=%llu binding=%u fetch-pc=%u size=%u\n",
-                                 static_cast<unsigned long long>(wanted),
-                                 static_cast<unsigned long long>(item.code_addr),
-                                 static_cast<unsigned long long>(submit_no), operation.index,
-                                 static_cast<unsigned long long>(operation.command_order),
-                                 r.binding, r.fetch_pc, r.size);
-                }
-            }
         }
         item.terminator_only_program_validated = rdna2_program_is_terminator_only(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
@@ -9678,6 +9655,37 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     st, operation.index, resolved_dispatch, submit_no, item,
                     capture_trace ? &failure : nullptr);
                 if (realization == RetainedComputeRealization::Realized) {
+                    // PROSPER_COMPUTE_ADDRESS_WATCH=0xADDR: name every program whose realized
+                    // resource table touches one guest allocation, with the binding and fetch pc
+                    // that reach it. One table scan per dispatch, no per-op cost.
+                    //
+                    // Placed HERE, beside the parent walk, and that placement is the point: this
+                    // watch first went into realize_compute_dispatches() and printed nothing for a
+                    // whole route, because the live path is realize_retained_compute(). A silent
+                    // zero from an instrument on an unused code path is indistinguishable from
+                    // "nothing touches this buffer" -- which is the conclusion it would have
+                    // supported, and it is false. Anchor a new watch to a line already proven to
+                    // execute on the route being measured.
+                    if (const char* watch = std::getenv("PROSPER_COMPUTE_ADDRESS_WATCH")) {
+                        char* end = nullptr;
+                        const uint64_t wanted = std::strtoull(watch, &end, 0);
+                        if (end && !*end && wanted && item.resources) {
+                            for (const ShaderResource& r : item.resources->resources) {
+                                if (r.gpu_addr != wanted) continue;
+                                std::fprintf(stderr,
+                                             "[compute-address-watch] addr=0x%llx program=0x%llx "
+                                             "submit=%llu dispatch=%zu order=%llu binding=%u "
+                                             "fetch-pc=%u size=%u\n",
+                                             static_cast<unsigned long long>(wanted),
+                                             static_cast<unsigned long long>(item.code_addr),
+                                             static_cast<unsigned long long>(submit_no),
+                                             operation.index,
+                                             static_cast<unsigned long long>(
+                                                 operation.command_order),
+                                             r.binding, r.fetch_pc, r.size);
+                            }
+                        }
+                    }
                     const LiveComputeParentWalkPreflight preflight =
                         preflight_compute_parent_walk(
                             item, previous_compute_code, previous_compute_realized,
