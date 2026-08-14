@@ -4181,6 +4181,14 @@ void report_compute_decline(const prosper::gpu::ComputeItem& item, const char* r
 //
 // The skip reports itself through the ordinary decline census, so a run made with it set can never
 // be mistaken for a default run when the log is read later.
+//
+// Two limits a reader of the result has to know, because neither is visible in the output:
+//   * A skip IS a decline. It clears `producer_epoch_ok` exactly as a real refusal does, which the
+//     next ParserStall latches into `indirect_dependencies_ok` for the rest of the submit. What you
+//     get is therefore not "the frame minus that dispatch" -- it is that frame minus the dispatch
+//     minus every indirect draw and dispatch after the next parser stall.
+//   * A program that takes `execute_cpu_fast_path` never reaches here, so naming one has no effect
+//     and produces no line. Silence is not proof the selector matched.
 const std::set<uint64_t>& compute_skip_programs() {
     static const std::set<uint64_t> programs = [] {
         std::set<uint64_t> parsed;
