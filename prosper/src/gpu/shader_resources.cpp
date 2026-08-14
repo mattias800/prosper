@@ -207,6 +207,15 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
             return false;
     }
 
+    // DST_SEL is a FORMAT-fetch control: it names which component each returned channel takes. The
+    // dynamic-scalar-offset selection is admitted for untyped loads only — the emitter rejects a
+    // typed fetch, store or atomic through a selected descriptor — and an untyped load moves raw
+    // dwords regardless of the descriptor's declared swizzle. So for that mode the swizzle cannot
+    // decide whether the table is bindable, while the user-SGPR mode, whose consumers may be typed,
+    // keeps requiring the identity mapping. GTA V's tables are three-component (0x3ac, X/Y/Z/1);
+    // requiring 0xfac rejected every one of them for a field none of their consumers reads (#2481).
+    const bool raw_only_selection =
+        resource.table_selector_mode == BufferTableSelectorMode::DynamicSbufferByteOffset;
     for (const ShaderBufferTableEntry& entry : resource.table_entries) {
         const uint64_t decoded_addr =
             (static_cast<uint64_t>(entry.vsharp[0]) |
@@ -236,7 +245,7 @@ bool valid_shader_buffer_table_contract(const ShaderResource& resource) {
              (entry.stride != resource.stride ||
               decoded_format != resource.format ||
               decoded_components != resource.num_components ||
-              dst_sel != 0xfacu)) ||
+              (dst_sel != 0xfacu && !raw_only_selection))) ||
             (null_descriptor && dst_sel != 0u && dst_sel != 0xfacu) ||
             (!entry.host_data && entry.host_data_size != 0u) ||
             (entry.host_data && entry.host_data_size < entry.size))
