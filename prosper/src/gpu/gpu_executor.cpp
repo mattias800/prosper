@@ -9654,6 +9654,43 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     st, operation.index, resolved_dispatch, submit_no, item,
                     capture_trace ? &failure : nullptr);
                 if (realization == RetainedComputeRealization::Realized) {
+                    // PROSPER_COMPUTE_ADDRESS_WATCH=0xADDR: name every program whose realized
+                    // resource table touches one guest allocation, with the binding and fetch pc
+                    // that reach it. One table scan per dispatch, no per-op cost.
+                    //
+                    // Placed HERE, beside the parent walk, and that placement is the point: this
+                    // watch first went into realize_compute_dispatches() and printed nothing for a
+                    // whole route, because the live path is realize_retained_compute(). A silent
+                    // zero from an instrument on an unused code path is indistinguishable from
+                    // "nothing touches this buffer" -- which is the conclusion it would have
+                    // supported, and it is false. Anchor a new watch to a line already proven to
+                    // execute on the route being measured.
+                    if (const char* watch = std::getenv("PROSPER_COMPUTE_ADDRESS_WATCH")) {
+                        char* end = nullptr;
+                        const uint64_t wanted = std::strtoull(watch, &end, 0);
+                        if (end && !*end && wanted && item.resources) {
+                            // Traversal lives in compute_address_watch_hits so the scalar/array
+                            // branch is testable: a runtime-array parent's gpu_addr is the
+                            // DESCRIPTOR TABLE address, not a backing range, and testing it here
+                            // fabricated matches and double-reported entries.
+                            for (const ComputeAddressWatchHit& hit :
+                                     compute_address_watch_hits(*item.resources, wanted)) {
+                                std::fprintf(stderr,
+                                             "[compute-address-watch] addr=0x%llx %s program=0x%llx "
+                                             "submit=%llu dispatch=%zu order=%llu binding=%u "
+                                             "fetch-pc=%u entry=%u base=0x%llx size=%u\n",
+                                             static_cast<unsigned long long>(wanted),
+                                             hit.from_array_entry ? "array-entry" : "resource",
+                                             static_cast<unsigned long long>(item.code_addr),
+                                             static_cast<unsigned long long>(submit_no),
+                                             operation.index,
+                                             static_cast<unsigned long long>(
+                                                 operation.command_order),
+                                             hit.binding, hit.fetch_pc, hit.entry_index,
+                                             static_cast<unsigned long long>(hit.base), hit.size);
+                            }
+                        }
+                    }
                     const LiveComputeParentWalkPreflight preflight =
                         preflight_compute_parent_walk(
                             item, previous_compute_code, previous_compute_realized,

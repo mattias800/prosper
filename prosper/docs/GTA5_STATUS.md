@@ -36,19 +36,340 @@ As of 2026-08-14, established and each measured rather than inferred:
 **So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
 lower it correctly.
 
-**The writer is `0x413dc6700` itself.** Its own writeback line names the table it later reads
-(`writeback binding=4 addr=0x20f848a240 changed=2062`), it reads through one binding and writes
-through another, and the two tables swap roles between dispatches — a double-buffered union-find with
-path compression. So this is a self-corrupting kernel, not a missing or refused producer.
+5. **Eight programs TOUCH the table; the writer set is UNKNOWN.** A containment census over a full
+   route names `0x413ce3400`, `0x413ce6000`, `0x413cea300`, `0x413cee500`, `0x413d88400`,
+   `0x413dc3400`, `0x413dc6700`, `0x413e1c300`. **"Touch" is a resource binding, not an access
+   direction** — the census cannot separate a reader from a writer, so it identifies no writer at
+   all. An earlier revision of this list said "at least two programs write the table"; that was a
+   matcher artifact (base equality, blind to a view whose base differs) and is withdrawn.
+6. **One program's write quality tracks the damage — a correlation, not an identification.**
+   `0x413dc3400`'s malformed-pair count separates 54 clean reads (0..13) from 126 cyclic ones
+   (19..106) with no overlap. Its slot-level causal test **failed**: 14% of cycle nodes sit on
+   malformed slots against a 4.4% base rate. It is one candidate among eight.
+7. **`0x413dc3400`'s store path is lane-predicated.** All six of its table stores sit inside an
+   `s_and_saveexec_b64` / `s_cbranch_execz` region, so *which slots are written* is decided by a
+   per-lane mask — and the defect's character is membership, not arithmetic: every record is
+   individually well-formed, in the wrong combination.
 
-`0x413ce3400` was an earlier attribution and is **superseded**: it is a writer of related state and it
-is never declined on a routed run, so the "producer was refused" hypothesis is dead — but it was never
-the question. Anything below that still reads as though an upstream producer must be found is
-historical; the sections concerned now say so.
+**The gating question is which of the eight programs WRITE the table.** The census measures a
+resource binding, not an access direction, and every downstream narrowing depends on that
+distinction — including whether `0x413dc3400` is a writer at all. Only once the writer set is known
+does "why do its writes go bad" become answerable, and even then what exists today is a
+correlation on an identical module (same SPIR-V hash, launch and 38 buffers either side of the
+transition), not established cause.
 
-What is NOT established: which of `0x413dc6700`'s own stores introduces a cycle, and whether that is
-the guest algorithm behaving correctly on inputs we produced wrongly upstream, or a defect in how we
-execute its write-back path.
+**Not established, and explicitly tested:** that each malformed pair becomes a 2-cycle. On a same-run
+join only 14% of cycle nodes sit on malformed slots against a 4.4% base rate — real enrichment, not a
+mechanism. The dispatch-level correlation stands; the slot-level one does not.
+
+**Superseded:** a paragraph here once named `0x413dc6700` as *the* writer and called it a
+self-corrupting kernel. Flips also occur in submits where it writes nothing, so that identification
+is dead — and the replacement is not "a second writer" either: **eight programs bind ranges covering
+this address and the census cannot say which of them write.**
+
+`0x413ce3400` is **back in scope.** It was marked superseded here on the grounds that it wrote only
+"related state"; the containment census lists it among the eight. What remains true of it is
+narrower: it is never declined on a routed run, so the "producer was refused" hypothesis is dead.
+
+**What is NOT established**, stated precisely because the wording above is easy to over-read:
+
+- **That `0x413dc3400` causes the cycles.** What is measured is a *dispatch-level correlation*: the
+  malformed-pair count of its writes separates 54 clean reads (0..13) from 126 cyclic ones (19..106)
+  with no overlap. The slot-level test **failed** — only 14% of cycle nodes sit on malformed slots
+  against a 4.4% base rate — so a shared upstream cause is not excluded, and no A/B or
+  clean-before/bad-after has been run.
+- **That `0x413dc3400` writes this table at all.** The census re-run is complete and reports eight
+  programs whose resources *contain* the address; a resource binding is not an access direction.
+  Nothing here is a direction-qualified observation, so "its writes go bad" is shorthand for a
+  correlation between its dispatches and the damage, not an established write.
+- **Which program or store introduces a cycle**, and whether the guest algorithm is behaving
+  correctly on inputs produced wrongly upstream.
+
+**The next experiment is direction-qualified attribution**: establish, per program, whether it reads
+or writes this range. Every further narrowing depends on it.
+
+## RETRACTED 2026-08-14: "the corrupting write is `0x413dc6700`'s own" was one sample
+
+The self-corrupting account was previously inferred from a writeback trace. It is now a direct
+before/after on adjacent dispatches of the same program, in the same submit, on current master:
+
+```text
+disp 38  read  0x20f848417c  CLEAN   cycles=0  cyclic-roots=0     oob-roots=1385  max-depth=21
+disp 38  execute ok, buffers=43, spirv=61143/177420afa4fd9c50
+disp 38  writeback binding=4 addr=0x20f848a240 changed=2357
+disp 39  read  0x20f848a240  CYCLIC  cycles=6  cyclic-roots=2062  oob-roots=0     max-depth=32
+```
+
+**RETRACTION.** The transition above is real and reproducible, and it does NOT establish cause. Two
+observations from a wider census of the same instrumentation kill the inference:
+
+- **A complete rewrite left the table CLEAN.** Submit 4312 dispatch 764 wrote 2,061 of 2,063 slots,
+  and every read in that submit reports `cycles=0`. If this program's write corrupted the table, the
+  most complete write in the route was the best chance to show it.
+- **Tables flip to cyclic with NO write from this program.** Submit 4725 reads `0x20f848417c` with
+  986 cyclic roots, and `0x413dc6700` writes nothing to it in that submit at all.
+
+So a flip adjacent to its write is not evidence that the write caused it, because flips also happen
+without one. What the original evidence established is that the program **writes the table it later
+reads** — which was already known — plus one coincidence.
+
+The generalisable error: a transition was observed next to a candidate cause, and adjacency was
+treated as causation without checking whether the transition also occurs WITHOUT the cause. The
+negative case is the whole test. Reproduce with `PROSPER_COMPUTELOG_CODE=0x413dc6700` plus
+`PROSPER_COMPUTE_PARENT_WALK=0x413dc6700:0x5b:3:0x07FFFFFF:64` and read the interleaved
+`parent-walk` / `execute` / `writeback` lines.
+
+### EIGHT programs touch the traversal table — the "two writers" census was wrong
+
+The first census matched `resource.gpu_addr == wanted` over top-level resources. Re-run with a
+containment matcher (`wanted >= base && wanted - base < size`, over scalars *and* `table_entries`),
+the same route reports **eight** programs, 3,931 hits:
+
+```text
+0x413ce3400   0x413ce6000   0x413cea300   0x413cee500
+0x413d88400   0x413dc3400   0x413dc6700   0x413e1c300
+```
+
+`0x413dc6700` holds nine bindings including the loop's read at fetch pc 91; `0x413e1c300` is the most
+frequent of all (four bindings, 308 hits each); `0x413cea300` appears with `fetch-pc=0xffffffff` —
+that is the terminator-only program, whose whole body is one `s_endpgm`.
+
+**Zero matches came from `table_entries`**, so on this allocation the array form is not exercised and
+the entire gain is base-equality → containment: six programs bind a view whose *base differs* while
+its range covers the address.
+
+Consequences, and they are large:
+
+- **"The table has two writers" is withdrawn.** It was an artifact of a matcher that could only see
+  an exact base.
+- **`0x413ce3400` is back in the picture.** This document marked it superseded on the grounds that it
+  was "a writer of related state"; it binds a range containing this table.
+- **The `0x413dc3400` correlation is unaffected but much less pointed.** Its malformed-pair count
+  still separates 54 clean reads from 126 cyclic ones with no overlap — that measurement stands —
+  but with seven other programs touching the allocation, "its writes are what go bad" is one
+  candidate among several rather than a narrowing to one.
+- **"Touches" is not "writes".** The census lists resources, not access direction. Distinguishing
+  readers from writers on this allocation is the next thing to measure, and it is now the gating
+  question rather than a detail.
+
+### `0x413dc3400`'s write quality separates clean tables from cyclic ones — correlation, not cause
+
+Tracing `0x413dc3400` — one of the eight touchers, and not established as a writer — with
+`PROSPER_COMPUTELOG_CODE=0x413dc3400` plus `PROSPER_COMPUTELOG_CHANGED`
+(its table is **binding 23** — binding indices are per-program, and reusing the consumer's numbers
+here produced a confident wrong answer first), and scoring each write by how many heads it lands
+without a matching tail in the next slot:
+
+| reads | n | prior write's malformed pairs |
+| --- | --- | --- |
+| `cycles=0` | 54 | **0..13** |
+| `cycles>0` | 126 | **19..106** |
+
+**No overlap across 180 reads.** The writes are clean (`MISMATCHED=0`) through submit 7480 and then
+jump to 77, 66, 67, … 104, 106, and the tables go cyclic exactly when they do.
+
+That makes `0x413dc3400`'s write quality a **quantitative oracle** — not an identification of the
+writer, since the census that produced this framing measured bindings rather than access direction
+and eight programs touch the allocation. The malformed-pair count: a fix must drive it to zero, and `cyclic-roots` should follow.
+
+**Stated as correlation, because that is what it is.** 180 reads with clean separation and a mechanism
+that explains the shape (a head whose tail is absent leaves an orphan tail from an older generation,
+and an orphan tail pointing back at its predecessor is exactly the observed 2-cycle) is strong, but no
+A/B has yet shown the cycles following the mismatches. The counter-example that would break it is a
+write with a high malformed count followed by a clean read; none occurred in 180 reads.
+
+One earlier inference is already dead by this data: **13 malformed pairs at submit 4162 produced no
+cycles at all**, so "any malformed pair corrupts the table" is false. There is a threshold between 13
+and 19, which is itself a clue — the structure tolerates some inconsistency.
+
+### The shader does not change across the boundary — only its input does
+
+`0x413dc3400` compiles to the **same module** on both sides of the transition:
+
+```text
+submit 7480  groups=9x1x1  buffers=38  spirv=57537/8dbb56b7a4feea9c   MISMATCHED=0
+submit 7898  groups=9x1x1  buffers=38  spirv=57537/8dbb56b7a4feea9c   MISMATCHED=77
+```
+
+Same SPIR-V hash, same launch, same 38 buffers. So the divergence is **data-dependent**, not a
+recompilation difference — which rules out cache/key effects and points at how our execution handles
+one particular input.
+
+`0x09249249` is the guest's **empty-slot sentinel**, not a prosper fill (it appears nowhere in our
+source). Decoded as a record it yields `next = 19,158,153`, far past the 2,063 records, so a walk
+reaching it leaves the array and terminates by the RDNA2 out-of-range rule. Many of the slots the
+first dirty write touches held it beforehand, i.e. they were previously empty.
+
+**Falsified while forming it:** "clean tables terminate via those OOB sentinels, and cycles appear
+once the table fills up." All 204 clean reads in this run have `oob-roots=0`; the cyclic ones range
+0..1,690. The relationship runs the other way from the guess, so OOB termination is not what keeps a
+clean table acyclic.
+
+### Two patterns in the malformed set that do NOT generalise
+
+Recorded so nobody re-derives them. Both looked convincing on one dispatch:
+
+- **Stride 16.** The first twenty malformed indices at submit 7898 read `884,885 · 900,901 ·
+  916,917 · 932,933` — adjacent pairs exactly 16 apart, which would point straight at a 16-lane
+  grouping (DPP row, tile). Across the full set the `index mod 16` histogram is spread over ten
+  residues, and it is a *different* spread on every dispatch. The regularity was in the first twenty
+  entries, not in the population.
+- **A distinguishing prior value.** At submit 7898 the malformed heads' previous contents include
+  `0x24924924` twenty-six times while well-formed heads never show it — a clean discriminator, and
+  `0x24924924` is `0x09249249 << 2`, the same repeating sentinel at another phase. It does not hold:
+  submit 8309's malformed priors are `0` and `2`, submit 14727's are `0x3FFFFFFF` and `0`. No value
+  is common to the malformed set across dispatches.
+
+**The honest position after that:** the malformed set has no structural signature I have found, so the
+correlation with cyclicity is currently the only handle on it, and pattern-hunting on derived metrics
+has stopped paying.
+
+### `0x413dc3400`'s table stores are LANE-PREDICATED
+
+`0x413dc3400` disassembles to 882 dwords / 765 instructions, and its six table stores share one
+shape — a store to the table and a store to a second buffer at the *same index*, both inside an
+EXEC-predicated region:
+
+```text
+pc592  s_or_b64            s[106:107], s[16:17], s[14:15]
+pc593  s_and_saveexec_b64  (EXEC &= that; old EXEC saved to s[106:107])
+pc594  s_cbranch_execz     -> 599            ; skip the block if no lane qualifies
+pc595  buffer_store_dword  v42, v58, s[8:11] ; a second buffer
+pc597  buffer_store_dword  v48, v58, s[0:3]  ; THE TABLE, same index v58
+pc599  s_mov_b64           exec, s[106:107]  ; restore
+```
+
+Six such blocks: (595,597), (606,608), (618,620), (630,632), (642,644), (654,656).
+
+Two consequences worth having:
+
+1. **Which slots get written is decided by a per-lane mask**, so a divergence in EXEC handling shows
+   up as *missing or extra* stores rather than wrong values — which matches the observed defect
+   (records that are individually well-formed, in the wrong combination) far better than an
+   arithmetic error would.
+2. The program is lowered through `emit_cfg_state_machine` (it is on the `role=terminal` list), where
+   EXEC is emulated per invocation and `s_cbranch_execz` needs a cross-lane vote. That is the same
+   machinery the consumer's loop exercised — and a hand-built kernel proved it correct for *that*
+   shape (`tests/test_cfg_trip_bound.cpp`), which does not extend to `s_and_saveexec_b64` feeding a
+   predicated store.
+
+This is a hypothesis, not a result: no measurement yet shows a lane storing when it should not, or
+failing to. The next instrument would compare the set of slots written against the set the mask
+selects.
+
+### The test was run, and it does NOT support cause
+
+Same-run capture (120 dumped cyclic tables and 98,837 changed-slot records, so the join is valid),
+asking whether the 2-cycles sit at slots the malformed writes touched:
+
+```text
+write-submit=10308  malformed=91  cycle-nodes=178  on-malformed-slot=26  (14%)
+write-submit=10708  malformed=93  cycle-nodes=178  on-malformed-slot=26  (14%)
+```
+
+Stable at **14%** across ten tables. With 91 malformed slots in 2,063 the base rate is 4.4%, so this
+is roughly 3x enrichment — a real association, and far from the "cycles land on malformed slots"
+that would close the chain. **86% of the cycle nodes are somewhere else.**
+
+So the malformed-pair count remains a strong *dispatch-level* correlate (54 clean reads at 0..13
+versus 126 cyclic at 19..106, no overlap) while failing as a *slot-level* mechanism. Two readings
+survive, and this data does not choose between them:
+
+- the metric is a proxy for some other property of a bad write, and that property produces the
+  cycles; or
+- malformed pairs and cycles share an upstream cause and neither produces the other.
+
+**What it rules out:** "each malformed pair becomes a 2-cycle." That was the mechanism I expected
+and it is wrong.
+
+### Open: why does it start at submit 7898?
+
+
+
+
+
+`0x413dc3400` writes 2,061 slots with zero malformed pairs for nine consecutive dispatches, then
+never again. Whatever changes at that point is the proximate cause, and it is a much smaller question
+than the one this investigation started with.
+
+### FALSIFIED: our store INDICES are wrong
+
+Grouped strictly per `(submit, dispatch)` — the ungrouped form of this analysis is meaningless and
+produced a confident wrong answer first — every head a dispatch writes has its matching tail at the
+very next slot:
+
+```text
+submit 4312 dispatch 764: 2061 slots written, 1031 heads, MISMATCHED=0
+submit 5555 dispatch  38: 1721 slots written,  864 heads, MISMATCHED=0
+```
+
+So the pair-store index arithmetic is correct in our execution. Whatever produces an orphaned tail,
+it is not this program emitting a head and a tail at non-adjacent slots.
+
+### The corruption has a SHAPE: overlapping pair writes, not garbage
+
+`PROSPER_COMPUTE_PARENT_WALK_DUMP` captured 138 cyclic tables. Every cycle in every one of them is a
+**2-cycle**, and the records involved are structurally valid — correct tag, plausible index:
+
+```text
+rec[452] = 0x00000e32   tag=2  bit30=0  next=454     <== cycle
+rec[453] = 0x40000e32   tag=2  bit30=1  next=454
+rec[454] = 0x40000e22   tag=2  bit30=1  next=452     <== cycle
+rec[455] = 0x00000e7a   tag=2  bit30=0  next=463
+```
+
+**The table is a sequence of PAIRS**: `rec[k+1] == rec[k] | 0x40000000`, same payload, bit 30 marking
+the second element. 920 such pairs across 2,063 records, and the pairing is not parity-locked (523
+begin at an even index, 397 at an odd one), so a pair is simply two consecutive slots.
+
+A `bit30=1` record must therefore be immediately preceded by its `bit30=0` twin. In every cycle it is
+not: above, slot 453 holds the *tail* of pair (452,453) while slot 454 holds a tail whose head is
+gone. **Two writers claimed slot 453** — one writing the tail of (452,453), one the head of
+(453,454) — and the survivor's orphaned partner at 454 points back at 452, closing the cycle.
+
+So this is an **overlapping-allocation / lost-update** signature, and the earlier "61 two-cycles" note
+was reading it correctly. What changes is that the falsification recorded against it was measured on
+`0x413ce3400`'s instruction footprint, which is only one of eight programs binding this allocation.
+Re-opened: it falsifies a lost-atomic hypothesis for one program, and no program is established as
+the writer.
+
+Two candidates for how two concurrent STORES land on overlapping slots (a different sense of
+"two writers" from the program census above — this is about lanes racing within a dispatch),
+neither yet tested:
+
+- **The pair store itself.** The program contains 3 `buffer_store_dwordx2` and 5 `buffer_store_dwordx3`
+  among its 23 stores, and a `dwordx2` writes exactly two consecutive dwords — a pair. An addressing
+  error in the multi-dword store path (element versus byte, or an off-by-one base) shifts a pair by
+  one slot and produces precisely this.
+- **The slot allocator.** `ds_add_rtn_u32` at guest pc121 is a bump allocator: each thread atomically
+  adds its size to an LDS counter and takes the old value as its base. Overlapping bases would do it.
+  **Checked and currently NOT suspect:** the emitter lowers it to `OpAtomicIAdd` with
+  `Scope_Workgroup` / `MemSem_WGAcqRel`, which is correct for `local=256` (four 64-wide waves), and
+  the program has no global-memory atomics at all — 41 MUBUF ops, every one a plain load or store.
+
+### What the same run also settles
+
+- **Most dispatches write nothing.** 52 of 64 writebacks are `changed=0`; the substantial ones are
+  `changed=2357`, `2061`, and a few single-digit updates. So the corrupting event is rare and
+  identifiable, not a steady drift.
+- **Both tables can be cyclic**, contrary to the earlier per-address reading: `0x20f848417c` is
+  162 clean / 30 cyclic and `0x20f848a240` is 40 clean / 120 cyclic across 352 resolved reads. The
+  asymmetry is real but it is not a property of the address.
+- **The resource table varies per dispatch.** The same program address compiles to different modules
+  (`spirv=58649/…` several distinct hashes, `61143/177420afa4fd9c50` on the big-write dispatch), and
+  `buffers` ranges from 1 to 43. A single dispatch's resource picture is not the program's.
+
+### The open question, now narrow
+
+Why does that write produce cycles? Candidates, none yet tested:
+
+1. the stored VALUES are wrong (our lowering of the store path computes the wrong record);
+2. the stored INDICES are wrong (right values, wrong slots);
+3. a concurrency effect at `threads=2063 local=256 groups=9` that the guest's algorithm tolerates on
+   hardware and our lowering does not preserve.
+
+The oracle is in place either way: `cyclic-roots` on the read immediately after the write is the
+number to move, and dispatch 38 of a `0x413dc6700` pair is where to look.
 
 ## Where the world went
 

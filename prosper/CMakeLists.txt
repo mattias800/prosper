@@ -1596,6 +1596,11 @@ if(TARGET prosper_core)
       set_tests_properties(gds_scan_memo_disabled PROPERTIES
                            ENVIRONMENT "PROSPER_NO_GDS_SCAN_MEMO=1")
 
+      # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
+      add_executable(test_compute_address_watch tests/test_compute_address_watch.cpp)
+      target_link_libraries(test_compute_address_watch PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME compute_address_watch COMMAND test_compute_address_watch)
+
       # The EXEC-driven pointer-chasing loop shape GTA V hangs on, plus PROSPER_CFG_TRIP_BOUND.
       add_executable(test_cfg_trip_bound tests/test_cfg_trip_bound.cpp)
       target_link_libraries(test_cfg_trip_bound PRIVATE prosper_core Vulkan::Vulkan)
