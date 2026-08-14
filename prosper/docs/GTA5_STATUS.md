@@ -66,6 +66,18 @@ The first domino turned out to be an **empty guest kernel**: `0x413cea300`, whos
 Fixed by proving emptiness from the raw stream (`rdna2_program_is_terminator_only`) and reporting such
 a dispatch as a successful no-op. A/B: 192 declines to 0.
 
+### The trip bound measures ONE emitter — a null from it is "not measured"
+
+`PROSPER_CFG_TRIP_BOUND` caps the **CFG dispatcher's** back edge. It does not touch either structured
+loop emitter, so a program the structurizer accepts is *structurally unmeasurable* by it and reports
+nothing whether or not it runs away. `0x413dc6700` happens to be covered — it reaches `role=terminal`
+in the structurizer and is lowered by `emit_cfg_state_machine` — which is why its witness fired at all.
+
+This is recorded because the emitter's own comment asserted the opposite for a while: a correction
+saying the structured emitters are NOT covered was added directly above a surviving sentence claiming
+all three were. Both are now pinned by assertions — a structured loop must be byte-identical when
+armed, a dispatcher loop must not be.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
@@ -138,6 +150,16 @@ falsification.
   #2542.
 - **The hang is an unconditionally infinite loop.** The same program executes successfully at dispatch
   38 and hangs at dispatch 39 of the same submit. Whatever spins is data-dependent. #2481.
+- **Our `v_cmpx` / `s_cbranch_execz` lowering cannot exit the guest's pointer-chasing loop.**
+  `0x413dc6700`'s whole 903-dword body contains exactly **one** backward branch, at guest pc97 back to
+  pc88, and that loop's only exit is `s_cbranch_execz` after a `v_cmpx_ne_u32`. Nothing else in the
+  loop writes EXEC, so if `v_cmpx` narrowed VCC instead of EXEC — plausible, because the e32
+  encoding's destination field still reads as VCC and `shader_inspect` prints it as `special:106` —
+  the loop could never end. **Falsified by a hand-built kernel of the identical shape**
+  (`tests/test_cfg_trip_bound.cpp`): built by hand rather than derived from the capture or the
+  recompiler, its body decrements the index instead of chasing a buffer, so only the control flow is
+  on trial. On real Vulkan, lane *i* walks exactly *i* steps for all 128 lanes — per-lane EXEC
+  narrowing and the cross-lane `execz` vote are both correct. #2542.
 - **Bounding the CFG dispatcher's trip count stops the hang.** Tried at 4096 and at 2^20; the device
   was lost both times. Note this cuts *against* the loop being unbounded rather than for it. #2481.
 
@@ -168,7 +190,9 @@ dispatch every other instrument has named, immediately followed by the device lo
 dispatch.**
 
 Three independent instruments now converge on `0x413dc6700` dispatch 39: the trip-bound hit witness
-(`trips=4096`, block 9, the loop body), the fence-wait duration, and the loss ordering.
+(`trips=4096`), the fence-wait duration, and the loss ordering. **The witness's third field is
+a guest PC, not a block ordinal** — see the correction below; it does not say the guest's loop
+is the thing spinning.
 
 ### This corrects the section that used to be here
 
@@ -307,7 +331,7 @@ It closes the chain that every other measurement in this document constrains:
 4. the parent array degrades — **once, irreversibly** (each buffer transitions clean->cyclic exactly
    once and never recovers, which is what a half-applied union-find update looks like)
 5. `0x413dc6700` walks the cyclic chain and never terminates — recorded directly by the trip-bound
-   hit witness at block 9, the loop body
+   hit witness (its third field is a guest PC, not a block ordinal — see the correction below)
 6. GPU watchdog -> RADV hard recovery -> live compute disabled process-wide
 7. `producer_epoch_ok` cleared -> `indirect_dependencies_ok` latched -> every remaining indirect draw
    dropped untried -> **no world**
@@ -502,6 +526,17 @@ At bound **4,096**, on the same program and phase:
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=38
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=14 trips=4096 submit=5547 dispatch=39
 [cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=40
+```
+
+**Correction (2026-08-14): the third field is `next-guest-pc`, and it was printed as `last-block`.**
+The shader stores the dispatcher's `pc_var` — the GUEST program counter it was about to run when the
+cap ran out. Reading `14` as "basic block 14" and mapping it by hand onto the block containing the
+guest's loop body produced the published claim that *the guest's loop is spinning*, which the numbers
+do not say. Guest pc 9 and pc 14 are both in the **prologue**:
+
+```text
+pc=0009  s_lshr_b32     s107, s107, 3
+pc=0014  s_load_dwordx4 s[8:11], s[22:23], s107
 ```
 
 11 hits across dispatches 38..48 of one submit — **including dispatch 39, the exact dispatch that
