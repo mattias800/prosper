@@ -6028,14 +6028,27 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         // because `candidate_draw_count` is the DRAW count and a compute-only submit has none. Before
         // this line the only way to reach the later phase was to re-run with successive AT values and
         // inspect each capsule, at one routed run apiece (#2481).
-        if (std::getenv("PROSPER_GPU_CAPTURE_LOG"))
+        if (std::getenv("PROSPER_GPU_CAPTURE_LOG")) {
+            // The widest viewport any draw in this submit uses. A draw COUNT cannot tell a main-view
+            // pass from a shadow pass — shadow atlases have high draw counts and share the main
+            // target's dimensions, differing only in viewport — so a census without this cannot be
+            // aimed at "the submit that draws the world" (#2481).
+            float widest_w = 0.0f, widest_h = 0.0f;
+            for (const DrawItem& draw : draws) {
+                if (!draw.ps.has_viewport) continue;
+                const float w = draw.ps.viewport_w < 0.0f ? -draw.ps.viewport_w : draw.ps.viewport_w;
+                const float h = draw.ps.viewport_h < 0.0f ? -draw.ps.viewport_h : draw.ps.viewport_h;
+                if (w * h > widest_w * widest_h) { widest_w = w; widest_h = h; }
+            }
             std::fprintf(stderr,
                          "[gpucap] candidate at=%llu submit=%llu draws=%zu computes=%zu "
-                         "semantic-dispatches=%zu%s\n",
+                         "semantic-dispatches=%zu viewport=%.0fx%.0f%s\n",
                          static_cast<unsigned long long>(current),
                          static_cast<unsigned long long>(submit_no), draws.size(), computes.size(),
                          semantic_state ? semantic_state->dispatches.size() : size_t{0},
+                         widest_w, widest_h,
                          claimed.load() ? " (already claimed)" : "");
+        }
         if (!output_triggered) {
             uint64_t wanted = 0;
             if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
