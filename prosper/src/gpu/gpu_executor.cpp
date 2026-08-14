@@ -2552,6 +2552,15 @@ static uint32_t validated_scalar_buffer_dword_count(
         const SrtUse& use, const DecodedBufferDescriptor& descriptor,
         const uint32_t* code, size_t dwords) {
     if (!use.scalar_buffer_dword_count) return 0u;
+    // An EMPTY V# carries no resource-level scalar bound. `scalar_buffer_dword_count` still answers
+    // one dword for the stride-zero empty case, because eece6f84's fold specialization is about
+    // whether a given access is provably out of range — but a RESOURCE built from that descriptor
+    // has `size == 0`, and a carried count of one then contradicts its own footprint. #2529 made
+    // `shader_resource_buffer_binding_bytes` authenticate the count against `size`, which turned
+    // that contradiction into a hard rejection: every GTA V compute capture failed to write with
+    // "invalid scalar-buffer bound metadata", losing the capture/replay tool entirely on that title.
+    // The empty descriptor's zero semantics are carried by `zero_record_raw`, not by this field.
+    if (descriptor.size_bytes == 0u) return 0u;
     if (use.kind != 1 || use.instruction_format != UINT32_MAX || use.use_pc >= dwords)
         return 0u;
     const Rdna2Inst consumer = rdna2_decode_one(code + use.use_pc, dwords - use.use_pc);
