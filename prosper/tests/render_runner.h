@@ -1570,6 +1570,27 @@ public:
                          static_cast<int>(result.wait_result));
             std::fflush(stderr);
         }
+        // A GRAPHICS submission that fails to submit or fails to complete is reported
+        // unconditionally, not only under the backend trace.
+        //
+        // Until now this was silent: the 5-second fence wait falls through to a blocking
+        // queue-wait-idle and says nothing, so a hung or lost graphics submission left no record at
+        // all. The compute backend, by contrast, reports its refusals loudly — with the result that
+        // a device loss discovered at compute's NEXT submit was read for days as "a compute dispatch
+        // hung the GPU", while the compute queue had in fact completed 705 of 705 fence waits with
+        // zero timeouts. The hang was never compute's; nothing on the graphics side was able to say
+        // so. See instrument trap 170.
+        if (result.submit_result != VK_SUCCESS || result.wait_result != VK_SUCCESS) {
+            static std::atomic<int> reported{0};
+            const int n = reported.fetch_add(1);
+            if (n < 16 || (n & 255) == 0)
+                std::fprintf(stderr,
+                             "[backend] GRAPHICS submission failed: submit=%d wait=%d "
+                             "command-buffers=%zu occurrence=%d\n",
+                             static_cast<int>(result.submit_result),
+                             static_cast<int>(result.wait_result),
+                             result.command_buffers, n + 1);
+        }
         const BackendSubmissionState state = backend_submission_state(
             result.submit_result == VK_SUCCESS,
             result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS);

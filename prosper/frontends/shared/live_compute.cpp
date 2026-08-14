@@ -7765,8 +7765,34 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (!vk_ok(compute_submit_rc, "queue-submit")) break;
         if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
+        const auto fence_wait_start = ComputeClock::now();
         const VkResult wait_result = vkWaitForFences(
             ctx.device, 1, &ctx.dispatch_fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
+        // Report a LONG wait even when it succeeds.
+        //
+        // A zero timeout count was read as proof that no compute dispatch hangs. That inference has a
+        // hole: an amdgpu context reset SIGNALS pending fences, so a dispatch the kernel watchdog
+        // killed can return VK_SUCCESS here and look indistinguishable from one that finished in
+        // microseconds — with the loss surfacing only at the NEXT submit. Duration is what separates
+        // them: a killed job sits at roughly the kernel's timeout (~10 s), a real one is sub-millisecond.
+        {
+            const double waited_ms = std::chrono::duration<double, std::milli>(
+                ComputeClock::now() - fence_wait_start).count();
+            if (waited_ms >= 100.0) {
+                static std::atomic<int> slow{0};
+                const int n = slow.fetch_add(1);
+                if (n < 24 || (n & 255) == 0)
+                    std::fprintf(stderr,
+                                 "[compute] SLOW fence wait %.1f ms result=%d program=0x%llx "
+                                 "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
+                                 waited_ms, static_cast<int>(wait_result),
+                                 static_cast<unsigned long long>(item.code_addr),
+                                 static_cast<unsigned long long>(item.submit_no),
+                                 static_cast<unsigned long long>(item.dispatch_index),
+                                 static_cast<unsigned long long>(item.command_order),
+                                 item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+            }
+        }
         if (!vk_ok(wait_result, "queue-wait")) {
             // cleanup() releases resources referenced by the command buffer, including a borrowed
             // renderer image's pin. With that image bound, in-flight work still references it and

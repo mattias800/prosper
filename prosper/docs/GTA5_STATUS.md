@@ -153,7 +153,42 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
-## NO COMPUTE DISPATCH EVER HANGS — the hard recovery originates elsewhere
+## CORRECTED AND CONVERGED: `0x413dc6700` dispatch 39 takes ~2 SECONDS, and the loss follows it
+
+Measuring the DURATION of every compute fence wait, and reporting any wait over 100 ms even when it
+succeeds, produced exactly one line in a whole route:
+
+```
+[compute] SLOW fence wait 2045.2 ms result=0 program=0x413dc6700 submit=8116 dispatch=39 order=14036 groups=9x1x1
+[compute] fatal Vulkan device loss stage=queue-submit … program=0x413dc6700 submit=8116 dispatch=40 order=14041
+```
+
+**One abnormal wait in the entire run — 2,045 ms against sub-millisecond for everything else — on the
+dispatch every other instrument has named, immediately followed by the device loss on the next
+dispatch.**
+
+Three independent instruments now converge on `0x413dc6700` dispatch 39: the trip-bound hit witness
+(`trips=4096`, block 9, the loop body), the fence-wait duration, and the loss ordering.
+
+### This corrects the section that used to be here
+
+That section argued "no compute dispatch ever hangs", from **0 fence-wait timeouts across 705 waits**.
+The count was right and the inference was wrong: the timeout is **30 seconds** and the event is **2
+seconds**, so a dispatch can be three orders of magnitude slower than every other one and still never
+trip it. A zero timeout count measures only "nothing exceeded 30 s" — it says nothing about whether
+anything is pathologically slow, which is the actual question.
+
+The alternative that motivated the check — that a context reset SIGNALS pending fences, so a killed
+job returns `VK_SUCCESS` and looks instant — remains untested and is no longer needed to explain
+anything.
+
+What survives from that section: the loss is still reported at `queue-submit` on the *next* dispatch,
+so the loss line alone never named the culprit. Instrument trap 170 stands as written about
+attribution; only the "not compute's" conclusion drawn from it was wrong.
+
+## Superseded: the earlier reframing
+
+### 
 
 Counted across every routed run in this investigation:
 
