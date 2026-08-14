@@ -170,6 +170,39 @@ Recorded so nobody re-derives them. Both looked convincing on one dispatch:
 correlation with cyclicity is currently the only handle on it, and pattern-hunting on derived metrics
 has stopped paying.
 
+### The corrupting writer's table stores are LANE-PREDICATED
+
+`0x413dc3400` disassembles to 882 dwords / 765 instructions, and its six table stores share one
+shape — a store to the table and a store to a second buffer at the *same index*, both inside an
+EXEC-predicated region:
+
+```text
+pc592  s_or_b64            s[106:107], s[16:17], s[14:15]
+pc593  s_and_saveexec_b64  (EXEC &= that; old EXEC saved to s[106:107])
+pc594  s_cbranch_execz     -> 599            ; skip the block if no lane qualifies
+pc595  buffer_store_dword  v42, v58, s[8:11] ; a second buffer
+pc597  buffer_store_dword  v48, v58, s[0:3]  ; THE TABLE, same index v58
+pc599  s_mov_b64           exec, s[106:107]  ; restore
+```
+
+Six such blocks: (595,597), (606,608), (618,620), (630,632), (642,644), (654,656).
+
+Two consequences worth having:
+
+1. **Which slots get written is decided by a per-lane mask**, so a divergence in EXEC handling shows
+   up as *missing or extra* stores rather than wrong values — which matches the observed defect
+   (records that are individually well-formed, in the wrong combination) far better than an
+   arithmetic error would.
+2. The program is lowered through `emit_cfg_state_machine` (it is on the `role=terminal` list), where
+   EXEC is emulated per invocation and `s_cbranch_execz` needs a cross-lane vote. That is the same
+   machinery the consumer's loop exercised — and a hand-built kernel proved it correct for *that*
+   shape (`tests/test_cfg_trip_bound.cpp`), which does not extend to `s_and_saveexec_b64` feeding a
+   predicated store.
+
+This is a hypothesis, not a result: no measurement yet shows a lane storing when it should not, or
+failing to. The next instrument would compare the set of slots written against the set the mask
+selects.
+
 ### The test that would upgrade correlation to cause
 
 Locate the 2-cycles in a resulting table and check whether they sit at slots the malformed writes
