@@ -5557,59 +5557,74 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             // the whole table: binding a partially populated descriptor array would let the guest's
             // own index select a slot prosper never resolved, which renders confidently wrong
             // content instead of failing visibly.
+            // The guest only guarantees the slots it actually selects. A record it never indexes on
+            // this dispatch may legitimately hold anything — GTA V's arena reuses the same 600-byte
+            // allocation, so unselected slots have been observed holding ordinary float data — and
+            // requiring EVERY slot to decode is a stronger contract than the guest's, which declined
+            // real tables. Bind a NULL descriptor for a slot that does not decode: RDNA2's own
+            // out-of-range contract returns zero through one, `ShaderBufferTableEntry` already models
+            // it, and it keeps the array's arity exact so the runtime index cannot land on a slot
+            // that was silently dropped. A table where NOTHING decodes is still declined — that is
+            // not a descriptor table at all.
             std::vector<ShaderBufferTableEntry> entries;
             entries.reserve(u.table_record_count);
-            bool table_ok = true;
-            for (uint32_t index = 0; index < u.table_record_count && table_ok; ++index) {
+            uint32_t resolved = 0;
+            for (uint32_t index = 0; index < u.table_record_count; ++index) {
                 const uint64_t entry_addr =
                     u.table_base + static_cast<uint64_t>(index) * u.table_entry_stride +
                     u.table_element_offset;
                 std::array<uint32_t, 4> words{};
-                if (!guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)))) {
-                    table_ok = false;
-                    break;
-                }
-                std::memcpy(words.data(),
-                            reinterpret_cast<const void*>(static_cast<uintptr_t>(entry_addr)),
-                            sizeof(words));
-                const DecodedBufferDescriptor entry = decode_buffer_descriptor(words.data());
-                if (entry.base <= 0x10000u || entry.size_bytes == 0u ||
-                    entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback) {
-                    table_ok = false;
-                    break;
+                DecodedBufferDescriptor entry{};
+                bool usable = guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)));
+                if (usable) {
+                    std::memcpy(words.data(),
+                                reinterpret_cast<const void*>(static_cast<uintptr_t>(entry_addr)),
+                                sizeof(words));
+                    entry = decode_buffer_descriptor(words.data());
+                    usable = entry.base > 0x10000u && entry.size_bytes != 0u &&
+                             entry.size_bytes <= 0x10000000u && !entry.forbid_unknown_fallback;
                 }
                 ShaderBufferTableEntry slot;
-                slot.vsharp = words;
-                slot.gpu_addr = entry.base;
-                slot.size = entry.size_bytes;
-                slot.stride = entry.stride;
+                if (usable) {
+                    slot.vsharp = words;
+                    slot.gpu_addr = entry.base;
+                    slot.size = entry.size_bytes;
+                    slot.stride = entry.stride;
+                    ++resolved;
+                }
                 entries.push_back(slot);
             }
-            if (!table_ok || entries.size() != u.table_record_count) {
+            if (resolved == 0u) {
                 if (std::getenv("PROSPER_DBG"))
                     std::fprintf(stderr,
                                  "[srt] selected-table pc=%u REJECTED base=0x%llx stride=%u "
-                                 "records=%u resolved=%zu\n",
+                                 "records=%u resolved=%u\n",
                                  u.use_pc, (unsigned long long)u.table_base, u.table_entry_stride,
-                                 u.table_record_count, entries.size());
+                                 u.table_record_count, resolved);
                 continue;
             }
             // A descriptor array is ONE Vulkan binding, so its declared element stride, format and
             // component count are shared by every entry — `valid_shader_buffer_table_contract`
             // requires exactly that. Derive them from the entries and reject a heterogeneous table
             // rather than picking one entry's shape and binding the rest through it.
-            const DecodedBufferDescriptor first =
-                decode_buffer_descriptor(entries.front().vsharp.data());
+            // Null slots carry no shape, so they neither define nor contradict the array's element
+            // contract; compare only the slots that resolved.
+            DecodedBufferDescriptor first{};
+            bool have_first = false;
             bool homogeneous = true;
             uint32_t widest = 0u;
             for (const ShaderBufferTableEntry& slot : entries) {
+                if (!slot.gpu_addr && !slot.size) continue;      // null slot
                 const DecodedBufferDescriptor entry =
                     decode_buffer_descriptor(slot.vsharp.data());
-                homogeneous &= entry.stride == first.stride &&
-                               entry.format == first.format &&
-                               entry.num_components == first.num_components;
+                if (!have_first) { first = entry; have_first = true; }
+                else
+                    homogeneous &= entry.stride == first.stride &&
+                                   entry.format == first.format &&
+                                   entry.num_components == first.num_components;
                 widest = std::max(widest, slot.size);
             }
+            homogeneous &= have_first;
             if (!homogeneous) {
                 if (std::getenv("PROSPER_DBG"))
                     std::fprintf(stderr,
