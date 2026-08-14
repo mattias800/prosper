@@ -5569,21 +5569,51 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             std::vector<ShaderBufferTableEntry> entries;
             entries.reserve(u.table_record_count);
             uint32_t resolved = 0;
+            bool unsupported_record = false;
             for (uint32_t index = 0; index < u.table_record_count; ++index) {
                 const uint64_t entry_addr =
                     u.table_base + static_cast<uint64_t>(index) * u.table_entry_stride +
                     u.table_element_offset;
                 std::array<uint32_t, 4> words{};
                 DecodedBufferDescriptor entry{};
-                bool usable = guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)));
-                if (usable) {
+                // TWO different conditions, deliberately kept apart. Nulling a slot is only sound
+                // when the record is not a descriptor at all -- a stale arena slot the guest never
+                // indexes. A record that decodes as a plausible V# prosper merely cannot SUPPORT is
+                // prosper's gap, and nulling it would let an in-range guest index read zeros with
+                // full confidence. The RDNA2 out-of-range argument does not cover that case: an
+                // out-of-range index returns zero by hardware rule, but an in-range index into a
+                // descriptor we declined to decode is not out of range.
+                bool readable = guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)));
+                bool not_a_descriptor = !readable;
+                bool unsupported_descriptor = false;
+                if (readable) {
                     std::memcpy(words.data(),
                                 reinterpret_cast<const void*>(static_cast<uintptr_t>(entry_addr)),
                                 sizeof(words));
                     entry = decode_buffer_descriptor(words.data());
-                    usable = entry.base > 0x10000u && entry.size_bytes != 0u &&
-                             entry.size_bytes <= 0x10000000u && !entry.forbid_unknown_fallback;
+                    not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
+                    unsupported_descriptor = !not_a_descriptor &&
+                        (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
                 }
+                if (unsupported_descriptor) {
+                    // Decline the WHOLE table, as before this change. A >256 MiB buffer or an
+                    // unrepresentable DST_SEL / USCALED-SSCALED 2_10_10_10 is a descriptor the guest
+                    // may well select.
+                    if (std::getenv("PROSPER_DBG"))
+                        std::fprintf(stderr,
+                                     "[srt] selected-table pc=%u REJECTED unsupported-record "
+                                     "index=%u base=0x%llx size=%u fallback=%d\n",
+                                     u.use_pc, index, (unsigned long long)entry.base,
+                                     entry.size_bytes, (int)entry.forbid_unknown_fallback);
+                    unsupported_record = true;
+                    break;
+                }
+                const bool usable = !not_a_descriptor;
+                if (!usable && std::getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[srt] selected-table pc=%u NULL-SLOT index=%u "
+                                 "words=%08x:%08x:%08x:%08x\n",
+                                 u.use_pc, index, words[0], words[1], words[2], words[3]);
                 ShaderBufferTableEntry slot;
                 if (usable) {
                     slot.vsharp = words;
@@ -5594,6 +5624,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 }
                 entries.push_back(slot);
             }
+            if (unsupported_record) continue;
             if (resolved == 0u) {
                 if (std::getenv("PROSPER_DBG"))
                     std::fprintf(stderr,
@@ -5666,9 +5697,10 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             if (std::getenv("PROSPER_DBG"))
                 std::fprintf(stderr,
                              "[srt] selected-table pc=%u producer=%u base=0x%llx stride=%u "
-                             "records=%u element=+0x%x\n",
+                             "records=%u resolved=%u element=+0x%x\n",
                              u.use_pc, u.table_load_pc, (unsigned long long)u.table_base,
-                             u.table_entry_stride, u.table_record_count, u.table_element_offset);
+                             u.table_entry_stride, u.table_record_count, resolved,
+                             u.table_element_offset);
             table.resources.push_back(r);
             continue;
         }

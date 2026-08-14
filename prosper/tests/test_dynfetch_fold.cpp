@@ -2758,6 +2758,72 @@ int main() {
                selected_table_short_resource->table_index_count == 0u),
           "an element that does not fit its record publishes no descriptor table");
 
+    // #2534: a slot whose record is NOT A DESCRIPTOR binds null; a table where nothing decodes is
+    // still declined. Same fixture, one record overwritten with the exact float garbage a live
+    // arena slot holds (`size_bytes == 0`), which is what an unselected stale slot looks like.
+    auto selected_table_with_garbage = [&](const std::vector<uint32_t>& garbage_entries,
+                                           const ShaderResource** out_resource,
+                                           std::vector<uint32_t>* out_spirv) {
+        static uint32_t records[5][30]{};
+        static ShaderResourceTable rt;
+        rt = ShaderResourceTable{};
+        std::memcpy(records, selected_table_records, sizeof(selected_table_records));
+        for (uint32_t entry : garbage_entries) {
+            records[entry][2] = 0x00000000u;   // base low
+            records[entry][3] = 0x00000000u;   // base high / stride -> base 0, stride 0
+            records[entry][4] = 0x3f800000u;   // NUM_RECORDS read as 1.0f
+            records[entry][5] = 0x00000000u;
+        }
+        const uint64_t base = reinterpret_cast<uint64_t>(records);
+        static uint32_t seed[16]{};
+        std::memcpy(seed, selected_table_seed, sizeof(selected_table_seed));
+        seed[0] = static_cast<uint32_t>(base);
+        seed[1] = (static_cast<uint32_t>(base >> 32) & 0xffffu) | (120u << 16);
+        add_compute_buffer_resources(rt, selected_table_shader.data(),
+                                     selected_table_shader.size(), seed, std::size(seed));
+        assign_convention_bindings(rt, 2);
+        ComputeShaderConfig config;
+        config.user_sgprs.assign(seed, seed + std::size(seed));
+        config.local_x = config.local_y = config.local_z = 1;
+        *out_spirv = recompile_compute(selected_table_shader.data(),
+                                       selected_table_shader.size(), &rt, config);
+        *out_resource = rt.by_fetch_pc(5u);
+    };
+
+    const ShaderResource* one_null_resource = nullptr;
+    std::vector<uint32_t> one_null_spirv;
+    selected_table_with_garbage({2u}, &one_null_resource, &one_null_spirv);
+    bool one_null_shape = one_null_resource &&
+        one_null_resource->table_entries.size() == 5u &&
+        one_null_resource->table_index_count == 5u;
+    if (one_null_shape)
+        for (uint32_t entry = 0; entry < 5u; ++entry) {
+            const auto& slot = one_null_resource->table_entries[entry];
+            if (entry == 2u)
+                one_null_shape &= slot.gpu_addr == 0u && slot.size == 0u;
+            else
+                one_null_shape &= slot.gpu_addr ==
+                        reinterpret_cast<uint64_t>(selected_table_payload[entry]) &&
+                    slot.size == 64u && slot.stride == 16u;
+        }
+    CHECK(one_null_shape && !one_null_spirv.empty(),
+          "an undecodable record binds a null slot and keeps the array's arity exact");
+
+    // Every record garbage -> nothing resolves -> the table must still be DECLINED. This asserts the
+    // OBSERVABLE behaviour, and it is worth being precise about what it does not assert: it does not
+    // isolate the `resolved == 0` guard. Measured by deleting that guard and re-running -- the arm
+    // still passes, because with no resolved slot the array has no element shape to derive and the
+    // table is already declined further down. So `resolved == 0` is a redundant belt here rather
+    // than the load-bearing check, the same way the reviewer observed `homogeneous &= have_first`
+    // is. Recording that instead of claiming a mutation proof the arm cannot give.
+    const ShaderResource* all_null_resource = nullptr;
+    std::vector<uint32_t> all_null_spirv;
+    selected_table_with_garbage({0u, 1u, 2u, 3u, 4u}, &all_null_resource, &all_null_spirv);
+    CHECK(all_null_resource == nullptr ||
+              all_null_resource->table_index_count == 0u ||
+              all_null_resource->table_entries.empty(),
+          "a table in which NOTHING decodes is declined, not bound as five null slots");
+
     // GTA V's 0x413ce6000/0x413ce6d00 programs load a four-dword V# through an S_BUFFER_LOAD whose
     // VCC-derived SOFFSET is intentionally unknown to this CPU fold. The outer V# is fully known and
     // has NUM_RECORDS=0, while the positive immediate begins beyond its effective scalar bound: publish
