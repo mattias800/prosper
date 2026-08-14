@@ -711,6 +711,73 @@ int main() {
                       "a truncated atomic that still ends at the module boundary is not the witness "
                       "(an exact operand count catches what a bounds check cannot)");
             }
+
+            // (d) The witness OpVariable given a non-canonical length. The builder emits it as four
+            //     words with no initializer; a six-word form is a different declaration, and every
+            //     other instruction this predicate consumes as proof is already length-exact.
+            {
+                std::vector<uint32_t> long_variable = emitted;
+                bool lengthened = false;
+                for (size_t word = 5; word < long_variable.size();) {
+                    const uint32_t op = long_variable[word] & 0xffffu;
+                    const uint32_t len = long_variable[word] >> 16;
+                    if (!len) break;
+                    if (op == OpVariableOp && len == 4 && long_variable[word + 2] == witness_var) {
+                        long_variable[word] = (6u << 16) | OpVariableOp;
+                        long_variable.insert(long_variable.begin() + word + 4, {0u, 0u});
+                        lengthened = true;
+                        break;
+                    }
+                    word += len;
+                }
+                CHECK(lengthened,
+                      "the emitted witness OpVariable is four words (arm precondition)");
+                CHECK(lengthened && !spirv_writes_trip_witness(long_variable),
+                      "a witness OpVariable of non-canonical length is not the witness");
+            }
+
+            // (e) and (f) pin the two AccessChain conditions the rebased-pointer arm does NOT reach.
+            //     That arm only discriminates the BASE; relaxing the shape back to `len >= 5` and
+            //     dropping the member-zero check left the whole test green. One arm per condition.
+            {
+                // (e) member-zero index replaced by the slot constant: right base, right last index,
+                //     wrong shape.
+                std::vector<uint32_t> wrong_member = emitted;
+                bool remembered = false;
+                for (size_t word = 5; word < wrong_member.size();) {
+                    const uint32_t op = wrong_member[word] & 0xffffu, len = wrong_member[word] >> 16;
+                    if (!len) break;
+                    if (op == OpAccessChainOp && len == 6 && wrong_member[word + 3] == witness_var &&
+                        slot_ids.count(wrong_member[word + 5])) {
+                        wrong_member[word + 4] = wrong_member[word + 5];
+                        remembered = true;
+                    }
+                    word += len;
+                }
+                CHECK(remembered,
+                      "the emitted witness access chain is base/member-0/slot (arm precondition)");
+                CHECK(remembered && !spirv_writes_trip_witness(wrong_member),
+                      "an access chain whose first index is not member zero is not the witness");
+
+                // (f) an extra index appended: right base, right member-zero, wrong word count.
+                std::vector<uint32_t> long_chain = emitted;
+                bool extended = false;
+                for (size_t word = 5; word < long_chain.size();) {
+                    const uint32_t op = long_chain[word] & 0xffffu, len = long_chain[word] >> 16;
+                    if (!len) break;
+                    if (op == OpAccessChainOp && len == 6 && long_chain[word + 3] == witness_var &&
+                        slot_ids.count(long_chain[word + 5])) {
+                        long_chain[word] = (7u << 16) | OpAccessChainOp;
+                        long_chain.insert(long_chain.begin() + word + 6, long_chain[word + 4]);
+                        extended = true;
+                        break;
+                    }
+                    word += len;
+                }
+                CHECK(extended && !spirv_writes_trip_witness(long_chain),
+                      "an access chain with an extra index is not the witness "
+                      "(the exact word count is load-bearing, not the operand minimum)");
+            }
         }
     }
 

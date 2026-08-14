@@ -16612,6 +16612,7 @@ bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv) {
     constexpr uint32_t DecorationBinding = 33, DecorationDescriptorSet = 34;
     // Exact word counts for the forms consumed below (opcode word included).
     constexpr uint32_t kDecorateLiteralWords = 4;      // OpDecorate target decoration literal
+    constexpr uint32_t kVariableWords = 4;             // result-type result storage-class, NO init
     constexpr uint32_t kAccessChainWords = 6;          // result-type result base member-0 slot
     constexpr uint32_t kAtomicUMaxWords = 7;           // result-type result pointer scope sem value
 
@@ -16621,7 +16622,10 @@ bool spirv_writes_trip_witness(const std::vector<uint32_t>& spirv) {
     for (size_t word = 5; word < spirv.size();) {
         const uint32_t op = spirv[word] & 0xffffu, len = spirv[word] >> 16;
         if (!len || word + len > spirv.size()) return false;   // truncated stream: fail closed
-        if (op == OpVariable && len >= 4) {
+        // EXACT, like every other instruction consumed as proof. The builder emits the internal-GDS
+        // variable as four words with no initializer; a longer OpVariable is a different declaration
+        // and this predicate has no business reasoning about it.
+        if (op == OpVariable && len == kVariableWords) {
             variables.insert(spirv[word + 2]);
         } else if (op == OpDecorate && len == kDecorateLiteralWords) {
             const uint32_t target = spirv[word + 1], value = spirv[word + 3];
