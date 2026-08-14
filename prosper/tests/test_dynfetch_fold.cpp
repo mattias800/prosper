@@ -2671,6 +2671,44 @@ int main() {
         zero_record_sbuffer_seed + std::size(zero_record_sbuffer_seed));
     zero_record_sbuffer_config.local_x = zero_record_sbuffer_config.local_y =
         zero_record_sbuffer_config.local_z = 1;
+    // #2528: an EMPTY V# with a REAL BASE must not carry a resource-level scalar bound. `size` is
+    // zero for such a resource, so a carried count of one contradicts its own footprint — and since
+    // #2529 made `shader_resource_buffer_binding_bytes` authenticate the count against `size`, that
+    // contradiction is a hard rejection. This is precisely the invariant the capture writer enforces
+    // before serializing, and violating it made every GTA V compute capture fail to write with
+    // "invalid scalar-buffer bound metadata", losing capture/replay on the title entirely.
+    //
+    // The base must be real: a zero-base V# is discarded by the builder long before any scalar bound
+    // is considered, so a fixture built on one asserts over an empty resource list and cannot fail.
+    alignas(16) static uint32_t empty_bound_backing[4] = {1u, 2u, 3u, 4u};
+    const uint64_t empty_bound_base = reinterpret_cast<uint64_t>(empty_bound_backing);
+    uint32_t empty_bound_seed[8]{};
+    empty_bound_seed[4] = static_cast<uint32_t>(empty_bound_base);
+    empty_bound_seed[5] = static_cast<uint32_t>(empty_bound_base >> 32) & 0xffffu;  // stride 0
+    empty_bound_seed[6] = 0u;                                                       // NUM_RECORDS 0
+    empty_bound_seed[7] = 0u;
+    // Immediate ZERO, unlike the chain above: with a positive immediate the fold proves the access
+    // wholly out of range and takes the zero-record marker path, which never attaches a scalar bound
+    // — so that shape cannot exercise this invariant at all.
+    const uint32_t empty_bound_chain[] = {
+        0x7ed40500u,              // v_readfirstlane_b32 vcc_lo, v0  (fold-unknown SOFFSET)
+        0xf4280202u, 0xd4000000u, // s_buffer_load_dwordx4 s[8:11], s[4:7], vcc_lo offset:0
+        0xe0382000u, 0x80020006u, // buffer_load_dwordx4 v[0:3], v6, s[8:11], 0
+        0xbf810000u,
+    };
+    ShaderResourceTable empty_bound_table;
+    add_compute_buffer_resources(empty_bound_table, empty_bound_chain,
+                                 std::size(empty_bound_chain), empty_bound_seed,
+                                 std::size(empty_bound_seed));
+    bool empty_bound_consistent = true;
+    for (const ShaderResource& resource : empty_bound_table.resources)
+        empty_bound_consistent &=
+            !resource.scalar_buffer_dword_count ||
+            shader_resource_buffer_binding_bytes(resource) != 0u;
+    CHECK(empty_bound_consistent,
+          "an empty V# publishes no scalar-buffer bound the capture writer would reject");
+
+
     const std::vector<uint32_t> zero_record_sbuffer_spirv = recompile_compute(
         zero_record_sbuffer_chain, std::size(zero_record_sbuffer_chain),
         &zero_record_sbuffer_table, zero_record_sbuffer_config);
