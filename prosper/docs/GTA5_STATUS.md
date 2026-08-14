@@ -26,19 +26,29 @@ PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700
 
 `0x413dc6700` hangs the GPU into a RADV **hard recovery** at `queue-submit`. prosper then disables
 live compute for the whole process, and every later dispatch and indirect draw in the frame is
-refused — so the frame cannot recover even partially. Skipping that one program removes the world
-geometry but lets everything else render, which both localises the defect and says what the program
-probably is: 43 resources, `threads=2063x1x1 local=256x1x1 groups=9x1x1`, 61,143 SPIR-V dwords — the
-shape of a tiled deferred lighting or light-culling pass.
+refused — so the frame cannot recover even partially.
+
+**Read that skipped-program frame carefully: it is not "the frame minus that dispatch".** A skip goes
+through the same decline path as a real refusal, so it clears `producer_epoch_ok` and the next
+`ParserStall` latches `indirect_dependencies_ok` for the rest of the submit. The frame is that frame
+minus the dispatch *minus every indirect draw and dispatch after the next parser stall*. The zero
+device losses and the appearance of real scene content are unaffected by this; what it costs is the
+right to attribute the *remaining* blackness in that image to `0x413dc6700` alone.
+
+What the program probably is, from what survives without it: 43 resources,
+`threads=2063x1x1 local=256x1x1 groups=9x1x1`, 61,143 SPIR-V dwords, and sky/flare/radar render while
+world geometry does not — the shape of a tiled deferred lighting or light-culling pass.
 
 **The frontier is therefore exactly one sentence: `0x413dc6700` must execute without hanging.**
 
 ### Why this took so long to see
 
 Until #2538 the live compute backend had **fifteen** `return false` paths in `execute_item()` that were
-silent, `trace`-gated, or logged without naming the dispatch. Every one of them reached the executor as
-`RealizationFailureReason::ComputeExecutionDeclined` — "the backend refused, and nothing recorded
-why". A gameplay submit's 196 realization failures were 59 anonymous declines and 128 cascade
+silent, `trace`-gated, or logged without naming the dispatch. The executor records such a refusal as
+`RealizationFailureReason::Unknown`, and **only when a capture trace is active** — so on a default run
+a refused dispatch left no record at all. (`ComputeExecutionDeclined`, which an earlier revision of
+this file named, is a classification added later by #2536; it did not exist when the frame went
+black.) A gameplay submit's 196 realization failures were 59 anonymous declines and 128 cascade
 failures, and the cascade hid the cause:
 
 1. a declined dispatch clears `producer_epoch_ok`
