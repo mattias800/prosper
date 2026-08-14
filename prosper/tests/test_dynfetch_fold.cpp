@@ -2703,6 +2703,41 @@ int main() {
               selected_table_entries_exact && !selected_table_spirv.empty(),
           "a dynamic scalar offset publishes its whole declared descriptor table");
 
+    // GTA V's real tables carry DST_SEL 0x3ac (X,Y,Z,1) rather than the identity 0xfac, because the
+    // selected buffers are three-component. Every consumer this path admits is an UNTYPED load, for
+    // which DST_SEL and the data format are inert -- the emitter states that untyped ops move raw
+    // dwords regardless of the V#'s declared format -- so the swizzle must not decide whether the
+    // table can be bound at all. Same table, same shader, only the selector word differs.
+    alignas(16) static uint32_t selected_table_xyz1[5][30]{};
+    std::memcpy(selected_table_xyz1, selected_table_records, sizeof(selected_table_records));
+    for (uint32_t entry = 0; entry < 5u; ++entry)
+        selected_table_xyz1[entry][5] = 0x3acu | (20u << 12u);
+    const uint64_t selected_table_xyz1_base = reinterpret_cast<uint64_t>(selected_table_xyz1);
+    uint32_t selected_table_xyz1_seed[16]{};
+    std::memcpy(selected_table_xyz1_seed, selected_table_seed, sizeof(selected_table_seed));
+    selected_table_xyz1_seed[0] = static_cast<uint32_t>(selected_table_xyz1_base);
+    selected_table_xyz1_seed[1] =
+        (static_cast<uint32_t>(selected_table_xyz1_base >> 32) & 0xffffu) | (120u << 16);
+    ShaderResourceTable selected_table_xyz1_rt;
+    add_compute_buffer_resources(
+        selected_table_xyz1_rt, selected_table_shader.data(), selected_table_shader.size(),
+        selected_table_xyz1_seed, std::size(selected_table_xyz1_seed));
+    assign_convention_bindings(selected_table_xyz1_rt, 2);
+    const ShaderResource* selected_table_xyz1_resource =
+        selected_table_xyz1_rt.by_fetch_pc(5u);
+    ComputeShaderConfig selected_table_xyz1_config = selected_table_config;
+    selected_table_xyz1_config.user_sgprs.assign(
+        selected_table_xyz1_seed,
+        selected_table_xyz1_seed + std::size(selected_table_xyz1_seed));
+    const std::vector<uint32_t> selected_table_xyz1_spirv = recompile_compute(
+        selected_table_shader.data(), selected_table_shader.size(), &selected_table_xyz1_rt,
+        selected_table_xyz1_config);
+    CHECK(selected_table_xyz1_resource &&
+              selected_table_xyz1_resource->table_index_count == 5u &&
+              selected_table_xyz1_resource->table_entries.size() == 5u &&
+              !selected_table_xyz1_spirv.empty(),
+          "a three-component DST_SEL still binds its descriptor table for untyped loads");
+
     // Same-site mutation: shrink the outer V# so the element at +8 no longer fits inside one
     // record. The selection is then not expressible as an array index and must fail visibly rather
     // than binding a differently-shaped table.
