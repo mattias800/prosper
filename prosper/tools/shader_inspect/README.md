@@ -36,6 +36,28 @@ spirv-val --target-env vulkan1.2 ~/prosper-shaders/target.spv
 The destination directory must already exist. As with raw shader dumps, the resulting SPIR-V is
 title-derived diagnostic data: keep it local and do not commit it.
 
+`PROSPER_COMPUTELOG_RAW=PATH` is the other half of that pair, and it is the one `shader_inspect`
+consumes: it writes the **guest RDNA2 bytes** of the same traced program, so "what did the guest
+write" and "what did we emit" can be compared for one address in a single run.
+
+```sh
+PROSPER_COMPUTELOG_CODE=0x413dc6700 \
+PROSPER_COMPUTELOG_RAW=~/work/target.bin \
+PROSPER_COMPUTELOG_SPIRV=~/work/target.spv \
+  ./build-linux/prosper-app <DUMP_ROOT>/<TITLE_ID>-app0
+./build-linux/shader_inspect ~/work/target.bin        # guest ISA, with resolved branch targets
+```
+
+Reach for it whenever the question is about **control flow** — where the loops are, what a loop's
+exits are, whether a branch is backward. `PROSPER_SHADER_DUMP_SUCCESS` also writes raw `.bin` files,
+but its filenames carry only hashes, so recovering the program at a known *address* from that
+directory means hash-matching by hand. The program length is re-derived by decoding to the program's
+own terminator rather than trusted, and a run prints what it wrote:
+
+```text
+[compute]   traced raw program=0x413dc6700 dwords=903 instructions=781 window=262144 path=... result=written
+```
+
 The first hash identifies the translated SPIR-V and the second identifies the exact raw RDNA2 stream.
 Pass the `.bin` file to `shader_inspect`; use the adjacent `.spv` for SPIR-V disassembly or validation.
 The dump directory is created automatically. `vs`, `ps`, and `cs` identify vertex, pixel, and compute stages.

@@ -14,6 +14,7 @@
 #include "gpu/bc_decode.hpp"
 #include "gpu/gpu_capture.hpp"
 #include "gpu/gpu_execute.hpp"
+#include "gpu/rdna2_decode.hpp"
 #include "gpu/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/shader_resources.hpp"
 #include "gpu/spirv_builder.hpp"
@@ -4033,6 +4034,58 @@ void maybe_dump_traced_compute_spirv(const prosper::gpu::ComputeItem& item, bool
                  ok ? "written" : "failed");
 }
 
+// The raw-guest half of PROSPER_COMPUTELOG_SPIRV. That switch answers "what did we emit"; this one
+// answers "what did the guest actually write", which is the only ground truth for a control-flow
+// question and the exact input `tools/shader_inspect` decodes. Without it the guest ISA for a live
+// program can only be recovered by hash-matching a PROSPER_SHADER_DUMP_SUCCESS directory, because
+// those filenames carry no code address -- so the two halves of a divergence could not be compared.
+//
+// The length is re-derived here rather than trusted: read what guest memory will actually give us,
+// then let the decoder walk to the program's own terminator. A truncated tail is written as what it
+// is (the walk stops), never padded, so an inspect of the result cannot silently disassemble bytes
+// that were never proven readable. CONFIDENCE: HIGH.
+void maybe_dump_traced_compute_raw(const prosper::gpu::ComputeItem& item, bool trace) {
+    const char* path = std::getenv("PROSPER_COMPUTELOG_RAW");
+    if (!trace || !path || !*path || !item.code_addr) return;
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> dumped;
+    std::lock_guard lock(mutex);
+    if (dumped.contains(item.code_addr)) return;
+
+    // Probe downward so an unmapped tail costs a smaller window rather than the whole dump.
+    size_t readable_bytes = 0;
+    for (size_t candidate = 256u * 1024u; candidate >= 256u; candidate /= 2u) {
+        if (prosper::gpu::guest_readable(item.code_addr, static_cast<uint32_t>(candidate))) {
+            readable_bytes = candidate;
+            break;
+        }
+    }
+    if (!readable_bytes) {
+        std::fprintf(stderr, "[compute]   traced raw program=0x%llx result=unreadable\n",
+                     static_cast<unsigned long long>(item.code_addr));
+        dumped.insert(item.code_addr);
+        return;
+    }
+
+    const uint32_t* code = reinterpret_cast<const uint32_t*>(uintptr_t(item.code_addr));
+    std::vector<prosper::gpu::Rdna2Inst> instructions;
+    const size_t consumed = prosper::gpu::rdna2_walk(code, readable_bytes / sizeof(uint32_t),
+                                                     instructions);
+    const size_t bytes = consumed * sizeof(uint32_t);
+    bool ok = false;
+    if (bytes) {
+        FILE* file = std::fopen(path, "wb");
+        ok = file && std::fwrite(code, 1, bytes, file) == bytes;
+        if (file && std::fclose(file) != 0) ok = false;
+    }
+    if (ok) dumped.insert(item.code_addr);
+    std::fprintf(stderr,
+                 "[compute]   traced raw program=0x%llx dwords=%zu instructions=%zu window=%zu "
+                 "path=%s result=%s\n",
+                 static_cast<unsigned long long>(item.code_addr), consumed, instructions.size(),
+                 readable_bytes, path, ok ? "written" : "failed");
+}
+
 std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item) {
     using prosper::gpu::ComputeCpuFastPath;
     using prosper::gpu::ResourceClass;
@@ -4236,6 +4289,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     const std::vector<uint32_t>& spirv = item.spirv;
     const bool trace = trace_compute_item(item);
     maybe_dump_traced_compute_spirv(item, trace);
+    maybe_dump_traced_compute_raw(item, trace);
     // Deliberately below the trace and SPIR-V dump: a skipped dispatch must still be observable by
     // the other instruments, so a run can answer "what would this program have been?" without also
     // running the dispatch that is under suspicion. That combination — dump the module, skip the
@@ -8923,8 +8977,15 @@ void report_trip_bound_witness(const prosper::gpu::ComputeItem& item) {
     if (!gds) return;
     uint32_t* witness = reinterpret_cast<uint32_t*>(gds) + prosper::gpu::kComputeTripWitnessDword;
     if (!witness[0]) return;
+    // `next-guest-pc`, not a block ordinal: witness[2] is the dispatcher's pc_var, the GUEST program
+    // counter it was about to dispatch when the cap ran out. This line used to call it `last-block`,
+    // and that one word cost a wrong conclusion — a value of 14 was read as "basic block 14", mapped
+    // onto the block containing the guest's loop body, and reported as "the guest's loop is spinning".
+    // Guest pc 14 is in the PROLOGUE. The number was right and the label made it mean the opposite of
+    // what it says: that the state machine is re-entering a pc it has already run, rather than
+    // iterating a loop the guest wrote.
     std::fprintf(stderr,
-                 "[cfg-trip-bound] HIT program=0x%llx phase=%u last-block=%u trips=%u "
+                 "[cfg-trip-bound] HIT program=0x%llx phase=%u next-guest-pc=%u trips=%u "
                  "submit=%llu dispatch=%llu order=%llu groups=%ux%ux%u\n",
                  static_cast<unsigned long long>(item.code_addr), witness[1], witness[2], witness[3],
                  static_cast<unsigned long long>(item.submit_no),
