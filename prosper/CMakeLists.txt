@@ -1596,6 +1596,11 @@ if(TARGET prosper_core)
       set_tests_properties(gds_scan_memo_disabled PROPERTIES
                            ENVIRONMENT "PROSPER_NO_GDS_SCAN_MEMO=1")
 
+      # The EXEC-driven pointer-chasing loop shape GTA V hangs on, plus PROSPER_CFG_TRIP_BOUND.
+      add_executable(test_cfg_trip_bound tests/test_cfg_trip_bound.cpp)
+      target_link_libraries(test_cfg_trip_bound PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME cfg_trip_bound_exec COMMAND test_cfg_trip_bound)
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       add_executable(test_recompiled_fragment tests/test_recompiled_fragment.cpp)
       target_link_libraries(test_recompiled_fragment PRIVATE prosper_core Vulkan::Vulkan)

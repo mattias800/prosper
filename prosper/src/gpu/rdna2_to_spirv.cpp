@@ -16402,70 +16402,85 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 //
 // A loop that never terminates hangs the GPU into a driver reset, which costs the whole process its
 // compute backend and every later indirect draw — and from outside it is indistinguishable from a
-// slow shader or from a defect anywhere else in the submit. Bounding every loop turns "is this a
-// non-terminating loop at all?" into one run, and covering all three emitters means the answer is
-// not confined to one lowering path.
+// slow shader or from a defect anywhere else in the submit. Bounding the dispatcher's loop turns
+// "is this a non-terminating loop at all?" into one run for the programs it covers.
+//
+// (This paragraph used to end "and covering all three emitters means the answer is not confined to
+// one lowering path" — the very claim the paragraph above corrects. The correction landed two lines
+// up and the boast survived underneath it, which is how a retracted statement keeps being read as
+// current. `tests/test_cfg_trip_bound.cpp` now pins both halves: a structured loop is unchanged when
+// armed, a dispatcher loop is not.)
 //
 // Unset, nothing is emitted and modules are byte-identical. It is NOT a fix: truncating a guest
 // program's control flow produces wrong results by construction, which is why it is opt-in and says
 // so when it arms.
 // See kComputeTripWitnessDword. Deliberately ignores the phase selector: if ANY phase of this program
 // will be bounded, the witness destination has to be bound for the whole dispatch.
-bool compute_trip_witness_active(uint64_t program_address) {
+// The complete selector state, read fresh rather than cached in function-local statics.
+//
+// Two reasons it is a struct and not three scattered getenv sites. First, the shader cache is keyed
+// on the program's CODE BYTES and never on its address, so a target and a non-target with the same
+// body collide on one entry: whichever compiled first would serve the other, handing the bounded
+// module to an excluded program or the unbounded module to the target. Either direction silently
+// destroys the isolation that makes a bounded run evidence about ONE program. The cache key therefore
+// mixes this whole struct in (see gpu_executor.cpp), and a struct is what makes that complete by
+// construction — a future selector added here cannot be forgotten there.
+//
+// Second, function-local statics parse the environment exactly once per process, which makes the
+// selectors untestable in-process: no test could arm a bound, assert, then disarm and assert again.
+// Re-reading costs three getenv calls per emitted loop during RECOMPILATION only (never per draw or
+// per dispatch — cf. #2214, which removed per-resource-per-draw getenv from the live renderer), and
+// recompiles are cache-warm after the first. CONFIDENCE: HIGH.
+ComputeTripBoundSettings compute_trip_bound_settings() {
+    ComputeTripBoundSettings settings;
     const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
-    if (!spec || !*spec) return false;
+    if (!spec || !*spec) return settings;
     char* end = nullptr;
     const unsigned long long parsed = strtoull(spec, &end, 0);
-    if (!end || *end || !parsed || parsed > 0xffffffffull) return false;
-    const char* only = getenv("PROSPER_CFG_TRIP_BOUND_PROGRAM");
-    if (!only || !*only) return true;
-    char* only_end = nullptr;
-    const unsigned long long wanted = strtoull(only, &only_end, 0);
-    if (!only_end || *only_end) return true;
-    return program_address == wanted;
-}
+    if (!end || *end || !parsed || parsed > 0xffffffffull) return settings;
+    settings.bound = static_cast<uint32_t>(parsed);
 
-uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
-                                uint32_t start_pc, uint32_t end_pc) {
-    static const uint32_t bound = [] {
-        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
-        if (!spec || !*spec) return 0u;
-        char* end = nullptr;
-        const unsigned long long parsed = strtoull(spec, &end, 0);
-        if (!end || *end || !parsed || parsed > 0xffffffffull) return 0u;
-        return static_cast<uint32_t>(parsed);
-    }();
     // PROSPER_CFG_TRIP_BOUND_PROGRAM=0xADDR — restrict the bound to ONE program, leaving every other
-    // recompiled module byte-identical.
-    //
-    // Without this, a bound low enough to be interesting truncates *many* shaders, and any later
-    // change of behaviour has a second explanation: an earlier truncated shader fed different data
-    // downstream. Targeting one program removes that alternative, which is what turns "the run got
-    // further" into evidence about the program under test.
-    static const uint64_t only_program = [] {
-        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND_PROGRAM");
-        if (!spec || !*spec) return 0ull;
-        char* end = nullptr;
-        const unsigned long long parsed = strtoull(spec, &end, 0);
-        return (!end || *end) ? 0ull : parsed;
-    }();
+    // recompiled module byte-identical. Without it, a bound low enough to be interesting truncates
+    // MANY shaders, and any later change of behaviour has a second explanation: an earlier truncated
+    // shader fed different data downstream. Targeting one program removes that alternative, which is
+    // what turns "the run got further" into evidence about the program under test.
+    if (const char* only = getenv("PROSPER_CFG_TRIP_BOUND_PROGRAM"); only && *only) {
+        char* only_end = nullptr;
+        const unsigned long long wanted = strtoull(only, &only_end, 0);
+        if (only_end && !*only_end) settings.only_program = wanted;
+    }
     // PROSPER_CFG_TRIP_BOUND_PHASE=K — bound only the K-th dispatcher of the selected program.
     //
     // A barrier-phased compute program emits one dispatcher per barrier-free phase, each covering a
     // different guest pc range. Bounding them together answers "does some loop in this program run
     // away" but not which, and they are not equivalent: an acyclic phase that needs a bound is a CFG
     // state-transition defect, while the phase containing the guest's own loop might merely be slow.
-    static const uint32_t only_phase = [] {
-        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND_PHASE");
-        if (!spec || !*spec) return 0xffffffffu;
-        char* end = nullptr;
-        const unsigned long long parsed = strtoull(spec, &end, 0);
-        return (!end || *end || parsed > 0xfffffffeull) ? 0xffffffffu
-                                                        : static_cast<uint32_t>(parsed);
-    }();
+    if (const char* phase = getenv("PROSPER_CFG_TRIP_BOUND_PHASE"); phase && *phase) {
+        char* phase_end = nullptr;
+        const unsigned long long parsed_phase = strtoull(phase, &phase_end, 0);
+        if (phase_end && !*phase_end && parsed_phase <= 0xfffffffeull)
+            settings.only_phase = static_cast<uint32_t>(parsed_phase);
+    }
+    return settings;
+}
+
+bool compute_trip_witness_active(uint64_t program_address) {
+    const ComputeTripBoundSettings settings = compute_trip_bound_settings();
+    if (!settings.bound) return false;
+    if (!settings.only_program) return true;
+    return program_address == settings.only_program;
+}
+
+uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
+                                uint32_t start_pc, uint32_t end_pc) {
+    const ComputeTripBoundSettings settings = compute_trip_bound_settings();
+    const uint32_t bound = settings.bound;
     if (!bound) return 0u;
-    if (only_program && program_address != only_program) return 0u;
-    if (only_phase != 0xffffffffu && phase != only_phase) return 0u;
+    if (settings.only_program && program_address != settings.only_program) return 0u;
+    if (settings.only_phase != ComputeTripBoundSettings::kAllPhases &&
+        phase != settings.only_phase)
+        return 0u;
     static std::mutex announce_mutex;
     static std::set<std::pair<uint64_t, uint32_t>> announced;
     bool first = false;

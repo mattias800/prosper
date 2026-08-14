@@ -38,6 +38,18 @@ inline constexpr uint32_t kComputeTripWitnessDword = 16380u;
 // bind the internal GDS buffer even for a program that uses no GDS of its own.
 bool compute_trip_witness_active(uint64_t program_address);
 
+// The complete PROSPER_CFG_TRIP_BOUND* selector state. Given a program's code bytes, this struct plus
+// the program's address fully determines whether a bound is emitted and where — which is exactly what
+// the shader cache key needs to mix in, since that key is otherwise blind to a program's address and
+// would let a target and a non-target with identical bodies share one compiled module.
+struct ComputeTripBoundSettings {
+    static constexpr uint32_t kAllPhases = 0xffffffffu;
+    uint32_t bound = 0;              // 0 = disarmed; nothing is emitted and modules are unchanged
+    uint64_t only_program = 0;       // 0 = every program
+    uint32_t only_phase = kAllPhases; // kAllPhases = every dispatcher phase
+};
+ComputeTripBoundSettings compute_trip_bound_settings();
+
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 struct Rdna2Inst;
 
