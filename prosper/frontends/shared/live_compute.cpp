@@ -4171,6 +4171,37 @@ void report_compute_decline(const prosper::gpu::ComputeItem& item, const char* r
                  item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
 }
 
+// PROSPER_COMPUTE_SKIP_PROGRAM=0xADDR[,0xADDR...] — decline the named compute programs.
+//
+// A bisection instrument, not a workaround, and it is deliberately impossible to enable by accident:
+// unset it and nothing changes. It exists because a single dispatch can take down everything after
+// it — a GPU hang costs the whole process its compute backend, and a wrong write corrupts every
+// consumer downstream — so "which dispatch is responsible?" is a question worth being able to ask
+// directly instead of by rebuilding.
+//
+// The skip reports itself through the ordinary decline census, so a run made with it set can never
+// be mistaken for a default run when the log is read later.
+const std::set<uint64_t>& compute_skip_programs() {
+    static const std::set<uint64_t> programs = [] {
+        std::set<uint64_t> parsed;
+        const char* spec = std::getenv("PROSPER_COMPUTE_SKIP_PROGRAM");
+        if (!spec) return parsed;
+        for (const char* cursor = spec; *cursor;) {
+            char* end = nullptr;
+            const uint64_t address = std::strtoull(cursor, &end, 0);
+            if (end == cursor) break;          // not a number: stop rather than guess
+            if (address) parsed.insert(address);
+            cursor = end;
+            while (*cursor == ',' || *cursor == ' ') ++cursor;
+        }
+        std::fprintf(stderr,
+                     "[compute] PROSPER_COMPUTE_SKIP_PROGRAM=%s -> %zu program(s) will be declined\n",
+                     spec, parsed.size());
+        return parsed;
+    }();
+    return programs;
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -4178,6 +4209,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         report_compute_decline(item, reason);
         return false;
     };
+    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr))
+        return decline("skipped-by-selector");
     const auto phase_start = ComputeClock::now();
     auto phase_setup = phase_start;
     auto phase_pipeline = phase_start;
