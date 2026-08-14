@@ -207,6 +207,28 @@ So the runaway dispatcher is the one wrapping the EXEC-narrowing walk, and the w
 a maximum chain of 11 steps. The defect is named to a program, a phase and a 117-instruction guest pc
 range.
 
+**The spinning dispatcher is the PORTABLE one, and that also explains the earlier void result.** The
+emitted module for `0x413dc6700` contains **zero `OpGroupNonUniform*` instructions** — so
+`b.native_subgroup_size` was 0 and the branch votes take the portable path: publish into
+`vote_pending_var` / `vote_value_var` in the switch case, then reduce through LDS scratch behind two
+workgroup barriers in the continue block.
+
+That is forced, not incidental. `rdna2_to_spirv.cpp` sets `b.native_subgroup_size = 0` when
+`partial_barrier_phases || exact_partial_dispatcher`, and this dispatch is both barrier-phased and
+partial (`threads=2063`, `local=256` — the final workgroup carries 15 real threads of 256).
+
+**This retires the `PROSPER_NATIVE_COMPUTE_MULTIWAVE` mystery recorded above as "void, not
+falsified".** That switch only moves `config.native_subgroup_size`, which this line then overrides to
+0 for exactly this shape — so the module *could not* change, and the byte-identical hashes were the
+correct outcome rather than a broken lever. The result stays void as evidence about emulation cost,
+but the reason is now known.
+
+It also narrows where the defect can live: the vote machinery under suspicion is the portable
+LDS-reduction path for a barrier-phased dispatcher with a partial final workgroup, not the native
+subgroup path. Two things checked there and found correct: the vote mailboxes (`vote_pending_var`,
+`vote_value_var`, …) are reset at the top of every dispatcher iteration, so a stale vote cannot carry
+over; and each lane's LDS contribution is gated on its own `pending` bit.
+
 **A cheap hit-witness attempt that does NOT work, recorded so nobody repeats it.** Idea: run the same
 phase-0 bound at 4,096 and 65,536 and compare the program's write-back hashes — if the loop terminates
 naturally under both, identical inputs must give identical outputs, and a difference would witness
