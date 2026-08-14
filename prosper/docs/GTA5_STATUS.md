@@ -151,7 +151,36 @@ once the table fills up." All 204 clean reads in this run have `oob-roots=0`; th
 0..1,690. The relationship runs the other way from the guess, so OOB termination is not what keeps a
 clean table acyclic.
 
+### Two patterns in the malformed set that do NOT generalise
+
+Recorded so nobody re-derives them. Both looked convincing on one dispatch:
+
+- **Stride 16.** The first twenty malformed indices at submit 7898 read `884,885 · 900,901 ·
+  916,917 · 932,933` — adjacent pairs exactly 16 apart, which would point straight at a 16-lane
+  grouping (DPP row, tile). Across the full set the `index mod 16` histogram is spread over ten
+  residues, and it is a *different* spread on every dispatch. The regularity was in the first twenty
+  entries, not in the population.
+- **A distinguishing prior value.** At submit 7898 the malformed heads' previous contents include
+  `0x24924924` twenty-six times while well-formed heads never show it — a clean discriminator, and
+  `0x24924924` is `0x09249249 << 2`, the same repeating sentinel at another phase. It does not hold:
+  submit 8309's malformed priors are `0` and `2`, submit 14727's are `0x3FFFFFFF` and `0`. No value
+  is common to the malformed set across dispatches.
+
+**The honest position after that:** the malformed set has no structural signature I have found, so the
+correlation with cyclicity is currently the only handle on it, and pattern-hunting on derived metrics
+has stopped paying.
+
+### The test that would upgrade correlation to cause
+
+Locate the 2-cycles in a resulting table and check whether they sit at slots the malformed writes
+touched. Same-run data is required — the cycle dumps and the changed-slot logs above come from
+different runs, which is exactly the kind of join that has produced wrong answers here. If the cycles
+land on malformed slots, the chain closes; if they land elsewhere, the malformed-pair metric is
+measuring something incidental and the correlation is a coincidence of magnitude.
+
 ### Open: why does it start at submit 7898?
+
+
 
 
 
