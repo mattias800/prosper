@@ -186,6 +186,29 @@ returns zero — those dispatches complete, which is why only some dispatches ha
 fine, so the emulation is broken". The clean reads are a real minority of the population, and they
 come first.
 
+### And it is ONE buffer, not a random failure
+
+Correlating every resolved read by the table address it walked:
+
+| table address | outcome | reads |
+| --- | --- | --- |
+| `0x20f848417c` | clean | **966** |
+| `0x20f848417c` | cyclic | 6 |
+| `0x20f848a240` | **cyclic** | **800** |
+| `0x20f848a240` | clean | 10 |
+
+`0x20f848a240` is cyclic in **800 of 810** reads (98.8%); `0x20f848417c` is clean in **966 of 972**
+(99.4%). The program alternates between two traversal tables, and **one of them is systematically
+corrupt while the other is systematically correct**. That is not a race or a timing artifact — it is
+a property of one buffer.
+
+The predecessor correlation carries no signal: both outcomes follow the same preceding dispatch
+(`previous-code=0x413dc6700`, realized, mostly not executed) in the same proportion.
+
+Note this is the same address whose *post-submit* snapshot I measured as acyclic, and used to retract
+the cyclic-table hypothesis. At dispatch time it is cyclic. The original hypothesis was right in
+substance; the capsule's snapshot timing is what made it look wrong.
+
 ### What this settles, and what it reopens
 
 Settled: the defect is **upstream data**, not the dispatcher's lowering of this loop. The recompiler
