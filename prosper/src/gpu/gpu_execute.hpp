@@ -453,6 +453,11 @@ struct ComputeItem {
     // Exact 0x413cf9200 authority token. The serialized impossible-stride marker and its root bytes
     // remain data until live realization or replay repeats the complete program/launch/root proof.
     bool gta5_cf9200_no_backing_validated = false;
+    // The guest program's whole body is one terminating instruction, re-proved from the raw stream
+    // by whoever built this item. Same authority rule as the tokens above: a capture may record the
+    // shape, but only realization or replay may assert it, so a serialized flag can never talk the
+    // backend into executing nothing on trust.
+    bool terminator_only_program_validated = false;
 };
 
 enum class SubmitOperationKind : uint8_t { Draw, Dispatch, DmaCopy };
