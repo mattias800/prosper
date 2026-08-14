@@ -16389,6 +16389,58 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // is gated by emit_body to complex compute CFGs without guest barriers. Ordinary LDS reads, writes,
 // and atomics remain valid while waves visit different cases. V_MBCNT is split into a dedicated
 // common phase so every workgroup invocation reaches its synthesized barriers in uniform control flow.
+// PROSPER_CFG_TRIP_BOUND=N — diagnostic only. Bound EVERY emitted loop (the CFG dispatcher and both
+// structured loop forms) at N iterations.
+//
+// A loop that never terminates hangs the GPU into a driver reset, which costs the whole process its
+// compute backend and every later indirect draw — and from outside it is indistinguishable from a
+// slow shader or from a defect anywhere else in the submit. Bounding every loop turns "is this a
+// non-terminating loop at all?" into one run, and covering all three emitters means the answer is
+// not confined to one lowering path.
+//
+// Unset, nothing is emitted and modules are byte-identical. It is NOT a fix: truncating a guest
+// program's control flow produces wrong results by construction, which is why it is opt-in and says
+// so when it arms.
+uint32_t emitted_loop_trip_bound(uint64_t program_address) {
+    static const uint32_t bound = [] {
+        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
+        if (!spec || !*spec) return 0u;
+        char* end = nullptr;
+        const unsigned long long parsed = strtoull(spec, &end, 0);
+        if (!end || *end || !parsed || parsed > 0xffffffffull) return 0u;
+        return static_cast<uint32_t>(parsed);
+    }();
+    // PROSPER_CFG_TRIP_BOUND_PROGRAM=0xADDR — restrict the bound to ONE program, leaving every other
+    // recompiled module byte-identical.
+    //
+    // Without this, a bound low enough to be interesting truncates *many* shaders, and any later
+    // change of behaviour has a second explanation: an earlier truncated shader fed different data
+    // downstream. Targeting one program removes that alternative, which is what turns "the run got
+    // further" into evidence about the program under test.
+    static const uint64_t only_program = [] {
+        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND_PROGRAM");
+        if (!spec || !*spec) return 0ull;
+        char* end = nullptr;
+        const unsigned long long parsed = strtoull(spec, &end, 0);
+        return (!end || *end) ? 0ull : parsed;
+    }();
+    if (!bound) return 0u;
+    if (only_program && program_address != only_program) return 0u;
+    static std::mutex announce_mutex;
+    static std::set<uint64_t> announced;
+    bool first = false;
+    {
+        std::lock_guard lock(announce_mutex);
+        first = announced.insert(program_address).second;
+    }
+    if (first)
+        fprintf(stderr,
+                "[cfg-trip-bound] program 0x%llx: every emitted loop bounded at %u iterations "
+                "(DIAGNOSTIC: truncates guest control flow)\n",
+                static_cast<unsigned long long>(program_address), bound);
+    return bound;
+}
+
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -18370,16 +18422,7 @@ bool emit_cfg_state_machine(
     // Unset, nothing is emitted and the module is byte-identical. It is NOT a fix — truncating a
     // guest program's control flow produces wrong results by construction — which is why it is
     // opt-in and says so.
-    static const uint32_t cfg_trip_bound = [] {
-        const char* spec = getenv("PROSPER_CFG_TRIP_BOUND");
-        if (!spec || !*spec) return 0u;
-        char* end = nullptr;
-        const unsigned long long parsed = strtoull(spec, &end, 0);
-        if (!end || *end || !parsed || parsed > 0xffffffffull) return 0u;
-        fprintf(stderr, "[cfg-trip-bound] dispatcher loops bounded at %llu iterations "
-                        "(DIAGNOSTIC: truncates guest control flow)\n", parsed);
-        return static_cast<uint32_t>(parsed);
-    }();
+    const uint32_t cfg_trip_bound = emitted_loop_trip_bound(b.diagnostic.program_address);
     const uint32_t trip_var = cfg_trip_bound ? b.function_var(b.t_u32, ptr_u32) : 0u;
     if (trip_var) b.store_function(trip_var, b.uconst(0));
     const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);

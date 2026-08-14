@@ -166,7 +166,29 @@ falsification.
 | + `PROSPER_WAIT_DEFER=1` | `0x413dc6700` submit 4643 **dispatch 39** order 1206 |
 | **+ `PROSPER_CFG_TRIP_BOUND=100000`** | **`0x413e14900`** submit 5954 **dispatch 52** order **24374** |
 
-**Control — the bound's VALUE is what matters, not the counter's presence.** With the counter emitted
+**Isolated control — one program instrumented, only the constant differs.** `PROSPER_CFG_TRIP_BOUND`
+is targetable with `PROSPER_CFG_TRIP_BOUND_PROGRAM=0xADDR`, which leaves every other recompiled module
+byte-identical. Both arms below instrument `0x413dc6700` and nothing else — the run log carries a
+single arm line naming that one program:
+
+| bound | target | outcome |
+| --- | --- | --- |
+| **4,096** | only `0x413dc6700` | **gets past it**, dies later at `0x413e14900` |
+| **4,000,000,000** | only `0x413dc6700` | **dies at `0x413dc6700`** |
+
+Same instrumentation, same module perturbation, different constant. That removes the two alternatives
+an untargeted bound leaves open: it cannot be an *earlier* truncated shader feeding different data
+downstream (no other shader is touched), and it cannot be SPIR-V perturbation changing RADV code
+generation (both arms carry the identical counter). **`0x413dc6700`'s loop genuinely exceeds 4,096
+iterations.**
+
+What is still NOT established is *which* of its three emitted phases spins, and there is no
+device-side witness that a cap was actually reached — the run log records that the feature armed, not
+that it fired. A hit witness (program, phase ordinal, workgroup, last `pc_var`, trip count, read back
+after the dispatch) is the next instrument, and it is what would turn this into a named
+CFG-state-transition defect rather than a bounded-loop observation.
+
+**Earlier, weaker control — the bound's value matters, not the counter's presence.** With the counter emitted
 but the bound set to 4,000,000,000 (effectively no bound), the device is lost at `0x413dc6700`
 dispatch 39 again, exactly as in the four unbounded runs. So the result is not codegen perturbation
 from adding a Function variable to the loop:
