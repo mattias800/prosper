@@ -35,6 +35,11 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 
 namespace prosper::gpu {
 
+// High 32 bits of the guest GPU VA aperture, learned from any full indirect-args base. One address
+// space per process, so this is process state rather than per-fold state.
+std::atomic<uint32_t> g_indirect_va_aperture{0};
+
+
 std::vector<RegWatchEntry> parse_reg_watch(const char* setting) {
     std::vector<RegWatchEntry> entries;
     if (!setting || !*setting) return entries;
@@ -4423,6 +4428,13 @@ void GpuState::apply(const Pm4Command& c) {
                 if (inherited)
                     base |= current & ~static_cast<uint64_t>(UINT32_MAX);
                 current = base;
+                // Remember the VA aperture. A PS5 process has ONE GPU virtual address space, but
+                // `indirect_*_base` is per-fold state, so a queue whose stream carries no SetBase
+                // starts at zero and its low-only DispatchIndirect offsets resolve to unmapped
+                // addresses. Retaining the aperture across folds is what lets those be recovered —
+                // see the recovery at the DispatchIndirect site, which is gated on readability.
+                if (base > UINT32_MAX)
+                    g_indirect_va_aperture.store(base >> 32, std::memory_order_relaxed);
                 // PROSPER_INDIRECTLOG: what the guest actually sends, because the fail-closed branch
                 // below it is silent. A low-only SetBase with no prior aperture leaves the base
                 // truncated, the executor then rejects the argument buffer as unreadable, and the
@@ -4862,6 +4874,35 @@ void GpuState::apply(const Pm4Command& c) {
             d.indirect = true;
             if (indirect_compute_base <= UINT64_MAX - c.indirect_offset)
                 d.indirect_args_addr = indirect_compute_base + c.indirect_offset;
+            // Recover a low-only argument address against the learned VA aperture.
+            //
+            // `indirect_compute_base` is per-fold state, but a PS5 process has ONE GPU address
+            // space. GTA V's async-compute queue carries DispatchIndirect packets whose 32-bit
+            // payload is a full address within the already-selected aperture, and no SetBase of its
+            // own — so its base is zero and the args resolve to an unmapped low address. Measured on
+            // a routed boot: 50 of 64 indirect compute dispatches, all on that queue, every one
+            // skipped as "unreadable arguments".
+            //
+            // Fail-closed by construction: the recovery is attempted ONLY when the address we would
+            // otherwise use is unreadable, and it is accepted ONLY if the recovered one is readable.
+            // A wrong aperture therefore leaves behaviour exactly as it is today. Probed on 49 of 49
+            // such dispatches: the raw low address is unmapped and `aperture | low` is mapped.
+            if (!indirect_compute_base && d.indirect_args_addr &&
+                !guest_readable(d.indirect_args_addr, 3u * sizeof(uint32_t))) {
+                const uint64_t aperture = g_indirect_va_aperture.load(std::memory_order_relaxed);
+                const uint64_t recovered =
+                    (aperture << 32) | (d.indirect_args_addr & 0xffffffffull);
+                if (aperture && guest_readable(recovered, 3u * sizeof(uint32_t))) {
+                    static std::atomic<int> recovered_count{0};
+                    if (recovered_count.fetch_add(1) < 24)
+                        fprintf(stderr,
+                                "[agc] indirect dispatch args recovered into the guest VA aperture: "
+                                "0x%llx -> 0x%llx (queue %u)\n",
+                                (unsigned long long)d.indirect_args_addr,
+                                (unsigned long long)recovered, (unsigned)c.queue_origin);
+                    d.indirect_args_addr = recovered;
+                }
+            }
             // PROSPER_INDIRECTLOG: base and offset SEPARATELY, plus the queue. The executor's
             // "unreadable arguments at 0x…" message prints only the sum, which cannot distinguish a
             // bad offset from a base that was never set on this queue — and `indirect_compute_base`
@@ -4870,11 +4911,32 @@ void GpuState::apply(const Pm4Command& c) {
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1) < 64)
                     fprintf(stderr,
-                            "[agc-dispatchindirect] q=%u base=0x%llx offset=0x%x -> args=0x%llx%s\n",
+                            "[agc-dispatchindirect] q=%u base=0x%llx offset=0x%x modifier=0x%llx "
+                            "(lo=0x%x hi=0x%x) -> args=0x%llx%s\n",
                             (unsigned)c.queue_origin,
                             (unsigned long long)indirect_compute_base, c.indirect_offset,
+                            (unsigned long long)c.dispatch_modifier,
+                            (unsigned)(c.dispatch_modifier & 0xffffffffu),
+                            (unsigned)(c.dispatch_modifier >> 32),
                             (unsigned long long)d.indirect_args_addr,
                             indirect_compute_base ? "" : "  BASE-UNSET");
+                // Which interpretation of a base-less packet is actually MAPPED? Probing costs
+                // nothing and settles what the payload means: a raw low address, the same low bits
+                // in the 0x20_ aperture every other resource in this title uses, or a genuine
+                // 64-bit address whose high dword we are currently folding into the modifier.
+                if (!indirect_compute_base && logged.load() < 64) {
+                    const uint64_t lo = c.indirect_offset;
+                    const uint64_t ap20 = lo | 0x2000000000ull;
+                    const uint64_t hi64 =
+                        lo | ((c.dispatch_modifier & 0xffffffffull) << 32);
+                    fprintf(stderr,
+                            "[agc-dispatchindirect]   readable? low=%d aperture20=%d hi-dword=%d "
+                            "(low=0x%llx ap20=0x%llx hi64=0x%llx)\n",
+                            (int)guest_readable(lo, 12), (int)guest_readable(ap20, 12),
+                            (int)guest_readable(hi64, 12),
+                            (unsigned long long)lo, (unsigned long long)ap20,
+                            (unsigned long long)hi64);
+                }
             }
             dispatches.push_back(std::move(d));
             dispatch_count++;

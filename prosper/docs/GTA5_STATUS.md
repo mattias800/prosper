@@ -153,7 +153,46 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
-## ROOT CAUSE CANDIDATE: indirect compute dispatches on queue 2 have NO argument base
+## FIXED: indirect compute dispatches on queue 2 had no argument base — 50 of 64 were skipped
+
+**Result of the fix, default run, no forced skips and no trip bound:**
+
+| | before | after |
+| --- | --- | --- |
+| `indirect dispatch skipped: unreadable arguments` | 50 of 64 | **0** |
+| device lost at | `0x413dc6700` **dispatch 39** | `0x413e14900` dispatch 52 |
+| frame | black + HUD | **sun, anamorphic lens flare, radar with street geometry and blips** |
+
+The run now gets past the first hanging program **on a default build** — the same milestone the
+diagnostic trip bound reached, but by executing the guest's work rather than truncating it.
+
+### The defect
+
+`SET_BASE_INDIRECT_ARGS` sets one `indirect_compute_base`, and that is **per-fold** state. A PS5
+process has one GPU virtual address space, but GTA V's async-compute queue carries `DispatchIndirect`
+packets whose 32-bit payload is a full address *within the already-selected aperture* and no SetBase
+of its own — so its base is zero and its arguments resolve to an unmapped low address.
+
+Probed on **49 of 49** such dispatches before changing anything:
+
+```
+readable? low=0  aperture20=1  hi-dword=0
+          (low=0xf8480120  ap20=0x20f8480120  hi64=0x21f8480120)
+```
+
+The raw low address is unmapped; `aperture | low` is mapped; folding the modifier as an ADDR_HI is
+not. The recovery learns the aperture from any full indirect base and applies it **only** when the
+address we would otherwise use is unreadable and the recovered one is readable — so a wrong aperture
+leaves behaviour exactly as it was.
+
+### What it does NOT fix
+
+The world is still black, and the traversal tables are still cyclic in a large minority of reads
+(944 cyclic vs 1,179 clean, against 806/1,782 before — proportionally better, not resolved). So the
+skipped dispatches were **a** cause of lost work but not the whole cause of the cyclic structure. The
+next device loss is `0x413e14900`, which a dispatcher bound does not save either.
+
+## Superseded: the root-cause candidate as first written
 
 `SET_BASE_INDIRECT_ARGS` sets one shared `indirect_compute_base` in the command processor. Logging
 base, offset and queue separately at the `DispatchIndirect` site:
