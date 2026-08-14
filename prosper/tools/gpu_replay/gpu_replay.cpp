@@ -69,6 +69,7 @@ void usage(const char* argv0) {
                          "[--override-resource DRAW:vs|ps:BINDING PATH] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
+                         "[--dump-compute-raw N PATH] "
                          "[--dump-realized-shader DRAW:vs|vs-main|fs PATH] "
                          "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
@@ -1875,6 +1876,7 @@ int main(int argc, char** argv) {
     uint32_t warmup_repeats = 0;
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::string compute_shader_spec, compute_shader_path;
+    std::string compute_raw_spec, compute_raw_path;
     std::string compute_override_spec, compute_override_path;
     bool resource_override_requested = false;
     prosper::tools::ResourceOverrideSelector resource_override_selector;
@@ -2047,6 +2049,9 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-compute" && i + 2 < argc) {
             compute_shader_spec = argv[++i]; compute_shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--dump-compute-raw" && i + 2 < argc) {
+            compute_raw_spec = argv[++i]; compute_raw_path = argv[++i];
+        }
         else if (std::string(argv[i]) == "--override-compute-spv" && i + 2 < argc) {
             compute_override_spec = argv[++i]; compute_override_path = argv[++i];
         }
@@ -2110,6 +2115,7 @@ int main(int argc, char** argv) {
             compute_only >= 0 ||
             warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
+            !compute_raw_spec.empty() ||
             !realized_shader_spec.empty() ||
             !compute_override_spec.empty() ||
             resource_override_requested ||
@@ -2943,6 +2949,47 @@ int main(int argc, char** argv) {
         std::fclose(f);
         std::fprintf(stderr, "[gpureplay] dumped compute %ld (%zu bytes) to %s\n",
                      index, bytes, compute_shader_path.c_str());
+    }
+    // The GUEST stream for a realized compute. `--dump-failed-shader` already exposes this for a
+    // FAILED stage, which left the common case unreachable: a dispatch that ran and produced wrong
+    // data is exactly the one whose original RDNA2 you want to disassemble, and it is never a
+    // failure. Answering "does the guest use an instruction our SPIR-V does not contain?" needed
+    // both halves, and only one existed.
+    if (!compute_raw_spec.empty()) {
+        char* end = nullptr;
+        const long index = std::strtol(compute_raw_spec.c_str(), &end, 0);
+        if (!end || *end || index < 0 || static_cast<size_t>(index) >= replay.computes.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid compute selector %s\n",
+                         compute_raw_spec.c_str());
+            return 2;
+        }
+        const auto& compute = replay.computes[static_cast<size_t>(index)];
+        if (compute.raw_shader_index >= replay.raw_shader_versions.size()) {
+            std::fprintf(stderr,
+                         "gpu_replay: compute %ld retains no raw guest stream "
+                         "(capture predates v39, or the program was not recorded)\n", index);
+            return 2;
+        }
+        const auto& raw = replay.raw_shader_versions[compute.raw_shader_index];
+        const size_t bytes = raw.words.size() * sizeof(uint32_t);
+        FILE* f = std::fopen(compute_raw_path.c_str(), "wb");
+        // fclose is CHECKED, unlike the sibling dumps. A guest stream is small enough to sit
+        // entirely inside stdio's buffer -- this one is 2 KiB against a 4 KiB default -- so nothing
+        // reaches the filesystem until the close, and ENOSPC/EDQUOT surfaces THERE and nowhere
+        // earlier. Ignoring it would print "dumped" and exit 0 over a truncated or empty file, on a
+        // machine whose scratch filesystem hits EDQUOT routinely. That is the exact shape this flag
+        // exists to avoid: an instrument that reports success while producing nothing.
+        const bool wrote = f && std::fwrite(raw.words.data(), 1, bytes, f) == bytes;
+        const bool closed = f && std::fclose(f) == 0;
+        if (!wrote || !closed) {
+            std::fprintf(stderr, "gpu_replay: cannot write %s\n", compute_raw_path.c_str());
+            return 2;
+        }
+        std::fprintf(stderr,
+                     "[gpureplay] dumped compute %ld raw guest stream code=0x%llx "
+                     "(%zu dwords, %zu bytes, endpgm=%d) to %s\n",
+                     index, static_cast<unsigned long long>(compute.code_addr),
+                     raw.words.size(), bytes, raw.has_endpgm ? 1 : 0, compute_raw_path.c_str());
     }
     if (!compute_resource_spec.empty()) {
         const size_t colon = compute_resource_spec.find(':');

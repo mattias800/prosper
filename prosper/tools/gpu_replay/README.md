@@ -262,6 +262,7 @@ render-state resolve, executor ordering, detile) — it is the right guard for c
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-realized-shader 18:fs /tmp/fragment-rdna2.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-compute-raw 0 /tmp/compute-rdna2.bin --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --compute-only 0 /tmp/submit.prgcap
 ./build-linux/gpu_replay --compute-only 0 --override-compute-spv 0 /tmp/reduced.spv \
   /tmp/submit.prgcap
@@ -480,6 +481,23 @@ executor cannot realize. `--inspect-only` prints the failure reason, decoded tar
 state, every referenced stage address, resource-table presence/count, descriptor issues, recompile coverage,
 and the first rejected opcode/format at its exact dword PC. It also prints the raw RDNA2 content hash, byte
 count, and whether the retained stream reached `s_endpgm`.
+
+`--dump-compute-raw N PATH` writes the **guest RDNA2 stream** of a *realized* compute — the input the
+recompiler saw, where `--dump-compute` writes its output. Use it to ask whether the guest uses an
+instruction the emitted SPIR-V does not contain:
+
+```bash
+gpu_replay --inspect-only --dump-compute-raw 29 /tmp/cs.bin /tmp/submit.prgcap
+llvm-mc -arch=amdgcn -mcpu=gfx1030 -disassemble -show-encoding < <(hexdump-of /tmp/cs.bin)
+```
+
+Two things to know. **Pass `--inspect-only`** unless you want a full Vulkan replay as well — the flag
+does not by itself select a non-rendering mode. And its precondition is *weaker* than the `raw=` column
+in `--inspect-only` output: that column reports whether the capture retained a raw stream for a
+program, while this flag needs only a valid `raw_shader_index` for the selected compute, so `raw=no`
+elsewhere does not mean the dump is unavailable. It fails closed — a capture with no retained stream
+says so and exits 2 rather than writing a truncated file, and the `fclose` is checked, so a full disk
+cannot produce a "dumped" line over an empty file.
 
 `--dump-failed-shader FAILURE:STAGE PATH` writes that raw stream for `shader_inspect` or a focused recompiler
 fixture. Both indices are the zero-based values printed by `--inspect-only`; they are not draw indices. Each raw
