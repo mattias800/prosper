@@ -62,14 +62,14 @@ transition), not established cause.
 join only 14% of cycle nodes sit on malformed slots against a 4.4% base rate — real enrichment, not a
 mechanism. The dispatch-level correlation stands; the slot-level one does not.
 
-**Superseded:** the paragraph that used to sit here named `0x413dc6700` as the writer and called it a
-self-corrupting kernel. It does write the table, but flips also occur in submits where it writes
-nothing, which is what the second writer explains.
+**Superseded:** a paragraph here once named `0x413dc6700` as *the* writer and called it a
+self-corrupting kernel. Flips also occur in submits where it writes nothing, so that identification
+is dead — and the replacement is not "a second writer" either: **eight programs bind ranges covering
+this address and the census cannot say which of them write.**
 
-`0x413ce3400` was an earlier attribution and is **superseded**: it is a writer of related state and it
-is never declined on a routed run, so the "producer was refused" hypothesis is dead — but it was never
-the question. Anything below that still reads as though an upstream producer must be found is
-historical; the sections concerned now say so.
+`0x413ce3400` is **back in scope.** It was marked superseded here on the grounds that it wrote only
+"related state"; the containment census lists it among the eight. What remains true of it is
+narrower: it is never declined on a routed run, so the "producer was refused" hypothesis is dead.
 
 **What is NOT established**, stated precisely because the wording above is easy to over-read:
 
@@ -78,12 +78,15 @@ historical; the sections concerned now say so.
   with no overlap. The slot-level test **failed** — only 14% of cycle nodes sit on malformed slots
   against a 4.4% base rate — so a shared upstream cause is not excluded, and no A/B or
   clean-before/bad-after has been run.
-- **That the writer set is closed at two.** The address watch that found `0x413dc3400` now matches by
-  containment over scalars *and* array entries, but the census behind the "two writers" statement was
-  taken with the earlier base-equality version, which cannot see an interior address or a
-  runtime-selected array element. **That census must be re-run before the set is treated as closed.**
-- **Which store introduces a cycle**, in either program, and whether the guest algorithm is behaving
-  correctly on inputs we produced wrongly upstream.
+- **That `0x413dc3400` writes this table at all.** The census re-run is complete and reports eight
+  programs whose resources *contain* the address; a resource binding is not an access direction.
+  Nothing here is a direction-qualified observation, so "its writes go bad" is shorthand for a
+  correlation between its dispatches and the damage, not an established write.
+- **Which program or store introduces a cycle**, and whether the guest algorithm is behaving
+  correctly on inputs produced wrongly upstream.
+
+**The next experiment is direction-qualified attribution**: establish, per program, whether it reads
+or writes this range. Every further narrowing depends on it.
 
 ## RETRACTED 2026-08-14: "the corrupting write is `0x413dc6700`'s own" was one sample
 
@@ -151,7 +154,8 @@ Consequences, and they are large:
 
 ### `0x413dc3400`'s write quality separates clean tables from cyclic ones — correlation, not cause
 
-Tracing the second writer with `PROSPER_COMPUTELOG_CODE=0x413dc3400` plus `PROSPER_COMPUTELOG_CHANGED`
+Tracing `0x413dc3400` — one of the eight touchers, and not established as a writer — with
+`PROSPER_COMPUTELOG_CODE=0x413dc3400` plus `PROSPER_COMPUTELOG_CHANGED`
 (its table is **binding 23** — binding indices are per-program, and reusing the consumer's numbers
 here produced a confident wrong answer first), and scoring each write by how many heads it lands
 without a matching tail in the next slot:
