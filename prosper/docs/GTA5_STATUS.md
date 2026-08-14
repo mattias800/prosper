@@ -153,7 +153,7 @@ falsification.
   are the guest's own `s_barrier`s rather than emulation scaffolding. Reopening it needs a lever
   verified by module hash **before** its result is read. #2481.
 
-## STRONG BUT UNCONFIRMED: bounding one dispatcher phase is the only change that gets past the hang
+## CONFIRMED BY HIT RECORD: phase 0's dispatcher loop runs past 4,096 iterations on the hanging dispatch
 
 `PROSPER_CFG_TRIP_BOUND=N` (new, diagnostic) forces every dispatcher loop out after N iterations. With
 `N=100000` the run gets **past** `0x413dc6700` and dies much later at a **different** program:
@@ -229,24 +229,35 @@ subgroup path. Two things checked there and found correct: the vote mailboxes (`
 `vote_value_var`, …) are reset at the top of every dispatcher iteration, so a stale vote cannot carry
 over; and each lane's LDS contribution is gated on its own `pending` bit.
 
-**The device-side hit witness is BUILT and DOES NOT WORK — its positive control fails.** The shader
-writes four dwords (hit flag, phase, last block, trip count) into the top of the internal GDS buffer
-when a cap runs out, and the host reports and clears them after each dispatch. At bound 4,096 it
-reported **zero hits**, which would read as "the cap was never reached".
+**The device-side hit witness WORKS, and the cap fires — on the dispatch that hangs.** The shader
+writes hit flag, phase, last block index and trip count into the top of the internal GDS buffer when a
+cap runs out; the host reports and clears them per dispatch.
 
-That reading is unavailable, because the positive control fails too: at **bound 2** — which a 15-block
-dispatcher phase cannot possibly satisfy — it also reports **zero hits**. The instrument cannot fire,
-so its silence carries no information at all, and the 4,096 null is void rather than negative.
+**Positive control first**: at bound **2** — which a 15-block dispatcher phase cannot satisfy — the
+witness produces **1,606 hit records**. It fires.
 
-Until the witness is fixed, "the loop exceeds N iterations" rests only on targeted A/B survival, which
-**cannot distinguish a real cap hit from the bound's literal operand changing RADV code generation** —
-the constant is an `OpULessThan` operand, so every bound value is a different SPIR-V module. That
-objection stands and is the reason the heading above says "unconfirmed".
+At bound **4,096**, on the same program and phase:
 
-Candidates for why the witness is inert, none yet checked: the internal GDS binding may not be
-injected for a program that uses no GDS of its own; the reflected descriptor may not be writable, so
-the backend never copies results back; or the module may be served from the shader cache without the
-instrumentation (the compile key omits both the program address and the trip-bound settings).
+```
+[cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=38
+[cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=14 trips=4096 submit=5547 dispatch=39
+[cfg-trip-bound] HIT program=0x413dc6700 phase=0 last-block=9  trips=4096 submit=5547 dispatch=40
+```
+
+11 hits across dispatches 38..48 of one submit — **including dispatch 39, the exact dispatch that
+hangs on an unbounded build**. Last block is **14** on dispatch 39 and **9** on the other ten.
+
+That is a direct record that the loop runs past 4,096 dispatcher iterations, replacing the earlier
+inference from device survival. It also answers the reviewer's P1: the conclusion no longer rests on
+comparing two modules that differ by a literal operand.
+
+**An earlier version of this witness was inert, and the reason is worth keeping.** The SPIR-V declared
+binding 127 while the resource table did not carry it, because the injection sat inside a conditional
+resource-build region this program skips. The contract check then rejected the module and the dispatch
+was **declined** — so the device survived because the program never ran, which is indistinguishable
+from "the bound worked" in every artifact except one line reading
+`skip invalid descriptor contract`. Its positive control at bound 2 produced zero hits, which is what
+exposed it. Injecting at table finalization fixed it.
 
 **A cheap hit-witness attempt that does NOT work, recorded so nobody repeats it.** Idea: run the same
 phase-0 bound at 4,096 and 65,536 and compare the program's write-back hashes — if the loop terminates

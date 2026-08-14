@@ -7757,6 +7757,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
             rdna2_gta5_cf9200_no_backing_dispatch(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
                 shader_dwords, config, *table);
+        // The trip-bound witness writes into the internal GDS buffer, so that binding must exist
+        // whenever the bound instruments this program — including for a program that uses no GDS of
+        // its own. Injected HERE, at table finalization, rather than beside the `uses_gds` test:
+        // that test sits inside a conditional resource-build region which a program can skip, and
+        // when it did, the emitted module declared binding 127 while the table did not carry it. The
+        // contract check then rejected the module and the dispatch was DECLINED — so the device
+        // survived because the program never ran, which is indistinguishable from "the bound worked"
+        // in every artifact except the one line that says `skip invalid descriptor contract`.
+        if (compute_trip_witness_active(code_addr) && table &&
+            std::none_of(table->resources.begin(), table->resources.end(),
+                         [](const ShaderResource& r) {
+                             return r.binding == kComputeInternalGdsBinding;
+                         })) {
+            ShaderResource witness;
+            witness.cls = ResourceClass::ConstantBuffer;
+            witness.format = DataFormat::Uint32;
+            witness.num_components = 1;
+            witness.binding = kComputeInternalGdsBinding;
+            witness.size = static_cast<uint32_t>(g_compute_gds.size());
+            witness.stride = 4;
+            witness.host_data = g_compute_gds.data();
+            witness.host_data_size = g_compute_gds.size();
+            table->resources.push_back(witness);
+        }
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
