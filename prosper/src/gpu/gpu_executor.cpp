@@ -7674,7 +7674,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const bool indirect_pointer_valid = discover_rdna2_indirect_pointer_relocations(
             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
             shader_dwords, config, *table);
-        if (indirect_pointer_valid && std::getenv("PROSPER_DBG")) {
+        // Report the DECLINE as well as the success, and name the program in both. Printing only
+        // successes made a declined proof indistinguishable from a program the analyzers were never
+        // offered, and the line carried no address, so a run's several hundred records could not be
+        // attributed to any shader at all. Both gaps cost real time on #2481: GTA V's
+        // `0x413d14100` is byte-for-byte the StaticFootprint analyzer's own 386-dword target and
+        // still rejects at its GLOBAL consumer, and nothing in the log said whether the analyzer
+        // had declined it or matched and failed during discovery.
+        if (std::getenv("PROSPER_DBG")) {
             const auto source_it = std::find_if(
                 table->resources.begin(), table->resources.end(),
                 is_indirect_pointer_relocation_resource);
@@ -7684,8 +7691,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 ? source->indirect_pointer_relocation
                 : IndirectPointerRelocationBinding{};
             std::fprintf(stderr,
-                         "[indirect-pointer-relocation] valid=1 records=%u segments=%u "
-                         "source-bytes=%llu binding-bytes=%u\n",
+                         "[indirect-pointer-relocation] program=0x%llx valid=%d records=%u "
+                         "segments=%u source-bytes=%llu binding-bytes=%u\n",
+                         static_cast<unsigned long long>(code_addr),
+                         static_cast<int>(indirect_pointer_valid),
                          marker.record_count, marker.segment_count,
                          static_cast<unsigned long long>(source ? source->size : 0u),
                          marker.binding_bytes);
