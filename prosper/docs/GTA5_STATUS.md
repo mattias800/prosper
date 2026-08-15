@@ -399,6 +399,43 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## THE HYPOTHESIS THIS ALL POINTS AT: the parent array is never cleared
+
+If the builder legitimately links only `{2, 5}` children, then **the slots it does not write must
+already hold something that terminates the consumer's walk** — the walk is
+`while (i != 0) i = bfe(rec[i], 3, 27)`, so a zero terminates and anything else does not.
+
+**It is not cleared.** The tree watch's pre-image at the builder's dispatch is not zero: it is the
+previous phase's stride-4 id array (`{0, 0, 0xa9, 1}` repeating). And the slots the builder leaves
+alone were measured holding `0x09249249`, `0x12492492`, `0x2db6db6d` — the Morton dilation constant
+and multiples — or, sometimes, zero.
+
+**A stale Morton key read as a parent index is exactly a divergent walk.** `0x09249249 >> 3` is
+0x1249249, far past 2,063, which terminates by out-of-range; but `0x12492492 >> 3 & 0x7ffffff` is
+0x2492492 — also out of range. The values that *do* trap are the ones left over from an earlier
+generation of the parent array itself, which are in range by construction.
+
+**This unifies every measurement on this branch:**
+
+- the builder's lowering is correct (eleven perfect submits) ✓
+- its output faithfully follows its input (`both` tracks `pairs`) ✓
+- the failure mode is "a store that does not execute, leaving a stale slot" — measured directly ✓
+- the perfect submits are the ones where nearly every node has two linkable children, so nearly
+  every slot gets written and stale values have nowhere to hide ✓
+- the transition is at a route position, because that is when the scene starts containing enough
+  triangle leaves for unwritten slots to appear ✓
+- no producer decline is necessary ✓
+
+**The prediction that would confirm it:** zero the 2,063-record parent array immediately before
+`0x413dc3400`'s dispatch and the cyclicity should vanish, with the tree becoming legitimately sparse
+(`pairs < 1030`, `cycles = 0`). That is a diagnostic-only experiment — it does not fix anything, since
+on hardware something must be doing the clear and the real question is what — but it is decisive, it
+needs no ISA knowledge, and it can be built as a `PROSPER_*` switch in one sitting.
+
+**`CONFIDENCE: MED-HIGH`.** Every measurement fits and nothing contradicts it, but it has not been
+tested, and the alternative — that the guest's own build does write every slot through a path prosper
+declines — is not excluded.
+
 ## The sparse tree IS a faithful consequence of its input (2026-08-15)
 
 Testing the right correspondence — for each parent with only one child, the **two child references in
