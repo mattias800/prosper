@@ -266,6 +266,43 @@ Fixing (1) alone cannot render the world if (2) also holds. **(2) is the better 
 a descriptor-resolution problem on an instruction prosper already implements, it is named exactly, and
 unlike (1) it does not depend on scene state.
 
+## The BVH traversal shader's descriptor is never classified as a BVH (2026-08-15)
+
+`PROSPER_DYNTRACE_FAIL_ADDR=205b654a00`. The shader is a **full-screen ray-tracing pass**:
+
+```
+launch groups=240x135x1 threads=1920x1080x1 local=8x8x1 user_sgprs=8
+pre-specialization raw const-fold recovered 72 descriptor use(s)
+```
+
+**Not one of the 72 is a `BVH(bvh4)`.** The dynfail dump distinguishes three kinds — `TEX/IMG(t8)`,
+`BUF(v4)` and `BVH(bvh4)` — and this shader, which executes `image_bvh_intersect_ray` at pc1180,
+recovers zero BVH descriptors. Two of its uses are unresolved with a **valid base and zero extent**:
+
+```
+BUF(v4) key=0xffffffff use_pc=1032 v4=a1f76200:00000020:00000000:00000000
+        base=0x20a1f76200 stride=0 records=0 size=0 required=28
+BUF(v4) key=0xffffffff use_pc=1266 v4=a1f76400:00000020:00000000:00000000
+        base=0x20a1f76400 stride=0 records=0 size=0 required=124
+```
+
+`required=28` is notable: prosper's own BVH emulation loads exactly **28 dwords** per node
+(`for (uint32_t k = 0; k < 28; ++k) w[k] = load_node(k);`).
+
+**Reading, `CONFIDENCE: MED`.** These are BVH descriptors being classified and decoded as buffer V#s.
+A GFX10 BVH descriptor has its own 4-dword layout — `decode_bvh_descriptor` in
+`agc_shader_layout.hpp` reads `type`, `box_grow`, `triangle_return_mode`, `box_node_64b`,
+`sort_enabled` from it — and interpreting one as a buffer V# yields `num_records = 0`, hence
+`size = 0`, hence an unbounded use, hence `unresolved-operand`. That fits every observation, but the
+alternative (the guest genuinely supplies a zero-extent descriptor at this point in the route) is not
+excluded, and a `key=0xffffffff` means neither fetch pc, SRT offset nor SGPR base matched — which has
+its own possible causes.
+
+**The check that would settle it** is whether decoding those two 4-dword words with
+`decode_bvh_descriptor` instead of `decode_buffer_descriptor` yields a plausible BVH: a base above
+`0x10000`, a sane `size_bytes`, and a `type` in range. That is an offline computation on four dwords
+and needs no run.
+
 ## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
 
 Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather
