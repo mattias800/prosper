@@ -399,6 +399,45 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## FIRST DRAW-LEVEL VIEW OF A GTA V FRAME — and the captured submits are nearly EMPTY (2026-08-15)
+
+The frame grab now works on this title. Three changes were needed, each opt-in so no existing
+contract moves:
+
+| switch | what it addresses |
+| --- | --- |
+| `PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1` | five packed/indirect-pointer provenance validators that abort the whole bundle; reported per acceptance as inspection-only |
+| `PROSPER_CAPTURE_WAIT_FOR_SUBMITS=1` | keeps the window open past empty presents (bounded at 240), because a present COUNT is not a unit of time on a burst-flipping title |
+| `PROSPER_CAPTURE_MAX_SUBMITS=N` | bounds the bundle by CONTENT — one GTA V burst appended 3.3 GB and blew even the 3,072 MB maximum, so no byte budget could capture it |
+
+Result: **`frame-bundle written (25 submits)`, 512 MB**, loading as
+`bundle v2 submits=25 logical=2002872578 unique=511842881 ratio=0.256 chunks=3773 resources=454`.
+
+### What the frame contains
+
+```
+[gpureplay] bundle-submit=19370 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19371 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19372 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19373 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19374 operations=1/1 output_bytes=1048576
+```
+
+**Four consecutive captured submits contain ZERO operations, and the fifth contains one.** At this
+point in the route the guest's submits carry almost no GPU work at all — which is consistent with
+the absent world, and is the first evidence about it that comes from the frame rather than from log
+statistics.
+
+**Read with care, `CONFIDENCE: MED`.** Three things are not established: whether `operations=0/0`
+means the guest submitted nothing or the capture recorded nothing; whether the 25-submit window
+landed on a representative part of the frame (it is bounded by `MAX_SUBMITS`, so it is the *first* 25
+of a burst); and whether the world's work lives in submits outside it. Replay stops at bundle submit
+5 with `indirect-pointer relocation has stale shader, launch, source, or proof state` — expected,
+since the capture was forced past provenance, and it means the later submits were not reconstructed.
+
+**The next step is to widen the cap and see where operations begin**, which is now a matter of one
+setting rather than an unusable tool.
+
 ## The F9 frame grab cannot be used on this title — diagnosed and filed (#2549)
 
 The charter names the F9 grab the fastest loop for a graphical bug, and GTA V — a GPU-driven title

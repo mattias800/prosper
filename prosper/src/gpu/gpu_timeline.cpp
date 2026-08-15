@@ -2242,6 +2242,32 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
             }
         }
     }
+    // PROSPER_CAPTURE_MAX_SUBMITS=N — stop appending after N submits, keeping what was captured.
+    //
+    // The window is closed by a PRESENT, so it cannot end mid-burst. GTA V flips in bursts and emits
+    // its whole frame's work between two of them: with the window correctly waiting for content, one
+    // burst appended 3.3 GB and blew even the 3,072 MB maximum, so no budget setting can capture it.
+    // A submit cap bounds the bundle by CONTENT rather than by presents or bytes, which is the only
+    // one of the three the caller can reason about ("give me the first 40 submits of this frame").
+    //
+    // Stops appending rather than failing: the submits already captured are a valid, inspectable
+    // bundle, and discarding them because more arrived is the behaviour this is here to avoid.
+    static const uint64_t max_submits = [] {
+        const char* spec = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
+        if (!spec || !*spec) return uint64_t{0};
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(spec, &end, 0);
+        return (end && !*end && parsed) ? static_cast<uint64_t>(parsed) : uint64_t{0};
+    }();
+    if (max_submits && b.submits >= max_submits) {
+        static std::atomic<int> capped{0};
+        if (capped.fetch_add(1) < 2)
+            std::fprintf(stderr,
+                         "[grab] frame-bundle: submit cap %llu reached; further submits in this "
+                         "window are not appended\n",
+                         (unsigned long long)max_submits);
+        return;
+    }
     if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
         b.failed = true;
         b.pending_failure_error = error;
@@ -2268,7 +2294,32 @@ void interactive_frame_bundle_on_present() {
                              b.frames_seen,
                              static_cast<unsigned long long>(
                                  b.bundle.submits.back().submit_index));
-            if (b.failed || b.frames_seen >= b.frames_wanted) {   // window complete (or aborted)
+            // A window that closes having captured NOTHING is never what the caller wanted: it
+            // produces a failed grab and a message telling them to widen it by hand. Extend it
+            // until at least one submit has been captured, bounded by the same 240-present ceiling
+            // the env var accepts.
+            //
+            // This exists because the window is a PRESENT COUNT, and a present count is not a unit
+            // of time. GTA V flips in bursts -- 48 presents in 26 ms, 12 in 7 ms, against a 23/s
+            // average -- so the window's wall-clock duration is effectively random and usually far
+            // too short to contain a submit. Every frame count from 1 to 48 failed on that title
+            // while the run demonstrably rendered (#2549).
+            //
+            // Bounded, and it never SHORTENS a window: a capture that already has submits closes
+            // exactly where it did before, so titles whose present count already works are
+            // unaffected.
+            // OPT-IN. The default contract -- close after exactly `frames_wanted` presents,
+            // whatever was captured -- is deliberate and asserted by gpu_capture_bundle_roundtrip,
+            // including that an empty window reports failure promptly rather than hanging on. This
+            // does not change it.
+            constexpr uint32_t kNoSubmitPresentCeiling = 240u;
+            static const bool wait_for_submits =
+                std::getenv("PROSPER_CAPTURE_WAIT_FOR_SUBMITS") != nullptr;
+            const bool window_complete =
+                b.frames_seen >= b.frames_wanted &&
+                (!wait_for_submits || b.submits > 0 ||
+                 b.frames_seen >= kNoSubmitPresentCeiling);
+            if (b.failed || window_complete) {   // window complete (or aborted)
                 if (!b.failed && b.submits > 0) { write_path = b.current_path; write_bundle = std::move(b.bundle); }
                 else if (b.failed) {
                     std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
