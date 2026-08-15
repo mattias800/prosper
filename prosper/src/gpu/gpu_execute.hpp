@@ -1639,6 +1639,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // EXP.EN is the final per-component gate after CB_TARGET_MASK and CB_SHADER_MASK. Vulkan exposes
     // the same preservation semantics through colorWriteMask: disabled attachment components retain
     // their old values even though the fragment output itself is a full vec4.
+    // The fragment shell's output capacity and the render state's colour-target count are the same
+    // quantity seen from two sides; if they ever diverge the smaller one silently wins here, as a
+    // `&= 0` on every slot above it.
+    static_assert(kFragmentColorOutputs == kColorTargetCount,
+                  "fragment colour outputs must cover every render-state colour target");
     const uint32_t exp_mask = fragment_color_export_mask(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)), max_shader_dwords);
     for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot)

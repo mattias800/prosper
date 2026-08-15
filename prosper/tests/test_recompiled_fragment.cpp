@@ -260,6 +260,40 @@ int main() {
     CHECK(!recompile_fragment(astro_partial_ps, std::size(astro_partial_ps)).empty(),
           "#825: recompiled Astro Bot's partial-EN fragment shader");
 
+    // Five-MRT export (#GTA5 G-buffer). EXP encoding: EN in bits[3:0], TARGET in bits[9:4],
+    // COMPR bit10, DONE bit11, VM bit12; MRT0..MRT7 are targets 0..7. Each export names v0 for all
+    // four channels (second dword 0), so the shader is a legal minimal five-target G-buffer writer.
+    //
+    // This is the regression for the defect that hid GTA V's entire 3D world: the fragment shell's
+    // colour-output array, the export-mask decoder and the emit-side `exported` array were all sized
+    // 2, so exports to MRT2+ were discarded. The live executor then does
+    // `write_mask &= (exp_mask >> slot*4) & 0xf` per slot, which turned every slot above 1 into a
+    // zero write mask -- the attachment was dropped no matter what CB_TARGET_MASK said.
+    //
+    // The mask below is the arm that fails without the fix: the old two-slot decoder can only ever
+    // return 0x000000ff, so asserting the full five-nibble value cannot pass by coincidence.
+    const uint32_t five_mrt_ps[] = {
+        0x7E000280u,                 // v_mov_b32 v0, 0
+        0xF800100Fu, 0x00000000u,    // exp mrt0 v0,v0,v0,v0   EN=0xf vm
+        0xF800101Fu, 0x00000000u,    // exp mrt1
+        0xF800102Fu, 0x00000000u,    // exp mrt2
+        0xF800103Fu, 0x00000000u,    // exp mrt3
+        0xF800184Fu, 0x00000000u,    // exp mrt4 ... done
+        0xBF810000u,                 // s_endpgm
+    };
+    const uint32_t five_mrt_mask =
+        fragment_color_export_mask(five_mrt_ps, std::size(five_mrt_ps));
+    printf("  five-MRT export mask = 0x%08x (want 0x000fffff)\n", five_mrt_mask);
+    CHECK(five_mrt_mask == 0x000fffffu,
+          "five-MRT fragment reports EN for MRT0..MRT4");
+    // Slots 2..4 specifically -- the ones the old array size could not represent. Stated separately
+    // so a future change that widens the array but breaks the shift still fails on the right claim.
+    CHECK(((five_mrt_mask >> 8) & 0xfu) == 0xfu, "five-MRT fragment: MRT2 has a full write mask");
+    CHECK(((five_mrt_mask >> 12) & 0xfu) == 0xfu, "five-MRT fragment: MRT3 has a full write mask");
+    CHECK(((five_mrt_mask >> 16) & 0xfu) == 0xfu, "five-MRT fragment: MRT4 has a full write mask");
+    CHECK(!recompile_fragment(five_mrt_ps, std::size(five_mrt_ps)).empty(),
+          "five-MRT fragment recompiles to a module with five colour outputs");
+
     const uint32_t astro_ngg_vs[] = {
         0xBFA00001u, 0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu,
         0x8F6A8C6Au, 0x887C6A6Bu, 0xBF800000u, 0xBF900009u, 0x906A8803u,
@@ -902,12 +936,21 @@ int main() {
             }
         }
 
+        // MRT3-only. This asserted `.empty()` until 2026-08-15, when the fragment shell's colour
+        // outputs went from 2 to 8 -- MRT3 is now genuinely supported, so rejecting it would be the
+        // defect rather than the guard. The original concern was never "MRT3 must fail"; it was that
+        // MRT3 must not be silently REMAPPED onto color0, which is what a naive widening would do
+        // and what the mask assertion below forbids directly: slot 3 set, slot 0 clear.
         const uint32_t mrt3_only[] = {
             0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
             0xF800183Fu, 0x03020100u, 0xBF810000u,
         };
-        CHECK(recompile_fragment(mrt3_only, std::size(mrt3_only)).empty(),
-              "#635: unsupported MRT3-only export stays fail-visible instead of remapping to color0");
+        CHECK(!recompile_fragment(mrt3_only, std::size(mrt3_only)).empty(),
+              "#635: MRT3-only export recompiles now that the shell carries eight colour outputs");
+        const uint32_t mrt3_mask = fragment_color_export_mask(mrt3_only, std::size(mrt3_only));
+        printf("  MRT3-only export mask = 0x%08x (want 0x0000f000)\n", mrt3_mask);
+        CHECK(mrt3_mask == 0x0000f000u,
+              "#635: MRT3-only export lands on slot 3 and does NOT remap onto color0");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

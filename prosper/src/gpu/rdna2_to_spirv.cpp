@@ -3668,9 +3668,21 @@ struct SpirvCompute {
         emit_condbranch(within, active, invocation_guard_merge);
         emit_label(active);
     }
-    // --- Fragment-shader shell: vec4 outputs for the implemented MRT0/MRT1 exports. ---
+    // --- Fragment-shader shell: vec4 outputs for the MRT0..MRT7 exports. ---
+    //
+    // This array WAS sized 2, and that single number was the whole of GTA V's missing 3D world.
+    // Its G-buffer pass exports five render targets
+    // (c0=albedo c1=... c2=... c3=... c4=..., tmask=0x000fffff smask=0x0003ffff), and every part of
+    // the pipeline below the shader already carried eight: the render state decodes all eight slots,
+    // `active_color_count` scans all eight, and the backend's render pass, framebuffer and blend
+    // state are all generic over `color_count`. Only the fragment recompiler stopped at two -- so
+    // three of the five attachments were dropped, the deferred lighting pass sampled buffers nothing
+    // had written, and the world rendered into a G-buffer that was then lit by nothing.
+    //
+    // The rest of this shell was already written generically against `v_color.size()`; the size was
+    // the only thing holding it to two.
     uint32_t t_v4f = 0;
-    std::array<uint32_t, 2> v_color{};
+    std::array<uint32_t, kFragmentColorOutputs> v_color{};
     void begin_fragment(const ShaderResourceTable* rt = nullptr, uint32_t color_mask = 1u) {
         bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
@@ -23875,7 +23887,10 @@ uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     uint32_t packed = 0;
-    std::array<bool, 2> realized{};
+    // One nibble per MRT, MRT0..MRT7. Sized 2 until 2026-08-15, which silently forced
+    // `write_mask &= 0` for slots 2..7 at gpu_execute.hpp's EXP.EN gate -- so a shader exporting to
+    // MRT2+ had those attachments dropped no matter what CB_TARGET_MASK and CB_SHADER_MASK said.
+    std::array<bool, kFragmentColorOutputs> realized{};
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP || in.exp_target >= realized.size() ||
@@ -23923,7 +23938,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP) continue;
-        if (in.exp_target < 2) color_mask |= 1u << in.exp_target;
+        if (in.exp_target < kFragmentColorOutputs) color_mask |= 1u << in.exp_target;
         else if (in.exp_target == 8 && !in.exp_compr) {
             has_depth_export |= (in.exp_en & kMrtzDepth) != 0;
             has_sample_mask_export |= (in.exp_en & kMrtzSampleMask) != 0;
@@ -24028,7 +24043,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
     // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
     for (uint32_t pc : mask_test_branches(ins, b.allow_b32_masks)) safe_branches.insert(pc);
-    std::array<bool, 2> exported{};
+    std::array<bool, kFragmentColorOutputs> exported{};
     auto exp_fn = [&](RegState& state, const Rdna2Inst& in) -> bool { // EXP MRT0/MRT1 -> matching output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
         // all-on) must not write the inactive lanes. Lower it to a real fragment discard: OpKill the lanes
@@ -24098,7 +24113,15 @@ static std::vector<uint32_t> recompile_fragment_impl(
                                      "pcrel target=%u body failed", pcrel_dispatch_target);
         return {};
     }
-    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export &&
+    // ANY colour slot counts, not just the first two. This tested `exported[0] || exported[1]` while
+    // the array was sized 2, which read as "did anything export"; once the shell carries eight
+    // outputs it silently became "did MRT0 or MRT1 export", and a shader whose only colour output is
+    // MRT2+ was rejected outright -- dropping its draws rather than its attachments. The guard's
+    // purpose is unchanged: a fragment program that emits no colour, no NULL, no depth and no sample
+    // mask is still fail-visible.
+    const bool exported_any_color =
+        std::any_of(exported.begin(), exported.end(), [](bool e) { return e; });
+    if (!exported_any_color && !has_null_export && !has_depth_export &&
         !has_sample_mask_export) {
         if (pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",

@@ -455,6 +455,16 @@ bool fragment_spirv_uses_internal_gds(const std::vector<uint32_t>& spirv);
 // an attachment write mask, not a request to source disabled VGPRs; callers intersect this with the
 // fixed-function CB_TARGET_MASK/CB_SHADER_MASK before creating the Vulkan pipeline. This preserves
 // destination channels disabled by a partial export exactly as RDNA2 does.
+// Colour outputs a recompiled fragment shader can declare, MRT0..MRT7. Must equal
+// prosper::gpu::kColorTargetCount -- the render state, the pass-grouping in the live renderer and
+// the backend's render pass/blend state are all sized by that constant, and a fragment shell that
+// declares fewer silently drops the attachments above its own limit. gpu_execute.hpp static_asserts
+// the two together, since it is the translation unit that sees both.
+inline constexpr uint32_t kFragmentColorOutputs = 8;
+
+// One 4-bit EXP.EN nibble per MRT, MRT0..MRT7, from the shader's own colour exports. The live
+// executor intersects this with CB_TARGET_MASK & CB_SHADER_MASK to produce each attachment's Vulkan
+// colorWriteMask, so a slot missing here is a slot that cannot be written at all.
 uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords);
 
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP

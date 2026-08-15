@@ -3778,6 +3778,54 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // from guest zeros were the same word. Reading a pass's inputs off this
                             // log therefore over-counted missing inputs, which is the one thing the
                             // log exists to answer.
+                            // PROSPER_RTT_GUESTPEEK=1 — for each distinct sampled surface, how
+                            // much of the GUEST backing is non-zero, next to how prosper resolved
+                            // it. This separates two states that every other signal renders
+                            // identically: a surface nothing ever wrote (guest bytes zero, cache
+                            // zero) from one the guest DID write through a path prosper did not
+                            // observe (guest bytes populated, cache zero) -- the second is a
+                            // prosper defect and the first is not, and they call for opposite work.
+                            // Read the guest VA directly rather than r.host_data: on this path
+                            // host_data is null for every sampled texture (measured: zero peeks in a
+                            // full routed run), so keying on it produced complete silence -- which
+                            // reads as "the guest backing is empty" and is instead "we never
+                            // looked". Guest code runs natively here, so a readability-checked VA is
+                            // the authoritative view of that memory.
+                            if (rtt_log && PROSPER_ENV_ON("PROSPER_RTT_GUESTPEEK") &&
+                                sampled_source_addr &&
+                                prosper::gpu::guest_readable(sampled_source_addr, 4096)) {
+                                static std::mutex peek_mutex;
+                                static std::set<uint64_t> peeked;
+                                bool first = false;
+                                {
+                                    std::lock_guard lock(peek_mutex);
+                                    first = peeked.insert(sampled_source_addr).second;
+                                }
+                                if (first) {
+                                    size_t window = std::min<size_t>(
+                                        prosper::gpu::gpu_capture_resource_footprint(r),
+                                        size_t(1) << 20);
+                                    while (window &&
+                                           !prosper::gpu::guest_readable(
+                                               sampled_source_addr,
+                                               static_cast<uint32_t>(window)))
+                                        window /= 2;
+                                    size_t nz = 0;
+                                    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(
+                                        static_cast<uintptr_t>(sampled_source_addr));
+                                    for (size_t i = 0; i < window; ++i) nz += bytes[i] != 0;
+                                    fprintf(stderr,
+                                            "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u guest "
+                                            "non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
+                                            (unsigned long long)sampled_source_addr, tw, th,
+                                            (unsigned)r.format, nz, window,
+                                            window ? 100.0 * nz / window : 0.0,
+                                            has_uniform_live_rtt ? "HIT-UNIFORM"
+                                                : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU"
+                                                                              : "HIT-CPU")
+                                                : has_ds_live ? "DS" : "miss");
+                                }
+                            }
                             if (rtt_log)
                                 fprintf(stderr,
                                         "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s "
@@ -5669,6 +5717,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 (slot == 0 && d.ps.color_write_mask) ||
                                 (slot == 1 && d.ps.color1_write_mask))
                                 c.has_mask.fetch_add(1, std::memory_order_relaxed);
+                            // The per-slot mask the DrawItem CARRIES, against the one its own two
+                            // mask registers IMPLY. render_state.cpp computes the first as
+                            // (cb_target_mask & cb_shader_mask) >> (slot*4) & 0xf, so a disagreement
+                            // means the per-slot array did not survive the path that built this
+                            // DrawItem -- and the array is what decides whether the attachment
+                            // exists at all.
+                            {
+                                const uint32_t implied =
+                                    ((d.ps.cb_target_mask & d.ps.cb_shader_mask) >> (slot * 4u))
+                                    & 0xfu;
+                                const uint32_t carried = d.ps.color_targets[slot].write_mask;
+                                if (implied != carried && color_binding(d, slot).base) {
+                                    static std::mutex disagree_mutex;
+                                    static std::map<std::tuple<uint32_t, uint32_t, uint32_t>,
+                                                    uint64_t> disagree;
+                                    std::lock_guard lock(disagree_mutex);
+                                    if (disagree.size() < 48)
+                                        ++disagree[{slot, implied, carried}];
+                                    static uint64_t n = 0;
+                                    if (++n % 8192 == 0) {
+                                        fprintf(stderr,
+                                                "[mrt-mask-disagree] per-slot write_mask carried by "
+                                                "the DrawItem vs implied by its own registers:\n");
+                                        for (const auto& e : disagree)
+                                            fprintf(stderr,
+                                                    "[mrt-mask-disagree]   c%u implied=0x%x "
+                                                    "carried=0x%x  x%llu\n",
+                                                    std::get<0>(e.first), std::get<1>(e.first),
+                                                    std::get<2>(e.first),
+                                                    (unsigned long long)e.second);
+                                    }
+                                }
+                            }
                             if (active_color(d, slot))
                                 c.active.fetch_add(1, std::memory_order_relaxed);
                         }
@@ -5695,6 +5776,62 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             e.first.first & e.first.second,
                                             (unsigned long long)e.second);
                             }
+                        }
+                        // The SHAPE of each distinct pass: its eight slot bases next to the two
+                        // mask registers. The aggregate above says how often a slot activates; it
+                        // cannot say which surfaces a given pass meant to write, which is what
+                        // "buffer X is sampled 23 times and never written" actually needs.
+                        {
+                            static std::mutex shape_mutex;
+                            static std::map<std::array<uint64_t, 10>, uint64_t> shapes;
+                            std::array<uint64_t, 10> shape{};
+                            for (uint32_t slot = 0; slot < 8u; ++slot)
+                                shape[slot] = color_binding(d, slot).base;
+                            shape[8] = d.ps.cb_target_mask;
+                            shape[9] = d.ps.cb_shader_mask;
+                            // PROSPER_MRT_SHAPE_FOR=0xADDR[,...] restricts recording to passes
+                            // whose slot-0 base is named. Without it the map fills with startup and
+                            // scanout passes long before the gameplay G-buffer pass appears, and an
+                            // unfiltered top-10 is then a list of the most FREQUENT shapes rather
+                            // than the ones being asked about.
+                            static const std::string shape_for =
+                                PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR")
+                                    ? PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR") : "";
+                            bool shape_wanted = shape_for.empty();
+                            if (!shape_wanted && shape[0]) {
+                                char needle[24];
+                                std::snprintf(needle, sizeof needle, "0x%llx",
+                                              (unsigned long long)shape[0]);
+                                shape_wanted = shape_for.find(needle) != std::string::npos;
+                            }
+                            if (!shape_wanted) goto shape_done;
+                            {
+                            std::lock_guard lock(shape_mutex);
+                            if (shapes.size() < 96 || shapes.count(shape)) ++shapes[shape];
+                            static uint64_t shape_reports = 0;
+                            if (++shape_reports % (shape_for.empty() ? 8192 : 256) == 0) {
+                                std::vector<std::pair<uint64_t, std::array<uint64_t, 10>>> ranked;
+                                for (const auto& e : shapes) ranked.push_back({e.second, e.first});
+                                std::sort(ranked.begin(), ranked.end(),
+                                          [](const auto& a, const auto& b) {
+                                              return a.first > b.first; });
+                                fprintf(stderr, "[mrt-shape] %zu distinct pass shapes\n",
+                                        shapes.size());
+                                for (size_t i = 0; i < ranked.size() && i < 10; ++i) {
+                                    fprintf(stderr, "[mrt-shape]   x%-6llu tmask=0x%08llx "
+                                            "smask=0x%08llx bases:",
+                                            (unsigned long long)ranked[i].first,
+                                            (unsigned long long)ranked[i].second[8],
+                                            (unsigned long long)ranked[i].second[9]);
+                                    for (uint32_t slot = 0; slot < 8u; ++slot)
+                                        if (ranked[i].second[slot])
+                                            fprintf(stderr, " c%u=0x%llx", slot,
+                                                    (unsigned long long)ranked[i].second[slot]);
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+                            }
+                            shape_done: ;
                         }
                         const uint64_t g = groups.fetch_add(1) + 1;
                         if ((g & (g - 1)) == 0 && g >= 4096) {

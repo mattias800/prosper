@@ -1829,6 +1829,72 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## ROOT CAUSE: the fragment recompiler supported only MRT0 and MRT1 (2026-08-15, fixed)
+
+GTA V's G-buffer pass exports **five** render targets. prosper's fragment shell carried **two**, so
+three of the five attachments were silently dropped from every G-buffer pass; the deferred lighting
+pass then sampled buffers nothing had written, and the world rendered into a G-buffer that was lit by
+nothing.
+
+The pass, from `PROSPER_MRT_SHAPE_FOR`:
+
+```
+x1754  tmask=0x000fffff smask=0x0003ffff
+       c0=0x207de60000 c1=0x207fe40000 c2=0x2083e00000 c3=0x2081e20000 c4=0x2085de0000
+```
+
+`tmask & smask = 0x0003ffff` — slots 0–3 at `0xf`, slot 4 at `0x3`. All five enabled by the guest.
+
+**Everything below the shader already carried eight.** The render state decodes all eight slots,
+`active_color_count` scans all eight, and the backend's render pass, framebuffer and blend state are
+generic over `color_count`. Four hard-coded `2`s in the fragment path were the whole limit:
+
+| site | was |
+| --- | --- |
+| `rdna2_to_spirv.cpp` fragment shell `v_color` | `std::array<uint32_t, 2>` |
+| `fragment_color_export_mask` `realized` | `std::array<bool, 2>` |
+| fragment colour-mask scan | `if (in.exp_target < 2)` |
+| emit-side `exported` | `std::array<bool, 2>` |
+| the "did anything export" guard | `!exported[0] && !exported[1]` |
+
+The consequence was not confined to the shader. `gpu_execute.hpp` gates every slot's Vulkan write
+mask by the shader's EXP.EN — `write_mask &= (exp_mask >> slot*4) & 0xf` — so a decoder that can
+never set bits above nibble 1 forces **`write_mask = 0` for slots 2–7 regardless of what
+CB_TARGET_MASK and CB_SHADER_MASK say**. Slots 0 and 1 survived only because `active_color` has
+named-field fallbacks for exactly those two.
+
+Measured, same route, before → after:
+
+```
+c2 ACTIVE=0 -> 2151      per-slot write_mask disagreements with the draw's own
+c3 ACTIVE=0 -> 2083      mask registers: 5,318 -> 0
+c4 ACTIVE=0 -> 1040
+```
+
+`ctest --no-tests=error -j4`: **245/245 pass**, exit 0.
+
+**The world is still not lit after this fix.** It is a verified, necessary defect fix — the G-buffer
+now reaches the lighting pass complete — and it is not by itself sufficient. Recorded that way rather
+than as a solution.
+
+### The instrument that found it, and the two that could not
+
+The disagreement census is the one that mattered: for every draw, the per-slot `write_mask` the
+DrawItem *carries* against the one its own `cb_target_mask & cb_shader_mask` *imply*.
+
+```
+c2 implied=0xf carried=0x0  x1830
+c3 implied=0xf carried=0x0  x2109
+c4 implied=0x3 carried=0x0  x1676
+```
+
+Neither of the two censuses before it could have found this. A per-slot **activation** census says
+slots 2–4 never activate but not why, and its `mask=0` column is equally consistent with "the guest
+disabled them" — which is what the mask histogram appeared to confirm, because that histogram was
+keyed on groups where slot 4 had a *base* and was dominated by unrelated passes whose masks really
+are slot-0-only. The defect only became visible when the same quantity was computed **two ways from
+the same draw** and compared.
+
 ## Correction: a colour-target census must intersect the WRITE MASK (2026-08-15)
 
 `PROSPER_TARGET_WATCH` and `PROSPER_DRAW_CENSUS` read `CB_COLORn_BASE` for all eight slots and count
