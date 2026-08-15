@@ -3,6 +3,7 @@
 // pixels. Used to verify recompiled shaders end-to-end (render -> readback -> pixel asserts). The
 // including test links Vulkan::Vulkan.
 #pragma once
+#include "../frontends/shared/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/diagnostic_selectors.hpp"
@@ -273,6 +274,11 @@ struct BackendColorTarget {
     // across roughly sixteen pass groups per frame -- kept only the last group's slots 2..4.
     std::array<uint64_t, prosper::gpu::kColorTargetCount> persistent_id_slots{};
     std::array<bool, prosper::gpu::kColorTargetCount> load_existing_slots{};
+    // Per-slot twin of `readback`/`readback1`. Defaults to true so every existing caller keeps its
+    // pixels; the depth-feedback splitter turns it off for non-final segments, which otherwise pay a
+    // full-extent copy per slot per segment purely because `color_count > 2` forces a readback.
+    std::array<bool, prosper::gpu::kColorTargetCount> readback_slots{
+        true, true, true, true, true, true, true, true};
 };
 
 // Optional complete-MRT readback contract. `color_count` is the active Vulkan attachment prefix
@@ -5560,11 +5566,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             upload.borrowed_compute_lease = r.borrowed_compute_image_lease;
                         }
 
-                        const bool target_feedback =
-                            (persistent_color &&
-                             r.persistent_render_target_id == color_target->persistent_id) ||
-                            (persistent_color1 &&
-                             r.persistent_render_target_id == color_target->persistent_id1);
+                        // Every ACTIVE bound slot, not just 0 and 1. A higher slot's image is now
+                        // persistent and SAMPLED-capable, so without this a draw sampling an active
+                        // MRT2+ target borrows the very same VkImage as both descriptor and colour
+                        // attachment -- bypassing the established CPU fallback and using one image
+                        // as shader-read and colour-attachment simultaneously.
+                        const bool target_feedback = [&] {
+                            if (!color_target || !r.persistent_render_target_id) return false;
+                            uint64_t bases[prosper::gpu::kColorTargetCount]{};
+                            bool active[prosper::gpu::kColorTargetCount]{};
+                            bases[0] = color_target->persistent_id;
+                            active[0] = persistent_color;
+                            bases[1] = color_target->persistent_id1;
+                            active[1] = persistent_color1;
+                            for (uint32_t slot = 2; slot < color_count; ++slot) {
+                                bases[slot] = color_target->persistent_id_slots[slot];
+                                active[slot] = cached_extra[slot] != nullptr;
+                            }
+                            return prosper::frontend::mrt_target_feedback(
+                                bases, active, color_count, r.persistent_render_target_id);
+                        }();
                         if (!upload.borrowed_compute && !r.is_storage_image &&
                             persistent_color_targets_enabled && !target_feedback &&
                             r.persistent_render_target_id && r.img_dim == 1) {
@@ -6390,8 +6411,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // and there is no else). That is up to 8 MB copied and discarded per pass.
     const bool readback_color0 = want_color_readback && readback_color0_wanted;
     const bool readback_color1 = want_color_readback && readback_color1_wanted;
+    // Slots 2+ ask per slot, exactly as slots 0 and 1 do. `color_count > 2` alone would force a
+    // readback of every higher slot on every segment of a split pass, including the ones whose
+    // pixels are thrown away.
+    const bool readback_extra_wanted = [&] {
+        for (uint32_t slot = 2; slot < color_count; ++slot)
+            if (!color_target || color_target->readback_slots[slot]) return true;
+        return false;
+    }();
     const bool readback_requested = readback_color0 || readback_color1 ||
-                                    (want_color_readback && color_count > 2);
+                                    (want_color_readback && readback_extra_wanted);
     const bool storage_writeback_requested = std::any_of(
         texture_uploads.begin(), texture_uploads.end(),
         [](const SharedTextureUpload& upload) {
@@ -6965,6 +6994,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     };
     publish_persistent_color(persistent_color, readback_color0, img);
     publish_persistent_color(persistent_color1, readback_color1, img1);
+    // Retained higher slots need the same availability/visibility barrier when no readback copy
+    // performed it. Keyed on whether THIS slot's readback path actually ran, since the new public
+    // contract admits want_color_readback=false and per-slot readback_slots -- in those branches a
+    // persistent slot 2+ would otherwise reach SHADER_READ_ONLY_OPTIMAL with no barrier making its
+    // writes visible to a later command buffer that samples or LOADs it.
+    for (uint32_t slot = 2; slot < color_count; ++slot)
+        publish_persistent_color(
+            cached_extra[slot] != nullptr,
+            readback_requested && (!color_target || color_target->readback_slots[slot]),
+            extra_images[slot]);
     if (persistent_ds) {
         VkImageMemoryBarrier ds_ready{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ds_ready.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -7074,7 +7113,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         transition_color_to_readback(persistent_color, readback_color0, img);
         transition_color_to_readback(persistent_color1, readback_color1, img1);
         for (uint32_t slot = 2; slot < color_count; ++slot)
-            transition_color_to_readback(cached_extra[slot] != nullptr, true, extra_images[slot]);
+            transition_color_to_readback(
+                cached_extra[slot] != nullptr,
+                !color_target || color_target->readback_slots[slot], extra_images[slot]);
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         cp.imageExtent = {W, H, 1};
@@ -7087,6 +7128,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cmd, img1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp1);
         }
         for (uint32_t slot = 2; slot < color_count; ++slot) {
+            if (color_target && !color_target->readback_slots[slot]) continue;
             VkBufferImageCopy extra_copy = cp;
             extra_copy.bufferOffset = color_offsets[slot];
             vkCmdCopyImageToBuffer(cmd, extra_images[slot],
@@ -7113,7 +7155,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         restore_persistent_color(persistent_color, readback_color0, img);
         restore_persistent_color(persistent_color1, readback_color1, img1);
         for (uint32_t slot = 2; slot < color_count; ++slot)
-            restore_persistent_color(cached_extra[slot] != nullptr, true, extra_images[slot]);
+            restore_persistent_color(
+                cached_extra[slot] != nullptr,
+                !color_target || color_target->readback_slots[slot], extra_images[slot]);
     }
     if (timing_enabled && flush_now)
         active_submission.end_gpu_timestamp(cmd);
@@ -7463,10 +7507,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 readback + static_cast<size_t>(color_offsets[1]),
                 readback + static_cast<size_t>(color_offsets[1] + color_bytes[1]));
         if (mrt_outputs)
-            for (uint32_t slot = 2; slot < color_count; ++slot)
+            for (uint32_t slot = 2; slot < color_count; ++slot) {
+                if (color_target && !color_target->readback_slots[slot]) continue;
                 mrt_outputs->colors[slot].assign(
                     readback + static_cast<size_t>(color_offsets[slot]),
                     readback + static_cast<size_t>(color_offsets[slot] + color_bytes[slot]));
+            }
         vkUnmapMemory(dev, bmem);
         color_target_stats.readbacks = persistent_color ? 1 : 0;
     }
@@ -7976,6 +8022,47 @@ inline size_t depth_feedback_split_index(std::span<const BackendDraw> draws,
     return draws.size();
 }
 
+// The contract one SEGMENT of a depth-feedback-split pass renders under.
+//
+// Extracted so the segment decisions are testable at the site that makes them. Every field here was
+// once derived inline, and two of them were wrong in ways no end-to-end assertion caught: non-final
+// segments were handed `mrt_outputs == nullptr`, so their colour_count collapsed to one attachment
+// and every MRT1..7 export in them was discarded; and later segments never asked to LOAD the higher
+// slots, so a fresh slot cleared at the second segment.
+//
+// The invariant the tests pin: the SHAPE is identical across segments and only the pixel
+// destination and the load/readback flags differ.
+struct SplitSegmentContract {
+    BackendColorTarget target{};
+    uint32_t color_count = 1;
+    bool has_target = false;
+};
+inline SplitSegmentContract split_segment_contract(const BackendColorTarget* whole,
+                                                   const BackendMrtOutputs* whole_mrt,
+                                                   bool first, bool final) {
+    SplitSegmentContract out;
+    // The attachment shape never varies by segment. A pass is five-MRT for all of its segments or
+    // none of them; splitting is a synchronisation boundary, not a change of render target.
+    out.color_count = whole_mrt ? whole_mrt->color_count : 1u;
+    if (!whole) return out;
+    out.target = *whole;
+    out.has_target = true;
+    if (!first) {
+        // Every later segment LOADS everything, or it erases what its predecessors drew.
+        out.target.load_existing = true;
+        out.target.load_existing1 = true;
+        out.target.load_existing_slots.fill(true);
+    }
+    if (!final) {
+        // A non-final segment's pixels are discarded, so do not copy them out. Slots 2+ must say so
+        // per slot: `color_count > 2` alone forces a readback regardless of the slot-0/1 flags.
+        out.target.readback = false;
+        out.target.readback1 = false;
+        out.target.readback_slots.fill(false);
+    }
+    return out;
+}
+
 // Logical multi-draw entry. Most calls remain one Vulkan render pass. A depth feedback transition
 // becomes multiple ordered passes without copying the (often large) BackendDraw shader/resource
 // payloads. Intermediate color is retained on the GPU when possible and carried through CPU pixels
@@ -8120,29 +8207,24 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const size_t end = begin + relative_end;
         const bool final = end == all.size();
 
-        BackendColorTarget segment_target{};
-        const BackendColorTarget* segment_target_ptr = nullptr;
-        if (color_target) {
-            segment_target = *color_target;
-            if (begin) {
-                segment_target.load_existing = true;
-                segment_target.load_existing1 = true;
-            }
-            if (!final) {
-                segment_target.readback = false;
-                segment_target.readback1 = false;
-            }
-            segment_target_ptr = &segment_target;
-        }
+        const SplitSegmentContract segment =
+            split_segment_contract(color_target, mrt_outputs, begin == 0, final);
+        const BackendColorTarget* segment_target_ptr =
+            segment.has_target ? &segment.target : nullptr;
         std::vector<uint8_t> intermediate_color1;
         std::vector<uint8_t>* segment_out1 = out_rgba1
             ? (final ? out_rgba1 : &intermediate_color1) : nullptr;
+        // The shape travels with every segment; only the pixel destination differs.
+        BackendMrtOutputs intermediate_mrt;
+        intermediate_mrt.color_count = segment.color_count;
+        BackendMrtOutputs* segment_mrt = mrt_outputs
+            ? (final ? mrt_outputs : &intermediate_mrt) : nullptr;
         std::vector<uint8_t> rendered = render_draw_pass_rgba(
             all.subspan(begin, end - begin), W, H, next_seed0,
             begin ? nullptr : clear_rgba, true, segment_target_ptr, next_seed1,
             begin ? nullptr : clear_rgba1, segment_out1, submission_batch,
             final ? flush_submission_batch : false, all,
-            final ? mrt_outputs : nullptr, want_color_readback);
+            segment_mrt, want_color_readback);
         add_stats();
 
         if (final) {

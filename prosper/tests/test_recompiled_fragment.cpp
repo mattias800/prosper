@@ -1033,6 +1033,50 @@ int main() {
             }
         }
 
+        // #2550 review round 3: the depth-feedback splitter's per-segment contract. A logical
+        // five-MRT pass that splits at a depth write->sample transition handed every pre-final
+        // segment `mrt_outputs == nullptr`, so those segments rendered with ONE attachment and
+        // discarded their MRT1..4 exports -- the same accumulation loss this PR fixes at the
+        // frontend's pass groups, reappearing at the backend's own physical boundary.
+        {
+            prosper::test::BackendColorTarget whole{};
+            whole.persistent_id = 0x2050000000ull;
+            whole.persistent_id_slots[2] = 0x2083e00000ull;
+            prosper::test::BackendMrtOutputs whole_mrt;
+            whole_mrt.color_count = 5;
+
+            const auto first_seg = prosper::test::split_segment_contract(
+                &whole, &whole_mrt, /*first=*/true, /*final=*/false);
+            const auto mid_seg = prosper::test::split_segment_contract(
+                &whole, &whole_mrt, /*first=*/false, /*final=*/false);
+            const auto last_seg = prosper::test::split_segment_contract(
+                &whole, &whole_mrt, /*first=*/false, /*final=*/true);
+
+            // The shape is identical across segments. This is the blocker: it used to be 1 for
+            // every segment but the last.
+            CHECK(first_seg.color_count == 5 && mid_seg.color_count == 5 &&
+                      last_seg.color_count == 5,
+                  "#2550: every segment of a split pass renders the same MRT shape");
+            // Later segments LOAD every slot, or they erase their predecessors' work.
+            CHECK(!first_seg.target.load_existing_slots[2] || whole.load_existing_slots[2],
+                  "#2550: the first segment does not force a load it was not asked for");
+            CHECK(mid_seg.target.load_existing_slots[2] && last_seg.target.load_existing_slots[2] &&
+                      mid_seg.target.load_existing && mid_seg.target.load_existing1,
+                  "#2550: every later segment loads every persistent slot");
+            // Non-final segments copy nothing out: their pixels are discarded, and `color_count > 2`
+            // alone would force a full-extent readback per slot per segment.
+            CHECK(!first_seg.target.readback_slots[2] && !mid_seg.target.readback_slots[2] &&
+                      !first_seg.target.readback && !first_seg.target.readback1,
+                  "#2550: non-final segments read back no slot");
+            CHECK(last_seg.target.readback_slots[2] && last_seg.target.readback,
+                  "#2550: the final segment keeps the caller's readback contract");
+            // The persistent identities must survive unchanged, or later segments would retain a
+            // different image than the one they are accumulating into.
+            CHECK(mid_seg.target.persistent_id_slots[2] == 0x2083e00000ull &&
+                      mid_seg.target.persistent_id == 0x2050000000ull,
+                  "#2550: a segment keeps the whole pass's persistent identities");
+        }
+
         // MRT3-only. This asserted `.empty()` until 2026-08-15, when the fragment shell's colour
         // outputs went from 2 to 8 -- MRT3 is now genuinely supported, so rejecting it would be the
         // defect rather than the guard. The original concern was never "MRT3 must fail"; it was that

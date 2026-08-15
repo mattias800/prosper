@@ -1829,6 +1829,51 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Third review round on #2550, all four fixed (2026-08-15)
+
+Every one a legacy "only MRT0/1 exist" seam that the widening newly reached.
+
+**1 (blocker) — a depth-feedback split dropped MRT2–7 from every non-final segment.** The splitter
+passed `final ? mrt_outputs : nullptr`, and `render_draw_pass_rgba` derives `color_count` from that
+pointer — falling back to `out_rgba1`, which the live renderer passes as null. So every pre-final
+segment of a five-MRT pass rendered with **one** attachment and discarded its MRT1–4 exports; later
+segments were never told to LOAD the higher slots either. The same accumulation loss this PR fixes at
+the frontend's pass groups, reappearing at the backend's own physical boundary.
+
+Fixed by extracting `split_segment_contract()`: the attachment SHAPE is identical across segments and
+only the pixel destination and the load/readback flags differ. Non-final segments now decline
+readback **per slot** — `color_count > 2` alone forced a full-extent copy of every higher slot on
+every segment, so the fix needed `readback_slots[]` to exist at all.
+
+**2 (high) — same-pass feedback detection knew only MRT0/MRT1.** Now that a higher slot's image is
+persistent and sampled-capable, sampling an active MRT2+ target borrowed the very `VkImage` the pass
+was writing. Both halves — the backend's descriptor borrow and the frontend's direct-live decision —
+now go through one `mrt_target_feedback()` policy.
+
+**3 (high) — the sparse-MRT gate had no regression at its production seam.** Reverting
+`any_slot_bound` to `base` left all 245 tests and the validation scan green. The union is now
+`mrt_any_slot_bound()` in the frontend policy header, called by both decisions that key on it and
+tested there.
+
+**4 (medium) — the no-readback publication lifecycle skipped MRT2–7.** `publish_persistent_color()`
+covered slots 0 and 1; a persistent higher slot could reach `SHADER_READ_ONLY_OPTIMAL` with no
+barrier making its writes visible to a later command buffer. Mirrored for every retained slot, keyed
+on whether that slot's readback path actually ran.
+
+All four are mutation-verified at their own sites: dropping the segment shape, dropping the segment
+load, narrowing the feedback policy to slots 0/1, and narrowing the union to colour-0 each turn a
+named assertion red.
+
+Live title after this round: **c2 4,533,513 · c3 4,533,513 · c4 3,472,691** non-black pixels,
+0 validation errors.
+
+### The seam this round is really about
+
+Every finding was the same shape: a policy written when only two colour slots could exist, left
+behind by a change that made eight possible. They were not in the diff — they were in code the diff
+made reachable. Grepping for `persistent_id1` or `color1` finds them; grepping for what changed does
+not.
+
 ## Second review round on #2550, all five fixed (2026-08-15)
 
 **1 (blocker) — MRT2–7 reused an image in the wrong Vulkan layout.** The retained image was recorded

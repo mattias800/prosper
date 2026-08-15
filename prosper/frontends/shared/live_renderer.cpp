@@ -162,6 +162,33 @@ void queue_guest_gpu_write(uint64_t addr, uint64_t size) {
         pending.overflowed = true;
 }
 
+// Does this draw bind `addr` as ANY active colour target?
+//
+// The direct-live sampling decision excluded `draw.color0_base` alone. That was complete only while
+// slots above 1 could not be persistent; they can now, so sampling an ACTIVE MRT2+ target would
+// otherwise borrow the very image the draw is writing -- one VkImage used as shader-read and colour
+// attachment at once, bypassing the CPU fallback that exists for exactly this case.
+//
+// "Active" matches the pass-grouping definition: a bound base whose write mask is non-zero. Slots 0
+// and 1 keep their named-field fallbacks, since a draw may carry either form.
+bool draw_binds_color_target(const prosper::gpu::DrawItem& draw, uint64_t addr) {
+    uint64_t bases[prosper::gpu::kColorTargetCount]{};
+    bool active[prosper::gpu::kColorTargetCount]{};
+    for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+        const auto& target = draw.ps.color_targets[slot];
+        uint32_t write_mask = target.write_mask;
+        if (slot == 0 && !write_mask) write_mask = draw.ps.color_write_mask;
+        if (slot == 1 && !write_mask) write_mask = draw.ps.color1_write_mask;
+        uint64_t base = draw.color_targets[slot].base;
+        if (!base && slot == 0) base = draw.color0_base;
+        if (!base && slot == 1) base = draw.color1_base;
+        bases[slot] = base;
+        active[slot] = write_mask != 0u;
+    }
+    return prosper::frontend::mrt_target_feedback(
+        bases, active, prosper::gpu::kColorTargetCount, addr);
+}
+
 void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
     for (auto it = cache.begin(); it != cache.end();) {
@@ -2531,7 +2558,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
                                 normalized_sampling) &&
-                            sampled_source_addr != draw.color0_base &&
+                            !draw_binds_color_target(draw, sampled_source_addr) &&
                             prosper::test::find_persistent_color_target(
                                 sampled_source_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
@@ -6462,10 +6489,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // active slots stayed transient and were cleared by the next group -- exactly
                     // the defect the persistence contract exists to remove, reintroduced at the one
                     // call site that decides whether the contract is used at all.
-                    const bool any_slot_bound = std::any_of(
-                        pass_bases.begin(),
-                        pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
-                        [](uint64_t slot_base) { return slot_base != 0; });
+                    const bool any_slot_bound = prosper::frontend::mrt_any_slot_bound(
+                        pass_bases.data(),
+                        static_cast<uint32_t>(std::min<size_t>(mrt_count, pass_bases.size())));
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed,
                         retained_uniform_clear ? retained_uniform_clear : clear_for(render_pass), true,
@@ -6495,10 +6521,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Keyed on the base rather than the draws' colour write masks for the
                         // separate reason that 457/457 is evidence about THIS route, and a future
                         // title could legally mix a colour-writing draw into a pass that has a base.
-                        /*want_color_readback=*/std::any_of(
-                            pass_bases.begin(),
-                            pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
-                            [](uint64_t slot_base) { return slot_base != 0; }));
+                        /*want_color_readback=*/any_slot_bound);
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
