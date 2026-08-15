@@ -298,10 +298,19 @@ alternative (the guest genuinely supplies a zero-extent descriptor at this point
 excluded, and a `key=0xffffffff` means neither fetch pc, SRT offset nor SGPR base matched — which has
 its own possible causes.
 
-**The check that would settle it** is whether decoding those two 4-dword words with
-`decode_bvh_descriptor` instead of `decode_buffer_descriptor` yields a plausible BVH: a base above
-`0x10000`, a sane `size_bytes`, and a `type` in range. That is an offline computation on four dwords
-and needs no run.
+**FALSIFIED, by running that check.** Decoding the two words with `decode_bvh_descriptor` gives
+`base = 0x20a1f7620000` — the BVH layout shifts its base left by 8, and the result lands far outside
+the guest address space, which sits around `0x20xxxxxxxx`. The **buffer** decode gives
+`base = 0x20a1f76200`, a perfectly plausible guest address. So these are not misclassified BVH
+descriptors, and the reading above is dead. Cost: one four-dword computation, no run.
+
+**What the same words do show.** Dwords 2 and 3 are **entirely zero**, while dwords 0 and 1 carry a
+sane base. A real buffer V# has a nonzero dword3 (it carries format and type bits), so an all-zero
+upper half is the signature of a **partially recovered descriptor** — the const-fold obtained the
+low two dwords and not the high two — rather than of a descriptor the guest genuinely wrote as
+zero-extent. `num_records = 0` then follows from dword2 being absent, and `size = 0` from that, and
+`unresolved-operand` from that. **That is the next thing to test**, and it is a different defect from
+anything this document has chased: not a wrong descriptor, a half-read one.
 
 ## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
 
