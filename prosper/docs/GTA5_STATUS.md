@@ -399,6 +399,60 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## The hang is NOT the only blocker — two more, measured (2026-08-15)
+
+Answering "is the compute hang the reason there is no world" directly, by looking at a frame with
+the hanging consumer skipped: **zero device losses, 9,363 frames, and the world is still absent.**
+Tutorial text and a few light blooms render; no geometry. So the compute chain cannot be the whole
+story, and two further blockers are visible in the same run.
+
+### 1. Indirect dispatch arguments arrive with a TRUNCATED address — and the fix is already in-tree, off
+
+```
+[agc] indirect dispatch skipped: unreadable arguments at 0xf8480120
+```
+
+The real address is `0x20f8480120`; the high byte is gone. `command_processor.cpp` already has an
+aperture-recovery path — `(aperture << 32) | (addr & 0xffffffff)` — behind
+**`PROSPER_INDIRECT_APERTURE_RECOVERY`, which is opt-in and off by default**. Its own comment records
+that with it off, 50 of 64 indirect compute dispatches are skipped as unreadable; with it on, 0 are,
+and the probe found the raw low address unmapped and `aperture | low` mapped on 49 of 49.
+
+**Measured here with the lever verified:** recovery fires 24 times
+(`0xf8480120 -> 0x20f8480120`, queue 2), unreadable-argument skips go **24 → 0**, device losses stay
+at 0. **And the frame is unchanged — still no world.** A genuine negative, not a void arm: the
+lever demonstrably moved.
+
+So the truncation is real and worth resolving on its own merits, but it is not what is hiding the
+world either.
+
+### 2. Three 4K DCC-compressed sampled images are unsupported
+
+```
+[render] DCC-compressed sampled image 3840x2160x1 fmt=1 tile=24 is unsupported; metadata=0/0
+[render] DCC-compressed sampled image 3840x2160x1 fmt=4 tile=27 is unsupported; metadata=81920/81920
+[render] DCC-compressed sampled image 3840x2160x1 fmt=9 tile=27 is unsupported; metadata=49152/49152
+```
+
+`live_renderer.cpp` handles DCC only for the **uniform fast-clear** case
+(`gfx10_dcc_fast_clear_rgba8`). When that fails it warns and **falls through to the ordinary
+format/detile path, which reads the COMPRESSED base bytes as if uncompressed** — garbage or black.
+
+These are full-screen 4K surfaces, they are **not** renderer-owned RTTs (`!rtt_hit`), and there are
+three of them in the formats a scene colour/normal/etc. set would use. **A composite that samples
+them cannot produce a world image regardless of what the geometry passes do.**
+
+`CONFIDENCE: MED-HIGH` that this is an independent blocker; `CONFIDENCE: LOW` on it being *the*
+remaining one, since nothing yet shows the geometry passes fill those surfaces in the first place.
+
+### Not a lead: `CB_COLOR_CONTROL.MODE=0`
+
+The same run reports 131,072 draws with an unmodeled `CB_COLOR_CONTROL.MODE=0` "still executed as an
+ordinary color draw", which looks alarming (MODE 0 is CB_DISABLE). **`render_state.hpp` already
+records that prosper's decoded MODE is not per-draw-trustworthy (#1706): a utility sequence's
+operation bits stay latched onto later ordinary draws.** So the count measures the latching, not
+131,072 draws that should have been suppressed. Checked before chasing.
+
 ## Six-reference simulation: the builder is PROVABLY faithful (2026-08-15)
 
 Codex's correction (#2542): `0x413dc3400` reads **six** candidate references per node, not two —
