@@ -399,6 +399,76 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## Six-reference simulation: the builder is PROVABLY faithful (2026-08-15)
+
+Codex's correction (#2542): `0x413dc3400` reads **six** candidate references per node, not two —
+`pc86` loads the first pair, `pc161` follows `(A >> 3) - 4` for a second pair, `pc237` follows
+`(B >> 3) - 4` for a third. **A histogram over record dwords 0/1 covers two of six and cannot predict
+how many parent slots a dispatch writes**, so `pairs == 1030` is an empirical control for one route
+state, not a universal oracle. What survives as a hard oracle is **acyclicity**.
+
+`tools/re/bvh_ref_simulator.py` reproduces all six selections over each captured input and diffs the
+expected destination set against the slots the dispatch actually changed:
+
+| dispatch | expected | written | expected-not-written | **written-not-expected** | ref cycles |
+| --- | --- | --- | --- | --- | --- |
+| s5943 d37 | 2061 | 2061 | 0 | **0** | 0 |
+| s7188 d37 | 2061 | 2061 | 0 | **0** | 0 |
+| s8842 d37 | 2061 | 2061 | 0 | **0** | 0 |
+| s16041 d37 | 2061 | 2061 | 0 | **0** | **117** |
+| s17181 d37 | 2061 | 2061 | 0 | **0** | **117** |
+| s19002 d37 | 2061 | 2061 | 0 | **0** | **117** |
+| s5528 d37 | 1754 | 1457 | 297 | **0** | 0 |
+| s9645 d37 | 1788 | 1283 | 505 | **0** | 0 |
+
+**`written but not expected` is ZERO in every frame measured.** The builder never writes a slot its
+input does not imply — now established over all six references rather than two.
+
+And the decisive rows are s16041 onward: **`expected = written = 2061`, `missing = 0`, and
+`cycles = 117`.** Everything the input implies is written, nothing else is, and the result is cyclic
+**because the input is**. There is no discrepancy left for the builder to be responsible for.
+
+(`expected-not-written` is nonzero in other frames because the simulator walks every node while the
+dispatch processes only its compacted, depth-parity subset. The informative direction is the other
+one, and it is zero everywhere.)
+
+**This closes `0x413dc3400`'s role definitively.** Together with the eleven perfect submits, two
+independent methods now say the same thing: the builder is correct and the defect is entirely
+upstream, in the node records `0x413ce6000` writes.
+
+## Corrections from Codex (#2542) to earlier sections
+
+- **`0x413cf9000` / `0x413cf9200` are arena aliases, not producers of the 64-byte tag records.**
+  `cf9000` is an initializer over an **80-byte** stride; `cf9200` operates **32-byte** records at a
+  320-byte V# near `0x209cc7ab00`. Their 117 changes each are a paired initialise/fill of a small
+  structure that merely overlaps the watched allocation. **So ranking writers by whole-watch change
+  count is misleading, and the +54 cycles this document attributed to `cf9000` should be discounted**
+  — its writes are not 64-byte records and decoding them as such is a category error. The genuine
+  64-byte-view producers are `cf5400`, `cf6100`, `ce6000` and `d1bf00`. `0x413ce6000`'s **+590** is
+  unaffected: it is a real 64-byte-view producer.
+- **The `record 4 + 8` arithmetic is exact**, not over-fitted: `pc74` forms `selector = word >> 3`,
+  `pc144` `v_readfirstlane_b32 vcc_lo, v7`, `pc149` `s_mulk_i32 vcc_lo, 120`, `pc153`
+  `s_buffer_load_dwordx4 … offset:8`. So `4 * 120 + 8 = 488` exactly. **The contract's weakness is
+  TEMPORAL, not arithmetic**: `selected_sbuffer_domain()` reads the source and the outer table
+  through `complete_resource_bytes()` — the currently CPU-visible mapping — with no command-order
+  snapshot coupling either to the bytes the GPU later consumes. Codex has retained evidence of the
+  same outer base decoding as **five coherent V#s** at exactly `+8` in one observation and floats in
+  another, so the buffer is a reused arena observed at different epochs. **The
+  "it holds frustum planes / the contract is over-fitted" framing in this document is therefore
+  wrong about the cause** — the layout is right and the epoch is not.
+- **The selector is `readfirstlane(source_word >> 3)`**, from the pc70 source records — not from a
+  saved EXEC mask, as this document earlier concluded from watching s106 alone. It is still not
+  const-foldable (a readfirstlane of live lane data is runtime state), so the conclusion that no fold
+  can resolve it stands; the stated *route* to it was wrong.
+- **`0x413e1ff00 toucher=0`** — Codex reached the same diagnosis independently: a watch-attribution
+  bug, not memory corruption. Already fixed here with `compute_address_window_hits`.
+
+**A systematic caveat this raises over much of the descriptor work above:** every capture in this
+document reads guest memory at fold or realization time on the CPU. That is not the execution epoch
+the GPU consumes. Codex's recommended discriminator is an ordered GPU-side readback of the pc70
+source, the root V# at `s[0:1] + 0xa8`, and all 600 outer bytes, captured **immediately before the
+dispatch executes** — a CPU reread is not sufficient.
+
 ## ROOT CAUSE, ATTRIBUTED: `0x413ce6000` writes the cyclic child graph (2026-08-15)
 
 Per-dispatch pre/post attribution on the node records at `0x209cc76000`, with the **child-graph cycle
