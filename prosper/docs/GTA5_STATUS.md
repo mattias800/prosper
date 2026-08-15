@@ -1829,6 +1829,52 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Fifth review round on #2550, all four fixed (2026-08-15)
+
+**1 (blocker) — MRT1 was still discarded under the live renderer's calling convention.** The live
+call passes `out_rgba1 == nullptr` and receives slot 1 through `BackendMrtOutputs`. On a non-final
+split the slot-1 readback therefore landed in `intermediate_mrt.colors[1]`, while the wrapper carried
+a seed forward only inside `if (out_rgba1)` — so MRT1 was lost on every split. The MRT2 regression
+could not see it because it jumps from MRT0 straight to MRT2. **The claim in the previous round that
+"slots 0 and 1 already carry through `seed_rgba`/`seed_rgba1`" was true only of the legacy explicit
+API, and is corrected here.** Added `seed_rgba1_slot`, the carry now takes whichever buffer received
+slot 1, and there is a second Vulkan split regression written with the live signature.
+
+**2 (high) — the MRT2–7 carry was selected by identity, not residency.** A non-zero
+`persistent_id_slots[slot]` does not mean the image survives: persistence also requires
+`persistent_color_targets_enabled` and a successful cache/budget allocation, and the slot-creation
+path falls back to a transient image while leaving the identity non-zero. The wrapper cannot see
+those decisions, so it no longer predicts them — a non-final split segment captures every slot
+unconditionally. Regressed with a non-zero MRT2 identity and
+`PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS=1`.
+
+**3 (high) — the materialization changes had no regression at their call sites.** Reverting either
+production site left everything green. Both decisions are now seams that own their gate —
+`mrt_direct_serves()` and `mrt_uniform_live_serves()` — and the mutation reverting the gate inside the
+seam turns a named assertion red.
+
+**4 (medium) — the binding test asserted a contract production does not have.** `backend_color_format`
+maps every unrecognised value, zero included, onto `R8G8B8A8_UNORM`, so the format term in the
+active-binding rule is **total**: it never rejects a slot. The test modelled `raw != 0` and asserted a
+zero format made a slot inactive. `PROSPER_MRT_CENSUS` had already reported "format known" for every
+slot in all 16,384 pass groups of a routed boot — the column is constant because the predicate is —
+and that measurement is in this document. I read it, wrote it down, and then wrote a test asserting
+the opposite. The test and the header now encode the real contract, and a backend-linked test pins
+the mapping the model depends on.
+
+### A metric with two regimes, and a control that was not one
+
+While verifying, `c4`'s peak read 507,887 where the previous round recorded 3,471,942. A second run
+on the same head gave 516,241, and I took that agreement as evidence of a regression in my own diff.
+It was not: **rebuilding the PREVIOUS head's sources and running them today gives 507,863.** The
+metric has two regimes depending on where the route lands, and two runs inside one regime agree with
+each other while saying nothing about the other.
+
+The lesson is the one this document keeps recording in different clothes: *the control has to be the
+old code run now*, not a number written down earlier. A remembered measurement is a measurement of a
+different machine state. `c2`/`c3` are stable across all of these (4.51–4.53M) and are the numbers
+worth quoting.
+
 ## Fourth review round on #2550, all four fixed (2026-08-15)
 
 **1 (blocker) — a depth-feedback split still discarded MRT2–7 when persistence was unavailable.**

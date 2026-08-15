@@ -2473,12 +2473,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // suppressed the lazy CPU materialisation; the corrected gate below then
                             // refused the direct image because the collision is real, and the
                             // resource fell through to stale guest bytes with no snapshot to use.
-                            const bool direct_serves = !fr.is_storage_image && r.img_dim == 1u &&
-                                sampled_extent_compatible &&
-                                !draw_binds_color_target(draw, sampled_source_addr) &&
+                            const bool direct_serves = prosper::frontend::mrt_direct_serves(
+                                draw, sampled_source_addr, fr.is_storage_image, r.img_dim,
+                                sampled_extent_compatible,
                                 prosper::test::find_persistent_color_target(
                                     sampled_source_addr, surface.w, surface.h,
-                                    surface.format) != nullptr;
+                                    surface.format) != nullptr,
+                                mrt_format_defined);
                             const VkFormat surface_format =
                                 prosper::test::backend_color_format(surface.format);
                             const uint32_t surface_bpp =
@@ -2560,15 +2561,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             prosper::test::find_persistent_color_target(
                                 sampled_source_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
-                        const bool has_uniform_live_rtt = !fr.is_storage_image &&
-                            !uniform_cpu_diagnostic_path && sampled_2d_view &&
-                            !r.in_mip_tail && live_rtt != g_rtt.end() &&
-                            live_rtt->second.has_uniform_color && live_rtt->second.w &&
-                            live_rtt->second.h &&
-                            prosper::frontend::rtt_sampled_extent_compatible(
-                                tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
-                                normalized_sampling) &&
-                            !draw_binds_color_target(draw, sampled_source_addr);
+                        const bool has_uniform_live_rtt = prosper::frontend::mrt_uniform_live_serves(
+                            draw, sampled_source_addr,
+                            /*preconditions=*/!fr.is_storage_image &&
+                                !uniform_cpu_diagnostic_path && sampled_2d_view &&
+                                !r.in_mip_tail && live_rtt != g_rtt.end() &&
+                                live_rtt->second.has_uniform_color && live_rtt->second.w &&
+                                live_rtt->second.h &&
+                                prosper::frontend::rtt_sampled_extent_compatible(
+                                    tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
+                                    normalized_sampling),
+                            mrt_format_defined);
                         const bool has_live_rtt =
                             has_cpu_live_rtt || has_gpu_live_rtt || has_uniform_live_rtt;
                         // A dim-5 base-slice view may need the CPU injection path rather than a direct

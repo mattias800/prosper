@@ -1033,6 +1033,19 @@ int main() {
             }
         }
 
+        // The backend colour-format mapping that frontends/shared/mrt_binding.hpp's active-binding
+        // rule depends on. It is TOTAL: every unrecognised raw value, zero included, maps to
+        // R8G8B8A8_UNORM, so the format term in that rule never rejects a slot. Pinned here, in a
+        // test that actually links the backend, because mrt_binding's own test must model the
+        // predicate rather than call it -- and a silently narrowed mapping would invalidate that
+        // model instead of failing.
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_UNDEFINED) ==
+                  VK_FORMAT_R8G8B8A8_UNORM,
+              "#2550: an undefined colour format maps to the RGBA8 fallback, it is not rejected");
+        CHECK(prosper::test::backend_color_format(static_cast<VkFormat>(0x7fffffff)) ==
+                  VK_FORMAT_R8G8B8A8_UNORM,
+              "#2550: the backend colour-format mapping is total");
+
         // #2550 review round 3: the depth-feedback splitter's per-segment contract. A logical
         // five-MRT pass that splits at a depth write->sample transition handed every pre-final
         // segment `mrt_outputs == nullptr`, so those segments rendered with ONE attachment and

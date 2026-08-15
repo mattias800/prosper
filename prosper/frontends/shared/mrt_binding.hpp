@@ -13,7 +13,12 @@
 // classified stale named state as a live binding, which denies the authoritative direct-GPU path and
 // — when no CPU snapshot exists — degrades to guest bytes rather than to a slower correct source.
 //
-// The rule: a slot is active when it has a base, a defined format, and a non-zero write mask. The
+// The rule: a slot is active when it has a base, a non-zero write mask, and a format the backend
+// accepts. That last term is TOTAL in the current backend -- `backend_color_format` maps every
+// unrecognised value, zero included, onto R8G8B8A8_UNORM, so it never rejects anything and a zero
+// format means "use the fallback" rather than "undefined". It is kept as a parameter because it is
+// the backend's decision to make, not this header's, and a backend that ever narrows it must narrow
+// grouping and feedback together. The
 // named `color0_*` / `color1_*` fields are consulted ONLY when the array representation is absent,
 // because `DrawItem` predates the complete array and capture versions through v33 carry the first
 // two attachments in those fields. Falling back whenever the array mask merely reads zero is a
@@ -53,7 +58,9 @@ inline uint32_t mrt_write_mask(const prosper::gpu::DrawItem& draw, uint32_t slot
 }
 
 // The base this slot is actively writing, or 0. `format_defined` decides whether a raw guest format
-// counts as defined; callers pass their own mapping so this header stays backend-free.
+// counts as accepted; callers pass their own mapping so this header stays backend-free. Note it is
+// total in today's backend -- see the file comment; do not read this parameter as evidence that a
+// zero format is rejected anywhere.
 template <typename FormatDefined>
 uint64_t mrt_active_color(const prosper::gpu::DrawItem& draw, uint32_t slot,
                           FormatDefined format_defined) {
@@ -86,6 +93,36 @@ bool mrt_draw_binds_target(const prosper::gpu::DrawItem& draw, uint64_t addr,
         active[slot] = bases[slot] != 0u;
     }
     return mrt_target_feedback(bases, active, prosper::gpu::kColorTargetCount, addr);
+}
+
+// The two materialization decisions that key on feedback, as seams that OWN their gate.
+//
+// They exist because the gate is the interesting part and a helper called beside it is not: with the
+// comparison written inline at each call site, reverting one to `sampled != draw.color0_base` left
+// every test green, since the tests exercised the helper rather than the decision.
+//
+// The two are coupled, which is why they must agree. `mrt_direct_serves` deciding TRUE suppresses
+// the lazy CPU materialisation for that resource; if the later bind then refuses the direct image --
+// which it must, when the sample really is one of this pass's targets -- there is no snapshot left
+// and the resource degrades to guest bytes. So a feedback collision has to be seen by BOTH, and it
+// used to be seen by neither above slot 1.
+
+// May the retained GPU image serve this sample directly?
+template <typename FormatDefined>
+bool mrt_direct_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
+                       bool is_storage_image, uint32_t img_dim, bool extent_compatible,
+                       bool has_persistent_target, FormatDefined format_defined) {
+    return !is_storage_image && img_dim == 1u && extent_compatible && has_persistent_target &&
+           !mrt_draw_binds_target(draw, sampled, format_defined);
+}
+
+// May the uniform-colour fast path serve this sample? `preconditions` folds the caller's own
+// non-feedback terms (not a storage image, a plain 2D view, not in a mip tail, a uniform cache entry
+// with a usable extent) so this seam owns exactly the feedback gate and nothing it cannot see.
+template <typename FormatDefined>
+bool mrt_uniform_live_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
+                             bool preconditions, FormatDefined format_defined) {
+    return preconditions && !mrt_draw_binds_target(draw, sampled, format_defined);
 }
 
 }  // namespace prosper::frontend
