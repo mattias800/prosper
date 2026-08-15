@@ -8,6 +8,9 @@
 // device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
+#include <map>
+#include <atomic>
+#include <string>
 #include "command_processor.hpp"   // GpuState
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
@@ -680,6 +683,38 @@ ParallelDrawRealizationStats parallel_draw_realization_stats();
 
 // APPEND ONLY, and update kMaxRealizationFailureReason below. The value is serialized as a raw byte
 // into .prgcap, and both the in-memory validator and the reader bound-check it against that maximum.
+// Per-target tally of draws discarded before they reach the renderer, by reason. Reported at powers
+// of two so a routed boot stays readable.
+inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
+                                       uint32_t cb_target_mask, uint32_t cb_shader_mask) {
+    static const bool on = std::getenv("PROSPER_DROPPED_DRAW_CENSUS") != nullptr;
+    if (!on) return;
+    static std::mutex mutex;
+    static std::map<std::pair<uint64_t, std::string>, uint64_t> dropped;
+    static std::atomic<uint64_t> total{0};
+    const uint64_t n = total.fetch_add(1) + 1;
+    {
+        std::lock_guard lock(mutex);
+        if (dropped.size() < 256 || dropped.count({color0_base, reason}))
+            ++dropped[{color0_base, reason}];
+        if ((n & (n - 1)) == 0 && n >= 256) {
+            std::vector<std::pair<uint64_t, std::pair<uint64_t, std::string>>> ranked;
+            for (const auto& e : dropped) ranked.push_back({e.second, e.first});
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::fprintf(stderr, "[dropped-draw] %llu draws discarded before the renderer\n",
+                         (unsigned long long)n);
+            for (size_t i = 0; i < ranked.size() && i < 12; ++i)
+                std::fprintf(stderr, "[dropped-draw]   target=0x%llx reason=%s x%llu\n",
+                             (unsigned long long)ranked[i].second.first,
+                             ranked[i].second.second.c_str(),
+                             (unsigned long long)ranked[i].first);
+            std::fprintf(stderr, "[dropped-draw]   (latest masks: target=0x%08x shader=0x%08x)\n",
+                         cb_target_mask, cb_shader_mask);
+        }
+    }
+}
+
 enum class RealizationFailureReason : uint8_t {
     None,
     Unknown,
@@ -1288,6 +1323,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         [](const auto& target) { return target.write_mask != 0; });
     if (!preexport_color_effect && !has_depth_stencil_side_effect(resolved_pipeline) &&
         !getenv("PROSPER_FORCE_COLORWRITE") && !getenv("PROSPER_NO_EARLY_NO_EFFECT")) {
+        // PROSPER_DROPPED_DRAW_CENSUS=1 — which colour targets lose draws before they ever reach the
+        // renderer, and why. A target census counts draws that ARRIVE; a surface whose draws are all
+        // discarded here reads as "written by nothing" in that census and in every write-path watch,
+        // which is indistinguishable from a surface the guest never renders to.
+        report_dropped_draw_target(rs.color0_base, "no-effect(early)", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) {
             failure->reason = RealizationFailureReason::NoEffect;
             // Keep the bound program addresses in captures without performing shader analysis.  A
@@ -1535,6 +1576,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     if (vs_words.empty() || fs_words.empty() || (interpolation.requires_geometry && gs.empty())) {
+        report_dropped_draw_target(rs.color0_base, "shader-recompile", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
@@ -1628,6 +1671,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                               validate_mode) ||
         !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1, SpirvShaderStage::Fragment,
                                               validate_mode)) {
+        report_dropped_draw_target(rs.color0_base, "descriptor-contract", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::DescriptorContract;
         if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
                                 "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
@@ -1662,6 +1707,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         ps.color_targets.begin(), ps.color_targets.end(),
         [](const auto& target) { return target.write_mask != 0; });
     if (!color_effect && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+        report_dropped_draw_target(rs.color0_base, "no-effect", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::NoEffect;
         if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);

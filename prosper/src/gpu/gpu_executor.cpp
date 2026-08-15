@@ -10844,8 +10844,47 @@ LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
     g_guest_gpu_write_observer = std::move(observer);
 }
+// PROSPER_GUEST_WRITE_WATCH=0xADDR[,0xADDR…] — report every guest-side GPU write that overlaps a
+// named address, with the caller that produced it.
+//
+// A colour-target census answers "which DRAW wrote this surface", and a compute address watch
+// answers "which DISPATCH bound it". Neither can see a DMA_DATA copy, a WRITE_DATA, a RELEASE_MEM or
+// an EVENT_WRITE, so a surface filled by any of those reads as "written by nothing" in both -- which
+// is exactly the state GTA V's 4K HDR scene colour is in, and the reason a third instrument is
+// needed before concluding that nothing fills it.
+void report_guest_write_watch(uint64_t addr, uint64_t size, const char* origin) {
+    static const std::vector<uint64_t> watched = [] {
+        std::vector<uint64_t> out;
+        const char* spec = std::getenv("PROSPER_GUEST_WRITE_WATCH");
+        for (const char* p = spec; p && *p;) {
+            char* end = nullptr;
+            const uint64_t v = std::strtoull(p, &end, 0);
+            if (end == p) break;
+            if (v) out.push_back(v);
+            p = (*end == ',') ? end + 1 : end;
+        }
+        return out;
+    }();
+    if (watched.empty()) return;
+    for (const uint64_t want : watched) {
+        // Any overlap counts: a fill of a 4K surface is one large range, not a write at its base.
+        if (!(addr <= want && want < addr + size)) continue;
+        static std::mutex mutex;
+        static std::map<std::pair<uint64_t, std::string>, uint64_t> seen;
+        std::lock_guard lock(mutex);
+        const uint64_t n = ++seen[{want, origin}];
+        if (n <= 4 || (n & (n - 1)) == 0)
+            std::fprintf(stderr,
+                         "[guest-write-watch] 0x%llx covered by %s write addr=0x%llx size=%llu "
+                         "(x%llu)\n",
+                         (unsigned long long)want, origin, (unsigned long long)addr,
+                         (unsigned long long)size, (unsigned long long)n);
+    }
+}
+
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    report_guest_write_watch(addr, size, "gpu");
     // Page-protection watches observe guest CPU stores, but device/DMA writes can mutate the same
     // direct-memory pages without a CPU protection fault. Mark the virtual range dirty as part of the
     // existing authoritative GPU-write notification so cross-submit texture/compute caches never trust
@@ -10862,6 +10901,7 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
 }
 void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    report_guest_write_watch(addr, size, "gpu-preserving");
     // The observer owns renderer-resident aliases (color/depth targets and their CPU snapshots),
     // which may differ from the exact guest bytes even when a compute result does not. Guest-memory
     // caches, page watches, and the submit journal remain valid because the caller proved that those

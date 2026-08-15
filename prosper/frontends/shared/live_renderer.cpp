@@ -5898,6 +5898,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // active_color1(): a fixed-function resolve exports nothing, so its color1_write_mask
                     // is 0 and active_color1 would report no destination. Without this the resolved surface
                     // the display later samples never receives the scene and the frame is a uniform fill.
+                    // Census every MODE=RESOLVE pass: source, destination and whether the
+                    // destination is one prosper can even express. prosper takes the destination
+                    // from `color1_base` alone, so a guest resolving into any other slot is
+                    // invisible to the resolve path -- a surface filled that way would read as
+                    // "written by nothing" in every other census.
+                    if (!pass.empty() && pass.front()->ps.cb_resolve &&
+                        PROSPER_ENV_ON("PROSPER_RESOLVE_CENSUS")) {
+                        static std::mutex mutex;
+                        static std::map<std::pair<uint64_t, uint64_t>, uint64_t> seen;
+                        const uint64_t rsrc = pass.front()->color0_base;
+                        const uint64_t rdst = pass.front()->color1_base;
+                        std::lock_guard lock(mutex);
+                        const uint64_t n = ++seen[{rsrc, rdst}];
+                        if (n <= 2 || (n & (n - 1)) == 0)
+                            fprintf(stderr,
+                                    "[resolve-census] src=0x%llx dst(color1)=0x%llx x%llu%s\n",
+                                    (unsigned long long)rsrc, (unsigned long long)rdst,
+                                    (unsigned long long)n,
+                                    rdst ? "" : "  <-- NO EXPRESSIBLE DESTINATION");
+                    }
                     static const bool no_resolve = getenv("PROSPER_NO_RESOLVE") != nullptr;
                     if (!pass.empty() && pass.front()->ps.cb_resolve && !no_resolve) {
                         const uint64_t rsrc = pass.front()->color0_base;
