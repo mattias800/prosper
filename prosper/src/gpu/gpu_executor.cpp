@@ -9361,9 +9361,14 @@ bool read_compute_tree_watch_words(const ComputeTreeWatchSelector& selector,
 // program that legitimately binds the range. Computed before the dispatch, because the ComputeItem
 // carrying the resource table is moved into the backend.
 std::string describe_compute_tree_watch_touch(const ShaderResourceTable* resources,
-                                              uint64_t wanted) {
+                                              uint64_t wanted, uint64_t bytes) {
     if (!resources) return "toucher=0";
-    const std::vector<ComputeAddressWatchHit> hits = compute_address_watch_hits(*resources, wanted);
+    // WINDOW, not address. The watch detects changes anywhere in the window, so asking whether a
+    // program binds only the window's first byte makes the two halves of the instrument answer
+    // different questions -- which reported a program that binds window+128 as a non-toucher, i.e.
+    // as an out-of-bounds write that was not one.
+    const std::vector<ComputeAddressWatchHit> hits =
+        compute_address_window_hits(*resources, wanted, bytes);
     if (hits.empty()) return "toucher=0";
     std::string touch = "toucher=1 at=";
     for (size_t i = 0; i < hits.size(); ++i) {
@@ -10141,8 +10146,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     const ComputeLaunchDimensions tree_watch_launch = item.launch;
                     const std::string tree_watch_touch =
                         compute_tree_watch_selector()
-                            ? describe_compute_tree_watch_touch(item.resources.get(),
-                                                                compute_tree_watch_selector()->addr)
+                            ? describe_compute_tree_watch_touch(
+                                  item.resources.get(), compute_tree_watch_selector()->addr,
+                                  static_cast<uint64_t>(compute_tree_watch_selector()->records) *
+                                      sizeof(uint32_t))
                             : std::string();
                     const std::vector<uint32_t> tree_watch_pre =
                         observe_compute_tree_watch_pre(item, submit_no, operation.index,

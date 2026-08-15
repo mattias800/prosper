@@ -246,9 +246,22 @@ of `0x413dc3400`** — in whatever produces `0x209cc76000`.
 
 **Its producers, from `PROSPER_COMPUTE_TREE_WATCH=0x209cc76000`:** `0x413cf9000` (117 changes),
 `0x413cf9200` (117), `0x413cf5400` (29), `0x413cf6100` (29), `0x413ce6000` (26), `0x413d1bf00` (2),
-and `0x413e1ff00` (3, **`toucher=0`**). `0x413cf9200` has 20 recompile-empty dispatches of 678, and
-`0x413e1ff00` writes bytes it does not bind. **Both are unexamined and both are better leads than
-anything remaining on the builder.**
+and `0x413e1ff00` (3, **`toucher=0`**). `0x413cf9200` has 20 recompile-empty dispatches of 678.
+
+**RETRACTED — `0x413e1ff00` does NOT write bytes it does not bind.** That was my own instrument
+producing a phantom. Its binding 7 is `base=0x209cc76080 size=160 stride=32`, i.e. **128 bytes inside
+the watched window**. The tree watch detects changes anywhere in the WINDOW but its `toucher` field
+asked whether a program binds the window's **first byte** — two different questions, and the
+disagreement reads as an out-of-bounds write. Fixed with `compute_address_window_hits`, and the
+retraction is recorded rather than quietly dropped because the phantom was reported as a lead before
+the resource map contradicted it.
+
+The same run corrects the producer picture in a way that matters: `0x413cf9000` binds only
+`0x209cc76000 size=320`, and `0x413cf9200` binds `size=320` plus a 64-byte view at `+0x140`. **They
+write the first 320 bytes — five records — not the bulk.** The only program binding the full
+132,032-byte array is `0x413ce6000` (bindings 13/14/17). So it *is* the bulk producer of the records,
+which the falsification above does not contradict: it executes on 29 of the cyclic submits, so its
+running is not the variable.
 
 ## THE BUILDER'S LOWERING IS CORRECT — it emits a perfect tree for eleven submits (2026-08-15)
 
