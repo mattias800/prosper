@@ -9340,6 +9340,38 @@ void report_compute_tree_watch(const char* phase, const ComputeTreeWatchSelector
     if (changed > kReportedSlots)
         std::fprintf(stderr, "[compute-tree-watch]   ... %u further changed slots not listed\n",
                      changed - kReportedSlots);
+
+    // PROSPER_COMPUTE_TREE_WATCH_DUMP=<dir>: write both images of a transition that INTRODUCES
+    // cycles. Twelve reported slots identify that something changed; they cannot answer what shape
+    // the damage has -- whether the wrong records cluster by workgroup, by wave, at the tail of the
+    // extent, or not at all. That question decides between a lane-activation defect and a
+    // value-computation defect, and it needs the whole array on disk.
+    //
+    // Gated on the clean -> cyclic transition specifically. Dumping every change would write
+    // hundreds of megabytes across a routed run and bury the two images that matter.
+    if (transition != ComputeTreeWatchTransition::CleanToCyclic) return;
+    const char* dump_root = std::getenv("PROSPER_COMPUTE_TREE_WATCH_DUMP");
+    if (!dump_root || !*dump_root) return;
+    auto write_image = [&](const char* which, const std::vector<uint32_t>& words) {
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s/tree-%s-s%llu-d%zu-o%llu-p%llx.bin", dump_root, which,
+                      static_cast<unsigned long long>(submit_no), dispatch_index,
+                      static_cast<unsigned long long>(order),
+                      static_cast<unsigned long long>(program));
+        std::FILE* file = std::fopen(path, "wb");
+        if (!file) {
+            std::fprintf(stderr, "[compute-tree-watch] dump open failed: %s\n", path);
+            return;
+        }
+        const size_t written = std::fwrite(words.data(), sizeof(uint32_t), words.size(), file);
+        const int closed = std::fclose(file);
+        if (written != words.size() || closed != 0)
+            std::fprintf(stderr, "[compute-tree-watch] dump write failed: %s\n", path);
+        else
+            std::fprintf(stderr, "[compute-tree-watch]   dumped %s -> %s\n", which, path);
+    };
+    write_image("pre", before);
+    write_image("post", after);
 }
 
 // Returns the pre-image so the caller can hand it back for the post comparison. Empty means the
