@@ -1076,11 +1076,20 @@ int main() {
             CHECK(mid_seg.target.load_existing_slots[2] && last_seg.target.load_existing_slots[2] &&
                       mid_seg.target.load_existing && mid_seg.target.load_existing1,
                   "#2550: every later segment loads every persistent slot");
-            // Non-final segments copy nothing out: their pixels are discarded, and `color_count > 2`
-            // alone would force a full-extent readback per slot per segment.
-            CHECK(!first_seg.target.readback_slots[2] && !mid_seg.target.readback_slots[2] &&
-                      !first_seg.target.readback && !first_seg.target.readback1,
-                  "#2550: non-final segments read back no slot");
+            // A non-final segment discards its own slot-0 pixels but must COPY OUT everything it
+            // may have to carry -- slot 1 and every active slot 2+ -- or the next segment has
+            // nothing to be seeded with. Asserted on the value the helper returns, which is the
+            // value the segment actually renders under: an earlier version left this decision to
+            // the caller, so this assertion read `non-final segments read back no slot` and
+            // documented the opposite of the effective contract.
+            CHECK(!first_seg.target.readback && !mid_seg.target.readback,
+                  "#2550: a non-final segment does not copy out slot 0");
+            CHECK(first_seg.target.readback_slots[2] && mid_seg.target.readback_slots[2] &&
+                      first_seg.target.readback1 && mid_seg.target.readback1,
+                  "#2550: a non-final segment copies out every slot it may have to carry");
+            // Slots outside the active prefix are not touched.
+            CHECK(!first_seg.target.readback_slots[5],
+                  "#2550: a slot beyond color_count is not read back");
             CHECK(last_seg.target.readback_slots[2] && last_seg.target.readback,
                   "#2550: the final segment keeps the caller's readback contract");
             // The persistent identities must survive unchanged, or later segments would retain a

@@ -8154,11 +8154,24 @@ inline SplitSegmentContract split_segment_contract(
         if (carried_slots[1]) out.target.seed_rgba1_slot = carried_slots[1];
     }
     if (!final) {
-        // A non-final segment's pixels are discarded, so do not copy them out. Slots 2+ must say so
-        // per slot: `color_count > 2` alone forces a readback regardless of the slot-0/1 flags.
+        // A non-final segment's slot-0 pixels are discarded, so do not copy them out.
         out.target.readback = false;
         out.target.readback1 = false;
         out.target.readback_slots.fill(false);
+        // ...but every slot this segment may have to CARRY must be copied out, or there is nothing
+        // to seed the next segment with. That is slot 1 (which the live renderer takes through
+        // BackendMrtOutputs) and every active slot 2+, unconditionally: whether a slot's image
+        // actually survives depends on persistent_color_targets_enabled and on a cache/budget
+        // allocation that can fall back to a transient image while leaving the identity non-zero,
+        // and none of that is visible from here.
+        //
+        // Decided HERE rather than by the caller amending the result. It was written as an
+        // override immediately after this function returned, which left the helper's own test
+        // asserting `non-final segments read back no slot` -- the exact opposite of the effective
+        // contract, in the test whose job is to document it.
+        for (uint32_t slot = 2; slot < out.color_count; ++slot)
+            out.target.readback_slots[slot] = true;
+        if (out.color_count > 1) out.target.readback1 = true;
     }
     return out;
 }
@@ -8309,31 +8322,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const size_t end = begin + relative_end;
         const bool final = end == all.size();
 
-        SplitSegmentContract segment = split_segment_contract(
+        const SplitSegmentContract segment = split_segment_contract(
             color_target, mrt_outputs, begin == 0, final, carried_slot_ptrs);
         const BackendColorTarget* segment_target_ptr =
             segment.has_target ? &segment.target : nullptr;
         std::vector<uint8_t> intermediate_color1;
         std::vector<uint8_t>* segment_out1 = out_rgba1
             ? (final ? out_rgba1 : &intermediate_color1) : nullptr;
-        // A non-final segment READS BACK every slot it may have to carry, unconditionally.
-        //
-        // Keying this on a non-zero persistent identity was wrong: persistence also requires
-        // persistent_color_targets_enabled and a successful cache/budget allocation, and the
-        // slot-creation path falls back to a transient image while leaving the identity non-zero.
-        // In any of those cases the identity says "retained" and the image is not, no bytes are
-        // captured, and the next segment starts from a cleared attachment. The wrapper cannot see
-        // those decisions, so it does not try to predict them -- it captures, which is correct when
-        // the image was transient and merely redundant when it survived. Split passes are rare;
-        // silently losing an attachment is not a price worth paying to avoid a copy on one.
-        if (!final && segment.has_target) {
-            for (uint32_t slot = 2; slot < segment.color_count; ++slot)
-                segment.target.readback_slots[slot] = true;
-            // Slot 1 travels through whichever output API the caller chose. `out_rgba1` is the
-            // legacy one; the live renderer takes slot 1 through BackendMrtOutputs, and on that
-            // path the readback landed in intermediate_mrt.colors[1] with nothing carrying it.
-            if (segment.color_count > 1) segment.target.readback1 = true;
-        }
         // The shape travels with every segment; only the pixel destination differs.
         BackendMrtOutputs intermediate_mrt;
         intermediate_mrt.color_count = segment.color_count;
