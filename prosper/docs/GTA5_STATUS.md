@@ -1829,6 +1829,52 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## The two inputs nothing writes (2026-08-15, measured)
+
+The gameplay chain is all `0x20…` and every link hits (Codex, #2542), so the world is already absent
+at the output of `fs=0x205b34be00`. That shader takes four inputs. Two of them are surfaces **no draw
+in the run ever renders into**:
+
+| input | RTT cache | draws that write it (exact, 131,072-draw run) |
+| --- | --- | --- |
+| `0x2085de0000` | HIT | **130,290** — slot1=8,262, slot4=122,028 |
+| `0x2063380000` | HIT | **1** |
+| `0x2052ac0000` (3840x2160 fmt=1) | MISS | **0 — never a colour target** |
+| `0x2054aa0000` (fmt=11) | MISS | **0 — never a colour target** |
+
+Measured with `PROSPER_TARGET_WATCH=<addr>,…`, which is exact and unsampled over all eight MRT slots.
+
+**Why the zeros are believable here, when a clean zero usually is not.** Two independent properties of
+the same run establish that the instrument could have expressed the result it did not find:
+
+- *The lever moves*: `0x2085de0000` reports 130,290 of 131,072 draws across two slots.
+- *The domain is expressible*: `0x2063380000` reports **exactly one** draw. That is the case a sampled
+  census structurally cannot represent, and it is the reason this measurement exists — see below.
+
+`0x2052ac0000` is also guest-readable and its first 8,252 bytes stay **all-zero for the whole run**
+(`[compute-tree-watch] … pairs=0 unpaired=0`, observed once and never changing). That is expected of any
+render target and is *not* independent evidence, since guest memory does not see GPU writes; it is
+recorded only so the next reader does not spend a run re-deriving it.
+
+### Two instrument defects this found, both of which had already produced a wrong answer
+
+1. **The draw census read only MRT slot 0.** A deferred renderer writes a G-buffer across slots 0–7 in
+   one draw, so a slot-0-only census cannot see most of what a frame renders into — and "is address X
+   ever a render target" was exactly the question being put to it. Its own control exposed it: the two
+   surfaces that demonstrably HIT the RTT cache never appeared in the census at all. Fixed to census all
+   eight slots. `0x2085de0000`'s traffic is 96% in **slot 4**, so the slot-0 census was blind to it.
+2. **The census samples 1 in 32 draws, and a sampled zero cannot answer an "ever" question.** A surface
+   written by ten draws is missed with probability (31/32)^10 ≈ 73%; by one draw, ≈ 97%. The sampling was
+   itself a correct earlier fix — the unsampled first version took a mutex and a map insert on every one
+   of 131,072 draws and stalled the routed run at 1,024 — but it silently changed what the instrument
+   could conclude. `PROSPER_TARGET_WATCH` is the exact form: bounded watch list, per-address atomics, no
+   lock, so it costs eight register lookups per draw and keeps the "ever" question answerable.
+   **`0x2063380000` is written by exactly one draw**, so this distinction is not hypothetical — the
+   sampled census would have reported it as never written, alongside the two that genuinely are.
+
+An unreadable tree-watch window also used to produce **no output at all**, which is indistinguishable
+from "nothing writes this address" — the conclusion it would have supported. It now says so.
+
 ## Ruled out / retracted here
 
 - **"Sibling pairs are `(odd, even)`."** Retracted. The clean table has 204 parents whose children

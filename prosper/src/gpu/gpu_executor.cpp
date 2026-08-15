@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <condition_variable>
@@ -9619,7 +9620,25 @@ std::vector<uint32_t> observe_compute_tree_watch_pre(const ComputeItem& item, ui
     const auto& selected = compute_tree_watch_selector();
     if (!selected) return {};
     std::vector<uint32_t> current;
-    if (!read_compute_tree_watch_words(*selected, current)) return {};
+    if (!read_compute_tree_watch_words(*selected, current)) {
+        // An unreadable watch window produced NO output at all -- indistinguishable from "nothing
+        // writes this address", which is the conclusion it would have supported. Report it once.
+        // Measured need: watching GTA V's 0x2052ac0000 returned complete silence, and the silence
+        // meant the address is not guest-readable, not that no program writes it.
+        static std::mutex mutex;
+        static std::set<uint64_t> reported;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            first = reported.insert(selected->addr).second;
+        }
+        if (first)
+            std::fprintf(stderr,
+                         "[compute-tree-watch] addr=0x%llx UNREADABLE (%u dwords) — this watch can "
+                         "report nothing about it; its silence is not evidence of no writer\n",
+                         static_cast<unsigned long long>(selected->addr), selected->records);
+        return {};
+    }
 
     LiveComputeTreeWatchState& state = compute_tree_watch_state();
     ++state.observations;
@@ -9988,6 +10007,81 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 //
                 // Counted before the `render` early-out so a run without the live renderer still
                 // reports what the command stream contained. Printed at powers of two.
+                // PROSPER_TARGET_WATCH=0x…,0x… — EXACT and unsampled: is this address EVER a
+                // colour target, in any of the eight MRT slots?
+                //
+                // Separate from the census below because the census samples 1 in 32 draws, and a
+                // sampled zero cannot answer an "ever" question. A surface written by ten draws is
+                // missed with probability (31/32)^10 ≈ 73%; by one draw, 97%. The census's zero for
+                // GTA V's 0x2052ac0000 therefore only excludes a *frequent* writer, which is not
+                // what was asked of it.
+                //
+                // Cost is eight register lookups per draw with no lock (per-address atomics), which
+                // is what the 1-in-32 sampling was protecting against when it applied to a mutex and
+                // a map insert. Watch list is bounded so the per-draw cost stays fixed.
+                {
+                    struct TargetWatch {
+                        uint64_t addr;
+                        std::atomic<uint64_t> hits[8];
+                        std::atomic<uint64_t> total;
+                    };
+                    static constexpr size_t kMaxWatch = 8;
+                    static std::array<TargetWatch, kMaxWatch> watch{};
+                    static size_t watch_count = 0;
+                    static std::atomic<uint64_t> watch_draws{0};
+                    static const bool watch_enabled = [] {
+                        const char* spec = std::getenv("PROSPER_TARGET_WATCH");
+                        if (!spec || !*spec) return false;
+                        for (const char* p = spec; *p && watch_count < kMaxWatch;) {
+                            char* end = nullptr;
+                            const uint64_t v = std::strtoull(p, &end, 0);
+                            if (end == p) break;
+                            watch[watch_count++].addr = v;
+                            p = (*end == ',') ? end + 1 : end;
+                        }
+                        std::fprintf(stderr, "[target-watch] watching %zu address(es)\n",
+                                     watch_count);
+                        return watch_count != 0;
+                    }();
+                    if (watch_enabled) {
+                        namespace P = prosper::agc::Pm4;
+                        constexpr uint32_t kColorRegisterStride = 0xf;
+                        const uint64_t wn = watch_draws.fetch_add(1) + 1;
+                        if (const GpuState* snap = st.draws[operation.index].state.get()) {
+                            for (uint32_t slot = 0; slot < 8u; ++slot) {
+                                const auto lo = snap->cx.find(
+                                    P::CB_COLOR0_BASE + slot * kColorRegisterStride);
+                                if (lo == snap->cx.end() || !lo->second) continue;
+                                const auto hi = snap->cx.find(P::CB_COLOR0_BASE_EXT + slot);
+                                uint64_t base = static_cast<uint64_t>(lo->second) << 8;
+                                if (hi != snap->cx.end())
+                                    base |= static_cast<uint64_t>(hi->second & 0xffu) << 40;
+                                for (size_t w = 0; w < watch_count; ++w) {
+                                    if (watch[w].addr != base) continue;
+                                    watch[w].hits[slot].fetch_add(1, std::memory_order_relaxed);
+                                    watch[w].total.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                        if ((wn & (wn - 1)) == 0 && wn >= 4096u) {
+                            for (size_t w = 0; w < watch_count; ++w) {
+                                std::string slots;
+                                for (uint32_t s = 0; s < 8u; ++s) {
+                                    const uint64_t h = watch[w].hits[s].load();
+                                    if (!h) continue;
+                                    slots += " slot" + std::to_string(s) + "=" + std::to_string(h);
+                                }
+                                std::fprintf(stderr,
+                                             "[target-watch] addr=0x%llx draws=%llu of %llu%s\n",
+                                             (unsigned long long)watch[w].addr,
+                                             (unsigned long long)watch[w].total.load(),
+                                             (unsigned long long)wn,
+                                             slots.empty() ? "  NEVER A COLOUR TARGET" :
+                                                 slots.c_str());
+                            }
+                        }
+                    }
+                }
                 if (std::getenv("PROSPER_DRAW_CENSUS")) {
                     static std::atomic<uint64_t> seen{0}, indirect_seen{0};
                     const uint64_t n = seen.fetch_add(1) + 1;
@@ -10009,21 +10103,31 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         // Straight from the draw's own register snapshot, the same two registers
                         // render_state.cpp uses (CB_COLOR0_BASE + its _EXT high bits). Avoids
                         // building a RenderState per draw on a path that runs 131,072 times.
+                        // ALL EIGHT MRT slots, not just slot 0. The first version read only
+                        // CB_COLOR0_BASE, and its own control exposed that: two surfaces which
+                        // demonstrably HIT the RTT cache (0x2063380000, 0x2085de0000) never appeared
+                        // in the census at all. A deferred renderer writes a G-buffer across slots
+                        // 0..7 in one draw, so a slot-0-only census cannot see most of what a frame
+                        // renders into -- and "is address X ever a render target" was exactly the
+                        // question being asked of it.
+                        //
+                        // Register layout from render_state.cpp: stride 0xf per slot for BASE, and
+                        // CB_COLOR0_BASE_EXT + slot for the high bits.
                         namespace P = prosper::agc::Pm4;
-                        uint64_t base = 0;
-                        uint32_t view = 0;
+                        constexpr uint32_t kColorRegisterStride = 0xf;
                         if (const GpuState* snap = st.draws[operation.index].state.get()) {
-                            const auto lo = snap->cx.find(P::CB_COLOR0_BASE);
-                            const auto hi = snap->cx.find(P::CB_COLOR0_BASE_EXT);
-                            const auto vw = snap->cx.find(P::CB_COLOR0_VIEW);
-                            if (lo != snap->cx.end())
-                                base = static_cast<uint64_t>(lo->second) << 8;
-                            if (hi != snap->cx.end())
-                                base |= static_cast<uint64_t>(hi->second & 0xffu) << 40;
-                            if (vw != snap->cx.end()) view = vw->second;
+                            std::lock_guard lock(target_mutex);
+                            for (uint32_t slot = 0; slot < 8u; ++slot) {
+                                const auto lo = snap->cx.find(
+                                    P::CB_COLOR0_BASE + slot * kColorRegisterStride);
+                                if (lo == snap->cx.end() || !lo->second) continue;
+                                const auto hi = snap->cx.find(P::CB_COLOR0_BASE_EXT + slot);
+                                uint64_t base = static_cast<uint64_t>(lo->second) << 8;
+                                if (hi != snap->cx.end())
+                                    base |= static_cast<uint64_t>(hi->second & 0xffu) << 40;
+                                ++targets[{base, slot, 0u}];
+                            }
                         }
-                        std::lock_guard lock(target_mutex);
-                        ++targets[{base, view, 0u}];
                     }
                     if ((n & (n - 1)) == 0 && n >= 4096u) {
                         std::fprintf(stderr,
@@ -10047,11 +10151,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         for (const auto& r : ranked) {
                             const std::pair<const std::tuple<uint64_t, uint32_t, uint32_t>, uint64_t>
                                 entry{r.second, r.first};
-                            if (shown++ >= 12) { std::fprintf(stderr,
+                            // All of them at the final report. Twelve was enough to see whether one
+                            // target dominates; it is not enough to answer "is address X ever a
+                            // render target", which is the question a specific suspect raises.
+                            const size_t limit = n >= 65536u ? targets.size() : 12u;
+                            if (shown++ >= limit) { std::fprintf(stderr,
                                 "[draw-census]   ... %zu further targets\n",
-                                targets.size() - 12); break; }
+                                targets.size() - limit); break; }
                             std::fprintf(stderr,
-                                         "[draw-census]   color0=0x%llx view=0x%x draws=%llu\n",
+                                         "[draw-census]   target=0x%llx slot=%u draws=%llu\n",
                                          (unsigned long long)std::get<0>(entry.first),
                                          std::get<1>(entry.first),
                                          (unsigned long long)entry.second);
