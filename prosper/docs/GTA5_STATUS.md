@@ -78,6 +78,81 @@ both decoding to parent 296), so it is a flag-bit difference and a separate anom
 **Ruled out by this measurement:** the "lost update" / two-writer race account of the cycle. Within
 one dispatch's pre/post pair there is exactly one writer, and its output is cyclic.
 
+## The failure mode, exactly: one of the two per-parent stores does not execute
+
+Established from both images of 18 clean -> cyclic transitions.
+
+**Ground truth.** Two clean captures give the target unambiguously: parent-multiplicity
+`{2: 1030, 1: 2}` — every parent has exactly two children — with 1,032 distinct parent values over
+0..2062, 515 of them above 1031, and 1,031 indices never a parent. Leaves and internals are
+interleaved, not segregated into low and high halves.
+
+**`0x413dc3400`'s output** measures `{2: ~872, 1: 220..461}`. For 220–461 parents **exactly one of
+the two children carries that parent**, and the missing child's slot still holds a *stale* value —
+`0x09249249`, `0x12492492` or `0x2db6db6d`, which are the Morton dilation constant times 1, 2 and 5,
+or plain zero. Those slots were never written by this dispatch. **So this is a store that does not
+execute, not a store that computes a wrong address or a wrong value.**
+
+### The store site
+
+All six stores sit in six separately exec-predicated blocks of identical shape (mnemonics from
+prosper's own decoder, `rdna2_to_spirv.cpp` VOP2 0x16 `v_lshrrev_b32`, 0x1B `v_and_b32`,
+0x25 `v_add_nc_u32`):
+
+```
+pc=0611  v_and_b32          v36, 7, v69      ; tag = child_ref & 7
+pc=0612  v_cmp_eq_u32       s8,  2, v36
+pc=0614  v_cmp_eq_u32       vcc, 5, v36
+pc=0615  s_or_b64           vcc, vcc, s8     ; tag == 2 || tag == 5
+pc=0616  s_and_saveexec_b64 vcc, vcc
+pc=0617  s_cbranch_execz    -> 622
+pc=0618  v_lshrrev_b32      v36, 3, v69      ; index = child_ref >> 3
+pc=0619  v_add_nc_u32       v36, -4, v36     ; index -= 4
+pc=0620  buffer_store_dword v40, v36, s0, 0  ; idxen=1, offen=0
+pc=0622  s_mov_b64          exec, vcc
+```
+
+A child is written only when its reference's low three bits are 2 or 5, into slot `(ref >> 3) - 4`.
+**Whether tags outside `{2, 5}` are written by a LATER PASS is the open question** — if they are,
+a stale slot here is expected and the defect is a missing program rather than this one (#2542).
+
+### A gap in the toucher census that may matter more
+
+The baseline routed run **skips 13 compute programs as unsupported**, and a skipped program never
+realizes a resource table — so `PROSPER_COMPUTE_ADDRESS_WATCH` and the tree watch are
+**structurally incapable of seeing any of them**. The clean "no unknown writer" result is therefore
+a statement about programs that ran, and only those. Baseline skip list:
+
+```
+0x2042f49a00 0x205b545c00 0x205b54ee00 0x205b5e8600 0x205b654a00 0x205b657200
+0x205b658800 0x205b67ce00 0x413ce6000 0x413cf9200 0x413cf9a00 0x413cf9d00 0x413d14100
+```
+
+If one of those is the pass that fills the slots `0x413dc3400` deliberately leaves alone, the cyclic
+table is a **missing program**, not a miscompiled one, and the fix is to make it recompile. Per the
+charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
+the next thing to implement regardless of how this particular question resolves.
+
+## Ruled out / retracted here
+
+- **"Sibling pairs are `(odd, even)`."** Retracted. The clean table has 204 parents whose children
+  are `(2j+1, 2j+2)` and **828** whose children are `(2j, 2j+1)` — pairs are adjacent at arbitrary
+  parity. The "first broken pair k=205" figure was computed under the fixed-alignment assumption and
+  its alignment part goes with it. The adjacency-based unpaired and cycle counts never assumed
+  alignment and stand.
+- **"Slot 300's bits[2:0] are an anomaly."** Retracted. `post-36-3.bin` has bits[2:0] == 0 in all
+  2,063 records while `live-a240.bin` carries a mix of 0 and 2, so that field varies legitimately
+  between clean tables.
+- **The LDS-undersizing hypothesis.** Dead: the module declares a Workgroup array of exactly 384
+  dwords = 1,536 bytes = 3 × 512-byte `COMPUTE_PGM_RSRC2.LDS_SIZE` granules, so the real allocation
+  is plumbed through and matched, not defaulted.
+- **Synchronization / race hypotheses for this program.** The broken-pair patterns from two
+  different frames share a 60-character suffix exactly, and `min` damage index is identical across
+  frames: the failure is deterministic given the input.
+- **A lane, wave or workgroup boundary effect.** `k mod 2/3/4/8/16` are all flat.
+- **`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` as an A/B arm.** Void, not negative: it skips 15 *more*
+  programs including `0x413d88400`, so `0x413dc3400` never dispatches and the phase never runs.
+
 ## What the structure IS: an LBVH / binary-radix-tree parent table from Morton keys
 
 Identified by Codex from the retained ISA (#2542), and it reframes everything below.
