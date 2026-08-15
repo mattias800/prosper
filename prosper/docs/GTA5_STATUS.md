@@ -211,7 +211,51 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
-## ROOT CAUSE: `0x413ce6000` never recompiles, and it is the producer of the tags (2026-08-15)
+## CORRECTION (2026-08-15): the "never executes" claim above is WRONG
+
+Watching the record array itself — `PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:2063` — refutes the
+strongest form of the claim in the section below. **`0x413ce6000` does write it**, 26 times on a
+150 s route, `toucher=1`. It is not declined on every dispatch; the `[compute] skip unsupported
+program` line that suggested otherwise fires **once per program ever**, so it reports "failed at
+least once", never "never ran". That distinction is stated elsewhere in this document and I still
+built a causal claim on the wrong side of it.
+
+The array's actual writers on one route:
+
+| program | changes | toucher |
+| --- | --- | --- |
+| `0x413cf9000` | 117 | 1 |
+| `0x413cf9200` | 117 | 1 |
+| `0x413cf5400` | 29 | 1 |
+| `0x413cf6100` | 29 | 1 |
+| `0x413ce6000` | **26** | 1 |
+| `0x413d1bf00` | 2 | 1 |
+| `0x413e1ff00` | 3 | **0** |
+
+**What survives** from the section below, because it was measured rather than inferred:
+
+- `0x413dc3400` corrupts the parent table on 37 of 40 dispatches. Unchanged.
+- `0x413dc3400`'s tag source is `0x209cc76000`, binding 4 / fetch-pc 86 — the resource-map alias is
+  exact and stands.
+- `0x413ce6000` writes that same array, is *sometimes* declined, and its reject is
+  `unresolved-operand pc=156`. Also stands.
+
+**What does not survive:** "`0x413ce6000` never executes, therefore the tags are stale, therefore the
+tree is cyclic." The producer runs most of the time, so a missing-producer story cannot be asserted
+on this evidence. It remains a *candidate* — a partially-written array would still leave some records
+stale — but the step from "sometimes declined" to "these particular tags are stale" is not made, and
+the frame-level correlation between a decline and a corrupted tree has not been measured. **Do that
+measurement before building on it.**
+
+`0x413e1ff00` changing the array three times with **`toucher=0`** is the case the tree watch was
+built to be able to report: a program that changes bytes without binding a range containing them.
+That is either an out-of-bounds write or a binding path the resource traversal does not model, and
+it is unexamined.
+
+## `0x413ce6000` is a producer of the tags, and is sometimes declined (2026-08-15)
+
+**Read the CORRECTION above first — this section's causal claim was overstated and the
+"never executes" premise is refuted. The resource alias it establishes is sound.**
 
 The chain is complete and every link is measured.
 
