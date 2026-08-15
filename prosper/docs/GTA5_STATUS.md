@@ -399,6 +399,39 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## The F9 frame grab cannot be used on this title — diagnosed and filed (#2549)
+
+The charter names the F9 grab the fastest loop for a graphical bug, and GTA V — a GPU-driven title
+whose world is absent — is exactly the case it exists for. It could not be run at all, and the
+message said only "the capture window contained no GPU submits".
+
+Instrumenting the submit hook with three counters and the window's wall-clock duration named the
+cause immediately:
+
+```
+[grab] submit hook reached=26840, 19206 while inactive, 7634 while not capturing;
+       window was open 26 ms for 48 presents
+```
+
+**48 presents in 26 ms**, and 12 presents in 7 ms — about **1,700 presents/second** against a 23/s
+average. **GTA V flips in bursts**, so a window defined as a present COUNT has an effectively random
+wall-clock duration, usually far too short to contain a submit.
+
+Two further refusals were found and opened behind `PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1`, which
+reports every acceptance as inspection-only: five packed/indirect-pointer provenance validators that
+abort the whole bundle when one compute dispatch cannot be exactly proven. Right for a replay bundle,
+wrong for a bundle meant to be read — and on this title they fire, so the grab aborted at submit
+19358 before the window problem was even reachable.
+
+With both addressed the capture reaches **181 frames / 22,599 submits**, and then hits the byte
+budget: 28 frames is 3.4 GB against a 3,072 MB maximum. **There is no setting that both lands on
+submits and fits the budget, because one knob controls both.** Filed as **#2549** with a
+time-based-window suggestion.
+
+**Consequence for everything above:** there is still no draw-level view of a GTA V frame. Every
+conclusion in this document about why the world is absent rests on log statistics, not on the frame's
+contents.
+
 ## Open, unquantified: 38 of 40 logged `WaitRegMem` waits are on UNMAPPED labels (2026-08-15)
 
 ```

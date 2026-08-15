@@ -2165,11 +2165,28 @@ bool capture_bundle_trigger_file_enabled() {
 }
 
 // Called per submit: when a frame grab is in progress, append this submit's realized state to the bundle.
+// "the capture window contained no GPU submits" is reported identically whether the submit hook was
+// never reached, was reached before the window opened, or was reached and rejected -- three
+// different faults with three different fixes, and the message distinguishes none of them. On GTA V
+// the window reports zero at 1, 16 and 48 frames while the same run demonstrably renders. These
+// counters make the failure name itself.
+std::atomic<uint64_t> g_grab_hook_reached{0};
+long long g_grab_window_open_ms = 0;
+std::atomic<uint64_t> g_grab_hook_inactive{0};
+std::atomic<uint64_t> g_grab_hook_not_capturing{0};
+
 void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_no) {
-    if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
+    g_grab_hook_reached.fetch_add(1, std::memory_order_relaxed);
+    if (!g_interactive_frame_active.load(std::memory_order_acquire)) {
+        g_grab_hook_inactive.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
-    if (!b.capturing || b.failed) return;
+    if (!b.capturing || b.failed) {
+        g_grab_hook_not_capturing.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     GpuCaptureFile capture;
     const GpuCaptureMetadata meta = runtime_capture_metadata(submit_no);
     std::string error;
@@ -2265,6 +2282,17 @@ void interactive_frame_bundle_on_present() {
                     // zero legitimately, and re-arming the same width is a coin flip (trap 101).
                     std::fprintf(stderr, "[grab] frame-bundle: window had no submits; widen it with "
                                          "PROSPER_CAPTURE_FRAMES=N (1..240) or re-arm\n");
+                    std::fprintf(stderr,
+                                 "[grab] frame-bundle: submit hook reached=%llu, %llu while "
+                                 "inactive, %llu while not capturing; window was open %lld ms "
+                                 "for %u presents\n",
+                                 (unsigned long long)g_grab_hook_reached.load(),
+                                 (unsigned long long)g_grab_hook_inactive.load(),
+                                 (unsigned long long)g_grab_hook_not_capturing.load(),
+                                 (long long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count() -
+                                     g_grab_window_open_ms),
+                                 b.frames_seen);
                     b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
                     b.outcome_error = "the capture window contained no GPU submits";
                 }
@@ -2278,6 +2306,8 @@ void interactive_frame_bundle_on_present() {
         } else if (!b.armed_path.empty()) {
             b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
             b.arm_delay_presents = 0;
+            g_grab_window_open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
             b.pending_failure_error.clear();
             // No arrow here, deliberately: " -> <path>" is reserved for a line emitted AFTER the

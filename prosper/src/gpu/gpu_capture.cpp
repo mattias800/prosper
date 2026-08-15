@@ -1610,6 +1610,31 @@ bool captured_compute_has_nullable_output_raw_buffer(
                     });
 }
 
+// PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1 — accept a capture whose GPU-driven provenance cannot
+// be proven exactly, and say so.
+//
+// These validators refuse the WHOLE BUNDLE when one compute dispatch's packed-pointer or
+// indirect-pointer state is not exactly provable. That is right for a bundle meant to REPLAY: a
+// relocation replayed without provenance would fabricate a pointer. It is wrong for a bundle meant
+// to be READ -- `gpu_replay --inspect-only`, the draw list, the render targets -- and on GTA V it
+// makes the F9 frame grab unusable on the one title whose world is GPU-driven, which is exactly
+// where a draw-level view is needed. The charter calls that grab the fastest loop for a graphical
+// bug; on this title it could not be run at all.
+//
+// Opt-in and reported, because a bundle that silently claimed replay fidelity it does not have
+// would be worse than the refusal it replaces.
+inline bool capture_allow_unproven_provenance(const char* what, const char* detail) {
+    static const bool allowed = std::getenv("PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT") != nullptr;
+    if (!allowed) return false;
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) < 12)
+        std::fprintf(stderr,
+                     "[capture] ALLOW_UNPROVEN_INDIRECT: accepting %s (%s). "
+                     "THIS BUNDLE IS FOR INSPECTION, NOT FAITHFUL REPLAY.\n",
+                     what, detail);
+    return true;
+}
+
 bool validate_captured_nullable_output_raw_buffer(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
@@ -1630,6 +1655,8 @@ bool validate_captured_nullable_output_raw_buffer(
         compute.launch.threads_y != 1u || compute.launch.threads_z != 1u ||
         compute.launch.groups_x != compute.recompile_config.user_sgprs[7] ||
         compute.launch.groups_y != 1u || compute.launch.groups_z != 1u) {
+        if (capture_allow_unproven_provenance("a nullable-output marker",
+                                              "stale captured launch provenance")) return true;
         error = "nullable-output marker has stale captured launch provenance";
         return false;
     }
@@ -1752,6 +1779,8 @@ bool validate_captured_gta5_packed_pointer(
     if (capture.format_version < 51u || candidates != 1u ||
         !compute.recompile_config_available ||
         compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        if (capture_allow_unproven_provenance("packed-pointer state",
+                                              "no exact compute provenance")) return true;
         error = "packed-pointer state lacks exact compute provenance";
         return false;
     }
@@ -1760,6 +1789,8 @@ bool validate_captured_gta5_packed_pointer(
         (static_cast<uint64_t>(config.threads_x) + config.local_x - 1u) / config.local_x;
     if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
         compute.launch.groups_z != 1u) {
+        if (capture_allow_unproven_provenance("packed-pointer state",
+                                              "stale captured launch provenance")) return true;
         error = "packed-pointer state has stale captured launch provenance";
         return false;
     }
@@ -1830,6 +1861,8 @@ bool validate_captured_indirect_pointer_relocations(
     if (capture.format_version < 53u || candidates != 1u ||
         !compute.recompile_config_available ||
         compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        if (capture_allow_unproven_provenance("an indirect-pointer relocation",
+                                              "no exact compute provenance")) return true;
         error = "indirect-pointer relocation lacks exact compute provenance";
         return false;
     }
@@ -1839,6 +1872,8 @@ bool validate_captured_indirect_pointer_relocations(
         config.local_x;
     if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
         compute.launch.groups_z != 1u) {
+        if (capture_allow_unproven_provenance("an indirect-pointer relocation",
+                                              "stale captured launch provenance")) return true;
         error = "indirect-pointer relocation has stale captured launch provenance";
         return false;
     }
