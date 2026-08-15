@@ -7625,8 +7625,17 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // preserving one native subgroup per guest wave. Keep the environment switch as an explicit
         // experiment for every other multi-wave shape; this automatic path is shader-address/title
         // independent and remains subject to all device and workgroup bounds below.
-        const bool native_multiwave_requested =
-            native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr;
+        // PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE: refuse the multi-wave native contract while leaving
+        // the ordinary one-wave native path alone. The symmetric counterpart of the switch above,
+        // and it exists because the broad PROSPER_NO_NATIVE_COMPUTE_SUBGROUP is unusable as an A/B
+        // arm: on a routed GTA V run it additionally declines fifteen OTHER programs, so the program
+        // under test never dispatches and the arm returns a zero that means "never ran" rather than
+        // "ran clean". This switch changes only shaders whose workgroup spans several guest waves,
+        // which is exactly the population the multiwave lowering is responsible for.
+        const bool native_multiwave_disabled =
+            getenv("PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE") != nullptr;
+        const bool native_multiwave_requested = !native_multiwave_disabled &&
+            (native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr);
         const bool native_subgroup_disabled =
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr;
         config.native_subgroup_size = select_native_compute_subgroup_size(
@@ -7649,6 +7658,27 @@ std::vector<ComputeItem> realize_compute_dispatches(
         if (getenv("PROSPER_SUBGROUP_LOG")) {
             const uint64_t local_invocations = static_cast<uint64_t>(config.local_x) *
                 config.local_y * config.local_z;
+            // Once per (program, resolved contract), not once per dispatch. Per-dispatch this line
+            // is emitted thousands of times on a routed run, and the volume is not merely untidy:
+            // it slows the subject enough to desync a timing-dependent pad script, so the route
+            // never reaches the phase you armed the diagnostic to observe. A run of this diagnostic
+            // on GTA V produced 1,464 lines and never dispatched the program under test, which made
+            // its zero read as a negative result when it was a run that never happened.
+            //
+            // Keyed on the resolved contract as well as the address, so a program whose contract
+            // legitimately changes between dispatches still reports every distinct outcome.
+            static std::mutex subgroup_log_mutex;
+            static std::set<std::pair<uint64_t, uint64_t>> subgroup_logged;
+            const uint64_t contract = (static_cast<uint64_t>(config.native_subgroup_size) << 32) |
+                                      (static_cast<uint64_t>(config.wave_size) << 8) |
+                                      (native_multiwave_requested ? 2u : 0u) |
+                                      (native_subgroup_disabled ? 1u : 0u);
+            bool first_report = false;
+            {
+                std::lock_guard lock(subgroup_log_mutex);
+                first_report = subgroup_logged.emplace(code_addr, contract).second;
+            }
+            if (first_report)
             std::fprintf(stderr,
                          "[subgroup] cs=0x%llx guest-wave=%u native=%u local=%ux%ux%u "
                          "invocations=%llu device-range=%u..%u max-wg-subgroups=%u "
