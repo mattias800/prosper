@@ -399,7 +399,54 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
-## FALSIFIED: the sparse tree is not "correct but sparse by design" (2026-08-15)
+## The sparse tree IS a faithful consequence of its input (2026-08-15)
+
+Testing the right correspondence — for each parent with only one child, the **two child references in
+that parent's own 64-byte node record**:
+
+```
+submit=10052  lone-child parents=164
+   both refs in {2,5} = 0      exactly one = 155      neither = 9
+   commonest (tag0,tag1): (5,0) x82, (0,5) x73, (0,0) x6
+```
+
+**Never both. 155 of 164 have exactly one linkable reference** — typically one box32 child (type 5)
+and one **triangle** child (type 0), which the `tag == 2 || tag == 5` predicate does not link.
+
+Across submits, over all 2,063 node records:
+
+| submit | pairs / unpaired | both refs linkable | exactly one | neither |
+| --- | --- | --- | --- | --- |
+| 5943 | **1029 / 2** | **1034** | 100 | 929 |
+| 7188 | **1029 / 2** | **1034** | 98 | 931 |
+| 8842 | **1029 / 2** | **1033** | 98 | 932 |
+| 9247 | **1029 / 2** | **1033** | 98 | 932 |
+| 10052 | 676 / 74 | 785 | 266 | 1012 |
+| 10449 | 616 / 73 | 775 | 271 | 1017 |
+
+**In the perfect submits `both ≈ 1033` and `pairs ≈ 1029` — they track each other.** In the broken
+ones `both` falls to ~780 and `exactly one` rises to ~270. The builder's output follows its input.
+
+**So `0x413dc3400` is faithfully building what it is told to build**, and the defect is that the node
+records it reads contain roughly 170 fewer linkable child pairs than they do in the frames that come
+out right. Combined with the eleven perfect submits, this is now two independent measurements saying
+the same thing: **the builder is not the defect; its input is.**
+
+What remains open is whether that input is *wrong* or merely *different* — a scene with more triangle
+leaves genuinely has fewer box-to-box links. Distinguishing them needs to know what the guest expects,
+which is the question outstanding with Codex, and it cannot be settled from the output alone. The
+`0x209cc76000` record array has 23 writers, so "which producer" is not yet a well-posed question
+either.
+
+## RETRACTED: that falsification tested the wrong correspondence (2026-08-15)
+
+**The section below asked the wrong question and its conclusion does not follow.** It tested whether
+a record's OWN node type predicts whether that record is paired. The predicate does not act on a
+record's own type — it acts on the **two child references stored in the PARENT's node record**. The
+right test is whether a lone-child parent's two refs differ in linkability, and it says something
+quite different (next section). The section is kept for the record; do not cite its conclusion.
+
+## OLD (wrong test): the sparse tree is not "correct but sparse by design"
 
 This reading was flagged as capable of inverting the whole investigation, so it was tested rather
 than left standing. If `0x413dc3400`'s `tag == 2 || tag == 5` predicate legitimately skips other node
