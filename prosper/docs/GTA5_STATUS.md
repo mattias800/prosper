@@ -399,6 +399,45 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## CONCLUSION: both rejecting programs build descriptors from LANE MASKS (2026-08-15)
+
+`PROSPER_DYNTRACE_SGPR=106` on `0x205b654a00`, filtered by program identity:
+
+```
+pc=1091 s106 <- KNOWN 0x00000005
+pc=1092 s106 <- KNOWN 0x00000001
+pc=1097 s106 <- FORGOTTEN words=85ea807e     <- SOP2 0x0b, a B64 op reading EXEC_LO
+pc=1098 s106 <- FORGOTTEN words=87ea6a00
+pc=1101 s106 <- KNOWN 0x00000004
+...
+pc=1154 s106 <- KNOWN 0x0000ffc8
+```
+
+s106 is known on some paths and lost on others, and where it is lost the source is **EXEC** —
+pc1097's `0x85ea807e` is a 64-bit scalar op whose `ssrc0` is `EXEC_LO`.
+
+**So both declined programs compute descriptor fields from lane masks:**
+
+| program | descriptor field | source |
+| --- | --- | --- |
+| `0x205b654a00` | BVH descriptor `s18` = `-1 + VCC_LO` | VCC_LO from **EXEC** at pc1097 |
+| `0x413ce6000` | array selector, `s_mulk_i32 s106, 120` | VCC_LO from **`s_andn1_saveexec_b64`** at pc116/131 |
+
+**A constant-folder cannot resolve either, and no widening of it ever will.** EXEC is a runtime
+wave state. This is not a gap in the fold's opcode coverage — the `s_mulk_i32`, `s_addk_i32`,
+`s_setreg_b32` and `s_waitcnt_vscnt` corrections made on this branch are all real fixes and none of
+them could have helped, which is exactly what their verified-lever negatives showed.
+
+**What this means for the fix.** These descriptors need a mechanism that does not fold: either
+resolving the descriptor from guest memory at dispatch time (the `selected_sbuffer` contract's
+approach — certify the domain, materialise the record), or a lowering that keeps the descriptor
+dynamic. Which one is a design question and needs the ISA read of what the guest intends by deriving
+a descriptor field from EXEC — plausibly a lane count or an active-mask popcount used as a size.
+
+**`CONFIDENCE: HIGH`** that both fields trace to lane masks — measured per register, per program, with
+a program identity that is actually unique. **`CONFIDENCE: LOW`** on what the guest means by it, which
+is the open question worth asking.
+
 ## The BVH descriptor's unresolved word is `s18`, and it depends on VCC_LO (2026-08-15)
 
 Watching each register of the descriptor `s[16:19]` in `0x205b654a00`, one run each:
