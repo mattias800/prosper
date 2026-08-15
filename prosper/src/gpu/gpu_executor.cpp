@@ -9980,9 +9980,48 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     for (const auto& operation : executable) {
         switch (operation.kind) {
             case RetainedSubmitKind::Draw: {
+                // PROSPER_DRAW_CENSUS=1 — the most basic number about a missing world, and nothing
+                // reported it: how many draws does prosper actually execute, and how many of them
+                // are indirect? An absent world with ten draws per frame and one with ten thousand
+                // are different problems, and every investigation of GTA V's missing world so far
+                // has proceeded without knowing which it is.
+                //
+                // Counted before the `render` early-out so a run without the live renderer still
+                // reports what the command stream contained. Printed at powers of two.
+                if (std::getenv("PROSPER_DRAW_CENSUS")) {
+                    static std::atomic<uint64_t> seen{0}, indirect_seen{0};
+                    const uint64_t n = seen.fetch_add(1) + 1;
+                    if (st.draws[operation.index].indirect)
+                        indirect_seen.fetch_add(1, std::memory_order_relaxed);
+                    if ((n & (n - 1)) == 0)
+                        std::fprintf(stderr,
+                                     "[draw-census] draws=%llu indirect=%llu submit=%llu\n",
+                                     (unsigned long long)n,
+                                     (unsigned long long)indirect_seen.load(),
+                                     (unsigned long long)submit_no);
+                }
                 if (!render) break;
                 if (st.draws[operation.index].indirect &&
                     (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    // The indirect latch drops this draw SILENTLY on an ordinary run -- the failure
+                    // is recorded only when a capture trace happens to be active. On a title whose
+                    // world is GPU-driven that is the difference between "the world is missing" and
+                    // "N indirect draws were dropped because a producer was declined", and nothing
+                    // reported it.
+                    //
+                    // Counted always, printed at powers of two so the volume stays bounded on a
+                    // title that does this every frame. The count is the point: an absent world with
+                    // zero dropped indirect draws and one with thousands are different problems.
+                    static std::atomic<uint64_t> latched_draws{0};
+                    const uint64_t dropped = latched_draws.fetch_add(1) + 1;
+                    if ((dropped & (dropped - 1)) == 0)
+                        std::fprintf(stderr,
+                                     "[agc] indirect DRAW dropped by the dependency latch "
+                                     "(count=%llu, submit=%llu, deps-ok=%u producer-ok=%u)\n",
+                                     (unsigned long long)dropped,
+                                     (unsigned long long)submit_no,
+                                     indirect_dependencies_ok ? 1u : 0u,
+                                     producer_epoch_ok ? 1u : 0u);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Draw, operation.index,

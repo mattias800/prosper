@@ -515,6 +515,44 @@ Two things must be checked before treating this as a defect, and neither has bee
 Recorded as an observation with its caveats rather than a lead, so the next reader neither chases it
 blind nor loses it.
 
+## THE DRAWS ARE HAPPENING: 131,072 executed, 0 indirect, 0 undecoded packets (2026-08-15)
+
+The most basic number about a missing world had never been measured. `PROSPER_DRAW_CENSUS=1` (added
+here, counted before the `render` early-out so it reports what the command stream contained):
+
+```
+[draw-census] draws=1024   indirect=0 submit=190
+[draw-census] draws=16384  indirect=0 submit=4248
+[draw-census] draws=131072 indirect=0 submit=13933
+```
+
+**Over 131,000 draws execute, and not one of them is indirect.**
+
+Three things follow, each independently verified:
+
+1. **The indirect dependency latch drops nothing.** A counter at the drop site (also added here —
+   the drop was silent unless a capture trace happened to be active) reports **zero** across a full
+   routed run that reached gameplay, with the instrument confirmed present in the binary and the
+   route confirmed by 44 builder transitions and 9,580 frames. **This retires the premise this
+   document opens with** for the current state: "every later indirect draw short-circuits untried"
+   is not what is happening.
+2. **prosper decodes every packet the title sends.** `pm4_registers.hpp` defines
+   `IT_DRAW_INDIRECT_MULTI = 0x2C` and `IT_DRAW_INDEX_INDIRECT_MULTI = 0x38`, and **neither is
+   referenced anywhere** — the decoder handles only `R_DRAW_INDEX_INDIRECT = 0x22`. That looked like
+   the answer for a GPU-driven title. It is not: the decoder logs each distinct undecoded type-3
+   opcode once, and **no `[pm4] unknown raw type-3 opcode` line appears in any run**. GTA V emits
+   neither MULTI variant. *(The two constants being defined and unused is still worth knowing — a
+   title that does use them would be silently mis-decoded — but it is not this title's defect.)*
+3. **So the world's geometry is somewhere in those 131,072 direct draws, and they execute.**
+
+**That relocates the question entirely.** It is no longer "why are the draws not issued" — they are
+issued and executed. It is **"why does the output of 131,072 executed draws not reach the screen"**.
+
+The strongest remaining candidate is the one already recorded and never quantified: **three 4K
+DCC-compressed sampled images are unsupported**, and when the fast-clear decode fails the renderer
+falls through to reading compressed bytes as uncompressed. A composite that samples the scene through
+those cannot produce a world image no matter how many draws filled them.
+
 ## What is NOT hiding the world — four eliminations, each with a verified lever (2026-08-15)
 
 Every one of these was measured on a routed run with the lever confirmed to have moved, so each is a
