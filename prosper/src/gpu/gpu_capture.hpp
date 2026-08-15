@@ -320,6 +320,12 @@ struct GpuCaptureDsSeed {
     uint32_t width = 0;
     uint32_t height = 0;
     GpuCaptureDsFormat format = GpuCaptureDsFormat::D32Float;
+    // Which array slice of the allocation this surface is. A cube shadow map is ONE six-layer guest
+    // allocation whose faces share every base above and differ only here, so without it two faces
+    // are the same identity: the writer rejects the second as a duplicate and a restore cannot
+    // replay them distinctly. Serialized in a v55 tail; captures below v55 read back as slice 0,
+    // which is exactly what every non-layered surface is.
+    uint32_t slice = 0;
     bool depth_valid = false;
     bool stencil_valid = false;
     std::vector<uint8_t> depth;

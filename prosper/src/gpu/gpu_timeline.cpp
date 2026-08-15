@@ -2174,6 +2174,22 @@ std::atomic<uint64_t> g_grab_hook_reached{0};
 long long g_grab_window_open_ms = 0;
 std::atomic<uint64_t> g_grab_hook_inactive{0};
 std::atomic<uint64_t> g_grab_hook_not_capturing{0};
+// Baselines taken when a capture window opens. The three counters above are process totals: they
+// accumulate from startup and were reported verbatim as evidence about one window, so ordinary
+// activity before F9 made a genuinely empty window look as though the hook had been reached during
+// it — defeating the single distinction this diagnostic exists to draw. Written and read under the
+// bundle mutex, on the same thread that opens and closes the window.
+uint64_t g_grab_hook_reached_at_open = 0;
+uint64_t g_grab_hook_inactive_at_open = 0;
+uint64_t g_grab_hook_not_capturing_at_open = 0;
+
+bool frame_bundle_submit_capped(uint64_t submits_appended, uint64_t max_submits) {
+    return max_submits != 0 && submits_appended >= max_submits;
+}
+
+uint64_t frame_bundle_window_delta(uint64_t total_now, uint64_t total_at_window_open) {
+    return total_now >= total_at_window_open ? total_now - total_at_window_open : 0;
+}
 
 void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_no) {
     g_grab_hook_reached.fetch_add(1, std::memory_order_relaxed);
@@ -2185,6 +2201,34 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     std::lock_guard<std::mutex> lk(b.mx);
     if (!b.capturing || b.failed) {
         g_grab_hook_not_capturing.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // PROSPER_CAPTURE_MAX_SUBMITS=N — stop appending after N submits, keeping what was captured.
+    //
+    // The window is closed by a PRESENT, so it cannot end mid-burst. GTA V flips in bursts and emits
+    // its whole frame's work between two of them: with the window correctly waiting for content, one
+    // burst appended 3.3 GB and blew even the 3,072 MB maximum, so no budget setting can capture it.
+    // A submit cap bounds the bundle by CONTENT rather than by presents or bytes, which is the only
+    // one of the three the caller can reason about ("give me the first 40 submits of this frame").
+    //
+    // Tested BEFORE any capture work, not after. Capturing a submit and then discarding it paid the
+    // full cost of every post-cap submit, and — worse — a post-cap capture FAILURE set `b.failed`
+    // and threw away the already-valid capped bundle, which is precisely the outcome the cap exists
+    // to prevent.
+    static const uint64_t max_submits = [] {
+        const char* spec = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
+        if (!spec || !*spec) return uint64_t{0};
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(spec, &end, 0);
+        return (end && !*end && parsed) ? static_cast<uint64_t>(parsed) : uint64_t{0};
+    }();
+    if (frame_bundle_submit_capped(b.submits, max_submits)) {
+        static std::atomic<int> capped{0};
+        if (capped.fetch_add(1) < 2)
+            std::fprintf(stderr,
+                         "[grab] frame-bundle: submit cap %llu reached; further submits in this "
+                         "window are not appended\n",
+                         (unsigned long long)max_submits);
         return;
     }
     GpuCaptureFile capture;
@@ -2241,32 +2285,6 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
                              static_cast<unsigned long long>(scanout_addr), seed_error.c_str());
             }
         }
-    }
-    // PROSPER_CAPTURE_MAX_SUBMITS=N — stop appending after N submits, keeping what was captured.
-    //
-    // The window is closed by a PRESENT, so it cannot end mid-burst. GTA V flips in bursts and emits
-    // its whole frame's work between two of them: with the window correctly waiting for content, one
-    // burst appended 3.3 GB and blew even the 3,072 MB maximum, so no budget setting can capture it.
-    // A submit cap bounds the bundle by CONTENT rather than by presents or bytes, which is the only
-    // one of the three the caller can reason about ("give me the first 40 submits of this frame").
-    //
-    // Stops appending rather than failing: the submits already captured are a valid, inspectable
-    // bundle, and discarding them because more arrived is the behaviour this is here to avoid.
-    static const uint64_t max_submits = [] {
-        const char* spec = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
-        if (!spec || !*spec) return uint64_t{0};
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(spec, &end, 0);
-        return (end && !*end && parsed) ? static_cast<uint64_t>(parsed) : uint64_t{0};
-    }();
-    if (max_submits && b.submits >= max_submits) {
-        static std::atomic<int> capped{0};
-        if (capped.fetch_add(1) < 2)
-            std::fprintf(stderr,
-                         "[grab] frame-bundle: submit cap %llu reached; further submits in this "
-                         "window are not appended\n",
-                         (unsigned long long)max_submits);
-        return;
     }
     if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
         b.failed = true;
@@ -2334,12 +2352,16 @@ void interactive_frame_bundle_on_present() {
                     std::fprintf(stderr, "[grab] frame-bundle: window had no submits; widen it with "
                                          "PROSPER_CAPTURE_FRAMES=N (1..240) or re-arm\n");
                     std::fprintf(stderr,
-                                 "[grab] frame-bundle: submit hook reached=%llu, %llu while "
-                                 "inactive, %llu while not capturing; window was open %lld ms "
-                                 "for %u presents\n",
-                                 (unsigned long long)g_grab_hook_reached.load(),
-                                 (unsigned long long)g_grab_hook_inactive.load(),
-                                 (unsigned long long)g_grab_hook_not_capturing.load(),
+                                 "[grab] frame-bundle: during this window the submit hook was "
+                                 "reached=%llu, %llu while inactive, %llu while not capturing; "
+                                 "window was open %lld ms for %u presents\n",
+                                 (unsigned long long)frame_bundle_window_delta(
+                                     g_grab_hook_reached.load(), g_grab_hook_reached_at_open),
+                                 (unsigned long long)frame_bundle_window_delta(
+                                     g_grab_hook_inactive.load(), g_grab_hook_inactive_at_open),
+                                 (unsigned long long)frame_bundle_window_delta(
+                                     g_grab_hook_not_capturing.load(),
+                                     g_grab_hook_not_capturing_at_open),
                                  (long long)(std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::steady_clock::now().time_since_epoch()).count() -
                                      g_grab_window_open_ms),
@@ -2359,6 +2381,10 @@ void interactive_frame_bundle_on_present() {
             b.arm_delay_presents = 0;
             g_grab_window_open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
+            g_grab_hook_reached_at_open = g_grab_hook_reached.load(std::memory_order_relaxed);
+            g_grab_hook_inactive_at_open = g_grab_hook_inactive.load(std::memory_order_relaxed);
+            g_grab_hook_not_capturing_at_open =
+                g_grab_hook_not_capturing.load(std::memory_order_relaxed);
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
             b.pending_failure_error.clear();
             // No arrow here, deliberately: " -> <path>" is reserved for a line emitted AFTER the

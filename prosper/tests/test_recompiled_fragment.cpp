@@ -936,6 +936,77 @@ int main() {
             }
         }
 
+        // Slots 2..7 must RETAIN across render groups (#2550 review). Before persistence they were
+        // transient images created per backend call with LOAD_OP_CLEAR, so a G-buffer assembled by
+        // several groups against one set of allocations kept only the last group's work. GTA V's
+        // G-buffer accumulates across roughly sixteen groups per frame, so this was the difference
+        // between three complete attachments and three attachments holding one group each.
+        //
+        // Two groups against ONE persistent slot-2 id: the first writes red to MRT2, the second
+        // writes only MRT0 and must leave MRT2 alone. The negative arm below re-runs the second
+        // group with load_existing off and requires MRT2 to come back cleared -- without it, a test
+        // that never loads would pass just as happily on a backend that never clears.
+        const uint32_t mrt0_and_mrt2[] = {
+            0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,   // v0..3 = GREEN
+            0xF800100Fu, 0x03020100u,                             // exp mrt0  (vm)
+            0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,   // v4..7 = RED
+            0xF800182Fu, 0x07060504u,                             // exp mrt2  (vm, done)
+            0xBF810000u,
+        };
+        const uint32_t mrt0_only[] = {
+            0x7E000280u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u,   // v0..3 = BLUE
+            0xF800180Fu, 0x03020100u,                             // exp mrt0  (vm, done)
+            0xBF810000u,
+        };
+        std::vector<uint32_t> frg_a = recompile_fragment(mrt0_and_mrt2, std::size(mrt0_and_mrt2));
+        std::vector<uint32_t> frg_b = recompile_fragment(mrt0_only, std::size(mrt0_only));
+        CHECK(!frg_a.empty() && !frg_b.empty(),
+              "#2550: MRT0+MRT2 and MRT0-only fragment shaders both recompile");
+        if (!frg_a.empty() && !frg_b.empty()) {
+            const float black[4] = {0, 0, 0, 1};
+            auto run_group = [&](const std::vector<uint32_t>& fs, uint64_t slot2_id,
+                                 bool load_existing, std::vector<uint8_t>& slot2_out) {
+                prosper::test::BackendDraw draw;
+                draw.vs = vert; draw.fs = fs;
+                prosper::test::BackendColorTarget target{};
+                target.persistent_id_slots[2] = slot2_id;
+                target.load_existing_slots[2] = load_existing;
+                prosper::test::BackendMrtOutputs outputs;
+                outputs.color_count = 3;
+                prosper::test::render_draws_rgba({draw}, W, H, nullptr, black, false, &target,
+                                                 nullptr, black, nullptr, nullptr, true, &outputs);
+                slot2_out = std::move(outputs.colors[2]);
+            };
+            constexpr uint64_t kSlot2Id = 0x20aa2200ull;
+            std::vector<uint8_t> first, second, cleared;
+            run_group(frg_a, kSlot2Id, true, first);
+            run_group(frg_b, kSlot2Id, true, second);
+            const size_t px = (size_t)W * H * 4;
+            CHECK(first.size() == px && second.size() == px,
+                  "#2550: slot 2 reads back at full extent from both render groups");
+            if (first.size() == px && second.size() == px) {
+                const uint8_t* f = &first[((size_t)(H / 2) * W + W / 2) * 4];
+                const uint8_t* g = &second[((size_t)(H / 2) * W + W / 2) * 4];
+                printf("  slot2 group1=(%u,%u,%u) group2=(%u,%u,%u)\n",
+                       f[0], f[1], f[2], g[0], g[1], g[2]);
+                CHECK(f[0] > 0xC0 && f[1] < 0x40 && f[2] < 0x40,
+                      "#2550: group 1 writes RED to the retained MRT2 attachment");
+                CHECK(g[0] > 0xC0 && g[1] < 0x40 && g[2] < 0x40,
+                      "#2550: group 2 does NOT clear MRT2 -- the first group's pixels survive");
+            }
+            // Negative arm: the same second group with load_existing off must come back cleared, so
+            // the assertion above is demonstrably sensitive to the LOAD and not to the backend
+            // simply never touching the attachment.
+            run_group(frg_a, kSlot2Id + 0x1000, true, first);
+            run_group(frg_b, kSlot2Id + 0x1000, false, cleared);
+            if (cleared.size() == px) {
+                const uint8_t* c = &cleared[((size_t)(H / 2) * W + W / 2) * 4];
+                printf("  slot2 no-load group2=(%u,%u,%u)\n", c[0], c[1], c[2]);
+                CHECK(c[0] < 0x40,
+                      "#2550: with load_existing off the second group DOES clear MRT2");
+            }
+        }
+
         // MRT3-only. This asserted `.empty()` until 2026-08-15, when the fragment shell's colour
         // outputs went from 2 to 8 -- MRT3 is now genuinely supported, so rejecting it would be the
         // defect rather than the guard. The original concern was never "MRT3 must fail"; it was that

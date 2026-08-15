@@ -318,6 +318,25 @@ int main() {
                 prosper::test::ds_depth_view_slice_max(face.view) == face.max;
         CHECK(decoded, "DB_DEPTH_VIEW decodes SLICE_START/MAX for all six cube faces");
 
+        // Exercise the PRODUCTION construction seam, not a hand-built key. Building PersistentDsKey
+        // directly asserts only that the struct has a slice field and stays green if the backend's
+        // decode is reverted; persistent_ds_key_for() is the function the backend actually calls.
+        {
+            prosper::gpu::ResolvedPipelineState face0{}, face1{};
+            face0.depth_read_base = face1.depth_read_base = 0x20d5cbe000ull;
+            face0.depth_write_base = face1.depth_write_base = 0x20d5cbe000ull;
+            face0.db_depth_view = 0x02000000u;   // SLICE_START=MAX=0
+            face1.db_depth_view = 0x02002001u;   // SLICE_START=MAX=1
+            const auto k0 = prosper::test::persistent_ds_key_for(
+                face0, 0, 512, 512, static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT));
+            const auto k1 = prosper::test::persistent_ds_key_for(
+                face1, 0, 512, 512, static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT));
+            CHECK(k0.slice == 0u && k1.slice == 1u,
+                  "the production DS identity derives its slice from DB_DEPTH_VIEW");
+            CHECK(!(k0 == k1),
+                  "two cube faces built through the production seam are distinct identities");
+        }
+
         // The regression proper: two faces of one cube differ ONLY in slice, and must not collide.
         // Before slice joined the key they shared one entry, so each face render reused and
         // overwrote the previous face's host image and only the last face survived -- a corruption

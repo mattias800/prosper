@@ -263,6 +263,16 @@ struct BackendColorTarget {
     bool load_existing1 = true;
     bool readback1 = true;
     VkFormat format1 = VK_FORMAT_UNDEFINED;
+    // Slots 2..7. The named fields above predate the complete array and remain the contract for
+    // slots 0 and 1; these carry the same two properties for the rest.
+    //
+    // Without them every slot above 1 was a TRANSIENT image created per backend call and cleared
+    // with LOAD_OP_CLEAR, so returning to the same allocation in a later render group erased what an
+    // earlier group had drawn there. That was unreachable while the fragment recompiler could only
+    // export MRT0/MRT1; the moment it could export five, GTA V's G-buffer -- which accumulates
+    // across roughly sixteen pass groups per frame -- kept only the last group's slots 2..4.
+    std::array<uint64_t, prosper::gpu::kColorTargetCount> persistent_id_slots{};
+    std::array<bool, prosper::gpu::kColorTargetCount> load_existing_slots{};
 };
 
 // Optional complete-MRT readback contract. `color_count` is the active Vulkan attachment prefix
@@ -2476,6 +2486,13 @@ inline uint32_t ds_depth_view_slice_start(uint32_t db_depth_view) {
              prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_START_HI_MASK)
             << prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_START_HI_SHIFT);
 }
+// The production construction seam for a depth/stencil identity. Extracted so a test can exercise
+// the SAME derivation the backend uses: a regression that builds PersistentDsKey by hand asserts
+// only that the struct has a slice field, and stays green if the decode below is reverted.
+inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelineState& ps,
+                                             uint64_t htile, uint32_t width, uint32_t height,
+                                             uint32_t format);
+
 inline uint32_t ds_depth_view_slice_max(uint32_t db_depth_view) {
     return (db_depth_view >> prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_MAX_SHIFT) &
            prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_MAX_MASK;
@@ -2541,6 +2558,13 @@ inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_de
                                            bool depth_may_be_written) {
     if (use_depth && depth_may_be_written)
         image.last_depth_write = ++persistent_ds_write_generation();
+}
+
+inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelineState& ps,
+                                             uint64_t htile, uint32_t width, uint32_t height,
+                                             uint32_t format) {
+    return {ps.depth_read_base, ps.depth_write_base, ps.stencil_read_base, ps.stencil_write_base,
+            htile, width, height, format, ds_depth_view_slice_start(ps.db_depth_view)};
 }
 
 inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
@@ -3281,6 +3305,7 @@ inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDs
         seed.depth_read_base = key.dr; seed.depth_write_base = key.dw;
         seed.stencil_read_base = key.sr; seed.stencil_write_base = key.sw;
         seed.htile_data_base = key.htile; seed.width = key.w; seed.height = key.h;
+        seed.slice = key.slice;   // a cube's faces differ only here
         if (key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT))
             seed.format = prosper::gpu::GpuCaptureDsFormat::D32Float;
         else if (key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT))
@@ -3350,13 +3375,12 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D32_SFLOAT_S8_UINT;
     const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
         (format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
-    // Seeds carry no DB_DEPTH_VIEW, so a restored surface keys at slice 0. That matches every
-    // non-layered surface exactly and is the only slice a seed can honestly claim; a layered guest
-    // allocation restored from a seed will re-key correctly as soon as the guest programs its view.
+    // The seed carries its own slice (capture v55). Restoring every seed at slice 0 would collapse
+    // a cube's six faces onto one identity on replay, which is the same defect the live cache had.
     PersistentDsKey key{seed.depth_read_base, seed.depth_write_base,
                         seed.stencil_read_base, seed.stencil_write_base,
                         seed.htile_data_base, seed.width, seed.height,
-                        static_cast<uint32_t>(format), 0u};
+                        static_cast<uint32_t>(format), seed.slice};
     PersistentDsImage& image = persistent_ds_cache()[key];
     if (!image.image) {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -3772,10 +3796,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (!htile_identity && getenv("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL") &&
             identity->stencil_read_base >= 0x10000)
             htile_identity = identity->stencil_read_base - 0x10000;
-        ds_key = {identity->depth_read_base, identity->depth_write_base,
-                  identity->stencil_read_base, identity->stencil_write_base,
-                  htile_identity, W, H, (uint32_t)DFMT,
-                  ds_depth_view_slice_start(identity->db_depth_view)};
+        ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
         ds_layout_initialized = cached_ds->layout_initialized;
@@ -3959,6 +3980,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::array<VkImage, prosper::gpu::kColorTargetCount> extra_images{};
     std::array<VkDeviceMemory, prosper::gpu::kColorTargetCount> extra_memories{};
     std::array<VkImageView, prosper::gpu::kColorTargetCount> extra_views{};
+    std::array<PersistentColorTargetImage*, prosper::gpu::kColorTargetCount> cached_extra{};
+    std::array<PersistentColorTargetKey, prosper::gpu::kColorTargetCount> extra_keys{};
     bool persistent_color1 = persistent_color1_enabled;
     PersistentColorTargetKey color_key1{};
     PersistentColorTargetImage* cached_color1 = nullptr;
@@ -4058,21 +4081,76 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         extra_memories[1] = imem1;
         extra_views[1] = view1;
     }
+    // Slots 2..7 retain their allocation across render groups when the caller names a persistent id,
+    // exactly as slots 0 and 1 do. Falls back to a transient image whenever the cache is unavailable
+    // or over its limits, which is the same fallback slot 1 takes -- a title that exceeds the budget
+    // loses accumulation on those slots rather than failing to render.
     for (uint32_t slot = 2; slot < color_count; ++slot) {
+        const uint64_t slot_id = color_target ? color_target->persistent_id_slots[slot] : 0;
+        const bool want_persistent = persistent_color_targets_enabled && slot_id;
+        if (want_persistent) {
+            extra_keys[slot] = {slot_id, W, H, color_formats[slot]};
+            auto [found, inserted] = persistent_color_target_cache().try_emplace(extra_keys[slot]);
+            (void)inserted;
+            cached_extra[slot] = &found->second;
+            cached_extra[slot]->last_use = color_target_generation;
+            extra_images[slot] = cached_extra[slot]->image;
+            extra_memories[slot] = cached_extra[slot]->memory;
+            extra_views[slot] = cached_extra[slot]->view;
+        }
+        if (extra_images[slot]) continue;   // retained from an earlier group
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D; ci.format = color_formats[slot];
         ci.extent = {W, H, 1}; ci.mipLevels = 1; ci.arrayLayers = 1;
         ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   (cached_extra[slot] ? (VK_IMAGE_USAGE_SAMPLED_BIT |
+                                          VK_IMAGE_USAGE_TRANSFER_DST_BIT) : 0u);
         vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
-        if (!extra_images[slot]) return out;
+        if (!extra_images[slot]) {
+            if (cached_extra[slot]) {
+                persistent_color_target_cache().erase(extra_keys[slot]);
+                cached_extra[slot] = nullptr;
+            }
+            return out;
+        }
         VkMemoryRequirements requirements{};
         vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = pick(requirements.memoryTypeBits, 0);
-        extra_memories[slot] = allocate_transient_render_memory(
-            dev, allocation.allocationSize, allocation.memoryTypeIndex);
+        if (cached_extra[slot]) {
+            const VkDeviceSize limit = persistent_color_target_limit();
+            while (!avoid_cache_eviction &&
+                   (persistent_color_target_cache().size() >
+                            persistent_color_target_count_limit() ||
+                    requirements.size > limit ||
+                    persistent_color_target_bytes() > limit - requirements.size) &&
+                   evict_persistent_color_target(ctx, color_target_generation)) {}
+            if (requirements.size <= limit &&
+                persistent_color_target_cache().size() <=
+                    persistent_color_target_count_limit() &&
+                persistent_color_target_bytes() <= limit - requirements.size &&
+                vkAllocateMemory(dev, &allocation, nullptr, &extra_memories[slot]) == VK_SUCCESS) {
+                cached_extra[slot]->bytes = requirements.size;
+                persistent_color_target_bytes() += requirements.size;
+            } else {
+                // Over budget: drop back to a transient image for this slot, exactly as slot 1 does.
+                vkDestroyImage(dev, extra_images[slot], nullptr);
+                extra_images[slot] = VK_NULL_HANDLE;
+                persistent_color_target_cache().erase(extra_keys[slot]);
+                cached_extra[slot] = nullptr;
+                ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
+                if (!extra_images[slot]) return out;
+                vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
+                allocation.allocationSize = requirements.size;
+                allocation.memoryTypeIndex = pick(requirements.memoryTypeBits, 0);
+            }
+        }
+        if (!extra_memories[slot])
+            extra_memories[slot] = allocate_transient_render_memory(
+                dev, allocation.allocationSize, allocation.memoryTypeIndex);
         VkImageViewCreateInfo view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_ci.image = extra_images[slot]; view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_ci.format = color_formats[slot];
@@ -4081,7 +4159,27 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkBindImageMemory(dev, extra_images[slot], extra_memories[slot], 0) == VK_SUCCESS &&
             vkCreateImageView(dev, &view_ci, nullptr, &extra_views[slot]) == VK_SUCCESS &&
             extra_views[slot];
-        if (!ready) return out;
+        if (!ready) {
+            if (extra_views[slot]) vkDestroyImageView(dev, extra_views[slot], nullptr);
+            vkDestroyImage(dev, extra_images[slot], nullptr);
+            if (cached_extra[slot]) {
+                if (cached_extra[slot]->bytes)
+                    persistent_color_target_bytes() -= cached_extra[slot]->bytes;
+                if (extra_memories[slot]) vkFreeMemory(dev, extra_memories[slot], nullptr);
+                persistent_color_target_cache().erase(extra_keys[slot]);
+            } else if (extra_memories[slot]) {
+                release_transient_render_memory(dev, extra_memories[slot]);
+            }
+            extra_images[slot] = VK_NULL_HANDLE;
+            extra_memories[slot] = VK_NULL_HANDLE;
+            extra_views[slot] = VK_NULL_HANDLE;
+            return out;
+        }
+        if (cached_extra[slot]) {
+            cached_extra[slot]->image = extra_images[slot];
+            cached_extra[slot]->memory = extra_memories[slot];
+            cached_extra[slot]->view = extra_views[slot];
+        }
     }
 
     if (use_ds && !dimg) {
@@ -4131,13 +4229,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                                : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
     for (uint32_t slot = 2; slot < color_count; ++slot) {
+        // LOAD a retained slot whose contents are valid, so a G-buffer built across several render
+        // groups accumulates instead of each group clearing its predecessor's work.
+        const bool load_slot = cached_extra[slot] && cached_extra[slot]->valid &&
+                               color_target && color_target->load_existing_slots[slot];
         att[slot].format = color_formats[slot];
         att[slot].samples = VK_SAMPLE_COUNT_1_BIT;
-        att[slot].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att[slot].loadOp = load_slot ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
         att[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         att[slot].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         att[slot].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        att[slot].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att[slot].initialLayout = load_slot ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                            : VK_IMAGE_LAYOUT_UNDEFINED;
         att[slot].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
     att[ds_attachment].format = DFMT; att[ds_attachment].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -7071,6 +7174,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         cached_color1->valid = true;
         cached_color1->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
+    for (uint32_t slot = 2; slot < color_count; ++slot) {
+        PersistentColorTargetImage* retained = cached_extra[slot];
+        if (!retained) continue;
+        active_submission.add_failure_cleanup([retained]() { retained->valid = false; });
+        retained->valid = true;
+        retained->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
     BackendSubmissionBatchResult batch_result;
     if (flush_now)
         batch_result = active_submission.submit_and_wait(dev, queue, backend_trace);
@@ -7454,6 +7564,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         persistent_pipeline_layouts.size();
     const bool transient_color = cached_color == nullptr;
     const bool transient_color1 = use_color1 && cached_color1 == nullptr;
+    // Per-slot twin of the two flags above, so the teardown lambda can tell a retained slot from a
+    // transient one without capturing the cache pointers themselves.
+    std::array<bool, prosper::gpu::kColorTargetCount> transient_extra{};
+    for (uint32_t slot = 2; slot < color_count; ++slot)
+        transient_extra[slot] = cached_extra[slot] == nullptr;
     const bool transient_ds = use_ds && cached_ds == nullptr;
     const RenderVkCtx* ctx_ptr = &ctx;
     active_submission.add_cleanup(
@@ -7465,6 +7580,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
          rb, bmem, fb, rp, transient_color, view, img, imem, transient_color1, view1, img1,
+         transient_extra,
          imem1, color_count, extra_views, extra_images, extra_memories,
          transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
          geom_buf, geom_mem, geom_counter, geom_counter_mem, ctx_ptr,
@@ -7547,6 +7663,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 release_transient_render_memory(dev, imem1);
             }
             for (uint32_t slot = 2; slot < color_count; ++slot) {
+                if (!transient_extra[slot]) continue;   // retained for the next render group
                 vkDestroyImageView(dev, extra_views[slot], nullptr);
                 vkDestroyImage(dev, extra_images[slot], nullptr);
                 release_transient_render_memory(dev, extra_memories[slot]);

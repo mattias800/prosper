@@ -6441,6 +6441,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     backend_target.load_existing1 = seed_rtt;
                     backend_target.readback1 = !defer_readback1;
                     backend_target.format1 = pass_format1;
+                    // Slots 2..7 retain across render groups on the same terms as slots 0 and 1.
+                    // A G-buffer built by several groups against one set of allocations otherwise
+                    // loses every group's work but the last, because slots above 1 were transient
+                    // images cleared per backend call.
+                    for (uint32_t slot = 2; slot < mrt_count; ++slot) {
+                        backend_target.persistent_id_slots[slot] = pass_bases[slot];
+                        backend_target.load_existing_slots[slot] = seed_rtt;
+                    }
                     auto backend_draws = build_bds(render_pass);
                     const auto build_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
@@ -6623,7 +6631,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.format = pass_formats[slot];
                         surface.has_uniform_color = false;
                         surface.dcc_metadata_dirty = false;
-                        surface.gpu_valid = slot == 1 &&
+                        // Any slot with a retained target is GPU-valid, not only slot 1. The
+                        // `slot == 1` clause dated from when slots above 1 had no persistent image
+                        // to be valid about.
+                        surface.gpu_valid =
                             prosper::test::find_persistent_color_target(
                                 pass_bases[slot], gw, gh, pass_formats[slot]) != nullptr;
                         if (!pixels.empty())

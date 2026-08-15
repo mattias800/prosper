@@ -1829,6 +1829,55 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Review findings on #2550, all four fixed (2026-08-15)
+
+Codex reviewed the MRT work and found four verified issues. All are real; all four were confirmed
+against the source before acting.
+
+**1 (blocker) — MRT2–7 did not survive a render group.** Slots 2+ were transient images created per
+backend call with `LOAD_OP_CLEAR` and `initialLayout = UNDEFINED`, and only slots 0 and 1 had a seed
+or persistent path. GTA V's G-buffer accumulates across roughly sixteen pass groups per frame, so
+each group erased its predecessor's slots 2–4 and only the last survived. The MRT widening made the
+recompiler able to emit five outputs while the runtime kept the attachment incomplete.
+
+Fixed by giving slots 2–7 the same persistent-target contract slots 0 and 1 have, with the same
+over-budget fallback to a transient image. Measured on the same route, best non-black pixel count per
+slot: **c2 240,121 → 4,513,318** and **c3 407,957 → 4,513,318** (54% of a 4K frame), c4 313,908 →
+513,338, with 0 validation errors.
+
+**2 (blocker) — layered DS capture identity omitted the slice.** Once two cube faces were valid,
+`snapshot_persistent_ds_images` emitted two seeds that were identical apart from the slice; the writer
+rejected the second as `duplicate DS seed identity`, so F9 capture failed outright, and restore keyed
+every seed at slice 0 so even a written capture could not replay the faces distinctly. Fixed with a
+**v55** capture tail carrying each seed's slice (pre-v55 reads back as slice 0).
+
+**3 (high) — `PROSPER_CAPTURE_MAX_SUBMITS` tested the cap after capturing.** Every post-cap submit
+paid the full capture cost, and a post-cap capture *failure* set `b.failed` and discarded the
+already-valid capped bundle — the exact outcome the cap exists to prevent. The cap is now tested
+before any capture work.
+
+**4 (medium/high) — the empty-window hook counters were process totals.** They accumulate from
+startup and were printed verbatim as evidence about one capture window, so ordinary activity before
+F9 made a genuinely empty window look as though the hook had been reached during it. Now baselined
+when the window opens, with a saturating delta so a missed baseline prints 0 rather than a wrapped
+count near 2^64.
+
+### Two lessons from the review worth more than the fixes
+
+- **A tail must go at the END of the stream, not beside the data it describes.** The v55 slice was
+  first written next to the DS seed records, which round-trips perfectly and desynchronises every
+  later tail the moment the version byte is downgraded — the exact thing eleven legacy-reopen
+  fixtures do. The capture format's append-only convention is not a style preference; it is what
+  makes `serialize at current version → lower the version byte → reparse` work at all.
+- **A test that builds a struct by hand does not cover the code that builds it.** Codex's sharpest
+  point: the first slice regression constructed `PersistentDsKey` directly, so reverting the
+  production decode left it green. The seam is now extracted as `persistent_ds_key_for()` and the
+  test calls it — verified by mutation: replacing the decode with `0u` turns both assertions red,
+  restoring it turns them green.
+- **And the one I got wrong on my own: `ctest` after `cmake --build --target screenshot` tests STALE
+  BINARIES.** The v55 change broke 23 assertions in `test_gpu_capture` while I reported 245/245,
+  because that target had not been rebuilt. Build everything before quoting a suite result.
+
 ## Cube depth: the DS cache overwrote its own faces (2026-08-15, fixed) — and the falsification above is RETRACTED
 
 **Retraction first.** The section below this one records cube shadow maps as falsified. That call was

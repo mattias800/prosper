@@ -337,6 +337,19 @@ void observe_guest_log_capture_gap();
 // the external controller moved its lever, while the one-shot state prevents a second arm.
 // Automatic trigger-file, fixed-present, and guest-log gates are mutually exclusive and fail closed
 // when more than one is configured, so one gate's completion cannot be attributed to another arm.
+// True when a submit must NOT be appended to the interactive frame bundle because the caller's
+// PROSPER_CAPTURE_MAX_SUBMITS cap is already met. Exported so the ORDERING can be regressed: the
+// submit hook must consult this before doing any capture work. Checking it afterwards meant every
+// post-cap submit paid the full capture cost, and a post-cap capture FAILURE discarded the
+// already-valid capped bundle -- the exact outcome the cap exists to prevent.
+bool frame_bundle_submit_capped(uint64_t submits_appended, uint64_t max_submits);
+
+// A hook counter scoped to ONE capture window. The underlying counters are process totals; the
+// empty-window report subtracts the value latched when the window opened. Saturating rather than
+// wrapping: if a baseline were ever missed or latched late, an unsigned wrap would print a count
+// near 2^64 and read as enormous activity, which is the opposite of the truth this line reports.
+uint64_t frame_bundle_window_delta(uint64_t total_now, uint64_t total_at_window_open);
+
 bool capture_bundle_trigger_file_enabled();
 
 } // namespace prosper::gpu

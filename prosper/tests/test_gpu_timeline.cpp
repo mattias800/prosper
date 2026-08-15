@@ -828,5 +828,29 @@ int main(int argc, char** argv) {
     std::filesystem::remove(version1, ec);
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
+    
+    // #2550 review: the submit cap is a decision the hook must make BEFORE capturing. A cap of zero
+    // means uncapped; below the cap appends; at or above it does not. The ordering itself lives at
+    // the call site, and this pins the predicate it calls.
+    CHECK(!prosper::gpu::frame_bundle_submit_capped(0, 0) &&
+              !prosper::gpu::frame_bundle_submit_capped(1000000, 0),
+          "a zero submit cap never caps");
+    CHECK(!prosper::gpu::frame_bundle_submit_capped(0, 40) &&
+              !prosper::gpu::frame_bundle_submit_capped(39, 40),
+          "submits below the cap are appended");
+    CHECK(prosper::gpu::frame_bundle_submit_capped(40, 40) &&
+              prosper::gpu::frame_bundle_submit_capped(41, 40),
+          "the submit at the cap, and every one after it, is not appended");
+
+    // Window-scoped counters. The saturating arm is the one that matters: the counters are process
+    // totals, so a missed or late baseline would otherwise wrap and print a number near 2^64 as
+    // evidence of activity during a window that had none.
+    CHECK(prosper::gpu::frame_bundle_window_delta(100, 90) == 10,
+          "a window counter reports activity since the window opened, not since process start");
+    CHECK(prosper::gpu::frame_bundle_window_delta(90, 90) == 0,
+          "a window with no hook activity reports zero");
+    CHECK(prosper::gpu::frame_bundle_window_delta(5, 90) == 0,
+          "a baseline above the total saturates to zero instead of wrapping");
+
     return 0;
 }
