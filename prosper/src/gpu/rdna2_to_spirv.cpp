@@ -19620,7 +19620,11 @@ bool emit_cfg_state_machine(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b));
                 if (!handled || !ok) {
-                    if (getenv("PROSPER_DBG"))
+                    // NOT gated on PROSPER_DBG. log_recompile_diagnostic gates its own PRINTING
+                    // on that variable and additionally RECORDS the reason for the unconditional
+                    // `[compute] skip unsupported program 0x… reason=…` line. An outer gate here
+                    // therefore suppressed the recording too, which is why five GTA V programs
+                    // reported reason=unrecorded while their cause existed and was formatted.
                         // The raw INSTRUCTION WORDS, because without them this line cannot be acted
                         // on. `fmt` and `op` are our decoder's own labels, so they identify the
                         // instruction only if you already trust the decode -- and a reject is
@@ -22011,7 +22015,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
-                if (getenv("PROSPER_DBG")) {
+                // NOT gated on PROSPER_DBG, for the reason at the CFG reject site above: the gate
+                // suppressed the RECORDING as well as the printing, and the recording is what the
+                // unconditional skip line reads. This site fires once per failing compile, so the
+                // formatting cost it now always pays is one string per rejected shader.
+                {
                     // `mode` separates the two rejections that used to print identically and want
                     // OPPOSITE work (#2412). `unknown-encoding` (handled=false) means no lowering
                     // exists — write the emitter. `unresolved-operand` (handled=true, ok=false)

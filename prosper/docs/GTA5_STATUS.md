@@ -97,6 +97,46 @@ one dispatch's pre/post pair there is exactly one writer, and its output is cycl
 - **A lane/wave/workgroup boundary effect.** Damage index mod 2/3/4/8/16 is flat.
 - **An unknown or out-of-bounds writer.** Every observed change reported `toucher=1`.
 
+## THE REMAINING BLOCKER, EXACTLY (2026-08-15)
+
+Every compute reject on a routed run now names its cause without `PROSPER_DBG`. `0x413ce6000` — the
+producer whose absence removes the world — is blocked by **one instruction**:
+
+```
+0x413ce6000  mode=unresolved-operand pc=156 words=e0382000,80020006 fmt=12 op=0xe
+```
+
+`fmt=12` is MUBUF, `op=0xe` is `buffer_load_dwordx3`. `mode=unresolved-operand` means the **lowering
+exists and the descriptor does not resolve** — the emitter is fine, the descriptor is the defect.
+
+pc156 is the **runtime-selected buffer array**: `PROSPER_COMPUTE_RESOURCE_MAP` shows it resolving in
+the live table as `binding=10 fetch-pc=156 base=0x203f2e9b38 size=13360 stride=20 entries=5`, while
+the pre-specialization const-fold trace (`PROSPER_DYNTRACE_FAIL`) shows it as
+`use_pc=156 v4=00000000:00000000:00000000:00000000 base=0x0 stride=0 records=0`. Its sibling at
+pc158 is the same shape. Those two are the only unresolved uses of the nineteen.
+
+**So the whole "GTA V has no 3D world" chain reduces to one buffer-array descriptor that does not
+const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
+
+The full reject census, now legible — every one is `mode=unresolved-operand`, i.e. every one is a
+descriptor that does not resolve rather than an instruction that is not implemented:
+
+| program | pc | fmt/op |
+| --- | --- | --- |
+| `0x413ce6000` | 156 | MUBUF `buffer_load_dwordx3` |
+| `0x413cf9200` | 5 | MUBUF `buffer_load_dword` |
+| `0x413cf9a00` | 11 | MUBUF `buffer_load_dword` |
+| `0x413cf9d00` | 70 | FLAT/GLOBAL `op=0xc` |
+| `0x413d14100` | 6 | MUBUF `buffer_load_dwordx3` |
+| `0x2042f49a00` | 16 | MIMG `op=0x1` |
+| `0x2042f4a600` | 7 | SMEM `op=0x4` |
+| `0x205b545c00` | 98 | VOP2 `op=0xf` |
+| `0x205b54ee00` | 90 | VOP2 `op=0xf` |
+| `0x205b5e8600` | 314 | SOP2 `op=0xe` |
+| `0x205b654a00` | 1180 | MIMG `op=0xe6` |
+| `0x205b657200` | 313 | MIMG `op=0xe6` |
+| `0x205b658800` | 82 | SOP1 `op=0x3` |
+
 ## ROOT CAUSE: `0x413ce6000` never recompiles, and it is the producer of the tags (2026-08-15)
 
 The chain is complete and every link is measured.
