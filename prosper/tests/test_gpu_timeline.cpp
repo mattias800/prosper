@@ -823,12 +823,6 @@ int main(int argc, char** argv) {
     std::filesystem::remove(runtime, ec);
     std::filesystem::remove(runtime_capture, ec);
     std::filesystem::remove(predecessor_capture, ec);
-    std::filesystem::remove(bundle_capture, ec);
-    std::filesystem::remove(compat_v2, ec);
-    std::filesystem::remove(version1, ec);
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    
     // #2550 review: the submit cap is a decision the hook must make BEFORE capturing. A cap of zero
     // means uncapped; below the cap appends; at or above it does not. The ordering itself lives at
     // the call site, and this pins the predicate it calls.
@@ -851,6 +845,12 @@ int main(int argc, char** argv) {
           "a window with no hook activity reports zero");
     CHECK(prosper::gpu::frame_bundle_window_delta(5, 90) == 0,
           "a baseline above the total saturates to zero instead of wrapping");
+
+    std::filesystem::remove(bundle_capture, ec);
+    std::filesystem::remove(compat_v2, ec);
+    std::filesystem::remove(version1, ec);
+    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
+    std::printf("== PASS ==\n");
 
     return 0;
 }

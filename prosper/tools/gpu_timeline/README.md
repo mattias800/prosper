@@ -250,3 +250,37 @@ invoke Vulkan. The latch belongs to the process-local capture request and still 
 or causality between the phase dispatch and a later draw.
 `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=N` restrict the same checkpoint by semantic dispatch count.
+
+## `rtt_pass_graph.py` — one frame's render-pass graph from a `PROSPER_RTTLOG=1` log
+
+Answers "where does the picture stop being there". A title can render a complete world into an
+off-screen target and still present black, and neither a draw census nor a target census can see
+that: both count *work*, and the defect is in the *dataflow*. What separates the two is the pair
+(what a pass sampled, what its output then contained), which `PROSPER_RTTLOG` already prints and
+which nothing assembled.
+
+```bash
+PROSPER_RTTLOG=1 ./prosper-app <DUMP_ROOT>/<TITLE_ID>-app0 > run.log 2>&1
+python3 tools/gpu_timeline/rtt_pass_graph.py run.log --frames 1 --min-draws 4
+python3 tools/gpu_timeline/rtt_pass_graph.py run.log --only 0xADDR      # passes touching one surface
+```
+
+The log interleaves two line kinds and the ordering is the whole trick: every `[rtt] sample tex`
+line belongs to a draw of the **next** `[rtt] pass` line, so a pass's inputs are exactly the samples
+since the previous pass, and `SCANOUT` delimits frames. Each input is annotated with how it actually
+resolved — `depth-bridge`, `stencil-bridge`, `UNIFORM COLOUR`, or `MISS -- guest bytes`.
+
+Three traps in the numbers it prints, all of which produced a wrong conclusion before being fixed:
+
+- **`rgb_nonblack` comes from an RGBA8 conversion**, so an HDR f16 target whose values sit below
+  1/255 reports exactly ZERO while carrying a complete scene. Use `PROSPER_DUMP_PASS` and look.
+- **`px_nonzero` counts BYTES and includes alpha.** A 3840x2160 buffer reading
+  `px_nonzero=8294400 rgb_nonblack=3527` is alpha-only, not "nearly full".
+- **A pass whose readback was deferred has EMPTY cpu pixels**, so both numbers describe nothing.
+  `PROSPER_RTTLOG` itself forces the readback that materialises them, which means enabling this log
+  changes what the renderer does — any per-pass content number describes a run made differently from
+  a default one.
+
+`PROSPER_DUMP_PASS=0xADDR[,…]` (with `PROSPER_DUMP_PASS_EVERY=N`, default 60) writes what a pass
+actually produced as an image, for slot 0 and for MRT slots 1..7, and reports `src=…B` plus
+`NO CPU PIXELS (readback deferred)` rather than silently writing no file.
