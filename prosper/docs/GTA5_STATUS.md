@@ -515,6 +515,60 @@ Two things must be checked before treating this as a defect, and neither has bee
 Recorded as an observation with its caveats rather than a lead, so the next reader neither chases it
 blind nor loses it.
 
+## THE BREAK: the composite samples `0x14…`/`0x15…`, but every render target is `0x20…` (2026-08-15)
+
+`PROSPER_RTTLOG=1` reports, per sampled texture, whether it resolved to a renderer-owned render
+target or fell through to guest memory. Over a routed run:
+
+```
+14389  -> HIT
+ 1638  -> miss
+   49  -> RTT PATH SKIPPED
+```
+
+A 90% hit rate — so the RTT machinery works. **But the misses are systematically the large surfaces,
+and they are in a different address range from every render target prosper draws into:**
+
+```
+[rtt] sample tex addr=0x1557c00000 3840x2160 fmt=9 -> miss (cache_size=8)
+[rtt] sample tex addr=0x1558c00000 3840x2160 fmt=9 -> miss (cache_size=85)
+[rtt] sample tex addr=0x1543c00000 3840x2160 -> miss
+[rtt] sample tex addr=0x1547c00000 4096x2048 -> miss
+[rtt] sample tex addr=0x14df560000 2048x2048 -> miss   (and four more 2048x2048)
+[rtt] sample tex addr=0x1544400000 1920x1080 -> miss
+```
+
+**Sampled addresses that HIT are `0x20xx…`** (the prefix census is dominated by `0x2066`, `0x206c`,
+`0x20d6`, `0x2067`, `0x205f`, `0x20e0`). **The misses are `0x14…`/`0x15…`.** And the draw census
+shows every colour target prosper renders into is `0x20…` — `0x208e5a0000` (~71,000 draws),
+`0x20431c0000`, `0x20ec7c0000`, and the scanouts `0x215ed10000` / `0x2160cf0000` / `0x2162cd0000`.
+
+**So the two sides of the frame use different virtual addresses for the same surfaces.** prosper's
+RTT cache is keyed on the address its draws rendered to; the composite asks for a different one and
+gets nothing, which for a surface prosper rendered into means it samples empty guest memory.
+
+**That is a mechanism that produces exactly the observed symptom**: ~71,000 draws fill a scene
+buffer, a composite runs and reaches the scanout, and the screen shows no world.
+
+**`CONFIDENCE: MED-HIGH` on the observation** — the hit/miss split, the size distribution and the
+address ranges are all measured. **`CONFIDENCE: LOW` on the cause.** Two readings are open and have
+not been separated:
+
+- **VA aliasing.** PS5 titles can map the same physical memory at more than one virtual address
+  (`sceKernelMapDirectMemory`). If the guest renders through one and samples through another, a
+  VA-keyed cache misses by construction, and the fix is to resolve RTT identity through physical
+  memory or an alias map rather than raw VA.
+- **A genuinely different surface.** The `0x14…`/`0x15…` surfaces may be resources the guest
+  produced by some path prosper does not render at all, in which case the miss is a symptom and the
+  absent producer is the defect.
+
+**The measurement that separates them:** whether any `0x14…`/`0x15…` address and any `0x20…` render
+target resolve to the same physical pages. That is answerable from the guest's own memory mapping and
+needs no further routed run.
+
+**This supersedes the DCC suspicion as the leading candidate.** The three unsupported 4K DCC surfaces
+(`0x2052ac0000`, `0x20e0380000`, `0x20df360000`) are all `0x20…` and are not among these misses.
+
 ## WHERE the draws go: a scene buffer with ~71,000 draws, and a composite that reaches the scanout (2026-08-15)
 
 `PROSPER_DRAW_CENSUS=1` now records each draw's `CB_COLOR0_BASE` (+ `_EXT`, + `CB_COLOR0_VIEW`),
