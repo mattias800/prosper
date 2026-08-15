@@ -367,11 +367,34 @@ Folded it: multiply a known destination, forget an unknown one as before, and st
 
 **It did not change the reject.** `0x413ce6000` still fails with `mode=unresolved-operand pc=156`.
 
-**And the arm is VOID, not negative** — the same discipline applied to the multiwave A/B. Nothing in
-this run demonstrates that the fold's output actually changed for this program: the reject is
-produced downstream of several other steps, and no artefact was hashed before the outcome was read.
-Treat "s_mulk folding does not fix `0x413ce6000`" as untested, not as false. The way to test it is to
-show s106 is now *known* at pc153 — which needs a fold-state probe that does not exist.
+**Then the probe was run, and it explains why — the fold was aimed at the wrong thing.**
+
+`PROSPER_DYNTRACE_SGPR=106` gives s106's complete fold history in this program:
+
+```
+pc=3    KNOWN 0x00000000
+pc=56   FORGOTTEN  words=beea376a
+pc=84   KNOWN 0x00000000 / 0xfffff7f0
+pc=90   KNOWN 0x7f7fffff
+pc=116  FORGOTTEN  words=beea3704      <- the break
+pc=131  FORGOTTEN  words=beea3704
+pc=149  FORGOTTEN  words=b86a0078      <- s_mulk_i32 s106, 120, with s106 ALREADY unknown
+```
+
+pc116 and pc131 are `SOP1 op=0x37 s[106:107], s[4:5]`, which prosper classifies as a **B64
+data/mask write** and which the RDNA2 encoding makes **`s_andn1_saveexec_b64`**: `exec = ~s4 & exec`,
+and **`s106` receives the OLD EXEC MASK**. Both are immediately followed by `s_cbranch_execz`.
+
+**So the descriptor-array selector is derived from a saved EXEC mask.** `s_mulk_i32 s106, 120` is
+multiplying a lane mask by the array's record stride. That is a wave-dependent runtime value, not a
+constant, and **no const-fold can ever resolve it** — which is precisely why this program has a
+dedicated `selected_sbuffer` contract that certifies the selector's complete *domain* from live
+source records instead of folding it.
+
+**Conclusion: the `s_mulk_i32` fold does not address this reject and cannot.** The reject is the
+contract's `selected-vsharp` decline — record 4 of the outer array holding float AABB data — and the
+const-fold was never on that path. The fold change stays for its own reasons; this reject needs the
+contract.
 
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.

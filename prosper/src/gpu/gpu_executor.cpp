@@ -2928,8 +2928,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // reach contradictory conclusions about the same chain. That happened: a Windows trace of s16
         // showed ZERO forget sites while the Linux fold attributed the loss of the descriptor-table
         // pointer to a v_cmp writing s16, and neither observation was wrong. (#2412)
+        // `program=` alongside `sh=`, because sh= IS NOT UNIQUE. It is the first code dword plus the
+        // span, and the first dword of a great many GTA V shaders is `bfa00003` -- `s_branch +3`, an
+        // ordinary prologue. Two different 276-dword programs therefore share `sh=bfa00003/276`, and
+        // filtering a watch by it silently mixes them: a trace filtered that way showed s106 being
+        // FORGOTTEN at a pc whose instruction words do not appear anywhere in the program being
+        // studied. The comment below claims this signature "identifies one cheaply and stably" -- it
+        // is cheap and stable, and it is not an identity. The code pointer is.
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] sh=%08x/%zu pc=%u s%d <- KNOWN 0x%08x\n",
+            fprintf(stderr,
+                    "[sgprwatch] program=0x%llx sh=%08x/%zu pc=%u s%d <- KNOWN 0x%08x\n",
+                    (unsigned long long)(uintptr_t)code,
                     dwords ? code[0] : 0u, dwords, watch_pc, r, v);
         if (valid_reg(r)) {
             val[(size_t)r] = v;
@@ -2947,7 +2956,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
     auto forget = [&](int r) {
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] sh=%08x/%zu pc=%u s%d <- FORGOTTEN words=%08x:%08x len=%u\n",
+            fprintf(stderr,
+                    "[sgprwatch] program=0x%llx sh=%08x/%zu pc=%u s%d <- FORGOTTEN "
+                    "words=%08x:%08x len=%u\n",
+                    (unsigned long long)(uintptr_t)code,
                     dwords ? code[0] : 0u, dwords, watch_pc, r, watch_w0, watch_w1, watch_len);
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
