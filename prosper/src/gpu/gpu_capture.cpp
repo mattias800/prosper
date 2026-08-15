@@ -3524,6 +3524,11 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     // the version is downgraded -- eleven legacy-reopen assertions failed that way when this field
     // was first placed next to the seed records.
     for (const auto& seed : c.ds_seeds) w.u32(seed.slice);
+    // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
+    // existed, so a capture sitting just under the maximum could serialize successfully into a file
+    // that read_gpu_capture then rejects as oversized -- a write that reports success and produces
+    // an unreadable artifact. Any tail added after this point must move this check again.
+    if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
 }

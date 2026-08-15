@@ -3982,6 +3982,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::array<VkImageView, prosper::gpu::kColorTargetCount> extra_views{};
     std::array<PersistentColorTargetImage*, prosper::gpu::kColorTargetCount> cached_extra{};
     std::array<PersistentColorTargetKey, prosper::gpu::kColorTargetCount> extra_keys{};
+    // One decision, consumed by the pre-pass barrier, the attachment's initialLayout and the LOAD op
+    // alike. Computed where all three can see it so they cannot disagree about whether this slot's
+    // contents are being carried forward.
+    std::array<bool, prosper::gpu::kColorTargetCount> load_extra{};
     bool persistent_color1 = persistent_color1_enabled;
     PersistentColorTargetKey color_key1{};
     PersistentColorTargetImage* cached_color1 = nullptr;
@@ -4181,6 +4185,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             cached_extra[slot]->view = extra_views[slot];
         }
     }
+    for (uint32_t slot = 2; slot < color_count; ++slot)
+        load_extra[slot] = cached_extra[slot] && cached_extra[slot]->valid &&
+                           color_target && color_target->load_existing_slots[slot];
 
     if (use_ds && !dimg) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -4231,8 +4238,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (uint32_t slot = 2; slot < color_count; ++slot) {
         // LOAD a retained slot whose contents are valid, so a G-buffer built across several render
         // groups accumulates instead of each group clearing its predecessor's work.
-        const bool load_slot = cached_extra[slot] && cached_extra[slot]->valid &&
-                               color_target && color_target->load_existing_slots[slot];
+        const bool load_slot = load_extra[slot];
         att[slot].format = color_formats[slot];
         att[slot].samples = VK_SAMPLE_COUNT_1_BIT;
         att[slot].loadOp = load_slot ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -4241,7 +4247,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         att[slot].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[slot].initialLayout = load_slot ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
                                             : VK_IMAGE_LAYOUT_UNDEFINED;
-        att[slot].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        att[slot].finalLayout = cached_extra[slot] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                   : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
     att[ds_attachment].format = DFMT; att[ds_attachment].samples = VK_SAMPLE_COUNT_1_BIT;
     // A guest-identified DS surface survives calls. New attachments get a defined initial value;
@@ -6463,6 +6470,29 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &load);
     }
+    // Slots 2..7 take the same pre-pass transition as slots 0 and 1, from the layout the retained
+    // image is ACTUALLY in. Recording COLOR_ATTACHMENT_OPTIMAL as the attachment's initialLayout
+    // without this barrier is undefined: the image rests in SHADER_READ_ONLY_OPTIMAL after its
+    // previous group's readback restore.
+    for (uint32_t slot = 2; slot < color_count; ++slot) {
+        if (!load_extra[slot]) continue;
+        VkImageMemoryBarrier load{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        load.oldLayout = cached_extra[slot]->layout;
+        load.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        load.image = extra_images[slot];
+        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        load.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        load.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &load);
+    }
     if (load_cached_color1) {
         VkImageMemoryBarrier load{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         load.oldLayout = cached_color1->layout;
@@ -7043,6 +7073,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         };
         transition_color_to_readback(persistent_color, readback_color0, img);
         transition_color_to_readback(persistent_color1, readback_color1, img1);
+        for (uint32_t slot = 2; slot < color_count; ++slot)
+            transition_color_to_readback(cached_extra[slot] != nullptr, true, extra_images[slot]);
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         cp.imageExtent = {W, H, 1};
@@ -7080,6 +7112,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         };
         restore_persistent_color(persistent_color, readback_color0, img);
         restore_persistent_color(persistent_color1, readback_color1, img1);
+        for (uint32_t slot = 2; slot < color_count; ++slot)
+            restore_persistent_color(cached_extra[slot] != nullptr, true, extra_images[slot]);
     }
     if (timing_enabled && flush_now)
         active_submission.end_gpu_timestamp(cmd);
@@ -7179,7 +7213,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (!retained) continue;
         active_submission.add_failure_cleanup([retained]() { retained->valid = false; });
         retained->valid = true;
-        retained->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        // The layout the image is ACTUALLY left in: the pass ends it in SHADER_READ_ONLY_OPTIMAL and
+        // the readback restore returns it there. Recording COLOR_ATTACHMENT_OPTIMAL here while the
+        // image sat in TRANSFER_SRC_OPTIMAL is what made the next group's initialLayout a lie --
+        // VUID-vkCmdDraw-None-09600, invisible on RADV because the pixels happened to survive.
+        retained->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     BackendSubmissionBatchResult batch_result;
     if (flush_now)

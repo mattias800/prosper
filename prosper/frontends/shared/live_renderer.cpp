@@ -6454,10 +6454,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         ? RenderClock::now() : RenderClock::time_point{};
                     prosper::test::BackendMrtOutputs mrt_outputs;
                     mrt_outputs.color_count = mrt_count;
+                    // The colour target is passed whenever ANY slot is bound, not colour-0 alone.
+                    // The same union the readback flag below already uses, and for the same reason
+                    // the comment there gives: a pass with colour-0 unbound and a higher slot bound
+                    // is reachable by construction. On `base != 0` alone such a pass populated
+                    // persistent_id_slots[2..7] and then handed the backend a nullptr, so those
+                    // active slots stayed transient and were cleared by the next group -- exactly
+                    // the defect the persistence contract exists to remove, reintroduced at the one
+                    // call site that decides whether the contract is used at all.
+                    const bool any_slot_bound = std::any_of(
+                        pass_bases.begin(),
+                        pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
+                        [](uint64_t slot_base) { return slot_base != 0; });
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed,
                         retained_uniform_clear ? retained_uniform_clear : clear_for(render_pass), true,
-                        live_gpu_targets && base ? &backend_target : nullptr,
+                        live_gpu_targets && any_slot_bound ? &backend_target : nullptr,
                         seed1, retained_uniform_clear1 ? retained_uniform_clear1
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,

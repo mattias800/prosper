@@ -889,17 +889,37 @@ int main() {
             0xF800180Fu, 0x07060504u,                             // exp mrt0 v4,v5,v6,v7
             0xBF810000u,                                          // s_endpgm
         };
+        // Rendered with FOUR attachments, which is what a shader exporting MRT3 is paired with in a
+        // real frame. It used to render into a single attachment, and that was only harmless while
+        // the recompiler silently dropped MRT3: once the shell carries eight outputs the module
+        // legitimately writes Location 3, and a one-attachment pass makes that write unused --
+        // caught by tools/vkval as `Undefined-Value-ShaderOutputNotConsumed`. Widening the pass is
+        // the faithful fix and strengthens the assertion: MRT0's blue must land on attachment 0 AND
+        // MRT3's red on attachment 3, which pins the mapping in both directions rather than only
+        // proving color0 is not red.
         std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
         CHECK(!frg.empty(), "#566: recompiled descending-order 4-MRT (MRT3 then MRT0) PS -> SPIR-V");
         if (!frg.empty()) {
-            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
-            CHECK(px2.size() == (size_t)W*H*4, "rendered the MRT-order PS");
-            if (px2.size() == (size_t)W*H*4) {
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = frg;
+            const float black[4] = {0, 0, 0, 1};
+            prosper::test::BackendMrtOutputs outputs;
+            outputs.color_count = 4;
+            std::vector<uint8_t> px2 = prosper::test::render_draws_rgba(
+                {draw}, W, H, nullptr, black, false, nullptr, nullptr, black, nullptr, nullptr,
+                true, &outputs);
+            const size_t want = (size_t)W * H * 4;
+            CHECK(px2.size() == want && outputs.colors[3].size() == want,
+                  "rendered the MRT-order PS into four attachments");
+            if (px2.size() == want && outputs.colors[3].size() == want) {
                 const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
-                printf("  mrt-order center=(%u,%u,%u,%u) expect BLUE (MRT0), not RED (MRT3)\n",
-                       cc[0],cc[1],cc[2],cc[3]);
+                const uint8_t* c3 = &outputs.colors[3][((size_t)(H/2) * W + W/2) * 4];
+                printf("  mrt-order attachment0=(%u,%u,%u,%u) attachment3=(%u,%u,%u,%u)\n",
+                       cc[0],cc[1],cc[2],cc[3], c3[0],c3[1],c3[2],c3[3]);
                 CHECK(cc[2] > 0x80 && cc[0] < 0x40,
                       "#566: color0 receives MRT0 (BLUE), not the first-emitted MRT3 (RED)");
+                CHECK(c3[0] > 0x80 && c3[2] < 0x40,
+                      "#566: MRT3's RED lands on attachment 3, not discarded and not on color0");
             }
         }
     }
@@ -999,6 +1019,12 @@ int main() {
             // simply never touching the attachment.
             run_group(frg_a, kSlot2Id + 0x1000, true, first);
             run_group(frg_b, kSlot2Id + 0x1000, false, cleared);
+            // Assert the extent, do not merely gate on it. A regression that makes the no-load call
+            // fail and return an EMPTY buffer would otherwise skip the only assertion in this arm
+            // and take the negative control down with it, silently.
+            CHECK(cleared.size() == px,
+                  "#2550: the no-load arm reads back at full extent (its assertion cannot be "
+                  "skipped by an empty result)");
             if (cleared.size() == px) {
                 const uint8_t* c = &cleared[((size_t)(H / 2) * W + W / 2) * 4];
                 printf("  slot2 no-load group2=(%u,%u,%u)\n", c[0], c[1], c[2]);

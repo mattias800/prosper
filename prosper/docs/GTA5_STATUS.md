@@ -1829,6 +1829,54 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Second review round on #2550, all five fixed (2026-08-15)
+
+**1 (blocker) — MRT2–7 reused an image in the wrong Vulkan layout.** The retained image was recorded
+as `COLOR_ATTACHMENT_OPTIMAL` while the pass left it in `TRANSFER_SRC_OPTIMAL` and no restore
+transition existed, so the next group declared an initial layout the image was not in. Codex
+reproduced it under `VK_LAYER_KHRONOS_validation` as `VUID-vkCmdDraw-None-09600`; the pixel assertion
+still passed on RADV, so the ordinary suite could not see it. Slots 2–7 now take the complete MRT0/1
+lifecycle — pre-pass load barrier from the truthful current layout, persistent final layout, readback
+transition, restore, and a recorded layout that matches. Mutation-verified: restoring the old
+recorded layout brings back exactly `VUID-vkCmdDraw-None-09600` (x2) plus
+`VUID-VkImageMemoryBarrier-oldLayout-01197` (x8); the fix gives **zero**, which also proves the layer
+was active rather than silently absent.
+
+**The gate already existed.** `tools/vkval/vk_validation_scan.py` runs the whole suite under the
+layer, allow-lists known IDs, fails on unknown ones, and refuses a clean verdict unless the layer
+provably loaded. Neither VUID is allow-listed, so that scan *is* the regression: `VKVAL_RC=0` now,
+and it fails with the defect present.
+
+**2 (high) — sparse MRT passes bypassed the persistence contract.** The colour target was passed to
+the backend only when MRT0's `base` was non-zero, and the comment at that very call site already
+documented that MRT0-unbound / higher-slot-bound passes are reachable. Such a pass populated
+`persistent_id_slots[2..7]` and then handed the backend `nullptr`. Now gated on the union of every
+bound slot — the same union the readback flag beside it already used. Effect on the live title: **c4
+513,338 → 3,472,691** non-black pixels.
+
+**3 (high) — the cap-order and baseline tests did not exercise the production sites.** They called
+two pure predicates, so moving the cap check back below the capture, or deleting the baseline latch,
+left every assertion green. Replaced with orchestration seams that *own* the properties:
+`frame_bundle_append_submit()` takes the capture step as an injected callable, so a test observes
+whether it ran; `frame_bundle_open_window()` owns the latch. Both mutations Codex named now fail —
+moving the cap below the capture gives 2 failures, deleting the latch gives 3.
+
+**4 (medium) — the MRT2 negative arm could skip itself.** It entered its only assertion under
+`if (cleared.size() == px)` without ever asserting that size, so a regression returning an empty
+buffer would have passed the negative control silently. The extent is asserted now.
+
+**5 (medium) — the capture size bound ran before the v55 tail.** A capture near the 4 GiB ceiling
+could serialize successfully into a file `read_gpu_capture` then rejects as oversized. Re-checked
+after the final tail, with a note that any future tail must move the check again.
+
+### The pattern across both review rounds
+
+Four of the nine findings across the two rounds are the same shape: **a check that cannot fail.** The
+negative arm gated on a size it never asserted; the cap and baseline tests called predicates instead
+of the sites; the timeline assertions sat after their own fail gate; and the layout defect passed
+every pixel assertion while being undefined behaviour. Only the last needed a tool to see — the other
+three were readable in the diff, and I wrote all of them.
+
 ## Review findings on #2550, all four fixed (2026-08-15)
 
 Codex reviewed the MRT work and found four verified issues. All are real; all four were confirmed
