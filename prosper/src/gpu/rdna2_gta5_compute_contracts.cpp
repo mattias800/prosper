@@ -796,6 +796,33 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     DecodedBufferDescriptor selected{};
     if (!selected_sbuffer_target_descriptor(selected_words, selected)) {
+        // Dump ALL FIVE records, not only the one the contract reads. The decline says record 4 does
+        // not hold a V#; it cannot say whether that is because the SELECTOR is wrong (some other
+        // record does hold one) or because the whole outer array is stale (none does). Those need
+        // opposite fixes, and one printed record cannot distinguish them.
+        //
+        // The outer array's address changes every frame -- 0x203f2e9b38, 0x203e989b38, 0x20408c9b38
+        // across successive dispatches -- so it is a per-frame ring allocation, which makes "stale
+        // ring contents" a live possibility rather than a remote one.
+        if (report_selected_sbuffer_reject(code, "selected-vsharp-records")) {
+            for (uint32_t record = 0; record < kSelectedSbufferOuterRecords; ++record) {
+                const uint32_t offset = record * kSelectedSbufferOuterStride + 8u;
+                if (offset + sizeof(std::array<uint32_t, 4>) > outer->size) break;
+                std::array<uint32_t, 4> words{};
+                std::memcpy(words.data(), outer_bytes + offset, sizeof(words));
+                DecodedBufferDescriptor probe{};
+                const bool plausible = selected_sbuffer_target_descriptor(words, probe);
+                const DecodedBufferDescriptor raw = decode_buffer_descriptor(words.data());
+                std::fprintf(stderr,
+                             "[gta-selected-sbuffer]   record=%u@+%u words=%08x:%08x:%08x:%08x "
+                             "base=0x%llx stride=%u records=%u size=%u fmt=%u comp=%u %s\n",
+                             record, offset, words[0], words[1], words[2], words[3],
+                             static_cast<unsigned long long>(raw.base), raw.stride,
+                             raw.num_records, raw.size_bytes,
+                             static_cast<unsigned>(raw.format), raw.num_components,
+                             plausible ? "<-- MATCHES the expected target shape" : "");
+            }
+        }
         if (report_selected_sbuffer_reject(code, "selected-vsharp"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=selected-vsharp words=%08x:%08x:%08x:%08x "

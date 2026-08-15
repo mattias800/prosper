@@ -399,6 +399,44 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## The `selected_sbuffer` contract is over-fitted: the "descriptor array" holds FRUSTUM PLANES (2026-08-15)
+
+Dumping **all five** records of the outer array on decline, rather than only the one the contract
+reads, settles what one record could not:
+
+```
+record=0@+8   words=3e177e0d:3d39304e:3f7ceb16:beec6371
+record=1@+128 words=3d044294:bc9a100f:3ce5d234:be5601a6
+record=2@+248 words=bdd106eb:3f7e94ad:bccf32ed:beee4863
+record=3@+368 words=be6fa5cf:bdb9257a:3f581219:bdf01a64
+record=4@+488 words=3f1a1f1a:bdc0f619:3f4afad1:bfa0b479
+```
+
+**None of the five is a descriptor. All five are floats, and they are unit normals plus a scalar:**
+
+| record | xyz | ‖xyz‖ | w |
+| --- | --- | --- | --- |
+| 0 | (0.1479, 0.0452, 0.9879) | **0.999** | −0.461 |
+| 2 | (−0.1020, 0.9944, −0.0253) | **1.000** | −0.465 |
+| 4 | (0.6021, −0.0942, 0.7929) | **1.001** | −1.256 |
+
+A unit 3-vector with a scalar is a **plane equation**. Five of them at stride 120 is a camera
+frustum, not a descriptor table.
+
+**So in the gameplay scene, the buffer the contract reads as a five-entry V# array holds frustum
+planes.** The contract was derived from a phase where record 4 did hold a V#, and it does not
+generalise. That also explains its companion `reject=consumer-resource`.
+
+This is why the earlier framing — "record 4 is stale, find its producer" — was the wrong question.
+The buffer is not stale; it is a **different buffer's worth of data**, correctly written by whoever
+owns it. Either `0x413ce6000`'s pc153 does not load a descriptor on this path in this scene, or the
+resource the contract binds at `fetch_pc=153` is not the one the guest means here.
+
+**`CONFIDENCE: HIGH` that these are planes and not descriptors** — three of five have unit-length
+normals, which floating-point garbage does not do. `CONFIDENCE: MED` on the consequence, because
+"the contract binds the wrong resource" and "the shader takes a different path here" both fit and
+have not been separated.
+
 ## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
 
 Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather
