@@ -211,6 +211,47 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
+## THE BUILDER'S LOWERING IS CORRECT — it emits a perfect tree for eleven submits (2026-08-15)
+
+`PROSPER_COMPUTE_DISPATCH_LOG` now carries the launch geometry, so the outcome and the launch can be
+read on one line. Across the whole route:
+
+```
+submit  threads       local     tree
+4802    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0     <- exactly correct
+5217    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+5632    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+6047    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+6463    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+6877    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+7292    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+7706    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+8121    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+8951    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+9360    2063x1x1      256x1x1   pairs=852  unpaired=247 cycles=57  <- and never correct again
+...     2063x1x1      256x1x1   cyclic for the remaining 30+ submits
+```
+
+**Eleven consecutive submits at pairs=1030, unpaired=0, cycles=0 — the exact clean ground truth — at
+an identical launch geometry, from the same compiled module.** A miscompiled shader does not produce
+the exactly correct answer eleven times in a row.
+
+**So `0x413dc3400`'s lowering is CORRECT, and the defect is in what it is fed.** Every
+lowering-side hypothesis for this program is retired by this one measurement: barrier placement,
+LDS sizing, wave model, the compaction, the exec-mask predication, the store addressing. They all
+produce a correct tree for eleven submits.
+
+The launch is identical on both sides of the boundary — `threads=2063x1x1 local=256x1x1` throughout —
+so an active-record count change is not the trigger either. The transition point is **not a fixed
+submit number**: one run breaks at ~6795, another at ~9360, so it tracks route position and scene
+content rather than a dispatch ordinal.
+
+**The remaining question is therefore narrow and concrete: what changes in the builder's input at
+that boundary?** Its tags come from `0x209cc76000` (2,063 × 64 bytes, binding 4 / fetch-pc 86).
+`PROSPER_COMPUTE_TREE_WATCH_AUX=0xADDR:DWORDS` (added here) dumps a second guest range alongside the
+watched table, and dumps the builder's clean transitions too so there is a control from the same run
+rather than only cyclic samples.
+
 ## FALSIFIED: the missing-producer hypothesis is dead (2026-08-15)
 
 `PROSPER_COMPUTE_DISPATCH_LOG` (added here) records **one line per dispatch** with its outcome, which

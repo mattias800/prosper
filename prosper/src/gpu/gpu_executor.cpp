@@ -2062,13 +2062,25 @@ bool compute_dispatch_log_selected(uint64_t program) {
 }
 
 void log_compute_dispatch(uint64_t program, uint64_t submit_no, size_t dispatch_index,
-                          uint64_t order, const char* outcome) {
+                          uint64_t order, const char* outcome,
+                          const ComputeLaunchDimensions* launch = nullptr) {
     if (!compute_dispatch_log_selected(program)) return;
+    // The launch travels with the outcome. GTA V's tree builder emits a PERFECT tree for five
+    // consecutive submits and then a cyclic one for the rest of the route, so the question is what
+    // differs between those two regimes -- and the guest's active-record count reaches the shader as
+    // the thread extent. A dispatch record without it cannot answer that.
+    char geometry[128] = "";
+    if (launch)
+        std::snprintf(geometry, sizeof(geometry),
+                      " groups=%ux%ux%u local=%ux%ux%u threads=%ux%ux%u",
+                      launch->groups_x, launch->groups_y, launch->groups_z,
+                      launch->local_x, launch->local_y, launch->local_z,
+                      launch->threads_x, launch->threads_y, launch->threads_z);
     std::fprintf(stderr,
-                 "[compute-dispatch] program=0x%llx submit=%llu dispatch=%zu order=%llu outcome=%s\n",
+                 "[compute-dispatch] program=0x%llx submit=%llu dispatch=%zu order=%llu outcome=%s%s\n",
                  static_cast<unsigned long long>(program),
                  static_cast<unsigned long long>(submit_no), dispatch_index,
-                 static_cast<unsigned long long>(order), outcome);
+                 static_cast<unsigned long long>(order), outcome, geometry);
 }
 
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
@@ -9421,7 +9433,11 @@ void report_compute_tree_watch(const char* phase, const ComputeTreeWatchSelector
     //
     // Gated on the clean -> cyclic transition specifically. Dumping every change would write
     // hundreds of megabytes across a routed run and bury the two images that matter.
-    if (transition != ComputeTreeWatchTransition::CleanToCyclic) return;
+    // CleanToClean is dumped too when an aux range is configured: a cyclic sample with no clean
+    // counterpart from the same run cannot show what CHANGED, only what is present.
+    const bool want_clean_control = std::getenv("PROSPER_COMPUTE_TREE_WATCH_AUX") != nullptr &&
+                                    transition == ComputeTreeWatchTransition::CleanToClean;
+    if (transition != ComputeTreeWatchTransition::CleanToCyclic && !want_clean_control) return;
     const char* dump_root = std::getenv("PROSPER_COMPUTE_TREE_WATCH_DUMP");
     if (!dump_root || !*dump_root) return;
     auto write_image = [&](const char* which, const std::vector<uint32_t>& words) {
@@ -9444,6 +9460,42 @@ void report_compute_tree_watch(const char* phase, const ComputeTreeWatchSelector
     };
     write_image("pre", before);
     write_image("post", after);
+
+    // PROSPER_COMPUTE_TREE_WATCH_AUX=0xADDR:DWORDS — dump a SECOND guest range at the same moment.
+    //
+    // The watched table is the OUTPUT. Its input lives somewhere else, and the question that matters
+    // is what differs about that input between a dispatch that produces a correct tree and one that
+    // does not. GTA V's builder emits pairs=1030 unpaired=0 for eleven consecutive submits at an
+    // identical launch geometry and then never again, which rules its lowering correct and makes the
+    // input the only remaining variable -- but nothing was capturing the input.
+    const char* aux = std::getenv("PROSPER_COMPUTE_TREE_WATCH_AUX");
+    if (!aux || !*aux) return;
+    char* aux_end = nullptr;
+    const uint64_t aux_addr = std::strtoull(aux, &aux_end, 0);
+    if (!aux_addr || !aux_end || *aux_end != ':') return;
+    const uint64_t aux_dwords = std::strtoull(aux_end + 1, &aux_end, 0);
+    if (!aux_dwords || aux_dwords > (1u << 22u) || (aux_end && *aux_end)) return;
+    const uint64_t aux_bytes = aux_dwords * sizeof(uint32_t);
+    if (!guest_readable(aux_addr, aux_bytes)) {
+        std::fprintf(stderr, "[compute-tree-watch]   aux 0x%llx unreadable\n",
+                     static_cast<unsigned long long>(aux_addr));
+        return;
+    }
+    std::vector<uint32_t> aux_words(static_cast<size_t>(aux_dwords));
+    std::memcpy(aux_words.data(),
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(aux_addr)),
+                static_cast<size_t>(aux_bytes));
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/aux-%llx-s%llu-d%zu-o%llu.bin", dump_root,
+                  static_cast<unsigned long long>(aux_addr),
+                  static_cast<unsigned long long>(submit_no), dispatch_index,
+                  static_cast<unsigned long long>(order));
+    std::FILE* file = std::fopen(path, "wb");
+    if (!file) return;
+    const size_t written = std::fwrite(aux_words.data(), sizeof(uint32_t), aux_words.size(), file);
+    const int closed = std::fclose(file);
+    std::fprintf(stderr, "[compute-tree-watch]   dumped aux -> %s (%s)\n", path,
+                 (written == aux_words.size() && closed == 0) ? "ok" : "SHORT");
 }
 
 // Returns the pre-image so the caller can hand it back for the post comparison. Empty means the
@@ -10086,6 +10138,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     // attributed to the dispatch that made it. Captured before the move: the
                     // post observation needs the program address, and `item` is consumed below.
                     const uint64_t tree_watch_program = item.code_addr;
+                    const ComputeLaunchDimensions tree_watch_launch = item.launch;
                     const std::string tree_watch_touch =
                         compute_tree_watch_selector()
                             ? describe_compute_tree_watch_touch(item.resources.get(),
@@ -10098,7 +10151,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         ? compute({item}) : compute({std::move(item)});
                     log_compute_dispatch(tree_watch_program, submit_no, operation.index,
                                          operation.command_order,
-                                         executed ? "executed" : "backend-declined");
+                                         executed ? "executed" : "backend-declined",
+                                         &tree_watch_launch);
                     observe_compute_tree_watch_post(tree_watch_program, tree_watch_touch, submit_no,
                                                     operation.index, operation.command_order,
                                                     tree_watch_pre);
