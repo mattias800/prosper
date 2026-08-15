@@ -10249,6 +10249,52 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     // Pre/post around the dispatch, so a change to the watched table is
                     // attributed to the dispatch that made it. Captured before the move: the
                     // post observation needs the program address, and `item` is consumed below.
+                    // PROSPER_COMPUTE_ZERO_BEFORE=0xPROGRAM:0xADDR:DWORDS — zero a guest range
+                    // immediately before the named program dispatches. DIAGNOSTIC ONLY: it fixes
+                    // nothing, because on hardware something must be performing whatever
+                    // initialisation this stands in for, and identifying that is the actual work.
+                    //
+                    // It exists to test one specific prediction that no amount of reading the ISA
+                    // settles: GTA V's tree builder writes parent links only for children whose node
+                    // type is in {2,5}, so the slots it skips must already hold a value that
+                    // terminates the consumer's `while (i != 0) i = bfe(rec[i], 3, 27)` walk. Zero
+                    // terminates; a leftover index from an earlier generation of the same array does
+                    // not. If the array is simply never cleared, zeroing it here should turn a cyclic
+                    // tree into a legitimately sparse one -- pairs below 1030 and cycles at zero.
+                    // That outcome is not reachable by any other experiment available.
+                    if (const char* zero_spec = std::getenv("PROSPER_COMPUTE_ZERO_BEFORE")) {
+                        char* cursor = nullptr;
+                        const uint64_t want_program = std::strtoull(zero_spec, &cursor, 0);
+                        if (cursor && *cursor == ':' && want_program == item.code_addr) {
+                            const uint64_t zero_addr = std::strtoull(cursor + 1, &cursor, 0);
+                            uint64_t zero_dwords = 0;
+                            if (cursor && *cursor == ':')
+                                zero_dwords = std::strtoull(cursor + 1, &cursor, 0);
+                            const uint64_t zero_bytes = zero_dwords * sizeof(uint32_t);
+                            if (zero_addr && zero_dwords && zero_dwords <= (1u << 22u) &&
+                                guest_readable(zero_addr, zero_bytes)) {
+                                std::memset(
+                                    reinterpret_cast<void*>(static_cast<uintptr_t>(zero_addr)), 0,
+                                    static_cast<size_t>(zero_bytes));
+                                static std::mutex zero_mutex;
+                                static uint64_t zero_count = 0;
+                                uint64_t count = 0;
+                                {
+                                    std::lock_guard lock(zero_mutex);
+                                    count = ++zero_count;
+                                }
+                                if (count <= 3 || (count % 25) == 0)
+                                    std::fprintf(stderr,
+                                                 "[compute-zero-before] program=0x%llx addr=0x%llx "
+                                                 "dwords=%llu submit=%llu dispatch=%zu count=%llu\n",
+                                                 (unsigned long long)item.code_addr,
+                                                 (unsigned long long)zero_addr,
+                                                 (unsigned long long)zero_dwords,
+                                                 (unsigned long long)submit_no, operation.index,
+                                                 (unsigned long long)count);
+                            }
+                        }
+                    }
                     const uint64_t tree_watch_program = item.code_addr;
                     const ComputeLaunchDimensions tree_watch_launch = item.launch;
                     const std::string tree_watch_touch =

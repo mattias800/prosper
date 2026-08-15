@@ -399,6 +399,55 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## FOUND: the CYCLES ARE IN THE INPUT — the node records' own child graph (2026-08-15)
+
+Two results, and together they close the question.
+
+### 1. The clear hypothesis is FALSIFIED, with the lever verified
+
+`PROSPER_COMPUTE_ZERO_BEFORE=0x413dc3400:0x20f848417c:2063` zeroes the parent array immediately
+before every builder dispatch. The clear demonstrably fires. **The later submits are still cyclic** —
+`cycles=63..101`, and now with `oob-roots=0`. So the cycles are **not** stale leftovers in the output
+array; the builder writes them into a freshly zeroed one.
+
+### 2. The cycles are in the builder's INPUT
+
+Building the child graph directly from the node records — for each node, its two child references
+decoded as `index = (ref >> 3) - 4` when the tag is in `{2,5}` — and testing that graph for cycles:
+
+```
+s11238 d15,d16,d19..d27   child-graph cycles = 0
+s11238 d37                child-graph cycles = 70     <- appears here
+s11637 d15,d16 ...        child-graph cycles = 70     (carried into the next submit)
+s11637 d37                child-graph cycles = 110
+s12036 ...                child-graph cycles = 110
+s13220 d37                child-graph cycles = 117
+... every later submit    child-graph cycles = 117
+```
+
+**The node records at `0x209cc76000` describe a cyclic child graph, and `0x413dc3400` faithfully
+reproduces it as a cyclic parent table.** Everything below about the builder now has its explanation:
+its lowering is correct, its output tracks its input, and its input is a cyclic graph.
+
+**The cycles appear between dispatch 27 and dispatch 37 of a submit, and they ACCUMULATE**
+(70 → 110 → 117), which is the signature of a structure being partially updated rather than rebuilt.
+The programs running in that window are `0x413ce3400` at d30 and **`0x413ce6000` at d36 — the bulk
+writer of the record array, and the one whose descriptor at pc156 does not resolve.**
+
+**So `0x413ce6000` is back at the centre of this, for a different reason than before.** The earlier
+falsification stands and was correct: its *absence* is not the cause, since 29 submits with it fully
+executing still went cyclic. The cause is its **output**. A program that is sometimes declined and,
+when it does run, has an unresolved descriptor is exactly a program that can write a partially-correct
+node array.
+
+### The next measurement, and it is one run
+
+Attribute the cycle appearance to a dispatch the same way the parent table's was: watch
+`0x209cc76000` with the tree watch's **pre/post** attribution and the child-graph cycle count as the
+metric, rather than the parent-walk metric which is meaningless on a node array. The instrument
+exists; only the analysis differs. That names the writer conclusively instead of by elimination
+between d30 and d36.
+
 ## THE HYPOTHESIS THIS ALL POINTS AT: the parent array is never cleared
 
 If the builder legitimately links only `{2, 5}` children, then **the slots it does not write must
