@@ -1031,6 +1031,34 @@ is not what these runs were.
 `scc = -1` has a handful of sites in the fold, and each is either a real SCC write or a conservative
 one like the `s_mulk_i32` case that was corrected.
 
+## The `selected_sbuffer` contract NEVER ACCEPTS — it is not on the path at all (2026-08-15)
+
+`PROSPER_GTA5_SBUFFER_ACCEPT=1` (added here) reports the descriptor the contract publishes on the
+dispatches it accepts. Every existing diagnostic on this contract described a **decline**, so the
+accept side had never been looked at.
+
+**It reports nothing. Zero accepts on a full routed run**, against two distinct decline reasons.
+
+Yet `0x413ce6000` **executes 129 times of 139**. So those executions do not go through this contract
+at all — they go through the **generic runtime-array lift**, which is what puts `entries=5` in the
+resource map at `fetch-pc=156/158`.
+
+**Consequence: every section above that reasons about this contract is reasoning about a path that
+does not fire.** The record-4 hardcoding, the selector histogram, the frustum-plane content of the
+outer buffer — all real observations, and all about machinery that declines and is then bypassed.
+They explain the ~10 dispatches that are declined outright; they do not explain the 129 that run.
+
+**The descriptor those 129 executions actually use comes from the generic lift**, and Codex's caveat
+applies to it exactly as it did to the contract: *"it too materializes entries eagerly from
+CPU-visible memory"*, with no command-order snapshot coupling it to the bytes the GPU consumes. A
+descriptor materialised from the wrong epoch is a coherent explanation for node records whose child
+graph is cyclic, and it is now the **only** remaining candidate on this path that has not been
+tested.
+
+**The next measurement is the generic lift's published entries at `0x413ce6000`'s dispatches**, in
+the same style: what addresses it materialises, and whether they change between a dispatch that adds
+cycles and one that does not.
+
 ## The contract reads a BVH NODE-REFERENCE array as a selector array (2026-08-15)
 
 The selector histogram, taken from the same source records the contract's own domain proof walks:
