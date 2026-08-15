@@ -399,6 +399,51 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## The contract reads a BVH NODE-REFERENCE array as a selector array (2026-08-15)
+
+The selector histogram, taken from the same source records the contract's own domain proof walks:
+
+```
+[gta-selected-sbuffer]  selectors distinct=2064 (selector:count) 4:1 5:1 6:1 7:1 8:1 9:1 10:1 ...
+[gta-selected-sbuffer]  record-4 selector would be 4; outer has 5 records of 120 bytes
+```
+
+**All 2,064 source records have a DIFFERENT selector, and they run 4, 5, 6, 7, 8, … — i.e.
+`selector = index + 4`.**
+
+That is not a selector. **It is the BVH node-reference encoding**, the same one `0x413dc3400` decodes
+at pc618–619 with `v_lshrrev_b32 v36, 3, v69` followed by `v_add_nc_u32 v36, -4, v36` —
+`index = (ref >> 3) - 4`. The source array at pc70 (stride 8, 2,064 records) is an array of **node
+references**, and `first >> 3` recovers `index + 4`, exactly as observed.
+
+**So `selected_sbuffer_domain`'s proof passes for an accidental reason.** It admits a record when
+`selector * 120` is either exactly 480 (record 4) or wholly out of bounds. With `selector = index+4`:
+index 0 gives selector 4 → offset 480 → "record 4"; indices 1..2063 give selectors 5..2067 → offsets
+600..248,040, every one past the 600-byte buffer → "wholly OOB". **Both arms are satisfied by an
+array that is not a selector array at all.** The proof is not wrong about the arithmetic; it is
+answering a question about the wrong data.
+
+The contract then reads 16 bytes at `480 + 8` of a 600-byte buffer that holds float data, gets a
+non-descriptor, and declines — correctly, at the last possible moment, having been misled four steps
+earlier.
+
+**This is the complete account of `0x413ce6000`'s reject**, and it is a contract defect rather than a
+missing lowering, a stale buffer, or a wrong selector value:
+
+1. the source array at pc70 holds BVH node references, not table selectors;
+2. `selected_sbuffer_domain` reads `first >> 3` as a selector and its two admissible arms are both
+   satisfied by that data for arithmetic reasons;
+3. the contract therefore reads record 4 of the outer buffer;
+4. the outer buffer holds float data in this scene (unit-normal plane equations, measured);
+5. `selected_sbuffer_target_descriptor` rejects it;
+6. no `selected_sbuffer_soffset` authority is published, so the descriptor for
+   `buffer_load_dwordx3` at pc156 never resolves;
+7. `mode=unresolved-operand pc=156`, and the program is declined.
+
+**`CONFIDENCE: HIGH`** on steps 1–5, all measured. **`CONFIDENCE: MED`** on 6–7 being the only
+remaining link, since the recompiler's descriptor matching has three routes and only the contract one
+has been traced.
+
 ## The `selected_sbuffer` contract is over-fitted: the "descriptor array" holds FRUSTUM PLANES (2026-08-15)
 
 Dumping **all five** records of the outer array on decline, rather than only the one the contract

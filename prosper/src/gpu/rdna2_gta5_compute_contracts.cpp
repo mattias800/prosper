@@ -1,5 +1,6 @@
 #include "rdna2_gta5_compute_contracts.hpp"
 #include <mutex>
+#include <map>
 #include <set>
 #include <string>
 
@@ -804,6 +805,41 @@ bool discover_rdna2_gta5_selected_sbuffer(
         // The outer array's address changes every frame -- 0x203f2e9b38, 0x203e989b38, 0x20408c9b38
         // across successive dispatches -- so it is a per-frame ring allocation, which makes "stale
         // ring contents" a live possibility rather than a remote one.
+        // The SELECTOR distribution, from the same source records the domain proof walks. The
+        // contract reads record 4 because its proof concluded every selector is 4-or-OOB; printing
+        // what the selectors actually are is what distinguishes "the proof is right and the array is
+        // something else" from "the proof is wrong".
+        if (report_selected_sbuffer_reject(code, "selector-histogram")) {
+            const uint8_t* source_bytes = source ? complete_resource_bytes(*source, source->size)
+                                                 : nullptr;
+            if (source_bytes) {
+                std::map<uint32_t, uint32_t> histogram;
+                for (uint32_t record = 0; record < kSelectedSbufferSourceRecords; ++record) {
+                    uint32_t first = 0;
+                    std::memcpy(&first, source_bytes + record * kSelectedSbufferSourceStride,
+                                sizeof(first));
+                    ++histogram[first >> 3u];
+                }
+                std::string text;
+                uint32_t shown = 0;
+                for (const auto& entry : histogram) {
+                    if (shown++ >= 12u) { text += " ..."; break; }
+                    char one[64];
+                    std::snprintf(one, sizeof(one), " %u:%u", entry.first, entry.second);
+                    text += one;
+                }
+                std::fprintf(stderr,
+                             "[gta-selected-sbuffer]   selectors distinct=%zu (selector:count)%s\n",
+                             histogram.size(), text.c_str());
+                std::fprintf(stderr,
+                             "[gta-selected-sbuffer]   record-4 selector would be %u; outer has %u "
+                             "records of %u bytes\n",
+                             kGtaSelectedSbufferRecord4Soffset / kSelectedSbufferOuterStride,
+                             kSelectedSbufferOuterRecords, kSelectedSbufferOuterStride);
+            } else {
+                std::fprintf(stderr, "[gta-selected-sbuffer]   selectors unavailable (source unreadable)\n");
+            }
+        }
         if (report_selected_sbuffer_reject(code, "selected-vsharp-records")) {
             for (uint32_t record = 0; record < kSelectedSbufferOuterRecords; ++record) {
                 const uint32_t offset = record * kSelectedSbufferOuterStride + 8u;
