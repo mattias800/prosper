@@ -353,6 +353,29 @@ and the const-fold alike — is what the remaining rejects have in common.
 VCC_LO and that prosper's VCC recognisers do not cover these shapes; it is *not* established that
 covering them is enough to make either program compile, because neither has been tried.
 
+## `s_mulk_i32` folding: landed, and it did NOT move the reject (2026-08-15)
+
+The const-fold's SOPK case handles **only** `s_movk_i32`; every other SOPK forgets its destination
+*and* invalidates SCC. Its own comment notes that `s_movk/s_version/s_cmovk/s_mulk` do not write SCC
+— so `s_mulk_i32` was being charged both costs it does not owe, and the comment demands per-opcode
+evidence before widening. That evidence exists: `0x413ce6000` pc149 is `s_mulk_i32 s106, 120` where
+120 is the descriptor array's exact record stride, feeding the select at pc153 and the rejecting load
+at pc156.
+
+Folded it: multiply a known destination, forget an unknown one as before, and stop clobbering SCC.
+245/245 ctest green.
+
+**It did not change the reject.** `0x413ce6000` still fails with `mode=unresolved-operand pc=156`.
+
+**And the arm is VOID, not negative** — the same discipline applied to the multiwave A/B. Nothing in
+this run demonstrates that the fold's output actually changed for this program: the reject is
+produced downstream of several other steps, and no artefact was hashed before the outcome was read.
+Treat "s_mulk folding does not fix `0x413ce6000`" as untested, not as false. The way to test it is to
+show s106 is now *known* at pc153 — which needs a fold-state probe that does not exist.
+
+The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
+backing and it costs nothing — not because it was shown to help.
+
 ## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
 
 Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather

@@ -5278,6 +5278,37 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         set_value(in.dst.value, (uint32_t)(int32_t)in.simm16);
                     break;
                 }
+                // s_mulk_i32: `D.i = D.i * signext(SIMM16)`, and it does NOT write SCC -- the comment
+                // below already says so while the code invalidated SCC for it anyway. Two costs, both
+                // paid on GTA V: the product is discarded, and every later s_cselect that depended on
+                // a live SCC loses it.
+                //
+                // The per-opcode evidence this widening requires, since the note below rightly refuses
+                // to take sibling opcodes for free: 0x413ce6000 pc149 is `s_mulk_i32 s106, 120`, where
+                // 120 is the descriptor array's exact record stride. It feeds
+                // `s_buffer_load_dwordx4 s[8:11], s[4:7], s106` at pc153, which selects one V# from
+                // that array, which is the descriptor for `buffer_load_dwordx3` at pc156 -- the
+                // instruction the program is rejected on, with mode=unresolved-operand. Forgetting
+                // s106 here is what makes that descriptor unresolvable.
+                //
+                // Multiplies a KNOWN destination only. An unknown destination still forgets, exactly
+                // as before; the change is that it no longer takes SCC with it.
+                if (in.opcode == kSopkOpcodeMulkI32) {
+                    if (in.dst.kind == OperandKind::SGPR) {
+                        uint32_t current = 0;
+                        if (known(in.dst.value, current))
+                            set_value(in.dst.value,
+                                      static_cast<uint32_t>(current *
+                                                            static_cast<uint32_t>(
+                                                                static_cast<int32_t>(in.simm16))));
+                        else
+                            forget(in.dst.value);
+                    }
+                    // A product is not an add-carry chain; the tracked origins cannot survive it.
+                    null_count_carry_origin = 0;
+                    bvh_count_carry_origin = 0;
+                    break;
+                }
                 // s_cmpk_* / s_addk_i32 write SCC (only s_movk/s_version/s_cmovk/s_mulk don't); this
                 // interpreter doesn't model the rest of SOPK, so they conservatively invalidate the
                 // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
