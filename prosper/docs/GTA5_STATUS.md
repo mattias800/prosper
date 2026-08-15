@@ -1829,6 +1829,58 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Where the picture actually goes (2026-08-15) — and three metrics that lied about it
+
+`tools/gpu_timeline/rtt_pass_graph.py` (new) reassembles a frame's render-pass graph from a
+`PROSPER_RTTLOG=1` log: every `[rtt] sample tex` line belongs to a draw of the *next* `[rtt] pass`
+line, so a pass's inputs are the samples since the previous pass, and `SCANOUT` delimits frames.
+Neither a draw census nor a target census can find a lost picture, because both count *work* and the
+defect is in the *dataflow*.
+
+What it shows for GTA V's gameplay frame — the deferred lighting pass:
+
+```
+0x20431c0000  3840x2160  draws=19   rgb_nonblack=0
+   <- 0x207de60000  3840x2160 un8   x19          G-buffer, full
+   <- 0x207fe40000  3840x2160 un8   x19          G-buffer, full
+   <- 0x2083e00000  3840x2160 un8   x23          G-buffer, full
+   <- 0x208f340000   256x256  un16  x1    MISS -- guest bytes
+   <- 0x20954c0000   512x512  un16  x1    MISS -- guest bytes      six shadow maps,
+   <- 0x2093cc0000   512x512  un16  x1    MISS -- guest bytes      none resolved from
+   <- 0x2094ec0000   512x512  un16  x1    MISS -- guest bytes      a renderer-owned image
+   <- 0x20948c0000   512x512  un16  x1    MISS -- guest bytes
+   <- 0x20942c0000   512x512  un16  x1    MISS -- guest bytes
+```
+
+Those six addresses also top the DS-invalidation histogram (`20948c0000` x1010, `2094ec0000` x860,
+`2093cc0000` x410 in one run), so they are surfaces prosper retains and then invalidates on a guest
+DMA. `PROSPER_DS_GUEST_WRITE_INVALIDATE=0` does move that lever cleanly — `depth-invalid=0
+stencil-invalid=0 extent=0`, against 1089/858/1628 with it on — but the route diverged in that run and
+never reached the tutorial, so **it is not yet an A/B and is not claimed as one.**
+
+### Three metrics that each read as "the world is black" when it is not
+
+Recorded because all three were acted on in this session before being caught:
+
+1. **`rgb_nonblack` is computed from an RGBA8 conversion, so an HDR f16 target whose values are all
+   below 1/255 reports exactly ZERO while carrying a complete scene.** `0x20431c0000` reports
+   `rgb_nonblack=0` while the very next pass extracts **47.5% non-black** from it. Reading the metric
+   as "black" is a false negative across the entire lighting stage.
+2. **`[rtt] sample tex … -> miss` spoke only for the COLOUR cache.** A 4K depth buffer the depth
+   bridge had resolved correctly and a texture decoded from guest zeros printed the same word, so
+   counting a pass's missing inputs off this log over-counted them. It now prints `DS-DEPTH` /
+   `DS-STENCIL` for a bridged binding.
+3. **A pass whose readback was deferred has EMPTY CPU pixels, and both `rgb_nonblack` and the new
+   dump then report on nothing.** Measured: `0x207de60000` produced `src=0B` on **1,938 of 1,938**
+   passes in a default run. The same target reports `rgb_nonblack=8267460` (99.7%) in a run with
+   `PROSPER_RTTLOG=1` — because **the instrument's own readback is what materialises the pixels it
+   then measures.** So `PROSPER_RTTLOG` changes the subject, and any per-pass content number is a
+   statement about a run that was made differently from a default one.
+
+`PROSPER_DUMP_PASS=0xADDR[,…]` (new, with `PROSPER_DUMP_PASS_EVERY`) writes what a pass actually
+produced as an image, and reports `src=…B` plus `NO CPU PIXELS (readback deferred)` rather than
+writing nothing — which is how defect 3 was found at all.
+
 ## The stencil plane of a rendered DS surface was never bridged (2026-08-15, fixed)
 
 `fs=0x205b34be00` samples two planes of **one** depth/stencil surface, and prosper retained only one

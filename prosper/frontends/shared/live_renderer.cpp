@@ -3738,11 +3738,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                 } // malformed/incomplete RTT bytes => miss; decode guest backing below
                             }
+                            // Report HOW the binding resolved, not merely whether the COLOUR cache
+                            // had it. This line used to print "miss" for a resource the depth or
+                            // stencil bridge had already resolved, because `rtt_hit` speaks only for
+                            // g_rtt -- so a correctly-bridged 4K depth buffer and a texture decoded
+                            // from guest zeros were the same word. Reading a pass's inputs off this
+                            // log therefore over-counted missing inputs, which is the one thing the
+                            // log exists to answer.
                             if (rtt_log)
-                                fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
+                                fprintf(stderr,
+                                        "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s "
+                                        "(cache_size=%zu)\n",
                                         (unsigned long long)sampled_source_addr, tw, th,
                                         (unsigned)r.format,
-                                        rtt_hit ? "HIT" : "miss", g_rtt.size());
+                                        rtt_hit ? "HIT"
+                                            : has_ds_live
+                                                ? (sampled_ds.aspect == VK_IMAGE_ASPECT_STENCIL_BIT
+                                                       ? "DS-STENCIL" : "DS-DEPTH")
+                                                : "miss",
+                                        g_rtt.size());
                         }
                         // CUBE texture (#273 — DOLL's title reflection probes / skybox): decode six
                         // independent thin-2D faces into the stacked w x 6h image addressed by the
@@ -6389,6 +6403,54 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         backend_call_timing, color_target_call};
                     if (lightweight_rtt_timing) pending_rtt_timing.push_back(rtt_timing_record);
                     else if (timing_enabled && rtt_log) print_rtt_timing(rtt_timing_record);
+                    // PROSPER_DUMP_PASS=0xADDR[,0xADDR…] — write what a pass actually produced, as an
+                    // image, for the named targets. `rgb_nonblack` alone cannot answer "is the world
+                    // there": it is computed from an RGBA8 conversion, so an HDR f16 target whose
+                    // values are all below 1/255 reports EXACTLY ZERO while carrying a complete
+                    // scene. That is not hypothetical here — GTA V's 0x20431c0000 reports
+                    // rgb_nonblack=0 while the very next pass extracts 47.5% non-black from it, so
+                    // reading the metric as "black" is a false negative on the whole lighting stage.
+                    //
+                    // Overwrites one file per target so the last write is the latest frame, and
+                    // dumps every PROSPER_DUMP_PASS_EVERY-th occurrence (default 60) because a 4K
+                    // BMP is 24 MB and a routed boot renders each of these a few hundred times.
+                    {
+                        static const std::string dump_spec =
+                            PROSPER_ENV_VALUE("PROSPER_DUMP_PASS")
+                                ? PROSPER_ENV_VALUE("PROSPER_DUMP_PASS") : "";
+                        if (!dump_spec.empty() && base) {
+                            char needle[24];
+                            std::snprintf(needle, sizeof needle, "0x%llx",
+                                          (unsigned long long)base);
+                            if (dump_spec.find(needle) != std::string::npos) {
+                                static const int every = PROSPER_ENV_VALUE("PROSPER_DUMP_PASS_EVERY")
+                                    ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
+                                static std::map<uint64_t, int> counted;
+                                if (counted[base]++ % every == 0) {
+                                    const std::vector<uint8_t> shot = inspection_rgba8(
+                                        rendered_pixels, gw, gh, pass_format);
+                                    const char* dir = getenv("PROSPER_FRAME_DIR");
+                                    char path[512];
+                                    std::snprintf(path, sizeof path, "%s/pass_%llx_%ux%u.bmp",
+                                                  dir ? dir : ".", (unsigned long long)base,
+                                                  gw, gh);
+                                    // Report the source size, not just the intent. A pass whose
+                                    // readback was deferred has EMPTY cpu pixels, and both this dump
+                                    // and `rgb_nonblack` are then reporting on nothing — which reads
+                                    // as "the target is black" rather than "we never looked".
+                                    const size_t want = size_t(gw) * gh * 4;
+                                    const bool ok = shot.size() == want &&
+                                        prosper::test::dump_bmp(path, shot, gw, gh);
+                                    fprintf(stderr,
+                                            "[dump-pass] target=0x%llx %ux%u src=%zuB rgba=%zuB/%zuB"
+                                            " -> %s\n",
+                                            (unsigned long long)base, gw, gh,
+                                            rendered_pixels.size(), shot.size(), want,
+                                            ok ? path : "NO CPU PIXELS (readback deferred)");
+                                }
+                            }
+                        }
+                    }
                     if (rtt_log) {
                         const std::vector<uint8_t> inspected = inspection_rgba8(
                             rendered_pixels, gw, gh, pass_format);
