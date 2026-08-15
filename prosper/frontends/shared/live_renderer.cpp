@@ -3979,7 +3979,70 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             resource_rtt_hit = true;
                         }
                         bool cube_done = dcc_fast_clear_done && is_cube;
-                        if (is_cube && !rtt_hit && !dcc_fast_clear_done) {
+                        // CUBE DEPTH BRIDGE. A guest depth cube is ONE six-layer allocation whose
+                        // faces prosper retains as separate DS images (each keyed by its
+                        // DB_DEPTH_VIEW slice). The recompiler lowers a cube sample onto a single
+                        // vertically stacked w x 6h image, so the faces are gathered and restacked
+                        // here -- nothing can bind six images as one cube.
+                        //
+                        // Without this the sample fell through to a guest-byte decode of memory the
+                        // renderer never writes, i.e. zeros. For an omnidirectional shadow map zero
+                        // is one pole of the depth range, so every shadow test answered the same way
+                        // everywhere; a two-pole experiment showed the value can drive GTA V's
+                        // lighting output from its normal content to exactly zero, so this input is
+                        // load-bearing rather than cosmetic.
+                        //
+                        // The guest surface is Z16 (DB_Z_INFO.FORMAT=1) while prosper canonicalises
+                        // host attachments to D32_SFLOAT, so the conversion is NUMERIC -- clamp to
+                        // [0,1] and quantise -- not a bit reinterpretation, and it must not invert:
+                        // reversed-Z is already carried by the stored values and by the comparison
+                        // direction. CONFIDENCE: MED on the 8-bit staging below; the value is
+                        // faithful, the precision is not the guest's, and a shadow compare is
+                        // precision-sensitive. Recorded rather than hidden.
+                        bool cube_depth_bridged = false;
+                        if (is_cube && !rtt_hit && !fr.is_storage_image && r.depth == 6u &&
+                            prosper::test::is_retained_ds_plane(r.gpu_addr)) {
+                            std::array<std::vector<float>, 6> faces;
+                            uint32_t slices_found = 0;
+                            std::string cube_error;
+                            const bool complete = prosper::test::read_persistent_ds_cube_depth(
+                                r.gpu_addr, tw, th, faces, slices_found, cube_error);
+                            static std::mutex cube_mutex;
+                            static std::set<uint64_t> cube_reported;
+                            bool first = false;
+                            {
+                                std::lock_guard lock(cube_mutex);
+                                first = cube_reported.insert(r.gpu_addr).second;
+                            }
+                            if (first)
+                                fprintf(stderr,
+                                        "[cube-depth] addr=0x%llx %ux%ux6 faces=%u/6 %s%s\n",
+                                        (unsigned long long)r.gpu_addr, tw, th, slices_found,
+                                        complete ? "bridged" : "NOT bridged",
+                                        cube_error.empty() ? "" : (" (" + cube_error + ")").c_str());
+                            if (complete && texture_pixels.size() >=
+                                    static_cast<size_t>(tw) * th * 6u * 4u) {
+                                for (uint32_t face = 0; face < 6u; ++face) {
+                                    const std::vector<float>& src = faces[face];
+                                    uint8_t* dst = texture_pixels.data() +
+                                        static_cast<size_t>(face) * tw * th * 4u;
+                                    for (size_t i = 0; i < static_cast<size_t>(tw) * th &&
+                                                       i < src.size(); ++i) {
+                                        float d = src[i];
+                                        d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
+                                        const uint8_t q = static_cast<uint8_t>(d * 255.0f + 0.5f);
+                                        dst[i * 4 + 0] = q;
+                                        dst[i * 4 + 1] = q;
+                                        dst[i * 4 + 2] = q;
+                                        dst[i * 4 + 3] = 0xffu;
+                                    }
+                                }
+                                cube_depth_bridged = true;
+                                rtt_hit = true;          // do not overwrite with a guest-byte decode
+                                resource_rtt_hit = true;
+                            }
+                        }
+                        if (is_cube && !rtt_hit && !dcc_fast_clear_done && !cube_depth_bridged) {
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");

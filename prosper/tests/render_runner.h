@@ -3306,6 +3306,82 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     return true;
 }
 
+// Read one retained DS image's DEPTH plane back to the CPU as float32.
+//
+// The cube-shadow bridge needs it: a guest depth cube is one six-layer allocation whose faces are
+// separate retained images (each keyed by its DB_DEPTH_VIEW slice), while the sampled representation
+// the recompiler lowers a cube sample onto is a single vertically stacked w x 6h image. Nothing can
+// bind six images as one cube, so the faces are gathered on the CPU and restacked.
+//
+// Costly by construction -- a full-extent copy per face -- so callers must gate it on a cube sample
+// that actually resolves to retained faces, never run it speculatively.
+inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, uint32_t height,
+                                     std::vector<float>& out, std::string& error) {
+    error.clear();
+    out.clear();
+    if (!image.image || !image.layout_initialized || !image.depth_valid) {
+        error = "retained DS image has no readable depth plane";
+        return false;
+    }
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
+    const size_t depth_bytes = static_cast<size_t>(width) * height * 4;
+    VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (!persistent_ds_transfer_buffer(ctx, depth_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       buffer, memory, error))
+        return false;
+    const BackendSubmissionState transfer = submit_persistent_ds_transfer(
+        ctx, image.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, width, height,
+        /*depth=*/true, /*stencil=*/false, false, error);
+    if (transfer != BackendSubmissionState::Complete) {
+        if (transfer != BackendSubmissionState::Pending) {
+            vkDestroyBuffer(ctx.dev, buffer, nullptr);
+            vkFreeMemory(ctx.dev, memory, nullptr);
+        }
+        if (error.empty()) error = "retained DS depth transfer did not complete";
+        return false;
+    }
+    void* mapped = nullptr;
+    if (vkMapMemory(ctx.dev, memory, 0, depth_bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
+        vkDestroyBuffer(ctx.dev, buffer, nullptr);
+        vkFreeMemory(ctx.dev, memory, nullptr);
+        error = "cannot map retained DS depth readback";
+        return false;
+    }
+    out.resize(static_cast<size_t>(width) * height);
+    std::memcpy(out.data(), mapped, depth_bytes);
+    vkUnmapMemory(ctx.dev, memory);
+    vkDestroyBuffer(ctx.dev, buffer, nullptr);
+    vkFreeMemory(ctx.dev, memory, nullptr);
+    return true;
+}
+
+// All six faces of a depth cube whose faces are retained separately, or false when any is missing.
+// `slices_found` reports how many were present, so a partial cube is a stated fact rather than a
+// silent half-result.
+inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_t height,
+                                          std::array<std::vector<float>, 6>& faces,
+                                          uint32_t& slices_found, std::string& error) {
+    error.clear();
+    slices_found = 0;
+    for (uint32_t slice = 0; slice < 6u; ++slice) {
+        PersistentDsImage* found = nullptr;
+        for (auto& [key, image] : persistent_ds_cache()) {
+            if (key.slice != slice || key.w != width || key.h != height) continue;
+            if (key.dr != base && key.dw != base) continue;
+            if (!image.depth_valid || !image.layout_initialized || !image.image) continue;
+            found = &image;
+            break;
+        }
+        if (!found) continue;
+        if (!read_persistent_ds_depth(*found, width, height, faces[slice], error)) return false;
+        ++slices_found;
+    }
+    return slices_found == 6u;
+}
+
 inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
                                           std::string& error) {
     error.clear(); seeds.clear();
