@@ -211,6 +211,36 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
+## Causal A/B: forcing the producer off collapses the builder entirely (2026-08-15)
+
+`PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700,0x413ce6000`, lever verified in the log
+(`-> 2 program(s) will be declined`), 200 s route, against the baseline arm.
+
+| | baseline | producer forced off |
+| --- | --- | --- |
+| `0x413dc3400` table-changing dispatches | **40** | **1** |
+| `0x413dc3400` clean -> cyclic | 37 | **0** |
+| clean -> cyclic, all programs | 40 (37 from the builder) | 46 (all from `0x413d88400`) |
+
+**`0x413dc3400` essentially stops writing a tree.** So its output does depend on `0x413ce6000`
+having run — the dependency the resource alias predicted is real and now demonstrated, not inferred.
+
+**The confound, stated because it is not excluded.** A declined compute dispatch clears
+`producer_epoch_ok`, and the next `ParserStall` latches `indirect_dependencies_ok` false for the rest
+of the submit — the indirect latch this document opens with. Forcing `0x413ce6000` to decline
+therefore suppresses later indirect dispatches too, so this arm cannot separate
+
+  (a) `0x413dc3400` runs and reads a stale record array, from
+  (b) `0x413dc3400` is never dispatched at all.
+
+Both predict what was measured. Separating them needs a per-dispatch execute/decline record for both
+programs in the same run, correlated frame by frame — which is the measurement the retracted
+root-cause claim needed and never had.
+
+Also note the dumped post-images differ in *provenance* between the arms: in the forced-off arm the
+clean -> cyclic transitions come from `0x413d88400`, not the builder, so their `pairs=0` is not
+comparable to the baseline builder's `pairs≈819`. The comparable figure is the dispatch count.
+
 ## CORRECTION (2026-08-15): the "never executes" claim above is WRONG
 
 Watching the record array itself — `PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:2063` — refutes the
