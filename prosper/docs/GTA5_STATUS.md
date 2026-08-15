@@ -423,10 +423,22 @@ Result: **`frame-bundle written (25 submits)`, 512 MB**, loading as
 [gpureplay] bundle-submit=19374 operations=1/1 output_bytes=1048576
 ```
 
-**Four consecutive captured submits contain ZERO operations, and the fifth contains one.** At this
-point in the route the guest's submits carry almost no GPU work at all — which is consistent with
-the absent world, and is the first evidence about it that comes from the frame rather than from log
-statistics.
+**Four consecutive captured submits contain ZERO operations, the fifth one, the sixth three.**
+Reproduced on an independent capture (submits 23910–23915 against 19370–19374), and
+`operations=%zu/%zu` is `limit / total`, so the second figure is the submit's real operation count.
+
+**But this window is NOT representative, and reading it as "the guest submits nothing" would be
+wrong.** The tree watch elsewhere in this document reports the BVH builder at `dispatch=37` and the
+scratch reuse at `dispatch=54` **within a single submit** — so submits carrying 50+ operations
+demonstrably exist on this route. The capture simply landed on a quiet stretch: `MAX_SUBMITS` bounds
+it to the *first* 25 of a burst, and the window opens wherever the timed arm falls.
+
+**What it does establish** is that the capture path now works end to end and that submit-level
+operation counts are readable. **What it does not** is anything about where the world's draws are.
+
+**The next step is to aim the capture at a submit known to contain work** — the tree watch names
+them exactly (any submit at its `d37`) — rather than at a wall-clock moment. `PROSPER_CAPTURE_FRAMES`
+arms on time or frame ordinal; landing on a chosen submit needs the arm to be submit-indexed.
 
 **Read with care, `CONFIDENCE: MED`.** Three things are not established: whether `operations=0/0`
 means the guest submitted nothing or the capture recorded nothing; whether the 25-submit window

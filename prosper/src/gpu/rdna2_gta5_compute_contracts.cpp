@@ -1,5 +1,6 @@
 #include "rdna2_gta5_compute_contracts.hpp"
 #include <mutex>
+#include <tuple>
 #include <map>
 #include <set>
 #include <string>
@@ -901,6 +902,35 @@ bool discover_rdna2_gta5_selected_sbuffer(
     if (!outer) return false;
     outer->selected_sbuffer_soffset = kGtaSelectedSbufferRecord4Soffset;
     outer->selected_sbuffer_words = selected_words;
+    // The ACCEPT side, which nothing reported. Every diagnostic on this contract described a
+    // DECLINE, so the descriptor it publishes on the ~93% of dispatches it accepts was invisible --
+    // and that descriptor is what the shader then reads its node records through.
+    //
+    // This matters because the proof behind it is weaker than its name: it reads the pc70 source and
+    // the 600-byte outer table through complete_resource_bytes(), i.e. the currently CPU-visible
+    // mapping, with no command-order snapshot coupling either to the bytes the GPU consumes (#2542).
+    // So an accepted descriptor can still be from the wrong epoch, and a wrong descriptor here means
+    // wrong node records downstream -- which is the measured defect.
+    //
+    // Deduped on the published descriptor, so a stable frame prints once and a CHANGE is what shows.
+    if (std::getenv("PROSPER_GTA5_SBUFFER_ACCEPT")) {
+        static std::mutex mutex;
+        static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> reported;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            first = reported.emplace(selected.base, selected.size_bytes, selected.stride).second;
+        }
+        if (first)
+            std::fprintf(stderr,
+                         "[gta-selected-sbuffer] ACCEPT record=4@+%u -> base=0x%llx size=%u "
+                         "stride=%u fmt=%u comps=%u words=%08x:%08x:%08x:%08x\n",
+                         kGtaSelectedSbufferRecord4Soffset + 8u,
+                         static_cast<unsigned long long>(selected.base), selected.size_bytes,
+                         selected.stride, static_cast<unsigned>(selected.format),
+                         selected.num_components, selected_words[0], selected_words[1],
+                         selected_words[2], selected_words[3]);
+    }
     return rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, resources);
 }
 
