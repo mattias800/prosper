@@ -2736,9 +2736,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ((reflected_binding->image_dim == 1u && r.img_dim == 1u) ||
                              (reflected_binding->image_dim == 2u && r.img_dim == 2u &&
                               r.depth != 0u));
+                        // A storage-image contract failure does not skip one binding -- the backend
+                        // returns an EMPTY batch, dropping every draw submitted with it
+                        // (render_runner.h, `return out;` in the pre-Vulkan validation loop). So
+                        // "which sub-condition failed" is the difference between one unusable
+                        // resource and a whole frame's geometry going missing, and the existing line
+                        // reports only `materialized=0`, which is the conjunction.
                         if (portable_raw_uvec4_storage &&
-                            (!portable_storage_guest_texel || !portable_storage_shape))
+                            (!portable_storage_guest_texel || !portable_storage_shape)) {
+                            static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> reported;
+                            if (reported.emplace(fr.set, fr.binding,
+                                                 static_cast<uint32_t>(r.format)).second)
+                                std::fprintf(stderr,
+                                    "[render] storage-image contract: set=%u binding=%u "
+                                    "portable-uvec4 REJECTED guest-texel=%u shape=%u "
+                                    "(writable=%u compressed=%u arrayed=%u multisampled=%u "
+                                    "reflected-dim=%u guest-dim=%u depth=%u fmt=%u comps=%u)\n",
+                                    fr.set, fr.binding, portable_storage_guest_texel,
+                                    portable_storage_shape ? 1u : 0u,
+                                    writable_storage_image ? 1u : 0u,
+                                    r.compression_enabled ? 1u : 0u,
+                                    reflected_binding->image_arrayed ? 1u : 0u,
+                                    reflected_binding->image_multisampled ? 1u : 0u,
+                                    reflected_binding->image_dim, r.img_dim, r.depth,
+                                    static_cast<unsigned>(r.format), r.num_components);
                             fr.storage_image_contract_valid = false;
+                        }
                         if (fr.is_storage_image &&
                             reflected_binding->image_numeric_class ==
                                 prosper::gpu::SpirvImageNumericClass::Uint &&

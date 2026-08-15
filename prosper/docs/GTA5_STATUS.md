@@ -399,6 +399,54 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## What is NOT hiding the world — four eliminations, each with a verified lever (2026-08-15)
+
+Every one of these was measured on a routed run with the lever confirmed to have moved, so each is a
+**genuine negative rather than a void arm**. None of them restores the world.
+
+| candidate | lever, verified | outcome |
+| --- | --- | --- |
+| the compute hang / device loss | consumer skipped → **0 device losses**, 9,363 frames | world still absent |
+| truncated indirect-dispatch arguments | aperture recovery fires 24×, unreadable **24 → 0** | frame unchanged |
+| storage-image contract dropping a whole batch | per-draw drop reports **"kept 0 of 1 draws"** | the batch *is* one draw; identical either way |
+| `CB_COLOR_CONTROL.MODE=0` on 131,072 draws | — | known latching artefact (#1706), not per-draw truth |
+
+### The storage-image rejection, precisely
+
+The failing resource is named exactly, and **the DCC hypothesis for it was wrong**:
+
+```
+[render] storage-image contract: set=1 binding=46 portable-uvec4 REJECTED
+    guest-texel=4 shape=0
+    writable=1  compressed=0  arrayed=0  multisampled=0
+    reflected-dim=1 guest-dim=1 depth=1 fmt=4 comps=2
+```
+
+The only failing term is **`writable=1`** — `portable_storage_shape` requires
+`!writable_storage_image`. Compression, arraying, multisampling and the dimensions are all fine. So
+**writable portable-uvec4 storage images are unsupported in the graphics path**, and that is a real
+gap worth closing on the charter's own terms.
+
+But its blast radius is one draw, not a frame: `PROSPER_RENDER_DROP_UNPROVEN_DRAW=1` reports
+`kept 0 of 1 draws in this batch` every time. The conservative whole-batch abort in `render_runner.h`
+looked alarming and costs nothing extra here.
+
+### Still open, and unquantified
+
+Three 4K DCC-compressed **sampled** images remain unsupported (fmt 1/4/9). That is a separate
+resource from the storage image above — the storage image is not compressed. Whether the composite
+depends on those three has not been established.
+
+### The instrument that would answer this, and why it has not yet
+
+`PROSPER_GRAB_BUNDLE_AFTER_MS` on `prosper-app` is the documented fastest loop for "why does this
+frame look wrong". It was tried at 170 s with `PROSPER_CAPTURE_FRAMES=1` and again with 16, and both
+report **"the capture window contained no GPU submits"** while the same run shows 271 `[agc]`, 60
+`[compute]` and 43 `[render]` lines and reaches 191 s of route. So the capture window and the
+submits are not lining up, and **that mismatch is itself the next thing to understand** — without a
+bundle there is no draw-level view of the frame, and every conclusion above is from log statistics
+rather than from the frame's actual contents.
+
 ## The hang is NOT the only blocker — two more, measured (2026-08-15)
 
 Answering "is the compute hang the reason there is no world" directly, by looking at a frame with

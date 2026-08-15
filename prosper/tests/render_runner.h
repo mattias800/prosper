@@ -3333,7 +3333,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (mrt_outputs)
         for (auto& color : mrt_outputs->colors) color.clear();
     if (draws.empty()) return out;
-    for (const BackendDraw& draw : draws)
+    // PROSPER_RENDER_DROP_UNPROVEN_DRAW=1 — DIAGNOSTIC. Discard only the draw carrying an
+    // unproven resource instead of the whole batch.
+    //
+    // The default below returns an EMPTY batch: one resource failing its contract drops every draw
+    // submitted alongside it. That is deliberately conservative, and its blast radius has never been
+    // measured. On GTA V exactly one binding fails -- set=1 binding=46, a WRITABLE portable-uvec4
+    // storage image, with compression, arraying, multisampling and dimensions all fine -- and the
+    // question of whether that single unsupported resource is what removes the 3D world cannot be
+    // answered without separating "this resource is unusable" from "this frame renders nothing".
+    //
+    // Diagnostic, not a fix: dropping the draw still loses whatever it would have written, and the
+    // real work is supporting writable portable-uvec4 storage images. It exists to make the blast
+    // radius measurable.
+    const bool drop_only_unproven_draw =
+        getenv("PROSPER_RENDER_DROP_UNPROVEN_DRAW") != nullptr;
+    std::vector<const BackendDraw*> proven_draws;
+    proven_draws.reserve(draws.size());
+    for (const BackendDraw& draw : draws) {
+        bool draw_proven = true;
         for (const FrameResource& resource : draw.R)
             if (!backend_texture_plane_span_valid(resource) ||
                 !backend_storage_image_numeric_contract_valid(resource)) {
@@ -3349,8 +3367,26 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             static_cast<int>(backend_color_format(resource.texture_format)),
                             resource.storage_image_contract_valid ? 1u : 0u);
                 }
-                return out;
+                draw_proven = false;
+                break;
             }
+        if (draw_proven) proven_draws.push_back(&draw);
+        else if (!drop_only_unproven_draw) return out;
+    }
+    std::vector<BackendDraw> proven_storage;
+    if (drop_only_unproven_draw && proven_draws.size() != draws.size()) {
+        static uint32_t dropped_reports = 0;
+        if (dropped_reports++ < 16u)
+            std::fprintf(stderr,
+                         "[render] DROP_UNPROVEN_DRAW: kept %zu of %zu draws in this batch\n",
+                         proven_draws.size(), draws.size());
+        if (proven_draws.empty()) return out;
+        proven_storage.reserve(proven_draws.size());
+        for (const BackendDraw* draw : proven_draws) proven_storage.push_back(*draw);
+        // `draws` is a by-value span; rebinding it keeps every downstream use unchanged.
+        // proven_storage outlives that use because it is declared in this scope.
+        draws = std::span<const BackendDraw>(proven_storage);
+    }
     if (backend_has_unproven_submission()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
