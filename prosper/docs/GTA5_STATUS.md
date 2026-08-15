@@ -399,6 +399,34 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## SCC over-invalidation fixed — and it is NOT what gates the BVH descriptor (2026-08-15)
+
+`PROSPER_DYNTRACE_SCC=1` (added here) reports every transition of the fold's tracked SCC with the pc
+and words that caused it. On `0x205b654a00` it found **325 conservative SCC losses**, from three SOPK
+encodings — and **two of them do not write SCC at all**:
+
+| count | encoding | writes SCC? |
+| --- | --- | --- |
+| 188 | `s_setreg_b32` (0x13) | **no** — writes a hardware register |
+| 43 | `s_waitcnt_vscnt` (0x17, sdst=NULL) | **no** — a wait, register-transparent |
+| 94 | `s_addk_i32` (0x0f) | yes, on signed overflow |
+
+Fixed: `s_setreg_b32` and `s_waitcnt_vscnt` no longer touch SCC, and `s_addk_i32` keeps invalidating
+it while now folding its **value** when the destination is known.
+
+**Lever verified: conservative SCC invalidations in that program went 325 → 0.**
+
+**And the reject is unchanged.** `0x205b654a00` still fails with `mode=unresolved-operand pc=1180`.
+Because the lever demonstrably moved, this is a **genuine negative, not a void arm**: SCC
+over-invalidation is not what gates the BVH descriptor.
+
+So of the four registers in the descriptor `s[16:19]`, dword3 (`s19`) was already observed resolving
+to `0x81000000` on some dispatches. **The next measurement is `s16`/`s17`/`s18`** — the base and size
+words — one watch each.
+
+The change stays on its own merits: two encodings were being charged an SCC write they do not
+perform, which is a correctness defect in the fold independent of this title.
+
 ## The BVH descriptor resolves only when SCC does (2026-08-15)
 
 `PROSPER_DYNTRACE_SGPR=19` on `0x205b654a00`, now that the watch prints a real program identity:

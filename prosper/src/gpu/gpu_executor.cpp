@@ -2910,6 +2910,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // program-local and several of this title's shaders share a prologue, which makes that match
     // unreliable (#2412).
     uint32_t watch_w0 = 0, watch_w1 = 0; uint32_t watch_len = 0;
+
+    // PROSPER_DYNTRACE_SCC=1 — report every transition of the tracked SCC, with the pc and words that
+    // caused it. SCC is a single bit and it gates whole descriptors: GTA V's ray-tracing pass builds
+    // its BVH descriptor's dword3 with `s_addc_u32 s19, -1, 0`, whose operands are both inline
+    // constants, so the ONLY thing that can leave it unknown is an unknown SCC. Without this, "the
+    // descriptor did not resolve" gives no way to find which earlier instruction cost it.
+    //
+    // Deliberately mirrors the register watch, including printing the program identity rather than
+    // the sh= signature -- which is not unique (#2548).
+    const bool watch_scc = std::getenv("PROSPER_DYNTRACE_SCC") != nullptr;
+    int last_reported_scc = -2;
+    auto report_scc = [&](const char* why) {
+        if (!watch_scc || scc == last_reported_scc) return;
+        last_reported_scc = scc;
+        fprintf(stderr, "[sccwatch] program=0x%llx pc=%u scc=%s %s words=%08x:%08x len=%u\n",
+                (unsigned long long)(uintptr_t)code, watch_pc,
+                scc < 0 ? "UNKNOWN" : (scc ? "1" : "0"), why, watch_w0, watch_w1, watch_len);
+    };
     // Per-register record of the instruction that most recently made it UNKNOWN. Sized like the other
     // per-register fold state; `0xffffffff` means "never forgotten in this walk", which is a distinct
     // and useful answer from "forgotten by <instruction>" — a V# word that was never written at all
@@ -3661,6 +3679,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
                 if (in.opcode != kSop1OpcodeMovB32 && in.opcode != kSop1OpcodeMovB64) {
                     scc = -1;
+                    report_scc("invalidated");
                     null_count_carry_origin = 0;
                     bvh_count_carry_origin = 0;
                 }
@@ -3982,6 +4001,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x0B: scc = (a <= c); break;                            // s_cmp_le_u32
                     default: scc = -1; break;
                 } else scc = -1;
+                report_scc("alu");
                 break;
             }
             case Rdna2Format::SMEM: {
@@ -5325,7 +5345,51 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // interpreter doesn't model the rest of SOPK, so they conservatively invalidate the
                 // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
                 // confidently-wrong V# patch.
+                // Three SOPK encodings account for every conservative SCC loss measured on GTA V's
+                // ray-tracing pass (0x205b654a00, PROSPER_DYNTRACE_SCC), and TWO OF THEM DO NOT
+                // WRITE SCC AT ALL:
+                //
+                //   188x  s_setreg_b32     (0x13) -- writes a HARDWARE REGISTER, not SCC
+                //    43x  s_waitcnt_vscnt  (0x17, sdst=NULL) -- a wait; register-transparent
+                //    94x  s_addk_i32       (0x0f) -- genuinely writes SCC on overflow
+                //
+                // This matters because SCC gates whole descriptors here: the BVH descriptor's dword3
+                // is `s_addc_u32 s19, -1, 0`, whose operands are both inline constants, so an unknown
+                // SCC is the ONLY thing that can leave it unresolved -- and an unresolved dword3 is
+                // `mode=unresolved-operand` at the image_bvh_intersect_ray that consumes it.
+                //
+                // s_addk_i32 keeps invalidating SCC, because it really does write it. Its VALUE is
+                // now folded when the destination is known, for the same reason s_mulk_i32's is.
+                if (in.opcode == kSopkOpcodeSetregB32) {
+                    // Its encoded "dst" field is a hwreg id, not an SGPR, so nothing scalar is
+                    // written and nothing needs forgetting.
+                    break;
+                }
+                if (in.opcode == kSopkOpcodeWaitcntVscnt) {
+                    // The sibling case above already passes the sdst=NULL(125) form through. Any
+                    // other destination is unmodelled, so forget it -- but never SCC.
+                    if (in.dst.kind == OperandKind::SGPR && in.dst.value != 125)
+                        forget(in.dst.value);
+                    break;
+                }
+                if (in.opcode == kSopkOpcodeAddkI32) {
+                    if (in.dst.kind == OperandKind::SGPR) {
+                        uint32_t current = 0;
+                        if (known(in.dst.value, current))
+                            set_value(in.dst.value,
+                                      current + static_cast<uint32_t>(
+                                                    static_cast<int32_t>(in.simm16)));
+                        else
+                            forget(in.dst.value);
+                    }
+                    scc = -1;                    // s_addk_i32 writes SCC on signed overflow
+                    report_scc("sopk-addk");
+                    null_count_carry_origin = 0;
+                    bvh_count_carry_origin = 0;
+                    break;
+                }
                 scc = -1;
+                report_scc("sopk-conservative");
                 null_count_carry_origin = 0;
                 bvh_count_carry_origin = 0;
                 if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
