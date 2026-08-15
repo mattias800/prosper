@@ -97,6 +97,66 @@ one dispatch's pre/post pair there is exactly one writer, and its output is cycl
 - **A lane/wave/workgroup boundary effect.** Damage index mod 2/3/4/8/16 is flat.
 - **An unknown or out-of-bounds writer.** Every observed change reported `toucher=1`.
 
+## ROOT CAUSE: `0x413ce6000` never recompiles, and it is the producer of the tags (2026-08-15)
+
+The chain is complete and every link is measured.
+
+**The alias, from `PROSPER_COMPUTE_RESOURCE_MAP`:**
+
+```
+0x413dc3400  binding=4  fetch-pc=86   base=0x209cc76000 size=132032 stride=64   (READ)
+0x413ce6000  binding=13 fetch-pc=212  base=0x209cc76000 size=132032 stride=64   (STORE)
+0x413ce6000  binding=14 fetch-pc=214  base=0x209cc76000 size=132032 stride=64   (STORE)
+0x413ce6000  binding=17 fetch-pc=253  base=0x209cc76000 size=132032 stride=64   (STORE)
+```
+
+`132032 = 2063 x 64` — one 64-byte record per node, exactly the node count. `fetch-pc=86` is the
+load Codex identified as the source of the classified references: `pc86 loads v56/v57 from
+s24[compacted_node].dword[0:1]`, and `v36 = v56 & 7`, `v37 = v57 & 7` are the tags the six store
+predicates test. Eight more of `0x413dc3400`'s bindings (6, 7, 8, 9, 10, 11, 12, 15) are the same
+buffer.
+
+**So `0x413ce6000` writes the record array whose tags `0x413dc3400` reads — and `0x413ce6000` is
+declined on every single dispatch.**
+
+### The full causal chain
+
+1. `0x413ce6000` fails to recompile: `compute-struct-reject execz pc=76 scalar write pc=84 leaves
+   vcc-half s106 live at merge pc=139`. It is realized 40 times per route, at d36, and executes zero
+   times.
+2. Its output — the 2,063 x 64-byte node record array at `0x209cc76000` — is therefore never written.
+3. `0x413dc3400` at d37 reads its six classified references out of that array.
+4. The stale references fail the `tag == 2 || tag == 5` predicate, so the matching child stores never
+   fire — which is exactly the measured failure mode: **a store that does not execute, leaving the
+   slot holding a stale value**.
+5. 220–461 parents end up with one child instead of two → the parent array is cyclic.
+6. `0x413dc6700` at d39+ walks it with a loop that has no iteration bound and no cycle detector →
+   GPU hang → RADV device loss → live compute disabled process-wide → every later indirect draw
+   dropped → **no world**.
+
+**This is the charter's rule in its purest form: an unsupported program is a fatal gap, not an
+acceptable skip.** One declined compute program, six dispatches upstream, removes the world.
+
+It also explains why `0x413ce3400` gets its tree right. Codex's ISA read: it computes both child
+indices directly from the Morton range/split and stores both links unconditionally, with no tag
+predicate anywhere in its 391 instructions. It does not depend on `0x209cc76000`, so a missing
+producer cannot reach it.
+
+**Do not "fix" this by removing `0x413dc3400`'s predicate.** The guest declines to dereference
+non-materialised references on purpose; making the stores unconditional would turn unmaterialised
+references into indices and change guest semantics. The fix is upstream: make `0x413ce6000` compile.
+
+### Status of that fix
+
+`PROSPER_VCC_SCALAR_DATA_MERGE=1` (this branch) widens the execz VCC-half proof from "not read" to
+"not read as a lane mask" and clears the first reject; `0x413ce6000` then fails at a *second* path
+that logs nothing under any variable. Making that second reject legible is the immediate next step —
+it is one of the five programs in the `reason=unrecorded` set.
+
+Note on a red herring: `[compute] program 0x413ce6000 is a proven no-op (only proven no-backing
+resources)` does appear, but only for an instance with **zero** backed resources (dispatch 968). At
+d36, where it matters, it has **17** backed resources including the three stores above.
+
 ## THE SECOND TABLE IS BUILT PERFECTLY — by a different program (2026-08-15)
 
 `PROSPER_COMPUTE_TREE_WATCH=0x20f848a240:2063`, same route. The two addresses are **not** a

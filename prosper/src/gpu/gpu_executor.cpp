@@ -9933,6 +9933,64 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     // "nothing touches this buffer" -- which is the conclusion it would have
                     // supported, and it is false. Anchor a new watch to a line already proven to
                     // execute on the route being measured.
+                    // PROSPER_COMPUTE_RESOURCE_MAP=0xADDR[,0xADDR...]: print each named program's
+                    // realized resource table once, with binding, fetch pc, base and size. The
+                    // question it exists to answer is "do these two programs bind the same buffer",
+                    // which the address watch cannot express -- that one starts from an address and
+                    // finds programs, and here the address is precisely what is unknown.
+                    //
+                    // Deduped per (program, table shape) so a program dispatched forty times per
+                    // route prints once. Volume matters: the existing PROSPER_COMPUTELOG_RESOURCES
+                    // needs PROSPER_COMPUTELOG, which slows the subject enough that a routed run
+                    // stops reaching the phase being measured.
+                    if (const char* map = std::getenv("PROSPER_COMPUTE_RESOURCE_MAP")) {
+                        bool wanted_program = false;
+                        for (const char* cursor = map; cursor && *cursor;) {
+                            char* end = nullptr;
+                            const uint64_t one = std::strtoull(cursor, &end, 0);
+                            if (end == cursor) break;
+                            if (one == item.code_addr) { wanted_program = true; break; }
+                            cursor = (*end == ',') ? end + 1 : end;
+                            if (!*end) break;
+                        }
+                        if (wanted_program && item.resources) {
+                            uint64_t shape = item.resources->resources.size();
+                            for (const ShaderResource& r : item.resources->resources)
+                                shape = shape * 1000003ull + r.gpu_addr + r.size + r.binding;
+                            static std::mutex map_mutex;
+                            static std::set<std::pair<uint64_t, uint64_t>> map_logged;
+                            bool first = false;
+                            {
+                                std::lock_guard lock(map_mutex);
+                                first = map_logged.emplace(item.code_addr, shape).second;
+                            }
+                            if (first) {
+                                std::fprintf(stderr,
+                                             "[compute-resource-map] program=0x%llx submit=%llu "
+                                             "dispatch=%zu resources=%zu\n",
+                                             static_cast<unsigned long long>(item.code_addr),
+                                             static_cast<unsigned long long>(submit_no),
+                                             operation.index,
+                                             item.resources->resources.size());
+                                for (const ShaderResource& r : item.resources->resources) {
+                                    std::fprintf(stderr,
+                                                 "[compute-resource-map]   binding=%u fetch-pc=%u "
+                                                 "base=0x%llx size=%u stride=%u entries=%u\n",
+                                                 r.binding, r.fetch_pc,
+                                                 static_cast<unsigned long long>(r.gpu_addr),
+                                                 r.size, r.stride, r.table_index_count);
+                                    for (size_t e = 0; e < r.table_entries.size(); ++e)
+                                        std::fprintf(stderr,
+                                                     "[compute-resource-map]     entry=%zu "
+                                                     "base=0x%llx size=%u\n",
+                                                     e,
+                                                     static_cast<unsigned long long>(
+                                                         r.table_entries[e].gpu_addr),
+                                                     r.table_entries[e].size);
+                                }
+                            }
+                        }
+                    }
                     if (const char* watch = std::getenv("PROSPER_COMPUTE_ADDRESS_WATCH")) {
                         char* end = nullptr;
                         const uint64_t wanted = std::strtoull(watch, &end, 0);
