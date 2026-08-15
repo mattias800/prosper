@@ -515,6 +515,56 @@ Two things must be checked before treating this as a defect, and neither has bee
 Recorded as an observation with its caveats rather than a lead, so the next reader neither chases it
 blind nor loses it.
 
+## WHERE the draws go: a scene buffer with ~71,000 draws, and a composite that reaches the scanout (2026-08-15)
+
+`PROSPER_DRAW_CENSUS=1` now records each draw's `CB_COLOR0_BASE` (+ `_EXT`, + `CB_COLOR0_VIEW`),
+sampled 1 in 32 and ranked by busiest:
+
+```
+[draw-census] draws=131072 indirect=0 submit=14180
+[draw-census]   distinct colour targets (sampled): 94
+[draw-census]   color0=0x208e5a0000 view=0x0      draws=2228     -> ~71,000 draws
+[draw-census]   color0=0x20431c0000 view=0x0      draws=457      -> ~14,600
+[draw-census]   color0=0x20ec7c0000 view=0x4002   draws=156  \
+[draw-census]   color0=0x20ec7c0000 view=0x0      draws=98    |  a LAYERED target: five distinct
+[draw-census]   color0=0x20ec7c0000 view=0x2001   draws=77    |  CB_COLOR0_VIEW slices
+[draw-census]   color0=0x20ec7c0000 view=0x8004   draws=55    |
+[draw-census]   color0=0x20ec7c0000 view=0x6003   draws=42   /
+[draw-census]   color0=0x215ed10000 view=0x0      draws=89   \
+[draw-census]   color0=0x2160cf0000 view=0x0      draws=86    |  the SCANOUT buffers
+[draw-census]   color0=0x2162cd0000 view=0x0      draws=83   /
+```
+
+**Two facts settle where the investigation goes next:**
+
+1. **A single dominant scene target takes ~71,000 draws** (`0x208e5a0000`). The world's geometry is
+   being drawn, in quantity, into one surface.
+2. **The scanout buffers each receive ~2,800 draws.** Those addresses are the ones the frame grab
+   reported as `present_front_address()` (`0x215ed10000`, `0x2160cf0000`, `0x2162cd0000`), so the
+   **composite runs and targets the presented surface**.
+
+**So the scene is drawn and the composite reaches the screen — and the screen has no world.** The
+break is between them: whatever the composite samples does not carry `0x208e5a0000`'s contents.
+
+That is a much narrower question than any asked before, and it has a named suspect already in this
+document: when a sampled image is DCC-compressed and the uniform fast-clear decode fails,
+`live_renderer.cpp` falls through to reading compressed bytes as uncompressed. The three unsupported
+4K DCC surfaces are `0x2052ac0000`, `0x20e0380000` and `0x20df360000` — **none of which is
+`0x208e5a0000`**, so that specific mechanism is not yet connected to the scene buffer.
+
+**The measurement that closes it: for the composite draws (those whose colour target is a scanout
+address), which textures do they sample, and does each resolve to prosper's own rendered image (an
+`rtt_hit`) or fall back to reading guest memory?** Guest memory for a surface prosper rendered into
+is black — the scanout dump confirms guest-side scanout is uniformly black, as expected when prosper
+renders into its own Vulkan images and presents those.
+
+### A note on instrument cost, because it cost a run
+
+The first version of this census took a mutex and inserted into a map on **every** one of 131,072
+draws and printed twelve lines at each power of two. The routed run stalled at 1,024 draws and never
+reached gameplay. Sampling 1 in 32 and reporting from 4,096 upward fixed it. An instrument that
+changes the subject's behaviour measures the instrument.
+
 ## THE DRAWS ARE HAPPENING: 131,072 executed, 0 indirect, 0 undecoded packets (2026-08-15)
 
 The most basic number about a missing world had never been measured. `PROSPER_DRAW_CENSUS=1` (added

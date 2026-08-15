@@ -9993,12 +9993,70 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     const uint64_t n = seen.fetch_add(1) + 1;
                     if (st.draws[operation.index].indirect)
                         indirect_seen.fetch_add(1, std::memory_order_relaxed);
-                    if ((n & (n - 1)) == 0)
+                    // WHERE the draws go, not just how many. 131,072 draws execute while the world
+                    // is absent, so the question is which surfaces they write and whether the one
+                    // that reaches the screen is among them. A count alone cannot answer that.
+                    //
+                    // Keyed on the colour-0 base and its extent, reported at teardown so the
+                    // per-draw path stays a map insert.
+                    // SAMPLED, 1 in 32. The first version took a mutex and inserted into a map on
+                    // every one of 131,072 draws and reported twelve lines at each power of two; the
+                    // routed run stalled at 1,024 draws and never reached gameplay. An instrument
+                    // that changes the subject's behaviour measures the instrument.
+                    static std::mutex target_mutex;
+                    static std::map<std::tuple<uint64_t, uint32_t, uint32_t>, uint64_t> targets;
+                    if ((n & 31u) == 0u) {
+                        // Straight from the draw's own register snapshot, the same two registers
+                        // render_state.cpp uses (CB_COLOR0_BASE + its _EXT high bits). Avoids
+                        // building a RenderState per draw on a path that runs 131,072 times.
+                        namespace P = prosper::agc::Pm4;
+                        uint64_t base = 0;
+                        uint32_t view = 0;
+                        if (const GpuState* snap = st.draws[operation.index].state.get()) {
+                            const auto lo = snap->cx.find(P::CB_COLOR0_BASE);
+                            const auto hi = snap->cx.find(P::CB_COLOR0_BASE_EXT);
+                            const auto vw = snap->cx.find(P::CB_COLOR0_VIEW);
+                            if (lo != snap->cx.end())
+                                base = static_cast<uint64_t>(lo->second) << 8;
+                            if (hi != snap->cx.end())
+                                base |= static_cast<uint64_t>(hi->second & 0xffu) << 40;
+                            if (vw != snap->cx.end()) view = vw->second;
+                        }
+                        std::lock_guard lock(target_mutex);
+                        ++targets[{base, view, 0u}];
+                    }
+                    if ((n & (n - 1)) == 0 && n >= 4096u) {
                         std::fprintf(stderr,
                                      "[draw-census] draws=%llu indirect=%llu submit=%llu\n",
                                      (unsigned long long)n,
                                      (unsigned long long)indirect_seen.load(),
                                      (unsigned long long)submit_no);
+                        std::lock_guard lock(target_mutex);
+                        // Busiest first. The numerically-lowest twelve addresses said nothing: the
+                        // question is whether one target dominates (a scene buffer) or the draws are
+                        // spread over hundreds of small ones.
+                        std::vector<std::pair<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t>>>
+                            ranked;
+                        ranked.reserve(targets.size());
+                        for (const auto& e : targets) ranked.push_back({e.second, e.first});
+                        std::sort(ranked.begin(), ranked.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+                        std::fprintf(stderr, "[draw-census]   distinct colour targets (sampled): %zu\n",
+                                     targets.size());
+                        size_t shown = 0;
+                        for (const auto& r : ranked) {
+                            const std::pair<const std::tuple<uint64_t, uint32_t, uint32_t>, uint64_t>
+                                entry{r.second, r.first};
+                            if (shown++ >= 12) { std::fprintf(stderr,
+                                "[draw-census]   ... %zu further targets\n",
+                                targets.size() - 12); break; }
+                            std::fprintf(stderr,
+                                         "[draw-census]   color0=0x%llx view=0x%x draws=%llu\n",
+                                         (unsigned long long)std::get<0>(entry.first),
+                                         std::get<1>(entry.first),
+                                         (unsigned long long)entry.second);
+                        }
+                    }
                 }
                 if (!render) break;
                 if (st.draws[operation.index].indirect &&
