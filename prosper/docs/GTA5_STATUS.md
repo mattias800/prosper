@@ -399,6 +399,59 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## ROOT CAUSE, ATTRIBUTED: `0x413ce6000` writes the cyclic child graph (2026-08-15)
+
+Per-dispatch pre/post attribution on the node records at `0x209cc76000`, with the **child-graph cycle
+count** as the metric:
+
+```
+submit  order   writer         cycles pre -> post
+6765    4550    0x413ce6000       0 -> 324    ADDS 324
+7180    24812   0x413ce6000     324 -> 398    ADDS 74
+7595    26144   0x413ce6000     398 -> 388    removes 10
+8835    26556   0x413ce6000     388 -> 402    ADDS 14
+15271   16831   0x413ce6000     350 -> 436    ADDS 86
+16088   14048   0x413ce6000     436 -> 468    ADDS 32
+16088   14546   0x413cf9000     468 -> 469    ADDS 1
+```
+
+| program | dispatches that add cycles | total added |
+| --- | --- | --- |
+| **`0x413ce6000`** | 7 | **590** |
+| `0x413cf9000` | 12 | 54 |
+
+**`0x413ce6000` is the program that makes the child graph cyclic**, including the transition from a
+completely acyclic graph to 324 cycles in one dispatch. It also *removes* cycles on other dispatches
+(−10, −14, −20, −18), which is the signature of an incremental refit that is partly wrong rather than
+a rebuild that is wholly wrong.
+
+### The complete chain, every link measured
+
+1. **`0x413ce6000`** writes the 2,063 × 64-byte node records at `0x209cc76000`, and its output
+   contains a **cyclic child graph**.
+2. **`0x413dc3400`** builds parent links from those records **faithfully** — its lowering is proven
+   correct by eleven consecutive perfect submits, and its output tracks its input.
+3. The parent table is therefore cyclic.
+4. **`0x413dc6700`** walks it with a loop that has no iteration bound and no cycle detector.
+5. GPU hang → RADV device loss → live compute disabled process-wide → every later indirect draw
+   dropped → **no 3D world**.
+
+**And `0x413ce6000` is exactly the program whose descriptor at pc156 does not resolve**
+(`mode=unresolved-operand`, the `selected_sbuffer` contract declining because the buffer it reads
+holds frustum planes) and which is declined outright on some dispatches. A program that cannot
+resolve one of its descriptors, and is sometimes not run at all, is precisely a program that writes a
+partially-correct node array.
+
+**`CONFIDENCE: HIGH`** on the attribution — per-dispatch pre/post, one writer, one metric, and the
+0 → 324 transition is unambiguous. **`CONFIDENCE: MED`** that the unresolved descriptor is *why* its
+output is wrong; that link is plausible and untested, and the honest alternative is that some other
+part of its lowering is at fault.
+
+**This supersedes the earlier "missing producer" framing without contradicting its falsification.**
+Absence was correctly ruled out — 29 submits with `0x413ce6000` fully executing still went cyclic.
+The cause is its **output**, which the earlier experiments could not distinguish because none of them
+measured what it wrote.
+
 ## FOUND: the CYCLES ARE IN THE INPUT — the node records' own child graph (2026-08-15)
 
 Two results, and together they close the question.
