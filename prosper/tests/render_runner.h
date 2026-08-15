@@ -279,6 +279,13 @@ struct BackendColorTarget {
     // full-extent copy per slot per segment purely because `color_count > 2` forces a readback.
     std::array<bool, prosper::gpu::kColorTargetCount> readback_slots{
         true, true, true, true, true, true, true, true};
+    // Initial contents for slots 2..7, the per-slot twin of `seed_rgba`/`seed_rgba1`. A depth
+    // feedback split renders a logical pass in several physical passes; when the slots are not
+    // persistent (the caller passed no identities, e.g. every path that runs with live GPU targets
+    // disabled) the ONLY way a later segment sees an earlier one's pixels is to be seeded with them.
+    // Without it the final segment created fresh transient attachments and cleared away everything
+    // the earlier segments drew into MRT2+.
+    std::array<const uint8_t*, prosper::gpu::kColorTargetCount> seed_slots{};
 };
 
 // Optional complete-MRT readback contract. `color_count` is the active Vulkan attachment prefix
@@ -4113,9 +4120,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         ci.imageType = VK_IMAGE_TYPE_2D; ci.format = color_formats[slot];
         ci.extent = {W, H, 1}; ci.mipLevels = 1; ci.arrayLayers = 1;
         ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        const bool slot_seeded = color_target && color_target->seed_slots[slot];
         ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    (cached_extra[slot] ? (VK_IMAGE_USAGE_SAMPLED_BIT |
-                                          VK_IMAGE_USAGE_TRANSFER_DST_BIT) : 0u);
+                                          VK_IMAGE_USAGE_TRANSFER_DST_BIT) : 0u) |
+                   (slot_seeded ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
         vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
         if (!extra_images[slot]) {
             if (cached_extra[slot]) {
@@ -4150,7 +4159,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 extra_images[slot] = VK_NULL_HANDLE;
                 persistent_color_target_cache().erase(extra_keys[slot]);
                 cached_extra[slot] = nullptr;
-                ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                           (slot_seeded ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
                 vkCreateImage(dev, &ci, nullptr, &extra_images[slot]);
                 if (!extra_images[slot]) return out;
                 vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
@@ -4244,7 +4254,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (uint32_t slot = 2; slot < color_count; ++slot) {
         // LOAD a retained slot whose contents are valid, so a G-buffer built across several render
         // groups accumulates instead of each group clearing its predecessor's work.
-        const bool load_slot = load_extra[slot];
+        const bool load_slot = load_extra[slot] ||
+                               (color_target && color_target->seed_slots[slot]);
         att[slot].format = color_formats[slot];
         att[slot].samples = VK_SAMPLE_COUNT_1_BIT;
         att[slot].loadOp = load_slot ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -6602,6 +6613,56 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &s1);
     }
+    // Slots 2..7 seed the same way slot 1 does. Split segments rely on this whenever the slots are
+    // not persistent: it is the only channel by which a later physical pass inherits an earlier
+    // one's pixels.
+    std::array<VkBuffer, prosper::gpu::kColorTargetCount> extra_seedbufs{};
+    std::array<VkDeviceMemory, prosper::gpu::kColorTargetCount> extra_seedmems{};
+    for (uint32_t slot = 2; slot < color_count; ++slot) {
+        if (!color_target || !color_target->seed_slots[slot]) continue;
+        const VkDeviceSize slot_bytes = color_bytes[slot];
+        if (!slot_bytes) continue;
+        VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        sci.size = slot_bytes; sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        vkCreateBuffer(dev, &sci, nullptr, &extra_seedbufs[slot]);
+        if (!extra_seedbufs[slot]) continue;
+        VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, extra_seedbufs[slot], &sr);
+        VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        sai.allocationSize = sr.size;
+        sai.memoryTypeIndex = pick(sr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        extra_seedmems[slot] =
+            allocate_transient_render_memory(dev, sai.allocationSize, sai.memoryTypeIndex);
+        if (!extra_seedmems[slot]) { vkDestroyBuffer(dev, extra_seedbufs[slot], nullptr);
+                                     extra_seedbufs[slot] = VK_NULL_HANDLE; continue; }
+        vkBindBufferMemory(dev, extra_seedbufs[slot], extra_seedmems[slot], 0);
+        void* sp = nullptr; vkMapMemory(dev, extra_seedmems[slot], 0, slot_bytes, 0, &sp);
+        memcpy(sp, color_target->seed_slots[slot], static_cast<size_t>(slot_bytes));
+        vkUnmapMemory(dev, extra_seedmems[slot]);
+        VkImageMemoryBarrier s0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        s0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        s0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        s0.image = extra_images[slot];
+        s0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &s0);
+        VkBufferImageCopy sc{}; sc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        sc.imageExtent = {W, H, 1};
+        vkCmdCopyBufferToImage(cmd, extra_seedbufs[slot], extra_images[slot],
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &sc);
+        VkImageMemoryBarrier s1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        s1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        s1.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        s1.image = extra_images[slot];
+        s1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        s1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &s1);
+    }
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
@@ -7663,6 +7724,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
          shared_buffers = std::move(shared_buffers),
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
+         extra_seedbufs, extra_seedmems,
          rb, bmem, fb, rp, transient_color, view, img, imem, transient_color1, view1, img1,
          transient_extra,
          imem1, color_count, extra_views, extra_images, extra_memories,
@@ -7732,6 +7794,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (seedmem) release_transient_render_memory(dev, seedmem);
             if (seedbuf1) vkDestroyBuffer(dev, seedbuf1, nullptr);
             if (seedmem1) release_transient_render_memory(dev, seedmem1);
+            for (uint32_t slot = 2; slot < prosper::gpu::kColorTargetCount; ++slot) {
+                if (extra_seedbufs[slot]) vkDestroyBuffer(dev, extra_seedbufs[slot], nullptr);
+                if (extra_seedmems[slot])
+                    release_transient_render_memory(dev, extra_seedmems[slot]);
+            }
             if (rb) vkDestroyBuffer(dev, rb, nullptr);
             if (bmem) release_transient_render_memory(dev, bmem);
             vkDestroyFramebuffer(dev, fb, nullptr);
@@ -8037,21 +8104,34 @@ struct SplitSegmentContract {
     uint32_t color_count = 1;
     bool has_target = false;
 };
-inline SplitSegmentContract split_segment_contract(const BackendColorTarget* whole,
-                                                   const BackendMrtOutputs* whole_mrt,
-                                                   bool first, bool final) {
+inline SplitSegmentContract split_segment_contract(
+    const BackendColorTarget* whole, const BackendMrtOutputs* whole_mrt, bool first, bool final,
+    const std::array<const uint8_t*, prosper::gpu::kColorTargetCount>& carried_slots = {}) {
     SplitSegmentContract out;
     // The attachment shape never varies by segment. A pass is five-MRT for all of its segments or
     // none of them; splitting is a synchronisation boundary, not a change of render target.
     out.color_count = whole_mrt ? whole_mrt->color_count : 1u;
-    if (!whole) return out;
-    out.target = *whole;
+    // A caller that named no persistent identities still needs a target when higher slots have to
+    // be carried between segments: the seed and readback flags live on it, and they are the only
+    // channel by which a non-persistent MRT2+ survives a physical pass boundary. A synthesised
+    // target is behaviourally identical to no target -- every identity is zero, so `persistent_color`
+    // and its siblings stay false and no cached image is consulted -- except that it can carry.
+    const bool carries_slots = out.color_count > 2u;
+    if (!whole && !carries_slots) return out;
+    if (whole) out.target = *whole;
     out.has_target = true;
     if (!first) {
         // Every later segment LOADS everything, or it erases what its predecessors drew.
         out.target.load_existing = true;
         out.target.load_existing1 = true;
         out.target.load_existing_slots.fill(true);
+        // LOADing is only sufficient when the slot is PERSISTENT. Where it is not -- the caller
+        // named no identity, which is every path running with live GPU targets disabled -- the
+        // later segment gets a fresh transient image, and the previous segment's pixels reach it
+        // only by being seeded in.
+        for (uint32_t slot = 2; slot < prosper::gpu::kColorTargetCount; ++slot)
+            if (!out.target.persistent_id_slots[slot]) out.target.seed_slots[slot] =
+                carried_slots[slot];
     }
     if (!final) {
         // A non-final segment's pixels are discarded, so do not copy them out. Slots 2+ must say so
@@ -8095,6 +8175,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     BackendPipelineCacheStats aggregate_pipelines{};
     BackendRenderTimingStats aggregate_timing{};
     std::vector<uint8_t> carried_color0;
+    std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> carried_slots;
+    std::array<const uint8_t*, prosper::gpu::kColorTargetCount> carried_slot_ptrs{};
     std::vector<uint8_t> carried_color1;
     const uint8_t* next_seed0 = seed_rgba;
     const uint8_t* next_seed1 = seed_rgba1;
@@ -8207,13 +8289,20 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const size_t end = begin + relative_end;
         const bool final = end == all.size();
 
-        const SplitSegmentContract segment =
-            split_segment_contract(color_target, mrt_outputs, begin == 0, final);
+        SplitSegmentContract segment = split_segment_contract(
+            color_target, mrt_outputs, begin == 0, final, carried_slot_ptrs);
         const BackendColorTarget* segment_target_ptr =
             segment.has_target ? &segment.target : nullptr;
         std::vector<uint8_t> intermediate_color1;
         std::vector<uint8_t>* segment_out1 = out_rgba1
             ? (final ? out_rgba1 : &intermediate_color1) : nullptr;
+        // A non-final segment must READ BACK any higher slot it has to carry forward by seed --
+        // otherwise there is nothing to seed the next segment with. Only when the slot is not
+        // persistent: a persistent slot is carried by the retained image and needs no copy.
+        for (uint32_t slot = 2; slot < prosper::gpu::kColorTargetCount; ++slot)
+            if (segment.has_target && !segment.target.persistent_id_slots[slot] &&
+                slot < segment.color_count)
+                segment.target.readback_slots[slot] = true;
         // The shape travels with every segment; only the pixel destination differs.
         BackendMrtOutputs intermediate_mrt;
         intermediate_mrt.color_count = segment.color_count;
@@ -8247,6 +8336,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             next_seed1 = carried_color1.empty() ? nullptr : carried_color1.data();
         } else {
             next_seed1 = nullptr;
+        }
+        // Carry each non-persistent higher slot's pixels into the next segment. Without this the
+        // final segment created fresh transient attachments and cleared away everything earlier
+        // segments drew into MRT2+ -- silently, since the shape and the flags were already right.
+        for (uint32_t slot = 2; slot < prosper::gpu::kColorTargetCount; ++slot) {
+            if (final) break;
+            carried_slots[slot] = std::move(intermediate_mrt.colors[slot]);
+            carried_slot_ptrs[slot] =
+                carried_slots[slot].empty() ? nullptr : carried_slots[slot].data();
         }
         begin = end;
     }

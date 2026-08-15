@@ -95,7 +95,6 @@ int main() {
     static_assert(mrt_extent_conflicts(1024, 32, 1920, 1080), "measured disagreement still truncates");
     static_assert(!mrt_extent_known(0, 0), "0x0 is the not-measured sentinel");
 
-    if (failures == 0) std::printf("mrt_extent: OK\n");
         // #2550 review: the sparse-MRT gate. Two live-renderer decisions key on this -- whether the
     // backend receives a BackendColorTarget at all, and whether colour pixels are asked for -- and
     // both were once "is colour-0 bound". A pass with MRT0 unbound and MRT2 bound is reachable by
@@ -142,5 +141,10 @@ int main() {
         CHECK(!prosper::frontend::mrt_target_feedback(bases, nullptr, 8, 0x2050000000ull));
     }
 
+    // Printed LAST, after every check above has run. It sat before the checks added in the
+    // #2550 review rounds, so a new failure exited non-zero while still reporting OK --
+    // the third instance in this branch of a success signal placed ahead of the work it
+    // claims to describe.
+    if (failures == 0) std::printf("mrt_extent: OK\n");
     return failures == 0 ? 0 : 1;
 }

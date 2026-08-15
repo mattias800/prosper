@@ -1829,6 +1829,50 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Fourth review round on #2550, all four fixed (2026-08-15)
+
+**1 (blocker) — a depth-feedback split still discarded MRT2–7 when persistence was unavailable.**
+Carrying the SHAPE through every segment was necessary and not sufficient. When the caller names no
+persistent identities — every path running with live GPU targets disabled: captures, per-target
+diagnostics, replay export, the recovery switch — the later segment gets a fresh transient
+attachment, and LOADing an image that was just created loads nothing. The earlier segment's pixels
+reach it only by being read back and **seeded** in, which is exactly what slots 0 and 1 already do
+through `seed_rgba`/`seed_rgba1`.
+
+Added `seed_slots[]`, the per-slot twin, with the upload path mirroring slot 1's. The splitter reads
+back any non-persistent higher slot it must carry and hands the pixels to the next segment.
+`split_segment_contract()` synthesises a carrier target when the caller gave none, since the seed
+flags have nowhere else to live — behaviourally identical to no target (every identity is zero) apart
+from the carry.
+
+**The regression is a real Vulkan one, and it reproduced the defect before the fix.** Segment 1 writes
+depth and RED to MRT2; the consumer samples that depth, which forces the physical split; the final
+segment never touches MRT2; `color_target` is null. Before the carry, the final MRT2 read
+`(0,0,0)` — after it, `(255,0,0)`. The test also asserts `depth_feedback_split_index() == 1`, so it
+cannot pass by failing to split.
+
+**2 (high) — same-pass feedback materialization kept MRT0-only gates.** The direct-path precheck and
+the uniform fast path still compared against `draw.color0_base`. For an MRT2+ collision the precheck
+said "direct serves", which suppressed the lazy CPU materialisation, and the corrected gate then
+refused the direct image — leaving the resource to fall through to guest bytes with no snapshot to
+use. All three sites (including the diagnostic classification) now use the all-slot rule.
+
+**3 (medium) — the feedback helper was a second, looser copy of "active".** It fell back to the named
+slot-0/1 mask whenever the array mask read zero and never required a defined format, where pass
+grouping falls back only when the array representation is ABSENT and requires base + format + mask.
+Extracted as `frontends/shared/mrt_binding.hpp`, used by both, and tested from a real `DrawItem`.
+
+**4 (low) — `test_mrt_extent` printed `OK` before the new checks ran.** Third instance in this branch
+of a success signal placed ahead of the work it describes.
+
+### Four rounds, one recurring mistake
+
+Rounds two, three and four each contained at least one finding of the form *a check that cannot
+fail*, and three of those were mine in the same shape: **new assertions appended at the end of a
+file, landing after the success print or the fail gate.** The cause is mechanical — inserting before
+the final `return` — and the fix is mechanical too: put new checks with the checks, and read what is
+between them and the exit.
+
 ## Third review round on #2550, all four fixed (2026-08-15)
 
 Every one a legacy "only MRT0/1 exist" seam that the widening newly reached.

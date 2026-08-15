@@ -5,7 +5,8 @@
 #include "rtt_authority.hpp"
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
-#include "mrt_extent.hpp"               // which MRT slot may join a pass (measured extents only)
+#include "mrt_extent.hpp"
+#include "mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
 #include "readback_policy.hpp"
 #include "capture_renderer_policy.hpp"
 #include "write_watch_policy.hpp"
@@ -171,22 +172,14 @@ void queue_guest_gpu_write(uint64_t addr, uint64_t size) {
 //
 // "Active" matches the pass-grouping definition: a bound base whose write mask is non-zero. Slots 0
 // and 1 keep their named-field fallbacks, since a draw may carry either form.
+// The backend's notion of a defined colour format, supplied to the shared policy so that header
+// stays backend-free. One mapping, used by grouping and feedback alike.
+bool mrt_format_defined(uint32_t raw) {
+    return prosper::test::backend_color_format(static_cast<VkFormat>(raw)) != VK_FORMAT_UNDEFINED;
+}
+
 bool draw_binds_color_target(const prosper::gpu::DrawItem& draw, uint64_t addr) {
-    uint64_t bases[prosper::gpu::kColorTargetCount]{};
-    bool active[prosper::gpu::kColorTargetCount]{};
-    for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
-        const auto& target = draw.ps.color_targets[slot];
-        uint32_t write_mask = target.write_mask;
-        if (slot == 0 && !write_mask) write_mask = draw.ps.color_write_mask;
-        if (slot == 1 && !write_mask) write_mask = draw.ps.color1_write_mask;
-        uint64_t base = draw.color_targets[slot].base;
-        if (!base && slot == 0) base = draw.color0_base;
-        if (!base && slot == 1) base = draw.color1_base;
-        bases[slot] = base;
-        active[slot] = write_mask != 0u;
-    }
-    return prosper::frontend::mrt_target_feedback(
-        bases, active, prosper::gpu::kColorTargetCount, addr);
+    return prosper::frontend::mrt_draw_binds_target(draw, addr, mrt_format_defined);
 }
 
 void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
@@ -2475,9 +2468,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 prosper::frontend::rtt_sampled_extent_compatible(
                                     tw, th, surface.w, surface.h, render_scale,
                                     normalized_sampling);
+                            // Must use the SAME all-slot rule as the gate it feeds. On colour-0
+                            // alone an MRT2+ feedback collision set direct_serves=true, which
+                            // suppressed the lazy CPU materialisation; the corrected gate below then
+                            // refused the direct image because the collision is real, and the
+                            // resource fell through to stale guest bytes with no snapshot to use.
                             const bool direct_serves = !fr.is_storage_image && r.img_dim == 1u &&
                                 sampled_extent_compatible &&
-                                sampled_source_addr != draw.color0_base &&
+                                !draw_binds_color_target(draw, sampled_source_addr) &&
                                 prosper::test::find_persistent_color_target(
                                     sampled_source_addr, surface.w, surface.h,
                                     surface.format) != nullptr;
@@ -2569,7 +2567,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             live_rtt->second.h &&
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
-                                normalized_sampling) && sampled_source_addr != draw.color0_base;
+                                normalized_sampling) &&
+                            !draw_binds_color_target(draw, sampled_source_addr);
                         const bool has_live_rtt =
                             has_cpu_live_rtt || has_gpu_live_rtt || has_uniform_live_rtt;
                         // A dim-5 base-slice view may need the CPU injection path rather than a direct
@@ -3540,7 +3539,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 else if (!live_rtt->second.gpu_valid) rtt_notvalid++;
                                 else if (live_rtt->second.w != tw || live_rtt->second.h != th)
                                     rtt_dimmismatch++;
-                                else if (sampled_source_addr == draw.color0_base) rtt_self++;
+                                else if (draw_binds_color_target(draw, sampled_source_addr))
+                                    rtt_self++;
                                 else if (prosper::test::find_persistent_color_target(
                                              sampled_source_addr, tw, th,
                                              live_rtt->second.format) == nullptr)
@@ -5665,41 +5665,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // the backbuffer, incremental HUD updates) composites OVER the earlier content instead
                 // of starting from the diagnostic clear. Real RT memory persists exactly this way.
                 static const bool seed_rtt = getenv("PROSPER_RTT_NOSEED") == nullptr;
+                // Pass grouping and same-pass feedback detection must not disagree about what an
+                // active binding is, so both go through frontends/shared/mrt_binding.hpp. These
+                // were duplicated lambdas; a second, looser copy in the feedback path classified
+                // stale named state as a live binding (#2550 review).
                 auto color_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-                    auto binding = draw.color_targets[slot];
-                    // DrawItem predates the complete array. Preserve direct callers and capture
-                    // versions through v33, whose first two attachments live in the named fields.
-                    if (!binding.base && !binding.width && !binding.height && slot == 0)
-                        binding = prosper::gpu::DrawItem::ColorTargetBinding{
-                            draw.color0_base, draw.color0_width, draw.color0_height};
-                    else if (!binding.base && !binding.width && !binding.height && slot == 1)
-                        binding = prosper::gpu::DrawItem::ColorTargetBinding{
-                            draw.color1_base, draw.color1_width, draw.color1_height};
-                    return binding;
+                    return prosper::frontend::mrt_color_binding(draw, slot);
                 };
                 auto active_format = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-                    uint32_t raw = draw.ps.color_targets[slot].format;
-                    if (slot == 0 && !raw) raw = draw.ps.color0_format;
-                    if (slot == 1 && !raw) raw = draw.ps.color1_format;
                     return prosper::test::backend_color_format(static_cast<VkFormat>(
-                        raw));
+                        prosper::frontend::mrt_raw_format(draw, slot)));
                 };
-                auto active_color = [&](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-                    const auto binding = color_binding(draw, slot);
-                    const auto& target = draw.ps.color_targets[slot];
-                    uint32_t write_mask = target.write_mask;
-                    if (slot == 0 && !target.format && !draw.color_targets[slot].base)
-                        write_mask = draw.ps.color_write_mask;
-                    else if (slot == 1 && !target.format && !draw.color_targets[slot].base)
-                        write_mask = draw.ps.color1_write_mask;
-                    return write_mask && active_format(draw, slot) != VK_FORMAT_UNDEFINED &&
-                           binding.base ? binding.base : uint64_t{0};
+                auto active_color = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
+                    return prosper::frontend::mrt_active_color(draw, slot, mrt_format_defined);
                 };
-                auto active_color_count = [&](const prosper::gpu::DrawItem& draw) {
-                    uint32_t count = 1;
-                    for (uint32_t slot = 1; slot < prosper::gpu::kColorTargetCount; ++slot)
-                        if (active_color(draw, slot)) count = slot + 1;
-                    return count;
+                auto active_color_count = [](const prosper::gpu::DrawItem& draw) {
+                    return prosper::frontend::mrt_active_color_count(draw, mrt_format_defined);
                 };
                 size_t pass_i = 0;
                 prosper::test::BackendSubmissionBatch backend_submission;

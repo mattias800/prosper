@@ -466,6 +466,66 @@ int main() {
         std::vector<uint8_t> via_bridge = prosper::test::render_draws_rgba({consumer}, W, H);
         CHECK(via_bridge.size() == (size_t)W * H * 4, "bridged consumer rendered");
 
+        // #2550 review round 4: a depth-feedback SPLIT must not lose MRT2's pixels when the slot
+        // is not persistent.
+        //
+        // Segment 1 writes depth and RED to MRT2. The consumer above samples that same depth, which
+        // is a write->sample transition, so depth_feedback_split_index() forces a physical pass
+        // boundary between them. `color_target` is null here -- the state every path with live GPU
+        // targets disabled runs in -- so MRT2 has no persistent identity and the second segment gets
+        // a fresh transient attachment. The earlier segment's pixels reach it only by being read
+        // back and seeded in.
+        //
+        // Before that carry existed, the final MRT2 came back cleared: the shape and the load flags
+        // were already correct, so nothing else in the suite could see it.
+        {
+            const uint32_t mrt0_and_mrt2[] = {
+                0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,   // v0..3 = GREEN
+                0xF800100Fu, 0x03020100u,                             // exp mrt0  (vm)
+                0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,   // v4..7 = RED
+                0xF800182Fu, 0x07060504u,                             // exp mrt2  (vm, done)
+                0xBF810000u,
+            };
+            std::vector<uint32_t> split_fs =
+                recompile_fragment(mrt0_and_mrt2, std::size(mrt0_and_mrt2));
+            CHECK(!split_fs.empty(), "#2550: MRT0+MRT2 depth-writing producer recompiles");
+            if (!split_fs.empty()) {
+                // MRT2 needs its OWN write mask and format: `producer` sets only the named slot-0
+                // mask, and a zero per-slot mask masks the shader's MRT2 export straight out. The
+                // first version of this fixture missed that and read black for the right reason at
+                // the wrong layer.
+                ResolvedPipelineState split_producer = producer;
+                split_producer.color_targets[2].write_mask = 0xFu;
+                split_producer.color_targets[2].format =
+                    static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+                prosper::test::BackendDraw writer;
+                writer.vs = vert_z; writer.fs = split_fs; writer.ps = &split_producer;
+                writer.vcount = 3;
+                prosper::test::BackendMrtOutputs split_out;
+                split_out.color_count = 3;
+                // Deliberately NO BackendColorTarget: this is the non-persistent path.
+                std::vector<uint8_t> split_c0 = prosper::test::render_draws_rgba(
+                    {writer, consumer}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true,
+                    /*color_target=*/nullptr, nullptr, nullptr, nullptr, nullptr, true,
+                    &split_out);
+
+                // The split must actually have happened, or this proves nothing about carrying.
+                const std::vector<prosper::test::BackendDraw> split_draws{writer, consumer};
+                CHECK(prosper::test::depth_feedback_split_index(split_draws, W, H) == 1u,
+                      "#2550: the depth write->sample transition forces a physical pass split");
+                CHECK(split_c0.size() == (size_t)W * H * 4 &&
+                          split_out.colors[2].size() == (size_t)W * H * 4,
+                      "#2550: a split pass still reads back MRT2 at full extent");
+                if (split_out.colors[2].size() == (size_t)W * H * 4) {
+                    const uint8_t* m2 =
+                        &split_out.colors[2][(((size_t)H / 2) * W + W / 2) * 4];
+                    std::printf("  split MRT2 center=(%u,%u,%u)\n", m2[0], m2[1], m2[2]);
+                    CHECK(m2[0] > 0xC0 && m2[2] < 0x40,
+                          "#2550: segment 1's RED survives the split into the final MRT2");
+                }
+            }
+        }
+
         std::vector<uint8_t> zeros((size_t)W * H * 4, 0);
         prosper::test::FrameResource unbridged = bridged;
         unbridged.persistent_depth_target_id = 0;
