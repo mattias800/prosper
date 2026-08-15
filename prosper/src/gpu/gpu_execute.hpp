@@ -582,6 +582,43 @@ struct ComputeAddressWatchHit {
 // unconditionally both fabricates matches against the descriptor table and double-reports an entry
 // whenever the parent and entry 0 happen to share an address. Branch, exactly as the graph does:
 // `table_index_count != 0` means the realized entries are the backing ranges and the parent is not.
+// Overlap of two ranges, ordered so it cannot wrap near UINT64_MAX.
+inline bool compute_address_ranges_overlap(uint64_t a_base, uint64_t a_size,
+                                           uint64_t b_base, uint64_t b_size) {
+    if (!a_size || !b_size) return false;
+    if (a_base >= b_base) return (a_base - b_base) < b_size;
+    return (b_base - a_base) < a_size;
+}
+
+// Windowed variant. The single-address form answers "does this program bind the exact byte", which
+// is the wrong question whenever the caller is watching a RANGE: a program binding
+// [window_base + 128, +160) touches the window and does not contain its first byte, so the
+// address form reports it as a non-toucher.
+//
+// That is not hypothetical. It produced a false "this program writes bytes it does not bind" on GTA
+// V -- reported as an out-of-bounds-write lead before the resource map showed the binding sitting
+// 128 bytes inside the window. An instrument whose two halves ask different questions manufactures
+// exactly the finding it was built to detect.
+inline std::vector<ComputeAddressWatchHit> compute_address_window_hits(
+        const ShaderResourceTable& table, uint64_t base, uint64_t bytes) {
+    std::vector<ComputeAddressWatchHit> hits;
+    for (const ShaderResource& r : table.resources) {
+        if (r.table_index_count) {
+            for (size_t e = 0; e < r.table_entries.size(); ++e) {
+                const ShaderBufferTableEntry& entry = r.table_entries[e];
+                if (!compute_address_ranges_overlap(entry.gpu_addr, entry.size, base, bytes))
+                    continue;
+                hits.push_back({r.binding, r.fetch_pc, static_cast<uint32_t>(e), entry.gpu_addr,
+                                entry.size, true});
+            }
+            continue;
+        }
+        if (compute_address_ranges_overlap(r.gpu_addr, r.size, base, bytes))
+            hits.push_back({r.binding, r.fetch_pc, 0xFFFFFFFFu, r.gpu_addr, r.size, false});
+    }
+    return hits;
+}
+
 inline std::vector<ComputeAddressWatchHit> compute_address_watch_hits(
         const ShaderResourceTable& table, uint64_t wanted) {
     std::vector<ComputeAddressWatchHit> hits;
@@ -1602,6 +1639,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // EXP.EN is the final per-component gate after CB_TARGET_MASK and CB_SHADER_MASK. Vulkan exposes
     // the same preservation semantics through colorWriteMask: disabled attachment components retain
     // their old values even though the fragment output itself is a full vec4.
+    // The fragment shell's output capacity and the render state's colour-target count are the same
+    // quantity seen from two sides; if they ever diverge the smaller one silently wins here, as a
+    // `&= 0` on every slot above it.
+    static_assert(kFragmentColorOutputs == kColorTargetCount,
+                  "fragment colour outputs must cover every render-state colour target");
     const uint32_t exp_mask = fragment_color_export_mask(
         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.ps_addr)), max_shader_dwords);
     for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot)

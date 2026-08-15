@@ -827,9 +827,38 @@ int main() {
     });
     CHECK(count_occurrences(
               legacy_skip_capture.output,
-              "[compute] skip unsupported program 0x246813570000bb55\n") == 1 &&
+              "[compute] skip unsupported program 0x246813570000bb55 reason=unrecorded\n") == 1 &&
               legacy_skip_capture.output.find("role=consequent") == std::string::npos,
-          "non-debug live skips preserve the legacy once-per-address diagnostic");
+          "non-debug live skips stay once-per-address and say so when no reason was recorded");
+
+    // The point of the reason field: a program whose reject WAS recorded must name it on the
+    // non-debug line. Without this arm the change is indistinguishable from appending a constant --
+    // `reason=unrecorded` alone is satisfied by a version that never looks the reason up.
+    const uint64_t reasoned_program = 0x246813570000cc55ull;
+    const RecompileDiagnosticContext reasoned_diagnostic{
+        RecompileDiagnosticStage::Compute, reasoned_program};
+    (void)capture_stderr([&] {
+        record_recompile_reject_reason_for_test(reasoned_diagnostic, "compute-struct-reject",
+                                          "route-decline", "unclaimed execnz pc=428");
+    });
+    const CapturedStderr reasoned_skip_capture = capture_stderr([&] {
+        (void)report_compute_recompile_skip_once(reasoned_diagnostic);
+    });
+    CHECK(count_occurrences(
+              reasoned_skip_capture.output,
+              "[compute] skip unsupported program 0x246813570000cc55 "
+              "reason=compute-struct-reject unclaimed execnz pc=428\n") == 1,
+          "a recorded reject reason reaches the non-debug skip line");
+
+    // And a "consequent" line must NOT overwrite it. A consequent only restates that an empty result
+    // was returned; if it could win, the diagnostic would replace the answer with the question.
+    (void)capture_stderr([&] {
+        record_recompile_reject_reason_for_test(reasoned_diagnostic, "compute-recompile-reject",
+                                          "consequent", "reason=empty-result dispatch-skipped");
+    });
+    CHECK(last_terminal_reject_reason(reasoned_program) ==
+              "compute-struct-reject unclaimed execnz pc=428",
+          "a consequent line does not overwrite the recorded cause");
 
     // The unit-level reporter checks above deliberately keep cache-hit and legacy behavior focused,
     // but they cannot guard the executor's integration site: a live shader-recompile failure must

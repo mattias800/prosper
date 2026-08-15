@@ -42,10 +42,44 @@ const char* recompile_diagnostic_stage_name(RecompileDiagnosticStage stage) {
 // Recompiles can run concurrently. Build the complete diagnostic on the stack and submit it through
 // one stdio call so one program's identity cannot be spliced onto another program's reject payload.
 // The context is an explicit per-call value; no global or thread-local attribution state is involved.
+// Last TERMINAL reject reason per program, recorded whether or not PROSPER_DBG is set.
+//
+// Every reject reason in this file sits behind PROSPER_DBG, and PROSPER_DBG is unusable on a routed
+// run: it produces a log large enough to desync a timing-dependent pad script, so the route never
+// reaches the phase whose rejects you wanted to read. The consequence is that
+// `[compute] skip unsupported program 0x...` has printed a bare address for the whole life of the
+// diagnostic, and the charter's rule that every skip is the next thing to implement cannot be
+// followed from it.
+//
+// Recording only the terminal role keeps this to one short string per rejected program (thirteen on
+// a 200 s GTA V route), so the map is bounded by the number of DISTINCT rejected programs rather
+// than by the number of dispatches.
+std::mutex& terminal_reject_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<uint64_t, std::string>& terminal_reject_reasons() {
+    static std::map<uint64_t, std::string> reasons;
+    return reasons;
+}
+
+void record_terminal_reject_reason(uint64_t program_address, const char* tag,
+                                   const char* payload) {
+    if (!program_address) return;
+    // A cap, because a pathological guest could present unboundedly many distinct programs. Losing
+    // late entries is strictly better than a diagnostic that grows without limit.
+    constexpr size_t kMaximumRecordedPrograms = 4096;
+    std::lock_guard lock(terminal_reject_mutex());
+    auto& reasons = terminal_reject_reasons();
+    if (reasons.size() >= kMaximumRecordedPrograms && !reasons.count(program_address)) return;
+    reasons[program_address] = std::string(tag) + " " + payload;
+}
+
 void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
                               const char* tag, const char* role, const char* format, ...) {
-    if (!std::getenv("PROSPER_DBG")) return;
-
+    // Formatted BEFORE the PROSPER_DBG gate: the terminal reason has to be recorded whether or not
+    // anyone is reading the verbose stream.
     char payload[1536];
     va_list args;
     va_start(args, format);
@@ -53,6 +87,15 @@ void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
     va_end(args);
     if (body < 0) return;
     payload[sizeof(payload) - 1] = '\0';
+    // Record every role EXCEPT "consequent". A consequent line only restates that an empty result
+    // was returned -- it names the effect, never the cause -- so letting it overwrite a terminal or
+    // route-decline reason would replace the answer with the question. Measured on a routed GTA V
+    // run: recording "terminal" alone left twelve of thirteen skips reading `reason=unrecorded`,
+    // because most reject sites use "route-decline".
+    if (role && std::strcmp(role, "consequent") != 0)
+        record_terminal_reject_reason(diagnostic.program_address, tag, payload);
+
+    if (!std::getenv("PROSPER_DBG")) return;
     size_t payload_size = std::strlen(payload);
     while (payload_size && (payload[payload_size - 1] == '\n' ||
                             payload[payload_size - 1] == '\r'))
@@ -78,6 +121,19 @@ void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
 }
 
 } // namespace
+
+void record_recompile_reject_reason_for_test(const RecompileDiagnosticContext& diagnostic,
+                                             const char* tag, const char* role,
+                                             const char* payload) {
+    log_recompile_diagnostic(diagnostic, tag, role, "%s", payload);
+}
+
+std::string last_terminal_reject_reason(uint64_t program_address) {
+    std::lock_guard lock(terminal_reject_mutex());
+    const auto& reasons = terminal_reject_reasons();
+    const auto found = reasons.find(program_address);
+    return found == reasons.end() ? std::string() : found->second;
+}
 
 void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& diagnostic) {
     log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "consequent",
@@ -3612,9 +3668,21 @@ struct SpirvCompute {
         emit_condbranch(within, active, invocation_guard_merge);
         emit_label(active);
     }
-    // --- Fragment-shader shell: vec4 outputs for the implemented MRT0/MRT1 exports. ---
+    // --- Fragment-shader shell: vec4 outputs for the MRT0..MRT7 exports. ---
+    //
+    // This array WAS sized 2, and that single number was the whole of GTA V's missing 3D world.
+    // Its G-buffer pass exports five render targets
+    // (c0=albedo c1=... c2=... c3=... c4=..., tmask=0x000fffff smask=0x0003ffff), and every part of
+    // the pipeline below the shader already carried eight: the render state decodes all eight slots,
+    // `active_color_count` scans all eight, and the backend's render pass, framebuffer and blend
+    // state are all generic over `color_count`. Only the fragment recompiler stopped at two -- so
+    // three of the five attachments were dropped, the deferred lighting pass sampled buffers nothing
+    // had written, and the world rendered into a G-buffer that was then lit by nothing.
+    //
+    // The rest of this shell was already written generically against `v_color.size()`; the size was
+    // the only thing holding it to two.
     uint32_t t_v4f = 0;
-    std::array<uint32_t, 2> v_color{};
+    std::array<uint32_t, kFragmentColorOutputs> v_color{};
     void begin_fragment(const ShaderResourceTable* rt = nullptr, uint32_t color_mask = 1u) {
         bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
@@ -4555,7 +4623,44 @@ uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in);
 uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);
 }
 
-inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
+// What a surviving read of R is allowed to be.
+//
+// AnyRead     -- R must not be read at all before it is redefined. The original and default proof.
+// MaskDomainOnly -- R may be read as 32-bit scalar DATA, but not by a lane-mask consumer. Only
+//                meaningful for a VCC half, and only sound because prosper models a VCC half written
+//                by a B32 scalar op as scalar data with its own storage: a 32-bit read of that half
+//                reproduces the written dword exactly, while a MASK read would need the per-lane
+//                predicate the scalar model deliberately does not reconstruct.
+//
+// The distinction is 32-bit-ness, not explicitness, and that is the whole subtlety: a VOP3
+// `v_cndmask_b32 v0, v1, v2, vcc` names VCC explicitly and still reads the mask domain. Every
+// mask consumer reads the PAIR, so requiring `scalar_alu_source_words(...) == 1` excludes all of
+// them -- VOP3 cndmask, VOP3B carry-in, `s_mov_b64 exec, vcc`, and B64 mask logic alike -- without
+// enumerating them. The e32 implicit readers and the vccz/vccnz branches are rejected earlier and
+// unconditionally, so they are excluded on both paths.
+enum class ScalarMergeProof { AnyRead, MaskDomainOnly };
+
+// Why the proof failed, for the reject message. A liveness proof that reports only "failed" makes
+// every widening of it a guess: the first attempt at MaskDomainOnly did not accept the GTA V kernel
+// it was written for, and without the blocking pc there was no way to tell whether the walk stopped
+// at a mask read, a data read, or an unmodelled opcode -- three different follow-ups.
+struct ScalarMergeBlocker {
+    uint32_t pc = UINT32_MAX;
+    const char* kind = "none";
+};
+
+inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
+                               ScalarMergeProof proof = ScalarMergeProof::AnyRead,
+                               ScalarMergeBlocker* blocker = nullptr) {
+    const auto block = [&](const Rdna2Inst& at, const char* kind) {
+        if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
+        return false;
+    };
+    // MaskDomainOnly is a VCC-half question by construction: an ordinary SGPR has no mask domain,
+    // so the relaxation would silently become "reads are fine", which is not a proof of anything.
+    if (proof == ScalarMergeProof::MaskDomainOnly && R != 106 && R != 107)
+        return false;
+    const bool data_read_ok = proof == ScalarMergeProof::MaskDomainOnly;
     // Prove liveness over the actual scalar CFG, not just lexical order. UE4 commonly places another
     // forward EXECZ after an if/merge and only then overwrites the scratch SGPR/VCC value. A linear
     // scan used to reject that safe shape merely because it encountered the second branch. Explore
@@ -4580,8 +4685,10 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
         // SMEM carve-out needs — compilers love `s_buffer_load_dword vcc_lo, …` scratch loads).
         if (R == 106 || R == 107) {
             if (in.fmt == Rdna2Format::VOP2 &&
-                (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2A))) return false;
-            if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) return false;
+                (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2A)))
+                return block(in, "vop2-implicit-vcc");
+            if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07))
+                return block(in, "vccz-branch");
         }
         switch (in.fmt) {
             // Most SOPK instructions remain fail-closed: s_addk/s_mulk/s_cmovk/s_cmpk read or
@@ -4596,7 +4703,18 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     if (in.dst.value == R) continue;
                     break;
                 }
-                return false;
+                // Under MaskDomainOnly the whole read-modify-write SOPK family is admissible. Every
+                // SOPK operates on ONE dword: s_addk_i32/s_mulk_i32 read and rewrite their encoded
+                // destination, s_cmpk_* read it and write SCC, s_cmovk_i32 reads it and may rewrite
+                // it. All three are 32-bit scalar-DATA touches of the half; none can consume it as a
+                // 64-bit lane mask, which is the only thing this proof needs to exclude.
+                //
+                // Deliberately does NOT claim the half died, even for the forms that always write
+                // it: continuing the walk is the conservative direction, and a later genuine mask
+                // read still fails the proof. Being wrong about the kill would be unsound; being
+                // silent about it only costs acceptances.
+                if (data_read_ok && in.dst.kind == OperandKind::SGPR) break;
+                return block(in, "unmodelled-sopk");
             case Rdna2Format::SOPP:
                 // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
                 // after the merge). A barrier is also scalar-register-transparent; it changes only
@@ -4617,7 +4735,7 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     }
                     continue;
                 }
-                return false;
+                return block(in, "unmodelled-sopp");
             case Rdna2Format::SMEM: {
                 // s_load/s_buffer_load: reads the SBASE pair (src[0], 2 regs) + SOFFSET (src[1]);
                 // redefines N consecutive dst SGPRs. Anything not a plain load -> bail.
@@ -4626,11 +4744,14 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     case 0x0: case 0x8: n = 1;  break;   case 0x1: case 0x9: n = 2;  break;
                     case 0x2: case 0xA: n = 4;  break;   case 0x3: case 0xB: n = 8;  break;
                     case 0x4: case 0xC: n = 16; break;
-                    default: return false;
+                    default: return block(in, "unmodelled-smem");
                 }
-                if (in.src[0].value == R || in.src[0].value + 1 == R) return false;         // SBASE read
+                if (in.src[0].value == R || in.src[0].value + 1 == R)
+                    return block(in, "smem-sbase");                                          // SBASE read
+                // SOFFSET is one dword and is consumed as an address, never as a lane mask.
                 if ((in.src[1].kind == OperandKind::SGPR || in.src[1].kind == OperandKind::Special) &&
-                    in.src[1].value == R) return false;                                     // SOFFSET read
+                    in.src[1].value == R && !data_read_ok)
+                    return block(in, "smem-soffset");                                        // SOFFSET read
                 if (R >= in.dst.value && R < in.dst.value + (int)n) continue;  // redefined: this path is dead
                 break;
             }
@@ -4644,8 +4765,9 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 const uint32_t implicit_read_width =
                     scalar_implicit_destination_read_width(in);
                 if (implicit_read_width && R >= in.dst.value &&
-                    R < in.dst.value + static_cast<int>(implicit_read_width))
-                    return false;
+                    R < in.dst.value + static_cast<int>(implicit_read_width) &&
+                    !(data_read_ok && implicit_read_width == 1))
+                    return block(in, "implicit-dst-rmw");
                 for (int k = 0; k < in.n_src; k++) {
                     if (in.src[k].kind != OperandKind::SGPR &&
                         in.src[k].kind != OperandKind::Special) continue;
@@ -4655,8 +4777,12 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     const uint32_t words = scalar_alu_source_words(in, k);
                     if (words == UINT32_MAX) continue;
                     if (R >= in.src[k].value &&
-                        R < in.src[k].value + static_cast<int>(words))
-                        return false;
+                        R < in.src[k].value + static_cast<int>(words)) {
+                        // A one-dword source is a scalar-data read. Anything wider reads the pair,
+                        // which is exactly the set of lane-mask consumers.
+                        if (data_read_ok && words == 1) continue;
+                        return block(in, words == 1 ? "source-dword" : "source-pair");
+                    }
                 }
                 // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
                 if (in.sdst.kind == OperandKind::SGPR &&
@@ -6002,11 +6128,28 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                     (r.dst.kind != OperandKind::SGPR && r.dst.kind != OperandKind::Special)) continue;
                 for (int vcc_half = 106; vcc_half <= 107; ++vcc_half) {
                     if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width) continue;
-                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half)) {
+                    // PROSPER_VCC_SCALAR_DATA_MERGE=1 widens the proof from "not read" to "not read
+                    // as a lane mask". The guard this loop implements is about the MASK domain --
+                    // its own comment says so -- but the test it applies is total liveness, so a
+                    // half that survives the merge only to be read as a 32-bit scalar dword is
+                    // rejected even though the scalar model reproduces that dword exactly.
+                    //
+                    // Opt-in rather than default because the same physical pair being a mask on one
+                    // predecessor and data on another has no runtime type tag, and this file already
+                    // rejects that join deliberately. Keeping it behind a switch also makes the A/B
+                    // have a lever that can be shown to have moved, which a byte-identical module
+                    // has already cost this investigation once.
+                    static const bool relax_vcc_scalar_data =
+                        std::getenv("PROSPER_VCC_SCALAR_DATA_MERGE") != nullptr;
+                    const ScalarMergeProof proof = relax_vcc_scalar_data
+                        ? ScalarMergeProof::MaskDomainOnly : ScalarMergeProof::AnyRead;
+                    ScalarMergeBlocker blocker;
+                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half, proof, &blocker)) {
                         log_recompile_diagnostic(
                             diagnostic, "compute-struct-reject", "route-decline",
-                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge pc=%u",
-                            in.pc, r.pc, vcc_half, region_end);
+                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge pc=%u "
+                            "blocked-by pc=%u kind=%s",
+                            in.pc, r.pc, vcc_half, region_end, blocker.pc, blocker.kind);
                         return reject();
                     }
                 }
@@ -19489,7 +19632,11 @@ bool emit_cfg_state_machine(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b));
                 if (!handled || !ok) {
-                    if (getenv("PROSPER_DBG"))
+                    // NOT gated on PROSPER_DBG. log_recompile_diagnostic gates its own PRINTING
+                    // on that variable and additionally RECORDS the reason for the unconditional
+                    // `[compute] skip unsupported program 0x… reason=…` line. An outer gate here
+                    // therefore suppressed the recording too, which is why five GTA V programs
+                    // reported reason=unrecorded while their cause existed and was formatted.
                         // The raw INSTRUCTION WORDS, because without them this line cannot be acted
                         // on. `fmt` and `op` are our decoder's own labels, so they identify the
                         // instruction only if you already trust the decode -- and a reject is
@@ -21880,7 +22027,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
-                if (getenv("PROSPER_DBG")) {
+                // NOT gated on PROSPER_DBG, for the reason at the CFG reject site above: the gate
+                // suppressed the RECORDING as well as the printing, and the recording is what the
+                // unconditional skip line reads. This site fires once per failing compile, so the
+                // formatting cost it now always pays is one string per rejected shader.
+                {
                     // `mode` separates the two rejections that used to print identically and want
                     // OPPOSITE work (#2412). `unknown-encoding` (handled=false) means no lowering
                     // exists — write the emitter. `unresolved-operand` (handled=true, ok=false)
@@ -23736,7 +23887,10 @@ uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     uint32_t packed = 0;
-    std::array<bool, 2> realized{};
+    // One nibble per MRT, MRT0..MRT7. Sized 2 until 2026-08-15, which silently forced
+    // `write_mask &= 0` for slots 2..7 at gpu_execute.hpp's EXP.EN gate -- so a shader exporting to
+    // MRT2+ had those attachments dropped no matter what CB_TARGET_MASK and CB_SHADER_MASK said.
+    std::array<bool, kFragmentColorOutputs> realized{};
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP || in.exp_target >= realized.size() ||
@@ -23784,7 +23938,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP) continue;
-        if (in.exp_target < 2) color_mask |= 1u << in.exp_target;
+        if (in.exp_target < kFragmentColorOutputs) color_mask |= 1u << in.exp_target;
         else if (in.exp_target == 8 && !in.exp_compr) {
             has_depth_export |= (in.exp_en & kMrtzDepth) != 0;
             has_sample_mask_export |= (in.exp_en & kMrtzSampleMask) != 0;
@@ -23889,7 +24043,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
     // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
     for (uint32_t pc : mask_test_branches(ins, b.allow_b32_masks)) safe_branches.insert(pc);
-    std::array<bool, 2> exported{};
+    std::array<bool, kFragmentColorOutputs> exported{};
     auto exp_fn = [&](RegState& state, const Rdna2Inst& in) -> bool { // EXP MRT0/MRT1 -> matching output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
         // all-on) must not write the inactive lanes. Lower it to a real fragment discard: OpKill the lanes
@@ -23959,7 +24113,15 @@ static std::vector<uint32_t> recompile_fragment_impl(
                                      "pcrel target=%u body failed", pcrel_dispatch_target);
         return {};
     }
-    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export &&
+    // ANY colour slot counts, not just the first two. This tested `exported[0] || exported[1]` while
+    // the array was sized 2, which read as "did anything export"; once the shell carries eight
+    // outputs it silently became "did MRT0 or MRT1 export", and a shader whose only colour output is
+    // MRT2+ was rejected outright -- dropping its draws rather than its attachments. The guard's
+    // purpose is unchanged: a fragment program that emits no colour, no NULL, no depth and no sample
+    // mask is still fail-visible.
+    const bool exported_any_color =
+        std::any_of(exported.begin(), exported.end(), [](bool e) { return e; });
+    if (!exported_any_color && !has_null_export && !has_depth_export &&
         !has_sample_mask_export) {
         if (pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",

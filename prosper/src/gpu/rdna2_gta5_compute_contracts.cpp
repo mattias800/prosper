@@ -1,4 +1,9 @@
 #include "rdna2_gta5_compute_contracts.hpp"
+#include <mutex>
+#include <tuple>
+#include <map>
+#include <set>
+#include <string>
 
 #include "agc_shader_layout.hpp"
 #include "rdna2_decode.hpp"
@@ -22,6 +27,24 @@ namespace {
 
 enum class NullableProgram : uint8_t { None, WorkgroupStore, WorkgroupProcess };
 enum class SelectedSbufferDomain : uint8_t { Reject, AllOob, Record4 };
+
+// The selected-sbuffer validator's six reject reasons were all behind PROSPER_DBG, which on a routed
+// run desyncs the pad script badly enough that the route never reaches the dispatch being validated.
+// So "this contract declined" was observable and WHY was not -- and on GTA V this contract is the
+// last thing standing between the title and its 3D world. PROSPER_GTA5_SBUFFER_REJECT=1 reports each
+// reason once per program instead, which is at most six lines for a whole run.
+//
+// The program identity is the code pointer: prosper maps guest memory directly, so it IS the guest
+// address the rest of the diagnostics print.
+inline bool report_selected_sbuffer_reject(const uint32_t* code, const char* reason) {
+    if (std::getenv("PROSPER_DBG")) return true;
+    if (!std::getenv("PROSPER_GTA5_SBUFFER_REJECT")) return false;
+    static std::mutex mutex;
+    static std::set<std::pair<uint64_t, std::string>> reported;
+    std::lock_guard lock(mutex);
+    return reported.emplace(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code)),
+                            std::string(reason)).second;
+}
 
 constexpr uint32_t kSelectedSbufferSourcePc = 70u;
 constexpr uint32_t kSelectedSbufferOuterPc = 153u;
@@ -622,7 +645,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     if (!rdna2_gta5_selected_sbuffer_launch(code, dwords, config)) {
         if (rdna2_gta5_selected_sbuffer_shader(code, dwords) &&
-            config.threads_x == kGtaSelectedSbufferThreads && std::getenv("PROSPER_DBG"))
+            config.threads_x == kGtaSelectedSbufferThreads && report_selected_sbuffer_reject(code, "launch"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=launch user=%zu local=%ux%ux%u "
                          "exact=%d threads=%ux%ux%u wave=%u tgid=%d/%d/%d tidig=%u\n",
@@ -662,7 +685,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     if (!source || !outer || !selected_sbuffer_source_shape(*source) ||
         !selected_sbuffer_outer_shape(*outer)) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "resource-shape"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=resource-shape source=%p outer=%p "
                          "source-shape=%d outer-shape=%d resources=%zu "
@@ -683,7 +706,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     const SelectedSbufferDomain domain = selected_sbuffer_domain(*source);
     if (domain == SelectedSbufferDomain::Reject) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "selector-domain"))
             std::fprintf(stderr, "[gta-selected-sbuffer] reject=selector-domain\n");
         return false;
     }
@@ -714,7 +737,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
 
     const uint8_t* outer_bytes = complete_resource_bytes(*outer, outer->size);
     if (!outer_bytes) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "outer-unreadable"))
             std::fprintf(stderr, "[gta-selected-sbuffer] reject=outer-unreadable\n");
         return false;
     }
@@ -775,7 +798,69 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     DecodedBufferDescriptor selected{};
     if (!selected_sbuffer_target_descriptor(selected_words, selected)) {
-        if (std::getenv("PROSPER_DBG"))
+        // Dump ALL FIVE records, not only the one the contract reads. The decline says record 4 does
+        // not hold a V#; it cannot say whether that is because the SELECTOR is wrong (some other
+        // record does hold one) or because the whole outer array is stale (none does). Those need
+        // opposite fixes, and one printed record cannot distinguish them.
+        //
+        // The outer array's address changes every frame -- 0x203f2e9b38, 0x203e989b38, 0x20408c9b38
+        // across successive dispatches -- so it is a per-frame ring allocation, which makes "stale
+        // ring contents" a live possibility rather than a remote one.
+        // The SELECTOR distribution, from the same source records the domain proof walks. The
+        // contract reads record 4 because its proof concluded every selector is 4-or-OOB; printing
+        // what the selectors actually are is what distinguishes "the proof is right and the array is
+        // something else" from "the proof is wrong".
+        if (report_selected_sbuffer_reject(code, "selector-histogram")) {
+            const uint8_t* source_bytes = source ? complete_resource_bytes(*source, source->size)
+                                                 : nullptr;
+            if (source_bytes) {
+                std::map<uint32_t, uint32_t> histogram;
+                for (uint32_t record = 0; record < kSelectedSbufferSourceRecords; ++record) {
+                    uint32_t first = 0;
+                    std::memcpy(&first, source_bytes + record * kSelectedSbufferSourceStride,
+                                sizeof(first));
+                    ++histogram[first >> 3u];
+                }
+                std::string text;
+                uint32_t shown = 0;
+                for (const auto& entry : histogram) {
+                    if (shown++ >= 12u) { text += " ..."; break; }
+                    char one[64];
+                    std::snprintf(one, sizeof(one), " %u:%u", entry.first, entry.second);
+                    text += one;
+                }
+                std::fprintf(stderr,
+                             "[gta-selected-sbuffer]   selectors distinct=%zu (selector:count)%s\n",
+                             histogram.size(), text.c_str());
+                std::fprintf(stderr,
+                             "[gta-selected-sbuffer]   record-4 selector would be %u; outer has %u "
+                             "records of %u bytes\n",
+                             kGtaSelectedSbufferRecord4Soffset / kSelectedSbufferOuterStride,
+                             kSelectedSbufferOuterRecords, kSelectedSbufferOuterStride);
+            } else {
+                std::fprintf(stderr, "[gta-selected-sbuffer]   selectors unavailable (source unreadable)\n");
+            }
+        }
+        if (report_selected_sbuffer_reject(code, "selected-vsharp-records")) {
+            for (uint32_t record = 0; record < kSelectedSbufferOuterRecords; ++record) {
+                const uint32_t offset = record * kSelectedSbufferOuterStride + 8u;
+                if (offset + sizeof(std::array<uint32_t, 4>) > outer->size) break;
+                std::array<uint32_t, 4> words{};
+                std::memcpy(words.data(), outer_bytes + offset, sizeof(words));
+                DecodedBufferDescriptor probe{};
+                const bool plausible = selected_sbuffer_target_descriptor(words, probe);
+                const DecodedBufferDescriptor raw = decode_buffer_descriptor(words.data());
+                std::fprintf(stderr,
+                             "[gta-selected-sbuffer]   record=%u@+%u words=%08x:%08x:%08x:%08x "
+                             "base=0x%llx stride=%u records=%u size=%u fmt=%u comp=%u %s\n",
+                             record, offset, words[0], words[1], words[2], words[3],
+                             static_cast<unsigned long long>(raw.base), raw.stride,
+                             raw.num_records, raw.size_bytes,
+                             static_cast<unsigned>(raw.format), raw.num_components,
+                             plausible ? "<-- MATCHES the expected target shape" : "");
+            }
+        }
+        if (report_selected_sbuffer_reject(code, "selected-vsharp"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=selected-vsharp words=%08x:%08x:%08x:%08x "
                          "base=0x%llx stride=%u records=%u size=%u format=%u components=%u\n",
@@ -793,7 +878,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
         (target_x2 && !selected_sbuffer_target_resource(
                           *target_x2, kSelectedSbufferLoadX2Pc, selected)))
     {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "consumer-resource"))
             std::fprintf(stderr, "[gta-selected-sbuffer] reject=consumer-resource\n");
         return false;
     }
@@ -817,6 +902,35 @@ bool discover_rdna2_gta5_selected_sbuffer(
     if (!outer) return false;
     outer->selected_sbuffer_soffset = kGtaSelectedSbufferRecord4Soffset;
     outer->selected_sbuffer_words = selected_words;
+    // The ACCEPT side, which nothing reported. Every diagnostic on this contract described a
+    // DECLINE, so the descriptor it publishes on the ~93% of dispatches it accepts was invisible --
+    // and that descriptor is what the shader then reads its node records through.
+    //
+    // This matters because the proof behind it is weaker than its name: it reads the pc70 source and
+    // the 600-byte outer table through complete_resource_bytes(), i.e. the currently CPU-visible
+    // mapping, with no command-order snapshot coupling either to the bytes the GPU consumes (#2542).
+    // So an accepted descriptor can still be from the wrong epoch, and a wrong descriptor here means
+    // wrong node records downstream -- which is the measured defect.
+    //
+    // Deduped on the published descriptor, so a stable frame prints once and a CHANGE is what shows.
+    if (std::getenv("PROSPER_GTA5_SBUFFER_ACCEPT")) {
+        static std::mutex mutex;
+        static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> reported;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            first = reported.emplace(selected.base, selected.size_bytes, selected.stride).second;
+        }
+        if (first)
+            std::fprintf(stderr,
+                         "[gta-selected-sbuffer] ACCEPT record=4@+%u -> base=0x%llx size=%u "
+                         "stride=%u fmt=%u comps=%u words=%08x:%08x:%08x:%08x\n",
+                         kGtaSelectedSbufferRecord4Soffset + 8u,
+                         static_cast<unsigned long long>(selected.base), selected.size_bytes,
+                         selected.stride, static_cast<unsigned>(selected.format),
+                         selected.num_components, selected_words[0], selected_words[1],
+                         selected_words[2], selected_words[3]);
+    }
     return rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, resources);
 }
 

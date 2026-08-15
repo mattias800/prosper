@@ -22,7 +22,75 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+// The windowed form exists because the address form asked a different question from the change
+// detection that consumed it. These arms pin the difference.
+//
+// Worked example this comes from: a program binding [window + 128, +160) was reported as touching
+// NOTHING, because the address form asks only whether a resource contains the window's FIRST byte.
+// The tree watch detects changes anywhere in the window, so the two halves disagreed, and the
+// disagreement was published as "this program writes bytes it does not bind" -- an out-of-bounds
+// write that never existed. An instrument whose halves ask different questions manufactures exactly
+// the finding it was built to detect.
+static prosper::gpu::ShaderResource watch_scalar(uint32_t binding, uint32_t fetch_pc, uint64_t base,
+                                   uint32_t size) {
+    prosper::gpu::ShaderResource r;
+    r.binding = binding;
+    r.fetch_pc = fetch_pc;
+    r.gpu_addr = base;
+    r.size = size;
+    return r;
+}
+
+static void test_window_hits() {
+    using prosper::gpu::compute_address_ranges_overlap;
+    using prosper::gpu::compute_address_window_hits;
+    using prosper::gpu::compute_address_watch_hits;
+
+    constexpr uint64_t kWindowBase = 0x209cc76000ull;
+    constexpr uint64_t kWindowBytes = 2063ull * 4ull;
+
+    prosper::gpu::ShaderResourceTable table;
+    table.resources.push_back(watch_scalar(7, 43, kWindowBase + 128, 160));   // interior
+    table.resources.push_back(watch_scalar(8, 44, kWindowBase - 0x1000, 64)); // wholly below
+    table.resources.push_back(watch_scalar(9, 45, kWindowBase + 8200, 64));   // straddles the end (window is 8252 bytes)
+
+    CHECK(compute_address_watch_hits(table, kWindowBase).empty(),
+          "the ADDRESS form finds nothing: no resource contains the window's first byte");
+
+    const auto window = compute_address_window_hits(table, kWindowBase, kWindowBytes);
+    CHECK(window.size() == 2u,
+          "the WINDOW form finds the interior resource and the one straddling the end");
+    bool saw_interior = false, saw_below = false;
+    for (const auto& hit : window) {
+        if (hit.binding == 7u && hit.fetch_pc == 43u) saw_interior = true;
+        if (hit.binding == 8u) saw_below = true;
+    }
+    CHECK(saw_interior, "the interior resource is named with its binding and fetch pc");
+    CHECK(!saw_below,
+          "a resource wholly below the window is still not a toucher (no false positive traded in)");
+
+    prosper::gpu::ShaderResourceTable adjacent;
+    adjacent.resources.push_back(watch_scalar(1, 1, kWindowBase - 64, 64));
+    CHECK(compute_address_window_hits(adjacent, kWindowBase, kWindowBytes).empty(),
+          "a resource ending exactly where the window begins does not overlap it");
+
+    prosper::gpu::ShaderResourceTable touching;
+    touching.resources.push_back(watch_scalar(1, 1, kWindowBase - 64, 65));
+    CHECK(compute_address_window_hits(touching, kWindowBase, kWindowBytes).size() == 1u,
+          "one byte of overlap is overlap");
+
+    CHECK(!compute_address_ranges_overlap(kWindowBase, 0, kWindowBase, 16),
+          "a zero-size resource never overlaps");
+    CHECK(!compute_address_ranges_overlap(kWindowBase, 16, kWindowBase, 0),
+          "a zero-size window never overlaps");
+    CHECK(!compute_address_ranges_overlap(UINT64_MAX - 8, 16, 0x1000, 64),
+          "a range near UINT64_MAX does not wrap into a low window");
+    CHECK(!compute_address_ranges_overlap(0x1000, 64, UINT64_MAX - 8, 16),
+          "and does not wrap with the arguments the other way round");
+}
+
 int main() {
+    test_window_hits();
     printf("== test_compute_address_watch ==\n");
     constexpr uint64_t kBase = 0x20f848417cull;
     constexpr uint64_t kSize = 8252;

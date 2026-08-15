@@ -5,7 +5,8 @@
 #include "rtt_authority.hpp"
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
-#include "mrt_extent.hpp"               // which MRT slot may join a pass (measured extents only)
+#include "mrt_extent.hpp"
+#include "mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
 #include "readback_policy.hpp"
 #include "capture_renderer_policy.hpp"
 #include "write_watch_policy.hpp"
@@ -160,6 +161,25 @@ void queue_guest_gpu_write(uint64_t addr, uint64_t size) {
         pending.ranges.emplace_back(addr, size);
     else
         pending.overflowed = true;
+}
+
+// Does this draw bind `addr` as ANY active colour target?
+//
+// The direct-live sampling decision excluded `draw.color0_base` alone. That was complete only while
+// slots above 1 could not be persistent; they can now, so sampling an ACTIVE MRT2+ target would
+// otherwise borrow the very image the draw is writing -- one VkImage used as shader-read and colour
+// attachment at once, bypassing the CPU fallback that exists for exactly this case.
+//
+// "Active" matches the pass-grouping definition: a bound base whose write mask is non-zero. Slots 0
+// and 1 keep their named-field fallbacks, since a draw may carry either form.
+// The backend's notion of a defined colour format, supplied to the shared policy so that header
+// stays backend-free. One mapping, used by grouping and feedback alike.
+bool mrt_format_defined(uint32_t raw) {
+    return prosper::test::backend_color_format(static_cast<VkFormat>(raw)) != VK_FORMAT_UNDEFINED;
+}
+
+bool draw_binds_color_target(const prosper::gpu::DrawItem& draw, uint64_t addr) {
+    return prosper::frontend::mrt_draw_binds_target(draw, addr, mrt_format_defined);
 }
 
 void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
@@ -2448,12 +2468,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 prosper::frontend::rtt_sampled_extent_compatible(
                                     tw, th, surface.w, surface.h, render_scale,
                                     normalized_sampling);
-                            const bool direct_serves = !fr.is_storage_image && r.img_dim == 1u &&
-                                sampled_extent_compatible &&
-                                sampled_source_addr != draw.color0_base &&
+                            // Must use the SAME all-slot rule as the gate it feeds. On colour-0
+                            // alone an MRT2+ feedback collision set direct_serves=true, which
+                            // suppressed the lazy CPU materialisation; the corrected gate below then
+                            // refused the direct image because the collision is real, and the
+                            // resource fell through to stale guest bytes with no snapshot to use.
+                            const bool direct_serves = prosper::frontend::mrt_direct_serves(
+                                draw, sampled_source_addr, fr.is_storage_image, r.img_dim,
+                                sampled_extent_compatible,
                                 prosper::test::find_persistent_color_target(
                                     sampled_source_addr, surface.w, surface.h,
-                                    surface.format) != nullptr;
+                                    surface.format) != nullptr,
+                                mrt_format_defined);
                             const VkFormat surface_format =
                                 prosper::test::backend_color_format(surface.format);
                             const uint32_t surface_bpp =
@@ -2531,18 +2557,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
                                 normalized_sampling) &&
-                            sampled_source_addr != draw.color0_base &&
+                            !draw_binds_color_target(draw, sampled_source_addr) &&
                             prosper::test::find_persistent_color_target(
                                 sampled_source_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
-                        const bool has_uniform_live_rtt = !fr.is_storage_image &&
-                            !uniform_cpu_diagnostic_path && sampled_2d_view &&
-                            !r.in_mip_tail && live_rtt != g_rtt.end() &&
-                            live_rtt->second.has_uniform_color && live_rtt->second.w &&
-                            live_rtt->second.h &&
-                            prosper::frontend::rtt_sampled_extent_compatible(
-                                tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
-                                normalized_sampling) && sampled_source_addr != draw.color0_base;
+                        const bool has_uniform_live_rtt = prosper::frontend::mrt_uniform_live_serves(
+                            draw, sampled_source_addr,
+                            /*preconditions=*/!fr.is_storage_image &&
+                                !uniform_cpu_diagnostic_path && sampled_2d_view &&
+                                !r.in_mip_tail && live_rtt != g_rtt.end() &&
+                                live_rtt->second.has_uniform_color && live_rtt->second.w &&
+                                live_rtt->second.h &&
+                                prosper::frontend::rtt_sampled_extent_compatible(
+                                    tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
+                                    normalized_sampling),
+                            mrt_format_defined);
                         const bool has_live_rtt =
                             has_cpu_live_rtt || has_gpu_live_rtt || has_uniform_live_rtt;
                         // A dim-5 base-slice view may need the CPU injection path rather than a direct
@@ -2568,6 +2597,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : prosper::test::PersistentDsSampled{};
                         const bool has_ds_live = sampled_ds.image != nullptr;
                         resource_has_ds_live = has_ds_live;
+                        // A binding rejected by the gate above never reaches the lookup, so it is
+                        // absent from every statistic the lookup keeps -- it reads as "we hold no
+                        // such surface" when we may hold it and be perfectly valid. Name the
+                        // failing sub-condition, once per (address, reason).
+                        if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG") && !has_ds_live) {
+                            uint32_t held_w = 0, held_h = 0;
+                            if (!(!has_live_rtt && !fr.is_storage_image && r.img_dim == 1u &&
+                                  r.cls == RC::Texture) &&
+                                prosper::test::is_retained_ds_plane(r.gpu_addr, &held_w, &held_h)) {
+                                static std::mutex gate_mutex;
+                                static std::set<std::pair<uint64_t, int>> reported;
+                                const int reason = has_live_rtt ? 0
+                                    : fr.is_storage_image ? 1
+                                    : r.img_dim != 1u ? 2 : 3;
+                                bool first = false;
+                                {
+                                    std::lock_guard lock(gate_mutex);
+                                    first = reported.emplace(r.gpu_addr, reason).second;
+                                }
+                                if (first)
+                                    fprintf(stderr,
+                                            "[dsbridge] GATED addr=0x%llx T#=%ux%ux%u dim=%u "
+                                            "cls=%u fmt=%u (retained DS %ux%u) never reached the "
+                                            "lookup: %s\n",
+                                            (unsigned long long)r.gpu_addr, tw, th, r.depth,
+                                            r.img_dim, (unsigned)r.cls, (unsigned)r.format,
+                                            held_w, held_h,
+                                            reason == 0 ? "has_live_rtt (colour cache claims it)"
+                                            : reason == 1 ? "is_storage_image"
+                                            : reason == 2 ? "img_dim != 1 (not a plain 2D view)"
+                                                          : "cls != Texture");
+                            }
+                        }
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = PROSPER_ENV_VALUE("PROSPER_PITCH")
@@ -2736,9 +2798,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ((reflected_binding->image_dim == 1u && r.img_dim == 1u) ||
                              (reflected_binding->image_dim == 2u && r.img_dim == 2u &&
                               r.depth != 0u));
+                        // A storage-image contract failure does not skip one binding -- the backend
+                        // returns an EMPTY batch, dropping every draw submitted with it
+                        // (render_runner.h, `return out;` in the pre-Vulkan validation loop). So
+                        // "which sub-condition failed" is the difference between one unusable
+                        // resource and a whole frame's geometry going missing, and the existing line
+                        // reports only `materialized=0`, which is the conjunction.
                         if (portable_raw_uvec4_storage &&
-                            (!portable_storage_guest_texel || !portable_storage_shape))
+                            (!portable_storage_guest_texel || !portable_storage_shape)) {
+                            static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> reported;
+                            if (reported.emplace(fr.set, fr.binding,
+                                                 static_cast<uint32_t>(r.format)).second)
+                                std::fprintf(stderr,
+                                    "[render] storage-image contract: set=%u binding=%u "
+                                    "portable-uvec4 REJECTED guest-texel=%u shape=%u "
+                                    "(writable=%u compressed=%u arrayed=%u multisampled=%u "
+                                    "reflected-dim=%u guest-dim=%u depth=%u fmt=%u comps=%u)\n",
+                                    fr.set, fr.binding, portable_storage_guest_texel,
+                                    portable_storage_shape ? 1u : 0u,
+                                    writable_storage_image ? 1u : 0u,
+                                    r.compression_enabled ? 1u : 0u,
+                                    reflected_binding->image_arrayed ? 1u : 0u,
+                                    reflected_binding->image_multisampled ? 1u : 0u,
+                                    reflected_binding->image_dim, r.img_dim, r.depth,
+                                    static_cast<unsigned>(r.format), r.num_components);
                             fr.storage_image_contract_valid = false;
+                        }
                         if (fr.is_storage_image &&
                             reflected_binding->image_numeric_class ==
                                 prosper::gpu::SpirvImageNumericClass::Uint &&
@@ -3457,7 +3542,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 else if (!live_rtt->second.gpu_valid) rtt_notvalid++;
                                 else if (live_rtt->second.w != tw || live_rtt->second.h != th)
                                     rtt_dimmismatch++;
-                                else if (sampled_source_addr == draw.color0_base) rtt_self++;
+                                else if (draw_binds_color_target(draw, sampled_source_addr))
+                                    rtt_self++;
                                 else if (prosper::test::find_persistent_color_target(
                                              sampled_source_addr, tw, th,
                                              live_rtt->second.format) == nullptr)
@@ -3715,11 +3801,81 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     }
                                 } // malformed/incomplete RTT bytes => miss; decode guest backing below
                             }
+                            // Report HOW the binding resolved, not merely whether the COLOUR cache
+                            // had it. This line used to print "miss" for a resource the depth or
+                            // stencil bridge had already resolved, because `rtt_hit` speaks only for
+                            // g_rtt -- so a correctly-bridged 4K depth buffer and a texture decoded
+                            // from guest zeros were the same word. Reading a pass's inputs off this
+                            // log therefore over-counted missing inputs, which is the one thing the
+                            // log exists to answer.
+                            // PROSPER_RTT_GUESTPEEK=1 — for each distinct sampled surface, how
+                            // much of the GUEST backing is non-zero, next to how prosper resolved
+                            // it. This separates two states that every other signal renders
+                            // identically: a surface nothing ever wrote (guest bytes zero, cache
+                            // zero) from one the guest DID write through a path prosper did not
+                            // observe (guest bytes populated, cache zero) -- the second is a
+                            // prosper defect and the first is not, and they call for opposite work.
+                            // Read the guest VA directly rather than r.host_data: on this path
+                            // host_data is null for every sampled texture (measured: zero peeks in a
+                            // full routed run), so keying on it produced complete silence -- which
+                            // reads as "the guest backing is empty" and is instead "we never
+                            // looked". Guest code runs natively here, so a readability-checked VA is
+                            // the authoritative view of that memory.
+                            if (rtt_log && PROSPER_ENV_ON("PROSPER_RTT_GUESTPEEK") &&
+                                sampled_source_addr &&
+                                prosper::gpu::guest_readable(sampled_source_addr, 4096)) {
+                                static std::mutex peek_mutex;
+                                static std::set<uint64_t> peeked;
+                                bool first = false;
+                                {
+                                    std::lock_guard lock(peek_mutex);
+                                    first = peeked.insert(sampled_source_addr).second;
+                                }
+                                if (first) {
+                                    size_t window = std::min<size_t>(
+                                        prosper::gpu::gpu_capture_resource_footprint(r),
+                                        size_t(1) << 20);
+                                    while (window &&
+                                           !prosper::gpu::guest_readable(
+                                               sampled_source_addr,
+                                               static_cast<uint32_t>(window)))
+                                        window /= 2;
+                                    size_t nz = 0;
+                                    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(
+                                        static_cast<uintptr_t>(sampled_source_addr));
+                                    for (size_t i = 0; i < window; ++i) nz += bytes[i] != 0;
+                                    fprintf(stderr,
+                                            "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u guest "
+                                            "non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
+                                            (unsigned long long)sampled_source_addr, tw, th,
+                                            (unsigned)r.format, nz, window,
+                                            window ? 100.0 * nz / window : 0.0,
+                                            has_uniform_live_rtt ? "HIT-UNIFORM"
+                                                : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU"
+                                                                              : "HIT-CPU")
+                                                : has_ds_live ? "DS" : "miss");
+                                }
+                            }
                             if (rtt_log)
-                                fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
+                                fprintf(stderr,
+                                        "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s "
+                                        "(cache_size=%zu)\n",
                                         (unsigned long long)sampled_source_addr, tw, th,
                                         (unsigned)r.format,
-                                        rtt_hit ? "HIT" : "miss", g_rtt.size());
+                                        // Which hit path, not merely that one hit. A UNIFORM-colour
+                                        // surface samples as one flat value everywhere, so a shader
+                                        // reading it produces correct geometry with no texture
+                                        // detail at all -- visually a smooth gradient inside a
+                                        // correct mask. That is indistinguishable from a real hit
+                                        // in a log that prints one word for all three paths, and it
+                                        // is exactly what GTA V's lighting output looks like.
+                                        has_uniform_live_rtt ? "HIT-UNIFORM"
+                                            : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU" : "HIT-CPU")
+                                            : has_ds_live
+                                                ? (sampled_ds.aspect == VK_IMAGE_ASPECT_STENCIL_BIT
+                                                       ? "DS-STENCIL" : "DS-DEPTH")
+                                                : "miss",
+                                        g_rtt.size());
                         }
                         // CUBE texture (#273 — DOLL's title reflection probes / skybox): decode six
                         // independent thin-2D faces into the stacked w x 6h image addressed by the
@@ -3769,6 +3925,58 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             (unsigned long long)metadata_bytes,
                                             metadata_got ? metadata[0] : 0u);
                             }
+                        }
+                        // PROSPER_DS_UNBRIDGED_FAR=1 — DIAGNOSTIC ONLY, never a shipped default.
+                        //
+                        // A depth surface prosper rendered into a retained DS image but could not
+                        // bridge decodes from guest memory the renderer never wrote, i.e. zeros. For
+                        // a shadow map zero is the NEAR plane, so every shadow test reads "occluded"
+                        // and the lighting pass outputs black over a perfectly good G-buffer. Filling
+                        // with far instead flips that to "unoccluded", which is equally wrong as
+                        // output but is a decisive discriminator: if the scene lights up, the
+                        // unbridged depth surface is the cause; if it does not, the hypothesis is
+                        // dead and no cube-assembly work is justified. It detects its own invalidity
+                        // in both directions, and it reports whether it fired at all.
+                        //
+                        // TWO POLES, and which one means "unoccluded" is not knowable a priori: a
+                        // reversed-Z depth buffer stores near at 1.0, so filling 0xff is the SAME
+                        // claim as the zeros it was meant to contradict. The experiment is only
+                        // decisive if both poles are run, so the fill byte is a parameter
+                        // (PROSPER_DS_UNBRIDGED_FILL, default 0xff) rather than a constant.
+                        //
+                        // Restricted to cubes by PROSPER_DS_UNBRIDGED_FAR=cube. The first run filled
+                        // every unbridged retained DS plane including the main 4K depth, which is
+                        // depth-tested against by the HUD -- the radar vanished, so the arm measured
+                        // the confound as much as the subject.
+                        static const std::string far_mode =
+                            PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FAR")
+                                ? PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FAR") : "";
+                        static const uint8_t far_fill = PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FILL")
+                            ? static_cast<uint8_t>(strtoul(
+                                  getenv("PROSPER_DS_UNBRIDGED_FILL"), nullptr, 0))
+                            : 0xffu;
+                        if (!rtt_hit && !has_ds_live && !fr.is_storage_image &&
+                            !far_mode.empty() && far_mode != "0" &&
+                            (far_mode != "cube" || r.img_dim == 3u) &&
+                            prosper::test::is_retained_ds_plane(r.gpu_addr)) {
+                            std::fill(texture_pixels.begin(), texture_pixels.end(), far_fill);
+                            static std::mutex far_mutex;
+                            static std::set<uint64_t> far_seen;
+                            static std::atomic<uint64_t> far_count{0};
+                            const uint64_t n = far_count.fetch_add(1) + 1;
+                            bool first = false;
+                            {
+                                std::lock_guard lock(far_mutex);
+                                first = far_seen.insert(r.gpu_addr).second;
+                            }
+                            if (first)
+                                fprintf(stderr,
+                                        "[ds-far] addr=0x%llx %ux%ux%u dim=%u filled 0x%02x "
+                                        "(unbridged retained DS plane; total=%llu)\n",
+                                        (unsigned long long)r.gpu_addr, tw, th, r.depth, r.img_dim,
+                                        (unsigned)far_fill, (unsigned long long)n);
+                            rtt_hit = true;   // do not overwrite it with a guest-byte decode below
+                            resource_rtt_hit = true;
                         }
                         bool cube_done = dcc_fast_clear_done && is_cube;
                         if (is_cube && !rtt_hit && !dcc_fast_clear_done) {
@@ -5460,41 +5668,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // the backbuffer, incremental HUD updates) composites OVER the earlier content instead
                 // of starting from the diagnostic clear. Real RT memory persists exactly this way.
                 static const bool seed_rtt = getenv("PROSPER_RTT_NOSEED") == nullptr;
+                // Pass grouping and same-pass feedback detection must not disagree about what an
+                // active binding is, so both go through frontends/shared/mrt_binding.hpp. These
+                // were duplicated lambdas; a second, looser copy in the feedback path classified
+                // stale named state as a live binding (#2550 review).
                 auto color_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-                    auto binding = draw.color_targets[slot];
-                    // DrawItem predates the complete array. Preserve direct callers and capture
-                    // versions through v33, whose first two attachments live in the named fields.
-                    if (!binding.base && !binding.width && !binding.height && slot == 0)
-                        binding = prosper::gpu::DrawItem::ColorTargetBinding{
-                            draw.color0_base, draw.color0_width, draw.color0_height};
-                    else if (!binding.base && !binding.width && !binding.height && slot == 1)
-                        binding = prosper::gpu::DrawItem::ColorTargetBinding{
-                            draw.color1_base, draw.color1_width, draw.color1_height};
-                    return binding;
+                    return prosper::frontend::mrt_color_binding(draw, slot);
                 };
                 auto active_format = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-                    uint32_t raw = draw.ps.color_targets[slot].format;
-                    if (slot == 0 && !raw) raw = draw.ps.color0_format;
-                    if (slot == 1 && !raw) raw = draw.ps.color1_format;
                     return prosper::test::backend_color_format(static_cast<VkFormat>(
-                        raw));
+                        prosper::frontend::mrt_raw_format(draw, slot)));
                 };
-                auto active_color = [&](const prosper::gpu::DrawItem& draw, uint32_t slot) {
-                    const auto binding = color_binding(draw, slot);
-                    const auto& target = draw.ps.color_targets[slot];
-                    uint32_t write_mask = target.write_mask;
-                    if (slot == 0 && !target.format && !draw.color_targets[slot].base)
-                        write_mask = draw.ps.color_write_mask;
-                    else if (slot == 1 && !target.format && !draw.color_targets[slot].base)
-                        write_mask = draw.ps.color1_write_mask;
-                    return write_mask && active_format(draw, slot) != VK_FORMAT_UNDEFINED &&
-                           binding.base ? binding.base : uint64_t{0};
+                auto active_color = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {
+                    return prosper::frontend::mrt_active_color(draw, slot, mrt_format_defined);
                 };
-                auto active_color_count = [&](const prosper::gpu::DrawItem& draw) {
-                    uint32_t count = 1;
-                    for (uint32_t slot = 1; slot < prosper::gpu::kColorTargetCount; ++slot)
-                        if (active_color(draw, slot)) count = slot + 1;
-                    return count;
+                auto active_color_count = [](const prosper::gpu::DrawItem& draw) {
+                    return prosper::frontend::mrt_active_color_count(draw, mrt_format_defined);
                 };
                 size_t pass_i = 0;
                 prosper::test::BackendSubmissionBatch backend_submission;
@@ -5514,6 +5703,162 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (timing_enabled) ++pending_timing.pass_groups_seen;
                     const uint64_t base = items[pass_i].color0_base;
                     const uint32_t requested_color_count = active_color_count(items[pass_i]);
+                    // PROSPER_MRT_CENSUS=1 — per slot, why an attachment did or did not become
+                    // active. A slot needs all three of base, a known format, and a non-zero write
+                    // mask; if any is absent the attachment is dropped silently and the draws that
+                    // wrote it produce nothing. On GTA V only c1 is ever published, while an exact
+                    // draw census shows 122,028 of 131,072 draws binding a colour target at SLOT 4 --
+                    // so one of these three is missing for that slot and nothing said which.
+                    if (PROSPER_ENV_ON("PROSPER_MRT_CENSUS")) {
+                        struct SlotCensus {
+                            std::atomic<uint64_t> seen{0}, has_base{0}, has_format{0},
+                                has_mask{0}, active{0};
+                        };
+                        static std::array<SlotCensus, prosper::gpu::kColorTargetCount> census;
+                        static std::atomic<uint64_t> groups{0};
+                        const auto& d = items[pass_i];
+                        for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+                            auto& c = census[slot];
+                            c.seen.fetch_add(1, std::memory_order_relaxed);
+                            if (color_binding(d, slot).base)
+                                c.has_base.fetch_add(1, std::memory_order_relaxed);
+                            if (active_format(d, slot) != VK_FORMAT_UNDEFINED)
+                                c.has_format.fetch_add(1, std::memory_order_relaxed);
+                            if (d.ps.color_targets[slot].write_mask ||
+                                (slot == 0 && d.ps.color_write_mask) ||
+                                (slot == 1 && d.ps.color1_write_mask))
+                                c.has_mask.fetch_add(1, std::memory_order_relaxed);
+                            // The per-slot mask the DrawItem CARRIES, against the one its own two
+                            // mask registers IMPLY. render_state.cpp computes the first as
+                            // (cb_target_mask & cb_shader_mask) >> (slot*4) & 0xf, so a disagreement
+                            // means the per-slot array did not survive the path that built this
+                            // DrawItem -- and the array is what decides whether the attachment
+                            // exists at all.
+                            {
+                                const uint32_t implied =
+                                    ((d.ps.cb_target_mask & d.ps.cb_shader_mask) >> (slot * 4u))
+                                    & 0xfu;
+                                const uint32_t carried = d.ps.color_targets[slot].write_mask;
+                                if (implied != carried && color_binding(d, slot).base) {
+                                    static std::mutex disagree_mutex;
+                                    static std::map<std::tuple<uint32_t, uint32_t, uint32_t>,
+                                                    uint64_t> disagree;
+                                    std::lock_guard lock(disagree_mutex);
+                                    if (disagree.size() < 48)
+                                        ++disagree[{slot, implied, carried}];
+                                    static uint64_t n = 0;
+                                    if (++n % 8192 == 0) {
+                                        fprintf(stderr,
+                                                "[mrt-mask-disagree] per-slot write_mask carried by "
+                                                "the DrawItem vs implied by its own registers:\n");
+                                        for (const auto& e : disagree)
+                                            fprintf(stderr,
+                                                    "[mrt-mask-disagree]   c%u implied=0x%x "
+                                                    "carried=0x%x  x%llu\n",
+                                                    std::get<0>(e.first), std::get<1>(e.first),
+                                                    std::get<2>(e.first),
+                                                    (unsigned long long)e.second);
+                                    }
+                                }
+                            }
+                            if (active_color(d, slot))
+                                c.active.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        // WHICH of the two masks is narrow. The write mask is
+                        // cb_target_mask & cb_shader_mask, and both default to 0xffffffff when the
+                        // register was never seen -- so a zero nibble means a register really was
+                        // programmed narrow, and the fix differs completely depending on which.
+                        // Histogrammed only over groups where slot 4 HAS a base, i.e. exactly the
+                        // population where the dropped attachment matters.
+                        if (color_binding(d, 4).base) {
+                            static std::mutex mask_mutex;
+                            static std::map<std::pair<uint32_t, uint32_t>, uint64_t> masks;
+                            std::lock_guard lock(mask_mutex);
+                            if (masks.size() < 64)
+                                ++masks[{d.ps.cb_target_mask, d.ps.cb_shader_mask}];
+                            static uint64_t reported = 0;
+                            if (++reported % 4096 == 0) {
+                                fprintf(stderr, "[mrt-census] masks where c4 has a base:\n");
+                                for (const auto& e : masks)
+                                    fprintf(stderr,
+                                            "[mrt-census]   cb_target_mask=0x%08x "
+                                            "cb_shader_mask=0x%08x -> effective=0x%08x  x%llu\n",
+                                            e.first.first, e.first.second,
+                                            e.first.first & e.first.second,
+                                            (unsigned long long)e.second);
+                            }
+                        }
+                        // The SHAPE of each distinct pass: its eight slot bases next to the two
+                        // mask registers. The aggregate above says how often a slot activates; it
+                        // cannot say which surfaces a given pass meant to write, which is what
+                        // "buffer X is sampled 23 times and never written" actually needs.
+                        {
+                            static std::mutex shape_mutex;
+                            static std::map<std::array<uint64_t, 10>, uint64_t> shapes;
+                            std::array<uint64_t, 10> shape{};
+                            for (uint32_t slot = 0; slot < 8u; ++slot)
+                                shape[slot] = color_binding(d, slot).base;
+                            shape[8] = d.ps.cb_target_mask;
+                            shape[9] = d.ps.cb_shader_mask;
+                            // PROSPER_MRT_SHAPE_FOR=0xADDR[,...] restricts recording to passes
+                            // whose slot-0 base is named. Without it the map fills with startup and
+                            // scanout passes long before the gameplay G-buffer pass appears, and an
+                            // unfiltered top-10 is then a list of the most FREQUENT shapes rather
+                            // than the ones being asked about.
+                            static const std::string shape_for =
+                                PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR")
+                                    ? PROSPER_ENV_VALUE("PROSPER_MRT_SHAPE_FOR") : "";
+                            bool shape_wanted = shape_for.empty();
+                            if (!shape_wanted && shape[0]) {
+                                char needle[24];
+                                std::snprintf(needle, sizeof needle, "0x%llx",
+                                              (unsigned long long)shape[0]);
+                                shape_wanted = shape_for.find(needle) != std::string::npos;
+                            }
+                            if (!shape_wanted) goto shape_done;
+                            {
+                            std::lock_guard lock(shape_mutex);
+                            if (shapes.size() < 96 || shapes.count(shape)) ++shapes[shape];
+                            static uint64_t shape_reports = 0;
+                            if (++shape_reports % (shape_for.empty() ? 8192 : 256) == 0) {
+                                std::vector<std::pair<uint64_t, std::array<uint64_t, 10>>> ranked;
+                                for (const auto& e : shapes) ranked.push_back({e.second, e.first});
+                                std::sort(ranked.begin(), ranked.end(),
+                                          [](const auto& a, const auto& b) {
+                                              return a.first > b.first; });
+                                fprintf(stderr, "[mrt-shape] %zu distinct pass shapes\n",
+                                        shapes.size());
+                                for (size_t i = 0; i < ranked.size() && i < 10; ++i) {
+                                    fprintf(stderr, "[mrt-shape]   x%-6llu tmask=0x%08llx "
+                                            "smask=0x%08llx bases:",
+                                            (unsigned long long)ranked[i].first,
+                                            (unsigned long long)ranked[i].second[8],
+                                            (unsigned long long)ranked[i].second[9]);
+                                    for (uint32_t slot = 0; slot < 8u; ++slot)
+                                        if (ranked[i].second[slot])
+                                            fprintf(stderr, " c%u=0x%llx", slot,
+                                                    (unsigned long long)ranked[i].second[slot]);
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+                            }
+                            shape_done: ;
+                        }
+                        const uint64_t g = groups.fetch_add(1) + 1;
+                        if ((g & (g - 1)) == 0 && g >= 4096) {
+                            fprintf(stderr, "[mrt-census] pass groups=%llu\n",
+                                    (unsigned long long)g);
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                                fprintf(stderr,
+                                        "[mrt-census]   c%u base=%llu format=%llu mask=%llu "
+                                        "ACTIVE=%llu\n",
+                                        slot,
+                                        (unsigned long long)census[slot].has_base.load(),
+                                        (unsigned long long)census[slot].has_format.load(),
+                                        (unsigned long long)census[slot].has_mask.load(),
+                                        (unsigned long long)census[slot].active.load());
+                        }
+                    }
                     std::array<uint64_t, prosper::gpu::kColorTargetCount> pass_bases{};
                     std::array<VkFormat, prosper::gpu::kColorTargetCount> pass_formats{};
                     for (uint32_t slot = 0; slot < requested_color_count; ++slot) {
@@ -6107,15 +6452,34 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     backend_target.load_existing1 = seed_rtt;
                     backend_target.readback1 = !defer_readback1;
                     backend_target.format1 = pass_format1;
+                    // Slots 2..7 retain across render groups on the same terms as slots 0 and 1.
+                    // A G-buffer built by several groups against one set of allocations otherwise
+                    // loses every group's work but the last, because slots above 1 were transient
+                    // images cleared per backend call.
+                    for (uint32_t slot = 2; slot < mrt_count; ++slot) {
+                        backend_target.persistent_id_slots[slot] = pass_bases[slot];
+                        backend_target.load_existing_slots[slot] = seed_rtt;
+                    }
                     auto backend_draws = build_bds(render_pass);
                     const auto build_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     prosper::test::BackendMrtOutputs mrt_outputs;
                     mrt_outputs.color_count = mrt_count;
+                    // The colour target is passed whenever ANY slot is bound, not colour-0 alone.
+                    // The same union the readback flag below already uses, and for the same reason
+                    // the comment there gives: a pass with colour-0 unbound and a higher slot bound
+                    // is reachable by construction. On `base != 0` alone such a pass populated
+                    // persistent_id_slots[2..7] and then handed the backend a nullptr, so those
+                    // active slots stayed transient and were cleared by the next group -- exactly
+                    // the defect the persistence contract exists to remove, reintroduced at the one
+                    // call site that decides whether the contract is used at all.
+                    const bool any_slot_bound = prosper::frontend::mrt_any_slot_bound(
+                        pass_bases.data(),
+                        static_cast<uint32_t>(std::min<size_t>(mrt_count, pass_bases.size())));
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed,
                         retained_uniform_clear ? retained_uniform_clear : clear_for(render_pass), true,
-                        live_gpu_targets && base ? &backend_target : nullptr,
+                        live_gpu_targets && any_slot_bound ? &backend_target : nullptr,
                         seed1, retained_uniform_clear1 ? retained_uniform_clear1
                             : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
                         nullptr,
@@ -6141,10 +6505,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // Keyed on the base rather than the draws' colour write masks for the
                         // separate reason that 457/457 is evidence about THIS route, and a future
                         // title could legally mix a colour-writing draw into a pass that has a base.
-                        /*want_color_readback=*/std::any_of(
-                            pass_bases.begin(),
-                            pass_bases.begin() + std::min<size_t>(mrt_count, pass_bases.size()),
-                            [](uint64_t slot_base) { return slot_base != 0; }));
+                        /*want_color_readback=*/any_slot_bound);
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
@@ -6184,6 +6545,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing.color_target_cached_bytes = color_target_call.cached_bytes;
                         pending_timing.color_target_cached_entries = color_target_call.cached_entries;
                     }
+                    static const std::string dump_spec =
+                        PROSPER_ENV_VALUE("PROSPER_DUMP_PASS")
+                            ? PROSPER_ENV_VALUE("PROSPER_DUMP_PASS") : "";
+                    static const int dump_pass_every =
+                        PROSPER_ENV_VALUE("PROSPER_DUMP_PASS_EVERY")
+                            ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
                     if (base && color_target_call.writes) {
                         RttSurf& surface = g_rtt[base];
@@ -6247,13 +6614,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     slot, (unsigned long long)pass_bases[slot],
                                     gw, gh, pass.size(), nz, rgb_nz);
                         }
+                        // PROSPER_DUMP_PASS covers slots 1..7 too. The first version dumped only
+                        // `base`, so the busiest target in GTA V's frame -- 0x2085de0000, written by
+                        // 130,290 of 131,072 draws, 96% of them in SLOT 4 -- could not be dumped at
+                        // all, and its absence read as "that pass does not run".
+                        if (!dump_spec.empty() && pass_bases[slot]) {
+                            char needle[24];
+                            std::snprintf(needle, sizeof needle, "0x%llx",
+                                          (unsigned long long)pass_bases[slot]);
+                            if (dump_spec.find(needle) != std::string::npos) {
+                                static std::map<uint64_t, int> slot_counted;
+                                if (slot_counted[pass_bases[slot]]++ % dump_pass_every == 0) {
+                                    const std::vector<uint8_t> shot = inspection_rgba8(
+                                        pixels, gw, gh, pass_formats[slot]);
+                                    const char* dir = getenv("PROSPER_FRAME_DIR");
+                                    char path[512];
+                                    std::snprintf(path, sizeof path, "%s/pass_%llx_s%u_%ux%u.bmp",
+                                                  dir ? dir : ".",
+                                                  (unsigned long long)pass_bases[slot], slot,
+                                                  gw, gh);
+                                    const size_t want = size_t(gw) * gh * 4;
+                                    const bool ok = shot.size() == want &&
+                                        prosper::test::dump_bmp(path, shot, gw, gh);
+                                    fprintf(stderr,
+                                            "[dump-pass] target=0x%llx slot=%u %ux%u src=%zuB -> %s\n",
+                                            (unsigned long long)pass_bases[slot], slot, gw, gh,
+                                            pixels.size(),
+                                            ok ? path : "NO CPU PIXELS (readback deferred)");
+                                }
+                            }
+                        }
                         RttSurf& surface = g_rtt[pass_bases[slot]];
                         surface.w = gw;
                         surface.h = gh;
                         surface.format = pass_formats[slot];
                         surface.has_uniform_color = false;
                         surface.dcc_metadata_dirty = false;
-                        surface.gpu_valid = slot == 1 &&
+                        // Any slot with a retained target is GPU-valid, not only slot 1. The
+                        // `slot == 1` clause dated from when slots above 1 had no persistent image
+                        // to be valid about.
+                        surface.gpu_valid =
                             prosper::test::find_persistent_color_target(
                                 pass_bases[slot], gw, gh, pass_formats[slot]) != nullptr;
                         if (!pixels.empty())
@@ -6366,6 +6766,49 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         backend_call_timing, color_target_call};
                     if (lightweight_rtt_timing) pending_rtt_timing.push_back(rtt_timing_record);
                     else if (timing_enabled && rtt_log) print_rtt_timing(rtt_timing_record);
+                    // PROSPER_DUMP_PASS=0xADDR[,0xADDR…] — write what a pass actually produced, as an
+                    // image, for the named targets. `rgb_nonblack` alone cannot answer "is the world
+                    // there": it is computed from an RGBA8 conversion, so an HDR f16 target whose
+                    // values are all below 1/255 reports EXACTLY ZERO while carrying a complete
+                    // scene. That is not hypothetical here — GTA V's 0x20431c0000 reports
+                    // rgb_nonblack=0 while the very next pass extracts 47.5% non-black from it, so
+                    // reading the metric as "black" is a false negative on the whole lighting stage.
+                    //
+                    // Overwrites one file per target so the last write is the latest frame, and
+                    // dumps every PROSPER_DUMP_PASS_EVERY-th occurrence (default 60) because a 4K
+                    // BMP is 24 MB and a routed boot renders each of these a few hundred times.
+                    {
+                        if (!dump_spec.empty() && base) {
+                            char needle[24];
+                            std::snprintf(needle, sizeof needle, "0x%llx",
+                                          (unsigned long long)base);
+                            if (dump_spec.find(needle) != std::string::npos) {
+                                static std::map<uint64_t, int> counted;
+                                if (counted[base]++ % dump_pass_every == 0) {
+                                    const std::vector<uint8_t> shot = inspection_rgba8(
+                                        rendered_pixels, gw, gh, pass_format);
+                                    const char* dir = getenv("PROSPER_FRAME_DIR");
+                                    char path[512];
+                                    std::snprintf(path, sizeof path, "%s/pass_%llx_%ux%u.bmp",
+                                                  dir ? dir : ".", (unsigned long long)base,
+                                                  gw, gh);
+                                    // Report the source size, not just the intent. A pass whose
+                                    // readback was deferred has EMPTY cpu pixels, and both this dump
+                                    // and `rgb_nonblack` are then reporting on nothing — which reads
+                                    // as "the target is black" rather than "we never looked".
+                                    const size_t want = size_t(gw) * gh * 4;
+                                    const bool ok = shot.size() == want &&
+                                        prosper::test::dump_bmp(path, shot, gw, gh);
+                                    fprintf(stderr,
+                                            "[dump-pass] target=0x%llx %ux%u src=%zuB rgba=%zuB/%zuB"
+                                            " -> %s\n",
+                                            (unsigned long long)base, gw, gh,
+                                            rendered_pixels.size(), shot.size(), want,
+                                            ok ? path : "NO CPU PIXELS (readback deferred)");
+                                }
+                            }
+                        }
+                    }
                     if (rtt_log) {
                         const std::vector<uint8_t> inspected = inspection_rgba8(
                             rendered_pixels, gw, gh, pass_format);

@@ -95,6 +95,56 @@ int main() {
     static_assert(mrt_extent_conflicts(1024, 32, 1920, 1080), "measured disagreement still truncates");
     static_assert(!mrt_extent_known(0, 0), "0x0 is the not-measured sentinel");
 
+        // #2550 review: the sparse-MRT gate. Two live-renderer decisions key on this -- whether the
+    // backend receives a BackendColorTarget at all, and whether colour pixels are asked for -- and
+    // both were once "is colour-0 bound". A pass with MRT0 unbound and MRT2 bound is reachable by
+    // construction, and on colour-0 alone it populated the per-slot persistence contract and then
+    // handed the backend a nullptr, leaving those slots transient and cleared by the next group.
+    {
+        const uint64_t none[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const uint64_t mrt0_only[8] = {0x2050000000ull, 0, 0, 0, 0, 0, 0, 0};
+        const uint64_t mrt2_without_mrt0[8] = {0, 0, 0x2083e00000ull, 0, 0, 0, 0, 0};
+        // A depth-only pass binds no colour slot -- the "skip the work" case the readback flag
+        // exists for, which must stay skipped.
+        CHECK(!prosper::frontend::mrt_any_slot_bound(none, 8));
+        CHECK(prosper::frontend::mrt_any_slot_bound(mrt0_only, 8));
+        // The case colour-0-alone got wrong.
+        CHECK(prosper::frontend::mrt_any_slot_bound(mrt2_without_mrt0, 8));
+        // Only the ACTIVE prefix counts: a base outside mrt_count is a stale register, not a bound
+        // attachment.
+        CHECK(!prosper::frontend::mrt_any_slot_bound(mrt2_without_mrt0, 1));
+        CHECK(prosper::frontend::mrt_any_slot_bound(mrt2_without_mrt0, 3));
+        CHECK(!prosper::frontend::mrt_any_slot_bound(nullptr, 8));
+        CHECK(!prosper::frontend::mrt_any_slot_bound(mrt0_only, 0));
+    }
+
+    // #2550 review round 3: same-pass render-target feedback. Both the backend's descriptor borrow
+    // and the frontend's direct-live sampling decision ask "is this sampled surface one I am
+    // writing", and both once asked it of slots 0 and 1 only. Now that a higher slot's image is
+    // persistent and sampled-capable, missing it means one VkImage is bound as shader-read and
+    // colour-attachment at once, bypassing the CPU fallback that exists for exactly this case.
+    {
+        const uint64_t bases[8] = {0x2050000000ull, 0, 0x2083e00000ull, 0, 0, 0, 0, 0};
+        const bool all_active[8] = {true, true, true, true, true, true, true, true};
+        CHECK(prosper::frontend::mrt_target_feedback(bases, all_active, 8, 0x2050000000ull));
+        // The case slots-0-and-1-only got wrong.
+        CHECK(prosper::frontend::mrt_target_feedback(bases, all_active, 8, 0x2083e00000ull));
+        CHECK(!prosper::frontend::mrt_target_feedback(bases, all_active, 8, 0x2099cc0000ull));
+        // Only the active prefix, and only ACTIVE slots: a stale base with a zero write mask is not
+        // a target and must not suppress a legitimate direct-live borrow.
+        CHECK(!prosper::frontend::mrt_target_feedback(bases, all_active, 2, 0x2083e00000ull));
+        const bool slot2_inactive[8] = {true, true, false, true, true, true, true, true};
+        CHECK(!prosper::frontend::mrt_target_feedback(bases, slot2_inactive, 8, 0x2083e00000ull));
+        // A zero sampled id never collides, and neither do null tables.
+        CHECK(!prosper::frontend::mrt_target_feedback(bases, all_active, 8, 0));
+        CHECK(!prosper::frontend::mrt_target_feedback(nullptr, all_active, 8, 0x2050000000ull));
+        CHECK(!prosper::frontend::mrt_target_feedback(bases, nullptr, 8, 0x2050000000ull));
+    }
+
+    // Printed LAST, after every check above has run. It sat before the checks added in the
+    // #2550 review rounds, so a new failure exited non-zero while still reporting OK --
+    // the third instance in this branch of a success signal placed ahead of the work it
+    // claims to describe.
     if (failures == 0) std::printf("mrt_extent: OK\n");
     return failures == 0 ? 0 : 1;
 }

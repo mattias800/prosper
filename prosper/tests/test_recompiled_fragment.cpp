@@ -260,6 +260,40 @@ int main() {
     CHECK(!recompile_fragment(astro_partial_ps, std::size(astro_partial_ps)).empty(),
           "#825: recompiled Astro Bot's partial-EN fragment shader");
 
+    // Five-MRT export (#GTA5 G-buffer). EXP encoding: EN in bits[3:0], TARGET in bits[9:4],
+    // COMPR bit10, DONE bit11, VM bit12; MRT0..MRT7 are targets 0..7. Each export names v0 for all
+    // four channels (second dword 0), so the shader is a legal minimal five-target G-buffer writer.
+    //
+    // This is the regression for the defect that hid GTA V's entire 3D world: the fragment shell's
+    // colour-output array, the export-mask decoder and the emit-side `exported` array were all sized
+    // 2, so exports to MRT2+ were discarded. The live executor then does
+    // `write_mask &= (exp_mask >> slot*4) & 0xf` per slot, which turned every slot above 1 into a
+    // zero write mask -- the attachment was dropped no matter what CB_TARGET_MASK said.
+    //
+    // The mask below is the arm that fails without the fix: the old two-slot decoder can only ever
+    // return 0x000000ff, so asserting the full five-nibble value cannot pass by coincidence.
+    const uint32_t five_mrt_ps[] = {
+        0x7E000280u,                 // v_mov_b32 v0, 0
+        0xF800100Fu, 0x00000000u,    // exp mrt0 v0,v0,v0,v0   EN=0xf vm
+        0xF800101Fu, 0x00000000u,    // exp mrt1
+        0xF800102Fu, 0x00000000u,    // exp mrt2
+        0xF800103Fu, 0x00000000u,    // exp mrt3
+        0xF800184Fu, 0x00000000u,    // exp mrt4 ... done
+        0xBF810000u,                 // s_endpgm
+    };
+    const uint32_t five_mrt_mask =
+        fragment_color_export_mask(five_mrt_ps, std::size(five_mrt_ps));
+    printf("  five-MRT export mask = 0x%08x (want 0x000fffff)\n", five_mrt_mask);
+    CHECK(five_mrt_mask == 0x000fffffu,
+          "five-MRT fragment reports EN for MRT0..MRT4");
+    // Slots 2..4 specifically -- the ones the old array size could not represent. Stated separately
+    // so a future change that widens the array but breaks the shift still fails on the right claim.
+    CHECK(((five_mrt_mask >> 8) & 0xfu) == 0xfu, "five-MRT fragment: MRT2 has a full write mask");
+    CHECK(((five_mrt_mask >> 12) & 0xfu) == 0xfu, "five-MRT fragment: MRT3 has a full write mask");
+    CHECK(((five_mrt_mask >> 16) & 0xfu) == 0xfu, "five-MRT fragment: MRT4 has a full write mask");
+    CHECK(!recompile_fragment(five_mrt_ps, std::size(five_mrt_ps)).empty(),
+          "five-MRT fragment recompiles to a module with five colour outputs");
+
     const uint32_t astro_ngg_vs[] = {
         0xBFA00001u, 0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu,
         0x8F6A8C6Au, 0x887C6A6Bu, 0xBF800000u, 0xBF900009u, 0x906A8803u,
@@ -855,17 +889,37 @@ int main() {
             0xF800180Fu, 0x07060504u,                             // exp mrt0 v4,v5,v6,v7
             0xBF810000u,                                          // s_endpgm
         };
+        // Rendered with FOUR attachments, which is what a shader exporting MRT3 is paired with in a
+        // real frame. It used to render into a single attachment, and that was only harmless while
+        // the recompiler silently dropped MRT3: once the shell carries eight outputs the module
+        // legitimately writes Location 3, and a one-attachment pass makes that write unused --
+        // caught by tools/vkval as `Undefined-Value-ShaderOutputNotConsumed`. Widening the pass is
+        // the faithful fix and strengthens the assertion: MRT0's blue must land on attachment 0 AND
+        // MRT3's red on attachment 3, which pins the mapping in both directions rather than only
+        // proving color0 is not red.
         std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
         CHECK(!frg.empty(), "#566: recompiled descending-order 4-MRT (MRT3 then MRT0) PS -> SPIR-V");
         if (!frg.empty()) {
-            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
-            CHECK(px2.size() == (size_t)W*H*4, "rendered the MRT-order PS");
-            if (px2.size() == (size_t)W*H*4) {
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = frg;
+            const float black[4] = {0, 0, 0, 1};
+            prosper::test::BackendMrtOutputs outputs;
+            outputs.color_count = 4;
+            std::vector<uint8_t> px2 = prosper::test::render_draws_rgba(
+                {draw}, W, H, nullptr, black, false, nullptr, nullptr, black, nullptr, nullptr,
+                true, &outputs);
+            const size_t want = (size_t)W * H * 4;
+            CHECK(px2.size() == want && outputs.colors[3].size() == want,
+                  "rendered the MRT-order PS into four attachments");
+            if (px2.size() == want && outputs.colors[3].size() == want) {
                 const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
-                printf("  mrt-order center=(%u,%u,%u,%u) expect BLUE (MRT0), not RED (MRT3)\n",
-                       cc[0],cc[1],cc[2],cc[3]);
+                const uint8_t* c3 = &outputs.colors[3][((size_t)(H/2) * W + W/2) * 4];
+                printf("  mrt-order attachment0=(%u,%u,%u,%u) attachment3=(%u,%u,%u,%u)\n",
+                       cc[0],cc[1],cc[2],cc[3], c3[0],c3[1],c3[2],c3[3]);
                 CHECK(cc[2] > 0x80 && cc[0] < 0x40,
                       "#566: color0 receives MRT0 (BLUE), not the first-emitted MRT3 (RED)");
+                CHECK(c3[0] > 0x80 && c3[2] < 0x40,
+                      "#566: MRT3's RED lands on attachment 3, not discarded and not on color0");
             }
         }
     }
@@ -902,12 +956,164 @@ int main() {
             }
         }
 
+        // Slots 2..7 must RETAIN across render groups (#2550 review). Before persistence they were
+        // transient images created per backend call with LOAD_OP_CLEAR, so a G-buffer assembled by
+        // several groups against one set of allocations kept only the last group's work. GTA V's
+        // G-buffer accumulates across roughly sixteen groups per frame, so this was the difference
+        // between three complete attachments and three attachments holding one group each.
+        //
+        // Two groups against ONE persistent slot-2 id: the first writes red to MRT2, the second
+        // writes only MRT0 and must leave MRT2 alone. The negative arm below re-runs the second
+        // group with load_existing off and requires MRT2 to come back cleared -- without it, a test
+        // that never loads would pass just as happily on a backend that never clears.
+        const uint32_t mrt0_and_mrt2[] = {
+            0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,   // v0..3 = GREEN
+            0xF800100Fu, 0x03020100u,                             // exp mrt0  (vm)
+            0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,   // v4..7 = RED
+            0xF800182Fu, 0x07060504u,                             // exp mrt2  (vm, done)
+            0xBF810000u,
+        };
+        const uint32_t mrt0_only[] = {
+            0x7E000280u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u,   // v0..3 = BLUE
+            0xF800180Fu, 0x03020100u,                             // exp mrt0  (vm, done)
+            0xBF810000u,
+        };
+        std::vector<uint32_t> frg_a = recompile_fragment(mrt0_and_mrt2, std::size(mrt0_and_mrt2));
+        std::vector<uint32_t> frg_b = recompile_fragment(mrt0_only, std::size(mrt0_only));
+        CHECK(!frg_a.empty() && !frg_b.empty(),
+              "#2550: MRT0+MRT2 and MRT0-only fragment shaders both recompile");
+        if (!frg_a.empty() && !frg_b.empty()) {
+            const float black[4] = {0, 0, 0, 1};
+            auto run_group = [&](const std::vector<uint32_t>& fs, uint64_t slot2_id,
+                                 bool load_existing, std::vector<uint8_t>& slot2_out) {
+                prosper::test::BackendDraw draw;
+                draw.vs = vert; draw.fs = fs;
+                prosper::test::BackendColorTarget target{};
+                target.persistent_id_slots[2] = slot2_id;
+                target.load_existing_slots[2] = load_existing;
+                prosper::test::BackendMrtOutputs outputs;
+                outputs.color_count = 3;
+                prosper::test::render_draws_rgba({draw}, W, H, nullptr, black, false, &target,
+                                                 nullptr, black, nullptr, nullptr, true, &outputs);
+                slot2_out = std::move(outputs.colors[2]);
+            };
+            constexpr uint64_t kSlot2Id = 0x20aa2200ull;
+            std::vector<uint8_t> first, second, cleared;
+            run_group(frg_a, kSlot2Id, true, first);
+            run_group(frg_b, kSlot2Id, true, second);
+            const size_t px = (size_t)W * H * 4;
+            CHECK(first.size() == px && second.size() == px,
+                  "#2550: slot 2 reads back at full extent from both render groups");
+            if (first.size() == px && second.size() == px) {
+                const uint8_t* f = &first[((size_t)(H / 2) * W + W / 2) * 4];
+                const uint8_t* g = &second[((size_t)(H / 2) * W + W / 2) * 4];
+                printf("  slot2 group1=(%u,%u,%u) group2=(%u,%u,%u)\n",
+                       f[0], f[1], f[2], g[0], g[1], g[2]);
+                CHECK(f[0] > 0xC0 && f[1] < 0x40 && f[2] < 0x40,
+                      "#2550: group 1 writes RED to the retained MRT2 attachment");
+                CHECK(g[0] > 0xC0 && g[1] < 0x40 && g[2] < 0x40,
+                      "#2550: group 2 does NOT clear MRT2 -- the first group's pixels survive");
+            }
+            // Negative arm: the same second group with load_existing off must come back cleared, so
+            // the assertion above is demonstrably sensitive to the LOAD and not to the backend
+            // simply never touching the attachment.
+            run_group(frg_a, kSlot2Id + 0x1000, true, first);
+            run_group(frg_b, kSlot2Id + 0x1000, false, cleared);
+            // Assert the extent, do not merely gate on it. A regression that makes the no-load call
+            // fail and return an EMPTY buffer would otherwise skip the only assertion in this arm
+            // and take the negative control down with it, silently.
+            CHECK(cleared.size() == px,
+                  "#2550: the no-load arm reads back at full extent (its assertion cannot be "
+                  "skipped by an empty result)");
+            if (cleared.size() == px) {
+                const uint8_t* c = &cleared[((size_t)(H / 2) * W + W / 2) * 4];
+                printf("  slot2 no-load group2=(%u,%u,%u)\n", c[0], c[1], c[2]);
+                CHECK(c[0] < 0x40,
+                      "#2550: with load_existing off the second group DOES clear MRT2");
+            }
+        }
+
+        // The backend colour-format mapping that frontends/shared/mrt_binding.hpp's active-binding
+        // rule depends on. It is TOTAL: every unrecognised raw value, zero included, maps to
+        // R8G8B8A8_UNORM, so the format term in that rule never rejects a slot. Pinned here, in a
+        // test that actually links the backend, because mrt_binding's own test must model the
+        // predicate rather than call it -- and a silently narrowed mapping would invalidate that
+        // model instead of failing.
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_UNDEFINED) ==
+                  VK_FORMAT_R8G8B8A8_UNORM,
+              "#2550: an undefined colour format maps to the RGBA8 fallback, it is not rejected");
+        CHECK(prosper::test::backend_color_format(static_cast<VkFormat>(0x7fffffff)) ==
+                  VK_FORMAT_R8G8B8A8_UNORM,
+              "#2550: the backend colour-format mapping is total");
+
+        // #2550 review round 3: the depth-feedback splitter's per-segment contract. A logical
+        // five-MRT pass that splits at a depth write->sample transition handed every pre-final
+        // segment `mrt_outputs == nullptr`, so those segments rendered with ONE attachment and
+        // discarded their MRT1..4 exports -- the same accumulation loss this PR fixes at the
+        // frontend's pass groups, reappearing at the backend's own physical boundary.
+        {
+            prosper::test::BackendColorTarget whole{};
+            whole.persistent_id = 0x2050000000ull;
+            whole.persistent_id_slots[2] = 0x2083e00000ull;
+            prosper::test::BackendMrtOutputs whole_mrt;
+            whole_mrt.color_count = 5;
+
+            const auto first_seg = prosper::test::split_segment_contract(
+                &whole, &whole_mrt, /*first=*/true, /*final=*/false);
+            const auto mid_seg = prosper::test::split_segment_contract(
+                &whole, &whole_mrt, /*first=*/false, /*final=*/false);
+            const auto last_seg = prosper::test::split_segment_contract(
+                &whole, &whole_mrt, /*first=*/false, /*final=*/true);
+
+            // The shape is identical across segments. This is the blocker: it used to be 1 for
+            // every segment but the last.
+            CHECK(first_seg.color_count == 5 && mid_seg.color_count == 5 &&
+                      last_seg.color_count == 5,
+                  "#2550: every segment of a split pass renders the same MRT shape");
+            // Later segments LOAD every slot, or they erase their predecessors' work.
+            CHECK(!first_seg.target.load_existing_slots[2] || whole.load_existing_slots[2],
+                  "#2550: the first segment does not force a load it was not asked for");
+            CHECK(mid_seg.target.load_existing_slots[2] && last_seg.target.load_existing_slots[2] &&
+                      mid_seg.target.load_existing && mid_seg.target.load_existing1,
+                  "#2550: every later segment loads every persistent slot");
+            // A non-final segment discards its own slot-0 pixels but must COPY OUT everything it
+            // may have to carry -- slot 1 and every active slot 2+ -- or the next segment has
+            // nothing to be seeded with. Asserted on the value the helper returns, which is the
+            // value the segment actually renders under: an earlier version left this decision to
+            // the caller, so this assertion read `non-final segments read back no slot` and
+            // documented the opposite of the effective contract.
+            CHECK(!first_seg.target.readback && !mid_seg.target.readback,
+                  "#2550: a non-final segment does not copy out slot 0");
+            CHECK(first_seg.target.readback_slots[2] && mid_seg.target.readback_slots[2] &&
+                      first_seg.target.readback1 && mid_seg.target.readback1,
+                  "#2550: a non-final segment copies out every slot it may have to carry");
+            // Slots outside the active prefix are not touched.
+            CHECK(!first_seg.target.readback_slots[5],
+                  "#2550: a slot beyond color_count is not read back");
+            CHECK(last_seg.target.readback_slots[2] && last_seg.target.readback,
+                  "#2550: the final segment keeps the caller's readback contract");
+            // The persistent identities must survive unchanged, or later segments would retain a
+            // different image than the one they are accumulating into.
+            CHECK(mid_seg.target.persistent_id_slots[2] == 0x2083e00000ull &&
+                      mid_seg.target.persistent_id == 0x2050000000ull,
+                  "#2550: a segment keeps the whole pass's persistent identities");
+        }
+
+        // MRT3-only. This asserted `.empty()` until 2026-08-15, when the fragment shell's colour
+        // outputs went from 2 to 8 -- MRT3 is now genuinely supported, so rejecting it would be the
+        // defect rather than the guard. The original concern was never "MRT3 must fail"; it was that
+        // MRT3 must not be silently REMAPPED onto color0, which is what a naive widening would do
+        // and what the mask assertion below forbids directly: slot 3 set, slot 0 clear.
         const uint32_t mrt3_only[] = {
             0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
             0xF800183Fu, 0x03020100u, 0xBF810000u,
         };
-        CHECK(recompile_fragment(mrt3_only, std::size(mrt3_only)).empty(),
-              "#635: unsupported MRT3-only export stays fail-visible instead of remapping to color0");
+        CHECK(!recompile_fragment(mrt3_only, std::size(mrt3_only)).empty(),
+              "#635: MRT3-only export recompiles now that the shell carries eight colour outputs");
+        const uint32_t mrt3_mask = fragment_color_export_mask(mrt3_only, std::size(mrt3_only));
+        printf("  MRT3-only export mask = 0x%08x (want 0x0000f000)\n", mrt3_mask);
+        CHECK(mrt3_mask == 0x0000f000u,
+              "#635: MRT3-only export lands on slot 3 and does NOT remap onto color0");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
