@@ -2568,6 +2568,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 : prosper::test::PersistentDsSampled{};
                         const bool has_ds_live = sampled_ds.image != nullptr;
                         resource_has_ds_live = has_ds_live;
+                        // A binding rejected by the gate above never reaches the lookup, so it is
+                        // absent from every statistic the lookup keeps -- it reads as "we hold no
+                        // such surface" when we may hold it and be perfectly valid. Name the
+                        // failing sub-condition, once per (address, reason).
+                        if (PROSPER_ENV_ON("PROSPER_DSBRIDGE_LOG") && !has_ds_live) {
+                            uint32_t held_w = 0, held_h = 0;
+                            if (!(!has_live_rtt && !fr.is_storage_image && r.img_dim == 1u &&
+                                  r.cls == RC::Texture) &&
+                                prosper::test::is_retained_ds_plane(r.gpu_addr, &held_w, &held_h)) {
+                                static std::mutex gate_mutex;
+                                static std::set<std::pair<uint64_t, int>> reported;
+                                const int reason = has_live_rtt ? 0
+                                    : fr.is_storage_image ? 1
+                                    : r.img_dim != 1u ? 2 : 3;
+                                bool first = false;
+                                {
+                                    std::lock_guard lock(gate_mutex);
+                                    first = reported.emplace(r.gpu_addr, reason).second;
+                                }
+                                if (first)
+                                    fprintf(stderr,
+                                            "[dsbridge] GATED addr=0x%llx T#=%ux%ux%u dim=%u "
+                                            "cls=%u fmt=%u (retained DS %ux%u) never reached the "
+                                            "lookup: %s\n",
+                                            (unsigned long long)r.gpu_addr, tw, th, r.depth,
+                                            r.img_dim, (unsigned)r.cls, (unsigned)r.format,
+                                            held_w, held_h,
+                                            reason == 0 ? "has_live_rtt (colour cache claims it)"
+                                            : reason == 1 ? "is_storage_image"
+                                            : reason == 2 ? "img_dim != 1 (not a plain 2D view)"
+                                                          : "cls != Texture");
+                            }
+                        }
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = PROSPER_ENV_VALUE("PROSPER_PITCH")
@@ -3806,6 +3839,58 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             (unsigned long long)metadata_bytes,
                                             metadata_got ? metadata[0] : 0u);
                             }
+                        }
+                        // PROSPER_DS_UNBRIDGED_FAR=1 — DIAGNOSTIC ONLY, never a shipped default.
+                        //
+                        // A depth surface prosper rendered into a retained DS image but could not
+                        // bridge decodes from guest memory the renderer never wrote, i.e. zeros. For
+                        // a shadow map zero is the NEAR plane, so every shadow test reads "occluded"
+                        // and the lighting pass outputs black over a perfectly good G-buffer. Filling
+                        // with far instead flips that to "unoccluded", which is equally wrong as
+                        // output but is a decisive discriminator: if the scene lights up, the
+                        // unbridged depth surface is the cause; if it does not, the hypothesis is
+                        // dead and no cube-assembly work is justified. It detects its own invalidity
+                        // in both directions, and it reports whether it fired at all.
+                        //
+                        // TWO POLES, and which one means "unoccluded" is not knowable a priori: a
+                        // reversed-Z depth buffer stores near at 1.0, so filling 0xff is the SAME
+                        // claim as the zeros it was meant to contradict. The experiment is only
+                        // decisive if both poles are run, so the fill byte is a parameter
+                        // (PROSPER_DS_UNBRIDGED_FILL, default 0xff) rather than a constant.
+                        //
+                        // Restricted to cubes by PROSPER_DS_UNBRIDGED_FAR=cube. The first run filled
+                        // every unbridged retained DS plane including the main 4K depth, which is
+                        // depth-tested against by the HUD -- the radar vanished, so the arm measured
+                        // the confound as much as the subject.
+                        static const std::string far_mode =
+                            PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FAR")
+                                ? PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FAR") : "";
+                        static const uint8_t far_fill = PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FILL")
+                            ? static_cast<uint8_t>(strtoul(
+                                  getenv("PROSPER_DS_UNBRIDGED_FILL"), nullptr, 0))
+                            : 0xffu;
+                        if (!rtt_hit && !has_ds_live && !fr.is_storage_image &&
+                            !far_mode.empty() && far_mode != "0" &&
+                            (far_mode != "cube" || r.img_dim == 3u) &&
+                            prosper::test::is_retained_ds_plane(r.gpu_addr)) {
+                            std::fill(texture_pixels.begin(), texture_pixels.end(), far_fill);
+                            static std::mutex far_mutex;
+                            static std::set<uint64_t> far_seen;
+                            static std::atomic<uint64_t> far_count{0};
+                            const uint64_t n = far_count.fetch_add(1) + 1;
+                            bool first = false;
+                            {
+                                std::lock_guard lock(far_mutex);
+                                first = far_seen.insert(r.gpu_addr).second;
+                            }
+                            if (first)
+                                fprintf(stderr,
+                                        "[ds-far] addr=0x%llx %ux%ux%u dim=%u filled 0x%02x "
+                                        "(unbridged retained DS plane; total=%llu)\n",
+                                        (unsigned long long)r.gpu_addr, tw, th, r.depth, r.img_dim,
+                                        (unsigned)far_fill, (unsigned long long)n);
+                            rtt_hit = true;   // do not overwrite it with a guest-byte decode below
+                            resource_rtt_hit = true;
                         }
                         bool cube_done = dcc_fast_clear_done && is_cube;
                         if (is_cube && !rtt_hit && !dcc_fast_clear_done) {

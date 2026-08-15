@@ -2544,6 +2544,27 @@ struct PersistentDsSampled {
     // plane (VUID-VkDescriptorImageInfo-imageView-01976).
     VkImageAspectFlagBits aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
 };
+// Addresses that matched a live DS surface and were still declined, with why. Separate from the
+// counters because an aggregate names a volume, never a fix.
+inline std::unordered_map<uint64_t, std::pair<std::string, uint64_t>>& per_address_misses() {
+    static std::unordered_map<uint64_t, std::pair<std::string, uint64_t>> misses;
+    return misses;
+}
+// Is this address a depth or stencil plane of ANY retained DS surface, at any extent? Used to tell
+// "we hold nothing here" apart from "we hold it and something upstream never asked", which the
+// bridge's own counters cannot distinguish: a binding rejected by the caller's gate never reaches
+// the lookup and so is invisible to every statistic the lookup keeps.
+inline bool is_retained_ds_plane(uint64_t addr, uint32_t* w = nullptr, uint32_t* h = nullptr) {
+    if (!addr) return false;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        (void)image;
+        if (key.dr != addr && key.dw != addr && key.sr != addr && key.sw != addr) continue;
+        if (w) *w = key.w;
+        if (h) *h = key.h;
+        return true;
+    }
+    return false;
+}
 inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t width,
                                                       uint32_t height,
                                                       uint32_t render_scale = 1,
@@ -2594,6 +2615,7 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
             // "the surface is here and we declined it" -- they call for opposite fixes.
             bool matched_plane = false, extent_bad = false, uninit = false;
             bool depth_req = false, stencil_req = false;
+            uint32_t cached_w = 0, cached_h = 0;
             for (const auto& [key, image] : persistent_ds_cache()) {
                 const bool d = key.dr == addr || key.dw == addr;
                 const bool st = key.sr == addr || key.sw == addr;
@@ -2602,18 +2624,47 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
                 if (!prosper::frontend::rtt_sampled_extent_compatible(
                         width, height, key.w, key.h, render_scale, normalized_sampling)) {
                     extent_bad = true;
+                    cached_w = key.w;
+                    cached_h = key.h;
                     continue;
                 }
                 if (!image.layout_initialized || !image.image) { uninit = true; continue; }
                 if (d && !image.depth_valid) depth_req = true;
                 if (st && !image.stencil_valid) stencil_req = true;
             }
-            if (!matched_plane) stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed);
-            else if (extent_bad) stats.miss_extent.fetch_add(1, std::memory_order_relaxed);
-            else if (uninit) stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed);
-            else if (stencil_req)
+            const char* why = nullptr;
+            if (!matched_plane) { stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed); }
+            else if (extent_bad) { stats.miss_extent.fetch_add(1, std::memory_order_relaxed);
+                                   why = "extent"; }
+            else if (uninit) { stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed);
+                               why = "uninitialized"; }
+            else if (stencil_req) {
                 stats.miss_stencil_invalid.fetch_add(1, std::memory_order_relaxed);
-            else if (depth_req) stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed);
+                why = "stencil-invalid"; }
+            else if (depth_req) { stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed);
+                                  why = "depth-invalid"; }
+            // Per-ADDRESS, because an aggregate cannot name the fix. A run reporting
+            // "depth-invalid=1089" says a thousand bindings declined; it does not say whether that
+            // is one surface declining a thousand times or a thousand surfaces declining once, and
+            // those are different defects. Only addresses that DID match a live surface are kept --
+            // the no-entry bucket is unbounded and is genuinely just "not ours".
+            if (why) {
+                static std::mutex reason_mutex;
+                std::lock_guard lock(reason_mutex);
+                auto& per = per_address_misses();
+                if (per.size() < 256 || per.count(addr)) {
+                    auto& row = per[addr];
+                    char detail[96];
+                    if (extent_bad)
+                        std::snprintf(detail, sizeof detail,
+                                      "extent (T# wants %ux%u, retained image is %ux%u)",
+                                      width, height, cached_w, cached_h);
+                    else
+                        std::snprintf(detail, sizeof detail, "%s", why);
+                    row.first = detail;
+                    ++row.second;
+                }
+            }
         }
         const uint64_t n = stats.calls.fetch_add(1) + 1;
         if ((n & (n - 1)) == 0 && n >= 1024) {
@@ -2629,6 +2680,32 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
                     (unsigned long long)stats.miss_stencil_invalid.load(),
                     (unsigned long long)stats.miss_extent.load(),
                     (unsigned long long)stats.miss_uninitialized.load());
+            std::vector<std::pair<uint64_t, std::pair<std::string, uint64_t>>> ranked;
+            {
+                static std::mutex reason_mutex_read;
+                std::lock_guard lock(reason_mutex_read);
+                for (const auto& e : per_address_misses()) ranked.push_back(e);
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+            for (size_t i = 0; i < ranked.size() && i < 12; ++i)
+                fprintf(stderr, "[dsbridge]   declined addr=0x%llx reason=%s x%llu\n",
+                        (unsigned long long)ranked[i].first, ranked[i].second.first.c_str(),
+                        (unsigned long long)ranked[i].second.second);
+            // The whole retained set, because "no-entry" is the largest miss bucket and it is the
+            // one an address list cannot describe: it says an address is not a plane of anything we
+            // hold, and the useful question is then WHAT we hold. A surface the guest samples as
+            // depth that never appears here was never rendered into a retained DS image at all,
+            // which is a different defect from one we hold and decline.
+            fprintf(stderr, "[dsbridge]   retained DS surfaces: %zu\n",
+                    persistent_ds_cache().size());
+            for (const auto& [key, image] : persistent_ds_cache())
+                fprintf(stderr,
+                        "[dsbridge]     dr=0x%llx dw=0x%llx sr=0x%llx sw=0x%llx %ux%u fmt=%u "
+                        "dvalid=%d svalid=%d\n",
+                        (unsigned long long)key.dr, (unsigned long long)key.dw,
+                        (unsigned long long)key.sr, (unsigned long long)key.sw,
+                        key.w, key.h, key.fmt, (int)image.depth_valid, (int)image.stencil_valid);
         }
     }
     if (best.image) return best;
