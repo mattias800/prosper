@@ -312,6 +312,47 @@ zero-extent. `num_records = 0` then follows from dword2 being absent, and `size 
 `unresolved-operand` from that. **That is the next thing to test**, and it is a different defect from
 anything this document has chased: not a wrong descriptor, a half-read one.
 
+## THE UNIFYING CAUSE: GTA V recycles VCC_LO as a general scalar register (2026-08-15)
+
+The BVH descriptor at the rejecting instruction is **built in the shader**, and it is built through
+VCC_LO. `0x205b654a00` pc1180 is `image_bvh_intersect_ray` with its descriptor in `s[16:19]`:
+
+```
+pc1171  s19  = <computed>
+pc1174  s106 = s19 & 0x000003ff            ; VCC_LO as scalar scratch
+pc1176  s17  = <computed>
+pc1177  s19  = s106 | 0x81000000           ; and back out of VCC_LO
+pc1179  s_waitcnt
+pc1180  image_bvh_intersect_ray  v[0..], v6, s[16:19], s[0..]
+```
+
+`(x & 0x3ff) | 0x81000000` is the BVH descriptor's dword3 — its size-high bits and type field. **The
+descriptor cannot resolve unless the const-fold tracks a value through VCC_LO.**
+
+That is the same obstacle as everywhere else in this title:
+
+| site | what VCC_LO carries | consequence |
+| --- | --- | --- |
+| `0x205b654a00` pc1174/1177 | the BVH descriptor's dword3 | `image_bvh_intersect_ray` rejects, the ray-tracing pass never compiles |
+| `0x413ce6000` pc149 | `s_mulk_i32 s106, 120`, the descriptor-array selector | `buffer_load_dwordx3` at pc156 rejects |
+| `0x413ce6000` pc84/90 | integer scratch inside an execz arm | the structurizer's VCC-half liveness guard rejects (cleared on this branch) |
+| GTA V generally | `is_gtav_wave64_vcc_lo_scalar_cselect` exists precisely for this | already a known pattern in the code |
+
+**prosper models VCC specially in each place independently — the liveness proof, the scalar-scratch
+recogniser, the descriptor const-fold — and each place has its own, narrower notion of which VCC
+writes count as data.** `is_wave64_vcc_lo_scalar_b32_candidate` admits exactly `s_cselect_b32` with
+inline operands and SOP2 B32 logicals. `s_mulk_i32` (SOPK) is not in it. Neither is the
+`s_and_b32`/`s_or_b32` pair above being tracked *through* to a descriptor.
+
+**This is the frontier.** Not the tree builder, whose lowering is proven correct by eleven perfect
+submits; and not a missing producer, which is falsified. A single coherent treatment of "VCC_LO used
+as an ordinary scalar register" — one recogniser consulted by the liveness proof, the scalar model
+and the const-fold alike — is what the remaining rejects have in common.
+
+`CONFIDENCE: MED` on that being sufficient. It is established that the descriptor passes through
+VCC_LO and that prosper's VCC recognisers do not cover these shapes; it is *not* established that
+covering them is enough to make either program compile, because neither has been tried.
+
 ## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
 
 Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather
