@@ -211,6 +211,45 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
+## The builder's INPUT differs between the two regimes (2026-08-15)
+
+`PROSPER_COMPUTE_TREE_WATCH_AUX=0x209cc76000:33008` captures the 2,063 x 64-byte record array
+alongside every builder transition, clean and cyclic, from one run. The tags the six store predicates
+test are `record.dword0 & 7` and `record.dword1 & 7`.
+
+**Every submit where the builder emits a perfect tree shares one input signature, and no broken
+submit has it:**
+
+| submit | pairs / unpaired | tag(dword0) | tag(dword1) |
+| --- | --- | --- | --- |
+| 5943 | **1029 / 2** | `{0:970, 2:2, 5:1088, 7:3}` | `{0:977, 1:5, 5:1078, 7:3}` |
+| 7188 | **1029 / 2** | `{0:972, 2:2, 5:1086, 7:3}` | `{0:977, 1:5, 5:1078, 7:3}` |
+| 8016 | **1029 / 2** | `{0:973, 2:2, 5:1085, 7:3}` | `{0:978, 1:5, 5:1077, 7:3}` |
+| 8842 | **1029 / 2** | `{0:973, 2:2, 5:1085, 7:3}` | `{0:978, 1:5, 5:1077, 7:3}` |
+| 9247 | **1029 / 2** | `{0:973, 2:2, 5:1085, 7:3}` | `{0:978, 1:5, 5:1077, 7:3}` |
+| 5528 | 663 / 64 | `{0:1120, 2:3, **4:2**, 5:935, 7:3}` | `{0:1122, **1:15**, 5:923, 7:3}` |
+| 6358 | 608 / 51 | `{0:1098, 2:3, **4:2**, 5:957, 7:3}` | `{0:1107, **1:15**, 5:938, 7:3}` |
+| 10052 | 676 / 74 | `{0:1133, 2:3, **4:2**, 5:922, 7:3}` | `{0:1134, **1:15**, 5:911, 7:3}` |
+
+Two differences are systematic in the early broken submits: **tag 4 appears in dword0** (exactly 2
+records, never present in a perfect submit) and **tag 1 in dword1 jumps from 5 to 15**.
+
+**But neither is the whole story, and the record says so.** The later broken submits (11238 onward)
+carry `1:5` and no tag 4 — the perfect signature on those two axes — and are still broken
+(`pairs≈861, unpaired≈193`), with tag 5 *higher* than in the perfect submits (1301 against 1085). So
+"tag 4 present" and "tag1 == 15" are correlates of the early regime, not the mechanism. Do not
+promote them to a rule.
+
+**What is established:** the array the builder reads changes materially with scene state, and the
+builder's output tracks it. Combined with the eleven perfect submits, that puts the defect **upstream
+of `0x413dc3400`** — in whatever produces `0x209cc76000`.
+
+**Its producers, from `PROSPER_COMPUTE_TREE_WATCH=0x209cc76000`:** `0x413cf9000` (117 changes),
+`0x413cf9200` (117), `0x413cf5400` (29), `0x413cf6100` (29), `0x413ce6000` (26), `0x413d1bf00` (2),
+and `0x413e1ff00` (3, **`toucher=0`**). `0x413cf9200` has 20 recompile-empty dispatches of 678, and
+`0x413e1ff00` writes bytes it does not bind. **Both are unexamined and both are better leads than
+anything remaining on the builder.**
+
 ## THE BUILDER'S LOWERING IS CORRECT — it emits a perfect tree for eleven submits (2026-08-15)
 
 `PROSPER_COMPUTE_DISPATCH_LOG` now carries the launch geometry, so the outcome and the launch can be
