@@ -1,4 +1,7 @@
 #include "rdna2_gta5_compute_contracts.hpp"
+#include <mutex>
+#include <set>
+#include <string>
 
 #include "agc_shader_layout.hpp"
 #include "rdna2_decode.hpp"
@@ -22,6 +25,24 @@ namespace {
 
 enum class NullableProgram : uint8_t { None, WorkgroupStore, WorkgroupProcess };
 enum class SelectedSbufferDomain : uint8_t { Reject, AllOob, Record4 };
+
+// The selected-sbuffer validator's six reject reasons were all behind PROSPER_DBG, which on a routed
+// run desyncs the pad script badly enough that the route never reaches the dispatch being validated.
+// So "this contract declined" was observable and WHY was not -- and on GTA V this contract is the
+// last thing standing between the title and its 3D world. PROSPER_GTA5_SBUFFER_REJECT=1 reports each
+// reason once per program instead, which is at most six lines for a whole run.
+//
+// The program identity is the code pointer: prosper maps guest memory directly, so it IS the guest
+// address the rest of the diagnostics print.
+inline bool report_selected_sbuffer_reject(const uint32_t* code, const char* reason) {
+    if (std::getenv("PROSPER_DBG")) return true;
+    if (!std::getenv("PROSPER_GTA5_SBUFFER_REJECT")) return false;
+    static std::mutex mutex;
+    static std::set<std::pair<uint64_t, std::string>> reported;
+    std::lock_guard lock(mutex);
+    return reported.emplace(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code)),
+                            std::string(reason)).second;
+}
 
 constexpr uint32_t kSelectedSbufferSourcePc = 70u;
 constexpr uint32_t kSelectedSbufferOuterPc = 153u;
@@ -622,7 +643,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     if (!rdna2_gta5_selected_sbuffer_launch(code, dwords, config)) {
         if (rdna2_gta5_selected_sbuffer_shader(code, dwords) &&
-            config.threads_x == kGtaSelectedSbufferThreads && std::getenv("PROSPER_DBG"))
+            config.threads_x == kGtaSelectedSbufferThreads && report_selected_sbuffer_reject(code, "launch"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=launch user=%zu local=%ux%ux%u "
                          "exact=%d threads=%ux%ux%u wave=%u tgid=%d/%d/%d tidig=%u\n",
@@ -662,7 +683,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     if (!source || !outer || !selected_sbuffer_source_shape(*source) ||
         !selected_sbuffer_outer_shape(*outer)) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "resource-shape"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=resource-shape source=%p outer=%p "
                          "source-shape=%d outer-shape=%d resources=%zu "
@@ -683,7 +704,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     const SelectedSbufferDomain domain = selected_sbuffer_domain(*source);
     if (domain == SelectedSbufferDomain::Reject) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "selector-domain"))
             std::fprintf(stderr, "[gta-selected-sbuffer] reject=selector-domain\n");
         return false;
     }
@@ -714,7 +735,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
 
     const uint8_t* outer_bytes = complete_resource_bytes(*outer, outer->size);
     if (!outer_bytes) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "outer-unreadable"))
             std::fprintf(stderr, "[gta-selected-sbuffer] reject=outer-unreadable\n");
         return false;
     }
@@ -775,7 +796,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
     }
     DecodedBufferDescriptor selected{};
     if (!selected_sbuffer_target_descriptor(selected_words, selected)) {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "selected-vsharp"))
             std::fprintf(stderr,
                          "[gta-selected-sbuffer] reject=selected-vsharp words=%08x:%08x:%08x:%08x "
                          "base=0x%llx stride=%u records=%u size=%u format=%u components=%u\n",
@@ -793,7 +814,7 @@ bool discover_rdna2_gta5_selected_sbuffer(
         (target_x2 && !selected_sbuffer_target_resource(
                           *target_x2, kSelectedSbufferLoadX2Pc, selected)))
     {
-        if (std::getenv("PROSPER_DBG"))
+        if (report_selected_sbuffer_reject(code, "consumer-resource"))
             std::fprintf(stderr, "[gta-selected-sbuffer] reject=consumer-resource\n");
         return false;
     }

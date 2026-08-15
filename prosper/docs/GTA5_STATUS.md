@@ -97,6 +97,45 @@ one dispatch's pre/post pair there is exactly one writer, and its output is cycl
 - **A lane/wave/workgroup boundary effect.** Damage index mod 2/3/4/8/16 is flat.
 - **An unknown or out-of-bounds writer.** Every observed change reported `toucher=1`.
 
+## The selected-sbuffer contract declines because the SELECTED V# IS FLOAT DATA (2026-08-15)
+
+`PROSPER_GTA5_SBUFFER_REJECT=1` (added on this branch; the six reasons in
+`rdna2_gta5_compute_contracts.cpp` were all behind `PROSPER_DBG`, which desyncs the route) reports
+exactly two declines for `0x413ce6000` on a whole run:
+
+```
+[gta-selected-sbuffer] reject=consumer-resource
+[gta-selected-sbuffer] reject=selected-vsharp
+    words=c540fa56:c51e1625:4373fd8a:45de36cc
+    base=0x1625c540fa56 stride=1310 records=1131675018 size=4294967295
+```
+
+**Those four words are floats**: `0xc540fa56` ≈ **-3087.6**, `0xc51e1625` ≈ **-2529.5**,
+`0x4373fd8a` ≈ **244.0**, `0x45de36cc` ≈ **7110.9**. That is a world-space AABB, not a descriptor —
+and the derived `base=0x1625c540fa56`, `records=1131675018`, `size=0xffffffff` are what you get from
+reinterpreting it. **prosper is correctly refusing to manufacture a descriptor out of it**; the
+contract's `selected-vsharp` guard is doing its job.
+
+So the selector resolves to a record that does not contain a V# at the expected offset. The chain to
+audit, with what is measured about each link:
+
+| link | measured |
+| --- | --- |
+| the selector's source records, pc70 | `base=0x20f848e2bc stride=8 records=2064 size=16512` — resolves |
+| the descriptor array, pc153 | `base=0x203f249b38 stride=120 records=5 size=600` — resolves |
+| `s_buffer_load_dwordx4 s[8:11], s[4:7], s106` | SMEM immediate offset **8**, so the V# is expected at `selector*120 + 8` |
+| the selected element | **float AABB data** |
+
+Three candidates, none yet excluded: the selector value is wrong; the V# lives at a different offset
+within the 120-byte record than `+8`; or the **source records at pc70 are themselves stale because
+their producer also does not run** — which would make this a chain of missing producers rather than
+one. That last one is the possibility to test first, because it is the same failure this whole
+investigation has already found once.
+
+Note the resource map lifts pc156/pc158 as `base=0x203f2e9b38 size=13360 stride=20 entries=5` —
+**stride 20, against the contract's expected 120**. Reconciling those two views is likely the fastest
+route in.
+
 ## The selector chain at `0x413ce6000` pc149..156 — the exact fix site
 
 Decoded with prosper's own opcode constants (`rdna2_decode.hpp`), not guessed:
