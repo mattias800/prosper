@@ -10,6 +10,74 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## THE CORRUPTING PROGRAM IS `0x413dc3400` (2026-08-15)
+
+Measured with `PROSPER_COMPUTE_TREE_WATCH=0x20f848417c:2063` on a 200 s routed run with the hanging
+consumer skipped (`PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700`, so zero device losses, 9,291 frames).
+The watch reads the table before and after **every** realized dispatch, so a change is attributed to
+the dispatch that made it rather than to an interval.
+
+**321 observations. Every clean -> cyclic transition:**
+
+| program | clean -> cyclic | cyclic -> clean | clean -> clean |
+| --- | --- | --- | --- |
+| `0x413dc3400` | **37** | 0 | 3 |
+| `0x413d88400` | 1 | 37 | 2 |
+| `0x413e1c300` | 1 | 1 | 158 |
+| `0x413cee500` | 0 | 1 | 79 |
+
+`0x413dc3400` made the table cyclic on **37 of its 40 dispatches**. Nothing else does it
+systematically.
+
+**Every observed writer reported `toucher=1`.** No change came from a program whose resource table
+does not contain the address, so there is no unknown writer and no out-of-bounds path to chase —
+the watch was built to be able to report that case and did not.
+
+### The per-submit chain, identical every submit
+
+```
+d15,d16  0x413cee500   Morton keys        -> pairs=0     unpaired=0    oob-roots=0   depth=3
+d37      0x413dc3400   topology build     -> cycles=19   pairs=919     unpaired=148  depth=68
+d39..47  0x413dc6700   the consumer       (skipped in this run; this is what hangs)
+d54      0x413d88400   repurposes the RAM -> pairs=0     unpaired=571
+```
+
+`0x413dc3400` writes 2,061 of 2,063 records in one dispatch through six store pcs (bindings/pcs
+`23:597, 25:608, 26:620, 27:632, 28:644, 29:656`), turning a table with **no** cycles into one with
+19 cycles, 57 cyclic roots and depth 68. The consumer runs two dispatches later and walks exactly
+that array. **This is the defect: the builder produces a cyclic parent array, and the hang is the
+downstream symptom.**
+
+The same run also shows `0x413d88400` at d54 leaving `pairs=0` — the allocation is **reused scratch**
+across phases, not one long-lived structure, which is why a pair count compared across phases moves
+by hundreds. Compare pair counts only within the same phase.
+
+### What a correct table looks like — measured, not assumed
+
+Against 91 captured 2,063-dword tables:
+
+| | pairs | unpaired | cycles | max depth |
+| --- | --- | --- | --- | --- |
+| clean parent tables (`live-a240`, `post-36-3`) | **1030** | **0** | 0 | **11** |
+| cyclic captures (85, one resource hash) | 1029 | 1 | 1 | 15 |
+| `0x413dc3400` output, live | 919 | 148 | 19 | 68 |
+
+This **confirms Codex's LBVH identification quantitatively**: a full binary tree over 1,032 leaves
+has 1,031 internal nodes, and a well-formed table measures 1,030 sibling pairs with zero unpaired
+records at depth 11, against log2(1032) = 10.01. Pairs are `(odd, even)`: the odd index is the head
+(side bit clear), the even index its mate (side bit set).
+
+In the 85-capture set the anomaly is *fully deterministic* — the same 4-member cycle
+`(256, 384, 447, 831)` and the same single unpaired record `300` in every one. All 85 share one
+resource hash, so this is one table observed 85 times, i.e. the corruption is **stable** across
+submits 7629 -> 9694 rather than re-derived; nothing repairs it. The four cycle members are each in
+a *well-formed* sibling pair, so the cycle is not caused by a broken pair — the parent links
+themselves are wrong. Slot 300 differs from its mate only in bits[2:0] (`0x942` against `0x940`,
+both decoding to parent 296), so it is a flag-bit difference and a separate anomaly from the cycle.
+
+**Ruled out by this measurement:** the "lost update" / two-writer race account of the cycle. Within
+one dispatch's pre/post pair there is exactly one writer, and its output is cyclic.
+
 ## What the structure IS: an LBVH / binary-radix-tree parent table from Morton keys
 
 Identified by Codex from the retained ISA (#2542), and it reframes everything below.
