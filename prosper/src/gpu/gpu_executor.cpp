@@ -2037,6 +2037,40 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     return *spirv;
 }
 
+// PROSPER_COMPUTE_DISPATCH_LOG=0xADDR[,0xADDR...]: one line per DISPATCH of the named programs,
+// with what actually happened to it. Every existing signal is once-per-program:
+// `[compute] skip unsupported program` fires once ever, and the subgroup, resource-map and
+// selected-sbuffer lines are all deduped. That is right for their purposes and wrong for this one,
+// and reading a once-per-program line as a per-dispatch property is exactly how a root-cause claim
+// in this investigation was published and had to be retracted -- the program it said "never runs"
+// ran 26 times.
+//
+// Answers "did THIS dispatch execute", which is what a frame-by-frame correlation between a decline
+// and a corrupted result needs.
+bool compute_dispatch_log_selected(uint64_t program) {
+    const char* spec = std::getenv("PROSPER_COMPUTE_DISPATCH_LOG");
+    if (!spec || !*spec || !program) return false;
+    for (const char* cursor = spec; cursor && *cursor;) {
+        char* end = nullptr;
+        const uint64_t one = std::strtoull(cursor, &end, 0);
+        if (end == cursor) return false;
+        if (one == program) return true;
+        if (*end != ',') return false;
+        cursor = end + 1;
+    }
+    return false;
+}
+
+void log_compute_dispatch(uint64_t program, uint64_t submit_no, size_t dispatch_index,
+                          uint64_t order, const char* outcome) {
+    if (!compute_dispatch_log_selected(program)) return;
+    std::fprintf(stderr,
+                 "[compute-dispatch] program=0x%llx submit=%llu dispatch=%zu order=%llu outcome=%s\n",
+                 static_cast<unsigned long long>(program),
+                 static_cast<unsigned long long>(submit_no), dispatch_index,
+                 static_cast<unsigned long long>(order), outcome);
+}
+
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
     static std::mutex mutex;
     static std::set<uint64_t> logged;
@@ -7871,6 +7905,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
         item.submit_no = submit_no;
         item.command_order = dispatch.command_order;
         if (item.spirv.empty()) {
+            log_compute_dispatch(code_addr, submit_no, dispatch_index, dispatch.command_order,
+                                 "recompile-empty");
             record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv,
                            &config);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
@@ -10060,6 +10096,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                                        operation.command_order, tree_watch_touch);
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
+                    log_compute_dispatch(tree_watch_program, submit_no, operation.index,
+                                         operation.command_order,
+                                         executed ? "executed" : "backend-declined");
                     observe_compute_tree_watch_post(tree_watch_program, tree_watch_touch, submit_no,
                                                     operation.index, operation.command_order,
                                                     tree_watch_pre);

@@ -211,6 +211,48 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
+## FALSIFIED: the missing-producer hypothesis is dead (2026-08-15)
+
+`PROSPER_COMPUTE_DISPATCH_LOG` (added here) records **one line per dispatch** with its outcome, which
+no existing signal did — every other one is deduped per program, and reading a once-per-program line
+as a per-dispatch property is how the root-cause claim two sections down got published and retracted.
+
+One 200 s route, 46 submits carrying a `0x413dc3400` dispatch:
+
+| | tree CYCLIC | tree clean |
+| --- | --- | --- |
+| `0x413ce6000` had a declined dispatch that submit | 10 | 0 |
+| `0x413ce6000` executed on **every** dispatch | **29** | 7 |
+
+**29 submits in which the producer ran on every single dispatch and the builder still produced a
+cyclic tree.** A producer decline is therefore **not necessary** for the corruption, and the
+"`0x413ce6000` fails to recompile → stale tags → cyclic tree" story is finished. Do not restart it.
+
+Per-dispatch outcomes over the run: `0x413ce6000` 129 executed / 10 recompile-empty; `0x413cf9200`
+658 executed / 20 recompile-empty; `0x413dc3400` 53 executed / 0 failures. Those recompile-empty
+dispatches are real gaps worth closing on their own merits — an unsupported program is a fatal gap —
+but they are **not** the cause of this defect.
+
+### What the same data shows instead: a route-position boundary
+
+The builder's output is clean for the first seven submits and cyclic from submit ~6795 onward,
+continuously:
+
+```
+3894  clean     6795  CYCLIC     9673  CYCLIC
+4307  clean     7211  CYCLIC    10076  CYCLIC
+4720  clean     7625  CYCLIC    10482  CYCLIC
+5135  clean     8039  CYCLIC    10875  CYCLIC
+5550  clean     8457  CYCLIC    11271  CYCLIC
+5965  clean     8867  CYCLIC    11674  CYCLIC
+6380  clean     9274  CYCLIC    12077  CYCLIC
+```
+
+This is a **transition at a point in the route**, not a per-submit coin flip. Whatever changes around
+submit 6795 — scene content reaching some size or shape — is the thing to characterise next. The
+first clean submit also shows `0x413ce6000` dispatching **94** times against 1 thereafter, so the
+early phase is a different workload entirely and the clean result there may not be comparable.
+
 ## Causal A/B: forcing the producer off collapses the builder entirely (2026-08-15)
 
 `PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700,0x413ce6000`, lever verified in the log
