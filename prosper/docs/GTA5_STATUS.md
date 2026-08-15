@@ -399,6 +399,36 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## FALSIFIED: the sparse tree is not "correct but sparse by design" (2026-08-15)
+
+This reading was flagged as capable of inverting the whole investigation, so it was tested rather
+than left standing. If `0x413dc3400`'s `tag == 2 || tag == 5` predicate legitimately skips other node
+types, the tree would be *supposed* to be sparse in frames containing them, the 1,030-pair oracle
+would be wrong for exactly the frames called broken, and the defect would be the consumer's unbounded
+walk over a legitimately-sparse table instead.
+
+Cross-referencing each parent-table record's pairing state against its **node type** in the record
+array, from the same dispatch (the aux dump makes this a same-moment comparison):
+
+| submit | unpaired | node types among UNPAIRED | node types among PAIRED |
+| --- | --- | --- | --- |
+| 10052 | 74 | `{0: 60, 5: 14}` | `{0: 318, 4: 1, 5: 357}` |
+| 11238 | 158 | `{0: 37, 5: 121}` | `{0: 414, 5: 518}` |
+| 11637 | 200 | `{0: 29, 5: 171}` | `{0: 313, 5: 587}` |
+| 12434 | 183 | `{0: 57, 5: 126}` | `{0: 223, 4: 1, 5: 445}` |
+
+**Node type does not determine pairing.** Types 0 and 5 appear on both sides in every sample — a
+type-5 record is sometimes paired and sometimes not, and so is a type-0 record. If the predicate
+explained the sparseness, unpaired records would be exactly the types outside `{2, 5}`, and they are
+not.
+
+**So the tree is genuinely malformed, the 1,030-pair oracle stands, and the consumer is not at
+fault.** The eleven perfect submits already showed the lowering is correct; this shows the sparse
+output is not a legitimate alternative shape either. Both point at the input.
+
+(The correspondence used here — parent-table index *i* ↔ record-array index *i* — follows from
+`0x413dc3400` writing `parent[(ref >> 3) - 4]` where the same reference indexes the node array.)
+
 ## CONCLUSION: both rejecting programs build descriptors from LANE MASKS (2026-08-15)
 
 `PROSPER_DYNTRACE_SGPR=106` on `0x205b654a00`, filtered by program identity:
