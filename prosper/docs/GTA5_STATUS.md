@@ -515,7 +515,153 @@ Two things must be checked before treating this as a defect, and neither has bee
 Recorded as an observation with its caveats rather than a lead, so the next reader neither chases it
 blind nor loses it.
 
-## THE BREAK: the composite samples `0x14…`/`0x15…`, but every render target is `0x20…` (2026-08-15)
+## `0x413ce6000` IS a bottom-up box32 BVH refit — and pc156 supplies BOUNDS, not references
+
+Codex's ISA read (#2542), with one decode correction to this document: **pc156 is
+`buffer_load_dwordx4`, not x3** (`e0382000 80020006`, GFX10.3 MUBUF op `0x0e`), and pc158
+(`e0342010 80020406`) is `buffer_load_dwordx2`. Together they load **six dwords into `v0..v5`** —
+AABB min/max XYZ.
+
+```
+pc156/158   load six BOUND values through the selected s[8:11]
+pc212       store dwordx4 v[0:3] to node offset +16
+pc214       store dwordx2 v[8:9] to node offset +32
+pc218       atomic allocation/counter through s[24:27]
+pc224       load dwordx2 v[4:5] through s[24:27]
+pc228..251  transform/encode those two indices, including node type 5
+pc253       store dwordx4 v[4:7] at node offset +0     <- the CHILD REFERENCES
+pc255/257   reload the node bounds
+pc260..266  min/max into the running bounds
+pc269       load the next parent/index and loop upward
+```
+
+So it is a **bottom-up construction/refit of box32 internal nodes**: merge six float bounds, obtain
+two child indices, write encoded child references plus bounds, propagate upward.
+
+**Three consequences, and the first retires a link this document asserted:**
+
+1. **The dynamic descriptor at pc156/158 feeds the BOUNDS at +16/+32. It does NOT supply the child
+   references written at pc253.** An epoch-stale pc156 can corrupt AABBs; it **does not directly
+   explain cyclic child references**. The "unresolved descriptor → wrong output → cycles" chain in
+   the sections above is therefore **not established**, and its `CONFIDENCE: MED` was generous.
+2. **The cyclic-reference frontier is the pc218/224 path** — the `s[24:27]` resource/counter/index
+   data, the index/base arithmetic involving `s16`, and the destination selection. That is where
+   ordered execution-epoch capture belongs.
+3. **A decline cannot itself perform the measured 0 → 324 cycle addition** — a declined dispatch
+   writes nothing. A prior decline could leave stale state a later executing invocation consumes, but
+   then the executing path is still part of the defect. The 29 cyclic submits on which every
+   `ce6000` dispatch executes already ruled out decline-alone as sufficient.
+
+The generic lift's CPU-epoch problem remains a real correctness issue; it is just not the direct
+value source for the reference cycles. **Do not close that link without measuring pc224's
+execution-epoch resource and indices.**
+
+## Submit-indexed capture already exists — #2549's workaround was not needed for this
+
+```
+PROSPER_GPU_TIMELINE_CAPTURE=<capture.prgcap>
+PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=1
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM=0x413ce6000
+```
+
+With a semantic selector, `CAPTURE_SUBMIT` is the **minimum** submit and the first later submit
+containing that program becomes the endpoint — which is exactly the "aim the capture at a submit that
+contains work" this document asked for, and it was already there.
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM=XxYxZ` qualifies further; a rolling predecessor
+bundle uses `..._CAPTURE_BUNDLE` + `..._CAPTURE_DEPTH`. `...AFTER_COMPUTE_PROGRAM` is a **cross-submit
+phase gate** and is the wrong selector when the endpoint is the submit containing `ce6000` itself.
+
+*(The F9 fixes on this branch remain valid for the interactive grab, and #2549's present-count
+finding still stands. But the capture this investigation needed did not require them.)*
+
+## The indirect-argument high dword is NOT folded into the modifier
+
+Also falsified by Codex. The HLE builder writes `cmd[1] = uint32_t(a1)` (offset), `cmd[2..3]` = the
+64-bit modifier, and PM4 decode reads them faithfully. The failing async-queue packet's live values:
+
+```
+base=0   offset=0xf8480120   modifier=0x21
+low | (modifier_low << 32) = 0x21f8480120   (unreadable)
+0x20f8480120                                (readable)
+```
+
+So the modifier is `0x21`, not `0x20` — the "the high dword is in the modifier" reading is dead, and
+**there is no evidence of a PM4 decoder bug**.
+
+**The decisive probe belongs before packet construction**, in `agc_cb_dispatch_indirect`: log the
+full `a1`, the full `a2`, and which exported NID entered the shared body — both DCB and ACB NIDs
+alias one HLE implementation, and the two forms may carry the address differently.
+
+- `a1 == 0x20f8480120` → the HLE builder truncates a full address and must preserve that ABI form.
+- `a1 == 0xf8480120` → the high bits never reached the builder, and the missing piece is per-ACB/queue
+  base state or another ABI-defined provenance source.
+
+**Until that is measured, aperture recovery stays diagnostic-only.** "Mapped under the common
+aperture" is not proof that it is the intended argument buffer — and this document's earlier framing
+of the truncation as a defect with an in-tree fix was ahead of the evidence.
+
+## RETRACTED — "THE BREAK" was two different presentation phases compared as one (2026-08-15)
+
+**The section below is wrong in its grouping and its interpretation, and is kept only so the
+measurements stay available. Do not cite its conclusion.** Codex falsified it with a
+`PROSPER_MEMLOG=1` + `PROSPER_RTTLOG=1` run (#2542):
+
+- **The physical mappings are disjoint, so VA aliasing is dead.** `VA 0x1557c00000 -> phys
+  0x105000000`; `VA 0x1543c00000 -> phys 0x102800000`; the dominant `0x208e5a0000` target lies inside
+  `VA 0x203de00000 -> phys 0x111000000` and resolves to physical `0x1617a0000`. None overlap. **A
+  physical-page RTT identity would miss exactly as the VA-keyed one does** — so the fix I proposed
+  would not have worked either.
+- **The `0x14…`/`0x15…` misses are not the gameplay composite at all.** They belong to
+  `fs=0x2042f83c00` — one full-resolution plus two half-resolution guest-backed planes, an
+  early/startup presentation path (very likely video/YUV-style input). They are ordinary guest
+  images, so an RTT miss there is **expected**.
+- **The real gameplay chain is entirely in `0x20…` and every link HITS:**
+
+```
+fs=0x205b34be00                       -> target 0x2056740000
+fs=0x205b384a00  samples 0x2056740000 HIT -> target 0x2058720000
+fs=0x205b363c00  samples 0x2058720000 HIT -> SCANOUT
+```
+
+  The last two stages preserve the producer's counts (`rgb_nonblack=1121820`), and the scanout holds
+  the tutorial/UI/light content but no world.
+
+**So the world is already absent at the OUTPUT of `fs=0x205b34be00`. It is not lost in the final
+composite, and not lost to an address mismatch.**
+
+What went wrong in my reasoning: I compared misses drawn from one presentation phase against render
+targets drawn from another, and read the address-range difference as a mismatch between two sides of
+*one* frame. The hit/miss counts and the address ranges were real; the grouping was not. A prefix
+histogram over a whole run cannot tell two phases apart, and I did not check that the sampled
+surfaces and the targets came from the same pass.
+
+## THE ACTUAL FRONTIER: the inputs of `fs=0x205b34be00` (2026-08-15)
+
+That fragment shader produces `0x2056740000`, the first stage of the gameplay chain, and its output
+already lacks the world. Its directly sampled inputs:
+
+| input | state |
+| --- | --- |
+| `0x2052ac0000` 3840x2160 fmt=1 | **RTT miss + DCC-unsupported warning** |
+| `0x2054aa0000` 3840x2160 fmt=11 | **RTT miss** |
+| `0x2063380000` 3840x2160 fmt=20 | HIT |
+| `0x2085de0000` 3840x2160 fmt=4 | HIT |
+
+**So the DCC problem is NOT superseded — it is the live lead, on the real chain.** `0x2052ac0000` is
+a guest-backed 4K surface that misses the RTT cache and then falls through to reading DCC-compressed
+bytes as uncompressed.
+
+Codex's qualification, which matters: **DCC warnings must be classified per surface.** Some
+DCC-described addresses do have a renderer-owned RTT image and hit; genuinely guest-backed ones such
+as `0x2052ac0000` and `0x20e0380000` miss and fall through. The renderer now carries all eight MRT
+bindings and the backend publishes them, so there is no evidence `0x2052ac0000` is merely an
+untracked secondary MRT — its persistent absence from the RTT cache makes **guest-backed DCC, or an
+unidentified producer, the better hypothesis**.
+
+**Next discriminator:** identify `0x2052ac0000`'s allocation and write history and inspect that exact
+input — not change RTT identity.
+
+## OLD (retracted): the composite samples `0x14…`/`0x15…` (2026-08-15)
 
 `PROSPER_RTTLOG=1` reports, per sampled texture, whether it resolved to a renderer-owned render
 target or fell through to guest memory. Over a routed run:
