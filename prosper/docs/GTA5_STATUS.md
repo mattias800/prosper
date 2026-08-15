@@ -211,6 +211,61 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
+## REFRAME: this is a RAY-TRACING BVH, and prosper already knows the format (2026-08-15)
+
+The "tag" this investigation has been tracking is the **AMD RDNA2 ray-tracing BVH `NODE_TYPE`**, and
+prosper's own recompiler says so. `rdna2_to_spirv.cpp` (search `is_box16`) software-emulates
+`IMAGE_BVH_INTERSECT_RAY`, loading 28 dwords of a node and branching on:
+
+```cpp
+const uint32_t is_tri0  = b.ucmp(Op_IEqual, node_type, b.uconst(0u));
+const uint32_t is_tri1  = b.ucmp(Op_IEqual, node_type, b.uconst(1u));
+const uint32_t is_box16 = b.ucmp(Op_IEqual, node_type, b.uconst(4u));   // 64-byte node
+const uint32_t is_box32 = b.ucmp(Op_IEqual, node_type, b.uconst(5u));   // 128-byte node
+```
+
+So bits[2:0] of a node reference are the node type: 0–3 triangle, **4 box16**, **5 box32**, 6
+instance, 7 procedural. Everything this investigation measured now has a name:
+
+| observation | reading |
+| --- | --- |
+| `0x209cc76000` at 64-byte stride | an array of **64-byte nodes** (box16 or triangle) |
+| tags 0 / 2 / 5 / 7 dominating | triangle / triangle2 / box32 / procedural |
+| **tag 4 appearing only in broken submits** | **box16 nodes entering the scene** |
+| the sibling-paired parent table | BVH topology |
+| Morton keys and `0x09249249` | an LBVH build, as Codex identified |
+| `0x413dc3400`'s `tag == 2 \|\| tag == 5` predicate | it writes links only for two specific node types |
+
+**`PROSPER_DECODED_BVH` machinery already exists** — `DecodedBvhDescriptor` in
+`agc_shader_layout.hpp` carries `box_grow`, `triangle_return_mode`, `box_node_64b`, `sort_enabled`,
+and the dynfail dump prints `BVH(bvh4)` descriptors. This is a supported surface, not an unknown one.
+
+### The consumers of the BVH do not compile
+
+`IMAGE_BVH_INTERSECT_RAY` is **MIMG opcode 0xe6** (`rdna2_to_spirv.cpp:14145`). Two programs in the
+reject census fail on exactly that instruction:
+
+```
+0x205b654a00  mode=unresolved-operand pc=1180 fmt=14 op=0xe6   image_bvh_intersect_ray
+0x205b657200  mode=unresolved-operand pc=313  fmt=14 op=0xe6   image_bvh_intersect_ray
+```
+
+`mode=unresolved-operand` means **the lowering exists and the BVH descriptor does not resolve**.
+prosper has the full software traversal emulation; the shaders that would use it are declined for a
+descriptor.
+
+**So there are two independent defects on the ray-tracing path, and the second was invisible until
+the reject reasons became readable:**
+
+1. `0x413dc3400` builds a cyclic topology once the scene passes a point — the input-dependent defect
+   this document tracks above.
+2. **The traversal shaders that consume the BVH never compile at all**, because their BVH descriptor
+   does not resolve.
+
+Fixing (1) alone cannot render the world if (2) also holds. **(2) is the better first target**: it is
+a descriptor-resolution problem on an instruction prosper already implements, it is named exactly, and
+unlike (1) it does not depend on scene state.
+
 ## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
 
 Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather
