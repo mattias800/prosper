@@ -4005,21 +4005,47 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::array<std::vector<float>, 6> faces;
                             uint32_t slices_found = 0;
                             std::string cube_error;
+                            uint32_t present_mask = 0, known_mask = 0;
                             const bool complete = prosper::test::read_persistent_ds_cube_depth(
-                                r.gpu_addr, tw, th, faces, slices_found, cube_error);
-                            static std::mutex cube_mutex;
-                            static std::set<uint64_t> cube_reported;
-                            bool first = false;
+                                r.gpu_addr, tw, th, faces, slices_found, cube_error,
+                                &present_mask, &known_mask);
+                            // Residency DISTRIBUTION, not a first-sight snapshot. "1 of 6 faces"
+                            // seen once is consistent with three different worlds: the guest
+                            // amortises faces across frames, prosper's invalidation evicts them
+                            // faster than they are re-rendered, or the sample simply landed
+                            // mid-sequence. A histogram over every sample separates them -- if the
+                            // count never reaches 6, no timing argument survives.
                             {
+                                static std::mutex cube_mutex;
+                                static std::map<std::pair<uint64_t, uint32_t>, uint64_t> hist;
+                                static std::map<uint64_t, std::pair<uint32_t, uint32_t>> masks;
+                                static uint64_t samples = 0;
                                 std::lock_guard lock(cube_mutex);
-                                first = cube_reported.insert(r.gpu_addr).second;
+                                ++hist[{r.gpu_addr, slices_found}];
+                                auto& seen_masks = masks[r.gpu_addr];
+                                seen_masks.first |= present_mask;   // any slice ever VALID
+                                seen_masks.second |= known_mask;    // any slice ever KNOWN
+                                if (((++samples) & (samples - 1)) == 0 && samples >= 64) {
+                                    fprintf(stderr,
+                                            "[cube-depth] residency after %llu cube samples "
+                                            "(faces resident -> times seen):\n",
+                                            (unsigned long long)samples);
+                                    for (const auto& e : hist)
+                                        fprintf(stderr,
+                                                "[cube-depth]   addr=0x%llx faces=%u/6 x%llu%s\n",
+                                                (unsigned long long)e.first.first, e.first.second,
+                                                (unsigned long long)e.second,
+                                                e.first.second == 6u ? "  <-- bridgeable" : "");
+                                    for (const auto& e : masks)
+                                        fprintf(stderr,
+                                                "[cube-depth]   addr=0x%llx slices ever VALID=0x%02x "
+                                                "ever KNOWN=0x%02x (bit n = slice n; 0x3f = all six)"
+                                                "\n",
+                                                (unsigned long long)e.first, e.second.first,
+                                                e.second.second);
+                                }
                             }
-                            if (first)
-                                fprintf(stderr,
-                                        "[cube-depth] addr=0x%llx %ux%ux6 faces=%u/6 %s%s\n",
-                                        (unsigned long long)r.gpu_addr, tw, th, slices_found,
-                                        complete ? "bridged" : "NOT bridged",
-                                        cube_error.empty() ? "" : (" (" + cube_error + ")").c_str());
+                            (void)cube_error;
                             if (complete && texture_pixels.size() >=
                                     static_cast<size_t>(tw) * th * 6u * 4u) {
                                 for (uint32_t face = 0; face < 6u; ++face) {

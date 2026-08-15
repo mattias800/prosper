@@ -3363,9 +3363,24 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
 // silent half-result.
 inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_t height,
                                           std::array<std::vector<float>, 6>& faces,
-                                          uint32_t& slices_found, std::string& error) {
+                                          uint32_t& slices_found, std::string& error,
+                                          uint32_t* present_mask = nullptr,
+                                          uint32_t* known_mask = nullptr) {
     error.clear();
     slices_found = 0;
+    if (present_mask) *present_mask = 0;
+    // Slices the cache holds an ENTRY for, whether or not its depth is currently valid. The
+    // difference between the two masks separates "prosper never rendered this face" from "it was
+    // rendered and then invalidated", which are different defects with different fixes.
+    if (known_mask) {
+        *known_mask = 0;
+        for (const auto& [key, image] : persistent_ds_cache()) {
+            (void)image;
+            if (key.w != width || key.h != height) continue;
+            if (key.dr != base && key.dw != base) continue;
+            if (key.slice < 6u) *known_mask |= 1u << key.slice;
+        }
+    }
     for (uint32_t slice = 0; slice < 6u; ++slice) {
         PersistentDsImage* found = nullptr;
         for (auto& [key, image] : persistent_ds_cache()) {
@@ -3377,6 +3392,7 @@ inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_
         }
         if (!found) continue;
         if (!read_persistent_ds_depth(*found, width, height, faces[slice], error)) return false;
+        if (present_mask) *present_mask |= 1u << slice;
         ++slices_found;
     }
     return slices_found == 6u;
@@ -7379,6 +7395,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             cached_ds->depth_valid = false;
             cached_ds->stencil_valid = false;
         });
+        // PROSPER_DS_SLICE_CENSUS=1 — per (base, slice): how many passes attached it, and how many
+        // of those actually claimed a depth write. A slice whose entry exists but never becomes
+        // valid is either never really written or is having its write disclaimed here, and those
+        // are different defects. GTA V's cube shadows show exactly that shape: every face has a
+        // cache entry, and slice 0 is never valid.
+        if (getenv("PROSPER_DS_SLICE_CENSUS")) {
+            static std::mutex mutex;
+            struct SliceTally { uint64_t passes = 0, claimed = 0, used_depth = 0, meaningful = 0; };
+            static std::map<std::pair<uint64_t, uint32_t>, SliceTally> tally;
+            static uint64_t n = 0;
+            std::lock_guard lock(mutex);
+            auto& row = tally[{ds_key.dr, ds_key.slice}];
+            ++row.passes;
+            if (use_depth) ++row.used_depth;
+            if (depth_used_meaningfully) ++row.meaningful;
+            if (use_depth && depth_used_meaningfully) ++row.claimed;
+            if (((++n) & (n - 1)) == 0 && n >= 256) {
+                fprintf(stderr, "[ds-slice] after %llu DS passes:\n", (unsigned long long)n);
+                for (const auto& e : tally)
+                    fprintf(stderr,
+                            "[ds-slice]   base=0x%llx slice=%u passes=%llu use_depth=%llu "
+                            "meaningful=%llu claimed_valid=%llu%s\n",
+                            (unsigned long long)e.first.first, e.first.second,
+                            (unsigned long long)e.second.passes,
+                            (unsigned long long)e.second.used_depth,
+                            (unsigned long long)e.second.meaningful,
+                            (unsigned long long)e.second.claimed,
+                            e.second.claimed ? "" : "   <-- never claims a depth write");
+            }
+        }
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;
