@@ -399,6 +399,38 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## Open, unquantified: 38 of 40 logged `WaitRegMem` waits are on UNMAPPED labels (2026-08-15)
+
+```
+[agc] WaitRegMem #3 q=A NOT satisfied at fold time: [0xf58]&0x190 = 0x0, func=5 ref=0xffffffff
+      — dependency violated | built@0ms(age=-1ms) pre@build=0x0 LABEL-UNMAPPED
+```
+
+Of the 40 logged, **38 carry `LABEL-UNMAPPED`** and 38 are on queue A. The awaited address in that
+sample is **`0xf58`** — four-byte aligned, so it passes the call site's gate, and far too small to be
+a guest address, which in this title are `0x20xxxxxxxx`.
+
+**That is the same shape as the indirect-dispatch argument truncation** on the previous section
+(`0xf8480120` for `0x20f8480120`), which has an in-tree aperture recovery. Whether the same recovery
+applies to `WAIT_REG_MEM` labels is untested.
+
+Two things must be checked before treating this as a defect, and neither has been:
+
+- **It may be normal.** `command_processor.cpp` states plainly that an unsatisfied wait is "NORMAL,
+  handled state" and that under content-load bursts it "fires thousands of times a minute". The
+  barrier model behind `PROSPER_WAIT_DEFER=1` exists precisely because the default folds past them.
+- **The count is a LOG CAP, not a measurement.** The diagnostic prints the first 40 and then every
+  1024th, so "40" says nothing about the true rate. Quoting it as a frequency would be the rate-limit
+  trap the orchestration doc warns about.
+- **`wm_addr` may be register space.** PM4 `WAIT_REG_MEM` selects register or memory addressing, and
+  this code path reads `wm_addr` as memory unconditionally (`guest_readable(c.wm_addr, 8)`). A
+  register-space wait would then always read as unmapped. This area carries substantial prior work
+  (#312, #380, #448), so the absence of a `mem_space` check may be deliberate rather than missing —
+  it has not been established either way here.
+
+Recorded as an observation with its caveats rather than a lead, so the next reader neither chases it
+blind nor loses it.
+
 ## What is NOT hiding the world — four eliminations, each with a verified lever (2026-08-15)
 
 Every one of these was measured on a routed run with the lever confirmed to have moved, so each is a
