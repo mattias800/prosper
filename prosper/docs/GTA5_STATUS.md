@@ -1829,6 +1829,52 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## The stencil plane of a rendered DS surface was never bridged (2026-08-15, fixed)
+
+`fs=0x205b34be00` samples two planes of **one** depth/stencil surface, and prosper retained only one
+of them:
+
+```
+[dsbridge] DS cache: dr=0x2052ac0000 dw=0x2052ac0000  sr=0x2054aa0000 sw=0x2054aa0000
+                     htile=0x2055310000  3840x2160 fmt=130 (D32_SFLOAT_S8_UINT) dvalid=1 svalid=1
+```
+
+`0x2052ac0000` is the depth plane and bridges correctly (#1275). `0x2054aa0000` is the **stencil
+plane of the same image**: `find_persistent_ds_sampled` matched only the depth bases (`dr`/`dw`), so
+every stencil sample fell through to a guest-byte decode of memory the renderer never writes — zeros.
+That is #1275's exact failure mode, left unfixed on the other plane. The guest declares the two planes
+`Float32` and `Uint8`, which is what a deferred renderer's material and light-volume classification
+reads.
+
+Fixed by matching `sr`/`sw` and binding the image's stencil aspect. Measured over a routed boot:
+`calls=262144 hit(depth=42897 stencil=2982)` — roughly 3,000 binds per run now sample the live image
+instead of zeros, with 0 validation errors.
+
+**This did NOT change the rendered frame, and the claim is kept separate from the fix.** A/B on the
+same route, HUD regions excluded from the metric: before 2.004% of pixels non-black, after 1.993% —
+inside the run-to-run spread of the route itself (0.283%–2.584% across five runs). The two frames are
+visually identical: the same three bloomed light sources and the same faint structure. So the stencil
+bridge is a verified gap fix, not the missing world.
+
+**The instrument that nearly sold it as one.** The bridge's logging printed the first eight hits and
+the first eight misses. On a routed boot all sixteen are consumed during startup by one plane, so it
+could report neither a rate nor a reason, and the "after" image *looks* like it has new content until
+it is put next to the "before" image. Replaced with per-plane counters classifying every miss as
+no-entry / depth-invalid / stencil-invalid / extent / uninitialized — the distinction between "we have
+no such surface" and "we have it and declined it" calls for opposite fixes and was previously
+invisible. The old cache dump also printed with the first miss, which on this route is always before
+the cache has any contents, so it read as "prosper retains no DS images" when it meant "not yet".
+
+### Ruled out by the same measurement
+
+- **The DCC "unsupported sampled image" warning on `0x2052ac0000` is a false alarm.** It fires from a
+  block that checks `!rtt_hit` but not `has_ds_live`, so it prints even when the depth bridge won the
+  binding; `meta=0x2055310000` is the surface's **HTILE**, being read as DCC metadata, and
+  `metadata=0/0` means the copy was correctly skipped because the bridge had already won. It is not
+  evidence of an unsupported path.
+- **`0x2052ac0000` is not an untracked secondary MRT.** It is a depth buffer, which is why it never
+  appears in a colour-target census, and it bridges: `[dsbridge] HIT … plane=depth`.
+
 ## The two inputs nothing writes (2026-08-15, measured)
 
 The gameplay chain is all `0x20…` and every link hits (Codex, #2542), so the world is already absent

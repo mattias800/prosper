@@ -2527,11 +2527,22 @@ persistent_ds_cache() {
 // memory. Resolve that address (read or write base — the guest aliases both at the same plane) to
 // the retained image so the consumer can bind it directly. Extent must match the T# exactly; only
 // a valid, initialized depth plane may be sampled.
+// The STENCIL plane is bridged on the same terms (2026-08-15). A combined depth/stencil surface has
+// two guest bases: the key's dr/dw name the depth plane and its sr/sw name the stencil plane, and a
+// guest T# addresses whichever plane it samples. Matching only dr/dw left every stencil sample
+// falling through to a guest-byte decode of memory the renderer never writes — zeros — which is
+// #1275's exact failure mode on the other plane. Grand Theft Auto V samples both planes of one
+// 3840x2160 D32_SFLOAT_S8_UINT surface (dr=dw=0x2052ac0000, sr=sw=0x2054aa0000), declaring the
+// depth plane Float32 and the stencil plane Uint8, which is what a deferred renderer's material and
+// light-volume classification reads.
 struct PersistentDsSampled {
     PersistentDsImage* image = nullptr;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0;
     uint32_t height = 0;
+    // Exactly one of DEPTH/STENCIL: a sampled-image view of a combined format may expose only one
+    // plane (VUID-VkDescriptorImageInfo-imageView-01976).
+    VkImageAspectFlagBits aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
 };
 inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t width,
                                                       uint32_t height,
@@ -2547,34 +2558,80 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
         if (!prosper::frontend::rtt_sampled_extent_compatible(
                 width, height, key.w, key.h, render_scale, normalized_sampling))
             continue;
-        if (key.dr != addr && key.dw != addr) continue;
-        if (!image.depth_valid || !image.layout_initialized || !image.image) continue;
+        const bool is_depth_plane = key.dr == addr || key.dw == addr;
+        const bool is_stencil_plane = key.sr == addr || key.sw == addr;
+        // A surface whose depth and stencil bases coincide cannot be disambiguated by address, so
+        // resolve it as depth — the historical behaviour, and the only plane #1275 ever bridged.
+        if (!is_depth_plane && !is_stencil_plane) continue;
+        if (!image.layout_initialized || !image.image) continue;
+        if (is_depth_plane ? !image.depth_valid : !image.stencil_valid) continue;
         if (!best.image || image.last_depth_write > best_write) {
-            best = {&image, static_cast<VkFormat>(key.fmt), key.w, key.h};
+            best = {&image, static_cast<VkFormat>(key.fmt), key.w, key.h,
+                    is_depth_plane ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT};
             best_write = image.last_depth_write;
         }
     }
-    if (best.image) {
-        if (bridge_log) {
-            static int hits = 0;
-            if (hits++ < 8)
-                fprintf(stderr, "[dsbridge] HIT addr=0x%llx requested=%ux%u image=%ux%u fmt=%u\n",
-                        (unsigned long long)addr, width, height, best.width, best.height,
-                        (unsigned)best.format);
-        }
-        return best;
-    }
+    // Counters, not first-N samples. The old logging printed the first eight hits and the first
+    // eight misses, which on a routed boot are all consumed by one plane during startup -- so it
+    // could not answer "how often does this miss, and why", which is the only question worth asking
+    // of a bridge. Reported at powers of two so a long run stays readable.
     if (bridge_log) {
-        static int misses = 0;
-        if (misses++ < 8) {
-            fprintf(stderr, "[dsbridge] miss addr=0x%llx %ux%u; cache:\n",
-                    (unsigned long long)addr, width, height);
-            for (const auto& [key, image] : persistent_ds_cache())
-                fprintf(stderr, "[dsbridge]   dr=0x%llx dw=0x%llx %ux%u fmt=%u dvalid=%d init=%d\n",
-                        (unsigned long long)key.dr, (unsigned long long)key.dw, key.w, key.h,
-                        key.fmt, (int)image.depth_valid, (int)image.layout_initialized);
+        struct DsBridgeStats {
+            std::atomic<uint64_t> calls{0};
+            std::atomic<uint64_t> hit_depth{0}, hit_stencil{0};
+            std::atomic<uint64_t> miss_no_entry{0};       // address is not a plane of any live DS
+            std::atomic<uint64_t> miss_depth_invalid{0};  // plane matched, aspect not valid
+            std::atomic<uint64_t> miss_stencil_invalid{0};
+            std::atomic<uint64_t> miss_extent{0};         // plane matched, extent incompatible
+            std::atomic<uint64_t> miss_uninitialized{0};
+        };
+        static DsBridgeStats stats;
+        if (best.image) {
+            (best.aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? stats.hit_stencil : stats.hit_depth)
+                .fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // Classify the miss against the cache, so "no such surface" is never confused with
+            // "the surface is here and we declined it" -- they call for opposite fixes.
+            bool matched_plane = false, extent_bad = false, uninit = false;
+            bool depth_req = false, stencil_req = false;
+            for (const auto& [key, image] : persistent_ds_cache()) {
+                const bool d = key.dr == addr || key.dw == addr;
+                const bool st = key.sr == addr || key.sw == addr;
+                if (!d && !st) continue;
+                matched_plane = true;
+                if (!prosper::frontend::rtt_sampled_extent_compatible(
+                        width, height, key.w, key.h, render_scale, normalized_sampling)) {
+                    extent_bad = true;
+                    continue;
+                }
+                if (!image.layout_initialized || !image.image) { uninit = true; continue; }
+                if (d && !image.depth_valid) depth_req = true;
+                if (st && !image.stencil_valid) stencil_req = true;
+            }
+            if (!matched_plane) stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed);
+            else if (extent_bad) stats.miss_extent.fetch_add(1, std::memory_order_relaxed);
+            else if (uninit) stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed);
+            else if (stencil_req)
+                stats.miss_stencil_invalid.fetch_add(1, std::memory_order_relaxed);
+            else if (depth_req) stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t n = stats.calls.fetch_add(1) + 1;
+        if ((n & (n - 1)) == 0 && n >= 1024) {
+            fprintf(stderr,
+                    "[dsbridge] calls=%llu hit(depth=%llu stencil=%llu) "
+                    "miss(no-entry=%llu depth-invalid=%llu stencil-invalid=%llu "
+                    "extent=%llu uninit=%llu)\n",
+                    (unsigned long long)n,
+                    (unsigned long long)stats.hit_depth.load(),
+                    (unsigned long long)stats.hit_stencil.load(),
+                    (unsigned long long)stats.miss_no_entry.load(),
+                    (unsigned long long)stats.miss_depth_invalid.load(),
+                    (unsigned long long)stats.miss_stencil_invalid.load(),
+                    (unsigned long long)stats.miss_extent.load(),
+                    (unsigned long long)stats.miss_uninitialized.load());
         }
     }
+    if (best.image) return best;
     return {};
 }
 
@@ -4099,6 +4156,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // the DEPTH aspect of ds_format, and the call transitions the image DS-attachment ->
         // shader-read around its passes.
         bool borrowed_ds = false;
+        bool borrowed_ds_stencil = false;   // sample the stencil plane rather than the depth plane
         bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
         VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
@@ -5319,6 +5377,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.borrowed_ds = true;
                                 upload.borrowed_ds_feedback = same_pass_feedback;
                                 upload.ds_format = sampled_ds.format;
+                                upload.borrowed_ds_stencil =
+                                    sampled_ds.aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
                             }
                         }
                         upload.persistent_id =
@@ -5523,8 +5583,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     // depth format's DEPTH aspect (one level — DS surfaces have no mip chains here);
                     // the sampled value arrives in R. The T# swizzle above still applies.
                     if (upload.borrowed_ds) {
+                        // The view format stays the image's combined DS format -- a depth/stencil
+                        // image admits no format reinterpretation -- and the aspect mask alone
+                        // selects the plane. Exactly one aspect, as a sampled view of a combined
+                        // format requires (VUID-VkDescriptorImageInfo-imageView-01976).
                         tvci.format = upload.ds_format;
-                        tvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+                        tvci.subresourceRange = {
+                            upload.borrowed_ds_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                                                       : VK_IMAGE_ASPECT_DEPTH_BIT,
+                            0, 1, 0, 1};
                     }
                     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
                     // Honor the game's decoded S# (r.mag/min/mip_filter, r.addr_uvw) instead of a fixed
