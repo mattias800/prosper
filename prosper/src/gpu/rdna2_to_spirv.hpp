@@ -12,6 +12,7 @@
 // runs the translated ALU ops, then stores v[out_vgpr] to storage buffer 1 (b[gid]).
 #pragma once
 #include <array>
+#include <string>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -110,6 +111,12 @@ struct RecompileDiagnosticContext {
 
 // Emit the canonical final live compute-skip diagnostic through the recompiler's atomic formatter.
 void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& diagnostic);
+
+// The last TERMINAL reject reason recorded for a program, or "" if none. Recorded whether or not
+// PROSPER_DBG is set, so the unconditional live skip line can name WHY a program was declined --
+// PROSPER_DBG is unusable on a routed run, which is why every skip has historically printed a bare
+// address that nobody could act on.
+std::string last_terminal_reject_reason(uint64_t program_address);
 
 // A narrowly-proven compiler-generated scalar jump table. The shader loads a uniform selector from a
 // direct constant buffer, bounds it, scales it by the 64-bit table-entry size, loads a PC-relative

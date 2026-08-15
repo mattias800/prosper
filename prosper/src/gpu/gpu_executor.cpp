@@ -2044,11 +2044,17 @@ bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
         std::lock_guard lock(mutex);
         if (!logged.insert(diagnostic.program_address).second) return false;
     }
-    if (std::getenv("PROSPER_DBG"))
+    if (std::getenv("PROSPER_DBG")) {
         log_compute_recompile_skip_diagnostic(diagnostic);
-    else
-        std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
-                     static_cast<unsigned long long>(diagnostic.program_address));
+        return true;
+    }
+    // Name the reason, not only the address. Every skip is meant to be the next thing implemented,
+    // and until now the only way to learn why one happened was PROSPER_DBG -- which on a routed run
+    // desyncs the pad script badly enough that the route never reaches the phase being diagnosed.
+    const std::string reason = last_terminal_reject_reason(diagnostic.program_address);
+    std::fprintf(stderr, "[compute] skip unsupported program 0x%llx reason=%s\n",
+                 static_cast<unsigned long long>(diagnostic.program_address),
+                 reason.empty() ? "unrecorded" : reason.c_str());
     return true;
 }
 

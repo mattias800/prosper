@@ -42,10 +42,44 @@ const char* recompile_diagnostic_stage_name(RecompileDiagnosticStage stage) {
 // Recompiles can run concurrently. Build the complete diagnostic on the stack and submit it through
 // one stdio call so one program's identity cannot be spliced onto another program's reject payload.
 // The context is an explicit per-call value; no global or thread-local attribution state is involved.
+// Last TERMINAL reject reason per program, recorded whether or not PROSPER_DBG is set.
+//
+// Every reject reason in this file sits behind PROSPER_DBG, and PROSPER_DBG is unusable on a routed
+// run: it produces a log large enough to desync a timing-dependent pad script, so the route never
+// reaches the phase whose rejects you wanted to read. The consequence is that
+// `[compute] skip unsupported program 0x...` has printed a bare address for the whole life of the
+// diagnostic, and the charter's rule that every skip is the next thing to implement cannot be
+// followed from it.
+//
+// Recording only the terminal role keeps this to one short string per rejected program (thirteen on
+// a 200 s GTA V route), so the map is bounded by the number of DISTINCT rejected programs rather
+// than by the number of dispatches.
+std::mutex& terminal_reject_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<uint64_t, std::string>& terminal_reject_reasons() {
+    static std::map<uint64_t, std::string> reasons;
+    return reasons;
+}
+
+void record_terminal_reject_reason(uint64_t program_address, const char* tag,
+                                   const char* payload) {
+    if (!program_address) return;
+    // A cap, because a pathological guest could present unboundedly many distinct programs. Losing
+    // late entries is strictly better than a diagnostic that grows without limit.
+    constexpr size_t kMaximumRecordedPrograms = 4096;
+    std::lock_guard lock(terminal_reject_mutex());
+    auto& reasons = terminal_reject_reasons();
+    if (reasons.size() >= kMaximumRecordedPrograms && !reasons.count(program_address)) return;
+    reasons[program_address] = std::string(tag) + " " + payload;
+}
+
 void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
                               const char* tag, const char* role, const char* format, ...) {
-    if (!std::getenv("PROSPER_DBG")) return;
-
+    // Formatted BEFORE the PROSPER_DBG gate: the terminal reason has to be recorded whether or not
+    // anyone is reading the verbose stream.
     char payload[1536];
     va_list args;
     va_start(args, format);
@@ -53,6 +87,15 @@ void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
     va_end(args);
     if (body < 0) return;
     payload[sizeof(payload) - 1] = '\0';
+    // Record every role EXCEPT "consequent". A consequent line only restates that an empty result
+    // was returned -- it names the effect, never the cause -- so letting it overwrite a terminal or
+    // route-decline reason would replace the answer with the question. Measured on a routed GTA V
+    // run: recording "terminal" alone left twelve of thirteen skips reading `reason=unrecorded`,
+    // because most reject sites use "route-decline".
+    if (role && std::strcmp(role, "consequent") != 0)
+        record_terminal_reject_reason(diagnostic.program_address, tag, payload);
+
+    if (!std::getenv("PROSPER_DBG")) return;
     size_t payload_size = std::strlen(payload);
     while (payload_size && (payload[payload_size - 1] == '\n' ||
                             payload[payload_size - 1] == '\r'))
@@ -78,6 +121,13 @@ void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
 }
 
 } // namespace
+
+std::string last_terminal_reject_reason(uint64_t program_address) {
+    std::lock_guard lock(terminal_reject_mutex());
+    const auto& reasons = terminal_reject_reasons();
+    const auto found = reasons.find(program_address);
+    return found == reasons.end() ? std::string() : found->second;
+}
 
 void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& diagnostic) {
     log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "consequent",
