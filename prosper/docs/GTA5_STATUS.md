@@ -78,6 +78,47 @@ both decoding to parent 296), so it is a flag-bit difference and a separate anom
 **Ruled out by this measurement:** the "lost update" / two-writer race account of the cycle. Within
 one dispatch's pre/post pair there is exactly one writer, and its output is cyclic.
 
+## THE SECOND TABLE IS BUILT PERFECTLY — by a different program (2026-08-15)
+
+`PROSPER_COMPUTE_TREE_WATCH=0x20f848a240:2063`, same route. The two addresses are **not** a
+ping-ponged copy of one structure: they have disjoint writer sets.
+
+| address | writers | result |
+| --- | --- | --- |
+| `0x20f848417c` | `0x413dc3400`, `0x413d88400`, `0x413e1c300`, `0x413cee500` | **37 of 40 dispatches leave it cyclic** |
+| `0x20f848a240` | `0x413ce3400`, `0x413cf5400`, `0x413d88400`, `0x413cdc200` | **clean; 3 of 133 transitions cyclic, each repaired immediately** |
+
+And the decisive line: **`0x413ce3400` produces a PERFECT tree at `0x20f848a240`, every single time.**
+
+```
+program=0x413ce3400 changed=2061 pre{... pairs=0 unpaired=0}
+                              post{cycles=0 cyclic-roots=0 oob-roots=0 max-depth=11 pairs=1030 unpaired=0}
+```
+
+`pairs=1030, unpaired=0, cycles=0, max-depth=11` — exactly the clean ground truth, on all 41 of its
+dispatches. So **prosper can already build this structure correctly.** The defect is specific to
+`0x413dc3400`, and there is now a working reference program to differentially compare against.
+
+The two are different programs, not two instances of one:
+
+| | `0x413ce3400` (correct) | `0x413dc3400` (broken) |
+| --- | --- | --- |
+| instructions | 391 | 765 |
+| DS (LDS) ops | **0** | 5 (`ds_write_b32` x2, `ds_add_rtn_u32`, `ds_read_b32` x2) |
+| `s_barrier` | **0** | 2 |
+| CFG dispatchers | — | 3 (one per barrier-free phase) |
+| MUBUF | 29 | 37 |
+
+**The distinguishing features of the failing one are exactly the workgroup-cooperative machinery**:
+the LDS stream compaction Codex decoded at pc47..74 (`ds_add_rtn_u32` hands each qualifying lane a
+ticket; the two barriers bracket counter initialisation and list publication), and the barrier-phased
+CFG dispatcher that machinery forces. The correct builder has none of it.
+
+That also resolves an inconsistency in the record: the consumer's own captures show ~1029-1030 pairs,
+which matches the `a240` tree rather than `417c`'s 919. The consumer's bound table address alternates
+between the two across frames, so it walks a good tree on some frames and the broken one on others —
+which is why the hang arrives at a particular dispatch rather than the first.
+
 ## The failure mode, exactly: one of the two per-parent stores does not execute
 
 Established from both images of 18 clean -> cyclic transitions.
