@@ -303,6 +303,48 @@ int main() {
               false, true, true, VK_COMPARE_OP_NEVER),
           "a depth write masked by NEVER does not claim writer recency");
 
+    // DB_DEPTH_VIEW slice identity. A cube shadow map is ONE six-layer guest allocation: all six
+    // faces share a depth base and the guest selects the face with DB_DEPTH_VIEW.SLICE_START/MAX.
+    // GTA V programs exactly these values against one base, one per face.
+    {
+        struct { uint32_t view, start, max; } const faces[] = {
+            {0x02000000u, 0u, 0u}, {0x02002001u, 1u, 1u}, {0x02004002u, 2u, 2u},
+            {0x02006003u, 3u, 3u}, {0x02008004u, 4u, 4u}, {0x0200a005u, 5u, 5u},
+        };
+        bool decoded = true;
+        for (const auto& face : faces)
+            decoded = decoded &&
+                prosper::test::ds_depth_view_slice_start(face.view) == face.start &&
+                prosper::test::ds_depth_view_slice_max(face.view) == face.max;
+        CHECK(decoded, "DB_DEPTH_VIEW decodes SLICE_START/MAX for all six cube faces");
+
+        // The regression proper: two faces of one cube differ ONLY in slice, and must not collide.
+        // Before slice joined the key they shared one entry, so each face render reused and
+        // overwrote the previous face's host image and only the last face survived -- a corruption
+        // of retained depth that no consumer could recover a valid cube from.
+        constexpr uint64_t kCubeBase = 0x20d5cbe000ull;
+        constexpr uint32_t kFaceW = 512, kFaceH = 512;
+        auto face_key = [&](uint32_t slice) {
+            return prosper::test::PersistentDsKey{
+                kCubeBase, kCubeBase, 0, 0, 0, kFaceW, kFaceH,
+                static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT), slice};
+        };
+        CHECK(!(face_key(0) == face_key(1)),
+              "two cube faces of one allocation are distinct DS identities");
+        auto& cache = prosper::test::persistent_ds_cache();
+        const size_t before = cache.size();
+        auto& face0 = cache[face_key(0)];
+        auto& face5 = cache[face_key(5)];
+        face0.image = (VkImage)(uintptr_t)0x501; face0.layout_initialized = true;
+        face5.image = (VkImage)(uintptr_t)0x505; face5.layout_initialized = true;
+        CHECK(cache.size() == before + 2,
+              "six-layer cube retains one host image per face, not one for all six");
+        CHECK(face0.image != face5.image && cache[face_key(0)].image == face0.image,
+              "a later face render does not overwrite an earlier face's retained image");
+        cache.erase(face_key(0));
+        cache.erase(face_key(5));
+    }
+
     // Exercise the actual D32/D32S8 sibling selector, not just the predicate above. A read-only
     // touch of the older format must not steal recency from the surface that was really written.
     {

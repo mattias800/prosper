@@ -2445,21 +2445,48 @@ inline RenderHostBufferPoolStats render_host_buffer_pool_stats() {
     return {pool.cached_bytes, pool.cached_buffers, pool.hits, pool.misses, pool.evictions};
 }
 
+// A depth/stencil surface's identity includes WHICH ARRAY SLICE the attachment view selects, not
+// only its allocation bases. A cube shadow map is ONE six-layer guest allocation: all six faces share
+// a base and the guest picks the face with DB_DEPTH_VIEW.SLICE_START/MAX, programming
+// 0x02000000, 0x02002001, 0x02004002 … 0x0200a005 for slices 0..5 against the same base (GTA V,
+// verified per-cube on a live route).
+//
+// Omitting the slice made every face of a cube collide on one key, so each face render REUSED and
+// overwrote the previous face's host image and only the last face survived. That is a corruption of
+// retained depth, independent of whether anything samples it: no consumer could recover a valid cube
+// from the cache however the sampling gate were relaxed.
+//
+// Non-layered surfaces program DB_DEPTH_VIEW=0 and therefore key at slice 0 exactly as before, so
+// this widens identity only where the guest actually used layers.
 struct PersistentDsKey {
     uint64_t dr = 0, dw = 0, sr = 0, sw = 0, htile = 0;
-    uint32_t w = 0, h = 0, fmt = 0;
+    uint32_t w = 0, h = 0, fmt = 0, slice = 0;
     bool operator==(const PersistentDsKey& o) const {
         return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw && htile == o.htile &&
-               w == o.w && h == o.h && fmt == o.fmt;
+               w == o.w && h == o.h && fmt == o.fmt && slice == o.slice;
     }
 };
+
+// DB_DEPTH_VIEW.SLICE_START, including its two high bits (SLICE_START occupies bits 0..10 with
+// SLICE_START_HI at 11..12; SLICE_MAX is bits 13..23). A single-face attachment programs
+// START == MAX, which is what a cube face render does.
+inline uint32_t ds_depth_view_slice_start(uint32_t db_depth_view) {
+    return (db_depth_view & prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_START_MASK) |
+           (((db_depth_view >> prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_START_HI_SHIFT) &
+             prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_START_HI_MASK)
+            << prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_START_HI_SHIFT);
+}
+inline uint32_t ds_depth_view_slice_max(uint32_t db_depth_view) {
+    return (db_depth_view >> prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_MAX_SHIFT) &
+           prosper::agc::Pm4::DB_DEPTH_VIEW_SLICE_MAX_MASK;
+}
 
 struct PersistentDsKeyHash {
     size_t operator()(const PersistentDsKey& k) const {
         size_t hash = 1469598103934665603ull;
         auto mix = [&](uint64_t v) { hash ^= static_cast<size_t>(v); hash *= 1099511628211ull; };
         mix(k.dr); mix(k.dw); mix(k.sr); mix(k.sw); mix(k.htile);
-        mix(k.w); mix(k.h); mix(k.fmt);
+        mix(k.w); mix(k.h); mix(k.fmt); mix(k.slice);
         return hash;
     }
 };
@@ -2701,11 +2728,12 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
                     persistent_ds_cache().size());
             for (const auto& [key, image] : persistent_ds_cache())
                 fprintf(stderr,
-                        "[dsbridge]     dr=0x%llx dw=0x%llx sr=0x%llx sw=0x%llx %ux%u fmt=%u "
-                        "dvalid=%d svalid=%d\n",
+                        "[dsbridge]     dr=0x%llx dw=0x%llx sr=0x%llx sw=0x%llx slice=%u "
+                        "%ux%u fmt=%u dvalid=%d svalid=%d\n",
                         (unsigned long long)key.dr, (unsigned long long)key.dw,
                         (unsigned long long)key.sr, (unsigned long long)key.sw,
-                        key.w, key.h, key.fmt, (int)image.depth_valid, (int)image.stencil_valid);
+                        key.slice, key.w, key.h, key.fmt,
+                        (int)image.depth_valid, (int)image.stencil_valid);
         }
     }
     if (best.image) return best;
@@ -3322,10 +3350,13 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D32_SFLOAT_S8_UINT;
     const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
         (format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    // Seeds carry no DB_DEPTH_VIEW, so a restored surface keys at slice 0. That matches every
+    // non-layered surface exactly and is the only slice a seed can honestly claim; a layered guest
+    // allocation restored from a seed will re-key correctly as soon as the guest programs its view.
     PersistentDsKey key{seed.depth_read_base, seed.depth_write_base,
                         seed.stencil_read_base, seed.stencil_write_base,
                         seed.htile_data_base, seed.width, seed.height,
-                        static_cast<uint32_t>(format)};
+                        static_cast<uint32_t>(format), 0u};
     PersistentDsImage& image = persistent_ds_cache()[key];
     if (!image.image) {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -3743,7 +3774,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = {identity->depth_read_base, identity->depth_write_base,
                   identity->stencil_read_base, identity->stencil_write_base,
-                  htile_identity, W, H, (uint32_t)DFMT};
+                  htile_identity, W, H, (uint32_t)DFMT,
+                  ds_depth_view_slice_start(identity->db_depth_view)};
         cached_ds = &persistent_ds_cache()[ds_key];
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
         ds_layout_initialized = cached_ds->layout_initialized;

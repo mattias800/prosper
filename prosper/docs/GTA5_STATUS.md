@@ -1829,6 +1829,48 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Cube depth: the DS cache overwrote its own faces (2026-08-15, fixed) — and the falsification above is RETRACTED
+
+**Retraction first.** The section below this one records cube shadow maps as falsified. That call was
+premature and is withdrawn. It read the *final screenshot*, and Codex's correction is right: the
+screenshot is the wrong readout for an input this deep in the frame. Re-run cube-only at both poles,
+reading the lighting output `0x20431c0000` instead:
+
+| cube fill | `0x20431c0000` |
+| --- | --- |
+| `0x00` | max=46, 44.5% non-black (matches baseline) |
+| `0xff` | **max=0, 0.0%** |
+
+The shadow term does not merely move the lighting output, it can zero it completely. The lever moves
+hard, so the cube path is load-bearing and the earlier "not the missing world" verdict was void, not
+negative. Recorded here because it is the second time this session that a black *screenshot* hid a
+large change one stage upstream.
+
+**The defect Codex identified underneath the bridge gate.** A cube shadow map is not six neighbouring
+allocations — it is ONE six-layer allocation whose faces share a depth base and are selected by
+`DB_DEPTH_VIEW.SLICE_START/MAX`. GTA V programs `0x02000000, 0x02002001, 0x02004002 … 0x0200a005`
+(start=max=0..5) against a single base. `PersistentDsKey` omitted the slice, so **every face render
+for a base collided on one key and overwrote the previous face's host image**; only the last face
+survived. No relaxation of the sampling gate could have recovered a valid cube from that cache.
+
+Fixed by adding the slice to the DS identity. Measured on the same route: retained DS surfaces
+**29 → 55**, and a cube base that held one entry now holds one per face:
+
+```
+0x20972c0000 slice=0 … slice=1 … slice=2 … slice=3 … slice=4
+0x20978c0000 slice=0 … slice=1 … slice=2 … slice=3 … slice=4
+```
+
+Non-layered surfaces program `DB_DEPTH_VIEW=0` and key at slice 0 exactly as before, so identity
+widens only where the guest actually used layers.
+
+**Still open (Codex's stage 2):** the cube T# is still gated out of the bridge by `img_dim == 1`, and
+binding it needs the six slices gathered into the backend's stacked sampled representation plus a
+**numeric depth conversion** — the guest surface is `Z16` (`DB_Z_INFO.FORMAT=1`) while prosper
+canonicalises host attachments to `D32_SFLOAT`, so the bridge must do
+`D32 float → clamp [0,1] → quantise to R16_UNORM`, not a bit reinterpretation and not a Z inversion
+(reversed-Z is already carried by the stored values and the comparison direction).
+
 ## ROOT CAUSE: the fragment recompiler supported only MRT0 and MRT1 (2026-08-15, fixed)
 
 GTA V's G-buffer pass exports **five** render targets. prosper's fragment shell carried **two**, so
