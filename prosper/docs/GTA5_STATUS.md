@@ -97,6 +97,41 @@ one dispatch's pre/post pair there is exactly one writer, and its output is cycl
 - **A lane/wave/workgroup boundary effect.** Damage index mod 2/3/4/8/16 is flat.
 - **An unknown or out-of-bounds writer.** Every observed change reported `toucher=1`.
 
+## The selector chain at `0x413ce6000` pc149..156 — the exact fix site
+
+Decoded with prosper's own opcode constants (`rdna2_decode.hpp`), not guessed:
+
+```
+pc149  s_mulk_i32            s106, 120          ; SOPK 0x10. selector * 120, in VCC_LO as scratch
+pc150  s_load_dwordx4        s[4:7], s[0:1], m0 ; the descriptor-ARRAY V#
+pc153  s_buffer_load_dwordx4 s[8:11], s[4:7], s106  ; SELECT one V# at selector*120
+pc156  buffer_load_dwordx3   v[0:2], v6, s[8:11], 0 ; use it   <-- mode=unresolved-operand
+```
+
+**120 is exactly the array's stride.** `PROSPER_DYNTRACE_FAIL` confirms the split:
+
+```
+BUF(v4) key=0xa8       use_pc=153  base=0x203f249b38 stride=120 records=5 size=600   RESOLVED
+BUF(v4) key=0xffffffff use_pc=156  v4=00000000:00000000:00000000:00000000            UNRESOLVED
+```
+
+So the descriptor-array lift **finds the array** at pc153 and **cannot resolve the selected element**
+at pc156: `key=0xffffffff` is the sentinel the executor's own comment names as matchable by none of
+the three routes (fetch pc, SRT offset, SGPR base).
+
+**Why the selector does not resolve. `CONFIDENCE: MED`.** The selector arrives through **VCC_LO used
+as an ordinary scalar register** — GTA V's compiler recycles it, which this file already documents
+elsewhere. prosper's VCC-as-scalar recognition is
+`is_wave64_vcc_lo_scalar_b32_candidate`, and it covers exactly two shapes: `s_cselect_b32` with
+inline operands, and SOP2 B32 logicals. **`s_mulk_i32` is SOPK and is in neither set**, so the write
+at pc149 is not recognised as a scalar-scratch definition. That matches the failure exactly, but the
+alternative — that the const-fold breaks somewhere else along `s106`'s chain — has not been
+separately excluded, so this is a lead and not a conclusion. Verify before building on it.
+
+This is the same underlying difficulty as the execz VCC-half liveness guard cleared earlier today:
+**every remaining obstacle in this program comes from the guest recycling VCC as a general scalar
+register, and prosper modelling VCC specially in each place independently.**
+
 ## THE REMAINING BLOCKER, EXACTLY (2026-08-15)
 
 Every compute reject on a routed run now names its cause without `PROSPER_DBG`. `0x413ce6000` — the
