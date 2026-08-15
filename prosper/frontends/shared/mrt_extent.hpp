@@ -29,6 +29,43 @@ constexpr bool mrt_extent_known(uint32_t w, uint32_t h) {
     return w != 0u && h != 0u;
 }
 
+// Does this pass bind ANY colour slot within its active prefix?
+//
+// Two decisions in the live renderer key on this and both were once written as "is colour-0 bound":
+// whether to hand the backend a BackendColorTarget at all, and whether to ask for colour pixels
+// back. A pass with colour-0 unbound and a higher slot bound is reachable by construction --
+// `mrt_count` does not depend on colour-0 -- and on `base != 0` alone such a pass populated the
+// per-slot persistence contract and then handed the backend a nullptr, so those active slots stayed
+// transient and were cleared by the next render group. Depth-only passes have every slot zero, so
+// the "skip the work" win the readback flag was added for is unchanged.
+//
+// Takes a pointer and a count rather than a container so the production array and a test fixture
+// exercise the identical expression.
+constexpr bool mrt_any_slot_bound(const uint64_t* slot_bases, uint32_t count) {
+    if (!slot_bases) return false;
+    for (uint32_t slot = 0; slot < count; ++slot)
+        if (slot_bases[slot] != 0u) return true;
+    return false;
+}
+
+// Does a sampled surface collide with a colour target this pass is actively writing?
+//
+// `bases[i]` is slot i's bound base and `active[i]` whether that slot is really being written. Both
+// the backend's descriptor borrow and the frontend's direct-live sampling decision ask this, and
+// both once asked it of slots 0 and 1 only -- complete while higher slots could not be persistent,
+// and wrong the moment they could. Sampling an ACTIVE MRT2+ target then borrows the very VkImage the
+// pass is writing, using one image as shader-read and colour-attachment at once and bypassing the
+// CPU fallback that exists for exactly this case.
+//
+// An inactive slot does not collide: a stale base with a zero write mask is not a target.
+constexpr bool mrt_target_feedback(const uint64_t* bases, const bool* active, uint32_t count,
+                                   uint64_t sampled) {
+    if (!bases || !active || !sampled) return false;
+    for (uint32_t slot = 0; slot < count; ++slot)
+        if (active[slot] && bases[slot] == sampled) return true;
+    return false;
+}
+
 // True only when a bound slot's extent is KNOWN to disagree with the extent the pass renders at.
 // An unknown extent on either side yields false: absence of a measurement is not evidence of a
 // mismatch, and the fail-safe direction is to keep a real, actively-written attachment rather than

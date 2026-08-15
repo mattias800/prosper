@@ -414,6 +414,11 @@ int main(int argc, char** argv) {
               GpuCaptureResourceInputVerdict::Mismatch,
           "FORMAT=INVALID V# still rejects a normalized byte-size disagreement");
 
+    // v55 appends one uint32 slice per DS seed at the very end of the stream. Legacy fixtures that
+    // downgrade the version byte in place must strip it first, like every tail before it.
+    auto v55_ds_slice_tail = [](const GpuCaptureFile& f) -> size_t {
+        return f.ds_seeds.size() * sizeof(uint32_t);
+    };
     auto resource_bool_tail = [](const GpuCaptureFile& f) -> size_t {
         size_t rc = 0;
         for (const auto& d : f.draws) rc += d.vrt.resources.size() + d.prt.resources.size();
@@ -591,6 +596,7 @@ int main(int argc, char** argv) {
         v45_provenance_bytes.resize(
             v45_provenance_bytes.size() -
             (4u + 100u * provenance_loaded.resource_provenance.size()));
+        v45_provenance_bytes.resize(v45_provenance_bytes.size() - v55_ds_slice_tail(provenance_loaded));  // v55 DS-seed slices
         v45_provenance_bytes[8] = 45;
         CHECK(deserialize_gpu_capture(v45_provenance_bytes, v45_provenance_loaded, error) &&
                   v45_provenance_loaded.format_version == 45 &&
@@ -826,7 +832,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame descriptor_array_replay;
     CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
               deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
-              descriptor_array_loaded.format_version == 54 &&
+              descriptor_array_loaded.format_version == 55 &&
               materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
               descriptor_array_replay.computes.size() == 1 &&
               descriptor_array_replay.computes[0].resources &&
@@ -1085,6 +1091,7 @@ int main(int argc, char** argv) {
               v16_scissor_bytes.size() >= 25,
           "v17 capture serializes effective guest scissor state");
     if (v16_scissor_bytes.size() >= 25) {
+        v16_scissor_bytes.resize(v16_scissor_bytes.size() - v55_ds_slice_tail(v16_scissor_source));  // v55 DS-seed slices
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v50_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v49_tail(v16_scissor_source));
         v16_scissor_bytes.resize(v16_scissor_bytes.size() - v48_tail(v16_scissor_source));
@@ -1207,7 +1214,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 54 &&
+              msaa_loaded.format_version == 55 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1260,6 +1267,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> v43_msaa_bytes;
     CHECK(serialize_gpu_capture(v43_msaa_source, v43_msaa_bytes, error),
           "current writer prepares an uncompressed v43 MSAA compatibility fixture");
+    v43_msaa_bytes.resize(v43_msaa_bytes.size() - v55_ds_slice_tail(v43_msaa_source));  // v55 DS-seed slices
     v43_msaa_bytes.resize(v43_msaa_bytes.size() - v50_tail(v43_msaa_source));
     v43_msaa_bytes.resize(v43_msaa_bytes.size() - v49_tail(v43_msaa_source));
     v43_msaa_bytes.resize(v43_msaa_bytes.size() - v48_tail(v43_msaa_source));
@@ -1321,7 +1329,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 54 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 55 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1332,7 +1340,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 54 &&
+              video_loaded.format_version == 55 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1340,6 +1348,7 @@ int main(int argc, char** argv) {
               video_replay.items[0].prt->resources[0].host_data_size == video_memory.size(),
           "v28 replay round-trips and binds the complete pitch-padded source span");
     std::vector<uint8_t> v46_zero_mip_bytes = video_capture_bytes;
+    v46_zero_mip_bytes.resize(v46_zero_mip_bytes.size() - v55_ds_slice_tail(video_capture));  // v55 DS-seed slices
     v46_zero_mip_bytes.resize(v46_zero_mip_bytes.size() - v50_tail(video_capture));
     v46_zero_mip_bytes.resize(v46_zero_mip_bytes.size() - v49_tail(video_capture));
     v46_zero_mip_bytes.resize(v46_zero_mip_bytes.size() - v48_tail(video_capture));
@@ -1375,7 +1384,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 54 &&
+              upgraded_video.format_version == 55 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1457,7 +1466,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 54 &&
+              array_layout_loaded.format_version == 55 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1556,6 +1565,7 @@ int main(int argc, char** argv) {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - v55_ds_slice_tail(volume_capture));  // v55 DS-seed slices
     volume_bytes.resize(volume_bytes.size() - v50_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v49_tail(volume_capture));
     volume_bytes.resize(volume_bytes.size() - v48_tail(volume_capture));
@@ -1624,6 +1634,44 @@ int main(int argc, char** argv) {
     GpuCaptureFile duplicate_ds = captured; duplicate_ds.ds_seeds.push_back(ds_seed);
     CHECK(!write_gpu_capture(path.string(), duplicate_ds, error) && error == "duplicate DS seed identity",
           "writer rejects duplicate persistent DS seed identities");
+    // Two faces of one cube: identical in every base, extent and format, differing ONLY in slice.
+    // Before slice joined the DS seed identity the writer rejected the second as a duplicate, so a
+    // capture taken once two cube faces were valid failed outright; and even a capture that had been
+    // written could not replay the faces distinctly, because restore keyed every seed at slice 0.
+    {
+        GpuCaptureFile two_faces = captured;
+        GpuCaptureDsSeed face1 = ds_seed;
+        face1.slice = 1;
+        two_faces.ds_seeds[0].slice = 0;
+        two_faces.ds_seeds.push_back(face1);
+        // Make the two faces' contents differ, so the round trip proves the payloads stay attached
+        // to the right slice rather than merely that two records survive.
+        two_faces.ds_seeds[1].depth.assign(16, 0x77);
+        std::vector<uint8_t> two_face_bytes;
+        GpuCaptureFile two_faces_loaded;
+        const bool round_tripped =
+            serialize_gpu_capture(two_faces, two_face_bytes, error) &&
+            deserialize_gpu_capture(two_face_bytes, two_faces_loaded, error);
+        CHECK(round_tripped,
+              "two cube faces differing only in slice are a valid capture, not a duplicate");
+        if (round_tripped) {
+            CHECK(two_faces_loaded.ds_seeds.size() == 2 &&
+                      two_faces_loaded.ds_seeds[0].slice == 0 &&
+                      two_faces_loaded.ds_seeds[1].slice == 1,
+                  "both cube faces survive the round trip with their slices");
+            CHECK(two_faces_loaded.ds_seeds.size() == 2 &&
+                      two_faces_loaded.ds_seeds[0].depth == two_faces.ds_seeds[0].depth &&
+                      two_faces_loaded.ds_seeds[1].depth == two_faces.ds_seeds[1].depth,
+                  "each face's depth payload stays attached to its own slice");
+        }
+        // The duplicate check must still fire on a genuine duplicate -- same slice included.
+        GpuCaptureFile same_slice = captured;
+        same_slice.ds_seeds.push_back(ds_seed);
+        CHECK(!write_gpu_capture(path.string(), same_slice, error) &&
+                  error == "duplicate DS seed identity",
+              "two seeds identical INCLUDING slice are still rejected as duplicates");
+    }
+
     GpuCaptureFile stencil_only = captured;
     stencil_only.ds_seeds[0].depth_valid = false; stencil_only.ds_seeds[0].depth.clear();
     std::vector<uint8_t> stencil_only_bytes;
@@ -1646,7 +1694,7 @@ int main(int argc, char** argv) {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    CHECK(loaded.format_version == 54 &&
+    CHECK(loaded.format_version == 55 &&
               loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
@@ -1658,6 +1706,7 @@ int main(int argc, char** argv) {
               v53_scalar_bytes.size() >= v54_tail(captured) + 12u,
           "v54 scalar-buffer tail is removable for a v53 compatibility fixture");
     if (v53_scalar_bytes.size() >= v54_tail(captured) + 12u) {
+        v53_scalar_bytes.resize(v53_scalar_bytes.size() - v55_ds_slice_tail(captured));  // v55 DS-seed slices
         v53_scalar_bytes.resize(v53_scalar_bytes.size() - v54_tail(captured));
         v53_scalar_bytes[8] = 53u;
         v53_scalar_bytes[9] = v53_scalar_bytes[10] = v53_scalar_bytes[11] = 0u;
@@ -1733,7 +1782,9 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> stale_bound_bytes;
     CHECK(serialize_gpu_capture(captured, stale_bound_bytes, error) && !stale_bound_bytes.empty(),
           "v54 stale scalar-buffer bound fixture serializes");
-    const size_t stale_tail = v54_tail(captured);
+    // v55 appends the DS-seed slices AFTER the v54 tail, so an offset measured from the end of the
+    // stream must skip them to land on the v54 records.
+    const size_t stale_tail = v54_tail(captured) + v55_ds_slice_tail(captured);
     bool stale_patched = false;
     if (stale_bound_bytes.size() >= stale_tail) {
         // The v54 tail is `count` followed by one dword per resource, in table order; resource 1 of
@@ -1758,6 +1809,11 @@ int main(int argc, char** argv) {
     CHECK(serialize_gpu_capture(captured, malformed_scalar_bytes, error) &&
               !malformed_scalar_bytes.empty(),
           "v54 scalar-buffer truncation fixture serializes");
+    // Drop the v55 DS-seed slice tail first, so popping a byte truncates the V54 tail this
+    // assertion is about rather than the newer one appended after it.
+    if (malformed_scalar_bytes.size() >= v55_ds_slice_tail(captured))
+        malformed_scalar_bytes.resize(malformed_scalar_bytes.size() -
+                                      v55_ds_slice_tail(captured));
     if (!malformed_scalar_bytes.empty()) malformed_scalar_bytes.pop_back();
     GpuCaptureFile malformed_scalar_loaded;
     CHECK(!deserialize_gpu_capture(malformed_scalar_bytes, malformed_scalar_loaded, error) &&
@@ -1781,6 +1837,7 @@ int main(int argc, char** argv) {
     CHECK(serialize_gpu_capture(pre_v31_source, v20_bytes, error) && v20_bytes.size() >= 21,
           "v21 capture serializes the logic-op extension");
     if (v20_bytes.size() >= 21) {
+        v20_bytes.resize(v20_bytes.size() - v55_ds_slice_tail(pre_v31_source));  // v55 DS-seed slices
         v20_bytes.resize(v20_bytes.size() - v50_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v49_tail(pre_v31_source));
         v20_bytes.resize(v20_bytes.size() - v48_tail(pre_v31_source));
@@ -1864,6 +1921,7 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> v42_bytes;
         CHECK(serialize_gpu_capture(captured, v42_bytes, error),
               "v43 capture serializes before the color-state downgrade");
+        v42_bytes.resize(v42_bytes.size() - v55_ds_slice_tail(captured));  // v55 DS-seed slices
         v42_bytes.resize(v42_bytes.size() - v50_tail(captured));
         v42_bytes.resize(v42_bytes.size() - v49_tail(captured));
         v42_bytes.resize(v42_bytes.size() - v48_tail(captured));
@@ -1894,6 +1952,7 @@ int main(int argc, char** argv) {
               v48_bvh_bytes.size() >=
                   v50_tail(captured) + v49_tail(captured) + v48_tail(captured),
           "v48 BVH sort state has a complete append-only tail");
+    v48_bvh_bytes.resize(v48_bvh_bytes.size() - v55_ds_slice_tail(captured));  // v55 DS-seed slices
     v48_bvh_bytes.resize(v48_bvh_bytes.size() - v50_tail(captured));
     v48_bvh_bytes.resize(v48_bvh_bytes.size() - v49_tail(captured));
     v48_bvh_bytes[8] = 48;
@@ -1926,6 +1985,7 @@ int main(int argc, char** argv) {
                   v50_tail(atomic_capture) + v49_tail(atomic_capture),
           "current capture has complete v49 and v50 append-only tails");
     v49_atomic_bytes = current_atomic_bytes;
+    v49_atomic_bytes.resize(v49_atomic_bytes.size() - v55_ds_slice_tail(atomic_capture));  // v55 DS-seed slices
     v49_atomic_bytes.resize(v49_atomic_bytes.size() - v50_tail(atomic_capture));
     v49_atomic_bytes[8] = 49;
     v49_atomic_bytes[9] = v49_atomic_bytes[10] = v49_atomic_bytes[11] = 0;
@@ -1990,6 +2050,7 @@ int main(int argc, char** argv) {
             v29_tail(pre_v31_source) + v28_tail(pre_v31_source) +
             v27_tail(pre_v31_source) + v26_tail(pre_v31_source) +
             v25_tail(pre_v31_source)) {
+        v24_resolve_bytes.resize(v24_resolve_bytes.size() - v55_ds_slice_tail(pre_v31_source));  // v55 DS-seed slices
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v50_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v49_tail(pre_v31_source));
         v24_resolve_bytes.resize(v24_resolve_bytes.size() - v48_tail(pre_v31_source));
@@ -2100,6 +2161,7 @@ int main(int argc, char** argv) {
         v44_tail(captured) + v43_tail(captured) +
             v42_tail(captured) + v41_tail(captured) +
             v40_tail(captured) + v39_tail(captured)) {
+        v37_compatible_bytes.resize(v37_compatible_bytes.size() - v55_ds_slice_tail(captured));  // v55 DS-seed slices
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v50_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v49_tail(captured));
         v37_compatible_bytes.resize(v37_compatible_bytes.size() - v48_tail(captured));
@@ -2624,6 +2686,7 @@ int main(int argc, char** argv) {
                   .atomic_x2_record_count == 25u,
           "v50 raw-compute replay preserves PGM_RSRC1, qword-atomic support, and record count");
     std::vector<uint8_t> v49_mixed_atomic = mixed_atomic_bytes;
+    v49_mixed_atomic.resize(v49_mixed_atomic.size() - v55_ds_slice_tail(mixed_atomic));  // v55 DS-seed slices
     v49_mixed_atomic.resize(v49_mixed_atomic.size() - v50_tail(mixed_atomic));
     v49_mixed_atomic[8] = 49;
     v49_mixed_atomic[9] = v49_mixed_atomic[10] = v49_mixed_atomic[11] = 0;
@@ -2705,6 +2768,7 @@ int main(int argc, char** argv) {
             v40_tail(v36_compute_source) +
             v39_tail(v36_compute_source) +
             v37_tail(v36_compute_source)) {
+        v36_compute_bytes.resize(v36_compute_bytes.size() - v55_ds_slice_tail(v36_compute_source));  // v55 DS-seed slices
         v36_compute_bytes.resize(v36_compute_bytes.size() - v50_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v49_tail(v36_compute_source));
         v36_compute_bytes.resize(v36_compute_bytes.size() - v48_tail(v36_compute_source));
@@ -3094,7 +3158,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 54 &&
+              failed_compute_loaded.format_version == 55 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3333,7 +3397,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 54 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 55 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&
@@ -3408,6 +3472,7 @@ int main(int argc, char** argv) {
             v44_tail(failed_capture) +
             v43_tail(failed_capture) +
             v42_tail(failed_capture) + v41_tail(failed_capture)) {
+        v40_failed_bytes.resize(v40_failed_bytes.size() - v55_ds_slice_tail(failed_capture));  // v55 DS-seed slices
         v40_failed_bytes.resize(v40_failed_bytes.size() - v50_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v49_tail(failed_capture));
         v40_failed_bytes.resize(v40_failed_bytes.size() - v48_tail(failed_capture));
@@ -3497,6 +3562,7 @@ int main(int argc, char** argv) {
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        v13_bytes.resize(v13_bytes.size() - v55_ds_slice_tail(legacy_source));  // v55 DS-seed slices
         v13_bytes.resize(v13_bytes.size() - v50_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v49_tail(legacy_source));
         v13_bytes.resize(v13_bytes.size() - v48_tail(legacy_source));
@@ -3619,9 +3685,9 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 55;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 56;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 55",
+          error == "unsupported capture version 56",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

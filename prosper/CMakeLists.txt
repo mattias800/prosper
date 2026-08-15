@@ -630,6 +630,13 @@ if(TARGET prosper_core)
   target_include_directories(test_mrt_extent PRIVATE frontends/shared)
   add_test(NAME mrt_extent COMMAND test_mrt_extent)
 
+  # ONE active-colour-binding policy, shared by pass grouping and same-pass feedback detection, built
+  # from a real DrawItem. A second, looser copy of this rule classified stale named state as a live
+  # binding (#2550 review).
+  add_executable(test_mrt_binding frontends/shared/test_mrt_binding.cpp)
+  target_include_directories(test_mrt_binding PRIVATE frontends/shared src)
+  add_test(NAME mrt_binding COMMAND test_mrt_binding)
+
   add_executable(test_rtt_injection frontends/shared/test_rtt_injection.cpp)
   target_include_directories(test_rtt_injection PRIVATE frontends/shared)
   add_test(NAME rtt_injection COMMAND test_rtt_injection)
@@ -1066,6 +1073,10 @@ if(TARGET prosper_core)
   add_executable(test_compute_parent_walk tests/test_compute_parent_walk.cpp)
   target_link_libraries(test_compute_parent_walk PRIVATE prosper_core)
   add_test(NAME compute_parent_walk COMMAND test_compute_parent_walk)
+
+  add_executable(test_compute_tree_watch tests/test_compute_tree_watch.cpp)
+  target_link_libraries(test_compute_tree_watch PRIVATE prosper_core)
+  add_test(NAME compute_tree_watch COMMAND test_compute_tree_watch)
 
   # Cross-submit readability reuse is valid only while the HLE mapping generation is unchanged.
   add_executable(test_guest_memory_map tests/test_guest_memory_map.cpp)

@@ -9,6 +9,7 @@
 #include "gpu_timeline.hpp"
 #include "capture_compute_policy.hpp"
 #include "compute_parent_walk.hpp"
+#include "compute_tree_watch.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <condition_variable>
@@ -2036,6 +2038,52 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     return *spirv;
 }
 
+// PROSPER_COMPUTE_DISPATCH_LOG=0xADDR[,0xADDR...]: one line per DISPATCH of the named programs,
+// with what actually happened to it. Every existing signal is once-per-program:
+// `[compute] skip unsupported program` fires once ever, and the subgroup, resource-map and
+// selected-sbuffer lines are all deduped. That is right for their purposes and wrong for this one,
+// and reading a once-per-program line as a per-dispatch property is exactly how a root-cause claim
+// in this investigation was published and had to be retracted -- the program it said "never runs"
+// ran 26 times.
+//
+// Answers "did THIS dispatch execute", which is what a frame-by-frame correlation between a decline
+// and a corrupted result needs.
+bool compute_dispatch_log_selected(uint64_t program) {
+    const char* spec = std::getenv("PROSPER_COMPUTE_DISPATCH_LOG");
+    if (!spec || !*spec || !program) return false;
+    for (const char* cursor = spec; cursor && *cursor;) {
+        char* end = nullptr;
+        const uint64_t one = std::strtoull(cursor, &end, 0);
+        if (end == cursor) return false;
+        if (one == program) return true;
+        if (*end != ',') return false;
+        cursor = end + 1;
+    }
+    return false;
+}
+
+void log_compute_dispatch(uint64_t program, uint64_t submit_no, size_t dispatch_index,
+                          uint64_t order, const char* outcome,
+                          const ComputeLaunchDimensions* launch = nullptr) {
+    if (!compute_dispatch_log_selected(program)) return;
+    // The launch travels with the outcome. GTA V's tree builder emits a PERFECT tree for five
+    // consecutive submits and then a cyclic one for the rest of the route, so the question is what
+    // differs between those two regimes -- and the guest's active-record count reaches the shader as
+    // the thread extent. A dispatch record without it cannot answer that.
+    char geometry[128] = "";
+    if (launch)
+        std::snprintf(geometry, sizeof(geometry),
+                      " groups=%ux%ux%u local=%ux%ux%u threads=%ux%ux%u",
+                      launch->groups_x, launch->groups_y, launch->groups_z,
+                      launch->local_x, launch->local_y, launch->local_z,
+                      launch->threads_x, launch->threads_y, launch->threads_z);
+    std::fprintf(stderr,
+                 "[compute-dispatch] program=0x%llx submit=%llu dispatch=%zu order=%llu outcome=%s%s\n",
+                 static_cast<unsigned long long>(program),
+                 static_cast<unsigned long long>(submit_no), dispatch_index,
+                 static_cast<unsigned long long>(order), outcome, geometry);
+}
+
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
     static std::mutex mutex;
     static std::set<uint64_t> logged;
@@ -2043,11 +2091,17 @@ bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
         std::lock_guard lock(mutex);
         if (!logged.insert(diagnostic.program_address).second) return false;
     }
-    if (std::getenv("PROSPER_DBG"))
+    if (std::getenv("PROSPER_DBG")) {
         log_compute_recompile_skip_diagnostic(diagnostic);
-    else
-        std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
-                     static_cast<unsigned long long>(diagnostic.program_address));
+        return true;
+    }
+    // Name the reason, not only the address. Every skip is meant to be the next thing implemented,
+    // and until now the only way to learn why one happened was PROSPER_DBG -- which on a routed run
+    // desyncs the pad script badly enough that the route never reaches the phase being diagnosed.
+    const std::string reason = last_terminal_reject_reason(diagnostic.program_address);
+    std::fprintf(stderr, "[compute] skip unsupported program 0x%llx reason=%s\n",
+                 static_cast<unsigned long long>(diagnostic.program_address),
+                 reason.empty() ? "unrecorded" : reason.c_str());
     return true;
 }
 
@@ -2857,6 +2911,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // program-local and several of this title's shaders share a prologue, which makes that match
     // unreliable (#2412).
     uint32_t watch_w0 = 0, watch_w1 = 0; uint32_t watch_len = 0;
+
+    // PROSPER_DYNTRACE_SCC=1 — report every transition of the tracked SCC, with the pc and words that
+    // caused it. SCC is a single bit and it gates whole descriptors: GTA V's ray-tracing pass builds
+    // its BVH descriptor's dword3 with `s_addc_u32 s19, -1, 0`, whose operands are both inline
+    // constants, so the ONLY thing that can leave it unknown is an unknown SCC. Without this, "the
+    // descriptor did not resolve" gives no way to find which earlier instruction cost it.
+    //
+    // Deliberately mirrors the register watch, including printing the program identity rather than
+    // the sh= signature -- which is not unique (#2548).
+    const bool watch_scc = std::getenv("PROSPER_DYNTRACE_SCC") != nullptr;
+    int last_reported_scc = -2;
+    auto report_scc = [&](const char* why) {
+        if (!watch_scc || scc == last_reported_scc) return;
+        last_reported_scc = scc;
+        fprintf(stderr, "[sccwatch] program=0x%llx pc=%u scc=%s %s words=%08x:%08x len=%u\n",
+                (unsigned long long)(uintptr_t)code, watch_pc,
+                scc < 0 ? "UNKNOWN" : (scc ? "1" : "0"), why, watch_w0, watch_w1, watch_len);
+    };
     // Per-register record of the instruction that most recently made it UNKNOWN. Sized like the other
     // per-register fold state; `0xffffffff` means "never forgotten in this walk", which is a distinct
     // and useful answer from "forgotten by <instruction>" — a V# word that was never written at all
@@ -2875,8 +2947,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         // reach contradictory conclusions about the same chain. That happened: a Windows trace of s16
         // showed ZERO forget sites while the Linux fold attributed the loss of the descriptor-table
         // pointer to a v_cmp writing s16, and neither observation was wrong. (#2412)
+        // `program=` alongside `sh=`, because sh= IS NOT UNIQUE. It is the first code dword plus the
+        // span, and the first dword of a great many GTA V shaders is `bfa00003` -- `s_branch +3`, an
+        // ordinary prologue. Two different 276-dword programs therefore share `sh=bfa00003/276`, and
+        // filtering a watch by it silently mixes them: a trace filtered that way showed s106 being
+        // FORGOTTEN at a pc whose instruction words do not appear anywhere in the program being
+        // studied. The comment below claims this signature "identifies one cheaply and stably" -- it
+        // is cheap and stable, and it is not an identity. The code pointer is.
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] sh=%08x/%zu pc=%u s%d <- KNOWN 0x%08x\n",
+            fprintf(stderr,
+                    "[sgprwatch] program=0x%llx sh=%08x/%zu pc=%u s%d <- KNOWN 0x%08x\n",
+                    (unsigned long long)(uintptr_t)code,
                     dwords ? code[0] : 0u, dwords, watch_pc, r, v);
         if (valid_reg(r)) {
             val[(size_t)r] = v;
@@ -2894,7 +2975,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     };
     auto forget = [&](int r) {
         if (r == watch_sgpr)
-            fprintf(stderr, "[sgprwatch] sh=%08x/%zu pc=%u s%d <- FORGOTTEN words=%08x:%08x len=%u\n",
+            fprintf(stderr,
+                    "[sgprwatch] program=0x%llx sh=%08x/%zu pc=%u s%d <- FORGOTTEN "
+                    "words=%08x:%08x len=%u\n",
+                    (unsigned long long)(uintptr_t)code,
                     dwords ? code[0] : 0u, dwords, watch_pc, r, watch_w0, watch_w1, watch_len);
         if (valid_reg(r)) {
             val_known.reset((size_t)r);
@@ -3596,6 +3680,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
                 if (in.opcode != kSop1OpcodeMovB32 && in.opcode != kSop1OpcodeMovB64) {
                     scc = -1;
+                    report_scc("invalidated");
                     null_count_carry_origin = 0;
                     bvh_count_carry_origin = 0;
                 }
@@ -3917,6 +4002,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x0B: scc = (a <= c); break;                            // s_cmp_le_u32
                     default: scc = -1; break;
                 } else scc = -1;
+                report_scc("alu");
                 break;
             }
             case Rdna2Format::SMEM: {
@@ -5225,11 +5311,86 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         set_value(in.dst.value, (uint32_t)(int32_t)in.simm16);
                     break;
                 }
+                // s_mulk_i32: `D.i = D.i * signext(SIMM16)`, and it does NOT write SCC -- the comment
+                // below already says so while the code invalidated SCC for it anyway. Two costs, both
+                // paid on GTA V: the product is discarded, and every later s_cselect that depended on
+                // a live SCC loses it.
+                //
+                // The per-opcode evidence this widening requires, since the note below rightly refuses
+                // to take sibling opcodes for free: 0x413ce6000 pc149 is `s_mulk_i32 s106, 120`, where
+                // 120 is the descriptor array's exact record stride. It feeds
+                // `s_buffer_load_dwordx4 s[8:11], s[4:7], s106` at pc153, which selects one V# from
+                // that array, which is the descriptor for `buffer_load_dwordx3` at pc156 -- the
+                // instruction the program is rejected on, with mode=unresolved-operand. Forgetting
+                // s106 here is what makes that descriptor unresolvable.
+                //
+                // Multiplies a KNOWN destination only. An unknown destination still forgets, exactly
+                // as before; the change is that it no longer takes SCC with it.
+                if (in.opcode == kSopkOpcodeMulkI32) {
+                    if (in.dst.kind == OperandKind::SGPR) {
+                        uint32_t current = 0;
+                        if (known(in.dst.value, current))
+                            set_value(in.dst.value,
+                                      static_cast<uint32_t>(current *
+                                                            static_cast<uint32_t>(
+                                                                static_cast<int32_t>(in.simm16))));
+                        else
+                            forget(in.dst.value);
+                    }
+                    // A product is not an add-carry chain; the tracked origins cannot survive it.
+                    null_count_carry_origin = 0;
+                    bvh_count_carry_origin = 0;
+                    break;
+                }
                 // s_cmpk_* / s_addk_i32 write SCC (only s_movk/s_version/s_cmovk/s_mulk don't); this
                 // interpreter doesn't model the rest of SOPK, so they conservatively invalidate the
                 // tracked SCC — a stale SCC consumed by a later s_cselect would fabricate a
                 // confidently-wrong V# patch.
+                // Three SOPK encodings account for every conservative SCC loss measured on GTA V's
+                // ray-tracing pass (0x205b654a00, PROSPER_DYNTRACE_SCC), and TWO OF THEM DO NOT
+                // WRITE SCC AT ALL:
+                //
+                //   188x  s_setreg_b32     (0x13) -- writes a HARDWARE REGISTER, not SCC
+                //    43x  s_waitcnt_vscnt  (0x17, sdst=NULL) -- a wait; register-transparent
+                //    94x  s_addk_i32       (0x0f) -- genuinely writes SCC on overflow
+                //
+                // This matters because SCC gates whole descriptors here: the BVH descriptor's dword3
+                // is `s_addc_u32 s19, -1, 0`, whose operands are both inline constants, so an unknown
+                // SCC is the ONLY thing that can leave it unresolved -- and an unresolved dword3 is
+                // `mode=unresolved-operand` at the image_bvh_intersect_ray that consumes it.
+                //
+                // s_addk_i32 keeps invalidating SCC, because it really does write it. Its VALUE is
+                // now folded when the destination is known, for the same reason s_mulk_i32's is.
+                if (in.opcode == kSopkOpcodeSetregB32) {
+                    // Its encoded "dst" field is a hwreg id, not an SGPR, so nothing scalar is
+                    // written and nothing needs forgetting.
+                    break;
+                }
+                if (in.opcode == kSopkOpcodeWaitcntVscnt) {
+                    // The sibling case above already passes the sdst=NULL(125) form through. Any
+                    // other destination is unmodelled, so forget it -- but never SCC.
+                    if (in.dst.kind == OperandKind::SGPR && in.dst.value != 125)
+                        forget(in.dst.value);
+                    break;
+                }
+                if (in.opcode == kSopkOpcodeAddkI32) {
+                    if (in.dst.kind == OperandKind::SGPR) {
+                        uint32_t current = 0;
+                        if (known(in.dst.value, current))
+                            set_value(in.dst.value,
+                                      current + static_cast<uint32_t>(
+                                                    static_cast<int32_t>(in.simm16)));
+                        else
+                            forget(in.dst.value);
+                    }
+                    scc = -1;                    // s_addk_i32 writes SCC on signed overflow
+                    report_scc("sopk-addk");
+                    null_count_carry_origin = 0;
+                    bvh_count_carry_origin = 0;
+                    break;
+                }
                 scc = -1;
+                report_scc("sopk-conservative");
                 null_count_carry_origin = 0;
                 bvh_count_carry_origin = 0;
                 if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
@@ -7618,8 +7779,17 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // preserving one native subgroup per guest wave. Keep the environment switch as an explicit
         // experiment for every other multi-wave shape; this automatic path is shader-address/title
         // independent and remains subject to all device and workgroup bounds below.
-        const bool native_multiwave_requested =
-            native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr;
+        // PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE: refuse the multi-wave native contract while leaving
+        // the ordinary one-wave native path alone. The symmetric counterpart of the switch above,
+        // and it exists because the broad PROSPER_NO_NATIVE_COMPUTE_SUBGROUP is unusable as an A/B
+        // arm: on a routed GTA V run it additionally declines fifteen OTHER programs, so the program
+        // under test never dispatches and the arm returns a zero that means "never ran" rather than
+        // "ran clean". This switch changes only shaders whose workgroup spans several guest waves,
+        // which is exactly the population the multiwave lowering is responsible for.
+        const bool native_multiwave_disabled =
+            getenv("PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE") != nullptr;
+        const bool native_multiwave_requested = !native_multiwave_disabled &&
+            (native_multiwave_wave_work || getenv("PROSPER_NATIVE_COMPUTE_MULTIWAVE") != nullptr);
         const bool native_subgroup_disabled =
             getenv("PROSPER_NO_NATIVE_COMPUTE_SUBGROUP") != nullptr;
         config.native_subgroup_size = select_native_compute_subgroup_size(
@@ -7642,6 +7812,27 @@ std::vector<ComputeItem> realize_compute_dispatches(
         if (getenv("PROSPER_SUBGROUP_LOG")) {
             const uint64_t local_invocations = static_cast<uint64_t>(config.local_x) *
                 config.local_y * config.local_z;
+            // Once per (program, resolved contract), not once per dispatch. Per-dispatch this line
+            // is emitted thousands of times on a routed run, and the volume is not merely untidy:
+            // it slows the subject enough to desync a timing-dependent pad script, so the route
+            // never reaches the phase you armed the diagnostic to observe. A run of this diagnostic
+            // on GTA V produced 1,464 lines and never dispatched the program under test, which made
+            // its zero read as a negative result when it was a run that never happened.
+            //
+            // Keyed on the resolved contract as well as the address, so a program whose contract
+            // legitimately changes between dispatches still reports every distinct outcome.
+            static std::mutex subgroup_log_mutex;
+            static std::set<std::pair<uint64_t, uint64_t>> subgroup_logged;
+            const uint64_t contract = (static_cast<uint64_t>(config.native_subgroup_size) << 32) |
+                                      (static_cast<uint64_t>(config.wave_size) << 8) |
+                                      (native_multiwave_requested ? 2u : 0u) |
+                                      (native_subgroup_disabled ? 1u : 0u);
+            bool first_report = false;
+            {
+                std::lock_guard lock(subgroup_log_mutex);
+                first_report = subgroup_logged.emplace(code_addr, contract).second;
+            }
+            if (first_report)
             std::fprintf(stderr,
                          "[subgroup] cs=0x%llx guest-wave=%u native=%u local=%ux%ux%u "
                          "invocations=%llu device-range=%u..%u max-wg-subgroups=%u "
@@ -7834,6 +8025,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
         item.submit_no = submit_no;
         item.command_order = dispatch.command_order;
         if (item.spirv.empty()) {
+            log_compute_dispatch(code_addr, submit_no, dispatch_index, dispatch.command_order,
+                                 "recompile-empty");
             record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv,
                            &config);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
@@ -7927,7 +8120,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 // matches a resource three ways: by fetch pc, by SRT offset, and by SGPR base; a
                 // resource carrying `srt=0xffffffff sgpr=0xffffffff` can be matched by none of them
                 // and is invisible to every lookup, however correct its address and size are.
-                if (std::getenv("PROSPER_DBG")) {
+                // Ungated. This block runs at most ONCE PER PROGRAM (it is inside
+                // report_compute_recompile_skip_once), so its cost is twelve programs' worth of
+                // lines on a routed GTA V boot -- while PROSPER_DBG, the gate it used to sit
+                // behind, produces a ~1.5 GB log and desyncs the pad script badly enough that the
+                // route never reaches the phase being diagnosed. A diagnostic reachable only by a
+                // switch that destroys the repro is not reachable. Same reasoning as the skip line
+                // itself, which was ungated for exactly this in an earlier commit.
+                {
                     if (!item.resources || item.resources->resources.empty()) {
                         std::fprintf(stderr,
                                      "[compute-table] program 0x%llx has NO resources at all\n",
@@ -9207,6 +9407,300 @@ RetainedComputeRealization realize_retained_compute(
     return RetainedComputeRealization::Realized;
 }
 
+// ---------------------------------------------------------------------------------------------
+// PROSPER_COMPUTE_TREE_WATCH=ADDR:RECORDS[:SHIFT:MASK]
+//
+// Address-keyed, evaluated around EVERY realized dispatch. The program-keyed parent walk above
+// answers "was the table cyclic when its consumer started"; this answers "which dispatch made it
+// cyclic", which is a different question and the one the consumer's hang depends on.
+//
+// Two comparisons per dispatch, and they are deliberately not the same comparison:
+//   pre  -- current bytes against the LAST observation, whenever that was. A change here was made
+//           by something that is not a dispatch (guest CPU, a copy, a graphics write).
+//   post -- current bytes against this dispatch's own pre-image. A change here is attributable to
+//           this dispatch, by construction.
+// Reporting them separately is what keeps "some dispatch between these two wrote it" from being
+// recorded as "this dispatch wrote it".
+//
+// The watch runs on every dispatch, not only on the programs already known to bind a range
+// containing the address, and reports `toucher=0/1` for each change. A change from a non-toucher
+// is a finding rather than noise: it means an out-of-bounds write, or a binding path the resource
+// traversal does not model. An instrument restricted to the suspects it already has cannot
+// discover that it is looking at the wrong set.
+struct LiveComputeTreeWatchState {
+    bool have_previous = false;
+    std::vector<uint32_t> previous;
+    ComputeParentWalkReport previous_report;
+    uint64_t previous_submit = 0;
+    uint64_t previous_order = 0;
+    uint64_t previous_program = 0;
+    uint64_t observations = 0;
+    uint64_t reported_changes = 0;
+};
+
+const std::optional<ComputeTreeWatchSelector>& compute_tree_watch_selector() {
+    static const auto selector = [] {
+        const char* value = std::getenv("PROSPER_COMPUTE_TREE_WATCH");
+        auto parsed = parse_compute_tree_watch_selector(value);
+        if (value && *value && !parsed)
+            std::fprintf(stderr,
+                         "[compute-tree-watch] invalid selector '%s'; expected "
+                         "ADDR:RECORDS[:SHIFT:MASK]\n",
+                         value);
+        return parsed;
+    }();
+    return selector;
+}
+
+LiveComputeTreeWatchState& compute_tree_watch_state() {
+    static LiveComputeTreeWatchState state;
+    return state;
+}
+
+// The guest allocation is the authority for what a later CPU-side read of this table sees. Reading
+// the running program's staged resource copy instead would make a pre/post pair compare two
+// different sources, which manufactures changes that nobody wrote.
+bool read_compute_tree_watch_words(const ComputeTreeWatchSelector& selector,
+                                   std::vector<uint32_t>& out) {
+    const uint64_t bytes = static_cast<uint64_t>(selector.records) * sizeof(uint32_t);
+    if (!guest_readable(selector.addr, bytes)) return false;
+    out.resize(selector.records);
+    std::memcpy(out.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(selector.addr)),
+                static_cast<size_t>(bytes));
+    return true;
+}
+
+// Name the binding and fetch pc when the running program's own table reaches the watched address.
+// A change reported with toucher=0 is the interesting case -- an out-of-bounds write, or a binding
+// path the traversal does not model -- so it must stay distinguishable from a change made by a
+// program that legitimately binds the range. Computed before the dispatch, because the ComputeItem
+// carrying the resource table is moved into the backend.
+std::string describe_compute_tree_watch_touch(const ShaderResourceTable* resources,
+                                              uint64_t wanted, uint64_t bytes) {
+    if (!resources) return "toucher=0";
+    // WINDOW, not address. The watch detects changes anywhere in the window, so asking whether a
+    // program binds only the window's first byte makes the two halves of the instrument answer
+    // different questions -- which reported a program that binds window+128 as a non-toucher, i.e.
+    // as an out-of-bounds write that was not one.
+    const std::vector<ComputeAddressWatchHit> hits =
+        compute_address_window_hits(*resources, wanted, bytes);
+    if (hits.empty()) return "toucher=0";
+    std::string touch = "toucher=1 at=";
+    for (size_t i = 0; i < hits.size(); ++i) {
+        char one[64];
+        std::snprintf(one, sizeof(one), "%s%u:%u", i ? "," : "", hits[i].binding, hits[i].fetch_pc);
+        touch += one;
+    }
+    return touch;
+}
+
+void report_compute_tree_watch(const char* phase, const ComputeTreeWatchSelector& selector,
+                               uint64_t program, const std::string& touch, uint64_t submit_no,
+                               size_t dispatch_index,
+                               uint64_t order, const std::vector<uint32_t>& before,
+                               const ComputeParentWalkReport& before_report,
+                               const std::vector<uint32_t>& after, uint64_t previous_submit,
+                               uint64_t previous_order, uint64_t previous_program,
+                               ComputeParentWalkReport& after_report) {
+    constexpr uint32_t kReportedSlots = 12;
+    uint32_t changed = 0;
+    const std::vector<ComputeTreeWatchDelta> deltas =
+        compute_tree_watch_deltas(before, after, kReportedSlots, &changed);
+    if (!changed) return;
+
+    LiveComputeTreeWatchState& state = compute_tree_watch_state();
+    ++state.reported_changes;
+
+    after_report = analyze_compute_parent_walk(after, selector.records, selector.index_shift,
+                                               selector.index_mask);
+    const ComputeTreeSiblingReport before_siblings = analyze_compute_tree_siblings(before);
+    const ComputeTreeSiblingReport after_siblings = analyze_compute_tree_siblings(after);
+    const ComputeTreeWatchTransition transition =
+        classify_compute_tree_watch_transition(before_report, after_report, true);
+
+    std::fprintf(stderr,
+                 "[compute-tree-watch] addr=0x%llx phase=%s transition=%s program=0x%llx "
+                 "submit=%llu dispatch=%zu order=%llu %s changed=%u records=%u "
+                 "pre{cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u pairs=%u unpaired=%u} "
+                 "post{cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u pairs=%u unpaired=%u} "
+                 "since{submit=%llu order=%llu program=0x%llx}\n",
+                 static_cast<unsigned long long>(selector.addr), phase,
+                 compute_tree_watch_transition_name(transition),
+                 static_cast<unsigned long long>(program),
+                 static_cast<unsigned long long>(submit_no), dispatch_index,
+                 static_cast<unsigned long long>(order), touch.c_str(), changed, selector.records,
+                 before_report.distinct_cycles, before_report.cyclic_roots,
+                 before_report.oob_roots, before_report.max_depth, before_siblings.pairs,
+                 before_siblings.unpaired_side, after_report.distinct_cycles,
+                 after_report.cyclic_roots, after_report.oob_roots, after_report.max_depth,
+                 after_siblings.pairs, after_siblings.unpaired_side,
+                 static_cast<unsigned long long>(previous_submit),
+                 static_cast<unsigned long long>(previous_order),
+                 static_cast<unsigned long long>(previous_program));
+
+    for (const ComputeTreeWatchDelta& delta : deltas)
+        std::fprintf(stderr, "[compute-tree-watch]   slot %u 0x%08x -> 0x%08x\n", delta.index,
+                     delta.before, delta.after);
+    if (changed > kReportedSlots)
+        std::fprintf(stderr, "[compute-tree-watch]   ... %u further changed slots not listed\n",
+                     changed - kReportedSlots);
+
+    // PROSPER_COMPUTE_TREE_WATCH_DUMP=<dir>: write both images of a transition that INTRODUCES
+    // cycles. Twelve reported slots identify that something changed; they cannot answer what shape
+    // the damage has -- whether the wrong records cluster by workgroup, by wave, at the tail of the
+    // extent, or not at all. That question decides between a lane-activation defect and a
+    // value-computation defect, and it needs the whole array on disk.
+    //
+    // Gated on the clean -> cyclic transition specifically. Dumping every change would write
+    // hundreds of megabytes across a routed run and bury the two images that matter.
+    // CleanToClean is dumped too when an aux range is configured: a cyclic sample with no clean
+    // counterpart from the same run cannot show what CHANGED, only what is present.
+    const bool want_clean_control = std::getenv("PROSPER_COMPUTE_TREE_WATCH_AUX") != nullptr &&
+                                    transition == ComputeTreeWatchTransition::CleanToClean;
+    if (transition != ComputeTreeWatchTransition::CleanToCyclic && !want_clean_control) return;
+    const char* dump_root = std::getenv("PROSPER_COMPUTE_TREE_WATCH_DUMP");
+    if (!dump_root || !*dump_root) return;
+    auto write_image = [&](const char* which, const std::vector<uint32_t>& words) {
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s/tree-%s-s%llu-d%zu-o%llu-p%llx.bin", dump_root, which,
+                      static_cast<unsigned long long>(submit_no), dispatch_index,
+                      static_cast<unsigned long long>(order),
+                      static_cast<unsigned long long>(program));
+        std::FILE* file = std::fopen(path, "wb");
+        if (!file) {
+            std::fprintf(stderr, "[compute-tree-watch] dump open failed: %s\n", path);
+            return;
+        }
+        const size_t written = std::fwrite(words.data(), sizeof(uint32_t), words.size(), file);
+        const int closed = std::fclose(file);
+        if (written != words.size() || closed != 0)
+            std::fprintf(stderr, "[compute-tree-watch] dump write failed: %s\n", path);
+        else
+            std::fprintf(stderr, "[compute-tree-watch]   dumped %s -> %s\n", which, path);
+    };
+    write_image("pre", before);
+    write_image("post", after);
+
+    // PROSPER_COMPUTE_TREE_WATCH_AUX=0xADDR:DWORDS — dump a SECOND guest range at the same moment.
+    //
+    // The watched table is the OUTPUT. Its input lives somewhere else, and the question that matters
+    // is what differs about that input between a dispatch that produces a correct tree and one that
+    // does not. GTA V's builder emits pairs=1030 unpaired=0 for eleven consecutive submits at an
+    // identical launch geometry and then never again, which rules its lowering correct and makes the
+    // input the only remaining variable -- but nothing was capturing the input.
+    const char* aux = std::getenv("PROSPER_COMPUTE_TREE_WATCH_AUX");
+    if (!aux || !*aux) return;
+    char* aux_end = nullptr;
+    const uint64_t aux_addr = std::strtoull(aux, &aux_end, 0);
+    if (!aux_addr || !aux_end || *aux_end != ':') return;
+    const uint64_t aux_dwords = std::strtoull(aux_end + 1, &aux_end, 0);
+    if (!aux_dwords || aux_dwords > (1u << 22u) || (aux_end && *aux_end)) return;
+    const uint64_t aux_bytes = aux_dwords * sizeof(uint32_t);
+    if (!guest_readable(aux_addr, aux_bytes)) {
+        std::fprintf(stderr, "[compute-tree-watch]   aux 0x%llx unreadable\n",
+                     static_cast<unsigned long long>(aux_addr));
+        return;
+    }
+    std::vector<uint32_t> aux_words(static_cast<size_t>(aux_dwords));
+    std::memcpy(aux_words.data(),
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(aux_addr)),
+                static_cast<size_t>(aux_bytes));
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/aux-%llx-s%llu-d%zu-o%llu.bin", dump_root,
+                  static_cast<unsigned long long>(aux_addr),
+                  static_cast<unsigned long long>(submit_no), dispatch_index,
+                  static_cast<unsigned long long>(order));
+    std::FILE* file = std::fopen(path, "wb");
+    if (!file) return;
+    const size_t written = std::fwrite(aux_words.data(), sizeof(uint32_t), aux_words.size(), file);
+    const int closed = std::fclose(file);
+    std::fprintf(stderr, "[compute-tree-watch]   dumped aux -> %s (%s)\n", path,
+                 (written == aux_words.size() && closed == 0) ? "ok" : "SHORT");
+}
+
+// Returns the pre-image so the caller can hand it back for the post comparison. Empty means the
+// window was unreadable and no post comparison should be attempted -- comparing against an empty
+// pre-image would report every slot as changed.
+std::vector<uint32_t> observe_compute_tree_watch_pre(const ComputeItem& item, uint64_t submit_no,
+                                                     size_t dispatch_index, uint64_t order,
+                                                     const std::string& touch) {
+    const auto& selected = compute_tree_watch_selector();
+    if (!selected) return {};
+    std::vector<uint32_t> current;
+    if (!read_compute_tree_watch_words(*selected, current)) {
+        // An unreadable watch window produced NO output at all -- indistinguishable from "nothing
+        // writes this address", which is the conclusion it would have supported. Report it once.
+        // Measured need: watching GTA V's 0x2052ac0000 returned complete silence, and the silence
+        // meant the address is not guest-readable, not that no program writes it.
+        static std::mutex mutex;
+        static std::set<uint64_t> reported;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            first = reported.insert(selected->addr).second;
+        }
+        if (first)
+            std::fprintf(stderr,
+                         "[compute-tree-watch] addr=0x%llx UNREADABLE (%u dwords) — this watch can "
+                         "report nothing about it; its silence is not evidence of no writer\n",
+                         static_cast<unsigned long long>(selected->addr), selected->records);
+        return {};
+    }
+
+    LiveComputeTreeWatchState& state = compute_tree_watch_state();
+    ++state.observations;
+    ComputeParentWalkReport current_report;
+    if (!state.have_previous) {
+        current_report = analyze_compute_parent_walk(current, selected->records,
+                                                     selected->index_shift, selected->index_mask);
+        const ComputeTreeSiblingReport siblings = analyze_compute_tree_siblings(current);
+        std::fprintf(stderr,
+                     "[compute-tree-watch] addr=0x%llx phase=first submit=%llu dispatch=%zu "
+                     "order=%llu records=%u cycles=%u cyclic-roots=%u oob-roots=%u max-depth=%u "
+                     "pairs=%u unpaired=%u\n",
+                     static_cast<unsigned long long>(selected->addr),
+                     static_cast<unsigned long long>(submit_no), dispatch_index,
+                     static_cast<unsigned long long>(order), selected->records,
+                     current_report.distinct_cycles, current_report.cyclic_roots,
+                     current_report.oob_roots, current_report.max_depth, siblings.pairs,
+                     siblings.unpaired_side);
+    } else {
+        current_report = state.previous_report;
+        report_compute_tree_watch("pre", *selected, item.code_addr, touch, submit_no,
+                                  dispatch_index, order,
+                                  state.previous, state.previous_report, current,
+                                  state.previous_submit, state.previous_order,
+                                  state.previous_program, current_report);
+    }
+    state.have_previous = true;
+    state.previous = current;
+    state.previous_report = current_report;
+    state.previous_submit = submit_no;
+    state.previous_order = order;
+    state.previous_program = item.code_addr;
+    return current;
+}
+
+void observe_compute_tree_watch_post(uint64_t program, const std::string& touch,
+                                     uint64_t submit_no, size_t dispatch_index, uint64_t order,
+                                     const std::vector<uint32_t>& pre_image) {
+    const auto& selected = compute_tree_watch_selector();
+    if (!selected || pre_image.empty()) return;
+    std::vector<uint32_t> current;
+    if (!read_compute_tree_watch_words(*selected, current)) return;
+
+    LiveComputeTreeWatchState& state = compute_tree_watch_state();
+    ComputeParentWalkReport after_report = state.previous_report;
+    report_compute_tree_watch("post", *selected, program, touch, submit_no, dispatch_index, order,
+                              pre_image, state.previous_report, current, submit_no, order, program,
+                              after_report);
+    state.previous = current;
+    state.previous_report = after_report;
+    state.previous_submit = submit_no;
+    state.previous_order = order;
+    state.previous_program = program;
+}
+
 struct LiveComputeParentWalkPreflight {
     bool selected = false;
     bool available = false;
@@ -9512,9 +10006,195 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     for (const auto& operation : executable) {
         switch (operation.kind) {
             case RetainedSubmitKind::Draw: {
+                // PROSPER_DRAW_CENSUS=1 — the most basic number about a missing world, and nothing
+                // reported it: how many draws does prosper actually execute, and how many of them
+                // are indirect? An absent world with ten draws per frame and one with ten thousand
+                // are different problems, and every investigation of GTA V's missing world so far
+                // has proceeded without knowing which it is.
+                //
+                // Counted before the `render` early-out so a run without the live renderer still
+                // reports what the command stream contained. Printed at powers of two.
+                // PROSPER_TARGET_WATCH=0x…,0x… — EXACT and unsampled: is this address EVER a
+                // colour target, in any of the eight MRT slots?
+                //
+                // Separate from the census below because the census samples 1 in 32 draws, and a
+                // sampled zero cannot answer an "ever" question. A surface written by ten draws is
+                // missed with probability (31/32)^10 ≈ 73%; by one draw, 97%. The census's zero for
+                // GTA V's 0x2052ac0000 therefore only excludes a *frequent* writer, which is not
+                // what was asked of it.
+                //
+                // Cost is eight register lookups per draw with no lock (per-address atomics), which
+                // is what the 1-in-32 sampling was protecting against when it applied to a mutex and
+                // a map insert. Watch list is bounded so the per-draw cost stays fixed.
+                {
+                    struct TargetWatch {
+                        uint64_t addr;
+                        std::atomic<uint64_t> hits[8];
+                        std::atomic<uint64_t> total;
+                    };
+                    static constexpr size_t kMaxWatch = 8;
+                    static std::array<TargetWatch, kMaxWatch> watch{};
+                    static size_t watch_count = 0;
+                    static std::atomic<uint64_t> watch_draws{0};
+                    static const bool watch_enabled = [] {
+                        const char* spec = std::getenv("PROSPER_TARGET_WATCH");
+                        if (!spec || !*spec) return false;
+                        for (const char* p = spec; *p && watch_count < kMaxWatch;) {
+                            char* end = nullptr;
+                            const uint64_t v = std::strtoull(p, &end, 0);
+                            if (end == p) break;
+                            watch[watch_count++].addr = v;
+                            p = (*end == ',') ? end + 1 : end;
+                        }
+                        std::fprintf(stderr, "[target-watch] watching %zu address(es)\n",
+                                     watch_count);
+                        return watch_count != 0;
+                    }();
+                    if (watch_enabled) {
+                        namespace P = prosper::agc::Pm4;
+                        constexpr uint32_t kColorRegisterStride = 0xf;
+                        const uint64_t wn = watch_draws.fetch_add(1) + 1;
+                        if (const GpuState* snap = st.draws[operation.index].state.get()) {
+                            for (uint32_t slot = 0; slot < 8u; ++slot) {
+                                const auto lo = snap->cx.find(
+                                    P::CB_COLOR0_BASE + slot * kColorRegisterStride);
+                                if (lo == snap->cx.end() || !lo->second) continue;
+                                const auto hi = snap->cx.find(P::CB_COLOR0_BASE_EXT + slot);
+                                uint64_t base = static_cast<uint64_t>(lo->second) << 8;
+                                if (hi != snap->cx.end())
+                                    base |= static_cast<uint64_t>(hi->second & 0xffu) << 40;
+                                for (size_t w = 0; w < watch_count; ++w) {
+                                    if (watch[w].addr != base) continue;
+                                    watch[w].hits[slot].fetch_add(1, std::memory_order_relaxed);
+                                    watch[w].total.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                        if ((wn & (wn - 1)) == 0 && wn >= 4096u) {
+                            for (size_t w = 0; w < watch_count; ++w) {
+                                std::string slots;
+                                for (uint32_t s = 0; s < 8u; ++s) {
+                                    const uint64_t h = watch[w].hits[s].load();
+                                    if (!h) continue;
+                                    slots += " slot" + std::to_string(s) + "=" + std::to_string(h);
+                                }
+                                std::fprintf(stderr,
+                                             "[target-watch] addr=0x%llx draws=%llu of %llu%s\n",
+                                             (unsigned long long)watch[w].addr,
+                                             (unsigned long long)watch[w].total.load(),
+                                             (unsigned long long)wn,
+                                             slots.empty() ? "  NEVER A COLOUR TARGET" :
+                                                 slots.c_str());
+                            }
+                        }
+                    }
+                }
+                if (std::getenv("PROSPER_DRAW_CENSUS")) {
+                    static std::atomic<uint64_t> seen{0}, indirect_seen{0};
+                    const uint64_t n = seen.fetch_add(1) + 1;
+                    if (st.draws[operation.index].indirect)
+                        indirect_seen.fetch_add(1, std::memory_order_relaxed);
+                    // WHERE the draws go, not just how many. 131,072 draws execute while the world
+                    // is absent, so the question is which surfaces they write and whether the one
+                    // that reaches the screen is among them. A count alone cannot answer that.
+                    //
+                    // Keyed on the colour-0 base and its extent, reported at teardown so the
+                    // per-draw path stays a map insert.
+                    // SAMPLED, 1 in 32. The first version took a mutex and inserted into a map on
+                    // every one of 131,072 draws and reported twelve lines at each power of two; the
+                    // routed run stalled at 1,024 draws and never reached gameplay. An instrument
+                    // that changes the subject's behaviour measures the instrument.
+                    static std::mutex target_mutex;
+                    static std::map<std::tuple<uint64_t, uint32_t, uint32_t>, uint64_t> targets;
+                    if ((n & 31u) == 0u) {
+                        // Straight from the draw's own register snapshot, the same two registers
+                        // render_state.cpp uses (CB_COLOR0_BASE + its _EXT high bits). Avoids
+                        // building a RenderState per draw on a path that runs 131,072 times.
+                        // ALL EIGHT MRT slots, not just slot 0. The first version read only
+                        // CB_COLOR0_BASE, and its own control exposed that: two surfaces which
+                        // demonstrably HIT the RTT cache (0x2063380000, 0x2085de0000) never appeared
+                        // in the census at all. A deferred renderer writes a G-buffer across slots
+                        // 0..7 in one draw, so a slot-0-only census cannot see most of what a frame
+                        // renders into -- and "is address X ever a render target" was exactly the
+                        // question being asked of it.
+                        //
+                        // Register layout from render_state.cpp: stride 0xf per slot for BASE, and
+                        // CB_COLOR0_BASE_EXT + slot for the high bits.
+                        namespace P = prosper::agc::Pm4;
+                        constexpr uint32_t kColorRegisterStride = 0xf;
+                        if (const GpuState* snap = st.draws[operation.index].state.get()) {
+                            std::lock_guard lock(target_mutex);
+                            for (uint32_t slot = 0; slot < 8u; ++slot) {
+                                const auto lo = snap->cx.find(
+                                    P::CB_COLOR0_BASE + slot * kColorRegisterStride);
+                                if (lo == snap->cx.end() || !lo->second) continue;
+                                const auto hi = snap->cx.find(P::CB_COLOR0_BASE_EXT + slot);
+                                uint64_t base = static_cast<uint64_t>(lo->second) << 8;
+                                if (hi != snap->cx.end())
+                                    base |= static_cast<uint64_t>(hi->second & 0xffu) << 40;
+                                ++targets[{base, slot, 0u}];
+                            }
+                        }
+                    }
+                    if ((n & (n - 1)) == 0 && n >= 4096u) {
+                        std::fprintf(stderr,
+                                     "[draw-census] draws=%llu indirect=%llu submit=%llu\n",
+                                     (unsigned long long)n,
+                                     (unsigned long long)indirect_seen.load(),
+                                     (unsigned long long)submit_no);
+                        std::lock_guard lock(target_mutex);
+                        // Busiest first. The numerically-lowest twelve addresses said nothing: the
+                        // question is whether one target dominates (a scene buffer) or the draws are
+                        // spread over hundreds of small ones.
+                        std::vector<std::pair<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t>>>
+                            ranked;
+                        ranked.reserve(targets.size());
+                        for (const auto& e : targets) ranked.push_back({e.second, e.first});
+                        std::sort(ranked.begin(), ranked.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+                        std::fprintf(stderr, "[draw-census]   distinct colour targets (sampled): %zu\n",
+                                     targets.size());
+                        size_t shown = 0;
+                        for (const auto& r : ranked) {
+                            const std::pair<const std::tuple<uint64_t, uint32_t, uint32_t>, uint64_t>
+                                entry{r.second, r.first};
+                            // All of them at the final report. Twelve was enough to see whether one
+                            // target dominates; it is not enough to answer "is address X ever a
+                            // render target", which is the question a specific suspect raises.
+                            const size_t limit = n >= 65536u ? targets.size() : 12u;
+                            if (shown++ >= limit) { std::fprintf(stderr,
+                                "[draw-census]   ... %zu further targets\n",
+                                targets.size() - limit); break; }
+                            std::fprintf(stderr,
+                                         "[draw-census]   target=0x%llx slot=%u draws=%llu\n",
+                                         (unsigned long long)std::get<0>(entry.first),
+                                         std::get<1>(entry.first),
+                                         (unsigned long long)entry.second);
+                        }
+                    }
+                }
                 if (!render) break;
                 if (st.draws[operation.index].indirect &&
                     (!indirect_dependencies_ok || !producer_epoch_ok)) {
+                    // The indirect latch drops this draw SILENTLY on an ordinary run -- the failure
+                    // is recorded only when a capture trace happens to be active. On a title whose
+                    // world is GPU-driven that is the difference between "the world is missing" and
+                    // "N indirect draws were dropped because a producer was declined", and nothing
+                    // reported it.
+                    //
+                    // Counted always, printed at powers of two so the volume stays bounded on a
+                    // title that does this every frame. The count is the point: an absent world with
+                    // zero dropped indirect draws and one with thousands are different problems.
+                    static std::atomic<uint64_t> latched_draws{0};
+                    const uint64_t dropped = latched_draws.fetch_add(1) + 1;
+                    if ((dropped & (dropped - 1)) == 0)
+                        std::fprintf(stderr,
+                                     "[agc] indirect DRAW dropped by the dependency latch "
+                                     "(count=%llu, submit=%llu, deps-ok=%u producer-ok=%u)\n",
+                                     (unsigned long long)dropped,
+                                     (unsigned long long)submit_no,
+                                     indirect_dependencies_ok ? 1u : 0u,
+                                     producer_epoch_ok ? 1u : 0u);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Draw, operation.index,
@@ -9665,6 +10345,64 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     // "nothing touches this buffer" -- which is the conclusion it would have
                     // supported, and it is false. Anchor a new watch to a line already proven to
                     // execute on the route being measured.
+                    // PROSPER_COMPUTE_RESOURCE_MAP=0xADDR[,0xADDR...]: print each named program's
+                    // realized resource table once, with binding, fetch pc, base and size. The
+                    // question it exists to answer is "do these two programs bind the same buffer",
+                    // which the address watch cannot express -- that one starts from an address and
+                    // finds programs, and here the address is precisely what is unknown.
+                    //
+                    // Deduped per (program, table shape) so a program dispatched forty times per
+                    // route prints once. Volume matters: the existing PROSPER_COMPUTELOG_RESOURCES
+                    // needs PROSPER_COMPUTELOG, which slows the subject enough that a routed run
+                    // stops reaching the phase being measured.
+                    if (const char* map = std::getenv("PROSPER_COMPUTE_RESOURCE_MAP")) {
+                        bool wanted_program = false;
+                        for (const char* cursor = map; cursor && *cursor;) {
+                            char* end = nullptr;
+                            const uint64_t one = std::strtoull(cursor, &end, 0);
+                            if (end == cursor) break;
+                            if (one == item.code_addr) { wanted_program = true; break; }
+                            cursor = (*end == ',') ? end + 1 : end;
+                            if (!*end) break;
+                        }
+                        if (wanted_program && item.resources) {
+                            uint64_t shape = item.resources->resources.size();
+                            for (const ShaderResource& r : item.resources->resources)
+                                shape = shape * 1000003ull + r.gpu_addr + r.size + r.binding;
+                            static std::mutex map_mutex;
+                            static std::set<std::pair<uint64_t, uint64_t>> map_logged;
+                            bool first = false;
+                            {
+                                std::lock_guard lock(map_mutex);
+                                first = map_logged.emplace(item.code_addr, shape).second;
+                            }
+                            if (first) {
+                                std::fprintf(stderr,
+                                             "[compute-resource-map] program=0x%llx submit=%llu "
+                                             "dispatch=%zu resources=%zu\n",
+                                             static_cast<unsigned long long>(item.code_addr),
+                                             static_cast<unsigned long long>(submit_no),
+                                             operation.index,
+                                             item.resources->resources.size());
+                                for (const ShaderResource& r : item.resources->resources) {
+                                    std::fprintf(stderr,
+                                                 "[compute-resource-map]   binding=%u fetch-pc=%u "
+                                                 "base=0x%llx size=%u stride=%u entries=%u\n",
+                                                 r.binding, r.fetch_pc,
+                                                 static_cast<unsigned long long>(r.gpu_addr),
+                                                 r.size, r.stride, r.table_index_count);
+                                    for (size_t e = 0; e < r.table_entries.size(); ++e)
+                                        std::fprintf(stderr,
+                                                     "[compute-resource-map]     entry=%zu "
+                                                     "base=0x%llx size=%u\n",
+                                                     e,
+                                                     static_cast<unsigned long long>(
+                                                         r.table_entries[e].gpu_addr),
+                                                     r.table_entries[e].size);
+                                }
+                            }
+                        }
+                    }
                     if (const char* watch = std::getenv("PROSPER_COMPUTE_ADDRESS_WATCH")) {
                         char* end = nullptr;
                         const uint64_t wanted = std::strtoull(watch, &end, 0);
@@ -9720,8 +10458,76 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         previous_compute_executed = false;
                         break;
                     }
+                    // Pre/post around the dispatch, so a change to the watched table is
+                    // attributed to the dispatch that made it. Captured before the move: the
+                    // post observation needs the program address, and `item` is consumed below.
+                    // PROSPER_COMPUTE_ZERO_BEFORE=0xPROGRAM:0xADDR:DWORDS — zero a guest range
+                    // immediately before the named program dispatches. DIAGNOSTIC ONLY: it fixes
+                    // nothing, because on hardware something must be performing whatever
+                    // initialisation this stands in for, and identifying that is the actual work.
+                    //
+                    // It exists to test one specific prediction that no amount of reading the ISA
+                    // settles: GTA V's tree builder writes parent links only for children whose node
+                    // type is in {2,5}, so the slots it skips must already hold a value that
+                    // terminates the consumer's `while (i != 0) i = bfe(rec[i], 3, 27)` walk. Zero
+                    // terminates; a leftover index from an earlier generation of the same array does
+                    // not. If the array is simply never cleared, zeroing it here should turn a cyclic
+                    // tree into a legitimately sparse one -- pairs below 1030 and cycles at zero.
+                    // That outcome is not reachable by any other experiment available.
+                    if (const char* zero_spec = std::getenv("PROSPER_COMPUTE_ZERO_BEFORE")) {
+                        char* cursor = nullptr;
+                        const uint64_t want_program = std::strtoull(zero_spec, &cursor, 0);
+                        if (cursor && *cursor == ':' && want_program == item.code_addr) {
+                            const uint64_t zero_addr = std::strtoull(cursor + 1, &cursor, 0);
+                            uint64_t zero_dwords = 0;
+                            if (cursor && *cursor == ':')
+                                zero_dwords = std::strtoull(cursor + 1, &cursor, 0);
+                            const uint64_t zero_bytes = zero_dwords * sizeof(uint32_t);
+                            if (zero_addr && zero_dwords && zero_dwords <= (1u << 22u) &&
+                                guest_readable(zero_addr, zero_bytes)) {
+                                std::memset(
+                                    reinterpret_cast<void*>(static_cast<uintptr_t>(zero_addr)), 0,
+                                    static_cast<size_t>(zero_bytes));
+                                static std::mutex zero_mutex;
+                                static uint64_t zero_count = 0;
+                                uint64_t count = 0;
+                                {
+                                    std::lock_guard lock(zero_mutex);
+                                    count = ++zero_count;
+                                }
+                                if (count <= 3 || (count % 25) == 0)
+                                    std::fprintf(stderr,
+                                                 "[compute-zero-before] program=0x%llx addr=0x%llx "
+                                                 "dwords=%llu submit=%llu dispatch=%zu count=%llu\n",
+                                                 (unsigned long long)item.code_addr,
+                                                 (unsigned long long)zero_addr,
+                                                 (unsigned long long)zero_dwords,
+                                                 (unsigned long long)submit_no, operation.index,
+                                                 (unsigned long long)count);
+                            }
+                        }
+                    }
+                    const uint64_t tree_watch_program = item.code_addr;
+                    const ComputeLaunchDimensions tree_watch_launch = item.launch;
+                    const std::string tree_watch_touch =
+                        compute_tree_watch_selector()
+                            ? describe_compute_tree_watch_touch(
+                                  item.resources.get(), compute_tree_watch_selector()->addr,
+                                  static_cast<uint64_t>(compute_tree_watch_selector()->records) *
+                                      sizeof(uint32_t))
+                            : std::string();
+                    const std::vector<uint32_t> tree_watch_pre =
+                        observe_compute_tree_watch_pre(item, submit_no, operation.index,
+                                                       operation.command_order, tree_watch_touch);
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
+                    log_compute_dispatch(tree_watch_program, submit_no, operation.index,
+                                         operation.command_order,
+                                         executed ? "executed" : "backend-declined",
+                                         &tree_watch_launch);
+                    observe_compute_tree_watch_post(tree_watch_program, tree_watch_touch, submit_no,
+                                                    operation.index, operation.command_order,
+                                                    tree_watch_pre);
                     if (capture_trace && executed)
                         capture_trace->computes.push_back(std::move(item));
                     if (capture_trace && !executed) {

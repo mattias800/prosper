@@ -131,7 +131,7 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // source records, and carrier witnesses instead of being trusted as serialized authority.
 // v54: retain the explicit scalar S_BUFFER dword bound. The ordinary resource size remains the V#'s
 // independent vector footprint; replay cannot reconstruct one from the other when STRIDE < 4.
-constexpr uint32_t kVersion = 54;
+constexpr uint32_t kVersion = 55;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -1154,7 +1154,7 @@ auto ds_seed_key(const GpuCaptureDsSeed& seed) {
     return std::tuple(seed.depth_read_base, seed.depth_write_base,
                       seed.stencil_read_base, seed.stencil_write_base,
                       seed.htile_data_base, seed.width, seed.height,
-                      static_cast<uint32_t>(seed.format));
+                      static_cast<uint32_t>(seed.format), seed.slice);
 }
 
 bool validate_ds_seed(const GpuCaptureDsSeed& seed, std::string& error) {
@@ -1610,6 +1610,31 @@ bool captured_compute_has_nullable_output_raw_buffer(
                     });
 }
 
+// PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1 — accept a capture whose GPU-driven provenance cannot
+// be proven exactly, and say so.
+//
+// These validators refuse the WHOLE BUNDLE when one compute dispatch's packed-pointer or
+// indirect-pointer state is not exactly provable. That is right for a bundle meant to REPLAY: a
+// relocation replayed without provenance would fabricate a pointer. It is wrong for a bundle meant
+// to be READ -- `gpu_replay --inspect-only`, the draw list, the render targets -- and on GTA V it
+// makes the F9 frame grab unusable on the one title whose world is GPU-driven, which is exactly
+// where a draw-level view is needed. The charter calls that grab the fastest loop for a graphical
+// bug; on this title it could not be run at all.
+//
+// Opt-in and reported, because a bundle that silently claimed replay fidelity it does not have
+// would be worse than the refusal it replaces.
+inline bool capture_allow_unproven_provenance(const char* what, const char* detail) {
+    static const bool allowed = std::getenv("PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT") != nullptr;
+    if (!allowed) return false;
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) < 12)
+        std::fprintf(stderr,
+                     "[capture] ALLOW_UNPROVEN_INDIRECT: accepting %s (%s). "
+                     "THIS BUNDLE IS FOR INSPECTION, NOT FAITHFUL REPLAY.\n",
+                     what, detail);
+    return true;
+}
+
 bool validate_captured_nullable_output_raw_buffer(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
@@ -1630,6 +1655,8 @@ bool validate_captured_nullable_output_raw_buffer(
         compute.launch.threads_y != 1u || compute.launch.threads_z != 1u ||
         compute.launch.groups_x != compute.recompile_config.user_sgprs[7] ||
         compute.launch.groups_y != 1u || compute.launch.groups_z != 1u) {
+        if (capture_allow_unproven_provenance("a nullable-output marker",
+                                              "stale captured launch provenance")) return true;
         error = "nullable-output marker has stale captured launch provenance";
         return false;
     }
@@ -1752,6 +1779,8 @@ bool validate_captured_gta5_packed_pointer(
     if (capture.format_version < 51u || candidates != 1u ||
         !compute.recompile_config_available ||
         compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        if (capture_allow_unproven_provenance("packed-pointer state",
+                                              "no exact compute provenance")) return true;
         error = "packed-pointer state lacks exact compute provenance";
         return false;
     }
@@ -1760,6 +1789,8 @@ bool validate_captured_gta5_packed_pointer(
         (static_cast<uint64_t>(config.threads_x) + config.local_x - 1u) / config.local_x;
     if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
         compute.launch.groups_z != 1u) {
+        if (capture_allow_unproven_provenance("packed-pointer state",
+                                              "stale captured launch provenance")) return true;
         error = "packed-pointer state has stale captured launch provenance";
         return false;
     }
@@ -1830,6 +1861,8 @@ bool validate_captured_indirect_pointer_relocations(
     if (capture.format_version < 53u || candidates != 1u ||
         !compute.recompile_config_available ||
         compute.raw_shader_index >= capture.raw_shader_versions.size()) {
+        if (capture_allow_unproven_provenance("an indirect-pointer relocation",
+                                              "no exact compute provenance")) return true;
         error = "indirect-pointer relocation lacks exact compute provenance";
         return false;
     }
@@ -1839,6 +1872,8 @@ bool validate_captured_indirect_pointer_relocations(
         config.local_x;
     if (compute.launch.groups_x != groups_x || compute.launch.groups_y != 1u ||
         compute.launch.groups_z != 1u) {
+        if (capture_allow_unproven_provenance("an indirect-pointer relocation",
+                                              "stale captured launch provenance")) return true;
         error = "indirect-pointer relocation has stale captured launch provenance";
         return false;
     }
@@ -2670,6 +2705,7 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(seed.depth_valid); w.u8(seed.stencil_valid);
         w.bytes(seed.depth); w.bytes(seed.stencil);
     }
+
     // v9 extends the resource contract with the base-level depth of 3D images. Keep the resource
     // record itself byte-compatible with v1-v8 and append depths in deterministic table order, so old
     // captures remain readable without duplicating every legacy table parser.
@@ -3478,6 +3514,21 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const auto& stage : diagnostic.stages)
             if (!write_scalar_buffer_bounds(stage.resource_table)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
+    // v55: each DS seed's array slice, in the same order as the seed records. Written at the END of
+    // the stream, not beside the records it belongs to.
+    //
+    // That placement is the whole point. Every version-gated addition here is a trailing tail so a
+    // reader at version N can stop before it, and the test suite exercises exactly that by
+    // serializing at the current version, LOWERING THE VERSION BYTE IN PLACE, and reparsing. A tail
+    // written mid-stream survives its own round trip and desynchronises every later tail the moment
+    // the version is downgraded -- eleven legacy-reopen assertions failed that way when this field
+    // was first placed next to the seed records.
+    for (const auto& seed : c.ds_seeds) w.u32(seed.slice);
+    // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
+    // existed, so a capture sitting just under the maximum could serialize successfully into a file
+    // that read_gpu_capture then rejects as oversized -- a write that reports success and produces
+    // an unreadable artifact. Any tail added after this point must move this check again.
+    if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
 }
@@ -3702,7 +3753,6 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         c.ds_seeds.resize(seed_count);
         uint64_t seed_total = 0;
-        std::set<decltype(ds_seed_key(GpuCaptureDsSeed{}))> keys;
         for (auto& seed : c.ds_seeds) {
             uint32_t format = 0;
             uint8_t depth_valid = 0, stencil_valid = 0;
@@ -3718,9 +3768,6 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             seed.depth_valid = depth_valid != 0;
             seed.stencil_valid = stencil_valid != 0;
             if (!validate_ds_seed(seed, error)) return false;
-            if (!keys.insert(ds_seed_key(seed)).second) {
-                error = "duplicate DS seed identity"; return false;
-            }
             const uint64_t plane_bytes = seed.depth.size() + seed.stencil.size();
             if (plane_bytes > kMaxTotalDsSeedBytes ||
                 seed_total > kMaxTotalDsSeedBytes - plane_bytes) {
@@ -4870,6 +4917,21 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     error = "invalid scalar-buffer bound state";
                     return false;
                 }
+    }
+    // v55 trailing tail: each DS seed's array slice, in seed order. Pre-v55 captures leave every
+    // seed at slice 0, which is what every non-layered surface is.
+    if (version >= 55)
+        for (auto& seed : c.ds_seeds)
+            if (!r.u32(seed.slice)) return false;
+    // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
+    // tail above: a per-record check would compare incomplete identities and reject two faces of one
+    // cube that differ only in slice -- which is exactly the capture this version exists to allow.
+    {
+        std::set<decltype(ds_seed_key(GpuCaptureDsSeed{}))> identities;
+        for (const auto& seed : c.ds_seeds)
+            if (!identities.insert(ds_seed_key(seed)).second) {
+                error = "duplicate DS seed identity"; return false;
+            }
     }
     for (auto& draw : c.draws) restore_legacy_color_target_aliases(draw);
     for (auto& diagnostic : c.failure_diagnostics)

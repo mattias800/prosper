@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -337,6 +338,44 @@ void observe_guest_log_capture_gap();
 // the external controller moved its lever, while the one-shot state prevents a second arm.
 // Automatic trigger-file, fixed-present, and guest-log gates are mutually exclusive and fail closed
 // when more than one is configured, so one gate's completion cannot be attributed to another arm.
+// One submit's journey through the interactive frame bundle's append policy, with the capture step
+// INJECTED. The injection is the point: the property at stake is an ordering -- the cap must be
+// consulted before any capture work -- and an ordering cannot be regressed by a predicate that
+// merely returns the right answer. A test supplies a capture step that records whether it ran, so
+// moving the cap check below the capture inside this function makes the test fail.
+//
+// Checking the cap afterwards meant every post-cap submit paid the full capture cost, and a post-cap
+// capture FAILURE set `failed` and discarded the already-valid capped bundle -- the exact outcome
+// the cap exists to prevent.
+struct FrameBundleAppendState {
+    bool capturing = false;
+    bool failed = false;
+    uint64_t submits_appended = 0;
+    uint64_t max_submits = 0;      // 0 = uncapped
+};
+enum class FrameBundleAppendOutcome {
+    NotCapturing,   // the window is closed, or an earlier submit already failed
+    Capped,         // the cap is met: the capture step is NOT run and the bundle is left intact
+    Appended,       // the capture step ran and succeeded
+    Failed,         // the capture step ran and failed; the bundle is marked failed
+};
+FrameBundleAppendOutcome frame_bundle_append_submit(
+    FrameBundleAppendState& state, const std::function<bool()>& capture_step);
+
+// Hook counters scoped to ONE capture window. The underlying counters are process totals, so the
+// empty-window report subtracts what was latched when the window opened.
+struct FrameBundleWindowCounters {
+    uint64_t reached = 0, inactive = 0, not_capturing = 0;
+};
+// Latches the baseline. Exported alongside the report so a mutation that drops the latch is
+// observable: the report then returns process totals instead of window activity.
+void frame_bundle_open_window(FrameBundleWindowCounters& baseline,
+                              const FrameBundleWindowCounters& totals_now);
+// Saturating: if a baseline were ever missed or latched late, an unsigned wrap would print a count
+// near 2^64 and read as enormous activity, the opposite of the truth this line reports.
+FrameBundleWindowCounters frame_bundle_window_report(
+    const FrameBundleWindowCounters& totals_now, const FrameBundleWindowCounters& baseline);
+
 bool capture_bundle_trigger_file_enabled();
 
 } // namespace prosper::gpu

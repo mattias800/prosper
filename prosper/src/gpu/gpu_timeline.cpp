@@ -2165,11 +2165,95 @@ bool capture_bundle_trigger_file_enabled() {
 }
 
 // Called per submit: when a frame grab is in progress, append this submit's realized state to the bundle.
+// "the capture window contained no GPU submits" is reported identically whether the submit hook was
+// never reached, was reached before the window opened, or was reached and rejected -- three
+// different faults with three different fixes, and the message distinguishes none of them. On GTA V
+// the window reports zero at 1, 16 and 48 frames while the same run demonstrably renders. These
+// counters make the failure name itself.
+std::atomic<uint64_t> g_grab_hook_reached{0};
+long long g_grab_window_open_ms = 0;
+std::atomic<uint64_t> g_grab_hook_inactive{0};
+std::atomic<uint64_t> g_grab_hook_not_capturing{0};
+// Baselines taken when a capture window opens. The three counters above are process totals: they
+// accumulate from startup and were reported verbatim as evidence about one window, so ordinary
+// activity before F9 made a genuinely empty window look as though the hook had been reached during
+// it — defeating the single distinction this diagnostic exists to draw. Written and read under the
+// bundle mutex, on the same thread that opens and closes the window.
+FrameBundleWindowCounters g_grab_hook_at_open{};
+FrameBundleWindowCounters grab_hook_totals_now() {
+    return {g_grab_hook_reached.load(std::memory_order_relaxed),
+            g_grab_hook_inactive.load(std::memory_order_relaxed),
+            g_grab_hook_not_capturing.load(std::memory_order_relaxed)};
+}
+
+FrameBundleAppendOutcome frame_bundle_append_submit(
+    FrameBundleAppendState& state, const std::function<bool()>& capture_step) {
+    if (!state.capturing || state.failed) return FrameBundleAppendOutcome::NotCapturing;
+    // BEFORE the capture step, never after. Everything below this line costs a full submit capture,
+    // and a failure below it marks the whole bundle failed -- so a post-cap submit reaching it
+    // discards the very bundle the cap was asked to preserve.
+    if (state.max_submits != 0 && state.submits_appended >= state.max_submits)
+        return FrameBundleAppendOutcome::Capped;
+    if (!capture_step()) {
+        state.failed = true;
+        return FrameBundleAppendOutcome::Failed;
+    }
+    ++state.submits_appended;
+    return FrameBundleAppendOutcome::Appended;
+}
+
+void frame_bundle_open_window(FrameBundleWindowCounters& baseline,
+                              const FrameBundleWindowCounters& totals_now) {
+    baseline = totals_now;
+}
+
+FrameBundleWindowCounters frame_bundle_window_report(
+    const FrameBundleWindowCounters& totals_now, const FrameBundleWindowCounters& baseline) {
+    auto delta = [](uint64_t now, uint64_t at_open) {
+        return now >= at_open ? now - at_open : 0;
+    };
+    return {delta(totals_now.reached, baseline.reached),
+            delta(totals_now.inactive, baseline.inactive),
+            delta(totals_now.not_capturing, baseline.not_capturing)};
+}
+
 void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_no) {
-    if (!g_interactive_frame_active.load(std::memory_order_acquire)) return;
+    g_grab_hook_reached.fetch_add(1, std::memory_order_relaxed);
+    if (!g_interactive_frame_active.load(std::memory_order_acquire)) {
+        g_grab_hook_inactive.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     InteractiveFrameBundle& b = interactive_frame_bundle();
     std::lock_guard<std::mutex> lk(b.mx);
-    if (!b.capturing || b.failed) return;
+    if (!b.capturing || b.failed) {
+        g_grab_hook_not_capturing.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // PROSPER_CAPTURE_MAX_SUBMITS=N — stop appending after N submits, keeping what was captured.
+    //
+    // The window is closed by a PRESENT, so it cannot end mid-burst. GTA V flips in bursts and emits
+    // its whole frame's work between two of them: with the window correctly waiting for content, one
+    // burst appended 3.3 GB and blew even the 3,072 MB maximum, so no budget setting can capture it.
+    // A submit cap bounds the bundle by CONTENT rather than by presents or bytes, which is the only
+    // one of the three the caller can reason about ("give me the first 40 submits of this frame").
+    //
+    // Tested BEFORE any capture work, not after. Capturing a submit and then discarding it paid the
+    // full cost of every post-cap submit, and — worse — a post-cap capture FAILURE set `b.failed`
+    // and threw away the already-valid capped bundle, which is precisely the outcome the cap exists
+    // to prevent.
+    static const uint64_t max_submits = [] {
+        const char* spec = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
+        if (!spec || !*spec) return uint64_t{0};
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(spec, &end, 0);
+        return (end && !*end && parsed) ? static_cast<uint64_t>(parsed) : uint64_t{0};
+    }();
+    // The whole append policy runs through frame_bundle_append_submit(), with everything below
+    // supplied as the injected capture step. That is what makes the ORDERING regressable: a test
+    // hands in a step that records whether it ran, so moving the cap check below the capture inside
+    // the seam is observable rather than merely wrong.
+    FrameBundleAppendState append{b.capturing, b.failed, b.submits, max_submits};
+    const FrameBundleAppendOutcome outcome = frame_bundle_append_submit(append, [&]() -> bool {
     GpuCaptureFile capture;
     const GpuCaptureMetadata meta = runtime_capture_metadata(submit_no);
     std::string error;
@@ -2178,11 +2262,10 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     // that is still comfortably within its deduplicated frame budget.
     if (!capture_gpustate_submit(state, submit_no, meta.width, meta.height, meta, capture, error,
                                  b.max_unique_bytes)) {
-        b.failed = true;
         b.pending_failure_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
-        return;
+        return false;
     }
     // A persistent shadow atlas may have been produced before the captured frame. Seed that
     // boundary state on the first submit only; later submits observe the replay cache updated by
@@ -2191,11 +2274,10 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     // mutated concurrently as it could from the independent present/flip thread.
     if (!b.submits && gpu_capture_ds_seed_snapshot_available() &&
         !read_all_gpu_capture_ds_seeds(capture.ds_seeds, error)) {
-        b.failed = true;
         b.pending_failure_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: initial DS snapshot failed (%s); grab aborted\n",
                      error.c_str());
-        return;
+        return false;
     }
     // F9 is armed from a frame the user has already seen, then captures the next complete GPU frame.
     // With deferred target readback the selected scanout can have been produced before that boundary
@@ -2226,13 +2308,30 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
         }
     }
     if (!append_capture_to_frame_bundle(b.bundle, capture, b.max_unique_bytes, error)) {
-        b.failed = true;
         b.pending_failure_error = error;
         std::fprintf(stderr, "[grab] frame-bundle: submit %llu failed (%s); grab aborted\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
-        return;
+        return false;
     }
-    ++b.submits;
+    return true;
+    });
+    switch (outcome) {
+        case FrameBundleAppendOutcome::Capped: {
+            static std::atomic<int> capped{0};
+            if (capped.fetch_add(1) < 2)
+                std::fprintf(stderr,
+                             "[grab] frame-bundle: submit cap %llu reached; further submits in "
+                             "this window are not appended\n",
+                             (unsigned long long)max_submits);
+            break;
+        }
+        case FrameBundleAppendOutcome::NotCapturing:
+        case FrameBundleAppendOutcome::Appended:
+        case FrameBundleAppendOutcome::Failed:
+            break;
+    }
+    b.failed = append.failed;
+    b.submits = append.submits_appended;
 }
 
 // Called per present (flip): starts the frame on the first present after F9, writes it on the next.
@@ -2251,7 +2350,32 @@ void interactive_frame_bundle_on_present() {
                              b.frames_seen,
                              static_cast<unsigned long long>(
                                  b.bundle.submits.back().submit_index));
-            if (b.failed || b.frames_seen >= b.frames_wanted) {   // window complete (or aborted)
+            // A window that closes having captured NOTHING is never what the caller wanted: it
+            // produces a failed grab and a message telling them to widen it by hand. Extend it
+            // until at least one submit has been captured, bounded by the same 240-present ceiling
+            // the env var accepts.
+            //
+            // This exists because the window is a PRESENT COUNT, and a present count is not a unit
+            // of time. GTA V flips in bursts -- 48 presents in 26 ms, 12 in 7 ms, against a 23/s
+            // average -- so the window's wall-clock duration is effectively random and usually far
+            // too short to contain a submit. Every frame count from 1 to 48 failed on that title
+            // while the run demonstrably rendered (#2549).
+            //
+            // Bounded, and it never SHORTENS a window: a capture that already has submits closes
+            // exactly where it did before, so titles whose present count already works are
+            // unaffected.
+            // OPT-IN. The default contract -- close after exactly `frames_wanted` presents,
+            // whatever was captured -- is deliberate and asserted by gpu_capture_bundle_roundtrip,
+            // including that an empty window reports failure promptly rather than hanging on. This
+            // does not change it.
+            constexpr uint32_t kNoSubmitPresentCeiling = 240u;
+            static const bool wait_for_submits =
+                std::getenv("PROSPER_CAPTURE_WAIT_FOR_SUBMITS") != nullptr;
+            const bool window_complete =
+                b.frames_seen >= b.frames_wanted &&
+                (!wait_for_submits || b.submits > 0 ||
+                 b.frames_seen >= kNoSubmitPresentCeiling);
+            if (b.failed || window_complete) {   // window complete (or aborted)
                 if (!b.failed && b.submits > 0) { write_path = b.current_path; write_bundle = std::move(b.bundle); }
                 else if (b.failed) {
                     std::fprintf(stderr, "[grab] frame-bundle aborted (see error above); not written\n");
@@ -2265,6 +2389,19 @@ void interactive_frame_bundle_on_present() {
                     // zero legitimately, and re-arming the same width is a coin flip (trap 101).
                     std::fprintf(stderr, "[grab] frame-bundle: window had no submits; widen it with "
                                          "PROSPER_CAPTURE_FRAMES=N (1..240) or re-arm\n");
+                    const FrameBundleWindowCounters window =
+                        frame_bundle_window_report(grab_hook_totals_now(), g_grab_hook_at_open);
+                    std::fprintf(stderr,
+                                 "[grab] frame-bundle: during this window the submit hook was "
+                                 "reached=%llu, %llu while inactive, %llu while not capturing; "
+                                 "window was open %lld ms for %u presents\n",
+                                 (unsigned long long)window.reached,
+                                 (unsigned long long)window.inactive,
+                                 (unsigned long long)window.not_capturing,
+                                 (long long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count() -
+                                     g_grab_window_open_ms),
+                                 b.frames_seen);
                     b.outcome_pending = true; b.outcome_ok = false; b.outcome_path = b.current_path;
                     b.outcome_error = "the capture window contained no GPU submits";
                 }
@@ -2278,6 +2415,9 @@ void interactive_frame_bundle_on_present() {
         } else if (!b.armed_path.empty()) {
             b.capturing = true; b.current_path = std::move(b.armed_path); b.armed_path.clear();
             b.arm_delay_presents = 0;
+            g_grab_window_open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            frame_bundle_open_window(g_grab_hook_at_open, grab_hook_totals_now());
             b.bundle = GpuCaptureBundle{}; b.submits = 0; b.frames_seen = 0; b.failed = false;
             b.pending_failure_error.clear();
             // No arrow here, deliberately: " -> <path>" is reserved for a line emitted AFTER the

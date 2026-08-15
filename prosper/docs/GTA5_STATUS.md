@@ -10,6 +10,2426 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## THE CORRUPTING PROGRAM IS `0x413dc3400` (2026-08-15)
+
+Measured with `PROSPER_COMPUTE_TREE_WATCH=0x20f848417c:2063` on a 200 s routed run with the hanging
+consumer skipped (`PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700`, so zero device losses, 9,291 frames).
+The watch reads the table before and after **every** realized dispatch, so a change is attributed to
+the dispatch that made it rather than to an interval.
+
+**321 observations. Every clean -> cyclic transition:**
+
+| program | clean -> cyclic | cyclic -> clean | clean -> clean |
+| --- | --- | --- | --- |
+| `0x413dc3400` | **37** | 0 | 3 |
+| `0x413d88400` | 1 | 37 | 2 |
+| `0x413e1c300` | 1 | 1 | 158 |
+| `0x413cee500` | 0 | 1 | 79 |
+
+`0x413dc3400` made the table cyclic on **37 of its 40 dispatches**. Nothing else does it
+systematically.
+
+**Every observed writer reported `toucher=1`.** No change came from a program whose resource table
+does not contain the address, so there is no unknown writer and no out-of-bounds path to chase —
+the watch was built to be able to report that case and did not.
+
+### The per-submit chain, identical every submit
+
+```
+d15,d16  0x413cee500   Morton keys        -> pairs=0     unpaired=0    oob-roots=0   depth=3
+d37      0x413dc3400   topology build     -> cycles=19   pairs=919     unpaired=148  depth=68
+d39..47  0x413dc6700   the consumer       (skipped in this run; this is what hangs)
+d54      0x413d88400   repurposes the RAM -> pairs=0     unpaired=571
+```
+
+`0x413dc3400` writes 2,061 of 2,063 records in one dispatch through six store pcs (bindings/pcs
+`23:597, 25:608, 26:620, 27:632, 28:644, 29:656`), turning a table with **no** cycles into one with
+19 cycles, 57 cyclic roots and depth 68. The consumer runs two dispatches later and walks exactly
+that array. **This is the defect: the builder produces a cyclic parent array, and the hang is the
+downstream symptom.**
+
+The same run also shows `0x413d88400` at d54 leaving `pairs=0` — the allocation is **reused scratch**
+across phases, not one long-lived structure, which is why a pair count compared across phases moves
+by hundreds. Compare pair counts only within the same phase.
+
+### What a correct table looks like — measured, not assumed
+
+Against 91 captured 2,063-dword tables:
+
+| | pairs | unpaired | cycles | max depth |
+| --- | --- | --- | --- | --- |
+| clean parent tables (`live-a240`, `post-36-3`) | **1030** | **0** | 0 | **11** |
+| cyclic captures (85, one resource hash) | 1029 | 1 | 1 | 15 |
+| `0x413dc3400` output, live | 919 | 148 | 19 | 68 |
+
+This **confirms Codex's LBVH identification quantitatively**: a full binary tree over 1,032 leaves
+has 1,031 internal nodes, and a well-formed table measures 1,030 sibling pairs with zero unpaired
+records at depth 11, against log2(1032) = 10.01. Pairs are `(odd, even)`: the odd index is the head
+(side bit clear), the even index its mate (side bit set).
+
+In the 85-capture set the anomaly is *fully deterministic* — the same 4-member cycle
+`(256, 384, 447, 831)` and the same single unpaired record `300` in every one. All 85 share one
+resource hash, so this is one table observed 85 times, i.e. the corruption is **stable** across
+submits 7629 -> 9694 rather than re-derived; nothing repairs it. The four cycle members are each in
+a *well-formed* sibling pair, so the cycle is not caused by a broken pair — the parent links
+themselves are wrong. Slot 300 differs from its mate only in bits[2:0] (`0x942` against `0x940`,
+both decoding to parent 296), so it is a flag-bit difference and a separate anomaly from the cycle.
+
+**Ruled out by this measurement:** the "lost update" / two-writer race account of the cycle. Within
+one dispatch's pre/post pair there is exactly one writer, and its output is cyclic.
+
+## Falsified for `0x413dc3400` (2026-08-15) — checked, not assumed
+
+- **Barrier uniformity.** All eight `OpControlBarrier`s in the emitted module are in uniform blocks.
+  Three sit in each dispatcher's **continue target** (`OpLoopMerge %163 %162` — %162 is the continue
+  block, reached by every invocation on every iteration) and five at structured merge targets. The
+  design comment in `rdna2_to_spirv.cpp` states this invariant explicitly ("the switch merge is
+  reached by every invocation on every iteration"); it holds in the artefact. A barrier inside a
+  `switch(pc)` *case* would have been a real Vulkan uniformity violation — it is not what is emitted.
+- **Native subgroup / multiwave lowering.** `[subgroup] cs=0x413dc3400 … native=0 … multiwave=0`:
+  the program is already lowered through the portable wave model, so there is no native lowering to
+  blame. `PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE=1` leaves all nine of its module hashes byte-identical.
+- **LDS undersizing.** The module declares 384 dwords = 1,536 bytes = 3 × 512-byte
+  `COMPUTE_PGM_RSRC2.LDS_SIZE` granules; Codex's ISA read puts the largest accessed LDS address at
+  byte 1,028. Sized correctly and over-provisioned either way.
+- **A race.** Two different frames produce broken-pair patterns sharing a 60-character suffix
+  exactly, with the same first damaged index. Deterministic given the input.
+- **A lane/wave/workgroup boundary effect.** Damage index mod 2/3/4/8/16 is flat.
+- **An unknown or out-of-bounds writer.** Every observed change reported `toucher=1`.
+
+## The selected-sbuffer contract declines because the SELECTED V# IS FLOAT DATA (2026-08-15)
+
+`PROSPER_GTA5_SBUFFER_REJECT=1` (added on this branch; the six reasons in
+`rdna2_gta5_compute_contracts.cpp` were all behind `PROSPER_DBG`, which desyncs the route) reports
+exactly two declines for `0x413ce6000` on a whole run:
+
+```
+[gta-selected-sbuffer] reject=consumer-resource
+[gta-selected-sbuffer] reject=selected-vsharp
+    words=c540fa56:c51e1625:4373fd8a:45de36cc
+    base=0x1625c540fa56 stride=1310 records=1131675018 size=4294967295
+```
+
+**Those four words are floats**: `0xc540fa56` ≈ **-3087.6**, `0xc51e1625` ≈ **-2529.5**,
+`0x4373fd8a` ≈ **244.0**, `0x45de36cc` ≈ **7110.9**. That is a world-space AABB, not a descriptor —
+and the derived `base=0x1625c540fa56`, `records=1131675018`, `size=0xffffffff` are what you get from
+reinterpreting it. **prosper is correctly refusing to manufacture a descriptor out of it**; the
+contract's `selected-vsharp` guard is doing its job.
+
+So the selector resolves to a record that does not contain a V# at the expected offset. The chain to
+audit, with what is measured about each link:
+
+| link | measured |
+| --- | --- |
+| the selector's source records, pc70 | `base=0x20f848e2bc stride=8 records=2064 size=16512` — resolves |
+| the descriptor array, pc153 | `base=0x203f249b38 stride=120 records=5 size=600` — resolves |
+| `s_buffer_load_dwordx4 s[8:11], s[4:7], s106` | SMEM immediate offset **8**, so the V# is expected at `selector*120 + 8` |
+| the selected element | **float AABB data** |
+
+Three candidates, none yet excluded: the selector value is wrong; the V# lives at a different offset
+within the 120-byte record than `+8`; or the **source records at pc70 are themselves stale because
+their producer also does not run** — which would make this a chain of missing producers rather than
+one. That last one is the possibility to test first, because it is the same failure this whole
+investigation has already found once.
+
+Note the resource map lifts pc156/pc158 as `base=0x203f2e9b38 size=13360 stride=20 entries=5` —
+**stride 20, against the contract's expected 120**. Reconciling those two views is likely the fastest
+route in.
+
+## The selector chain at `0x413ce6000` pc149..156 — the exact fix site
+
+Decoded with prosper's own opcode constants (`rdna2_decode.hpp`), not guessed:
+
+```
+pc149  s_mulk_i32            s106, 120          ; SOPK 0x10. selector * 120, in VCC_LO as scratch
+pc150  s_load_dwordx4        s[4:7], s[0:1], m0 ; the descriptor-ARRAY V#
+pc153  s_buffer_load_dwordx4 s[8:11], s[4:7], s106  ; SELECT one V# at selector*120
+pc156  buffer_load_dwordx3   v[0:2], v6, s[8:11], 0 ; use it   <-- mode=unresolved-operand
+```
+
+**120 is exactly the array's stride.** `PROSPER_DYNTRACE_FAIL` confirms the split:
+
+```
+BUF(v4) key=0xa8       use_pc=153  base=0x203f249b38 stride=120 records=5 size=600   RESOLVED
+BUF(v4) key=0xffffffff use_pc=156  v4=00000000:00000000:00000000:00000000            UNRESOLVED
+```
+
+So the descriptor-array lift **finds the array** at pc153 and **cannot resolve the selected element**
+at pc156: `key=0xffffffff` is the sentinel the executor's own comment names as matchable by none of
+the three routes (fetch pc, SRT offset, SGPR base).
+
+**Why the selector does not resolve. `CONFIDENCE: MED`.** The selector arrives through **VCC_LO used
+as an ordinary scalar register** — GTA V's compiler recycles it, which this file already documents
+elsewhere. prosper's VCC-as-scalar recognition is
+`is_wave64_vcc_lo_scalar_b32_candidate`, and it covers exactly two shapes: `s_cselect_b32` with
+inline operands, and SOP2 B32 logicals. **`s_mulk_i32` is SOPK and is in neither set**, so the write
+at pc149 is not recognised as a scalar-scratch definition. That matches the failure exactly, but the
+alternative — that the const-fold breaks somewhere else along `s106`'s chain — has not been
+separately excluded, so this is a lead and not a conclusion. Verify before building on it.
+
+This is the same underlying difficulty as the execz VCC-half liveness guard cleared earlier today:
+**every remaining obstacle in this program comes from the guest recycling VCC as a general scalar
+register, and prosper modelling VCC specially in each place independently.**
+
+## THE REMAINING BLOCKER, EXACTLY (2026-08-15)
+
+Every compute reject on a routed run now names its cause without `PROSPER_DBG`. `0x413ce6000` — the
+producer whose absence removes the world — is blocked by **one instruction**:
+
+```
+0x413ce6000  mode=unresolved-operand pc=156 words=e0382000,80020006 fmt=12 op=0xe
+```
+
+`fmt=12` is MUBUF, `op=0xe` is `buffer_load_dwordx3`. `mode=unresolved-operand` means the **lowering
+exists and the descriptor does not resolve** — the emitter is fine, the descriptor is the defect.
+
+pc156 is the **runtime-selected buffer array**: `PROSPER_COMPUTE_RESOURCE_MAP` shows it resolving in
+the live table as `binding=10 fetch-pc=156 base=0x203f2e9b38 size=13360 stride=20 entries=5`, while
+the pre-specialization const-fold trace (`PROSPER_DYNTRACE_FAIL`) shows it as
+`use_pc=156 v4=00000000:00000000:00000000:00000000 base=0x0 stride=0 records=0`. Its sibling at
+pc158 is the same shape. Those two are the only unresolved uses of the nineteen.
+
+**So the whole "GTA V has no 3D world" chain reduces to one buffer-array descriptor that does not
+const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
+
+The full reject census, now legible — every one is `mode=unresolved-operand`, i.e. every one is a
+descriptor that does not resolve rather than an instruction that is not implemented:
+
+| program | pc | fmt/op |
+| --- | --- | --- |
+| `0x413ce6000` | 156 | MUBUF `buffer_load_dwordx3` |
+| `0x413cf9200` | 5 | MUBUF `buffer_load_dword` |
+| `0x413cf9a00` | 11 | MUBUF `buffer_load_dword` |
+| `0x413cf9d00` | 70 | FLAT/GLOBAL `op=0xc` |
+| `0x413d14100` | 6 | MUBUF `buffer_load_dwordx3` |
+| `0x2042f49a00` | 16 | MIMG `op=0x1` |
+| `0x2042f4a600` | 7 | SMEM `op=0x4` |
+| `0x205b545c00` | 98 | VOP2 `op=0xf` |
+| `0x205b54ee00` | 90 | VOP2 `op=0xf` |
+| `0x205b5e8600` | 314 | SOP2 `op=0xe` |
+| `0x205b654a00` | 1180 | MIMG `op=0xe6` |
+| `0x205b657200` | 313 | MIMG `op=0xe6` |
+| `0x205b658800` | 82 | SOP1 `op=0x3` |
+
+## REFRAME: this is a RAY-TRACING BVH, and prosper already knows the format (2026-08-15)
+
+The "tag" this investigation has been tracking is the **AMD RDNA2 ray-tracing BVH `NODE_TYPE`**, and
+prosper's own recompiler says so. `rdna2_to_spirv.cpp` (search `is_box16`) software-emulates
+`IMAGE_BVH_INTERSECT_RAY`, loading 28 dwords of a node and branching on:
+
+```cpp
+const uint32_t is_tri0  = b.ucmp(Op_IEqual, node_type, b.uconst(0u));
+const uint32_t is_tri1  = b.ucmp(Op_IEqual, node_type, b.uconst(1u));
+const uint32_t is_box16 = b.ucmp(Op_IEqual, node_type, b.uconst(4u));   // 64-byte node
+const uint32_t is_box32 = b.ucmp(Op_IEqual, node_type, b.uconst(5u));   // 128-byte node
+```
+
+So bits[2:0] of a node reference are the node type: 0–3 triangle, **4 box16**, **5 box32**, 6
+instance, 7 procedural. Everything this investigation measured now has a name:
+
+| observation | reading |
+| --- | --- |
+| `0x209cc76000` at 64-byte stride | an array of **64-byte nodes** (box16 or triangle) |
+| tags 0 / 2 / 5 / 7 dominating | triangle / triangle2 / box32 / procedural |
+| **tag 4 appearing only in broken submits** | **box16 nodes entering the scene** |
+| the sibling-paired parent table | BVH topology |
+| Morton keys and `0x09249249` | an LBVH build, as Codex identified |
+| `0x413dc3400`'s `tag == 2 \|\| tag == 5` predicate | it writes links only for two specific node types |
+
+**`PROSPER_DECODED_BVH` machinery already exists** — `DecodedBvhDescriptor` in
+`agc_shader_layout.hpp` carries `box_grow`, `triangle_return_mode`, `box_node_64b`, `sort_enabled`,
+and the dynfail dump prints `BVH(bvh4)` descriptors. This is a supported surface, not an unknown one.
+
+### The consumers of the BVH do not compile
+
+`IMAGE_BVH_INTERSECT_RAY` is **MIMG opcode 0xe6** (`rdna2_to_spirv.cpp:14145`). Two programs in the
+reject census fail on exactly that instruction:
+
+```
+0x205b654a00  mode=unresolved-operand pc=1180 fmt=14 op=0xe6   image_bvh_intersect_ray
+0x205b657200  mode=unresolved-operand pc=313  fmt=14 op=0xe6   image_bvh_intersect_ray
+```
+
+`mode=unresolved-operand` means **the lowering exists and the BVH descriptor does not resolve**.
+prosper has the full software traversal emulation; the shaders that would use it are declined for a
+descriptor.
+
+**So there are two independent defects on the ray-tracing path, and the second was invisible until
+the reject reasons became readable:**
+
+1. `0x413dc3400` builds a cyclic topology once the scene passes a point — the input-dependent defect
+   this document tracks above.
+2. **The traversal shaders that consume the BVH never compile at all**, because their BVH descriptor
+   does not resolve.
+
+Fixing (1) alone cannot render the world if (2) also holds. **(2) is the better first target**: it is
+a descriptor-resolution problem on an instruction prosper already implements, it is named exactly, and
+unlike (1) it does not depend on scene state.
+
+## The BVH traversal shader's descriptor is never classified as a BVH (2026-08-15)
+
+`PROSPER_DYNTRACE_FAIL_ADDR=205b654a00`. The shader is a **full-screen ray-tracing pass**:
+
+```
+launch groups=240x135x1 threads=1920x1080x1 local=8x8x1 user_sgprs=8
+pre-specialization raw const-fold recovered 72 descriptor use(s)
+```
+
+**Not one of the 72 is a `BVH(bvh4)`.** The dynfail dump distinguishes three kinds — `TEX/IMG(t8)`,
+`BUF(v4)` and `BVH(bvh4)` — and this shader, which executes `image_bvh_intersect_ray` at pc1180,
+recovers zero BVH descriptors. Two of its uses are unresolved with a **valid base and zero extent**:
+
+```
+BUF(v4) key=0xffffffff use_pc=1032 v4=a1f76200:00000020:00000000:00000000
+        base=0x20a1f76200 stride=0 records=0 size=0 required=28
+BUF(v4) key=0xffffffff use_pc=1266 v4=a1f76400:00000020:00000000:00000000
+        base=0x20a1f76400 stride=0 records=0 size=0 required=124
+```
+
+`required=28` is notable: prosper's own BVH emulation loads exactly **28 dwords** per node
+(`for (uint32_t k = 0; k < 28; ++k) w[k] = load_node(k);`).
+
+**Reading, `CONFIDENCE: MED`.** These are BVH descriptors being classified and decoded as buffer V#s.
+A GFX10 BVH descriptor has its own 4-dword layout — `decode_bvh_descriptor` in
+`agc_shader_layout.hpp` reads `type`, `box_grow`, `triangle_return_mode`, `box_node_64b`,
+`sort_enabled` from it — and interpreting one as a buffer V# yields `num_records = 0`, hence
+`size = 0`, hence an unbounded use, hence `unresolved-operand`. That fits every observation, but the
+alternative (the guest genuinely supplies a zero-extent descriptor at this point in the route) is not
+excluded, and a `key=0xffffffff` means neither fetch pc, SRT offset nor SGPR base matched — which has
+its own possible causes.
+
+**FALSIFIED, by running that check.** Decoding the two words with `decode_bvh_descriptor` gives
+`base = 0x20a1f7620000` — the BVH layout shifts its base left by 8, and the result lands far outside
+the guest address space, which sits around `0x20xxxxxxxx`. The **buffer** decode gives
+`base = 0x20a1f76200`, a perfectly plausible guest address. So these are not misclassified BVH
+descriptors, and the reading above is dead. Cost: one four-dword computation, no run.
+
+**What the same words do show.** Dwords 2 and 3 are **entirely zero**, while dwords 0 and 1 carry a
+sane base. A real buffer V# has a nonzero dword3 (it carries format and type bits), so an all-zero
+upper half is the signature of a **partially recovered descriptor** — the const-fold obtained the
+low two dwords and not the high two — rather than of a descriptor the guest genuinely wrote as
+zero-extent. `num_records = 0` then follows from dword2 being absent, and `size = 0` from that, and
+`unresolved-operand` from that. **That is the next thing to test**, and it is a different defect from
+anything this document has chased: not a wrong descriptor, a half-read one.
+
+## THE UNIFYING CAUSE: GTA V recycles VCC_LO as a general scalar register (2026-08-15)
+
+The BVH descriptor at the rejecting instruction is **built in the shader**, and it is built through
+VCC_LO. `0x205b654a00` pc1180 is `image_bvh_intersect_ray` with its descriptor in `s[16:19]`:
+
+```
+pc1171  s19  = <computed>
+pc1174  s106 = s19 & 0x000003ff            ; VCC_LO as scalar scratch
+pc1176  s17  = <computed>
+pc1177  s19  = s106 | 0x81000000           ; and back out of VCC_LO
+pc1179  s_waitcnt
+pc1180  image_bvh_intersect_ray  v[0..], v6, s[16:19], s[0..]
+```
+
+`(x & 0x3ff) | 0x81000000` is the BVH descriptor's dword3 — its size-high bits and type field. **The
+descriptor cannot resolve unless the const-fold tracks a value through VCC_LO.**
+
+That is the same obstacle as everywhere else in this title:
+
+| site | what VCC_LO carries | consequence |
+| --- | --- | --- |
+| `0x205b654a00` pc1174/1177 | the BVH descriptor's dword3 | `image_bvh_intersect_ray` rejects, the ray-tracing pass never compiles |
+| `0x413ce6000` pc149 | `s_mulk_i32 s106, 120`, the descriptor-array selector | `buffer_load_dwordx3` at pc156 rejects |
+| `0x413ce6000` pc84/90 | integer scratch inside an execz arm | the structurizer's VCC-half liveness guard rejects (cleared on this branch) |
+| GTA V generally | `is_gtav_wave64_vcc_lo_scalar_cselect` exists precisely for this | already a known pattern in the code |
+
+**prosper models VCC specially in each place independently — the liveness proof, the scalar-scratch
+recogniser, the descriptor const-fold — and each place has its own, narrower notion of which VCC
+writes count as data.** `is_wave64_vcc_lo_scalar_b32_candidate` admits exactly `s_cselect_b32` with
+inline operands and SOP2 B32 logicals. `s_mulk_i32` (SOPK) is not in it. Neither is the
+`s_and_b32`/`s_or_b32` pair above being tracked *through* to a descriptor.
+
+**This is the frontier.** Not the tree builder, whose lowering is proven correct by eleven perfect
+submits; and not a missing producer, which is falsified. A single coherent treatment of "VCC_LO used
+as an ordinary scalar register" — one recogniser consulted by the liveness proof, the scalar model
+and the const-fold alike — is what the remaining rejects have in common.
+
+`CONFIDENCE: MED` on that being sufficient. It is established that the descriptor passes through
+VCC_LO and that prosper's VCC recognisers do not cover these shapes; it is *not* established that
+covering them is enough to make either program compile, because neither has been tried.
+
+## `s_mulk_i32` folding: landed, and it did NOT move the reject (2026-08-15)
+
+The const-fold's SOPK case handles **only** `s_movk_i32`; every other SOPK forgets its destination
+*and* invalidates SCC. Its own comment notes that `s_movk/s_version/s_cmovk/s_mulk` do not write SCC
+— so `s_mulk_i32` was being charged both costs it does not owe, and the comment demands per-opcode
+evidence before widening. That evidence exists: `0x413ce6000` pc149 is `s_mulk_i32 s106, 120` where
+120 is the descriptor array's exact record stride, feeding the select at pc153 and the rejecting load
+at pc156.
+
+Folded it: multiply a known destination, forget an unknown one as before, and stop clobbering SCC.
+245/245 ctest green.
+
+**It did not change the reject.** `0x413ce6000` still fails with `mode=unresolved-operand pc=156`.
+
+**Then the probe was run, and it explains why — the fold was aimed at the wrong thing.**
+
+`PROSPER_DYNTRACE_SGPR=106` gives s106's complete fold history in this program:
+
+```
+pc=3    KNOWN 0x00000000
+pc=56   FORGOTTEN  words=beea376a
+pc=84   KNOWN 0x00000000 / 0xfffff7f0
+pc=90   KNOWN 0x7f7fffff
+pc=116  FORGOTTEN  words=beea3704      <- the break
+pc=131  FORGOTTEN  words=beea3704
+pc=149  FORGOTTEN  words=b86a0078      <- s_mulk_i32 s106, 120, with s106 ALREADY unknown
+```
+
+pc116 and pc131 are `SOP1 op=0x37 s[106:107], s[4:5]`, which prosper classifies as a **B64
+data/mask write** and which the RDNA2 encoding makes **`s_andn1_saveexec_b64`**: `exec = ~s4 & exec`,
+and **`s106` receives the OLD EXEC MASK**. Both are immediately followed by `s_cbranch_execz`.
+
+**So the descriptor-array selector is derived from a saved EXEC mask.** `s_mulk_i32 s106, 120` is
+multiplying a lane mask by the array's record stride. That is a wave-dependent runtime value, not a
+constant, and **no const-fold can ever resolve it** — which is precisely why this program has a
+dedicated `selected_sbuffer` contract that certifies the selector's complete *domain* from live
+source records instead of folding it.
+
+**Conclusion: the `s_mulk_i32` fold does not address this reject and cannot.** The reject is the
+contract's `selected-vsharp` decline — record 4 of the outer array holding float AABB data — and the
+const-fold was never on that path. The fold change stays for its own reasons; this reject needs the
+contract.
+
+The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
+backing and it costs nothing — not because it was shown to help.
+
+## FIRST DRAW-LEVEL VIEW OF A GTA V FRAME — and the captured submits are nearly EMPTY (2026-08-15)
+
+The frame grab now works on this title. Three changes were needed, each opt-in so no existing
+contract moves:
+
+| switch | what it addresses |
+| --- | --- |
+| `PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1` | five packed/indirect-pointer provenance validators that abort the whole bundle; reported per acceptance as inspection-only |
+| `PROSPER_CAPTURE_WAIT_FOR_SUBMITS=1` | keeps the window open past empty presents (bounded at 240), because a present COUNT is not a unit of time on a burst-flipping title |
+| `PROSPER_CAPTURE_MAX_SUBMITS=N` | bounds the bundle by CONTENT — one GTA V burst appended 3.3 GB and blew even the 3,072 MB maximum, so no byte budget could capture it |
+
+Result: **`frame-bundle written (25 submits)`, 512 MB**, loading as
+`bundle v2 submits=25 logical=2002872578 unique=511842881 ratio=0.256 chunks=3773 resources=454`.
+
+### What the frame contains
+
+```
+[gpureplay] bundle-submit=19370 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19371 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19372 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19373 operations=0/0 output_bytes=0
+[gpureplay] bundle-submit=19374 operations=1/1 output_bytes=1048576
+```
+
+**Four consecutive captured submits contain ZERO operations, the fifth one, the sixth three.**
+Reproduced on an independent capture (submits 23910–23915 against 19370–19374), and
+`operations=%zu/%zu` is `limit / total`, so the second figure is the submit's real operation count.
+
+**But this window is NOT representative, and reading it as "the guest submits nothing" would be
+wrong.** The tree watch elsewhere in this document reports the BVH builder at `dispatch=37` and the
+scratch reuse at `dispatch=54` **within a single submit** — so submits carrying 50+ operations
+demonstrably exist on this route. The capture simply landed on a quiet stretch: `MAX_SUBMITS` bounds
+it to the *first* 25 of a burst, and the window opens wherever the timed arm falls.
+
+**What it does establish** is that the capture path now works end to end and that submit-level
+operation counts are readable. **What it does not** is anything about where the world's draws are.
+
+**The next step is to aim the capture at a submit known to contain work** — the tree watch names
+them exactly (any submit at its `d37`) — rather than at a wall-clock moment. `PROSPER_CAPTURE_FRAMES`
+arms on time or frame ordinal; landing on a chosen submit needs the arm to be submit-indexed.
+
+**Read with care, `CONFIDENCE: MED`.** Three things are not established: whether `operations=0/0`
+means the guest submitted nothing or the capture recorded nothing; whether the 25-submit window
+landed on a representative part of the frame (it is bounded by `MAX_SUBMITS`, so it is the *first* 25
+of a burst); and whether the world's work lives in submits outside it. Replay stops at bundle submit
+5 with `indirect-pointer relocation has stale shader, launch, source, or proof state` — expected,
+since the capture was forced past provenance, and it means the later submits were not reconstructed.
+
+**The next step is to widen the cap and see where operations begin**, which is now a matter of one
+setting rather than an unusable tool.
+
+## The F9 frame grab cannot be used on this title — diagnosed and filed (#2549)
+
+The charter names the F9 grab the fastest loop for a graphical bug, and GTA V — a GPU-driven title
+whose world is absent — is exactly the case it exists for. It could not be run at all, and the
+message said only "the capture window contained no GPU submits".
+
+Instrumenting the submit hook with three counters and the window's wall-clock duration named the
+cause immediately:
+
+```
+[grab] submit hook reached=26840, 19206 while inactive, 7634 while not capturing;
+       window was open 26 ms for 48 presents
+```
+
+**48 presents in 26 ms**, and 12 presents in 7 ms — about **1,700 presents/second** against a 23/s
+average. **GTA V flips in bursts**, so a window defined as a present COUNT has an effectively random
+wall-clock duration, usually far too short to contain a submit.
+
+Two further refusals were found and opened behind `PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1`, which
+reports every acceptance as inspection-only: five packed/indirect-pointer provenance validators that
+abort the whole bundle when one compute dispatch cannot be exactly proven. Right for a replay bundle,
+wrong for a bundle meant to be read — and on this title they fire, so the grab aborted at submit
+19358 before the window problem was even reachable.
+
+With both addressed the capture reaches **181 frames / 22,599 submits**, and then hits the byte
+budget: 28 frames is 3.4 GB against a 3,072 MB maximum. **There is no setting that both lands on
+submits and fits the budget, because one knob controls both.** Filed as **#2549** with a
+time-based-window suggestion.
+
+**Consequence for everything above:** there is still no draw-level view of a GTA V frame. Every
+conclusion in this document about why the world is absent rests on log statistics, not on the frame's
+contents.
+
+## Open, unquantified: 38 of 40 logged `WaitRegMem` waits are on UNMAPPED labels (2026-08-15)
+
+```
+[agc] WaitRegMem #3 q=A NOT satisfied at fold time: [0xf58]&0x190 = 0x0, func=5 ref=0xffffffff
+      — dependency violated | built@0ms(age=-1ms) pre@build=0x0 LABEL-UNMAPPED
+```
+
+Of the 40 logged, **38 carry `LABEL-UNMAPPED`** and 38 are on queue A. The awaited address in that
+sample is **`0xf58`** — four-byte aligned, so it passes the call site's gate, and far too small to be
+a guest address, which in this title are `0x20xxxxxxxx`.
+
+**That is the same shape as the indirect-dispatch argument truncation** on the previous section
+(`0xf8480120` for `0x20f8480120`), which has an in-tree aperture recovery. Whether the same recovery
+applies to `WAIT_REG_MEM` labels is untested.
+
+Two things must be checked before treating this as a defect, and neither has been:
+
+- **It may be normal.** `command_processor.cpp` states plainly that an unsatisfied wait is "NORMAL,
+  handled state" and that under content-load bursts it "fires thousands of times a minute". The
+  barrier model behind `PROSPER_WAIT_DEFER=1` exists precisely because the default folds past them.
+- **The count is a LOG CAP, not a measurement.** The diagnostic prints the first 40 and then every
+  1024th, so "40" says nothing about the true rate. Quoting it as a frequency would be the rate-limit
+  trap the orchestration doc warns about.
+- **`wm_addr` may be register space.** PM4 `WAIT_REG_MEM` selects register or memory addressing, and
+  this code path reads `wm_addr` as memory unconditionally (`guest_readable(c.wm_addr, 8)`). A
+  register-space wait would then always read as unmapped. This area carries substantial prior work
+  (#312, #380, #448), so the absence of a `mem_space` check may be deliberate rather than missing —
+  it has not been established either way here.
+
+Recorded as an observation with its caveats rather than a lead, so the next reader neither chases it
+blind nor loses it.
+
+## `0x413ce6000` IS a bottom-up box32 BVH refit — and pc156 supplies BOUNDS, not references
+
+Codex's ISA read (#2542), with one decode correction to this document: **pc156 is
+`buffer_load_dwordx4`, not x3** (`e0382000 80020006`, GFX10.3 MUBUF op `0x0e`), and pc158
+(`e0342010 80020406`) is `buffer_load_dwordx2`. Together they load **six dwords into `v0..v5`** —
+AABB min/max XYZ.
+
+```
+pc156/158   load six BOUND values through the selected s[8:11]
+pc212       store dwordx4 v[0:3] to node offset +16
+pc214       store dwordx2 v[8:9] to node offset +32
+pc218       atomic allocation/counter through s[24:27]
+pc224       load dwordx2 v[4:5] through s[24:27]
+pc228..251  transform/encode those two indices, including node type 5
+pc253       store dwordx4 v[4:7] at node offset +0     <- the CHILD REFERENCES
+pc255/257   reload the node bounds
+pc260..266  min/max into the running bounds
+pc269       load the next parent/index and loop upward
+```
+
+So it is a **bottom-up construction/refit of box32 internal nodes**: merge six float bounds, obtain
+two child indices, write encoded child references plus bounds, propagate upward.
+
+**Three consequences, and the first retires a link this document asserted:**
+
+1. **The dynamic descriptor at pc156/158 feeds the BOUNDS at +16/+32. It does NOT supply the child
+   references written at pc253.** An epoch-stale pc156 can corrupt AABBs; it **does not directly
+   explain cyclic child references**. The "unresolved descriptor → wrong output → cycles" chain in
+   the sections above is therefore **not established**, and its `CONFIDENCE: MED` was generous.
+2. **The cyclic-reference frontier is the pc218/224 path** — the `s[24:27]` resource/counter/index
+   data, the index/base arithmetic involving `s16`, and the destination selection. That is where
+   ordered execution-epoch capture belongs.
+3. **A decline cannot itself perform the measured 0 → 324 cycle addition** — a declined dispatch
+   writes nothing. A prior decline could leave stale state a later executing invocation consumes, but
+   then the executing path is still part of the defect. The 29 cyclic submits on which every
+   `ce6000` dispatch executes already ruled out decline-alone as sufficient.
+
+The generic lift's CPU-epoch problem remains a real correctness issue; it is just not the direct
+value source for the reference cycles. **Do not close that link without measuring pc224's
+execution-epoch resource and indices.**
+
+## Submit-indexed capture already exists — #2549's workaround was not needed for this
+
+```
+PROSPER_GPU_TIMELINE_CAPTURE=<capture.prgcap>
+PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=1
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM=0x413ce6000
+```
+
+With a semantic selector, `CAPTURE_SUBMIT` is the **minimum** submit and the first later submit
+containing that program becomes the endpoint — which is exactly the "aim the capture at a submit that
+contains work" this document asked for, and it was already there.
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM=XxYxZ` qualifies further; a rolling predecessor
+bundle uses `..._CAPTURE_BUNDLE` + `..._CAPTURE_DEPTH`. `...AFTER_COMPUTE_PROGRAM` is a **cross-submit
+phase gate** and is the wrong selector when the endpoint is the submit containing `ce6000` itself.
+
+*(The F9 fixes on this branch remain valid for the interactive grab, and #2549's present-count
+finding still stands. But the capture this investigation needed did not require them.)*
+
+## The indirect-argument high dword is NOT folded into the modifier
+
+Also falsified by Codex. The HLE builder writes `cmd[1] = uint32_t(a1)` (offset), `cmd[2..3]` = the
+64-bit modifier, and PM4 decode reads them faithfully. The failing async-queue packet's live values:
+
+```
+base=0   offset=0xf8480120   modifier=0x21
+low | (modifier_low << 32) = 0x21f8480120   (unreadable)
+0x20f8480120                                (readable)
+```
+
+So the modifier is `0x21`, not `0x20` — the "the high dword is in the modifier" reading is dead, and
+**there is no evidence of a PM4 decoder bug**.
+
+**The decisive probe belongs before packet construction**, in `agc_cb_dispatch_indirect`: log the
+full `a1`, the full `a2`, and which exported NID entered the shared body — both DCB and ACB NIDs
+alias one HLE implementation, and the two forms may carry the address differently.
+
+- `a1 == 0x20f8480120` → the HLE builder truncates a full address and must preserve that ABI form.
+- `a1 == 0xf8480120` → the high bits never reached the builder, and the missing piece is per-ACB/queue
+  base state or another ABI-defined provenance source.
+
+**Until that is measured, aperture recovery stays diagnostic-only.** "Mapped under the common
+aperture" is not proof that it is the intended argument buffer — and this document's earlier framing
+of the truncation as a defect with an in-tree fix was ahead of the evidence.
+
+## RETRACTED — "THE BREAK" was two different presentation phases compared as one (2026-08-15)
+
+**The section below is wrong in its grouping and its interpretation, and is kept only so the
+measurements stay available. Do not cite its conclusion.** Codex falsified it with a
+`PROSPER_MEMLOG=1` + `PROSPER_RTTLOG=1` run (#2542):
+
+- **The physical mappings are disjoint, so VA aliasing is dead.** `VA 0x1557c00000 -> phys
+  0x105000000`; `VA 0x1543c00000 -> phys 0x102800000`; the dominant `0x208e5a0000` target lies inside
+  `VA 0x203de00000 -> phys 0x111000000` and resolves to physical `0x1617a0000`. None overlap. **A
+  physical-page RTT identity would miss exactly as the VA-keyed one does** — so the fix I proposed
+  would not have worked either.
+- **The `0x14…`/`0x15…` misses are not the gameplay composite at all.** They belong to
+  `fs=0x2042f83c00` — one full-resolution plus two half-resolution guest-backed planes, an
+  early/startup presentation path (very likely video/YUV-style input). They are ordinary guest
+  images, so an RTT miss there is **expected**.
+- **The real gameplay chain is entirely in `0x20…` and every link HITS:**
+
+```
+fs=0x205b34be00                       -> target 0x2056740000
+fs=0x205b384a00  samples 0x2056740000 HIT -> target 0x2058720000
+fs=0x205b363c00  samples 0x2058720000 HIT -> SCANOUT
+```
+
+  The last two stages preserve the producer's counts (`rgb_nonblack=1121820`), and the scanout holds
+  the tutorial/UI/light content but no world.
+
+**So the world is already absent at the OUTPUT of `fs=0x205b34be00`. It is not lost in the final
+composite, and not lost to an address mismatch.**
+
+What went wrong in my reasoning: I compared misses drawn from one presentation phase against render
+targets drawn from another, and read the address-range difference as a mismatch between two sides of
+*one* frame. The hit/miss counts and the address ranges were real; the grouping was not. A prefix
+histogram over a whole run cannot tell two phases apart, and I did not check that the sampled
+surfaces and the targets came from the same pass.
+
+## THE ACTUAL FRONTIER: the inputs of `fs=0x205b34be00` (2026-08-15)
+
+That fragment shader produces `0x2056740000`, the first stage of the gameplay chain, and its output
+already lacks the world. Its directly sampled inputs:
+
+| input | state |
+| --- | --- |
+| `0x2052ac0000` 3840x2160 fmt=1 | **RTT miss + DCC-unsupported warning** |
+| `0x2054aa0000` 3840x2160 fmt=11 | **RTT miss** |
+| `0x2063380000` 3840x2160 fmt=20 | HIT |
+| `0x2085de0000` 3840x2160 fmt=4 | HIT |
+
+**So the DCC problem is NOT superseded — it is the live lead, on the real chain.** `0x2052ac0000` is
+a guest-backed 4K surface that misses the RTT cache and then falls through to reading DCC-compressed
+bytes as uncompressed.
+
+Codex's qualification, which matters: **DCC warnings must be classified per surface.** Some
+DCC-described addresses do have a renderer-owned RTT image and hit; genuinely guest-backed ones such
+as `0x2052ac0000` and `0x20e0380000` miss and fall through. The renderer now carries all eight MRT
+bindings and the backend publishes them, so there is no evidence `0x2052ac0000` is merely an
+untracked secondary MRT — its persistent absence from the RTT cache makes **guest-backed DCC, or an
+unidentified producer, the better hypothesis**.
+
+**Next discriminator:** identify `0x2052ac0000`'s allocation and write history and inspect that exact
+input — not change RTT identity.
+
+## OLD (retracted): the composite samples `0x14…`/`0x15…` (2026-08-15)
+
+`PROSPER_RTTLOG=1` reports, per sampled texture, whether it resolved to a renderer-owned render
+target or fell through to guest memory. Over a routed run:
+
+```
+14389  -> HIT
+ 1638  -> miss
+   49  -> RTT PATH SKIPPED
+```
+
+A 90% hit rate — so the RTT machinery works. **But the misses are systematically the large surfaces,
+and they are in a different address range from every render target prosper draws into:**
+
+```
+[rtt] sample tex addr=0x1557c00000 3840x2160 fmt=9 -> miss (cache_size=8)
+[rtt] sample tex addr=0x1558c00000 3840x2160 fmt=9 -> miss (cache_size=85)
+[rtt] sample tex addr=0x1543c00000 3840x2160 -> miss
+[rtt] sample tex addr=0x1547c00000 4096x2048 -> miss
+[rtt] sample tex addr=0x14df560000 2048x2048 -> miss   (and four more 2048x2048)
+[rtt] sample tex addr=0x1544400000 1920x1080 -> miss
+```
+
+**Sampled addresses that HIT are `0x20xx…`** (the prefix census is dominated by `0x2066`, `0x206c`,
+`0x20d6`, `0x2067`, `0x205f`, `0x20e0`). **The misses are `0x14…`/`0x15…`.** And the draw census
+shows every colour target prosper renders into is `0x20…` — `0x208e5a0000` (~71,000 draws),
+`0x20431c0000`, `0x20ec7c0000`, and the scanouts `0x215ed10000` / `0x2160cf0000` / `0x2162cd0000`.
+
+**So the two sides of the frame use different virtual addresses for the same surfaces.** prosper's
+RTT cache is keyed on the address its draws rendered to; the composite asks for a different one and
+gets nothing, which for a surface prosper rendered into means it samples empty guest memory.
+
+**That is a mechanism that produces exactly the observed symptom**: ~71,000 draws fill a scene
+buffer, a composite runs and reaches the scanout, and the screen shows no world.
+
+**`CONFIDENCE: MED-HIGH` on the observation** — the hit/miss split, the size distribution and the
+address ranges are all measured. **`CONFIDENCE: LOW` on the cause.** Two readings are open and have
+not been separated:
+
+- **VA aliasing.** PS5 titles can map the same physical memory at more than one virtual address
+  (`sceKernelMapDirectMemory`). If the guest renders through one and samples through another, a
+  VA-keyed cache misses by construction, and the fix is to resolve RTT identity through physical
+  memory or an alias map rather than raw VA.
+- **A genuinely different surface.** The `0x14…`/`0x15…` surfaces may be resources the guest
+  produced by some path prosper does not render at all, in which case the miss is a symptom and the
+  absent producer is the defect.
+
+**The measurement that separates them:** whether any `0x14…`/`0x15…` address and any `0x20…` render
+target resolve to the same physical pages. That is answerable from the guest's own memory mapping and
+needs no further routed run.
+
+**This supersedes the DCC suspicion as the leading candidate.** The three unsupported 4K DCC surfaces
+(`0x2052ac0000`, `0x20e0380000`, `0x20df360000`) are all `0x20…` and are not among these misses.
+
+## WHERE the draws go: a scene buffer with ~71,000 draws, and a composite that reaches the scanout (2026-08-15)
+
+`PROSPER_DRAW_CENSUS=1` now records each draw's `CB_COLOR0_BASE` (+ `_EXT`, + `CB_COLOR0_VIEW`),
+sampled 1 in 32 and ranked by busiest:
+
+```
+[draw-census] draws=131072 indirect=0 submit=14180
+[draw-census]   distinct colour targets (sampled): 94
+[draw-census]   color0=0x208e5a0000 view=0x0      draws=2228     -> ~71,000 draws
+[draw-census]   color0=0x20431c0000 view=0x0      draws=457      -> ~14,600
+[draw-census]   color0=0x20ec7c0000 view=0x4002   draws=156  \
+[draw-census]   color0=0x20ec7c0000 view=0x0      draws=98    |  a LAYERED target: five distinct
+[draw-census]   color0=0x20ec7c0000 view=0x2001   draws=77    |  CB_COLOR0_VIEW slices
+[draw-census]   color0=0x20ec7c0000 view=0x8004   draws=55    |
+[draw-census]   color0=0x20ec7c0000 view=0x6003   draws=42   /
+[draw-census]   color0=0x215ed10000 view=0x0      draws=89   \
+[draw-census]   color0=0x2160cf0000 view=0x0      draws=86    |  the SCANOUT buffers
+[draw-census]   color0=0x2162cd0000 view=0x0      draws=83   /
+```
+
+**Two facts settle where the investigation goes next:**
+
+1. **A single dominant scene target takes ~71,000 draws** (`0x208e5a0000`). The world's geometry is
+   being drawn, in quantity, into one surface.
+2. **The scanout buffers each receive ~2,800 draws.** Those addresses are the ones the frame grab
+   reported as `present_front_address()` (`0x215ed10000`, `0x2160cf0000`, `0x2162cd0000`), so the
+   **composite runs and targets the presented surface**.
+
+**So the scene is drawn and the composite reaches the screen — and the screen has no world.** The
+break is between them: whatever the composite samples does not carry `0x208e5a0000`'s contents.
+
+That is a much narrower question than any asked before, and it has a named suspect already in this
+document: when a sampled image is DCC-compressed and the uniform fast-clear decode fails,
+`live_renderer.cpp` falls through to reading compressed bytes as uncompressed. The three unsupported
+4K DCC surfaces are `0x2052ac0000`, `0x20e0380000` and `0x20df360000` — **none of which is
+`0x208e5a0000`**, so that specific mechanism is not yet connected to the scene buffer.
+
+**The measurement that closes it: for the composite draws (those whose colour target is a scanout
+address), which textures do they sample, and does each resolve to prosper's own rendered image (an
+`rtt_hit`) or fall back to reading guest memory?** Guest memory for a surface prosper rendered into
+is black — the scanout dump confirms guest-side scanout is uniformly black, as expected when prosper
+renders into its own Vulkan images and presents those.
+
+### A note on instrument cost, because it cost a run
+
+The first version of this census took a mutex and inserted into a map on **every** one of 131,072
+draws and printed twelve lines at each power of two. The routed run stalled at 1,024 draws and never
+reached gameplay. Sampling 1 in 32 and reporting from 4,096 upward fixed it. An instrument that
+changes the subject's behaviour measures the instrument.
+
+## THE DRAWS ARE HAPPENING: 131,072 executed, 0 indirect, 0 undecoded packets (2026-08-15)
+
+The most basic number about a missing world had never been measured. `PROSPER_DRAW_CENSUS=1` (added
+here, counted before the `render` early-out so it reports what the command stream contained):
+
+```
+[draw-census] draws=1024   indirect=0 submit=190
+[draw-census] draws=16384  indirect=0 submit=4248
+[draw-census] draws=131072 indirect=0 submit=13933
+```
+
+**Over 131,000 draws execute, and not one of them is indirect.**
+
+Three things follow, each independently verified:
+
+1. **The indirect dependency latch drops nothing.** A counter at the drop site (also added here —
+   the drop was silent unless a capture trace happened to be active) reports **zero** across a full
+   routed run that reached gameplay, with the instrument confirmed present in the binary and the
+   route confirmed by 44 builder transitions and 9,580 frames. **This retires the premise this
+   document opens with** for the current state: "every later indirect draw short-circuits untried"
+   is not what is happening.
+2. **prosper decodes every packet the title sends.** `pm4_registers.hpp` defines
+   `IT_DRAW_INDIRECT_MULTI = 0x2C` and `IT_DRAW_INDEX_INDIRECT_MULTI = 0x38`, and **neither is
+   referenced anywhere** — the decoder handles only `R_DRAW_INDEX_INDIRECT = 0x22`. That looked like
+   the answer for a GPU-driven title. It is not: the decoder logs each distinct undecoded type-3
+   opcode once, and **no `[pm4] unknown raw type-3 opcode` line appears in any run**. GTA V emits
+   neither MULTI variant. *(The two constants being defined and unused is still worth knowing — a
+   title that does use them would be silently mis-decoded — but it is not this title's defect.)*
+3. **So the world's geometry is somewhere in those 131,072 direct draws, and they execute.**
+
+**That relocates the question entirely.** It is no longer "why are the draws not issued" — they are
+issued and executed. It is **"why does the output of 131,072 executed draws not reach the screen"**.
+
+The strongest remaining candidate is the one already recorded and never quantified: **three 4K
+DCC-compressed sampled images are unsupported**, and when the fast-clear decode fails the renderer
+falls through to reading compressed bytes as uncompressed. A composite that samples the scene through
+those cannot produce a world image no matter how many draws filled them.
+
+## What is NOT hiding the world — four eliminations, each with a verified lever (2026-08-15)
+
+Every one of these was measured on a routed run with the lever confirmed to have moved, so each is a
+**genuine negative rather than a void arm**. None of them restores the world.
+
+| candidate | lever, verified | outcome |
+| --- | --- | --- |
+| the compute hang / device loss | consumer skipped → **0 device losses**, 9,363 frames | world still absent |
+| truncated indirect-dispatch arguments | aperture recovery fires 24×, unreadable **24 → 0** | frame unchanged |
+| storage-image contract dropping a whole batch | per-draw drop reports **"kept 0 of 1 draws"** | the batch *is* one draw; identical either way |
+| `CB_COLOR_CONTROL.MODE=0` on 131,072 draws | — | known latching artefact (#1706), not per-draw truth |
+
+### The storage-image rejection, precisely
+
+The failing resource is named exactly, and **the DCC hypothesis for it was wrong**:
+
+```
+[render] storage-image contract: set=1 binding=46 portable-uvec4 REJECTED
+    guest-texel=4 shape=0
+    writable=1  compressed=0  arrayed=0  multisampled=0
+    reflected-dim=1 guest-dim=1 depth=1 fmt=4 comps=2
+```
+
+The only failing term is **`writable=1`** — `portable_storage_shape` requires
+`!writable_storage_image`. Compression, arraying, multisampling and the dimensions are all fine. So
+**writable portable-uvec4 storage images are unsupported in the graphics path**, and that is a real
+gap worth closing on the charter's own terms.
+
+But its blast radius is one draw, not a frame: `PROSPER_RENDER_DROP_UNPROVEN_DRAW=1` reports
+`kept 0 of 1 draws in this batch` every time. The conservative whole-batch abort in `render_runner.h`
+looked alarming and costs nothing extra here.
+
+### Still open, and unquantified
+
+Three 4K DCC-compressed **sampled** images remain unsupported (fmt 1/4/9). That is a separate
+resource from the storage image above — the storage image is not compressed. Whether the composite
+depends on those three has not been established.
+
+### The instrument that would answer this, and why it has not yet
+
+`PROSPER_GRAB_BUNDLE_AFTER_MS` on `prosper-app` is the documented fastest loop for "why does this
+frame look wrong". It was tried at 170 s with `PROSPER_CAPTURE_FRAMES=1` and again with 16, and both
+report **"the capture window contained no GPU submits"** while the same run shows 271 `[agc]`, 60
+`[compute]` and 43 `[render]` lines and reaches 191 s of route. So the capture window and the
+submits are not lining up, and **that mismatch is itself the next thing to understand** — without a
+bundle there is no draw-level view of the frame, and every conclusion above is from log statistics
+rather than from the frame's actual contents.
+
+## The hang is NOT the only blocker — two more, measured (2026-08-15)
+
+Answering "is the compute hang the reason there is no world" directly, by looking at a frame with
+the hanging consumer skipped: **zero device losses, 9,363 frames, and the world is still absent.**
+Tutorial text and a few light blooms render; no geometry. So the compute chain cannot be the whole
+story, and two further blockers are visible in the same run.
+
+### 1. Indirect dispatch arguments arrive with a TRUNCATED address — and the fix is already in-tree, off
+
+```
+[agc] indirect dispatch skipped: unreadable arguments at 0xf8480120
+```
+
+The real address is `0x20f8480120`; the high byte is gone. `command_processor.cpp` already has an
+aperture-recovery path — `(aperture << 32) | (addr & 0xffffffff)` — behind
+**`PROSPER_INDIRECT_APERTURE_RECOVERY`, which is opt-in and off by default**. Its own comment records
+that with it off, 50 of 64 indirect compute dispatches are skipped as unreadable; with it on, 0 are,
+and the probe found the raw low address unmapped and `aperture | low` mapped on 49 of 49.
+
+**Measured here with the lever verified:** recovery fires 24 times
+(`0xf8480120 -> 0x20f8480120`, queue 2), unreadable-argument skips go **24 → 0**, device losses stay
+at 0. **And the frame is unchanged — still no world.** A genuine negative, not a void arm: the
+lever demonstrably moved.
+
+So the truncation is real and worth resolving on its own merits, but it is not what is hiding the
+world either.
+
+### 2. Three 4K DCC-compressed sampled images are unsupported
+
+```
+[render] DCC-compressed sampled image 3840x2160x1 fmt=1 tile=24 is unsupported; metadata=0/0
+[render] DCC-compressed sampled image 3840x2160x1 fmt=4 tile=27 is unsupported; metadata=81920/81920
+[render] DCC-compressed sampled image 3840x2160x1 fmt=9 tile=27 is unsupported; metadata=49152/49152
+```
+
+`live_renderer.cpp` handles DCC only for the **uniform fast-clear** case
+(`gfx10_dcc_fast_clear_rgba8`). When that fails it warns and **falls through to the ordinary
+format/detile path, which reads the COMPRESSED base bytes as if uncompressed** — garbage or black.
+
+These are full-screen 4K surfaces, they are **not** renderer-owned RTTs (`!rtt_hit`), and there are
+three of them in the formats a scene colour/normal/etc. set would use. **A composite that samples
+them cannot produce a world image regardless of what the geometry passes do.**
+
+`CONFIDENCE: MED-HIGH` that this is an independent blocker; `CONFIDENCE: LOW` on it being *the*
+remaining one, since nothing yet shows the geometry passes fill those surfaces in the first place.
+
+### Not a lead: `CB_COLOR_CONTROL.MODE=0`
+
+The same run reports 131,072 draws with an unmodeled `CB_COLOR_CONTROL.MODE=0` "still executed as an
+ordinary color draw", which looks alarming (MODE 0 is CB_DISABLE). **`render_state.hpp` already
+records that prosper's decoded MODE is not per-draw-trustworthy (#1706): a utility sequence's
+operation bits stay latched onto later ordinary draws.** So the count measures the latching, not
+131,072 draws that should have been suppressed. Checked before chasing.
+
+## Six-reference simulation: the builder is PROVABLY faithful (2026-08-15)
+
+Codex's correction (#2542): `0x413dc3400` reads **six** candidate references per node, not two —
+`pc86` loads the first pair, `pc161` follows `(A >> 3) - 4` for a second pair, `pc237` follows
+`(B >> 3) - 4` for a third. **A histogram over record dwords 0/1 covers two of six and cannot predict
+how many parent slots a dispatch writes**, so `pairs == 1030` is an empirical control for one route
+state, not a universal oracle. What survives as a hard oracle is **acyclicity**.
+
+`tools/re/bvh_ref_simulator.py` reproduces all six selections over each captured input and diffs the
+expected destination set against the slots the dispatch actually changed:
+
+| dispatch | expected | written | expected-not-written | **written-not-expected** | ref cycles |
+| --- | --- | --- | --- | --- | --- |
+| s5943 d37 | 2061 | 2061 | 0 | **0** | 0 |
+| s7188 d37 | 2061 | 2061 | 0 | **0** | 0 |
+| s8842 d37 | 2061 | 2061 | 0 | **0** | 0 |
+| s16041 d37 | 2061 | 2061 | 0 | **0** | **117** |
+| s17181 d37 | 2061 | 2061 | 0 | **0** | **117** |
+| s19002 d37 | 2061 | 2061 | 0 | **0** | **117** |
+| s5528 d37 | 1754 | 1457 | 297 | **0** | 0 |
+| s9645 d37 | 1788 | 1283 | 505 | **0** | 0 |
+
+**`written but not expected` is ZERO in every frame measured.** The builder never writes a slot its
+input does not imply — now established over all six references rather than two.
+
+And the decisive rows are s16041 onward: **`expected = written = 2061`, `missing = 0`, and
+`cycles = 117`.** Everything the input implies is written, nothing else is, and the result is cyclic
+**because the input is**. There is no discrepancy left for the builder to be responsible for.
+
+(`expected-not-written` is nonzero in other frames because the simulator walks every node while the
+dispatch processes only its compacted, depth-parity subset. The informative direction is the other
+one, and it is zero everywhere.)
+
+**This closes `0x413dc3400`'s role definitively.** Together with the eleven perfect submits, two
+independent methods now say the same thing: the builder is correct and the defect is entirely
+upstream, in the node records `0x413ce6000` writes.
+
+## Corrections from Codex (#2542) to earlier sections
+
+- **`0x413cf9000` / `0x413cf9200` are arena aliases, not producers of the 64-byte tag records.**
+  `cf9000` is an initializer over an **80-byte** stride; `cf9200` operates **32-byte** records at a
+  320-byte V# near `0x209cc7ab00`. Their 117 changes each are a paired initialise/fill of a small
+  structure that merely overlaps the watched allocation. **So ranking writers by whole-watch change
+  count is misleading, and the +54 cycles this document attributed to `cf9000` should be discounted**
+  — its writes are not 64-byte records and decoding them as such is a category error. The genuine
+  64-byte-view producers are `cf5400`, `cf6100`, `ce6000` and `d1bf00`. `0x413ce6000`'s **+590** is
+  unaffected: it is a real 64-byte-view producer.
+- **The `record 4 + 8` arithmetic is exact**, not over-fitted: `pc74` forms `selector = word >> 3`,
+  `pc144` `v_readfirstlane_b32 vcc_lo, v7`, `pc149` `s_mulk_i32 vcc_lo, 120`, `pc153`
+  `s_buffer_load_dwordx4 … offset:8`. So `4 * 120 + 8 = 488` exactly. **The contract's weakness is
+  TEMPORAL, not arithmetic**: `selected_sbuffer_domain()` reads the source and the outer table
+  through `complete_resource_bytes()` — the currently CPU-visible mapping — with no command-order
+  snapshot coupling either to the bytes the GPU later consumes. Codex has retained evidence of the
+  same outer base decoding as **five coherent V#s** at exactly `+8` in one observation and floats in
+  another, so the buffer is a reused arena observed at different epochs. **The
+  "it holds frustum planes / the contract is over-fitted" framing in this document is therefore
+  wrong about the cause** — the layout is right and the epoch is not.
+- **The selector is `readfirstlane(source_word >> 3)`**, from the pc70 source records — not from a
+  saved EXEC mask, as this document earlier concluded from watching s106 alone. It is still not
+  const-foldable (a readfirstlane of live lane data is runtime state), so the conclusion that no fold
+  can resolve it stands; the stated *route* to it was wrong.
+- **`0x413e1ff00 toucher=0`** — Codex reached the same diagnosis independently: a watch-attribution
+  bug, not memory corruption. Already fixed here with `compute_address_window_hits`.
+
+**A systematic caveat this raises over much of the descriptor work above:** every capture in this
+document reads guest memory at fold or realization time on the CPU. That is not the execution epoch
+the GPU consumes. Codex's recommended discriminator is an ordered GPU-side readback of the pc70
+source, the root V# at `s[0:1] + 0xa8`, and all 600 outer bytes, captured **immediately before the
+dispatch executes** — a CPU reread is not sufficient.
+
+## ROOT CAUSE, ATTRIBUTED: `0x413ce6000` writes the cyclic child graph (2026-08-15)
+
+Per-dispatch pre/post attribution on the node records at `0x209cc76000`, with the **child-graph cycle
+count** as the metric:
+
+```
+submit  order   writer         cycles pre -> post
+6765    4550    0x413ce6000       0 -> 324    ADDS 324
+7180    24812   0x413ce6000     324 -> 398    ADDS 74
+7595    26144   0x413ce6000     398 -> 388    removes 10
+8835    26556   0x413ce6000     388 -> 402    ADDS 14
+15271   16831   0x413ce6000     350 -> 436    ADDS 86
+16088   14048   0x413ce6000     436 -> 468    ADDS 32
+16088   14546   0x413cf9000     468 -> 469    ADDS 1
+```
+
+| program | dispatches that add cycles | total added |
+| --- | --- | --- |
+| **`0x413ce6000`** | 7 | **590** |
+| `0x413cf9000` | 12 | 54 |
+
+**`0x413ce6000` is the program that makes the child graph cyclic**, including the transition from a
+completely acyclic graph to 324 cycles in one dispatch. It also *removes* cycles on other dispatches
+(−10, −14, −20, −18), which is the signature of an incremental refit that is partly wrong rather than
+a rebuild that is wholly wrong.
+
+### The complete chain, every link measured
+
+1. **`0x413ce6000`** writes the 2,063 × 64-byte node records at `0x209cc76000`, and its output
+   contains a **cyclic child graph**.
+2. **`0x413dc3400`** builds parent links from those records **faithfully** — its lowering is proven
+   correct by eleven consecutive perfect submits, and its output tracks its input.
+3. The parent table is therefore cyclic.
+4. **`0x413dc6700`** walks it with a loop that has no iteration bound and no cycle detector.
+5. GPU hang → RADV device loss → live compute disabled process-wide → every later indirect draw
+   dropped → **no 3D world**.
+
+**And `0x413ce6000` is exactly the program whose descriptor at pc156 does not resolve**
+(`mode=unresolved-operand`, the `selected_sbuffer` contract declining because the buffer it reads
+holds frustum planes) and which is declined outright on some dispatches. A program that cannot
+resolve one of its descriptors, and is sometimes not run at all, is precisely a program that writes a
+partially-correct node array.
+
+**`CONFIDENCE: HIGH`** on the attribution — per-dispatch pre/post, one writer, one metric, and the
+0 → 324 transition is unambiguous. **`CONFIDENCE: MED`** that the unresolved descriptor is *why* its
+output is wrong; that link is plausible and untested, and the honest alternative is that some other
+part of its lowering is at fault.
+
+**This supersedes the earlier "missing producer" framing without contradicting its falsification.**
+Absence was correctly ruled out — 29 submits with `0x413ce6000` fully executing still went cyclic.
+The cause is its **output**, which the earlier experiments could not distinguish because none of them
+measured what it wrote.
+
+## FOUND: the CYCLES ARE IN THE INPUT — the node records' own child graph (2026-08-15)
+
+Two results, and together they close the question.
+
+### 1. The clear hypothesis is FALSIFIED, with the lever verified
+
+`PROSPER_COMPUTE_ZERO_BEFORE=0x413dc3400:0x20f848417c:2063` zeroes the parent array immediately
+before every builder dispatch. The clear demonstrably fires. **The later submits are still cyclic** —
+`cycles=63..101`, and now with `oob-roots=0`. So the cycles are **not** stale leftovers in the output
+array; the builder writes them into a freshly zeroed one.
+
+### 2. The cycles are in the builder's INPUT
+
+Building the child graph directly from the node records — for each node, its two child references
+decoded as `index = (ref >> 3) - 4` when the tag is in `{2,5}` — and testing that graph for cycles:
+
+```
+s11238 d15,d16,d19..d27   child-graph cycles = 0
+s11238 d37                child-graph cycles = 70     <- appears here
+s11637 d15,d16 ...        child-graph cycles = 70     (carried into the next submit)
+s11637 d37                child-graph cycles = 110
+s12036 ...                child-graph cycles = 110
+s13220 d37                child-graph cycles = 117
+... every later submit    child-graph cycles = 117
+```
+
+**The node records at `0x209cc76000` describe a cyclic child graph, and `0x413dc3400` faithfully
+reproduces it as a cyclic parent table.** Everything below about the builder now has its explanation:
+its lowering is correct, its output tracks its input, and its input is a cyclic graph.
+
+**The cycles appear between dispatch 27 and dispatch 37 of a submit, and they ACCUMULATE**
+(70 → 110 → 117), which is the signature of a structure being partially updated rather than rebuilt.
+The programs running in that window are `0x413ce3400` at d30 and **`0x413ce6000` at d36 — the bulk
+writer of the record array, and the one whose descriptor at pc156 does not resolve.**
+
+**So `0x413ce6000` is back at the centre of this, for a different reason than before.** The earlier
+falsification stands and was correct: its *absence* is not the cause, since 29 submits with it fully
+executing still went cyclic. The cause is its **output**. A program that is sometimes declined and,
+when it does run, has an unresolved descriptor is exactly a program that can write a partially-correct
+node array.
+
+### The next measurement, and it is one run
+
+Attribute the cycle appearance to a dispatch the same way the parent table's was: watch
+`0x209cc76000` with the tree watch's **pre/post** attribution and the child-graph cycle count as the
+metric, rather than the parent-walk metric which is meaningless on a node array. The instrument
+exists; only the analysis differs. That names the writer conclusively instead of by elimination
+between d30 and d36.
+
+## THE HYPOTHESIS THIS ALL POINTS AT: the parent array is never cleared
+
+If the builder legitimately links only `{2, 5}` children, then **the slots it does not write must
+already hold something that terminates the consumer's walk** — the walk is
+`while (i != 0) i = bfe(rec[i], 3, 27)`, so a zero terminates and anything else does not.
+
+**It is not cleared.** The tree watch's pre-image at the builder's dispatch is not zero: it is the
+previous phase's stride-4 id array (`{0, 0, 0xa9, 1}` repeating). And the slots the builder leaves
+alone were measured holding `0x09249249`, `0x12492492`, `0x2db6db6d` — the Morton dilation constant
+and multiples — or, sometimes, zero.
+
+**A stale Morton key read as a parent index is exactly a divergent walk.** `0x09249249 >> 3` is
+0x1249249, far past 2,063, which terminates by out-of-range; but `0x12492492 >> 3 & 0x7ffffff` is
+0x2492492 — also out of range. The values that *do* trap are the ones left over from an earlier
+generation of the parent array itself, which are in range by construction.
+
+**This unifies every measurement on this branch:**
+
+- the builder's lowering is correct (eleven perfect submits) ✓
+- its output faithfully follows its input (`both` tracks `pairs`) ✓
+- the failure mode is "a store that does not execute, leaving a stale slot" — measured directly ✓
+- the perfect submits are the ones where nearly every node has two linkable children, so nearly
+  every slot gets written and stale values have nowhere to hide ✓
+- the transition is at a route position, because that is when the scene starts containing enough
+  triangle leaves for unwritten slots to appear ✓
+- no producer decline is necessary ✓
+
+**The prediction that would confirm it:** zero the 2,063-record parent array immediately before
+`0x413dc3400`'s dispatch and the cyclicity should vanish, with the tree becoming legitimately sparse
+(`pairs < 1030`, `cycles = 0`). That is a diagnostic-only experiment — it does not fix anything, since
+on hardware something must be doing the clear and the real question is what — but it is decisive, it
+needs no ISA knowledge, and it can be built as a `PROSPER_*` switch in one sitting.
+
+**`CONFIDENCE: MED-HIGH`.** Every measurement fits and nothing contradicts it, but it has not been
+tested, and the alternative — that the guest's own build does write every slot through a path prosper
+declines — is not excluded.
+
+## The sparse tree IS a faithful consequence of its input (2026-08-15)
+
+Testing the right correspondence — for each parent with only one child, the **two child references in
+that parent's own 64-byte node record**:
+
+```
+submit=10052  lone-child parents=164
+   both refs in {2,5} = 0      exactly one = 155      neither = 9
+   commonest (tag0,tag1): (5,0) x82, (0,5) x73, (0,0) x6
+```
+
+**Never both. 155 of 164 have exactly one linkable reference** — typically one box32 child (type 5)
+and one **triangle** child (type 0), which the `tag == 2 || tag == 5` predicate does not link.
+
+Across submits, over all 2,063 node records:
+
+| submit | pairs / unpaired | both refs linkable | exactly one | neither |
+| --- | --- | --- | --- | --- |
+| 5943 | **1029 / 2** | **1034** | 100 | 929 |
+| 7188 | **1029 / 2** | **1034** | 98 | 931 |
+| 8842 | **1029 / 2** | **1033** | 98 | 932 |
+| 9247 | **1029 / 2** | **1033** | 98 | 932 |
+| 10052 | 676 / 74 | 785 | 266 | 1012 |
+| 10449 | 616 / 73 | 775 | 271 | 1017 |
+
+**In the perfect submits `both ≈ 1033` and `pairs ≈ 1029` — they track each other.** In the broken
+ones `both` falls to ~780 and `exactly one` rises to ~270. The builder's output follows its input.
+
+**So `0x413dc3400` is faithfully building what it is told to build**, and the defect is that the node
+records it reads contain roughly 170 fewer linkable child pairs than they do in the frames that come
+out right. Combined with the eleven perfect submits, this is now two independent measurements saying
+the same thing: **the builder is not the defect; its input is.**
+
+What remains open is whether that input is *wrong* or merely *different* — a scene with more triangle
+leaves genuinely has fewer box-to-box links. Distinguishing them needs to know what the guest expects,
+which is the question outstanding with Codex, and it cannot be settled from the output alone. The
+`0x209cc76000` record array has 23 writers, so "which producer" is not yet a well-posed question
+either.
+
+## RETRACTED: that falsification tested the wrong correspondence (2026-08-15)
+
+**The section below asked the wrong question and its conclusion does not follow.** It tested whether
+a record's OWN node type predicts whether that record is paired. The predicate does not act on a
+record's own type — it acts on the **two child references stored in the PARENT's node record**. The
+right test is whether a lone-child parent's two refs differ in linkability, and it says something
+quite different (next section). The section is kept for the record; do not cite its conclusion.
+
+## OLD (wrong test): the sparse tree is not "correct but sparse by design"
+
+This reading was flagged as capable of inverting the whole investigation, so it was tested rather
+than left standing. If `0x413dc3400`'s `tag == 2 || tag == 5` predicate legitimately skips other node
+types, the tree would be *supposed* to be sparse in frames containing them, the 1,030-pair oracle
+would be wrong for exactly the frames called broken, and the defect would be the consumer's unbounded
+walk over a legitimately-sparse table instead.
+
+Cross-referencing each parent-table record's pairing state against its **node type** in the record
+array, from the same dispatch (the aux dump makes this a same-moment comparison):
+
+| submit | unpaired | node types among UNPAIRED | node types among PAIRED |
+| --- | --- | --- | --- |
+| 10052 | 74 | `{0: 60, 5: 14}` | `{0: 318, 4: 1, 5: 357}` |
+| 11238 | 158 | `{0: 37, 5: 121}` | `{0: 414, 5: 518}` |
+| 11637 | 200 | `{0: 29, 5: 171}` | `{0: 313, 5: 587}` |
+| 12434 | 183 | `{0: 57, 5: 126}` | `{0: 223, 4: 1, 5: 445}` |
+
+**Node type does not determine pairing.** Types 0 and 5 appear on both sides in every sample — a
+type-5 record is sometimes paired and sometimes not, and so is a type-0 record. If the predicate
+explained the sparseness, unpaired records would be exactly the types outside `{2, 5}`, and they are
+not.
+
+**So the tree is genuinely malformed, the 1,030-pair oracle stands, and the consumer is not at
+fault.** The eleven perfect submits already showed the lowering is correct; this shows the sparse
+output is not a legitimate alternative shape either. Both point at the input.
+
+(The correspondence used here — parent-table index *i* ↔ record-array index *i* — follows from
+`0x413dc3400` writing `parent[(ref >> 3) - 4]` where the same reference indexes the node array.)
+
+## CONCLUSION: both rejecting programs build descriptors from LANE MASKS (2026-08-15)
+
+`PROSPER_DYNTRACE_SGPR=106` on `0x205b654a00`, filtered by program identity:
+
+```
+pc=1091 s106 <- KNOWN 0x00000005
+pc=1092 s106 <- KNOWN 0x00000001
+pc=1097 s106 <- FORGOTTEN words=85ea807e     <- SOP2 0x0b, a B64 op reading EXEC_LO
+pc=1098 s106 <- FORGOTTEN words=87ea6a00
+pc=1101 s106 <- KNOWN 0x00000004
+...
+pc=1154 s106 <- KNOWN 0x0000ffc8
+```
+
+s106 is known on some paths and lost on others, and where it is lost the source is **EXEC** —
+pc1097's `0x85ea807e` is a 64-bit scalar op whose `ssrc0` is `EXEC_LO`.
+
+**So both declined programs compute descriptor fields from lane masks:**
+
+| program | descriptor field | source |
+| --- | --- | --- |
+| `0x205b654a00` | BVH descriptor `s18` = `-1 + VCC_LO` | VCC_LO from **EXEC** at pc1097 |
+| `0x413ce6000` | array selector, `s_mulk_i32 s106, 120` | VCC_LO from **`s_andn1_saveexec_b64`** at pc116/131 |
+
+**A constant-folder cannot resolve either, and no widening of it ever will.** EXEC is a runtime
+wave state. This is not a gap in the fold's opcode coverage — the `s_mulk_i32`, `s_addk_i32`,
+`s_setreg_b32` and `s_waitcnt_vscnt` corrections made on this branch are all real fixes and none of
+them could have helped, which is exactly what their verified-lever negatives showed.
+
+**What this means for the fix.** These descriptors need a mechanism that does not fold: either
+resolving the descriptor from guest memory at dispatch time (the `selected_sbuffer` contract's
+approach — certify the domain, materialise the record), or a lowering that keeps the descriptor
+dynamic. Which one is a design question and needs the ISA read of what the guest intends by deriving
+a descriptor field from EXEC — plausibly a lane count or an active-mask popcount used as a size.
+
+**`CONFIDENCE: HIGH`** that both fields trace to lane masks — measured per register, per program, with
+a program identity that is actually unique. **`CONFIDENCE: LOW`** on what the guest means by it, which
+is the open question worth asking.
+
+## The BVH descriptor's unresolved word is `s18`, and it depends on VCC_LO (2026-08-15)
+
+Watching each register of the descriptor `s[16:19]` in `0x205b654a00`, one run each:
+
+| register | state before pc1180 | site |
+| --- | --- | --- |
+| `s16` | **KNOWN** at pc1163 | |
+| `s17` | **KNOWN** at pc1176 | |
+| `s18` | **FORGOTTEN** at pc1169 | `words=80126ac1` = `s_add_u32 s18, -1, vcc_lo` |
+| `s19` | KNOWN `0x81000000` on some dispatches | `s_or_b32 s19, s106, 0x81000000` |
+
+**`s18` is the word that fails, and it is `-1 + VCC_LO`.**
+
+So the ray-tracing pass's BVH descriptor cannot resolve because **two of its four words are computed
+from VCC_LO** — `s18` at pc1169 and `s19` at pc1177 — and prosper does not track a value into VCC_LO
+on this path. That is the same obstacle as `0x413ce6000`'s selector and the same one the execz
+liveness guard was about, now demonstrated by direct measurement on the exact register rather than
+inferred from the ISA.
+
+**This is the sharpest statement of the frontier available:** GTA V's compiler uses VCC_LO as a
+general-purpose scalar register, and prosper's descriptor const-fold loses values through it. Two
+programs — the ray-tracing pass and the BVH producer — are declined for exactly this, and between
+them they are the ray-tracing path.
+
+What is *not* established: **where** s106's value is lost in `0x205b654a00`. The register watch will
+say — `PROSPER_DYNTRACE_SGPR=106` filtered to `program=0x205b654a00`, exactly as was done for
+`0x413ce6000` — and that is the next measurement. In `0x413ce6000` the answer was
+`s_andn1_saveexec_b64`, i.e. a genuine lane mask that no fold can resolve; if the same holds here,
+the fix is a contract rather than a fold, and if it does not, it is a fold gap with a named opcode.
+
+## SCC over-invalidation fixed — and it is NOT what gates the BVH descriptor (2026-08-15)
+
+`PROSPER_DYNTRACE_SCC=1` (added here) reports every transition of the fold's tracked SCC with the pc
+and words that caused it. On `0x205b654a00` it found **325 conservative SCC losses**, from three SOPK
+encodings — and **two of them do not write SCC at all**:
+
+| count | encoding | writes SCC? |
+| --- | --- | --- |
+| 188 | `s_setreg_b32` (0x13) | **no** — writes a hardware register |
+| 43 | `s_waitcnt_vscnt` (0x17, sdst=NULL) | **no** — a wait, register-transparent |
+| 94 | `s_addk_i32` (0x0f) | yes, on signed overflow |
+
+Fixed: `s_setreg_b32` and `s_waitcnt_vscnt` no longer touch SCC, and `s_addk_i32` keeps invalidating
+it while now folding its **value** when the destination is known.
+
+**Lever verified: conservative SCC invalidations in that program went 325 → 0.**
+
+**And the reject is unchanged.** `0x205b654a00` still fails with `mode=unresolved-operand pc=1180`.
+Because the lever demonstrably moved, this is a **genuine negative, not a void arm**: SCC
+over-invalidation is not what gates the BVH descriptor.
+
+So of the four registers in the descriptor `s[16:19]`, dword3 (`s19`) was already observed resolving
+to `0x81000000` on some dispatches. **The next measurement is `s16`/`s17`/`s18`** — the base and size
+words — one watch each.
+
+The change stays on its own merits: two encodings were being charged an SCC write they do not
+perform, which is a correctness defect in the fold independent of this title.
+
+## The BVH descriptor resolves only when SCC does (2026-08-15)
+
+`PROSPER_DYNTRACE_SGPR=19` on `0x205b654a00`, now that the watch prints a real program identity:
+
+```
+pc=1171 s19 <- FORGOTTEN words=821380c1        pc=1171 s19 <- KNOWN 0x00000000
+pc=1177 s19 <- FORGOTTEN words=8813ff6a        pc=1177 s19 <- KNOWN 0x81000000
+```
+
+**The descriptor's dword3 resolves on some dispatches and not others**, ending at `0x81000000` when
+it does. pc1171 is `s_addc_u32 s19, -1, 0` — **both operands are inline constants**, so the only
+input that can make it unknown is **SCC**.
+
+`s_addc_u32` **is** modelled by the fold (`case 0x04`, guarded by `if (scc < 0) { ok = false; }`).
+*(I first reported it as unmodelled, from a grep for `kSop2OpcodeAddcU32` that missed the literal
+`0x04` at the case label. Corrected here.)* So the BVH descriptor's resolution reduces to: **is SCC
+tracked across the instructions before pc1171?**
+
+That makes SCC invalidation the lever, and it is exactly what the `s_mulk_i32` change touched — that
+op does not write SCC and the fold was clobbering SCC for it anyway.
+
+**Suggestive but confounded, recorded as such.** Across runs on this branch `0x205b654a00`'s reject
+changed from a `compute-struct-reject` to the pc1180 descriptor reject, and the total skip count fell
+18 → 15 → 14 → 13. Neither is evidence: the runs differ in more than one variable and the route
+reaches different phases. **A clean A/B needs one flag toggled with the artefact hashed first**, which
+is not what these runs were.
+
+**The concrete next step** is a census of what invalidates SCC on the path to pc1171 in this program —
+`scc = -1` has a handful of sites in the fold, and each is either a real SCC write or a conservative
+one like the `s_mulk_i32` case that was corrected.
+
+## The `selected_sbuffer` contract NEVER ACCEPTS — it is not on the path at all (2026-08-15)
+
+`PROSPER_GTA5_SBUFFER_ACCEPT=1` (added here) reports the descriptor the contract publishes on the
+dispatches it accepts. Every existing diagnostic on this contract described a **decline**, so the
+accept side had never been looked at.
+
+**It reports nothing. Zero accepts on a full routed run**, against two distinct decline reasons.
+
+Yet `0x413ce6000` **executes 129 times of 139**. So those executions do not go through this contract
+at all — they go through the **generic runtime-array lift**, which is what puts `entries=5` in the
+resource map at `fetch-pc=156/158`.
+
+**Consequence: every section above that reasons about this contract is reasoning about a path that
+does not fire.** The record-4 hardcoding, the selector histogram, the frustum-plane content of the
+outer buffer — all real observations, and all about machinery that declines and is then bypassed.
+They explain the ~10 dispatches that are declined outright; they do not explain the 129 that run.
+
+**The descriptor those 129 executions actually use comes from the generic lift**, and Codex's caveat
+applies to it exactly as it did to the contract: *"it too materializes entries eagerly from
+CPU-visible memory"*, with no command-order snapshot coupling it to the bytes the GPU consumes. A
+descriptor materialised from the wrong epoch is a coherent explanation for node records whose child
+graph is cyclic, and it is now the **only** remaining candidate on this path that has not been
+tested.
+
+**The next measurement is the generic lift's published entries at `0x413ce6000`'s dispatches**, in
+the same style: what addresses it materialises, and whether they change between a dispatch that adds
+cycles and one that does not.
+
+## The contract reads a BVH NODE-REFERENCE array as a selector array (2026-08-15)
+
+The selector histogram, taken from the same source records the contract's own domain proof walks:
+
+```
+[gta-selected-sbuffer]  selectors distinct=2064 (selector:count) 4:1 5:1 6:1 7:1 8:1 9:1 10:1 ...
+[gta-selected-sbuffer]  record-4 selector would be 4; outer has 5 records of 120 bytes
+```
+
+**All 2,064 source records have a DIFFERENT selector, and they run 4, 5, 6, 7, 8, … — i.e.
+`selector = index + 4`.**
+
+That is not a selector. **It is the BVH node-reference encoding**, the same one `0x413dc3400` decodes
+at pc618–619 with `v_lshrrev_b32 v36, 3, v69` followed by `v_add_nc_u32 v36, -4, v36` —
+`index = (ref >> 3) - 4`. The source array at pc70 (stride 8, 2,064 records) is an array of **node
+references**, and `first >> 3` recovers `index + 4`, exactly as observed.
+
+**So `selected_sbuffer_domain`'s proof passes for an accidental reason.** It admits a record when
+`selector * 120` is either exactly 480 (record 4) or wholly out of bounds. With `selector = index+4`:
+index 0 gives selector 4 → offset 480 → "record 4"; indices 1..2063 give selectors 5..2067 → offsets
+600..248,040, every one past the 600-byte buffer → "wholly OOB". **Both arms are satisfied by an
+array that is not a selector array at all.** The proof is not wrong about the arithmetic; it is
+answering a question about the wrong data.
+
+The contract then reads 16 bytes at `480 + 8` of a 600-byte buffer that holds float data, gets a
+non-descriptor, and declines — correctly, at the last possible moment, having been misled four steps
+earlier.
+
+**This is the complete account of `0x413ce6000`'s reject**, and it is a contract defect rather than a
+missing lowering, a stale buffer, or a wrong selector value:
+
+1. the source array at pc70 holds BVH node references, not table selectors;
+2. `selected_sbuffer_domain` reads `first >> 3` as a selector and its two admissible arms are both
+   satisfied by that data for arithmetic reasons;
+3. the contract therefore reads record 4 of the outer buffer;
+4. the outer buffer holds float data in this scene (unit-normal plane equations, measured);
+5. `selected_sbuffer_target_descriptor` rejects it;
+6. no `selected_sbuffer_soffset` authority is published, so the descriptor for
+   `buffer_load_dwordx3` at pc156 never resolves;
+7. `mode=unresolved-operand pc=156`, and the program is declined.
+
+**`CONFIDENCE: HIGH`** on steps 1–5, all measured. **`CONFIDENCE: MED`** on 6–7 being the only
+remaining link, since the recompiler's descriptor matching has three routes and only the contract one
+has been traced.
+
+## The `selected_sbuffer` contract is over-fitted: the "descriptor array" holds FRUSTUM PLANES (2026-08-15)
+
+Dumping **all five** records of the outer array on decline, rather than only the one the contract
+reads, settles what one record could not:
+
+```
+record=0@+8   words=3e177e0d:3d39304e:3f7ceb16:beec6371
+record=1@+128 words=3d044294:bc9a100f:3ce5d234:be5601a6
+record=2@+248 words=bdd106eb:3f7e94ad:bccf32ed:beee4863
+record=3@+368 words=be6fa5cf:bdb9257a:3f581219:bdf01a64
+record=4@+488 words=3f1a1f1a:bdc0f619:3f4afad1:bfa0b479
+```
+
+**None of the five is a descriptor. All five are floats, and they are unit normals plus a scalar:**
+
+| record | xyz | ‖xyz‖ | w |
+| --- | --- | --- | --- |
+| 0 | (0.1479, 0.0452, 0.9879) | **0.999** | −0.461 |
+| 2 | (−0.1020, 0.9944, −0.0253) | **1.000** | −0.465 |
+| 4 | (0.6021, −0.0942, 0.7929) | **1.001** | −1.256 |
+
+A unit 3-vector with a scalar is a **plane equation**. Five of them at stride 120 is a camera
+frustum, not a descriptor table.
+
+**So in the gameplay scene, the buffer the contract reads as a five-entry V# array holds frustum
+planes.** The contract was derived from a phase where record 4 did hold a V#, and it does not
+generalise. That also explains its companion `reject=consumer-resource`.
+
+This is why the earlier framing — "record 4 is stale, find its producer" — was the wrong question.
+The buffer is not stale; it is a **different buffer's worth of data**, correctly written by whoever
+owns it. Either `0x413ce6000`'s pc153 does not load a descriptor on this path in this scene, or the
+resource the contract binds at `fetch_pc=153` is not the one the guest means here.
+
+**`CONFIDENCE: HIGH` that these are planes and not descriptors** — three of five have unit-length
+normals, which floating-point garbage does not do. `CONFIDENCE: MED` on the consequence, because
+"the contract binds the wrong resource" and "the shader takes a different path here" both fit and
+have not been separated.
+
+## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
+
+Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather
+than its first 8 KB finds **23 distinct writing programs**, not the seven the narrower window showed:
+
+```
+0x413e15400 652   0x413e14200 651   0x413e14500 651   0x413cf9200 603   0x413cf9000 569
+0x413cdc200 218   0x413cf5400  43   0x413cf6100  43   0x413ce6000  32   0x413e1ff00  31
+0x413ced900  10   0x413d1bf00   9   0x413d21600   8   0x413dc3400   6   0x413d87800   5
+0x413e16400   5   0x413e13000   3   0x413e14900   2   0x413d21800   1   0x413d21c00   1
+0x413d22000   1   0x413d22b00   1   0x413e13200   1
+```
+
+**So this is a shared scratch pool that many programs reuse across phases**, exactly like the
+traversal table itself. `132032 = 2063 x 64` is how `0x413dc3400` and `0x413ce6000` *view* it, not
+proof that the allocation belongs to them.
+
+Two consequences for anything built on the earlier analysis:
+
+- **"The only program binding the full array is `0x413ce6000`" was a statement about the narrow
+  window.** Over the full range there are 23 writers, and the three busiest — `0x413e14200`,
+  `0x413e14500`, `0x413e15400`, ~650 changes each — were entirely invisible to every census before
+  this one. A watch window narrower than the buffer under study reports a writer set that is
+  guaranteed incomplete.
+- **The tag histograms remain valid** because they were captured by the aux dump *at the builder's
+  own dispatch*, which is the only moment that matters. But attributing a tag change to a producer is
+  not possible from writer counts alone with 23 of them interleaved; it needs the last-writer-per-
+  record, which nothing currently records.
+
+The early phase is visible in the same data and is a different workload: at submit 3864
+`0x413ced900` leaves the pool all-zero (`{0: 2063}`) and `0x413d1bf00` fills it progressively over
+eight dispatches. Tag distributions there span all eight values, unlike the two-regime pattern at
+builder time.
+
+## The builder's INPUT differs between the two regimes (2026-08-15)
+
+`PROSPER_COMPUTE_TREE_WATCH_AUX=0x209cc76000:33008` captures the 2,063 x 64-byte record array
+alongside every builder transition, clean and cyclic, from one run. The tags the six store predicates
+test are `record.dword0 & 7` and `record.dword1 & 7`.
+
+**Every submit where the builder emits a perfect tree shares one input signature, and no broken
+submit has it:**
+
+| submit | pairs / unpaired | tag(dword0) | tag(dword1) |
+| --- | --- | --- | --- |
+| 5943 | **1029 / 2** | `{0:970, 2:2, 5:1088, 7:3}` | `{0:977, 1:5, 5:1078, 7:3}` |
+| 7188 | **1029 / 2** | `{0:972, 2:2, 5:1086, 7:3}` | `{0:977, 1:5, 5:1078, 7:3}` |
+| 8016 | **1029 / 2** | `{0:973, 2:2, 5:1085, 7:3}` | `{0:978, 1:5, 5:1077, 7:3}` |
+| 8842 | **1029 / 2** | `{0:973, 2:2, 5:1085, 7:3}` | `{0:978, 1:5, 5:1077, 7:3}` |
+| 9247 | **1029 / 2** | `{0:973, 2:2, 5:1085, 7:3}` | `{0:978, 1:5, 5:1077, 7:3}` |
+| 5528 | 663 / 64 | `{0:1120, 2:3, **4:2**, 5:935, 7:3}` | `{0:1122, **1:15**, 5:923, 7:3}` |
+| 6358 | 608 / 51 | `{0:1098, 2:3, **4:2**, 5:957, 7:3}` | `{0:1107, **1:15**, 5:938, 7:3}` |
+| 10052 | 676 / 74 | `{0:1133, 2:3, **4:2**, 5:922, 7:3}` | `{0:1134, **1:15**, 5:911, 7:3}` |
+
+Two differences are systematic in the early broken submits: **tag 4 appears in dword0** (exactly 2
+records, never present in a perfect submit) and **tag 1 in dword1 jumps from 5 to 15**.
+
+**But neither is the whole story, and the record says so.** The later broken submits (11238 onward)
+carry `1:5` and no tag 4 — the perfect signature on those two axes — and are still broken
+(`pairs≈861, unpaired≈193`), with tag 5 *higher* than in the perfect submits (1301 against 1085). So
+"tag 4 present" and "tag1 == 15" are correlates of the early regime, not the mechanism. Do not
+promote them to a rule.
+
+**What is established:** the array the builder reads changes materially with scene state, and the
+builder's output tracks it. Combined with the eleven perfect submits, that puts the defect **upstream
+of `0x413dc3400`** — in whatever produces `0x209cc76000`.
+
+**Its producers, from `PROSPER_COMPUTE_TREE_WATCH=0x209cc76000`:** `0x413cf9000` (117 changes),
+`0x413cf9200` (117), `0x413cf5400` (29), `0x413cf6100` (29), `0x413ce6000` (26), `0x413d1bf00` (2),
+and `0x413e1ff00` (3, **`toucher=0`**). `0x413cf9200` has 20 recompile-empty dispatches of 678.
+
+**RETRACTED — `0x413e1ff00` does NOT write bytes it does not bind.** That was my own instrument
+producing a phantom. Its binding 7 is `base=0x209cc76080 size=160 stride=32`, i.e. **128 bytes inside
+the watched window**. The tree watch detects changes anywhere in the WINDOW but its `toucher` field
+asked whether a program binds the window's **first byte** — two different questions, and the
+disagreement reads as an out-of-bounds write. Fixed with `compute_address_window_hits`, and the
+retraction is recorded rather than quietly dropped because the phantom was reported as a lead before
+the resource map contradicted it.
+
+The same run corrects the producer picture in a way that matters: `0x413cf9000` binds only
+`0x209cc76000 size=320`, and `0x413cf9200` binds `size=320` plus a 64-byte view at `+0x140`. **They
+write the first 320 bytes — five records — not the bulk.** The only program binding the full
+132,032-byte array is `0x413ce6000` (bindings 13/14/17). So it *is* the bulk producer of the records,
+which the falsification above does not contradict: it executes on 29 of the cyclic submits, so its
+running is not the variable.
+
+## THE BUILDER'S LOWERING IS CORRECT — it emits a perfect tree for eleven submits (2026-08-15)
+
+`PROSPER_COMPUTE_DISPATCH_LOG` now carries the launch geometry, so the outcome and the launch can be
+read on one line. Across the whole route:
+
+```
+submit  threads       local     tree
+4802    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0     <- exactly correct
+5217    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+5632    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+6047    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+6463    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+6877    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+7292    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+7706    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+8121    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+8951    2063x1x1      256x1x1   pairs=1030 unpaired=0 cycles=0
+9360    2063x1x1      256x1x1   pairs=852  unpaired=247 cycles=57  <- and never correct again
+...     2063x1x1      256x1x1   cyclic for the remaining 30+ submits
+```
+
+**Eleven consecutive submits at pairs=1030, unpaired=0, cycles=0 — the exact clean ground truth — at
+an identical launch geometry, from the same compiled module.** A miscompiled shader does not produce
+the exactly correct answer eleven times in a row.
+
+**So `0x413dc3400`'s lowering is CORRECT, and the defect is in what it is fed.** Every
+lowering-side hypothesis for this program is retired by this one measurement: barrier placement,
+LDS sizing, wave model, the compaction, the exec-mask predication, the store addressing. They all
+produce a correct tree for eleven submits.
+
+The launch is identical on both sides of the boundary — `threads=2063x1x1 local=256x1x1` throughout —
+so an active-record count change is not the trigger either. The transition point is **not a fixed
+submit number**: one run breaks at ~6795, another at ~9360, so it tracks route position and scene
+content rather than a dispatch ordinal.
+
+**The remaining question is therefore narrow and concrete: what changes in the builder's input at
+that boundary?** Its tags come from `0x209cc76000` (2,063 × 64 bytes, binding 4 / fetch-pc 86).
+`PROSPER_COMPUTE_TREE_WATCH_AUX=0xADDR:DWORDS` (added here) dumps a second guest range alongside the
+watched table, and dumps the builder's clean transitions too so there is a control from the same run
+rather than only cyclic samples.
+
+## FALSIFIED: the missing-producer hypothesis is dead (2026-08-15)
+
+`PROSPER_COMPUTE_DISPATCH_LOG` (added here) records **one line per dispatch** with its outcome, which
+no existing signal did — every other one is deduped per program, and reading a once-per-program line
+as a per-dispatch property is how the root-cause claim two sections down got published and retracted.
+
+One 200 s route, 46 submits carrying a `0x413dc3400` dispatch:
+
+| | tree CYCLIC | tree clean |
+| --- | --- | --- |
+| `0x413ce6000` had a declined dispatch that submit | 10 | 0 |
+| `0x413ce6000` executed on **every** dispatch | **29** | 7 |
+
+**29 submits in which the producer ran on every single dispatch and the builder still produced a
+cyclic tree.** A producer decline is therefore **not necessary** for the corruption, and the
+"`0x413ce6000` fails to recompile → stale tags → cyclic tree" story is finished. Do not restart it.
+
+Per-dispatch outcomes over the run: `0x413ce6000` 129 executed / 10 recompile-empty; `0x413cf9200`
+658 executed / 20 recompile-empty; `0x413dc3400` 53 executed / 0 failures. Those recompile-empty
+dispatches are real gaps worth closing on their own merits — an unsupported program is a fatal gap —
+but they are **not** the cause of this defect.
+
+### What the same data shows instead: a route-position boundary
+
+The builder's output is clean for the first seven submits and cyclic from submit ~6795 onward,
+continuously:
+
+```
+3894  clean     6795  CYCLIC     9673  CYCLIC
+4307  clean     7211  CYCLIC    10076  CYCLIC
+4720  clean     7625  CYCLIC    10482  CYCLIC
+5135  clean     8039  CYCLIC    10875  CYCLIC
+5550  clean     8457  CYCLIC    11271  CYCLIC
+5965  clean     8867  CYCLIC    11674  CYCLIC
+6380  clean     9274  CYCLIC    12077  CYCLIC
+```
+
+This is a **transition at a point in the route**, not a per-submit coin flip. Whatever changes around
+submit 6795 — scene content reaching some size or shape — is the thing to characterise next. The
+first clean submit also shows `0x413ce6000` dispatching **94** times against 1 thereafter, so the
+early phase is a different workload entirely and the clean result there may not be comparable.
+
+## Causal A/B: forcing the producer off collapses the builder entirely (2026-08-15)
+
+`PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700,0x413ce6000`, lever verified in the log
+(`-> 2 program(s) will be declined`), 200 s route, against the baseline arm.
+
+| | baseline | producer forced off |
+| --- | --- | --- |
+| `0x413dc3400` table-changing dispatches | **40** | **1** |
+| `0x413dc3400` clean -> cyclic | 37 | **0** |
+| clean -> cyclic, all programs | 40 (37 from the builder) | 46 (all from `0x413d88400`) |
+
+**`0x413dc3400` essentially stops writing a tree.** So its output does depend on `0x413ce6000`
+having run — the dependency the resource alias predicted is real and now demonstrated, not inferred.
+
+**The confound, stated because it is not excluded.** A declined compute dispatch clears
+`producer_epoch_ok`, and the next `ParserStall` latches `indirect_dependencies_ok` false for the rest
+of the submit — the indirect latch this document opens with. Forcing `0x413ce6000` to decline
+therefore suppresses later indirect dispatches too, so this arm cannot separate
+
+  (a) `0x413dc3400` runs and reads a stale record array, from
+  (b) `0x413dc3400` is never dispatched at all.
+
+Both predict what was measured. Separating them needs a per-dispatch execute/decline record for both
+programs in the same run, correlated frame by frame — which is the measurement the retracted
+root-cause claim needed and never had.
+
+Also note the dumped post-images differ in *provenance* between the arms: in the forced-off arm the
+clean -> cyclic transitions come from `0x413d88400`, not the builder, so their `pairs=0` is not
+comparable to the baseline builder's `pairs≈819`. The comparable figure is the dispatch count.
+
+## CORRECTION (2026-08-15): the "never executes" claim above is WRONG
+
+Watching the record array itself — `PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:2063` — refutes the
+strongest form of the claim in the section below. **`0x413ce6000` does write it**, 26 times on a
+150 s route, `toucher=1`. It is not declined on every dispatch; the `[compute] skip unsupported
+program` line that suggested otherwise fires **once per program ever**, so it reports "failed at
+least once", never "never ran". That distinction is stated elsewhere in this document and I still
+built a causal claim on the wrong side of it.
+
+The array's actual writers on one route:
+
+| program | changes | toucher |
+| --- | --- | --- |
+| `0x413cf9000` | 117 | 1 |
+| `0x413cf9200` | 117 | 1 |
+| `0x413cf5400` | 29 | 1 |
+| `0x413cf6100` | 29 | 1 |
+| `0x413ce6000` | **26** | 1 |
+| `0x413d1bf00` | 2 | 1 |
+| `0x413e1ff00` | 3 | **0** |
+
+**What survives** from the section below, because it was measured rather than inferred:
+
+- `0x413dc3400` corrupts the parent table on 37 of 40 dispatches. Unchanged.
+- `0x413dc3400`'s tag source is `0x209cc76000`, binding 4 / fetch-pc 86 — the resource-map alias is
+  exact and stands.
+- `0x413ce6000` writes that same array, is *sometimes* declined, and its reject is
+  `unresolved-operand pc=156`. Also stands.
+
+**What does not survive:** "`0x413ce6000` never executes, therefore the tags are stale, therefore the
+tree is cyclic." The producer runs most of the time, so a missing-producer story cannot be asserted
+on this evidence. It remains a *candidate* — a partially-written array would still leave some records
+stale — but the step from "sometimes declined" to "these particular tags are stale" is not made, and
+the frame-level correlation between a decline and a corrupted tree has not been measured. **Do that
+measurement before building on it.**
+
+`0x413e1ff00` changing the array three times with **`toucher=0`** is the case the tree watch was
+built to be able to report: a program that changes bytes without binding a range containing them.
+That is either an out-of-bounds write or a binding path the resource traversal does not model, and
+it is unexamined.
+
+## `0x413ce6000` is a producer of the tags, and is sometimes declined (2026-08-15)
+
+**Read the CORRECTION above first — this section's causal claim was overstated and the
+"never executes" premise is refuted. The resource alias it establishes is sound.**
+
+The chain is complete and every link is measured.
+
+**The alias, from `PROSPER_COMPUTE_RESOURCE_MAP`:**
+
+```
+0x413dc3400  binding=4  fetch-pc=86   base=0x209cc76000 size=132032 stride=64   (READ)
+0x413ce6000  binding=13 fetch-pc=212  base=0x209cc76000 size=132032 stride=64   (STORE)
+0x413ce6000  binding=14 fetch-pc=214  base=0x209cc76000 size=132032 stride=64   (STORE)
+0x413ce6000  binding=17 fetch-pc=253  base=0x209cc76000 size=132032 stride=64   (STORE)
+```
+
+`132032 = 2063 x 64` — one 64-byte record per node, exactly the node count. `fetch-pc=86` is the
+load Codex identified as the source of the classified references: `pc86 loads v56/v57 from
+s24[compacted_node].dword[0:1]`, and `v36 = v56 & 7`, `v37 = v57 & 7` are the tags the six store
+predicates test. Eight more of `0x413dc3400`'s bindings (6, 7, 8, 9, 10, 11, 12, 15) are the same
+buffer.
+
+**So `0x413ce6000` writes the record array whose tags `0x413dc3400` reads — and `0x413ce6000` is
+declined on every single dispatch.**
+
+### The full causal chain
+
+1. `0x413ce6000` fails to recompile: `compute-struct-reject execz pc=76 scalar write pc=84 leaves
+   vcc-half s106 live at merge pc=139`. It is realized 40 times per route, at d36, and executes zero
+   times.
+2. Its output — the 2,063 x 64-byte node record array at `0x209cc76000` — is therefore never written.
+3. `0x413dc3400` at d37 reads its six classified references out of that array.
+4. The stale references fail the `tag == 2 || tag == 5` predicate, so the matching child stores never
+   fire — which is exactly the measured failure mode: **a store that does not execute, leaving the
+   slot holding a stale value**.
+5. 220–461 parents end up with one child instead of two → the parent array is cyclic.
+6. `0x413dc6700` at d39+ walks it with a loop that has no iteration bound and no cycle detector →
+   GPU hang → RADV device loss → live compute disabled process-wide → every later indirect draw
+   dropped → **no world**.
+
+**This is the charter's rule in its purest form: an unsupported program is a fatal gap, not an
+acceptable skip.** One declined compute program, six dispatches upstream, removes the world.
+
+It also explains why `0x413ce3400` gets its tree right. Codex's ISA read: it computes both child
+indices directly from the Morton range/split and stores both links unconditionally, with no tag
+predicate anywhere in its 391 instructions. It does not depend on `0x209cc76000`, so a missing
+producer cannot reach it.
+
+**Do not "fix" this by removing `0x413dc3400`'s predicate.** The guest declines to dereference
+non-materialised references on purpose; making the stores unconditional would turn unmaterialised
+references into indices and change guest semantics. The fix is upstream: make `0x413ce6000` compile.
+
+### Status of that fix
+
+`PROSPER_VCC_SCALAR_DATA_MERGE=1` (this branch) widens the execz VCC-half proof from "not read" to
+"not read as a lane mask" and clears the first reject; `0x413ce6000` then fails at a *second* path
+that logs nothing under any variable. Making that second reject legible is the immediate next step —
+it is one of the five programs in the `reason=unrecorded` set.
+
+Note on a red herring: `[compute] program 0x413ce6000 is a proven no-op (only proven no-backing
+resources)` does appear, but only for an instance with **zero** backed resources (dispatch 968). At
+d36, where it matters, it has **17** backed resources including the three stores above.
+
+## THE SECOND TABLE IS BUILT PERFECTLY — by a different program (2026-08-15)
+
+`PROSPER_COMPUTE_TREE_WATCH=0x20f848a240:2063`, same route. The two addresses are **not** a
+ping-ponged copy of one structure: they have disjoint writer sets.
+
+| address | writers | result |
+| --- | --- | --- |
+| `0x20f848417c` | `0x413dc3400`, `0x413d88400`, `0x413e1c300`, `0x413cee500` | **37 of 40 dispatches leave it cyclic** |
+| `0x20f848a240` | `0x413ce3400`, `0x413cf5400`, `0x413d88400`, `0x413cdc200` | **clean; 3 of 133 transitions cyclic, each repaired immediately** |
+
+And the decisive line: **`0x413ce3400` produces a PERFECT tree at `0x20f848a240`, every single time.**
+
+```
+program=0x413ce3400 changed=2061 pre{... pairs=0 unpaired=0}
+                              post{cycles=0 cyclic-roots=0 oob-roots=0 max-depth=11 pairs=1030 unpaired=0}
+```
+
+`pairs=1030, unpaired=0, cycles=0, max-depth=11` — exactly the clean ground truth, on all 41 of its
+dispatches. So **prosper can already build this structure correctly.** The defect is specific to
+`0x413dc3400`, and there is now a working reference program to differentially compare against.
+
+The two are different programs, not two instances of one:
+
+| | `0x413ce3400` (correct) | `0x413dc3400` (broken) |
+| --- | --- | --- |
+| instructions | 391 | 765 |
+| DS (LDS) ops | **0** | 5 (`ds_write_b32` x2, `ds_add_rtn_u32`, `ds_read_b32` x2) |
+| `s_barrier` | **0** | 2 |
+| CFG dispatchers | — | 3 (one per barrier-free phase) |
+| MUBUF | 29 | 37 |
+
+**The distinguishing features of the failing one are exactly the workgroup-cooperative machinery**:
+the LDS stream compaction Codex decoded at pc47..74 (`ds_add_rtn_u32` hands each qualifying lane a
+ticket; the two barriers bracket counter initialisation and list publication), and the barrier-phased
+CFG dispatcher that machinery forces. The correct builder has none of it.
+
+That also resolves an inconsistency in the record: the consumer's own captures show ~1029-1030 pairs,
+which matches the `a240` tree rather than `417c`'s 919. The consumer's bound table address alternates
+between the two across frames, so it walks a good tree on some frames and the broken one on others —
+which is why the hang arrives at a particular dispatch rather than the first.
+
+## The failure mode, exactly: one of the two per-parent stores does not execute
+
+Established from both images of 18 clean -> cyclic transitions.
+
+**Ground truth.** Two clean captures give the target unambiguously: parent-multiplicity
+`{2: 1030, 1: 2}` — every parent has exactly two children — with 1,032 distinct parent values over
+0..2062, 515 of them above 1031, and 1,031 indices never a parent. Leaves and internals are
+interleaved, not segregated into low and high halves.
+
+**`0x413dc3400`'s output** measures `{2: ~872, 1: 220..461}`. For 220–461 parents **exactly one of
+the two children carries that parent**, and the missing child's slot still holds a *stale* value —
+`0x09249249`, `0x12492492` or `0x2db6db6d`, which are the Morton dilation constant times 1, 2 and 5,
+or plain zero. Those slots were never written by this dispatch. **So this is a store that does not
+execute, not a store that computes a wrong address or a wrong value.**
+
+### The store site
+
+All six stores sit in six separately exec-predicated blocks of identical shape (mnemonics from
+prosper's own decoder, `rdna2_to_spirv.cpp` VOP2 0x16 `v_lshrrev_b32`, 0x1B `v_and_b32`,
+0x25 `v_add_nc_u32`):
+
+```
+pc=0611  v_and_b32          v36, 7, v69      ; tag = child_ref & 7
+pc=0612  v_cmp_eq_u32       s8,  2, v36
+pc=0614  v_cmp_eq_u32       vcc, 5, v36
+pc=0615  s_or_b64           vcc, vcc, s8     ; tag == 2 || tag == 5
+pc=0616  s_and_saveexec_b64 vcc, vcc
+pc=0617  s_cbranch_execz    -> 622
+pc=0618  v_lshrrev_b32      v36, 3, v69      ; index = child_ref >> 3
+pc=0619  v_add_nc_u32       v36, -4, v36     ; index -= 4
+pc=0620  buffer_store_dword v40, v36, s0, 0  ; idxen=1, offen=0
+pc=0622  s_mov_b64          exec, vcc
+```
+
+A child is written only when its reference's low three bits are 2 or 5, into slot `(ref >> 3) - 4`.
+**Whether tags outside `{2, 5}` are written by a LATER PASS is the open question** — if they are,
+a stale slot here is expected and the defect is a missing program rather than this one (#2542).
+
+### A gap in the toucher census that may matter more
+
+The baseline routed run **skips 13 compute programs as unsupported**, and a skipped program never
+realizes a resource table — so `PROSPER_COMPUTE_ADDRESS_WATCH` and the tree watch are
+**structurally incapable of seeing any of them**. The clean "no unknown writer" result is therefore
+a statement about programs that ran, and only those. Baseline skip list:
+
+```
+0x2042f49a00 0x205b545c00 0x205b54ee00 0x205b5e8600 0x205b654a00 0x205b657200
+0x205b658800 0x205b67ce00 0x413ce6000 0x413cf9200 0x413cf9a00 0x413cf9d00 0x413d14100
+```
+
+If one of those is the pass that fills the slots `0x413dc3400` deliberately leaves alone, the cyclic
+table is a **missing program**, not a miscompiled one, and the fix is to make it recompile. Per the
+charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
+the next thing to implement regardless of how this particular question resolves.
+
+## Fifth review round on #2550, all four fixed (2026-08-15)
+
+**1 (blocker) — MRT1 was still discarded under the live renderer's calling convention.** The live
+call passes `out_rgba1 == nullptr` and receives slot 1 through `BackendMrtOutputs`. On a non-final
+split the slot-1 readback therefore landed in `intermediate_mrt.colors[1]`, while the wrapper carried
+a seed forward only inside `if (out_rgba1)` — so MRT1 was lost on every split. The MRT2 regression
+could not see it because it jumps from MRT0 straight to MRT2. **The claim in the previous round that
+"slots 0 and 1 already carry through `seed_rgba`/`seed_rgba1`" was true only of the legacy explicit
+API, and is corrected here.** Added `seed_rgba1_slot`, the carry now takes whichever buffer received
+slot 1, and there is a second Vulkan split regression written with the live signature.
+
+**2 (high) — the MRT2–7 carry was selected by identity, not residency.** A non-zero
+`persistent_id_slots[slot]` does not mean the image survives: persistence also requires
+`persistent_color_targets_enabled` and a successful cache/budget allocation, and the slot-creation
+path falls back to a transient image while leaving the identity non-zero. The wrapper cannot see
+those decisions, so it no longer predicts them — a non-final split segment captures every slot
+unconditionally. Regressed with a non-zero MRT2 identity and
+`PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS=1`.
+
+**3 (high) — the materialization changes had no regression at their call sites.** Reverting either
+production site left everything green. Both decisions are now seams that own their gate —
+`mrt_direct_serves()` and `mrt_uniform_live_serves()` — and the mutation reverting the gate inside the
+seam turns a named assertion red.
+
+**4 (medium) — the binding test asserted a contract production does not have.** `backend_color_format`
+maps every unrecognised value, zero included, onto `R8G8B8A8_UNORM`, so the format term in the
+active-binding rule is **total**: it never rejects a slot. The test modelled `raw != 0` and asserted a
+zero format made a slot inactive. `PROSPER_MRT_CENSUS` had already reported "format known" for every
+slot in all 16,384 pass groups of a routed boot — the column is constant because the predicate is —
+and that measurement is in this document. I read it, wrote it down, and then wrote a test asserting
+the opposite. The test and the header now encode the real contract, and a backend-linked test pins
+the mapping the model depends on.
+
+### A metric with two regimes, and a control that was not one
+
+While verifying, `c4`'s peak read 507,887 where the previous round recorded 3,471,942. A second run
+on the same head gave 516,241, and I took that agreement as evidence of a regression in my own diff.
+It was not: **rebuilding the PREVIOUS head's sources and running them today gives 507,863.** The
+metric has two regimes depending on where the route lands, and two runs inside one regime agree with
+each other while saying nothing about the other.
+
+The lesson is the one this document keeps recording in different clothes: *the control has to be the
+old code run now*, not a number written down earlier. A remembered measurement is a measurement of a
+different machine state. `c2`/`c3` are stable across all of these (4.51–4.53M) and are the numbers
+worth quoting.
+
+## Fourth review round on #2550, all four fixed (2026-08-15)
+
+**1 (blocker) — a depth-feedback split still discarded MRT2–7 when persistence was unavailable.**
+Carrying the SHAPE through every segment was necessary and not sufficient. When the caller names no
+persistent identities — every path running with live GPU targets disabled: captures, per-target
+diagnostics, replay export, the recovery switch — the later segment gets a fresh transient
+attachment, and LOADing an image that was just created loads nothing. The earlier segment's pixels
+reach it only by being read back and **seeded** in, which is exactly what slots 0 and 1 already do
+through `seed_rgba`/`seed_rgba1`.
+
+Added `seed_slots[]`, the per-slot twin, with the upload path mirroring slot 1's. The splitter reads
+back any non-persistent higher slot it must carry and hands the pixels to the next segment.
+`split_segment_contract()` synthesises a carrier target when the caller gave none, since the seed
+flags have nowhere else to live — behaviourally identical to no target (every identity is zero) apart
+from the carry.
+
+**The regression is a real Vulkan one, and it reproduced the defect before the fix.** Segment 1 writes
+depth and RED to MRT2; the consumer samples that depth, which forces the physical split; the final
+segment never touches MRT2; `color_target` is null. Before the carry, the final MRT2 read
+`(0,0,0)` — after it, `(255,0,0)`. The test also asserts `depth_feedback_split_index() == 1`, so it
+cannot pass by failing to split.
+
+**2 (high) — same-pass feedback materialization kept MRT0-only gates.** The direct-path precheck and
+the uniform fast path still compared against `draw.color0_base`. For an MRT2+ collision the precheck
+said "direct serves", which suppressed the lazy CPU materialisation, and the corrected gate then
+refused the direct image — leaving the resource to fall through to guest bytes with no snapshot to
+use. All three sites (including the diagnostic classification) now use the all-slot rule.
+
+**3 (medium) — the feedback helper was a second, looser copy of "active".** It fell back to the named
+slot-0/1 mask whenever the array mask read zero and never required a defined format, where pass
+grouping falls back only when the array representation is ABSENT and requires base + format + mask.
+Extracted as `frontends/shared/mrt_binding.hpp`, used by both, and tested from a real `DrawItem`.
+
+**4 (low) — `test_mrt_extent` printed `OK` before the new checks ran.** Third instance in this branch
+of a success signal placed ahead of the work it describes.
+
+### Four rounds, one recurring mistake
+
+Rounds two, three and four each contained at least one finding of the form *a check that cannot
+fail*, and three of those were mine in the same shape: **new assertions appended at the end of a
+file, landing after the success print or the fail gate.** The cause is mechanical — inserting before
+the final `return` — and the fix is mechanical too: put new checks with the checks, and read what is
+between them and the exit.
+
+## Third review round on #2550, all four fixed (2026-08-15)
+
+Every one a legacy "only MRT0/1 exist" seam that the widening newly reached.
+
+**1 (blocker) — a depth-feedback split dropped MRT2–7 from every non-final segment.** The splitter
+passed `final ? mrt_outputs : nullptr`, and `render_draw_pass_rgba` derives `color_count` from that
+pointer — falling back to `out_rgba1`, which the live renderer passes as null. So every pre-final
+segment of a five-MRT pass rendered with **one** attachment and discarded its MRT1–4 exports; later
+segments were never told to LOAD the higher slots either. The same accumulation loss this PR fixes at
+the frontend's pass groups, reappearing at the backend's own physical boundary.
+
+Fixed by extracting `split_segment_contract()`: the attachment SHAPE is identical across segments and
+only the pixel destination and the load/readback flags differ. Non-final segments now decline
+readback **per slot** — `color_count > 2` alone forced a full-extent copy of every higher slot on
+every segment, so the fix needed `readback_slots[]` to exist at all.
+
+**2 (high) — same-pass feedback detection knew only MRT0/MRT1.** Now that a higher slot's image is
+persistent and sampled-capable, sampling an active MRT2+ target borrowed the very `VkImage` the pass
+was writing. Both halves — the backend's descriptor borrow and the frontend's direct-live decision —
+now go through one `mrt_target_feedback()` policy.
+
+**3 (high) — the sparse-MRT gate had no regression at its production seam.** Reverting
+`any_slot_bound` to `base` left all 245 tests and the validation scan green. The union is now
+`mrt_any_slot_bound()` in the frontend policy header, called by both decisions that key on it and
+tested there.
+
+**4 (medium) — the no-readback publication lifecycle skipped MRT2–7.** `publish_persistent_color()`
+covered slots 0 and 1; a persistent higher slot could reach `SHADER_READ_ONLY_OPTIMAL` with no
+barrier making its writes visible to a later command buffer. Mirrored for every retained slot, keyed
+on whether that slot's readback path actually ran.
+
+All four are mutation-verified at their own sites: dropping the segment shape, dropping the segment
+load, narrowing the feedback policy to slots 0/1, and narrowing the union to colour-0 each turn a
+named assertion red.
+
+Live title after this round: **c2 4,533,513 · c3 4,533,513 · c4 3,472,691** non-black pixels,
+0 validation errors.
+
+### The seam this round is really about
+
+Every finding was the same shape: a policy written when only two colour slots could exist, left
+behind by a change that made eight possible. They were not in the diff — they were in code the diff
+made reachable. Grepping for `persistent_id1` or `color1` finds them; grepping for what changed does
+not.
+
+## Second review round on #2550, all five fixed (2026-08-15)
+
+**1 (blocker) — MRT2–7 reused an image in the wrong Vulkan layout.** The retained image was recorded
+as `COLOR_ATTACHMENT_OPTIMAL` while the pass left it in `TRANSFER_SRC_OPTIMAL` and no restore
+transition existed, so the next group declared an initial layout the image was not in. Codex
+reproduced it under `VK_LAYER_KHRONOS_validation` as `VUID-vkCmdDraw-None-09600`; the pixel assertion
+still passed on RADV, so the ordinary suite could not see it. Slots 2–7 now take the complete MRT0/1
+lifecycle — pre-pass load barrier from the truthful current layout, persistent final layout, readback
+transition, restore, and a recorded layout that matches. Mutation-verified: restoring the old
+recorded layout brings back exactly `VUID-vkCmdDraw-None-09600` (x2) plus
+`VUID-VkImageMemoryBarrier-oldLayout-01197` (x8); the fix gives **zero**, which also proves the layer
+was active rather than silently absent.
+
+**The gate already existed.** `tools/vkval/vk_validation_scan.py` runs the whole suite under the
+layer, allow-lists known IDs, fails on unknown ones, and refuses a clean verdict unless the layer
+provably loaded. Neither VUID is allow-listed, so that scan *is* the regression: `VKVAL_RC=0` now,
+and it fails with the defect present.
+
+**2 (high) — sparse MRT passes bypassed the persistence contract.** The colour target was passed to
+the backend only when MRT0's `base` was non-zero, and the comment at that very call site already
+documented that MRT0-unbound / higher-slot-bound passes are reachable. Such a pass populated
+`persistent_id_slots[2..7]` and then handed the backend `nullptr`. Now gated on the union of every
+bound slot — the same union the readback flag beside it already used. Effect on the live title: **c4
+513,338 → 3,472,691** non-black pixels.
+
+**3 (high) — the cap-order and baseline tests did not exercise the production sites.** They called
+two pure predicates, so moving the cap check back below the capture, or deleting the baseline latch,
+left every assertion green. Replaced with orchestration seams that *own* the properties:
+`frame_bundle_append_submit()` takes the capture step as an injected callable, so a test observes
+whether it ran; `frame_bundle_open_window()` owns the latch. Both mutations Codex named now fail —
+moving the cap below the capture gives 2 failures, deleting the latch gives 3.
+
+**4 (medium) — the MRT2 negative arm could skip itself.** It entered its only assertion under
+`if (cleared.size() == px)` without ever asserting that size, so a regression returning an empty
+buffer would have passed the negative control silently. The extent is asserted now.
+
+**5 (medium) — the capture size bound ran before the v55 tail.** A capture near the 4 GiB ceiling
+could serialize successfully into a file `read_gpu_capture` then rejects as oversized. Re-checked
+after the final tail, with a note that any future tail must move the check again.
+
+### The pattern across both review rounds
+
+Four of the nine findings across the two rounds are the same shape: **a check that cannot fail.** The
+negative arm gated on a size it never asserted; the cap and baseline tests called predicates instead
+of the sites; the timeline assertions sat after their own fail gate; and the layout defect passed
+every pixel assertion while being undefined behaviour. Only the last needed a tool to see — the other
+three were readable in the diff, and I wrote all of them.
+
+## Review findings on #2550, all four fixed (2026-08-15)
+
+Codex reviewed the MRT work and found four verified issues. All are real; all four were confirmed
+against the source before acting.
+
+**1 (blocker) — MRT2–7 did not survive a render group.** Slots 2+ were transient images created per
+backend call with `LOAD_OP_CLEAR` and `initialLayout = UNDEFINED`, and only slots 0 and 1 had a seed
+or persistent path. GTA V's G-buffer accumulates across roughly sixteen pass groups per frame, so
+each group erased its predecessor's slots 2–4 and only the last survived. The MRT widening made the
+recompiler able to emit five outputs while the runtime kept the attachment incomplete.
+
+Fixed by giving slots 2–7 the same persistent-target contract slots 0 and 1 have, with the same
+over-budget fallback to a transient image. Measured on the same route, best non-black pixel count per
+slot: **c2 240,121 → 4,513,318** and **c3 407,957 → 4,513,318** (54% of a 4K frame), c4 313,908 →
+513,338, with 0 validation errors.
+
+**2 (blocker) — layered DS capture identity omitted the slice.** Once two cube faces were valid,
+`snapshot_persistent_ds_images` emitted two seeds that were identical apart from the slice; the writer
+rejected the second as `duplicate DS seed identity`, so F9 capture failed outright, and restore keyed
+every seed at slice 0 so even a written capture could not replay the faces distinctly. Fixed with a
+**v55** capture tail carrying each seed's slice (pre-v55 reads back as slice 0).
+
+**3 (high) — `PROSPER_CAPTURE_MAX_SUBMITS` tested the cap after capturing.** Every post-cap submit
+paid the full capture cost, and a post-cap capture *failure* set `b.failed` and discarded the
+already-valid capped bundle — the exact outcome the cap exists to prevent. The cap is now tested
+before any capture work.
+
+**4 (medium/high) — the empty-window hook counters were process totals.** They accumulate from
+startup and were printed verbatim as evidence about one capture window, so ordinary activity before
+F9 made a genuinely empty window look as though the hook had been reached during it. Now baselined
+when the window opens, with a saturating delta so a missed baseline prints 0 rather than a wrapped
+count near 2^64.
+
+### Two lessons from the review worth more than the fixes
+
+- **A tail must go at the END of the stream, not beside the data it describes.** The v55 slice was
+  first written next to the DS seed records, which round-trips perfectly and desynchronises every
+  later tail the moment the version byte is downgraded — the exact thing eleven legacy-reopen
+  fixtures do. The capture format's append-only convention is not a style preference; it is what
+  makes `serialize at current version → lower the version byte → reparse` work at all.
+- **A test that builds a struct by hand does not cover the code that builds it.** Codex's sharpest
+  point: the first slice regression constructed `PersistentDsKey` directly, so reverting the
+  production decode left it green. The seam is now extracted as `persistent_ds_key_for()` and the
+  test calls it — verified by mutation: replacing the decode with `0u` turns both assertions red,
+  restoring it turns them green.
+- **And the one I got wrong on my own: `ctest` after `cmake --build --target screenshot` tests STALE
+  BINARIES.** The v55 change broke 23 assertions in `test_gpu_capture` while I reported 245/245,
+  because that target had not been rebuilt. Build everything before quoting a suite result.
+
+## Cube depth: the DS cache overwrote its own faces (2026-08-15, fixed) — and the falsification above is RETRACTED
+
+**Retraction first.** The section below this one records cube shadow maps as falsified. That call was
+premature and is withdrawn. It read the *final screenshot*, and Codex's correction is right: the
+screenshot is the wrong readout for an input this deep in the frame. Re-run cube-only at both poles,
+reading the lighting output `0x20431c0000` instead:
+
+| cube fill | `0x20431c0000` |
+| --- | --- |
+| `0x00` | max=46, 44.5% non-black (matches baseline) |
+| `0xff` | **max=0, 0.0%** |
+
+The shadow term does not merely move the lighting output, it can zero it completely. The lever moves
+hard, so the cube path is load-bearing and the earlier "not the missing world" verdict was void, not
+negative. Recorded here because it is the second time this session that a black *screenshot* hid a
+large change one stage upstream.
+
+**The defect Codex identified underneath the bridge gate.** A cube shadow map is not six neighbouring
+allocations — it is ONE six-layer allocation whose faces share a depth base and are selected by
+`DB_DEPTH_VIEW.SLICE_START/MAX`. GTA V programs `0x02000000, 0x02002001, 0x02004002 … 0x0200a005`
+(start=max=0..5) against a single base. `PersistentDsKey` omitted the slice, so **every face render
+for a base collided on one key and overwrote the previous face's host image**; only the last face
+survived. No relaxation of the sampling gate could have recovered a valid cube from that cache.
+
+Fixed by adding the slice to the DS identity. Measured on the same route: retained DS surfaces
+**29 → 55**, and a cube base that held one entry now holds one per face:
+
+```
+0x20972c0000 slice=0 … slice=1 … slice=2 … slice=3 … slice=4
+0x20978c0000 slice=0 … slice=1 … slice=2 … slice=3 … slice=4
+```
+
+Non-layered surfaces program `DB_DEPTH_VIEW=0` and key at slice 0 exactly as before, so identity
+widens only where the guest actually used layers.
+
+**Still open (Codex's stage 2):** the cube T# is still gated out of the bridge by `img_dim == 1`, and
+binding it needs the six slices gathered into the backend's stacked sampled representation plus a
+**numeric depth conversion** — the guest surface is `Z16` (`DB_Z_INFO.FORMAT=1`) while prosper
+canonicalises host attachments to `D32_SFLOAT`, so the bridge must do
+`D32 float → clamp [0,1] → quantise to R16_UNORM`, not a bit reinterpretation and not a Z inversion
+(reversed-Z is already carried by the stored values and the comparison direction).
+
+## ROOT CAUSE: the fragment recompiler supported only MRT0 and MRT1 (2026-08-15, fixed)
+
+GTA V's G-buffer pass exports **five** render targets. prosper's fragment shell carried **two**, so
+three of the five attachments were silently dropped from every G-buffer pass; the deferred lighting
+pass then sampled buffers nothing had written, and the world rendered into a G-buffer that was lit by
+nothing.
+
+The pass, from `PROSPER_MRT_SHAPE_FOR`:
+
+```
+x1754  tmask=0x000fffff smask=0x0003ffff
+       c0=0x207de60000 c1=0x207fe40000 c2=0x2083e00000 c3=0x2081e20000 c4=0x2085de0000
+```
+
+`tmask & smask = 0x0003ffff` — slots 0–3 at `0xf`, slot 4 at `0x3`. All five enabled by the guest.
+
+**Everything below the shader already carried eight.** The render state decodes all eight slots,
+`active_color_count` scans all eight, and the backend's render pass, framebuffer and blend state are
+generic over `color_count`. Four hard-coded `2`s in the fragment path were the whole limit:
+
+| site | was |
+| --- | --- |
+| `rdna2_to_spirv.cpp` fragment shell `v_color` | `std::array<uint32_t, 2>` |
+| `fragment_color_export_mask` `realized` | `std::array<bool, 2>` |
+| fragment colour-mask scan | `if (in.exp_target < 2)` |
+| emit-side `exported` | `std::array<bool, 2>` |
+| the "did anything export" guard | `!exported[0] && !exported[1]` |
+
+The consequence was not confined to the shader. `gpu_execute.hpp` gates every slot's Vulkan write
+mask by the shader's EXP.EN — `write_mask &= (exp_mask >> slot*4) & 0xf` — so a decoder that can
+never set bits above nibble 1 forces **`write_mask = 0` for slots 2–7 regardless of what
+CB_TARGET_MASK and CB_SHADER_MASK say**. Slots 0 and 1 survived only because `active_color` has
+named-field fallbacks for exactly those two.
+
+Measured, same route, before → after:
+
+```
+c2 ACTIVE=0 -> 2151      per-slot write_mask disagreements with the draw's own
+c3 ACTIVE=0 -> 2083      mask registers: 5,318 -> 0
+c4 ACTIVE=0 -> 1040
+```
+
+`ctest --no-tests=error -j4`: **245/245 pass**, exit 0.
+
+**The world is still not lit after this fix.** It is a verified, necessary defect fix — the G-buffer
+now reaches the lighting pass complete — and it is not by itself sufficient. Recorded that way rather
+than as a solution.
+
+### The instrument that found it, and the two that could not
+
+The disagreement census is the one that mattered: for every draw, the per-slot `write_mask` the
+DrawItem *carries* against the one its own `cb_target_mask & cb_shader_mask` *imply*.
+
+```
+c2 implied=0xf carried=0x0  x1830
+c3 implied=0xf carried=0x0  x2109
+c4 implied=0x3 carried=0x0  x1676
+```
+
+Neither of the two censuses before it could have found this. A per-slot **activation** census says
+slots 2–4 never activate but not why, and its `mask=0` column is equally consistent with "the guest
+disabled them" — which is what the mask histogram appeared to confirm, because that histogram was
+keyed on groups where slot 4 had a *base* and was dominated by unrelated passes whose masks really
+are slot-0-only. The defect only became visible when the same quantity was computed **two ways from
+the same draw** and compared.
+
+## Correction: a colour-target census must intersect the WRITE MASK (2026-08-15)
+
+`PROSPER_TARGET_WATCH` and `PROSPER_DRAW_CENSUS` read `CB_COLORn_BASE` for all eight slots and count
+a draw as writing that address. **That over-counts, and the earlier figures published from it are
+wrong.** A base register is sticky: the guest leaves `CB_COLOR4_BASE` programmed long after it stops
+rendering to slot 4, and hardware writes a slot only where `CB_TARGET_MASK & CB_SHADER_MASK` has a
+non-zero nibble for it.
+
+Measured (`PROSPER_MRT_CENSUS`, 16,384 pass groups):
+
+```
+c0 base=16384 format=16384 mask=15590 ACTIVE=15590
+c1 base=11796 format=16384 mask= 2729 ACTIVE= 2729
+c2 base=11796 format=16384 mask=    0 ACTIVE=    0
+c3 base=11796 format=16384 mask=    0 ACTIVE=    0
+c4 base=11796 format=16384 mask=    0 ACTIVE=    0
+```
+
+and over the groups where slot 4 *has* a base, the dominant state is
+`cb_target_mask=0x0000000f cb_shader_mask=0x0000000f` (x11,647) — **slot 0 only**. Both registers are
+present and genuinely narrow; neither is being truncated by prosper, and both default to `0xffffffff`
+when absent, so a zero nibble is real guest state.
+
+**So "0x2085de0000 is written by 130,290 of 131,072 draws, 96% of them in slot 4" is retracted.**
+Those were stale bindings. The renderer is right to drop them, MRT slots 2–7 are not a defect here,
+and the eight-slot census fix — which was itself a correct fix to a slot-0-only census — bought a
+number that still needed the mask to mean anything.
+
+The narrower lesson, which cost two rounds: **an eight-slot census with no mask intersection is not
+"more complete" than a one-slot census, it is differently wrong** — the first under-reports, the
+second over-reports, and only the second looks like progress.
+
+## Where the picture actually goes (2026-08-15) — and three metrics that lied about it
+
+`tools/gpu_timeline/rtt_pass_graph.py` (new) reassembles a frame's render-pass graph from a
+`PROSPER_RTTLOG=1` log: every `[rtt] sample tex` line belongs to a draw of the *next* `[rtt] pass`
+line, so a pass's inputs are the samples since the previous pass, and `SCANOUT` delimits frames.
+Neither a draw census nor a target census can find a lost picture, because both count *work* and the
+defect is in the *dataflow*.
+
+What it shows for GTA V's gameplay frame — the deferred lighting pass:
+
+```
+0x20431c0000  3840x2160  draws=19   rgb_nonblack=0
+   <- 0x207de60000  3840x2160 un8   x19          G-buffer, full
+   <- 0x207fe40000  3840x2160 un8   x19          G-buffer, full
+   <- 0x2083e00000  3840x2160 un8   x23          G-buffer, full
+   <- 0x208f340000   256x256  un16  x1    MISS -- guest bytes
+   <- 0x20954c0000   512x512  un16  x1    MISS -- guest bytes      six shadow maps,
+   <- 0x2093cc0000   512x512  un16  x1    MISS -- guest bytes      none resolved from
+   <- 0x2094ec0000   512x512  un16  x1    MISS -- guest bytes      a renderer-owned image
+   <- 0x20948c0000   512x512  un16  x1    MISS -- guest bytes
+   <- 0x20942c0000   512x512  un16  x1    MISS -- guest bytes
+```
+
+Those six addresses also top the DS-invalidation histogram (`20948c0000` x1010, `2094ec0000` x860,
+`2093cc0000` x410 in one run), so they are surfaces prosper retains and then invalidates on a guest
+DMA. `PROSPER_DS_GUEST_WRITE_INVALIDATE=0` does move that lever cleanly — `depth-invalid=0
+stencil-invalid=0 extent=0`, against 1089/858/1628 with it on — but the route diverged in that run and
+never reached the tutorial, so **it is not yet an A/B and is not claimed as one.**
+
+### Three metrics that each read as "the world is black" when it is not
+
+Recorded because all three were acted on in this session before being caught:
+
+1. **`rgb_nonblack` is computed from an RGBA8 conversion, so an HDR f16 target whose values are all
+   below 1/255 reports exactly ZERO while carrying a complete scene.** `0x20431c0000` reports
+   `rgb_nonblack=0` while the very next pass extracts **47.5% non-black** from it. Reading the metric
+   as "black" is a false negative across the entire lighting stage.
+2. **`[rtt] sample tex … -> miss` spoke only for the COLOUR cache.** A 4K depth buffer the depth
+   bridge had resolved correctly and a texture decoded from guest zeros printed the same word, so
+   counting a pass's missing inputs off this log over-counted them. It now prints `DS-DEPTH` /
+   `DS-STENCIL` for a bridged binding.
+3. **A pass whose readback was deferred has EMPTY CPU pixels, and both `rgb_nonblack` and the new
+   dump then report on nothing.** Measured: `0x207de60000` produced `src=0B` on **1,938 of 1,938**
+   passes in a default run. The same target reports `rgb_nonblack=8267460` (99.7%) in a run with
+   `PROSPER_RTTLOG=1` — because **the instrument's own readback is what materialises the pixels it
+   then measures.** So `PROSPER_RTTLOG` changes the subject, and any per-pass content number is a
+   statement about a run that was made differently from a default one.
+
+`PROSPER_DUMP_PASS=0xADDR[,…]` (new, with `PROSPER_DUMP_PASS_EVERY`) writes what a pass actually
+produced as an image, and reports `src=…B` plus `NO CPU PIXELS (readback deferred)` rather than
+writing nothing — which is how defect 3 was found at all.
+
+## The stencil plane of a rendered DS surface was never bridged (2026-08-15, fixed)
+
+`fs=0x205b34be00` samples two planes of **one** depth/stencil surface, and prosper retained only one
+of them:
+
+```
+[dsbridge] DS cache: dr=0x2052ac0000 dw=0x2052ac0000  sr=0x2054aa0000 sw=0x2054aa0000
+                     htile=0x2055310000  3840x2160 fmt=130 (D32_SFLOAT_S8_UINT) dvalid=1 svalid=1
+```
+
+`0x2052ac0000` is the depth plane and bridges correctly (#1275). `0x2054aa0000` is the **stencil
+plane of the same image**: `find_persistent_ds_sampled` matched only the depth bases (`dr`/`dw`), so
+every stencil sample fell through to a guest-byte decode of memory the renderer never writes — zeros.
+That is #1275's exact failure mode, left unfixed on the other plane. The guest declares the two planes
+`Float32` and `Uint8`, which is what a deferred renderer's material and light-volume classification
+reads.
+
+Fixed by matching `sr`/`sw` and binding the image's stencil aspect. Measured over a routed boot:
+`calls=262144 hit(depth=42897 stencil=2982)` — roughly 3,000 binds per run now sample the live image
+instead of zeros, with 0 validation errors.
+
+**This did NOT change the rendered frame, and the claim is kept separate from the fix.** A/B on the
+same route, HUD regions excluded from the metric: before 2.004% of pixels non-black, after 1.993% —
+inside the run-to-run spread of the route itself (0.283%–2.584% across five runs). The two frames are
+visually identical: the same three bloomed light sources and the same faint structure. So the stencil
+bridge is a verified gap fix, not the missing world.
+
+**The instrument that nearly sold it as one.** The bridge's logging printed the first eight hits and
+the first eight misses. On a routed boot all sixteen are consumed during startup by one plane, so it
+could report neither a rate nor a reason, and the "after" image *looks* like it has new content until
+it is put next to the "before" image. Replaced with per-plane counters classifying every miss as
+no-entry / depth-invalid / stencil-invalid / extent / uninitialized — the distinction between "we have
+no such surface" and "we have it and declined it" calls for opposite fixes and was previously
+invisible. The old cache dump also printed with the first miss, which on this route is always before
+the cache has any contents, so it read as "prosper retains no DS images" when it meant "not yet".
+
+### Ruled out by the same measurement
+
+- **The DCC "unsupported sampled image" warning on `0x2052ac0000` is a false alarm.** It fires from a
+  block that checks `!rtt_hit` but not `has_ds_live`, so it prints even when the depth bridge won the
+  binding; `meta=0x2055310000` is the surface's **HTILE**, being read as DCC metadata, and
+  `metadata=0/0` means the copy was correctly skipped because the bridge had already won. It is not
+  evidence of an unsupported path.
+- **`0x2052ac0000` is not an untracked secondary MRT.** It is a depth buffer, which is why it never
+  appears in a colour-target census, and it bridges: `[dsbridge] HIT … plane=depth`.
+
+## The two inputs nothing writes (2026-08-15, measured)
+
+The gameplay chain is all `0x20…` and every link hits (Codex, #2542), so the world is already absent
+at the output of `fs=0x205b34be00`. That shader takes four inputs. Two of them are surfaces **no draw
+in the run ever renders into**:
+
+| input | RTT cache | draws that write it (exact, 131,072-draw run) |
+| --- | --- | --- |
+| `0x2085de0000` | HIT | **130,290** — slot1=8,262, slot4=122,028 |
+| `0x2063380000` | HIT | **1** |
+| `0x2052ac0000` (3840x2160 fmt=1) | MISS | **0 — never a colour target** |
+| `0x2054aa0000` (fmt=11) | MISS | **0 — never a colour target** |
+
+Measured with `PROSPER_TARGET_WATCH=<addr>,…`, which is exact and unsampled over all eight MRT slots.
+
+**Why the zeros are believable here, when a clean zero usually is not.** Two independent properties of
+the same run establish that the instrument could have expressed the result it did not find:
+
+- *The lever moves*: `0x2085de0000` reports 130,290 of 131,072 draws across two slots.
+- *The domain is expressible*: `0x2063380000` reports **exactly one** draw. That is the case a sampled
+  census structurally cannot represent, and it is the reason this measurement exists — see below.
+
+`0x2052ac0000` is also guest-readable and its first 8,252 bytes stay **all-zero for the whole run**
+(`[compute-tree-watch] … pairs=0 unpaired=0`, observed once and never changing). That is expected of any
+render target and is *not* independent evidence, since guest memory does not see GPU writes; it is
+recorded only so the next reader does not spend a run re-deriving it.
+
+### Two instrument defects this found, both of which had already produced a wrong answer
+
+1. **The draw census read only MRT slot 0.** A deferred renderer writes a G-buffer across slots 0–7 in
+   one draw, so a slot-0-only census cannot see most of what a frame renders into — and "is address X
+   ever a render target" was exactly the question being put to it. Its own control exposed it: the two
+   surfaces that demonstrably HIT the RTT cache never appeared in the census at all. Fixed to census all
+   eight slots. `0x2085de0000`'s traffic is 96% in **slot 4**, so the slot-0 census was blind to it.
+2. **The census samples 1 in 32 draws, and a sampled zero cannot answer an "ever" question.** A surface
+   written by ten draws is missed with probability (31/32)^10 ≈ 73%; by one draw, ≈ 97%. The sampling was
+   itself a correct earlier fix — the unsampled first version took a mutex and a map insert on every one
+   of 131,072 draws and stalled the routed run at 1,024 — but it silently changed what the instrument
+   could conclude. `PROSPER_TARGET_WATCH` is the exact form: bounded watch list, per-address atomics, no
+   lock, so it costs eight register lookups per draw and keeps the "ever" question answerable.
+   **`0x2063380000` is written by exactly one draw**, so this distinction is not hypothetical — the
+   sampled census would have reported it as never written, alongside the two that genuinely are.
+
+An unreadable tree-watch window also used to produce **no output at all**, which is indistinguishable
+from "nothing writes this address" — the conclusion it would have supported. It now says so.
+
+## Ruled out / retracted here
+
+- **"Sibling pairs are `(odd, even)`."** Retracted. The clean table has 204 parents whose children
+  are `(2j+1, 2j+2)` and **828** whose children are `(2j, 2j+1)` — pairs are adjacent at arbitrary
+  parity. The "first broken pair k=205" figure was computed under the fixed-alignment assumption and
+  its alignment part goes with it. The adjacency-based unpaired and cycle counts never assumed
+  alignment and stand.
+- **"Slot 300's bits[2:0] are an anomaly."** Retracted. `post-36-3.bin` has bits[2:0] == 0 in all
+  2,063 records while `live-a240.bin` carries a mix of 0 and 2, so that field varies legitimately
+  between clean tables.
+- **The LDS-undersizing hypothesis.** Dead: the module declares a Workgroup array of exactly 384
+  dwords = 1,536 bytes = 3 × 512-byte `COMPUTE_PGM_RSRC2.LDS_SIZE` granules, so the real allocation
+  is plumbed through and matched, not defaulted.
+- **Synchronization / race hypotheses for this program.** The broken-pair patterns from two
+  different frames share a 60-character suffix exactly, and `min` damage index is identical across
+  frames: the failure is deterministic given the input.
+- **A lane, wave or workgroup boundary effect.** `k mod 2/3/4/8/16` are all flat.
+- **`PROSPER_NO_NATIVE_COMPUTE_SUBGROUP=1` as an A/B arm.** Void, not negative: it skips 15 *more*
+  programs including `0x413d88400`, so `0x413dc3400` never dispatches and the phase never runs.
+
+## What the structure IS: an LBVH / binary-radix-tree parent table from Morton keys
+
+Identified by Codex from the retained ISA (#2542), and it reframes everything below.
+
+- **2,063 = 2 × 1,032 − 1** — exactly the node count of a full binary tree with 1,032 leaves and
+  1,031 internal nodes.
+- **Adjacent pairs are SIBLINGS** sharing one parent; bit 30 identifies the child side. The root is
+  the single unpaired node. That explains the count, the pairing, the parent chase and the depth
+  parity together, where "union-find with path compression" only explained the chase.
+- `0x413cee500` contains the standard 3D Morton bit-dilation constants `0x030000ff`, `0x0300f00f`,
+  `0x030c30c3` and **`0x09249249`**, then stores `buffer_store_dwordx3` at pc274 — Morton key
+  generation.
+- `0x413e1c300` loads two three-dword records, runs a 64-lane LDS compare/exchange loop, and stores
+  two three-dword records — a Morton sort/merge pass upstream of topology construction.
+
+**CORRECTION — `0x09249249` is NOT an empty-slot sentinel.** This document said it was. It is the
+Morton dilation mask, used as a literal by the key generator. In the captured parent view it happens
+to behave as an out-of-range terminator, but that may be an intentional empty value, a Morton key
+left in repurposed scratch, or another phase's encoding. Call it an **observed OOB/unused value**
+until its producing store is identified.
+
+**Naming:** the "malformed head/tail pair" score is measuring a real property, but the neutral name
+is **unpaired sibling records**. Keep it as a quantitative correlation and do NOT promote "must be
+zero" to a correctness rule: clean samples tolerate up to 13, and the slot-level causal test failed.
+A sharper check is whether the active-node count predicts exactly 1,031 sibling pairs.
+
+## Access direction: eight touchers, FIVE may-writers
+
+Codex joined the census's `fetch-pc` values to the retained guest instructions. MUBUF `0x0c..0x0e`
+are loads, `0x1c..0x1e` are stores:
+
+| program | watched instructions | direction |
+| --- | --- | --- |
+| `0x413ce3400` | pc35, 66, 68 … 421, all `buffer_load_dword{,x2}` | **read only** |
+| `0x413ce6000` | pc36 `buffer_load_dword` | **read only** |
+| `0x413cea300` | terminator-only, `fetch-pc=0xffffffff` | **no data access** |
+| `0x413cee500` | pc274 `buffer_store_dwordx3` | **write** |
+| `0x413d88400` | 18 watched pcs, all stores | **write** |
+| `0x413dc3400` | pc597/608/620/632/644/656 stores | **write** |
+| `0x413dc6700` | pc91 load; pc53/65 and 618..677 stores | **read/write** |
+| `0x413e1c300` | pc86/95 loads x3; pc166/176 stores x3 | **read/write** |
+
+So the may-write set is **`0x413cee500`, `0x413d88400`, `0x413dc3400`, `0x413dc6700`,
+`0x413e1c300`**. The two read-only programs and the terminator leave the writer investigation.
+
+**A statically writable descriptor whose range contains the address is a CANDIDATE writer**, not
+proof that a given invocation wrote that 4-byte slot; changed-byte pre/post evidence closes that.
+
+**Address-boundary caveat that must not be lost:** `0x413e1c300`'s observed view is
+`base=0x20f8482140 size=33024`, and `base + size == 0x20f848a240` **exactly**. It therefore may write
+the first table and proves nothing about the second. The census must be re-run for `0x20f848a240`
+before this eight-program set is carried across both ping-pong tables.
+
+## No guest-side escape makes a reachable cycle safe
+
+Checked by Codex against the retained ISA: the pre-loop bound only excludes padded threads (on the
+problematic shape `s18 = 2063` and the launch has 2,063 guest threads, so every active root is
+represented); the loop has no iteration count and no cycle detector; `v_cmpx_ne_u32` only retires
+lanes reaching index zero, so a lane inside a cycle stays active forever; and the `s24` comparison
+happens **after** the walk, so it cannot guard entry.
+
+A builder may hold transiently inconsistent parent links while constructing the hierarchy. Hardware
+still cannot launch this consumer on reachable cyclic links — they must be repaired before it,
+excluded from its active root set, or absent from the bytes it consumes.
+
 ## The current account — read this before anything below it
 
 This document is layered: it grew as an investigation log, and several sections below are historical

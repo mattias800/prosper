@@ -563,7 +563,7 @@ int main() {
               {}, {captured_compute},
               {{SubmitOperationKind::Dispatch, 0u, 1u}}, metadata,
               capture_reader, captured, capture_error) &&
-              captured.format_version == 54u && captured.computes.size() == 1u &&
+              captured.format_version == 55u && captured.computes.size() == 1u &&
               captured.computes[0].resources.resources[0].internal_bytes.size() ==
                   compiled_source->host_data_size,
           "capture stores the dispatch-owned relocation snapshot as v53 internal bytes");

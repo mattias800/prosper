@@ -303,6 +303,67 @@ int main() {
               false, true, true, VK_COMPARE_OP_NEVER),
           "a depth write masked by NEVER does not claim writer recency");
 
+    // DB_DEPTH_VIEW slice identity. A cube shadow map is ONE six-layer guest allocation: all six
+    // faces share a depth base and the guest selects the face with DB_DEPTH_VIEW.SLICE_START/MAX.
+    // GTA V programs exactly these values against one base, one per face.
+    {
+        struct { uint32_t view, start, max; } const faces[] = {
+            {0x02000000u, 0u, 0u}, {0x02002001u, 1u, 1u}, {0x02004002u, 2u, 2u},
+            {0x02006003u, 3u, 3u}, {0x02008004u, 4u, 4u}, {0x0200a005u, 5u, 5u},
+        };
+        bool decoded = true;
+        for (const auto& face : faces)
+            decoded = decoded &&
+                prosper::test::ds_depth_view_slice_start(face.view) == face.start &&
+                prosper::test::ds_depth_view_slice_max(face.view) == face.max;
+        CHECK(decoded, "DB_DEPTH_VIEW decodes SLICE_START/MAX for all six cube faces");
+
+        // Exercise the PRODUCTION construction seam, not a hand-built key. Building PersistentDsKey
+        // directly asserts only that the struct has a slice field and stays green if the backend's
+        // decode is reverted; persistent_ds_key_for() is the function the backend actually calls.
+        {
+            prosper::gpu::ResolvedPipelineState face0{}, face1{};
+            face0.depth_read_base = face1.depth_read_base = 0x20d5cbe000ull;
+            face0.depth_write_base = face1.depth_write_base = 0x20d5cbe000ull;
+            face0.db_depth_view = 0x02000000u;   // SLICE_START=MAX=0
+            face1.db_depth_view = 0x02002001u;   // SLICE_START=MAX=1
+            const auto k0 = prosper::test::persistent_ds_key_for(
+                face0, 0, 512, 512, static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT));
+            const auto k1 = prosper::test::persistent_ds_key_for(
+                face1, 0, 512, 512, static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT));
+            CHECK(k0.slice == 0u && k1.slice == 1u,
+                  "the production DS identity derives its slice from DB_DEPTH_VIEW");
+            CHECK(!(k0 == k1),
+                  "two cube faces built through the production seam are distinct identities");
+        }
+
+        // The regression proper: two faces of one cube differ ONLY in slice, and must not collide.
+        // Before slice joined the key they shared one entry, so each face render reused and
+        // overwrote the previous face's host image and only the last face survived -- a corruption
+        // of retained depth that no consumer could recover a valid cube from.
+        constexpr uint64_t kCubeBase = 0x20d5cbe000ull;
+        constexpr uint32_t kFaceW = 512, kFaceH = 512;
+        auto face_key = [&](uint32_t slice) {
+            return prosper::test::PersistentDsKey{
+                kCubeBase, kCubeBase, 0, 0, 0, kFaceW, kFaceH,
+                static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT), slice};
+        };
+        CHECK(!(face_key(0) == face_key(1)),
+              "two cube faces of one allocation are distinct DS identities");
+        auto& cache = prosper::test::persistent_ds_cache();
+        const size_t before = cache.size();
+        auto& face0 = cache[face_key(0)];
+        auto& face5 = cache[face_key(5)];
+        face0.image = (VkImage)(uintptr_t)0x501; face0.layout_initialized = true;
+        face5.image = (VkImage)(uintptr_t)0x505; face5.layout_initialized = true;
+        CHECK(cache.size() == before + 2,
+              "six-layer cube retains one host image per face, not one for all six");
+        CHECK(face0.image != face5.image && cache[face_key(0)].image == face0.image,
+              "a later face render does not overwrite an earlier face's retained image");
+        cache.erase(face_key(0));
+        cache.erase(face_key(5));
+    }
+
     // Exercise the actual D32/D32S8 sibling selector, not just the predicate above. A read-only
     // touch of the older format must not steal recency from the surface that was really written.
     {
@@ -404,6 +465,176 @@ int main() {
         consumer.R = {bridged}; consumer.vcount = 3;
         std::vector<uint8_t> via_bridge = prosper::test::render_draws_rgba({consumer}, W, H);
         CHECK(via_bridge.size() == (size_t)W * H * 4, "bridged consumer rendered");
+
+        // #2550 review round 4: a depth-feedback SPLIT must not lose MRT2's pixels when the slot
+        // is not persistent.
+        //
+        // Segment 1 writes depth and RED to MRT2. The consumer above samples that same depth, which
+        // is a write->sample transition, so depth_feedback_split_index() forces a physical pass
+        // boundary between them. `color_target` is null here -- the state every path with live GPU
+        // targets disabled runs in -- so MRT2 has no persistent identity and the second segment gets
+        // a fresh transient attachment. The earlier segment's pixels reach it only by being read
+        // back and seeded in.
+        //
+        // Before that carry existed, the final MRT2 came back cleared: the shape and the load flags
+        // were already correct, so nothing else in the suite could see it.
+        {
+            const uint32_t mrt0_and_mrt2[] = {
+                0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,   // v0..3 = GREEN
+                0xF800100Fu, 0x03020100u,                             // exp mrt0  (vm)
+                0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,   // v4..7 = RED
+                0xF800182Fu, 0x07060504u,                             // exp mrt2  (vm, done)
+                0xBF810000u,
+            };
+            std::vector<uint32_t> split_fs =
+                recompile_fragment(mrt0_and_mrt2, std::size(mrt0_and_mrt2));
+            CHECK(!split_fs.empty(), "#2550: MRT0+MRT2 depth-writing producer recompiles");
+            if (!split_fs.empty()) {
+                // MRT2 needs its OWN write mask and format: `producer` sets only the named slot-0
+                // mask, and a zero per-slot mask masks the shader's MRT2 export straight out. The
+                // first version of this fixture missed that and read black for the right reason at
+                // the wrong layer.
+                ResolvedPipelineState split_producer = producer;
+                split_producer.color_targets[2].write_mask = 0xFu;
+                split_producer.color_targets[2].format =
+                    static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+                prosper::test::BackendDraw writer;
+                writer.vs = vert_z; writer.fs = split_fs; writer.ps = &split_producer;
+                writer.vcount = 3;
+                prosper::test::BackendMrtOutputs split_out;
+                split_out.color_count = 3;
+                // Deliberately NO BackendColorTarget: this is the non-persistent path.
+                std::vector<uint8_t> split_c0 = prosper::test::render_draws_rgba(
+                    {writer, consumer}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true,
+                    /*color_target=*/nullptr, nullptr, nullptr, nullptr, nullptr, true,
+                    &split_out);
+
+                // The split must actually have happened, or this proves nothing about carrying.
+                const std::vector<prosper::test::BackendDraw> split_draws{writer, consumer};
+                CHECK(prosper::test::depth_feedback_split_index(split_draws, W, H) == 1u,
+                      "#2550: the depth write->sample transition forces a physical pass split");
+                CHECK(split_c0.size() == (size_t)W * H * 4 &&
+                          split_out.colors[2].size() == (size_t)W * H * 4,
+                      "#2550: a split pass still reads back MRT2 at full extent");
+                if (split_out.colors[2].size() == (size_t)W * H * 4) {
+                    const uint8_t* m2 =
+                        &split_out.colors[2][(((size_t)H / 2) * W + W / 2) * 4];
+                    std::printf("  split MRT2 center=(%u,%u,%u)\n", m2[0], m2[1], m2[2]);
+                    CHECK(m2[0] > 0xC0 && m2[2] < 0x40,
+                          "#2550: segment 1's RED survives the split into the final MRT2");
+                }
+            }
+        }
+
+        // A NON-ZERO MRT2 identity with backend persistence DISABLED. This is the case a carry
+        // decision keyed on the identity gets wrong: the contract says "retained", the backend
+        // creates a transient image anyway, and the next segment starts from a cleared attachment.
+        // The same happens on an over-budget allocation fallback, which leaves the identity
+        // non-zero too -- so the wrapper does not predict residency, it captures unconditionally.
+        {
+            const uint32_t mrt0_and_mrt2_id[] = {
+                0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+                0xF800100Fu, 0x03020100u,
+                0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,
+                0xF800182Fu, 0x07060504u,
+                0xBF810000u,
+            };
+            std::vector<uint32_t> id_fs =
+                recompile_fragment(mrt0_and_mrt2_id, std::size(mrt0_and_mrt2_id));
+            if (!id_fs.empty()) {
+                ResolvedPipelineState id_producer = producer;
+                id_producer.color_targets[2].write_mask = 0xFu;
+                id_producer.color_targets[2].format =
+                    static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+                prosper::test::BackendDraw id_writer;
+                id_writer.vs = vert_z; id_writer.fs = id_fs; id_writer.ps = &id_producer;
+                id_writer.vcount = 3;
+                prosper::test::BackendColorTarget id_target{};
+                id_target.persistent_id = 0x20aa0000ull;
+                id_target.persistent_id_slots[2] = 0x20aa2000ull;   // non-zero: "retained"
+                prosper::test::BackendMrtOutputs id_out;
+                id_out.color_count = 3;
+#ifdef _WIN32
+                _putenv_s("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS", "1");
+#else
+                setenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS", "1", 1);
+#endif
+                std::vector<uint8_t> id_c0 = prosper::test::render_draws_rgba(
+                    {id_writer, consumer}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true,
+                    &id_target, nullptr, nullptr, nullptr, nullptr, true, &id_out);
+#ifdef _WIN32
+                _putenv_s("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS", "");
+#else
+                unsetenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS");
+#endif
+                CHECK(id_c0.size() == (size_t)W * H * 4 &&
+                          id_out.colors[2].size() == (size_t)W * H * 4,
+                      "#2550: a split with a non-zero identity still reads back MRT2");
+                if (id_out.colors[2].size() == (size_t)W * H * 4) {
+                    const uint8_t* m2 = &id_out.colors[2][(((size_t)H / 2) * W + W / 2) * 4];
+                    std::printf("  split MRT2 (id set, persistence off) center=(%u,%u,%u)\n",
+                                m2[0], m2[1], m2[2]);
+                    CHECK(m2[0] > 0xC0 && m2[2] < 0x40,
+                          "#2550: a non-zero identity does not establish residency -- MRT2 still "
+                          "survives the split with backend persistence disabled");
+                }
+            }
+        }
+
+        // The same split, for MRT1, through the LIVE RENDERER's calling convention: `out_rgba1` is
+        // null and slot 1 arrives via BackendMrtOutputs. On that path the non-final segment's
+        // slot-1 readback landed in `intermediate_mrt.colors[1]` while the wrapper only carried a
+        // seed forward inside `if (out_rgba1)`, so MRT1 was lost on every split -- and the MRT2 test
+        // above cannot see it, because it deliberately jumps from MRT0 to MRT2.
+        {
+            const uint32_t mrt0_and_mrt1[] = {
+                0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,   // v0..3 = GREEN
+                0xF800100Fu, 0x03020100u,                             // exp mrt0  (vm)
+                0x7E0802F2u, 0x7E0A0280u, 0x7E0C0280u, 0x7E0E02F2u,   // v4..7 = RED
+                0xF800181Fu, 0x07060504u,                             // exp mrt1  (vm, done)
+                0xBF810000u,
+            };
+            std::vector<uint32_t> split1_fs =
+                recompile_fragment(mrt0_and_mrt1, std::size(mrt0_and_mrt1));
+            CHECK(!split1_fs.empty(), "#2550: MRT0+MRT1 depth-writing producer recompiles");
+            if (!split1_fs.empty()) {
+                // Slot 1's blend write mask comes from the NAMED color1_write_mask
+                // (render_runner.h:5161), not from the per-slot array -- the established slot-0/1
+                // convention. Setting only the array leaves attachment 1 masked off, and the test
+                // then reads the clear colour and blames the carry. Set both, as render_state.cpp
+                // does when it resolves a real draw.
+                ResolvedPipelineState split1_producer = producer;
+                split1_producer.color1_write_mask = 0xFu;
+                split1_producer.color_targets[1].write_mask = 0xFu;
+                split1_producer.color1_format =
+                    static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+                split1_producer.color_targets[1].format =
+                    static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+                prosper::test::BackendDraw writer1;
+                writer1.vs = vert_z; writer1.fs = split1_fs; writer1.ps = &split1_producer;
+                writer1.vcount = 3;
+                prosper::test::BackendMrtOutputs split1_out;
+                split1_out.color_count = 2;
+                // out_rgba1 = nullptr, exactly as the live renderer calls it.
+                std::vector<uint8_t> split1_c0 = prosper::test::render_draws_rgba(
+                    {writer1, consumer}, W, H, nullptr, nullptr, /*persist_depth_stencil=*/true,
+                    /*color_target=*/nullptr, nullptr, nullptr, /*out_rgba1=*/nullptr, nullptr,
+                    true, &split1_out);
+                const std::vector<prosper::test::BackendDraw> split1_draws{writer1, consumer};
+                CHECK(prosper::test::depth_feedback_split_index(split1_draws, W, H) == 1u,
+                      "#2550: the MRT1 fixture also splits at the depth write->sample transition");
+                CHECK(split1_c0.size() == (size_t)W * H * 4 &&
+                          split1_out.colors[1].size() == (size_t)W * H * 4,
+                      "#2550: a split pass reads back MRT1 through BackendMrtOutputs");
+                if (split1_out.colors[1].size() == (size_t)W * H * 4) {
+                    const uint8_t* m1 =
+                        &split1_out.colors[1][(((size_t)H / 2) * W + W / 2) * 4];
+                    std::printf("  split MRT1 center=(%u,%u,%u)\n", m1[0], m1[1], m1[2]);
+                    CHECK(m1[0] > 0xC0 && m1[2] < 0x40,
+                          "#2550: segment 1's RED survives the split into the final MRT1");
+                }
+            }
+        }
 
         std::vector<uint8_t> zeros((size_t)W * H * 4, 0);
         prosper::test::FrameResource unbridged = bridged;

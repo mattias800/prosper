@@ -823,10 +823,88 @@ int main(int argc, char** argv) {
     std::filesystem::remove(runtime, ec);
     std::filesystem::remove(runtime_capture, ec);
     std::filesystem::remove(predecessor_capture, ec);
+    // #2550 review round 2: test the ORDERING and the BASELINE, not predicates that merely return
+    // the right answer. The previous version called two pure helpers directly, so moving the cap
+    // check back below the capture, or deleting the baseline latch, left every assertion green.
+    // These drive the production seams and observe whether the injected capture step ran.
+    {
+        using prosper::gpu::FrameBundleAppendOutcome;
+        using prosper::gpu::FrameBundleAppendState;
+
+        // At the cap: the capture step must NOT run, and the already-appended submits and the
+        // failed flag must be untouched. This is the "a failing N+1 submit preserves the first N"
+        // property -- at the cap the N+1 capture never executes, so it cannot fail the bundle.
+        int ran = 0;
+        FrameBundleAppendState at_cap{true, false, 40, 40};
+        auto never_ok = [&]() { ++ran; return false; };
+        const auto capped = prosper::gpu::frame_bundle_append_submit(at_cap, never_ok);
+        CHECK(capped == FrameBundleAppendOutcome::Capped && ran == 0,
+              "at the submit cap the capture step does not run");
+        CHECK(!at_cap.failed && at_cap.submits_appended == 40,
+              "a capped submit preserves the bundle: not failed, count unchanged");
+
+        // Below the cap the step runs and the count advances.
+        ran = 0;
+        FrameBundleAppendState below{true, false, 39, 40};
+        auto ok = [&]() { ++ran; return true; };
+        CHECK(prosper::gpu::frame_bundle_append_submit(below, ok) ==
+                      FrameBundleAppendOutcome::Appended &&
+                  ran == 1 && below.submits_appended == 40 && !below.failed,
+              "below the cap the capture step runs and the submit is appended");
+
+        // A genuine capture failure below the cap does mark the bundle failed -- the cap changes
+        // WHEN the step runs, never whether a real failure is honoured.
+        ran = 0;
+        FrameBundleAppendState failing{true, false, 1, 40};
+        CHECK(prosper::gpu::frame_bundle_append_submit(failing, never_ok) ==
+                      FrameBundleAppendOutcome::Failed &&
+                  ran == 1 && failing.failed && failing.submits_appended == 1,
+              "a capture failure below the cap fails the bundle and appends nothing");
+
+        // Uncapped, and the closed-window cases.
+        ran = 0;
+        FrameBundleAppendState uncapped{true, false, 1000000, 0};
+        CHECK(prosper::gpu::frame_bundle_append_submit(uncapped, ok) ==
+                      FrameBundleAppendOutcome::Appended && ran == 1,
+              "a zero cap never caps, however many submits have been appended");
+        ran = 0;
+        FrameBundleAppendState closed{false, false, 0, 40};
+        FrameBundleAppendState already_failed{true, true, 0, 40};
+        CHECK(prosper::gpu::frame_bundle_append_submit(closed, ok) ==
+                      FrameBundleAppendOutcome::NotCapturing &&
+                  prosper::gpu::frame_bundle_append_submit(already_failed, ok) ==
+                      FrameBundleAppendOutcome::NotCapturing && ran == 0,
+              "a closed or already-failed window runs no capture step");
+    }
+    {
+        using prosper::gpu::FrameBundleWindowCounters;
+        // Two windows over one process. The counters are process totals, so the second window must
+        // report only its own activity -- deleting the latch in frame_bundle_open_window() makes
+        // this report the totals and fails here.
+        FrameBundleWindowCounters baseline{};
+        prosper::gpu::frame_bundle_open_window(baseline, {10, 3, 2});
+        const auto first = prosper::gpu::frame_bundle_window_report({14, 5, 2}, baseline);
+        CHECK(first.reached == 4 && first.inactive == 2 && first.not_capturing == 0,
+              "a window reports activity since it opened, not since process start");
+
+        prosper::gpu::frame_bundle_open_window(baseline, {14, 5, 2});
+        const auto second = prosper::gpu::frame_bundle_window_report({14, 5, 2}, baseline);
+        CHECK(second.reached == 0 && second.inactive == 0 && second.not_capturing == 0,
+              "a second window with no activity reports zero, not the first window's counts");
+
+        // Saturating: a missed or late latch must print 0, never a wrapped count near 2^64.
+        FrameBundleWindowCounters late{};
+        prosper::gpu::frame_bundle_open_window(late, {90, 90, 90});
+        const auto backwards = prosper::gpu::frame_bundle_window_report({5, 5, 5}, late);
+        CHECK(backwards.reached == 0 && backwards.inactive == 0 && backwards.not_capturing == 0,
+              "a baseline above the total saturates to zero instead of wrapping");
+    }
+
     std::filesystem::remove(bundle_capture, ec);
     std::filesystem::remove(compat_v2, ec);
     std::filesystem::remove(version1, ec);
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
+
     return 0;
 }
