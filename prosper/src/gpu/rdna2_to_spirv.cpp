@@ -4605,7 +4605,44 @@ uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in);
 uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);
 }
 
-inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
+// What a surviving read of R is allowed to be.
+//
+// AnyRead     -- R must not be read at all before it is redefined. The original and default proof.
+// MaskDomainOnly -- R may be read as 32-bit scalar DATA, but not by a lane-mask consumer. Only
+//                meaningful for a VCC half, and only sound because prosper models a VCC half written
+//                by a B32 scalar op as scalar data with its own storage: a 32-bit read of that half
+//                reproduces the written dword exactly, while a MASK read would need the per-lane
+//                predicate the scalar model deliberately does not reconstruct.
+//
+// The distinction is 32-bit-ness, not explicitness, and that is the whole subtlety: a VOP3
+// `v_cndmask_b32 v0, v1, v2, vcc` names VCC explicitly and still reads the mask domain. Every
+// mask consumer reads the PAIR, so requiring `scalar_alu_source_words(...) == 1` excludes all of
+// them -- VOP3 cndmask, VOP3B carry-in, `s_mov_b64 exec, vcc`, and B64 mask logic alike -- without
+// enumerating them. The e32 implicit readers and the vccz/vccnz branches are rejected earlier and
+// unconditionally, so they are excluded on both paths.
+enum class ScalarMergeProof { AnyRead, MaskDomainOnly };
+
+// Why the proof failed, for the reject message. A liveness proof that reports only "failed" makes
+// every widening of it a guess: the first attempt at MaskDomainOnly did not accept the GTA V kernel
+// it was written for, and without the blocking pc there was no way to tell whether the walk stopped
+// at a mask read, a data read, or an unmodelled opcode -- three different follow-ups.
+struct ScalarMergeBlocker {
+    uint32_t pc = UINT32_MAX;
+    const char* kind = "none";
+};
+
+inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
+                               ScalarMergeProof proof = ScalarMergeProof::AnyRead,
+                               ScalarMergeBlocker* blocker = nullptr) {
+    const auto block = [&](const Rdna2Inst& at, const char* kind) {
+        if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
+        return false;
+    };
+    // MaskDomainOnly is a VCC-half question by construction: an ordinary SGPR has no mask domain,
+    // so the relaxation would silently become "reads are fine", which is not a proof of anything.
+    if (proof == ScalarMergeProof::MaskDomainOnly && R != 106 && R != 107)
+        return false;
+    const bool data_read_ok = proof == ScalarMergeProof::MaskDomainOnly;
     // Prove liveness over the actual scalar CFG, not just lexical order. UE4 commonly places another
     // forward EXECZ after an if/merge and only then overwrites the scratch SGPR/VCC value. A linear
     // scan used to reject that safe shape merely because it encountered the second branch. Explore
@@ -4630,8 +4667,10 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
         // SMEM carve-out needs — compilers love `s_buffer_load_dword vcc_lo, …` scratch loads).
         if (R == 106 || R == 107) {
             if (in.fmt == Rdna2Format::VOP2 &&
-                (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2A))) return false;
-            if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) return false;
+                (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2A)))
+                return block(in, "vop2-implicit-vcc");
+            if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07))
+                return block(in, "vccz-branch");
         }
         switch (in.fmt) {
             // Most SOPK instructions remain fail-closed: s_addk/s_mulk/s_cmovk/s_cmpk read or
@@ -4646,7 +4685,7 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     if (in.dst.value == R) continue;
                     break;
                 }
-                return false;
+                return block(in, "unmodelled-sopk");
             case Rdna2Format::SOPP:
                 // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
                 // after the merge). A barrier is also scalar-register-transparent; it changes only
@@ -4667,7 +4706,7 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     }
                     continue;
                 }
-                return false;
+                return block(in, "unmodelled-sopp");
             case Rdna2Format::SMEM: {
                 // s_load/s_buffer_load: reads the SBASE pair (src[0], 2 regs) + SOFFSET (src[1]);
                 // redefines N consecutive dst SGPRs. Anything not a plain load -> bail.
@@ -4676,11 +4715,14 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     case 0x0: case 0x8: n = 1;  break;   case 0x1: case 0x9: n = 2;  break;
                     case 0x2: case 0xA: n = 4;  break;   case 0x3: case 0xB: n = 8;  break;
                     case 0x4: case 0xC: n = 16; break;
-                    default: return false;
+                    default: return block(in, "unmodelled-smem");
                 }
-                if (in.src[0].value == R || in.src[0].value + 1 == R) return false;         // SBASE read
+                if (in.src[0].value == R || in.src[0].value + 1 == R)
+                    return block(in, "smem-sbase");                                          // SBASE read
+                // SOFFSET is one dword and is consumed as an address, never as a lane mask.
                 if ((in.src[1].kind == OperandKind::SGPR || in.src[1].kind == OperandKind::Special) &&
-                    in.src[1].value == R) return false;                                     // SOFFSET read
+                    in.src[1].value == R && !data_read_ok)
+                    return block(in, "smem-soffset");                                        // SOFFSET read
                 if (R >= in.dst.value && R < in.dst.value + (int)n) continue;  // redefined: this path is dead
                 break;
             }
@@ -4694,8 +4736,9 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 const uint32_t implicit_read_width =
                     scalar_implicit_destination_read_width(in);
                 if (implicit_read_width && R >= in.dst.value &&
-                    R < in.dst.value + static_cast<int>(implicit_read_width))
-                    return false;
+                    R < in.dst.value + static_cast<int>(implicit_read_width) &&
+                    !(data_read_ok && implicit_read_width == 1))
+                    return block(in, "implicit-dst-rmw");
                 for (int k = 0; k < in.n_src; k++) {
                     if (in.src[k].kind != OperandKind::SGPR &&
                         in.src[k].kind != OperandKind::Special) continue;
@@ -4705,8 +4748,12 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     const uint32_t words = scalar_alu_source_words(in, k);
                     if (words == UINT32_MAX) continue;
                     if (R >= in.src[k].value &&
-                        R < in.src[k].value + static_cast<int>(words))
-                        return false;
+                        R < in.src[k].value + static_cast<int>(words)) {
+                        // A one-dword source is a scalar-data read. Anything wider reads the pair,
+                        // which is exactly the set of lane-mask consumers.
+                        if (data_read_ok && words == 1) continue;
+                        return block(in, words == 1 ? "source-dword" : "source-pair");
+                    }
                 }
                 // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
                 if (in.sdst.kind == OperandKind::SGPR &&
@@ -6052,11 +6099,28 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                     (r.dst.kind != OperandKind::SGPR && r.dst.kind != OperandKind::Special)) continue;
                 for (int vcc_half = 106; vcc_half <= 107; ++vcc_half) {
                     if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width) continue;
-                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half)) {
+                    // PROSPER_VCC_SCALAR_DATA_MERGE=1 widens the proof from "not read" to "not read
+                    // as a lane mask". The guard this loop implements is about the MASK domain --
+                    // its own comment says so -- but the test it applies is total liveness, so a
+                    // half that survives the merge only to be read as a 32-bit scalar dword is
+                    // rejected even though the scalar model reproduces that dword exactly.
+                    //
+                    // Opt-in rather than default because the same physical pair being a mask on one
+                    // predecessor and data on another has no runtime type tag, and this file already
+                    // rejects that join deliberately. Keeping it behind a switch also makes the A/B
+                    // have a lever that can be shown to have moved, which a byte-identical module
+                    // has already cost this investigation once.
+                    static const bool relax_vcc_scalar_data =
+                        std::getenv("PROSPER_VCC_SCALAR_DATA_MERGE") != nullptr;
+                    const ScalarMergeProof proof = relax_vcc_scalar_data
+                        ? ScalarMergeProof::MaskDomainOnly : ScalarMergeProof::AnyRead;
+                    ScalarMergeBlocker blocker;
+                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half, proof, &blocker)) {
                         log_recompile_diagnostic(
                             diagnostic, "compute-struct-reject", "route-decline",
-                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge pc=%u",
-                            in.pc, r.pc, vcc_half, region_end);
+                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge pc=%u "
+                            "blocked-by pc=%u kind=%s",
+                            in.pc, r.pc, vcc_half, region_end, blocker.pc, blocker.kind);
                         return reject();
                     }
                 }
