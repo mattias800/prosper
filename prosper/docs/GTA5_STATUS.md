@@ -211,6 +211,40 @@ descriptor that does not resolve rather than an instruction that is not implemen
 | `0x205b657200` | 313 | MIMG `op=0xe6` |
 | `0x205b658800` | 82 | SOP1 `op=0x3` |
 
+## `0x209cc76000` is a SHARED POOL with 23 writers, not a dedicated record array (2026-08-15)
+
+Watching the **whole** 132,032-byte range (`PROSPER_COMPUTE_TREE_WATCH=0x209cc76000:33008`) rather
+than its first 8 KB finds **23 distinct writing programs**, not the seven the narrower window showed:
+
+```
+0x413e15400 652   0x413e14200 651   0x413e14500 651   0x413cf9200 603   0x413cf9000 569
+0x413cdc200 218   0x413cf5400  43   0x413cf6100  43   0x413ce6000  32   0x413e1ff00  31
+0x413ced900  10   0x413d1bf00   9   0x413d21600   8   0x413dc3400   6   0x413d87800   5
+0x413e16400   5   0x413e13000   3   0x413e14900   2   0x413d21800   1   0x413d21c00   1
+0x413d22000   1   0x413d22b00   1   0x413e13200   1
+```
+
+**So this is a shared scratch pool that many programs reuse across phases**, exactly like the
+traversal table itself. `132032 = 2063 x 64` is how `0x413dc3400` and `0x413ce6000` *view* it, not
+proof that the allocation belongs to them.
+
+Two consequences for anything built on the earlier analysis:
+
+- **"The only program binding the full array is `0x413ce6000`" was a statement about the narrow
+  window.** Over the full range there are 23 writers, and the three busiest — `0x413e14200`,
+  `0x413e14500`, `0x413e15400`, ~650 changes each — were entirely invisible to every census before
+  this one. A watch window narrower than the buffer under study reports a writer set that is
+  guaranteed incomplete.
+- **The tag histograms remain valid** because they were captured by the aux dump *at the builder's
+  own dispatch*, which is the only moment that matters. But attributing a tag change to a producer is
+  not possible from writer counts alone with 23 of them interleaved; it needs the last-writer-per-
+  record, which nothing currently records.
+
+The early phase is visible in the same data and is a different workload: at submit 3864
+`0x413ced900` leaves the pool all-zero (`{0: 2063}`) and `0x413d1bf00` fills it progressively over
+eight dispatches. Tag distributions there span all eight values, unlike the two-regime pattern at
+builder time.
+
 ## The builder's INPUT differs between the two regimes (2026-08-15)
 
 `PROSPER_COMPUTE_TREE_WATCH_AUX=0x209cc76000:33008` captures the 2,063 x 64-byte record array
