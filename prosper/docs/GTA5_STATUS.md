@@ -399,6 +399,37 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## The BVH descriptor resolves only when SCC does (2026-08-15)
+
+`PROSPER_DYNTRACE_SGPR=19` on `0x205b654a00`, now that the watch prints a real program identity:
+
+```
+pc=1171 s19 <- FORGOTTEN words=821380c1        pc=1171 s19 <- KNOWN 0x00000000
+pc=1177 s19 <- FORGOTTEN words=8813ff6a        pc=1177 s19 <- KNOWN 0x81000000
+```
+
+**The descriptor's dword3 resolves on some dispatches and not others**, ending at `0x81000000` when
+it does. pc1171 is `s_addc_u32 s19, -1, 0` — **both operands are inline constants**, so the only
+input that can make it unknown is **SCC**.
+
+`s_addc_u32` **is** modelled by the fold (`case 0x04`, guarded by `if (scc < 0) { ok = false; }`).
+*(I first reported it as unmodelled, from a grep for `kSop2OpcodeAddcU32` that missed the literal
+`0x04` at the case label. Corrected here.)* So the BVH descriptor's resolution reduces to: **is SCC
+tracked across the instructions before pc1171?**
+
+That makes SCC invalidation the lever, and it is exactly what the `s_mulk_i32` change touched — that
+op does not write SCC and the fold was clobbering SCC for it anyway.
+
+**Suggestive but confounded, recorded as such.** Across runs on this branch `0x205b654a00`'s reject
+changed from a `compute-struct-reject` to the pc1180 descriptor reject, and the total skip count fell
+18 → 15 → 14 → 13. Neither is evidence: the runs differ in more than one variable and the route
+reaches different phases. **A clean A/B needs one flag toggled with the artefact hashed first**, which
+is not what these runs were.
+
+**The concrete next step** is a census of what invalidates SCC on the path to pc1171 in this program —
+`scc = -1` has a handful of sites in the fold, and each is either a real SCC write or a conservative
+one like the `s_mulk_i32` case that was corrected.
+
 ## The contract reads a BVH NODE-REFERENCE array as a selector array (2026-08-15)
 
 The selector histogram, taken from the same source records the contract's own domain proof walks:
