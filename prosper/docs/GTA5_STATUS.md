@@ -399,6 +399,36 @@ contract.
 The change is kept on its own merits — it is a documented over-conservatism corrected with ISA
 backing and it costs nothing — not because it was shown to help.
 
+## The BVH descriptor's unresolved word is `s18`, and it depends on VCC_LO (2026-08-15)
+
+Watching each register of the descriptor `s[16:19]` in `0x205b654a00`, one run each:
+
+| register | state before pc1180 | site |
+| --- | --- | --- |
+| `s16` | **KNOWN** at pc1163 | |
+| `s17` | **KNOWN** at pc1176 | |
+| `s18` | **FORGOTTEN** at pc1169 | `words=80126ac1` = `s_add_u32 s18, -1, vcc_lo` |
+| `s19` | KNOWN `0x81000000` on some dispatches | `s_or_b32 s19, s106, 0x81000000` |
+
+**`s18` is the word that fails, and it is `-1 + VCC_LO`.**
+
+So the ray-tracing pass's BVH descriptor cannot resolve because **two of its four words are computed
+from VCC_LO** — `s18` at pc1169 and `s19` at pc1177 — and prosper does not track a value into VCC_LO
+on this path. That is the same obstacle as `0x413ce6000`'s selector and the same one the execz
+liveness guard was about, now demonstrated by direct measurement on the exact register rather than
+inferred from the ISA.
+
+**This is the sharpest statement of the frontier available:** GTA V's compiler uses VCC_LO as a
+general-purpose scalar register, and prosper's descriptor const-fold loses values through it. Two
+programs — the ray-tracing pass and the BVH producer — are declined for exactly this, and between
+them they are the ray-tracing path.
+
+What is *not* established: **where** s106's value is lost in `0x205b654a00`. The register watch will
+say — `PROSPER_DYNTRACE_SGPR=106` filtered to `program=0x205b654a00`, exactly as was done for
+`0x413ce6000` — and that is the next measurement. In `0x413ce6000` the answer was
+`s_andn1_saveexec_b64`, i.e. a genuine lane mask that no fold can resolve; if the same holds here,
+the fix is a contract rather than a fold, and if it does not, it is a fold gap with a named opcode.
+
 ## SCC over-invalidation fixed — and it is NOT what gates the BVH descriptor (2026-08-15)
 
 `PROSPER_DYNTRACE_SCC=1` (added here) reports every transition of the fold's tracked SCC with the pc
