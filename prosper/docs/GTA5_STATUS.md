@@ -78,6 +78,25 @@ both decoding to parent 296), so it is a flag-bit difference and a separate anom
 **Ruled out by this measurement:** the "lost update" / two-writer race account of the cycle. Within
 one dispatch's pre/post pair there is exactly one writer, and its output is cyclic.
 
+## Falsified for `0x413dc3400` (2026-08-15) — checked, not assumed
+
+- **Barrier uniformity.** All eight `OpControlBarrier`s in the emitted module are in uniform blocks.
+  Three sit in each dispatcher's **continue target** (`OpLoopMerge %163 %162` — %162 is the continue
+  block, reached by every invocation on every iteration) and five at structured merge targets. The
+  design comment in `rdna2_to_spirv.cpp` states this invariant explicitly ("the switch merge is
+  reached by every invocation on every iteration"); it holds in the artefact. A barrier inside a
+  `switch(pc)` *case* would have been a real Vulkan uniformity violation — it is not what is emitted.
+- **Native subgroup / multiwave lowering.** `[subgroup] cs=0x413dc3400 … native=0 … multiwave=0`:
+  the program is already lowered through the portable wave model, so there is no native lowering to
+  blame. `PROSPER_NO_NATIVE_COMPUTE_MULTIWAVE=1` leaves all nine of its module hashes byte-identical.
+- **LDS undersizing.** The module declares 384 dwords = 1,536 bytes = 3 × 512-byte
+  `COMPUTE_PGM_RSRC2.LDS_SIZE` granules; Codex's ISA read puts the largest accessed LDS address at
+  byte 1,028. Sized correctly and over-provisioned either way.
+- **A race.** Two different frames produce broken-pair patterns sharing a 60-character suffix
+  exactly, with the same first damaged index. Deterministic given the input.
+- **A lane/wave/workgroup boundary effect.** Damage index mod 2/3/4/8/16 is flat.
+- **An unknown or out-of-bounds writer.** Every observed change reported `toucher=1`.
+
 ## THE SECOND TABLE IS BUILT PERFECTLY — by a different program (2026-08-15)
 
 `PROSPER_COMPUTE_TREE_WATCH=0x20f848a240:2063`, same route. The two addresses are **not** a
