@@ -118,6 +118,12 @@ void log_compute_recompile_skip_diagnostic(const RecompileDiagnosticContext& dia
 // address that nobody could act on.
 std::string last_terminal_reject_reason(uint64_t program_address);
 
+// Test-only hook: record a reject reason exactly as a compile site would, so the skip line's
+// reason plumbing can be exercised without driving a full recompile to a specific internal reject.
+void record_recompile_reject_reason_for_test(const RecompileDiagnosticContext& diagnostic,
+                                             const char* tag, const char* role,
+                                             const char* payload);
+
 // A narrowly-proven compiler-generated scalar jump table. The shader loads a uniform selector from a
 // direct constant buffer, bounds it, scales it by the 64-bit table-entry size, loads a PC-relative
 // target, and reaches it with s_setpc_b64. Arbitrary indirect control flow remains unsupported: this

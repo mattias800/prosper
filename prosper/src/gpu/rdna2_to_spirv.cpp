@@ -122,6 +122,12 @@ void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
 
 } // namespace
 
+void record_recompile_reject_reason_for_test(const RecompileDiagnosticContext& diagnostic,
+                                             const char* tag, const char* role,
+                                             const char* payload) {
+    log_recompile_diagnostic(diagnostic, tag, role, "%s", payload);
+}
+
 std::string last_terminal_reject_reason(uint64_t program_address) {
     std::lock_guard lock(terminal_reject_mutex());
     const auto& reasons = terminal_reject_reasons();
@@ -4685,6 +4691,17 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                     if (in.dst.value == R) continue;
                     break;
                 }
+                // Under MaskDomainOnly the whole read-modify-write SOPK family is admissible. Every
+                // SOPK operates on ONE dword: s_addk_i32/s_mulk_i32 read and rewrite their encoded
+                // destination, s_cmpk_* read it and write SCC, s_cmovk_i32 reads it and may rewrite
+                // it. All three are 32-bit scalar-DATA touches of the half; none can consume it as a
+                // 64-bit lane mask, which is the only thing this proof needs to exclude.
+                //
+                // Deliberately does NOT claim the half died, even for the forms that always write
+                // it: continuing the walk is the conservative direction, and a later genuine mask
+                // read still fails the proof. Being wrong about the kill would be unsound; being
+                // silent about it only costs acceptances.
+                if (data_read_ok && in.dst.kind == OperandKind::SGPR) break;
                 return block(in, "unmodelled-sopk");
             case Rdna2Format::SOPP:
                 // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
