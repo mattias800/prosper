@@ -1829,6 +1829,38 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## Correction: a colour-target census must intersect the WRITE MASK (2026-08-15)
+
+`PROSPER_TARGET_WATCH` and `PROSPER_DRAW_CENSUS` read `CB_COLORn_BASE` for all eight slots and count
+a draw as writing that address. **That over-counts, and the earlier figures published from it are
+wrong.** A base register is sticky: the guest leaves `CB_COLOR4_BASE` programmed long after it stops
+rendering to slot 4, and hardware writes a slot only where `CB_TARGET_MASK & CB_SHADER_MASK` has a
+non-zero nibble for it.
+
+Measured (`PROSPER_MRT_CENSUS`, 16,384 pass groups):
+
+```
+c0 base=16384 format=16384 mask=15590 ACTIVE=15590
+c1 base=11796 format=16384 mask= 2729 ACTIVE= 2729
+c2 base=11796 format=16384 mask=    0 ACTIVE=    0
+c3 base=11796 format=16384 mask=    0 ACTIVE=    0
+c4 base=11796 format=16384 mask=    0 ACTIVE=    0
+```
+
+and over the groups where slot 4 *has* a base, the dominant state is
+`cb_target_mask=0x0000000f cb_shader_mask=0x0000000f` (x11,647) — **slot 0 only**. Both registers are
+present and genuinely narrow; neither is being truncated by prosper, and both default to `0xffffffff`
+when absent, so a zero nibble is real guest state.
+
+**So "0x2085de0000 is written by 130,290 of 131,072 draws, 96% of them in slot 4" is retracted.**
+Those were stale bindings. The renderer is right to drop them, MRT slots 2–7 are not a defect here,
+and the eight-slot census fix — which was itself a correct fix to a slot-0-only census — bought a
+number that still needed the mask to mean anything.
+
+The narrower lesson, which cost two rounds: **an eight-slot census with no mask intersection is not
+"more complete" than a one-slot census, it is differently wrong** — the first under-reports, the
+second over-reports, and only the second looks like progress.
+
 ## Where the picture actually goes (2026-08-15) — and three metrics that lied about it
 
 `tools/gpu_timeline/rtt_pass_graph.py` (new) reassembles a frame's render-pass graph from a

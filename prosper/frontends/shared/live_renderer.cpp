@@ -3784,7 +3784,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         "(cache_size=%zu)\n",
                                         (unsigned long long)sampled_source_addr, tw, th,
                                         (unsigned)r.format,
-                                        rtt_hit ? "HIT"
+                                        // Which hit path, not merely that one hit. A UNIFORM-colour
+                                        // surface samples as one flat value everywhere, so a shader
+                                        // reading it produces correct geometry with no texture
+                                        // detail at all -- visually a smooth gradient inside a
+                                        // correct mask. That is indistinguishable from a real hit
+                                        // in a log that prints one word for all three paths, and it
+                                        // is exactly what GTA V's lighting output looks like.
+                                        has_uniform_live_rtt ? "HIT-UNIFORM"
+                                            : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU" : "HIT-CPU")
                                             : has_ds_live
                                                 ? (sampled_ds.aspect == VK_IMAGE_ASPECT_STENCIL_BIT
                                                        ? "DS-STENCIL" : "DS-DEPTH")
@@ -5636,6 +5644,73 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     if (timing_enabled) ++pending_timing.pass_groups_seen;
                     const uint64_t base = items[pass_i].color0_base;
                     const uint32_t requested_color_count = active_color_count(items[pass_i]);
+                    // PROSPER_MRT_CENSUS=1 — per slot, why an attachment did or did not become
+                    // active. A slot needs all three of base, a known format, and a non-zero write
+                    // mask; if any is absent the attachment is dropped silently and the draws that
+                    // wrote it produce nothing. On GTA V only c1 is ever published, while an exact
+                    // draw census shows 122,028 of 131,072 draws binding a colour target at SLOT 4 --
+                    // so one of these three is missing for that slot and nothing said which.
+                    if (PROSPER_ENV_ON("PROSPER_MRT_CENSUS")) {
+                        struct SlotCensus {
+                            std::atomic<uint64_t> seen{0}, has_base{0}, has_format{0},
+                                has_mask{0}, active{0};
+                        };
+                        static std::array<SlotCensus, prosper::gpu::kColorTargetCount> census;
+                        static std::atomic<uint64_t> groups{0};
+                        const auto& d = items[pass_i];
+                        for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot) {
+                            auto& c = census[slot];
+                            c.seen.fetch_add(1, std::memory_order_relaxed);
+                            if (color_binding(d, slot).base)
+                                c.has_base.fetch_add(1, std::memory_order_relaxed);
+                            if (active_format(d, slot) != VK_FORMAT_UNDEFINED)
+                                c.has_format.fetch_add(1, std::memory_order_relaxed);
+                            if (d.ps.color_targets[slot].write_mask ||
+                                (slot == 0 && d.ps.color_write_mask) ||
+                                (slot == 1 && d.ps.color1_write_mask))
+                                c.has_mask.fetch_add(1, std::memory_order_relaxed);
+                            if (active_color(d, slot))
+                                c.active.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        // WHICH of the two masks is narrow. The write mask is
+                        // cb_target_mask & cb_shader_mask, and both default to 0xffffffff when the
+                        // register was never seen -- so a zero nibble means a register really was
+                        // programmed narrow, and the fix differs completely depending on which.
+                        // Histogrammed only over groups where slot 4 HAS a base, i.e. exactly the
+                        // population where the dropped attachment matters.
+                        if (color_binding(d, 4).base) {
+                            static std::mutex mask_mutex;
+                            static std::map<std::pair<uint32_t, uint32_t>, uint64_t> masks;
+                            std::lock_guard lock(mask_mutex);
+                            if (masks.size() < 64)
+                                ++masks[{d.ps.cb_target_mask, d.ps.cb_shader_mask}];
+                            static uint64_t reported = 0;
+                            if (++reported % 4096 == 0) {
+                                fprintf(stderr, "[mrt-census] masks where c4 has a base:\n");
+                                for (const auto& e : masks)
+                                    fprintf(stderr,
+                                            "[mrt-census]   cb_target_mask=0x%08x "
+                                            "cb_shader_mask=0x%08x -> effective=0x%08x  x%llu\n",
+                                            e.first.first, e.first.second,
+                                            e.first.first & e.first.second,
+                                            (unsigned long long)e.second);
+                            }
+                        }
+                        const uint64_t g = groups.fetch_add(1) + 1;
+                        if ((g & (g - 1)) == 0 && g >= 4096) {
+                            fprintf(stderr, "[mrt-census] pass groups=%llu\n",
+                                    (unsigned long long)g);
+                            for (uint32_t slot = 0; slot < prosper::gpu::kColorTargetCount; ++slot)
+                                fprintf(stderr,
+                                        "[mrt-census]   c%u base=%llu format=%llu mask=%llu "
+                                        "ACTIVE=%llu\n",
+                                        slot,
+                                        (unsigned long long)census[slot].has_base.load(),
+                                        (unsigned long long)census[slot].has_format.load(),
+                                        (unsigned long long)census[slot].has_mask.load(),
+                                        (unsigned long long)census[slot].active.load());
+                        }
+                    }
                     std::array<uint64_t, prosper::gpu::kColorTargetCount> pass_bases{};
                     std::array<VkFormat, prosper::gpu::kColorTargetCount> pass_formats{};
                     for (uint32_t slot = 0; slot < requested_color_count; ++slot) {
@@ -6306,6 +6381,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing.color_target_cached_bytes = color_target_call.cached_bytes;
                         pending_timing.color_target_cached_entries = color_target_call.cached_entries;
                     }
+                    static const std::string dump_spec =
+                        PROSPER_ENV_VALUE("PROSPER_DUMP_PASS")
+                            ? PROSPER_ENV_VALUE("PROSPER_DUMP_PASS") : "";
+                    static const int dump_pass_every =
+                        PROSPER_ENV_VALUE("PROSPER_DUMP_PASS_EVERY")
+                            ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
                     if (base && color_target_call.writes) {
                         RttSurf& surface = g_rtt[base];
@@ -6368,6 +6449,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     "px_nonzero=%zu rgb_nonblack=%zu\n",
                                     slot, (unsigned long long)pass_bases[slot],
                                     gw, gh, pass.size(), nz, rgb_nz);
+                        }
+                        // PROSPER_DUMP_PASS covers slots 1..7 too. The first version dumped only
+                        // `base`, so the busiest target in GTA V's frame -- 0x2085de0000, written by
+                        // 130,290 of 131,072 draws, 96% of them in SLOT 4 -- could not be dumped at
+                        // all, and its absence read as "that pass does not run".
+                        if (!dump_spec.empty() && pass_bases[slot]) {
+                            char needle[24];
+                            std::snprintf(needle, sizeof needle, "0x%llx",
+                                          (unsigned long long)pass_bases[slot]);
+                            if (dump_spec.find(needle) != std::string::npos) {
+                                static std::map<uint64_t, int> slot_counted;
+                                if (slot_counted[pass_bases[slot]]++ % dump_pass_every == 0) {
+                                    const std::vector<uint8_t> shot = inspection_rgba8(
+                                        pixels, gw, gh, pass_formats[slot]);
+                                    const char* dir = getenv("PROSPER_FRAME_DIR");
+                                    char path[512];
+                                    std::snprintf(path, sizeof path, "%s/pass_%llx_s%u_%ux%u.bmp",
+                                                  dir ? dir : ".",
+                                                  (unsigned long long)pass_bases[slot], slot,
+                                                  gw, gh);
+                                    const size_t want = size_t(gw) * gh * 4;
+                                    const bool ok = shot.size() == want &&
+                                        prosper::test::dump_bmp(path, shot, gw, gh);
+                                    fprintf(stderr,
+                                            "[dump-pass] target=0x%llx slot=%u %ux%u src=%zuB -> %s\n",
+                                            (unsigned long long)pass_bases[slot], slot, gw, gh,
+                                            pixels.size(),
+                                            ok ? path : "NO CPU PIXELS (readback deferred)");
+                                }
+                            }
                         }
                         RttSurf& surface = g_rtt[pass_bases[slot]];
                         surface.w = gw;
@@ -6500,18 +6611,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // dumps every PROSPER_DUMP_PASS_EVERY-th occurrence (default 60) because a 4K
                     // BMP is 24 MB and a routed boot renders each of these a few hundred times.
                     {
-                        static const std::string dump_spec =
-                            PROSPER_ENV_VALUE("PROSPER_DUMP_PASS")
-                                ? PROSPER_ENV_VALUE("PROSPER_DUMP_PASS") : "";
                         if (!dump_spec.empty() && base) {
                             char needle[24];
                             std::snprintf(needle, sizeof needle, "0x%llx",
                                           (unsigned long long)base);
                             if (dump_spec.find(needle) != std::string::npos) {
-                                static const int every = PROSPER_ENV_VALUE("PROSPER_DUMP_PASS_EVERY")
-                                    ? std::max(1, atoi(getenv("PROSPER_DUMP_PASS_EVERY"))) : 60;
                                 static std::map<uint64_t, int> counted;
-                                if (counted[base]++ % every == 0) {
+                                if (counted[base]++ % dump_pass_every == 0) {
                                     const std::vector<uint8_t> shot = inspection_rgba8(
                                         rendered_pixels, gw, gh, pass_format);
                                     const char* dir = getenv("PROSPER_FRAME_DIR");

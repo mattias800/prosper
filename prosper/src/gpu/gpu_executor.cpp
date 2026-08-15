@@ -8120,7 +8120,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 // matches a resource three ways: by fetch pc, by SRT offset, and by SGPR base; a
                 // resource carrying `srt=0xffffffff sgpr=0xffffffff` can be matched by none of them
                 // and is invisible to every lookup, however correct its address and size are.
-                if (std::getenv("PROSPER_DBG")) {
+                // Ungated. This block runs at most ONCE PER PROGRAM (it is inside
+                // report_compute_recompile_skip_once), so its cost is twelve programs' worth of
+                // lines on a routed GTA V boot -- while PROSPER_DBG, the gate it used to sit
+                // behind, produces a ~1.5 GB log and desyncs the pad script badly enough that the
+                // route never reaches the phase being diagnosed. A diagnostic reachable only by a
+                // switch that destroys the repro is not reachable. Same reasoning as the skip line
+                // itself, which was ungated for exactly this in an earlier commit.
+                {
                     if (!item.resources || item.resources->resources.empty()) {
                         std::fprintf(stderr,
                                      "[compute-table] program 0x%llx has NO resources at all\n",

@@ -31,7 +31,7 @@ PASS_RE = re.compile(
     r'\[rtt\] pass (?:target|c\d+)=(0x[0-9a-f]+) extent=(\d+)x(\d+).*?\((\d+) draws\) '
     r'px_nonzero=(\d+)(?: rgb_nonblack=(\d+))?')
 SAMPLE_RE = re.compile(
-    r'\[rtt\] sample tex addr=(0x[0-9a-f]+) (\d+)x(\d+) fmt=(\d+) -> (HIT|miss|DS-DEPTH|DS-STENCIL)')
+    r'\[rtt\] sample tex addr=(0x[0-9a-f]+) (\d+)x(\d+) fmt=(\d+) -> (HIT|HIT-GPU|HIT-CPU|HIT-UNIFORM|miss|DS-DEPTH|DS-STENCIL)')
 
 # prosper::gpu::DataFormat, for reading a pass's role off its format rather than guessing from extent.
 FORMATS = {0: 'unknown', 1: 'f32', 2: 'u32', 3: 'i32', 4: 'f16', 5: 'un16', 6: 'sn16', 7: 'u16',
@@ -116,7 +116,9 @@ def main():
             for (addr, iw, ih, ifmt), count, state in summarized:
                 print('             <- %-14s %9s %-12s x%-4d %s' %
                       (addr, '%dx%d' % (iw, ih), fmt_name(ifmt), count,
-                       {'HIT': '', 'DS-DEPTH': 'depth-bridge', 'DS-STENCIL': 'stencil-bridge'}
+                       {'HIT': '', 'HIT-GPU': '', 'HIT-CPU': 'cpu',
+                       'HIT-UNIFORM': 'UNIFORM COLOUR -- no texture detail',
+                       'DS-DEPTH': 'depth-bridge', 'DS-STENCIL': 'stencil-bridge'}
                       .get(state, 'MISS -- guest bytes')))
         print()
     return 0
