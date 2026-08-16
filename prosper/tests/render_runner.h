@@ -2495,7 +2495,6 @@ struct PersistentDsKey {
                w == o.w && h == o.h && fmt == o.fmt && slice == o.slice;
     }
 };
-
 // DB_DEPTH_VIEW.SLICE_START, including its two high bits (SLICE_START occupies bits 0..10 with
 // SLICE_START_HI at 11..12; SLICE_MAX is bits 13..23). A single-face attachment programs
 // START == MAX, which is what a cube face render does.
@@ -2810,8 +2809,45 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             guest_ranges_overlap(addr, size, key.sw, stencil_size);
         const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
         if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
-        if (depth_overlap || htile_overlap) image.depth_valid = false;
-        if (stencil_overlap || htile_overlap) image.stencil_valid = false;
+        // WHICH aspect a write hit, and the byte counts that decided it. The aggregate line at the
+        // end reports how many entries were touched and never which aspect or why, so a surface that
+        // loses its depth to an HTILE overlap looks identical there to one that lost it to a real
+        // depth write.
+        static const bool log_detail = getenv("PROSPER_DSLOG") != nullptr;
+        if (log_detail)
+            fprintf(stderr,
+                    "[ds] invalidate dr=0x%llx sr=0x%llx htile=0x%llx slice=%u depth=%d stencil=%d "
+                    "htile_hit=%d origin=%s addr=0x%llx size=%llu depth_bytes=%llu "
+                    "stencil_bytes=%llu htile_bytes=%llu gap=%lld\n",
+                    (unsigned long long)key.dr, (unsigned long long)key.sr,
+                    (unsigned long long)key.htile, key.slice,
+                    (int)depth_overlap, (int)stencil_overlap, (int)htile_overlap,
+                    prosper::gpu::guest_gpu_write_origin(),
+                    (unsigned long long)addr, (unsigned long long)size,
+                    (unsigned long long)depth_size,
+                    (unsigned long long)stencil_size, (unsigned long long)htile_size,
+                    (long long)((key.sr ? key.sr : key.sw) - (key.dr ? key.dr : key.dw)));
+        // PROSPER_DS_HTILE_INVALIDATE=0 -- experiment arm, default ON (historical behaviour).
+        //
+        // The retained depth image is a Vulkan image; guest memory does not back it. So a guest
+        // write can only invalidate it by making guest memory authoritative for content the image
+        // claims to hold. For the DEPTH and STENCIL planes that is exactly what a write means. For
+        // HTILE it is true of a fast CLEAR (the metadata says "this tile is value X" and the plane
+        // bytes are then ignored) and false of every other HTILE update -- a compute HiZ refresh
+        // rewrites the metadata while the depth values it describes are unchanged.
+        //
+        // GTA V takes the second path 730 times per 200 s route against 135 real stencil writes,
+        // and each one discards a fully rendered 4K depth buffer that the deferred lighting pass
+        // samples on the very next pass. The arm exists to measure that split before any behaviour
+        // is changed; decoding HTILE to tell a clear from a refresh is the actual fix.
+        static const bool htile_invalidates = []() {
+            const char* v = getenv("PROSPER_DS_HTILE_INVALIDATE");
+            return !(v && v[0] == '0');
+        }();
+        const bool htile_kill = htile_overlap && htile_invalidates;
+        if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
+        if (depth_overlap || htile_kill) image.depth_valid = false;
+        if (stencil_overlap || htile_kill) image.stencil_valid = false;
         ++invalidated;
     }
     if (invalidated && getenv("PROSPER_DSLOG"))
@@ -3747,6 +3783,75 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // The #371 approximation picks the compare-appropriate always-pass value; sweeping this
     // instead reveals whether a pass's draws sit at DIFFERENT depths (a mid value culls some
     // draws but not others), i.e. whether real guest depth contents would gate them.
+    // PROSPER_DEPTH_CLEAR_WHY=1 — how a pass's fresh-image depth value was derived, next to what its
+    // draws actually compare with.
+    //
+    // The latch above is FIRST-DRAW-WINS, so one draw fixes the initial value for every later draw in
+    // the pass. #457 already fixed one instance of that class (a stencil-only first draw forcing the
+    // wrong reverse-Z depth value); this reports whether it is happening again on the depth side,
+    // which the derived float alone cannot show. A pass whose draws are predominantly GREATER but
+    // whose value came out 1.0 is rejecting its own geometry.
+    if (getenv("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
+        uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
+        uint32_t greater_colour = 0, less_colour = 0;
+        uint32_t reversed_viewports = 0, forward_viewports = 0;
+        float vp_min = -1.0f, vp_max = -1.0f;
+        int first_op = -1;
+        // What DB_DEPTH_CLEAR actually holds, whether or not a draw enables it. #371 forbids
+        // CONSUMING it without an explicit enable -- Astro Bot leaves packed 1920x1080 max
+        // coordinates in the register, which read as 2.15e-36 and rejected whole scenes -- but
+        // reading it here is free and says whether a plausible clear value is even present on the
+        // passes that need one. A surface fast-cleared through HTILE metadata sets no draw's
+        // depth_clear_enable, so the value it was cleared to is invisible to the latch above.
+        float first_clear_value = -1.0f;
+        for (const auto& d : logical_draws) {
+            if (!d.ps) continue;
+            if (!(d.ps->depth_test_enable || effective_depth_clear(d.ps))) continue;
+            if (first_op < 0) {
+                first_op = static_cast<int>(d.ps->depth_compare_op);
+                first_clear_value = d.ps->depth_clear_value;
+            }
+            // The viewport depth range, which is how a reverse-Z surface declares itself: a guest
+            // using near=1/far=0 programs min_depth=1, max_depth=0. If the range is the ordinary
+            // 0..1 while the compares are GREATER, the reversal lives in the projection matrix
+            // instead and the stored values are what the shader emits.
+            if (d.ps->has_viewport) {
+                if (d.ps->min_depth > d.ps->max_depth) ++reversed_viewports;
+                else ++forward_viewports;
+                vp_min = d.ps->min_depth; vp_max = d.ps->max_depth;
+            }
+            if (d.ps->depth_clear_enable) ++explicit_clear;
+            // Split by whether the draw WRITES COLOUR. The initial value should serve the draws
+            // whose output is lost when they fail, and a depth-only or mask draw loses nothing
+            // visible. Plain majority ignored this and reproduced the old answer on exactly the
+            // passes that matter (7 vs 7, and 6 vs 7 the wrong way).
+            const bool writes_colour = std::any_of(
+                d.ps->color_targets.begin(), d.ps->color_targets.end(),
+                [](const auto& t) { return t.write_mask != 0; });
+            switch (d.ps->depth_compare_op) {
+                case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL:
+                    ++greater; if (writes_colour) ++greater_colour; break;
+                case VK_COMPARE_OP_LESS: case VK_COMPARE_OP_LESS_OR_EQUAL:
+                    ++less; if (writes_colour) ++less_colour; break;
+                default: ++other; break;
+            }
+        }
+        static std::mutex why_mutex;
+        static std::map<std::tuple<uint64_t, float, uint32_t, uint32_t, uint32_t>, uint64_t> seen;
+        std::lock_guard lock(why_mutex);
+        const uint64_t n = ++seen[{color_target ? color_target->persistent_id : 0ull,
+                                   depth_clear, greater, less, other}];
+        if ((n & (n - 1)) == 0)
+            fprintf(stderr,
+                    "[depth-clear-why] target=0x%llx derived=%.3f reg_clear=%.6g first_op=%d "
+                    "explicit=%u compares{greater=%u less=%u other=%u} "
+                    "colour{greater=%u less=%u} vp{min=%g max=%g rev=%u fwd=%u} "
+                    "draws=%zu (x%llu)\n",
+                    (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
+                    depth_clear, first_clear_value, first_op, explicit_clear, greater, less, other,
+                    greater_colour, less_colour, vp_min, vp_max, reversed_viewports,
+                    forward_viewports, logical_draws.size(), (unsigned long long)n);
+    }
     if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
@@ -3822,6 +3927,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
+        // The key carries the PASS extent, so one guest depth surface reached through two passes of
+        // different extent becomes two independent entries -- and the larger one's guest range is
+        // sized from that extent, which is how a 512x512 shadow cascade acquires a 33 MB depth range
+        // that swallows its neighbours. Log the first sighting of each identity so the producing
+        // pass is nameable rather than inferred.
+        static const bool log_new_ds = getenv("PROSPER_DSLOG") != nullptr;
+        if (log_new_ds && !cached_ds->image)
+            fprintf(stderr, "[ds] new-entry dr=0x%llx dw=0x%llx sr=0x%llx slice=%u extent=%ux%u\n",
+                    (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
+                    (unsigned long long)ds_key.sr, ds_key.slice, ds_key.w, ds_key.h);
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
         ds_layout_initialized = cached_ds->layout_initialized;
         depth_was_valid = cached_ds->depth_valid;
@@ -7303,6 +7418,36 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             cached_ds->depth_valid = false;
             cached_ds->stencil_valid = false;
         });
+        // PROSPER_DS_SLICE_CENSUS=1 — per (base, slice): how many passes attached it, and how many
+        // of those actually claimed a depth write. A slice whose entry exists but never becomes
+        // valid is either never really written or is having its write disclaimed here, and those
+        // are different defects. GTA V's cube shadows show exactly that shape: every face has a
+        // cache entry, and slice 0 is never valid.
+        if (getenv("PROSPER_DS_SLICE_CENSUS")) {
+            static std::mutex mutex;
+            struct SliceTally { uint64_t passes = 0, claimed = 0, used_depth = 0, meaningful = 0; };
+            static std::map<std::pair<uint64_t, uint32_t>, SliceTally> tally;
+            static uint64_t n = 0;
+            std::lock_guard lock(mutex);
+            auto& row = tally[{ds_key.dr, ds_key.slice}];
+            ++row.passes;
+            if (use_depth) ++row.used_depth;
+            if (depth_used_meaningfully) ++row.meaningful;
+            if (use_depth && depth_used_meaningfully) ++row.claimed;
+            if (((++n) & (n - 1)) == 0 && n >= 256) {
+                fprintf(stderr, "[ds-slice] after %llu DS passes:\n", (unsigned long long)n);
+                for (const auto& e : tally)
+                    fprintf(stderr,
+                            "[ds-slice]   base=0x%llx slice=%u passes=%llu use_depth=%llu "
+                            "meaningful=%llu claimed_valid=%llu%s\n",
+                            (unsigned long long)e.first.first, e.first.second,
+                            (unsigned long long)e.second.passes,
+                            (unsigned long long)e.second.used_depth,
+                            (unsigned long long)e.second.meaningful,
+                            (unsigned long long)e.second.claimed,
+                            e.second.claimed ? "" : "   <-- never claims a depth write");
+            }
+        }
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;

@@ -29,7 +29,7 @@ import sys
 
 PASS_RE = re.compile(
     r'\[rtt\] pass (?:target|c\d+)=(0x[0-9a-f]+) extent=(\d+)x(\d+).*?\((\d+) draws\) '
-    r'px_nonzero=(\d+)(?: rgb_nonblack=(\d+))?')
+    r'(?:src=(\d+)B )?px_nonzero=(\d+)(?: rgb_nonblack=(\d+))?')
 SAMPLE_RE = re.compile(
     r'\[rtt\] sample tex addr=(0x[0-9a-f]+) (\d+)x(\d+) fmt=(\d+) -> (HIT|HIT-GPU|HIT-CPU|HIT-UNIFORM|miss|DS-DEPTH|DS-STENCIL)')
 
@@ -59,9 +59,13 @@ def parse(path):
             if not m:
                 continue
             scanout = 'SCANOUT' in line
+            # src is the readback byte count. Zero counters with src=0 mean the readback was
+            # deferred -- "we never looked" -- not that the target is black. Logs written before
+            # the field existed have src=None, and their zeros are simply ambiguous.
+            src = int(m.group(5)) if m.group(5) is not None else None
             passes.append((m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)),
-                           int(m.group(5)), int(m.group(6)) if m.group(6) else None,
-                           pending, scanout))
+                           int(m.group(6)), int(m.group(7)) if m.group(7) else None,
+                           pending, scanout, src))
             pending = []
             if scanout:
                 frames.append(passes)
@@ -101,7 +105,7 @@ def main():
           (len(frames), min(args.frames, len(frames))))
 
     for frame in frames[-args.frames:]:
-        for target, w, h, draws, nz, rgb, inputs, scanout in frame:
+        for target, w, h, draws, nz, rgb, inputs, scanout, src in frame:
             if draws < args.min_draws:
                 continue
             summarized = summarize_inputs(inputs)
@@ -110,9 +114,11 @@ def main():
                 continue
             pixels = w * h
             share = ('%5.1f%%' % (100.0 * rgb / pixels)) if rgb is not None and pixels else '    ?'
-            print('%s %-14s %9s draws=%-5d rgb_nonblack=%-9s (%s of %d px)  px_nonzero=%d' %
+            # A zero that came from an empty readback is not a measurement of the target.
+            unread = ' NOT READ BACK (counters are void)' if src == 0 else ''
+            print('%s %-14s %9s draws=%-5d rgb_nonblack=%-9s (%s of %d px)  px_nonzero=%d%s' %
                   ('SCANOUT' if scanout else '       ', target, '%dx%d' % (w, h), draws,
-                   rgb if rgb is not None else '?', share, pixels, nz))
+                   rgb if rgb is not None else '?', share, pixels, nz, unread))
             for (addr, iw, ih, ifmt), count, state in summarized:
                 print('             <- %-14s %9s %-12s x%-4d %s' %
                       (addr, '%dx%d' % (iw, ih), fmt_name(ifmt), count,

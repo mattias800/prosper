@@ -8,6 +8,9 @@
 // device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
+#include <map>
+#include <atomic>
+#include <string>
 #include "command_processor.hpp"   // GpuState
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
@@ -24,6 +27,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <tuple>
 #include <memory>
 #include <vector>
 #include <set>
@@ -680,6 +684,158 @@ ParallelDrawRealizationStats parallel_draw_realization_stats();
 
 // APPEND ONLY, and update kMaxRealizationFailureReason below. The value is serialized as a raw byte
 // into .prgcap, and both the in-memory validator and the reader bound-check it against that maximum.
+// Per-target tally of draws discarded before they reach the renderer, by reason. Reported at powers
+// of two so a routed boot stays readable.
+// Whether the census below will record anything. Exposed so a caller that must DERIVE a colour
+// target to report one -- the retained/indirect exits run before any render state is extracted --
+// can skip that work entirely when the census is off, instead of paying for a diagnostic nobody
+// asked for on every dropped operation.
+inline bool dropped_draw_census_enabled() {
+    static const bool on = std::getenv("PROSPER_DROPPED_DRAW_CENSUS") != nullptr;
+    return on;
+}
+
+// What became of the dispatch a [compute-binds] row describes. `RecompileEmpty` rows come from a
+// resource table that is incomplete by construction, so they are a lower bound on that program's
+// bindings -- see the contract above report_compute_binding_watch.
+enum class ComputeBindOutcome { Executed, SkippedDescriptors, RecompileEmpty };
+
+// The identity a [compute-binds] row asserts, and therefore the exact key its dedup must use.
+//
+// A key NARROWER than the line silently drops rows that differ in what the reader is reading, and
+// this reporter had that defect twice. First it was keyed on (program, gpu_addr) alone, so distinct
+// bindings at one guest base collapsed: compute tables deliberately carry per-use resources -- the
+// same allocation appears once as a sampled Texture and again as a StorageImage, or under two fetch
+// pcs -- and whichever was encountered first suppressed the rest, so in a producer hunt the
+// surviving row could be the READ view while the WRITE view went unprinted, which is the exact
+// "nothing writes this surface" conclusion the instrument exists to prevent. Then, with that fixed,
+// the key still omitted the four SHAPE fields the line prints (size, width, height, format) while
+// the comment claimed it spanned everything -- and a dynamic descriptor can hold program, base,
+// binding, fetch pc, class and outcome steady while its view shape changes, so the first row's
+// metadata would be presented as if it described every later observation. On this title that is the
+// worst possible field to collapse: extent and f16-versus-f11f11f10 ARE the conversion under
+// investigation.
+//
+// So every field the row prints is a key field. Do not add a printed column without adding it here.
+struct ComputeBindWatchKey {
+    uint64_t program = 0;
+    uint64_t resource_addr = 0;
+    uint64_t watched = 0;
+    uint32_t binding = 0;
+    uint32_t fetch_pc = 0;
+    uint32_t cls = 0;
+    uint32_t outcome = 0;
+    uint32_t size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = 0;
+    bool operator<(const ComputeBindWatchKey& other) const {
+        return std::tie(program, resource_addr, watched, binding, fetch_pc, cls, outcome,
+                        size, width, height, format) <
+               std::tie(other.program, other.resource_addr, other.watched, other.binding,
+                        other.fetch_pc, other.cls, other.outcome, other.size, other.width,
+                        other.height, other.format);
+    }
+};
+
+inline ComputeBindWatchKey compute_bind_watch_key(uint64_t program, const ShaderResource& resource,
+                                                  uint64_t watched, ComputeBindOutcome outcome) {
+    ComputeBindWatchKey key;
+    key.program = program;
+    key.resource_addr = resource.gpu_addr;
+    key.watched = watched;
+    key.binding = resource.binding;
+    key.fetch_pc = resource.fetch_pc;
+    key.cls = static_cast<uint32_t>(resource.cls);
+    key.outcome = static_cast<uint32_t>(outcome);
+    key.size = resource.size;
+    key.width = resource.width;
+    key.height = resource.height;
+    key.format = static_cast<uint32_t>(resource.format);
+    return key;
+}
+
+// THE production selection + dedup seam: which rows [compute-binds] emits for one dispatch. Range
+// filtering, key construction and the dedup insert all live here, so a test that calls this function
+// exercises the same code the reporter runs and a narrowing mutation anywhere in it is visible to
+// that test. report_compute_binding_watch below is then only environment parsing and fprintf.
+//
+// Split out for exactly that reason: an earlier regression tested compute_bind_watch_key alone and
+// therefore proved the helper builds the intended tuple while proving nothing about whether the
+// reporter deduped on it -- narrowing the key at the reporter's own insert left the test green.
+inline std::vector<ComputeBindWatchKey> compute_bind_watch_rows(
+    std::set<ComputeBindWatchKey>& reported, const std::vector<uint64_t>& watched,
+    uint64_t code_addr, const ShaderResourceTable* resources, ComputeBindOutcome outcome) {
+    std::vector<ComputeBindWatchKey> rows;
+    if (watched.empty() || !resources) return rows;
+    for (const auto& resource : resources->resources) {
+        // Match the whole span, not the base: a consumer names a surface by its base while a
+        // producer may bind a subrange or a mip, and requiring equality would report "nobody binds
+        // it" for a producer that plainly does. A size of 0 is one byte, not an open span.
+        const uint64_t begin = resource.gpu_addr;
+        const uint64_t end = begin + (resource.size ? resource.size : 1);
+        for (const uint64_t want : watched) {
+            if (!begin || want < begin || want >= end) continue;
+            const ComputeBindWatchKey key =
+                compute_bind_watch_key(code_addr, resource, want, outcome);
+            if (!reported.insert(key).second) continue;
+            rows.push_back(key);
+        }
+    }
+    return rows;
+}
+
+inline const char* compute_bind_outcome_name(ComputeBindOutcome outcome) {
+    return outcome == ComputeBindOutcome::Executed              ? "executed"
+         : outcome == ComputeBindOutcome::SkippedDescriptors    ? "skipped-descriptors"
+                                                                : "partial-recompile-empty";
+}
+
+// How many operations each instrumented exit was OFFERED, so a zero in the census can be read. A
+// drop reason reporting nothing is ambiguous between "this exit rejects nothing" and "this exit
+// never runs on this route", and those are opposite conclusions: the first retires a hypothesis,
+// the second means the instrument is blind and the hypothesis is untouched. Only the attempt count
+// separates them.
+inline std::atomic<uint64_t>& retained_draw_attempts() {
+    static std::atomic<uint64_t> attempts{0};
+    return attempts;
+}
+
+inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
+                                       uint32_t cb_target_mask, uint32_t cb_shader_mask) {
+    if (!dropped_draw_census_enabled()) return;
+    static std::mutex mutex;
+    static std::map<std::pair<uint64_t, std::string>, uint64_t> dropped;
+    static std::atomic<uint64_t> total{0};
+    const uint64_t n = total.fetch_add(1) + 1;
+    {
+        std::lock_guard lock(mutex);
+        if (dropped.size() < 256 || dropped.count({color0_base, reason}))
+            ++dropped[{color0_base, reason}];
+        if ((n & (n - 1)) == 0 && n >= 256) {
+            std::vector<std::pair<uint64_t, std::pair<uint64_t, std::string>>> ranked;
+            for (const auto& e : dropped) ranked.push_back({e.second, e.first});
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::fprintf(stderr, "[dropped-draw] %llu draws discarded before the renderer\n",
+                         (unsigned long long)n);
+            for (size_t i = 0; i < ranked.size() && i < 12; ++i)
+                std::fprintf(stderr, "[dropped-draw]   target=0x%llx reason=%s x%llu\n",
+                             (unsigned long long)ranked[i].second.first,
+                             ranked[i].second.second.c_str(),
+                             (unsigned long long)ranked[i].first);
+            std::fprintf(stderr, "[dropped-draw]   (latest masks: target=0x%08x shader=0x%08x)\n",
+                         cb_target_mask, cb_shader_mask);
+            // Makes a zero readable: with retained-draw attempts in the thousands and no
+            // `retained-not-selected` / `indirect-arguments` row above, the indirect path demonstrably
+            // ran and demonstrably dropped nothing. With attempts at zero the same empty census says
+            // only that the instrument never fired.
+            std::fprintf(stderr, "[dropped-draw]   (retained/indirect draw attempts: %llu)\n",
+                         (unsigned long long)retained_draw_attempts().load());
+        }
+    }
+}
+
 enum class RealizationFailureReason : uint8_t {
     None,
     Unknown,
@@ -790,6 +946,16 @@ void notify_compute_authority_boundary(const ComputeAuthorityBoundary& boundary)
 // without making prosper_core depend on Vulkan.
 using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
+// Names the PM4 packet responsible for the next guest write, for PROSPER_GUEST_WRITE_WATCH. Thread
+// local and reset by the caller; a watch line that says only "a guest write covered this" cannot
+// distinguish a 512 KiB DMA_DATA fill from an 8-byte completion label, and those imply opposite
+// things about whether the surface's contents were replaced.
+void set_guest_gpu_write_origin(const char* origin);
+// The same tag, readable by an observer. The DS invalidation runs inside the observer callback, so
+// it can name the packet that cost a surface its contents instead of reporting only that something
+// did -- "HTILE overlap discarded a rendered 4K depth buffer" and "a DMA_DATA fast clear replaced
+// it" are the same line without this, and only the second means the discard was correct.
+const char* guest_gpu_write_origin();
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 // A backend can prove that a dispatched write reproduced the exact guest bytes while renderer-owned
 // aliases at the same address may still hold divergent state. Notify those alias owners without
@@ -1288,6 +1454,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         [](const auto& target) { return target.write_mask != 0; });
     if (!preexport_color_effect && !has_depth_stencil_side_effect(resolved_pipeline) &&
         !getenv("PROSPER_FORCE_COLORWRITE") && !getenv("PROSPER_NO_EARLY_NO_EFFECT")) {
+        // PROSPER_DROPPED_DRAW_CENSUS=1 — which colour targets lose draws before they ever reach the
+        // renderer, and why. A target census counts draws that ARRIVE; a surface whose draws are all
+        // discarded here reads as "written by nothing" in that census and in every write-path watch,
+        // which is indistinguishable from a surface the guest never renders to.
+        report_dropped_draw_target(rs.color0_base, "no-effect(early)", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) {
             failure->reason = RealizationFailureReason::NoEffect;
             // Keep the bound program addresses in captures without performing shader analysis.  A
@@ -1535,6 +1707,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     if (vs_words.empty() || fs_words.empty() || (interpolation.requires_geometry && gs.empty())) {
+        report_dropped_draw_target(rs.color0_base, "shader-recompile", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
@@ -1628,6 +1802,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                               validate_mode) ||
         !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1, SpirvShaderStage::Fragment,
                                               validate_mode)) {
+        report_dropped_draw_target(rs.color0_base, "descriptor-contract", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::DescriptorContract;
         if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
                                 "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
@@ -1662,6 +1838,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         ps.color_targets.begin(), ps.color_targets.end(),
         [](const auto& target) { return target.write_mask != 0; });
     if (!color_effect && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+        report_dropped_draw_target(rs.color0_base, "no-effect", rs.cb_target_mask,
+                                   rs.cb_shader_mask);
         if (failure) failure->reason = RealizationFailureReason::NoEffect;
         if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);

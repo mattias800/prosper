@@ -1324,13 +1324,23 @@ struct SpirvCompute {
                               uint32_t* valid_lane = nullptr) {
         return subgroup_row_shr_dynamic(value, active, uconst(amount), 0, valid_lane);
     }
-    uint32_t subgroup_row_ror8(uint32_t value, uint32_t active,
-                               uint32_t* valid_lane = nullptr) {
+    // `stride` is the XOR applied to the lane id, and must be < 16.
+    //
+    // ROW_ROR:8 was the first member of this family and is spelled XOR 8 below, because XOR 8 is
+    // exactly (row_lane - 8) modulo 16. ROW_XMASK:n is XOR n by definition, so the two controls
+    // share one implementation and ROW_ROR:8 is literally ROW_XMASK:8. Generalising the stride is
+    // therefore not a widening of the lowering, only of the control values that reach it.
+    //
+    // The property that makes every stride < 16 exact, and makes it exact independently of the host
+    // subgroup width, is that XOR by a value under 16 touches only bits 0..3 -- so the source lane
+    // stays inside the same architectural DPP16 row, and every row and subgroup bit above bit 3 is
+    // preserved. That is the same argument the ROR:8 form already relied on; it was never specific
+    // to 8.
+    uint32_t subgroup_row_xor(uint32_t value, uint32_t active, uint32_t stride,
+                              uint32_t* valid_lane = nullptr) {
         mark_subgroup_min16();
         const uint32_t lane = subgroup_local_id();
-        // ROW_ROR:8 swaps the two eight-lane halves of each architectural DPP16 row. XOR 8 is
-        // exactly (row_lane - 8) modulo 16 while preserving every row/subgroup bit above bit 3.
-        const uint32_t source_lane = ibin(Op_BitwiseXor, lane, uconst(8));
+        const uint32_t source_lane = ibin(Op_BitwiseXor, lane, uconst(stride & 15u));
         const uint32_t rotated = subgroup_shuffle(value, source_lane);
         // FI=0 makes an EXEC-inactive source invalid. The one admitted form has BOUND_CTRL=1,
         // whose caller substitutes zero for that invalid source before V_MIN_F32.
@@ -7892,12 +7902,34 @@ enum class DppRowRor8Op : uint32_t {
     MaxF32 = 3,
 };
 
+// The XOR stride a DPP control applies to the lane id, or 0 if the control is not in this family.
+//
+// ROW_ROR:8 (0x128) and ROW_XMASK:n (0x160..0x16f) are one family: ROW_XMASK:n is XOR n by
+// definition, and XOR 8 is exactly (row_lane - 8) modulo 16, so ROW_ROR:8 IS ROW_XMASK:8. The
+// emitter already lowered the 8 case through an XOR; this only lets the other strides reach it.
+//
+// XMASK:0 is included: its stride is the identity, which is a legal permutation. It was once excluded
+// because a no-op is hard to tell from a decode error BY ITS RESULT -- a statement about diagnosis,
+// not about whether the guest may issue the instruction.
+// Membership and stride are SEPARATE answers. Folding them into one return made 0 mean both "stride
+// zero" and "not in this family", which excluded ROW_XMASK:0 -- a legal member whose stride happens to
+// be the identity. That is a representation artifact, not a semantic reason to refuse a guest
+// instruction, so the caller asks the two questions independently.
+inline bool dpp_row_xor_ctrl(uint32_t dpp_ctrl, uint32_t* stride = nullptr) {
+    uint32_t s = 0;
+    if (dpp_ctrl == 0x128u) s = 8u;
+    else if (dpp_ctrl >= 0x160u && dpp_ctrl <= 0x16fu) s = dpp_ctrl - 0x160u;
+    else return false;
+    if (stride) *stride = s;
+    return true;
+}
+
 // Exact bounded row-rotate family emitted by GTA V's screen-space compute passes. The decoder has
 // already proved FI=0/no source modifiers; repeat every retained control field here so the ordinary
 // emitter and CFG dispatcher share one fail-closed contract. VOP1 MOV has only the permuted SRC0;
 // the two VOP2 float operations combine that value with the destination lane's unpermuted SRC1.
 DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
-    if (!in.has_dpp || !in.dpp_bound_ctrl || in.dpp_ctrl != 0x128u ||
+    if (!in.has_dpp || !in.dpp_bound_ctrl || !dpp_row_xor_ctrl(in.dpp_ctrl) ||
         in.dpp_row_mask != 0xfu || in.dpp_bank_mask != 0xfu ||
         in.dst.kind != OperandKind::VGPR || in.src[0].kind != OperandKind::VGPR)
         return DppRowRor8Op::None;
@@ -10375,7 +10407,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // when the host subgroup width differs from the guest wave width.
             if (in.has_dpp) {
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                const bool row_ror8 = in.dpp_ctrl == 0x128u;
+                uint32_t row_xor = 0;
+                const bool row_ror8 = dpp_row_xor_ctrl(in.dpp_ctrl, &row_xor);
                 if (row_ror8) {
                     // Direct shuffle is valid only when one native subgroup is exactly one guest
                     // wave. Portable/default-subgroup compute is routed through synchronized CFG
@@ -10386,7 +10419,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         ok = false; return true;
                     }
                     uint32_t valid_source = 0;
-                    const uint32_t rotated = b.subgroup_row_ror8(a, rs.exec, &valid_source);
+                    const uint32_t rotated =
+                        b.subgroup_row_xor(a, rs.exec, row_xor, &valid_source);
                     a = b.sel(valid_source, rotated, b.uconst(0));
                 } else if (row_shr) {
                     // The portable NGG vertex shell represents the one live guest lane as lane 0.
@@ -10879,7 +10913,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // ROW_SHR in the proven one-live-lane NGG projection supplies zero for lane 0.
             if (in.has_dpp) {
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                const bool row_ror8 = in.dpp_ctrl == 0x128u;
+                uint32_t row_xor = 0;
+                const bool row_ror8 = dpp_row_xor_ctrl(in.dpp_ctrl, &row_xor);
                 const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
@@ -10892,7 +10927,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         ok = false; return true;
                     }
                     uint32_t valid_source = 0;
-                    const uint32_t rotated = b.subgroup_row_ror8(a, rs.exec, &valid_source);
+                    const uint32_t rotated =
+                        b.subgroup_row_xor(a, rs.exec, row_xor, &valid_source);
                     a = b.sel(valid_source, rotated, b.uconst(0));
                 } else if (row_shr) {
                     if (b.is_vertex) {
@@ -14416,14 +14452,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
                  res && res->cls != ResourceClass::Texture))
                 res = nullptr;
-            if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
-                && getenv("PROSPER_DBG")) {
+            if (!res || (res->cls != ResourceClass::Texture &&
+                         res->cls != ResourceClass::StorageImage)) {
                 // Resolution-failure diagnostic: which provenance step failed for this image op.
+                //
+                // Ungated, and deduped per (pc, srsrc). It fires only when an image op has already
+                // failed to resolve, so its volume is bounded by the defect it reports. Behind
+                // PROSPER_DBG it was unreachable in practice on any routed boot.
+                static std::mutex mimg_mutex;
+                // Keyed by PROGRAM as well as (pc, srsrc): every shader has a pc 16, so a
+                // pc-only key lets the first program to reach one silence all later programs and
+                // attribute its line to a shader the reader is not looking at.
+                static std::set<std::tuple<uint64_t, uint32_t, int>> mimg_reported;
+                bool first_report = false;
+                {
+                    std::lock_guard<std::mutex> lock(mimg_mutex);
+                    first_report = mimg_reported.emplace(b.diagnostic.program_address, in.pc,
+                                                         in.src[1].value).second;
+                }
+                if (!first_report) { ok = false; return true; }
                 uint32_t srt_tag = 0;
                 const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
                 const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
                 const ShaderResource* pp = rt->by_fetch_pc(in.pc);
-                fprintf(stderr, "[mimg-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s (%zu res)\n",
+                fprintf(stderr, "[mimg-unresolved] program=0x%llx pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s (%zu res)\n",
+                        (unsigned long long)b.diagnostic.program_address,
                         in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
                         has_srt_tag ? srt_tag : 0u,
                         pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
@@ -14740,6 +14793,38 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                  res->img_dim != in.mimg_dim || res->sample_count != 1u ||
                  res->declared_mip_levels != 1u || res->in_mip_tail ||
                  res->compression_enabled || (in.mimg_dim == 5u && !b.is_compute))) {
+                // Name the sub-condition. Seven terms collapse into one
+                // `mode=unresolved-operand`, and an investigation cannot act on that: "the mip is
+                // not proven zero" and "the resource declares compression" are different pieces of
+                // work. Ungated and deduped per pc, so it costs one line per declining site --
+                // PROSPER_DBG, the usual home for this, produces a ~1.5 GB log and desyncs the pad
+                // script badly enough that the route never reaches the phase being diagnosed.
+                //
+                // Measured on GTA V's 0x2042f49a00, a compute pass that reads the main depth and
+                // stencil and writes two 4K storage images the frame goes on to sample:
+                //   pc=16 shape=1 proven_zero_mip=0 ... compressed=1
+                // so exactly two terms hold it, and one of them describes guest bytes that this
+                // resource does not read -- 0x2052ac0000 resolves through the sampled-depth bridge,
+                // whose pixels come from a retained Vulkan image rather than from compressed memory.
+                static std::mutex mip_mutex;
+                // Same program-scoped key as [mimg-mip-why]; see the note there.
+                static std::set<std::pair<uint64_t, uint32_t>> mip_reported;
+                bool first_mip = false;
+                {
+                    std::lock_guard<std::mutex> lock(mip_mutex);
+                    first_mip = mip_reported.emplace(b.diagnostic.program_address, in.pc).second;
+                }
+                if (first_mip)
+                    std::fprintf(stderr,
+                                 "[mimg-mip] program=0x%llx image_load_mip declined pc=%u shape=%d "
+                                 "proven_zero_mip=%d img_dim=%u/%u samples=%u mips=%u mip_tail=%d "
+                                 "compressed=%d array_in_gfx=%d\n",
+                                 (unsigned long long)b.diagnostic.program_address, in.pc,
+                                 (int)rdna2_mimg_zero_mip_shape(in),
+                                 (int)res->proven_zero_mip, res->img_dim, in.mimg_dim,
+                                 res->sample_count, res->declared_mip_levels,
+                                 (int)res->in_mip_tail, (int)res->compression_enabled,
+                                 (int)(in.mimg_dim == 5u && !b.is_compute));
                 ok = false;
                 return true;
             }
@@ -20022,11 +20107,14 @@ bool emit_cfg_state_machine(
             }
             if (b.native_subgroup_size) {
                 // One exact native subgroup is one guest wave and this case is subgroup-uniform.
-                // FI=0 makes an EXEC-inactive rotated source read as zero. ROW_ROR:8 always names
-                // an in-range lane in its 16-lane row, so BOUND_CTRL does not decide this case.
+                // FI=0 makes an EXEC-inactive permuted source read as zero. Every stride in this
+                // family XORs only bits 0..3, so the source is always an in-range lane of the same
+                // 16-lane row and BOUND_CTRL does not decide this case.
                 uint32_t valid_source = 0;
-                const uint32_t rotated = b.subgroup_row_ror8(
-                    src0_value, state.exec, &valid_source);
+                const uint32_t rotated = b.subgroup_row_xor(
+                    src0_value, state.exec,
+                    [&]{ uint32_t st = 0; dpp_row_xor_ctrl(dpp_row_ror8->dpp_ctrl, &st); return st; }(),
+                    &valid_source);
                 const uint32_t bounded = b.sel(valid_source, rotated, zero);
                 uint32_t result = bounded;
                 if (operation == DppRowRor8Op::MinF32)
