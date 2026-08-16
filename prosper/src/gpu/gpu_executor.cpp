@@ -3468,6 +3468,32 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         const bool proven_zero_mip_at_use =
             rdna2_mimg_zero_mip_shape(in, &mip_vgpr) &&
             same_block_zero_vgprs.test(mip_vgpr);
+        // Why the proof failed, at the site that knows. `[mimg-mip]` downstream reports
+        // `proven_zero_mip=0` and stops there, which is the bool this line produced -- it cannot say
+        // whether the mip register was never written in this block, was written from a scalar the
+        // fold could not evaluate, or was discarded by an EXEC write. Those are three different
+        // pieces of work and the difference is only visible here. Deduped per pc, ungated for the
+        // same reason the downstream line is: PROSPER_DBG desyncs the routed repro.
+        if (rdna2_mimg_zero_mip_shape(in, &mip_vgpr)) {
+            // Dedup by (PROGRAM, pc). A pc-only key collides across programs -- every shader has a
+            // pc=16 -- so the first program to reach a pc silently speaks for every later one, and
+            // the line then describes a kernel the reader is not looking at.
+            static std::mutex why_mutex;
+            static std::set<std::pair<const uint32_t*, uint32_t>> why_reported;
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(why_mutex);
+                first = why_reported.insert({code, in.pc}).second;
+            }
+            if (first)
+                std::fprintf(stderr,
+                             "[mimg-mip-why] program=0x%llx pc=%u proven_at_use=%d mip_vgpr=v%u "
+                             "in_zero_set=%d exec_pristine=%d cfg_known=%d\n",
+                             (unsigned long long)(uintptr_t)code, in.pc,
+                             (int)proven_zero_mip_at_use, mip_vgpr,
+                             mip_vgpr < 256 ? (int)same_block_zero_vgprs.test(mip_vgpr) : -1,
+                             (int)zero_mip_exec_pristine, (int)zero_mip_cfg_known);
+        }
         // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
         // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
         // be BOTH a qualifying target and the sole-predecessor branch of a later target: a block
