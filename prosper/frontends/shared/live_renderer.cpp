@@ -659,22 +659,35 @@ bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
 // This is not a repair and must never become one: it makes a consumer read bytes the guest did not
 // point it at, so a picture appearing under it is evidence about the DECODE, never a fix. Leave it
 // unset outside an A/B.
-// PROSPER_SCAN_DESCRIPTOR=<hex surface base>[,<hex base>…] — find every V#/T# in guest memory that
-// POINTS AT a surface, once, from the render thread.
+// PROSPER_SCAN_DESCRIPTOR=<hex surface base>[,<hex base>…] — count CANDIDATE descriptor words in
+// guest memory whose value matches a surface's base field, once, from the render thread.
 //
-// The question it answers is the one left over when every write path comes back empty: a surface
+// READ THE NEGATIVES CAREFULLY. This is a candidate-word scan, not a descriptor enumerator, and it is
+// not exhaustive in three separate ways:
+//   * COVERAGE. It probes 2 MiB-aligned spans in a fixed window and keeps only spans that are
+//     readable IN FULL, so a descriptor in a partially mapped span, or in a mapping outside the
+//     window, is never examined. The report prints the spans kept and skipped so the coverage is
+//     visible rather than assumed.
+//   * VALIDATION. A matching dword is only the value a base field WOULD hold; the following words are
+//     printed but not checked against a descriptor layout. A hit is a candidate, not proof that a
+//     descriptor lives there, and an ordinary integer can match.
+//   * DIRECTION. A descriptor does not encode read/write intent -- that lives in the shader
+//     instruction -- so a hit cannot distinguish a producer's view of a surface from a consumer's.
+// **A zero therefore cannot establish that no producer exists.** It bounds where one was not found,
+// which is a weaker and different claim.
+//
+// COST: it runs SYNCHRONOUSLY on the render callback and may read several GiB, so the frame it fires
+// on stalls visibly. Opt-in and one-shot for that reason; never leave it set for a timing run.
+//
+// The question it exists for is the one left over when every write path comes back empty: a surface
 // nothing writes is either one the guest genuinely never produces, or one whose producer prosper
 // failed to RESOLVE -- and an unresolved producer is invisible to every instrument that enumerates
-// resolved tables. `PROSPER_DYNTRACE_FAIL` prints only the descriptors the const-fold managed to
-// evaluate; measured on GTA V's failing kernels it printed 15 of 21 image ops for 0x205b5e8600 and 4
-// of 6 for 0x205b657200, so its null covered most of the population and not all of it.
+// resolved tables. `PROSPER_DYNTRACE_FAIL` prints only the descriptors the const-fold evaluated;
+// measured on GTA V's failing kernels it printed 15 of 21 image ops for 0x205b5e8600 and 4 of 6 for
+// 0x205b657200, so its null covered most of that population and not all of it.
 //
-// A descriptor's base field is the address shifted right by 8, so the surface is findable by scanning
-// mapped guest memory for that dword. Every hit is a table entry naming the surface; the count
-// separates "only consumers know about it" from "a producer's table names it too".
-//
-// One-shot and bounded: it runs on the first render callback after the requested frame, reports, and
-// never runs again.
+// A descriptor's base field holds the address shifted right by 8, so a surface's candidates are
+// findable by matching that dword. Use the result as a lead to follow, not as a census.
 void scan_for_descriptors_once(uint64_t frame_index) {
     struct Spec { std::vector<uint64_t> bases; uint64_t at_frame = 0; };
     static const Spec spec = [] {
@@ -700,11 +713,14 @@ void scan_for_descriptors_once(uint64_t frame_index) {
     // over the region PS5 titles map and keep the readable spans.
     constexpr uint64_t kStep = 2ull << 20;
     constexpr uint64_t kBegin = 0x2000000000ull, kEnd = 0x2200000000ull;
-    size_t spans = 0, scanned_mb = 0;
+    size_t spans = 0, skipped_spans = 0, scanned_mb = 0;
     std::map<uint64_t, uint64_t> hits;   // surface base -> count
     std::map<uint64_t, std::map<std::string, uint64_t>> shapes;  // base -> shape -> count
     for (uint64_t page = kBegin; page < kEnd; page += kStep) {
-        if (!prosper::gpu::guest_readable(page, static_cast<uint32_t>(kStep))) continue;
+        if (!prosper::gpu::guest_readable(page, static_cast<uint32_t>(kStep))) {
+            ++skipped_spans;   // unmapped OR only partially mapped -- not examined
+            continue;
+        }
         ++spans; scanned_mb += kStep >> 20;
         const uint32_t* words = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(page));
         const size_t count = kStep / sizeof(uint32_t);
@@ -724,10 +740,14 @@ void scan_for_descriptors_once(uint64_t frame_index) {
             }
         }
     }
-    fprintf(stderr, "[descr-scan] scanned %zu MiB over %zu readable spans at frame %llu\n",
-            scanned_mb, spans, (unsigned long long)frame_index);
+    fprintf(stderr,
+            "[descr-scan] examined %zu MiB over %zu fully-readable spans at frame %llu; %zu span(s) "
+            "SKIPPED (unmapped or partially mapped) -- negatives are NOT exhaustive\n",
+            scanned_mb, spans, (unsigned long long)frame_index, skipped_spans);
     for (const uint64_t base : spec.bases) {
-        fprintf(stderr, "[descr-scan] 0x%llx: %llu word(s) match, %zu distinct following shape(s)\n",
+        fprintf(stderr,
+                "[descr-scan] 0x%llx: %llu CANDIDATE word(s) match its base field, %zu distinct "
+                "following shape(s) -- unvalidated, and direction (producer vs consumer) unknown\n",
                 (unsigned long long)base, (unsigned long long)hits[base], shapes[base].size());
         size_t shown = 0;
         for (const auto& [sig, n] : shapes[base]) {
@@ -6013,13 +6033,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // silently drop any ordinary draws grouped after it. Key on it so a resolve is always
                     // its own pass.
                     const bool resolve0 = items[pass_i].ps.cb_resolve;
-                    // The DEPTH/STENCIL attachment is part of a pass's target identity, not just its
-                    // colour attachments.
-                    //
-                    // A render pass has ONE depth attachment, and the backend picks one cached DS
-                    // image for the whole grouped call from its first meaningful draw. Grouping on
-                    // colour alone therefore let a single call span draws that name different DS
-                    // surfaces -- or, for a layered surface, different DB_DEPTH_VIEW SLICES of one
                     std::vector<const prosper::gpu::DrawItem*> pass;
                     auto same_targets = [&](const prosper::gpu::DrawItem& draw) {
                         if (draw.color0_base != base ||
