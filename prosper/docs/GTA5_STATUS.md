@@ -3425,6 +3425,15 @@ falsification.
   work), **2,253** (expand-pattern fix), **2,299** (expand + preserving) — the second change is inside
   the run-to-run spread. The `gpu-preserving` origin is a small minority of these writes;
   `compute-writeback(cpu-fill)` dominates. Reverted rather than left as dead API.
+- **An unimplemented Sony stub is gating the missing conversion pass.** *Solid.* The natural next
+  hypothesis once the defect moved to guest logic: 22 NIDs answer 0, and one of them could be the
+  input to the decision. Call counts say no. `PROSPER_PROGRESS=100 PROSPER_PROGRESS_UNIMPL=1` dumps
+  the per-NID table (it rides the heartbeat and needs ~12 of them, so a coarse `PROSPER_PROGRESS`
+  never reaches it): over a 400 s routed boot **every unimplemented NID is called once or twice**,
+  the sole exception being `libSceRemoteplay::g3PNjYKWqnQ` at 19. `libSceAgc::MlEw1feXcjg`
+  (`sceAgcQueueEndOfPipeActionPatchData`) — the most plausible GPU-gating candidate — is called
+  **once**. Nothing is polled per frame, so no stub is positioned to gate a per-frame pass.
+  (`libSceAgc::Ikfdt-rIqCE` remains unidentified: it is in no library of the 3.20 firmware dump.)
 - **One of the never-executing compute kernels writes the scene colour.** *Solid.* This was the
   last standing candidate after every draw, DMA and resolve path came back empty, and it had a real
   gap behind it: `PROSPER_COMPUTE_BINDS` enumerates *resolved* resource tables, and those kernels are
