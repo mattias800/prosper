@@ -7039,9 +7039,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (size_t p = 0; p + 3 < inspected.size(); p += 4)
                             rgb_nz += (inspected[p] != 0 || inspected[p + 1] != 0 ||
                                        inspected[p + 2] != 0);
+                        // `src=` is load-bearing, not decoration. Both counters are computed from
+                        // `rendered_pixels`, so a pass whose readback was deferred reports
+                        // `px_nonzero=0 rgb_nonblack=0` -- identical to a genuinely black target, and
+                        // indistinguishable from it without this field. The `[dump-pass]` line four
+                        // lines up already guards exactly this ("as 'the target is black' rather than
+                        // 'we never looked'"); this line did not, and readbacks are deferred routinely
+                        // -- `[readback-why]` buckets nine distinct reasons.
+                        //
+                        // It matters most for the conclusion it silently supports. Every "this pass
+                        // reads populated inputs and emits nothing" reading on GTA V rests on these
+                        // two counters, and "we never looked" produces that reading for free.
                         fprintf(stderr, "[rtt] pass target=0x%llx extent=%ux%u native=%ux%u (%zu draws) "
-                                "px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
-                                (unsigned long long)base, gw, gh, native_w, native_h, pass.size(), nz, rgb_nz, g_rtt.size(),
+                                "src=%zuB px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
+                                (unsigned long long)base, gw, gh, native_w, native_h, pass.size(),
+                                rendered_pixels.size(), nz, rgb_nz, g_rtt.size(),
                                 is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : "");
                     }
                     // PROSPER_DUMP_DRAWSTEPS: for a pass targeting a SCANOUT buffer, re-render the pass
