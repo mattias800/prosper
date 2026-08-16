@@ -3047,6 +3047,37 @@ bloom buffers are what the three visible lights come through. Note the **format 
 HDR chain (`0x20df360000`, `0x2078ea0000`, `0x2074ee0000`, all heavily sampled) is `f16`, while the
 empty tap is `f11f11f10` — so the missing producer is a **format conversion** of a chain that works.
 
+### The deferred lighting resolve is rejected by the DEPTH TEST (2026-08-16)
+
+**This is the sharpest result in this document and it is a prosper defect, not a missing guest
+producer.** It is separate from the absent scene-colour producer below; both are live.
+
+The lighting resolve — the 15+ draw pass that consumes the whole G-buffer — emits colour in only
+**10 of 122** read-back passes (readback confirmed per pass via `src=`, so these zeros are
+measurements and not deferred readbacks). `PROSPER_NO_DEPTH=1` disables the depth test and nothing
+else:
+
+| | control | `PROSPER_NO_DEPTH=1` |
+| --- | --- | --- |
+| read-back passes with 15+ draws | 122 | 120 |
+| ...of which carry colour | **10 (8%)** | **65 (54%)** |
+| max `rgb_nonblack` | 3,798,218 (46%) | **8,294,400 (100%)** |
+
+A full 4K frame of coverage appears the moment the depth test stops rejecting. So the light-volume
+draws are executing and being discarded per-fragment.
+
+**What this rules IN, and the part that is not yet pinned.** The rejection means the depth attachment
+bound to that pass holds real content that the light volumes fail against — if it held the derived
+"compare-appropriate always-pass" value (#371) nothing would be rejected at all. So the candidates
+are a compare-direction mismatch (GTA V uses reversed-Z, where near is 1.0 and the same clear byte
+means the opposite thing), light-volume geometry at the wrong depth, or the pass being handed a
+depth attachment that is not the one the G-buffer wrote. `PROSPER_DEPTH_CLEAR=<float>` and
+`PROSPER_NO_STENCIL=1` are the next two arms; both exist already.
+
+**Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
+same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
+`live_renderer.cpp` in the `PROSPER_DS_UNBRIDGED_FAR` comment).
+
 ### The producer is missing from the GUEST's command stream, not from prosper's decode
 
 This was worth establishing before writing any more emulator code, and it is now exhaustive. Every
