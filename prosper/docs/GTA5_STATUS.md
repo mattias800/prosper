@@ -3106,10 +3106,31 @@ below is real.
 | **`PROSPER_NO_STENCIL=1`** | **2,104,048** | **+7.4%** |
 | majority depth-clear derivation | 1,942,739 | −0.8% (refuted, reverted) |
 
-**Depth rejection is the dominant loss and stencil rejection is a real second one.** They are
-independent: disabling either alone recovers content. None of these is a fix — each disables a test
-the guest asked for — but together they say the depth/stencil state bound to the lighting resolve
-does not hold what the guest's draws expect to test against.
+> ## RETRACTED — the metric measures BLOOM, not world content
+>
+> **Every number in the table above is real and its interpretation was wrong.** `rgb_nonblack` rises
+> under those arms because a blown-out white blob and a blue haze flood the frame, not because the
+> world appears. **I only found this by opening the images**, which is the whole lesson:
+>
+> - `PROSPER_NO_DEPTH=1` (2,810,666, +43.5%): a large overexposed blob, blue haze, **no world
+>   geometry, and the radar is GONE**. Strictly worse than the control to look at.
+> - `PROSPER_NO_STENCIL=1` (2,104,048, +7.4%): the same blob and haze; radar and tutorial text
+>   survive; still **no world geometry**.
+> - `PROSPER_RTT_ALIAS` — the one arm that genuinely shows the bank interior — scores **19,623
+>   distinct colours against the control's 30,262.** It shows *more* world with *fewer* colours.
+>
+> So on this title neither `nonblack_rgb_pixels` nor `distinct_rgb_colors` separates "the world
+> rendered" from "bloom flooded the screen", and they can rank a worse frame higher. This is the
+> `## Ruled out` list's colour-metric trap in a new costume: **a bloom smear fools the metric exactly
+> as a gradient does.** Quote these counters only alongside the image.
+>
+> **What survives:** the depth and stencil tests do change what reaches the lighting buffer, and
+> `PROSPER_DEPTH_CLEAR=1.0` still drives it to zero while `0.0` does not, so the fresh-image value is
+> a real lever on that buffer. What does NOT survive is "disabling the test recovers presented
+> content" — it recovers bloom. The mixed-compare and fresh-attachment findings below are unaffected;
+> they are structural facts about the pass, not pixel counts.
+
+**These arms are diagnostics, not fixes** — each disables a test the guest asked for.
 
 That is consistent with the DS bridge's own declines on this route: `0x2054aa0000` (the stencil
 plane) declines `stencil-invalid` up to **846** times, and `0x2052ac0000` (depth) `depth-invalid`

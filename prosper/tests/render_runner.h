@@ -4083,6 +4083,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (getenv("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
         uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
         uint32_t greater_colour = 0, less_colour = 0;
+        uint32_t reversed_viewports = 0, forward_viewports = 0;
+        float vp_min = -1.0f, vp_max = -1.0f;
         int first_op = -1;
         // What DB_DEPTH_CLEAR actually holds, whether or not a draw enables it. #371 forbids
         // CONSUMING it without an explicit enable -- Astro Bot leaves packed 1920x1080 max
@@ -4097,6 +4099,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (first_op < 0) {
                 first_op = static_cast<int>(d.ps->depth_compare_op);
                 first_clear_value = d.ps->depth_clear_value;
+            }
+            // The viewport depth range, which is how a reverse-Z surface declares itself: a guest
+            // using near=1/far=0 programs min_depth=1, max_depth=0. If the range is the ordinary
+            // 0..1 while the compares are GREATER, the reversal lives in the projection matrix
+            // instead and the stored values are what the shader emits.
+            if (d.ps->has_viewport) {
+                if (d.ps->min_depth > d.ps->max_depth) ++reversed_viewports;
+                else ++forward_viewports;
+                vp_min = d.ps->min_depth; vp_max = d.ps->max_depth;
             }
             if (d.ps->depth_clear_enable) ++explicit_clear;
             // Split by whether the draw WRITES COLOUR. The initial value should serve the draws
@@ -4123,10 +4134,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             fprintf(stderr,
                     "[depth-clear-why] target=0x%llx derived=%.3f reg_clear=%.6g first_op=%d "
                     "explicit=%u compares{greater=%u less=%u other=%u} "
-                    "colour{greater=%u less=%u} draws=%zu (x%llu)\n",
+                    "colour{greater=%u less=%u} vp{min=%g max=%g rev=%u fwd=%u} "
+                    "draws=%zu (x%llu)\n",
                     (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
                     depth_clear, first_clear_value, first_op, explicit_clear, greater, less, other,
-                    greater_colour, less_colour, logical_draws.size(), (unsigned long long)n);
+                    greater_colour, less_colour, vp_min, vp_max, reversed_viewports,
+                    forward_viewports, logical_draws.size(), (unsigned long long)n);
     }
     if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
