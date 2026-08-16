@@ -3242,6 +3242,39 @@ real.
 same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
 `live_renderer.cpp` in the `PROSPER_DS_UNBRIDGED_FAR` comment).
 
+### The missing operation, named exactly (2026-08-16)
+
+Tracing the post chain backwards from the composite finds where scene content *does* enter it, and
+that pins what is absent to a single conversion.
+
+**The bloom pyramid works, and its source is the lit scene.** The pass writing `0x205f1a0000`
+(1920x1080) reads `0x20471e0000` — the 4K **f16** buffer holding the lit scene — and carries
+**44% non-black**. The chain below it (960x540 → 480x270 → 240x135 and back up) is populated
+throughout. So the guest demonstrably *can* read the lit scene, and does, for bloom.
+
+Meanwhile the composite's base tap `0x2063380000` (4K **f11f11f10**) is empty. That is exactly the
+picture on screen: **bloom-lit sources appear, the base scene does not.**
+
+So the absent operation is now a single named conversion:
+
+> **4K f16 `0x20471e0000` → 4K f11f11f10 `0x2063380000`**, once per frame.
+
+**Aliasing the composite's tap to either lit buffer renders the world with the HUD intact** —
+`PROSPER_RTT_ALIAS=2063380000:20471e0000` gives **5,413,464 non-black (65% of frame)** and a bank wall
+in correct perspective with its architectural lines, the lit source and its bloom, and the complete
+radar. (`…:20431c0000` shows a different, darker part of the same room.) Both are diagnostics; neither
+is a fix, because prosper must not invent a copy the guest did not issue.
+
+**And they are not the same memory.** `PROSPER_MEMLOG` gives three distinct physical addresses —
+scene colour `0x136580000`, HDR/bloom source `0x11a3e0000`, lighting `0x1163c0000` — so prosper is
+right to keep them separate and there is no aliasing fix hiding here.
+
+**Which leaves guest logic as the only remaining explanation.** The guest allocates the buffer, clears
+it once at start-up, samples it 24x per frame forever, reads its *source* for bloom in the same frame,
+and never runs the pass that fills it. Something prosper answers upstream selects that path. That is a
+different hunt from everything above — a guest-decision question, not a GPU one — and it is where the
+next session should start.
+
 ### The producer is missing from the GUEST's command stream, not from prosper's decode
 
 This was worth establishing before writing any more emulator code, and it is now exhaustive. Every
