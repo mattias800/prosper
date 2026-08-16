@@ -950,8 +950,25 @@ bundle and there is no frame count that fits under 2 GiB. (An earlier revision o
 divided 42,861 submits by 153 frames and published "≈ 14 MB per frame" as a sizing rule. That
 arithmetic is right and the inference from it is wrong: the 4-frame run falsifies it outright.)
 
-The lever is the budget, not the window: **`PROSPER_CAPTURE_BUNDLE_MAX_MB`** on `prosper-app`, which
-accepts 64..3072 MiB against a 2048 MiB default.
+The lever is the budget, not the window — **`PROSPER_CAPTURE_BUNDLE_MAX_MB`**, 64..3072 MiB against a
+2048 MiB default — **and on this title it is not enough at its maximum:**
+
+```
+FRAMES=240, limit 2048 MiB -> 2,155,499,889 bytes   (died at frame 153)
+FRAMES=4,   limit 2048 MiB -> 2,236,660,079 bytes
+FRAMES=4,   limit 3072 MiB -> 3,351,980,610 bytes
+FRAMES=1,   limit 3072 MiB -> 3,269,369,026 bytes   <- ONE frame, over the ceiling
+```
+
+A single frame costs 3.27 GB against a 3072 MiB (3.22 GB) hard clamp, so **there is currently no
+setting under which an F9 bundle of GTA V completes.** The last row is the one that matters: it is not
+a window-size problem and cannot be tuned away. (These are overshoot values at the point of abort,
+not totals, and they vary run to run, so the true working-set size is unknown and above 3.35 GB.)
+
+The fix worth building is not a bigger number. The question a bundle is wanted for here — *which
+compute program binds the empty composite tap* — needs **resource tables and descriptors, not pixel
+payloads**; a metadata-only capture would fit inside any budget and answer it directly. Tracked as
+#2554.
 
 The three gates are **sequential and each masks the next**, which is why this took several runs to
 walk: widen the window and you meet provenance; clear provenance and you meet the size limit; and
