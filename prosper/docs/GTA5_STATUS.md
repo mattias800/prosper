@@ -3118,6 +3118,34 @@ up to 826. **But note the trap already recorded above**: suppressing those decli
 something real and "make the bridge always valid" is not the fix either. The open question is what
 the correct contents are, not how to stop declining them.
 
+### Why no initial value can work: the resolve mixes GREATER and LESS draws 7:7
+
+`PROSPER_DEPTH_CLEAR_WHY=1` prints the derived value per **colour target**, which is what makes this
+answerable. For `0x20431c0000`:
+
+| pass shape | derived | correct? |
+| --- | --- | --- |
+| `greater=66 less=0`, `greater=8 less=0`, `greater=4 less=0`, … | 0.000 | yes |
+| **`greater=7 less=7` draws=15** | **1.000** | **unsatisfiable** |
+| **`greater=6 less=7` draws=14** | **1.000** | **unsatisfiable** |
+
+The mixed passes **are** the 14/15-draw resolve, `first_op=1` (LESS) latches the far value, and the
+six or seven GREATER draws then always-fail against it.
+
+**This is also exactly why the majority rule failed, and the failure is informative rather than
+embarrassing:** at 7 versus 7 the tie-break falls back to first-draw (LESS → 1.0), and at 6 versus 7
+the majority *is* LESS → 1.0. Majority reproduces the old answer on precisely the passes that matter.
+**No single fresh-image value can serve a pass that mixes both compare directions against one
+attachment** — the approximation is not merely mis-tuned here, it is unsatisfiable by construction.
+
+And the attachment really is fresh, which the poles already proved: if it were LOADed from a retained
+image the initial value could not matter, yet `PROSPER_DEPTH_CLEAR=1.0` drives the resolve to **0 of
+124** passes with content.
+
+**So the direction is: this pass must LOAD the G-buffer's real depth/stencil rather than receive a
+freshly-created attachment.** That is a DS-retention problem across the G-buffer → lighting
+transition, not a clear-value problem, and it explains why every value-shaped fix has failed.
+
 **Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
 same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
 `live_renderer.cpp` in the `PROSPER_DS_UNBRIDGED_FAR` comment).

@@ -4026,13 +4026,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         }
         static std::mutex why_mutex;
-        static std::map<std::tuple<float, uint32_t, uint32_t, uint32_t>, uint64_t> seen;
+        static std::map<std::tuple<uint64_t, float, uint32_t, uint32_t, uint32_t>, uint64_t> seen;
         std::lock_guard lock(why_mutex);
-        const uint64_t n = ++seen[{depth_clear, greater, less, other}];
+        const uint64_t n = ++seen[{color_target ? color_target->persistent_id : 0ull,
+                                   depth_clear, greater, less, other}];
         if ((n & (n - 1)) == 0)
             fprintf(stderr,
-                    "[depth-clear-why] derived=%.3f first_op=%d explicit=%u compares{greater=%u "
-                    "less=%u other=%u} draws=%zu (x%llu)\n",
+                    "[depth-clear-why] target=0x%llx derived=%.3f first_op=%d explicit=%u "
+                    "compares{greater=%u less=%u other=%u} draws=%zu (x%llu)\n",
+                    (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
                     depth_clear, first_op, explicit_clear, greater, less, other,
                     logical_draws.size(), (unsigned long long)n);
     }
