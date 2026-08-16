@@ -2983,9 +2983,49 @@ Two facts fix the frontier:
    Meanwhile the lit scene sits in `0x20431c0000` / `0x20471e0000`, which the composite never reads.
 
 So the world is not lost in the composite and not lost at scanout: **the producer of the scene-colour
-buffer is missing entirely.** The leading candidate is a declined compute dispatch — see the
-descriptor-key note below — because compute is the one producer class whose failures leave no pass
-line at all.
+buffer is missing entirely.**
+
+### The producer is missing from the GUEST's command stream, not from prosper's decode
+
+This was worth establishing before writing any more emulator code, and it is now exhaustive. Every
+path that can write a surface has an instrument, and all of them are empty for `0x2063380000`:
+
+| path | instrument | result |
+| --- | --- | --- |
+| draws, every drop class | `PROSPER_DROPPED_DRAW_CENSUS`, extended to `RetainedDrawNotSelected` + `IndirectArguments` | 256 drops, all on two other targets; **7,871 retained/indirect attempts, 0 dropped** |
+| DMA / WRITE_DATA / RELEASE_MEM / EVENT_WRITE | `PROSPER_GUEST_WRITE_WATCH` | nothing |
+| DS planes | `PROSPER_DSBRIDGE_LOG` | not a plane of any retained surface |
+| guest CPU | `PROSPER_RTT_GUESTPEEK` | 0/1048576 bytes non-zero, stable to sample #1024 |
+| undecoded PM4 | `[pm4] unknown raw type-3 opcode` (ungated) | **zero unknown opcodes on the whole route** |
+| async-compute queue | `q=` in the WaitRegMem line | ACB *is* processed (38 `q=A` vs 2 `q=D`) |
+| predicated jumps | `PROSPER_PREDLOG`, now sampled across the whole run | **8,192+ jumps, `pred=0` on every one, `skip=0`** |
+| whole-submit rejection | `[agc] ordered DMA submit rejected` | zero |
+| **the guest's own register writes** | `PROSPER_COLORSTATETRACE=3840x2160` | across **1,437,781** 4K colour-state records the guest programs `0x2063380000` as a colour target **exactly once** |
+
+That last row is the decisive one. prosper is not losing the producer — **the guest never issues it.**
+It allocates and clears its own 4K HDR scene buffer once, samples it 24× per frame forever, and never
+renders to it.
+
+And the emptiness is not confined to that one surface: **the entire post-process chain is clears.**
+The first bloom level `0x20602a0000` is written by one draw with *no sampled inputs* and
+`px_nonzero=0`, exactly like the scene colour's single pass. A whole phase of the frame is missing
+its work while the lighting that feeds it is 45% populated.
+
+### What that leaves, and the caveat on the compute census
+
+The remaining candidate is the compute chain, and specifically the nine programs that never execute.
+**Six of them — the `0x205b5*` cluster — dispatch at exactly 1920×1080**, which is the post-chain's
+own resolution (`0x20602a0000`, `0x2066be0000` and the rest are all 1920×1080). The only 4K one,
+`0x2042f49a00`, is a depth decompress: `PROSPER_COMPUTE_MEMPROBE=2042f49a00:0:40:16` decodes its
+source T#s to `0x2052ac0000` (depth) and `0x2054aa0000` (stencil) with `0x2055310000` (HTILE) as
+metadata, and it stores to plain copies at `0x204b1a0000` / `0x204d180000` / `0x204da00000`.
+
+**`PROSPER_COMPUTE_BINDS` reports zero programs binding `0x2063380000`, and that null is VOID for
+exactly the population in question.** The instrument enumerates a dispatch's resolved resource table,
+and the never-executing programs are precisely the ones whose resource tables fail to resolve — so it
+cannot see their bindings however correct it is. The positive control that "validated" it
+(`0x20431c0000`, many rows) was bound by an *executing* program, which tests the discriminator and
+not the domain. Do not cite that zero as evidence about the nine.
 
 ## Ruled out
 
@@ -3006,6 +3046,30 @@ falsification.
   pixels; it is a bridge-health improvement whose visual effect is nil.
   (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
   compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
+- **Predicated jumps are dropping the composite (the #319 shape, one title over).** *Solid.* The
+  polarity in `command_processor.cpp` (`skip = cond != 0`) is `CONFIDENCE: MED` and pinned on another
+  title, so this was a fair suspicion. Measured across a whole routed run: **8,192+ folded jumps,
+  `pred=0` on every one, `skip=0`.** GTA V does not predicate its jumps at all. The old 96-line cap on
+  that log is why this looked open — it expired thousands of frames before the 3D chain begins at
+  ~87% of the run, so it only ever described the loading screen.
+- **`sceAgcAcbJump` is the missing producer (the #319 defect on the async-compute queue).** *Solid.*
+  It was genuinely unregistered, and `hle_agc.cpp:675` records that the DCB sibling's absence made
+  "the composite never execute" — GTA V's exact picture, and GTA V does drive post-processing through
+  the ACB. But a builder mirroring the DCB argument roles refuses on the first call:
+  `target=0x0 ndw=0x21 a5=0x5 a6=<the acb again> a7=0x1 a8=0x2ec`, so `a3` is not the target and the
+  roles do not transfer. It is also called **exactly once** in a 200 s route, so it cannot be a
+  per-frame producer under any ABI. Left registered as a logging observer that returns 0.
+- **The composite's scene-colour T# is stale or mis-derived.** *Solid.* `PROSPER_RTT_GUESTPEEK` now
+  prints descriptor provenance, and the working buffer `0x20431c0000` and the empty `0x2063380000`
+  resolve **identically** — no SRT key, no SGPR key, matched by fetch pc. Provenance gives the failing
+  one no special status. Reinforced by the colour-state census above: the guest itself programs that
+  address as a target exactly once in 1.4M records, so there is nothing for a stale descriptor to be
+  stale *about*.
+- **A missing device capability blocks the rejected compute kernels.** *Solid.* The native subgroup
+  contract is **ENABLED** on this machine (`size_control=1 full_subgroups=1 vote=1 arithmetic=1`,
+  sizes 32..64, AMD Radeon 8060S / RADV STRIX_HALO), so `0x205b5e8600`'s VCC_LO read is not blocked by
+  a capability. Its mask is untracked because the write is in another basic block — a cross-block
+  dataflow limit, which is different work.
 - **`no-entry` at 81% of DS-bridge calls is a defect.** *Instrument.* `find_persistent_ds_sampled` is
   consulted for **every sampled binding**, so `no-entry` counts every ordinary colour texture in the
   frame; the code says so at `tests/render_runner.h:2796` ("the no-entry bucket is unbounded and is
