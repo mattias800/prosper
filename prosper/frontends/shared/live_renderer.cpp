@@ -5964,12 +5964,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // silently drop any ordinary draws grouped after it. Key on it so a resolve is always
                     // its own pass.
                     const bool resolve0 = items[pass_i].ps.cb_resolve;
+                    // The DEPTH/STENCIL attachment is part of a pass's target identity, not just its
+                    // colour attachments.
+                    //
+                    // A render pass has ONE depth attachment, and the backend picks one cached DS
+                    // image for the whole grouped call from its first meaningful draw. Grouping on
+                    // colour alone therefore let a single call span draws that name different DS
+                    // surfaces -- or, for a layered surface, different DB_DEPTH_VIEW SLICES of one
+                    // allocation. Every such draw then rendered into the first face the call
+                    // happened to select.
+                    //
+                    // Measured on GTA V (Codex, #2542): one grouped call crosses DB_DEPTH_VIEW from
+                    // slice 0 to slice 1 at draw 65, so several guest cube faces were being rendered
+                    // into one host face. That also makes any "the cube has six valid faces"
+                    // measurement void: the handles existed, their contents did not correspond to
+                    // six guest faces.
+                    auto ds_identity = [](const prosper::gpu::DrawItem& draw) {
+                        return std::tuple(draw.ps.depth_read_base, draw.ps.depth_write_base,
+                                          draw.ps.stencil_read_base, draw.ps.stencil_write_base,
+                                          draw.ps.htile_data_base,
+                                          prosper::test::ds_depth_view_slice_start(
+                                              draw.ps.db_depth_view));
+                    };
+                    const auto ds0 = ds_identity(items[pass_i]);
                     std::vector<const prosper::gpu::DrawItem*> pass;
                     auto same_targets = [&](const prosper::gpu::DrawItem& draw) {
                         if (draw.color0_base != base ||
                             active_color_count(draw) != requested_color_count ||
                             active_format(draw, 0) != format0)
                             return false;
+                        if (ds_identity(draw) != ds0) return false;
                         for (uint32_t slot = 1; slot < requested_color_count; ++slot)
                             if (active_color(draw, slot) != pass_bases[slot] ||
                                 active_format(draw, slot) != pass_formats[slot]) return false;

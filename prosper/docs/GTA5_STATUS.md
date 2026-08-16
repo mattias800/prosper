@@ -1829,6 +1829,49 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## RETRACTED: "cube shadows are not the missing world" (2026-08-16)
+
+That conclusion is **void, not a demonstrated negative**, and the reason is worth more than the claim.
+
+Pass grouping's `same_targets` compared colour targets, formats and resolve mode — and **not the
+depth/stencil attachment**. A render pass has one depth attachment and the backend selects one cached
+DS image for the whole grouped call from its first meaningful draw, so a single call could span draws
+naming different DS surfaces, or different `DB_DEPTH_VIEW` **slices of one layered allocation**. Every
+such draw rendered into whichever face the call happened to select. Codex measured one grouped call
+crossing slice 0 → slice 1 at draw 65.
+
+So when I reported "six valid faces" under `PROSPER_DS_GUEST_WRITE_INVALIDATE=0`, the six *handles*
+existed and their *contents* did not correspond to six guest faces. The lever I thought I had moved
+was never moved.
+
+**Fixed**: grouping now splits on DS identity — depth/stencil bases, HTILE base, and the
+`DB_DEPTH_VIEW` slice. Measured on the same route with defaults (invalidation ON):
+
+| cube | faces valid before | after |
+| --- | --- | --- |
+| `0x2094ec0000` | 1 (`0x01`) | **5** (`0x1f`) |
+| `0x20948c0000` | 1 (`0x01`) | **3** (`0x07`) |
+| `0x208f340000` | 4 (`0x1e`) | 4 (`0x1e`) |
+| `0x2097ec0000` | 5 (`0x3e`) | 5 (`0x3e`) |
+
+Multiple guest faces really were being rendered into one host face, and the earlier per-slice census
+could not see it because the census counted the passes the backend *made*, not the faces the guest
+*asked for*.
+
+**The cube A/B is still open.** Reaching 6/6 requires the invalidation switch, which perturbs the
+frame on its own (the HUD disappears in that arm), so "world still black with the cube bridged" is
+not a clean measurement either. The honest state is: the bridge works when faces are resident, the
+grouping defect that corrupted them is fixed, and whether the cube is load-bearing for the world is
+**not yet established in either direction**.
+
+### The pattern, again
+
+This is the third time this session a negative result turned out to be void because the lever was not
+actually moved — after the compute-program "never executes" retraction and the RTTLOG readback that
+materialised the pixels it measured. Each time the surface evidence looked sufficient. The thing that
+caught all three was someone asking *what would have to be true for this measurement to mean what I
+think it means* — twice that someone was Codex.
+
 ## Fifth review round on #2550, all four fixed (2026-08-15)
 
 **1 (blocker) — MRT1 was still discarded under the live renderer's calling convention.** The live
