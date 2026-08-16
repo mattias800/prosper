@@ -3175,12 +3175,30 @@ The first link is already measured elsewhere in this document: **730 of 900 inva
 `0x2052ac0000` are HTILE-only overlap** (`depth=0 stencil=0 htile_hit=1`, a 655,360-byte write at
 `0x2055310000`), and HTILE conservatively discards both aspects.
 
-**The fix is the one the invalidation comment already names, and it is now motivated by a full causal
-chain rather than a hunch: an HTILE write must invalidate depth only when it encodes a fast CLEAR,
-not when it is an ordinary metadata refresh.** That needs HTILE decoded. Note the blunt version is
-already falsified — `PROSPER_DS_HTILE_INVALIDATE=0` suppresses the invalidation wholesale and *loses*
-29% of presented content, because surfaces the guest really did rewrite then keep stale contents. The
-discrimination has to be per-write, not per-switch.
+**The obvious fix — "invalidate only on a fast CLEAR, not on a metadata refresh" — was implemented,
+measured, and is INERT here, and the measurement reframes the problem.** A fast clear writes one
+value to every tile while a per-tile zmin/zmax refresh does not, so post-write uniformity separates
+them without decoding HTILE's layout. Measured on a routed 400 s boot: **all 4,959 HTILE-overlap
+writes leave the plane uniform** (`htile_clear=1`), so the discriminator classifies every one as a
+clear, behaviour is unchanged, and the code was reverted rather than left dead.
+
+**What that tells us is more useful than the fix would have been: these really do look like fast
+clears, so invalidating depth is CORRECT.** The guest is clearing its depth buffer, prosper is right
+to drop the retained contents, and the defect is one step later —
+
+> when an HTILE fast clear invalidates depth, prosper has **no clear value** and falls back to
+> guessing one from the pass's compare ops. On hardware the clear value is whatever the guest
+> programmed (for reverse-Z, the far value 0.0, which its GREATER light volumes pass against). The
+> fresh-image approximation guesses **1.0** on this 7:7 mixed pass, and they all fail.
+
+So the fix is to **supply the fast-clear value** rather than to suppress the invalidation. The value
+is available in principle from `DB_DEPTH_CLEAR` at clear time or from the uniform HTILE word itself;
+what is missing is that a clear performed through HTILE metadata sets no draw's
+`depth_clear_enable`, so the existing "explicit clear wins" branch never sees it.
+
+Also note the blunt version stays falsified: `PROSPER_DS_HTILE_INVALIDATE=0` suppresses invalidation
+wholesale and *loses* 29% of presented content, which is exactly what should happen if the clears are
+real.
 
 **Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
 same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
