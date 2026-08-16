@@ -2140,58 +2140,42 @@ inline void note_compute_program_outcome(uint64_t code_addr, bool executed,
 // evidence that it does not bind the address. Only `executed` and `skipped-descriptors` rows come
 // from a fully resolved table. Read a null across a failing-shader population as "unproven", never
 // as "cleared". CONFIDENCE: HIGH (the coverage gap is measured, not assumed).
-// `ComputeBindOutcome`, `ComputeBindWatchKey` and `compute_bind_watch_key` live in gpu_execute.hpp so
-// the dedup seam is reachable from a test; that header carries why the key must span every dimension
-// this line prints.
-
+// `ComputeBindOutcome`, `ComputeBindWatchKey`, `compute_bind_watch_key` and the selection/dedup seam
+// `compute_bind_watch_rows` all live in gpu_execute.hpp, where the regression reaches them. This
+// function is deliberately only environment parsing and formatting: every decision about WHICH rows
+// exist -- range filtering, key construction, dedup -- is in the tested function, so a narrowing
+// anywhere in that logic fails the regression instead of passing it.
 inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourceTable* resources,
                                          ComputeBindOutcome outcome) {
-    struct Watch { std::vector<uint64_t> addrs; };
-    static const Watch watch = [] {
-        Watch w;
+    static const std::vector<uint64_t> watch = [] {
+        std::vector<uint64_t> addrs;
         const char* spec = std::getenv("PROSPER_COMPUTE_BINDS");
-        if (!spec || !*spec) return w;
+        if (!spec || !*spec) return addrs;
         for (const char* cursor = spec; *cursor;) {
             char* end = nullptr;
             const uint64_t value = std::strtoull(cursor, &end, 16);
             if (end == cursor) break;
-            w.addrs.push_back(value);
+            addrs.push_back(value);
             cursor = (*end == ',') ? end + 1 : end;
         }
-        return w;
+        return addrs;
     }();
-    if (watch.addrs.empty() || !resources) return;
-    for (const auto& resource : resources->resources) {
-        // Match the whole span, not the base: a consumer names a surface by its base while a
-        // producer may bind a subrange or a mip, and requiring equality would report "nobody binds
-        // it" for a producer that plainly does.
-        const uint64_t begin = resource.gpu_addr;
-        const uint64_t end = begin + (resource.size ? resource.size : 1);
-        for (const uint64_t want : watch.addrs) {
-            if (!begin || want < begin || want >= end) continue;
-            // Dedup on every dimension the line reports -- built by compute_bind_watch_key so the two
-            // cannot drift apart. See gpu_execute.hpp for what a narrower key loses; the short form is
-            // that one guest base carries several per-use resources, and collapsing them can print the
-            // read view of a surface while hiding the write view.
-            static std::mutex mutex;
-            static std::set<ComputeBindWatchKey> reported;
-            std::lock_guard lock(mutex);
-            if (!reported.insert(compute_bind_watch_key(code_addr, resource, want, outcome)).second)
-                continue;
-            const char* outcome_name = outcome == ComputeBindOutcome::Executed ? "executed"
-                                     : outcome == ComputeBindOutcome::SkippedDescriptors
-                                           ? "skipped-descriptors"
-                                           : "partial-recompile-empty";
-            std::fprintf(stderr,
-                         "[compute-binds] 0x%llx bound by program=0x%llx binding=%u class=%u "
-                         "fetch_pc=%u addr=0x%llx size=%llu %ux%u fmt=%u outcome=%s\n",
-                         (unsigned long long)want, (unsigned long long)code_addr, resource.binding,
-                         static_cast<unsigned>(resource.cls), resource.fetch_pc,
-                         (unsigned long long)resource.gpu_addr,
-                         (unsigned long long)resource.size, resource.width, resource.height,
-                         static_cast<unsigned>(resource.format), outcome_name);
-        }
+    if (watch.empty() || !resources) return;
+    static std::mutex mutex;
+    static std::set<ComputeBindWatchKey> reported;
+    std::vector<ComputeBindWatchKey> rows;
+    {
+        std::lock_guard lock(mutex);
+        rows = compute_bind_watch_rows(reported, watch, code_addr, resources, outcome);
     }
+    for (const ComputeBindWatchKey& row : rows)
+        std::fprintf(stderr,
+                     "[compute-binds] 0x%llx bound by program=0x%llx binding=%u class=%u "
+                     "fetch_pc=%u addr=0x%llx size=%llu %ux%u fmt=%u outcome=%s\n",
+                     (unsigned long long)row.watched, (unsigned long long)row.program, row.binding,
+                     row.cls, row.fetch_pc, (unsigned long long)row.resource_addr,
+                     (unsigned long long)row.size, row.width, row.height, row.format,
+                     compute_bind_outcome_name(static_cast<ComputeBindOutcome>(row.outcome)));
 }
 
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {

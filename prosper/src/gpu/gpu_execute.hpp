@@ -703,13 +703,20 @@ enum class ComputeBindOutcome { Executed, SkippedDescriptors, RecompileEmpty };
 // The identity a [compute-binds] row asserts, and therefore the exact key its dedup must use.
 //
 // A key NARROWER than the line silently drops rows that differ in what the reader is reading, and
-// this reporter had that defect: keyed on (program, gpu_addr) alone, it collapsed distinct bindings
-// at one guest base. Compute tables deliberately carry per-use resources -- the same allocation
-// appears once as a sampled Texture and again as a StorageImage, or under two fetch pcs -- and each
-// use gets its own binding. Whichever was encountered first suppressed the rest, so in a producer
-// hunt the surviving row could be the READ view while the WRITE view went unprinted: the exact
-// "nothing writes this surface" conclusion the instrument exists to prevent. Build the key with
-// compute_bind_watch_key so every printed dimension is in it by construction.
+// this reporter had that defect twice. First it was keyed on (program, gpu_addr) alone, so distinct
+// bindings at one guest base collapsed: compute tables deliberately carry per-use resources -- the
+// same allocation appears once as a sampled Texture and again as a StorageImage, or under two fetch
+// pcs -- and whichever was encountered first suppressed the rest, so in a producer hunt the
+// surviving row could be the READ view while the WRITE view went unprinted, which is the exact
+// "nothing writes this surface" conclusion the instrument exists to prevent. Then, with that fixed,
+// the key still omitted the four SHAPE fields the line prints (size, width, height, format) while
+// the comment claimed it spanned everything -- and a dynamic descriptor can hold program, base,
+// binding, fetch pc, class and outcome steady while its view shape changes, so the first row's
+// metadata would be presented as if it described every later observation. On this title that is the
+// worst possible field to collapse: extent and f16-versus-f11f11f10 ARE the conversion under
+// investigation.
+//
+// So every field the row prints is a key field. Do not add a printed column without adding it here.
 struct ComputeBindWatchKey {
     uint64_t program = 0;
     uint64_t resource_addr = 0;
@@ -718,10 +725,16 @@ struct ComputeBindWatchKey {
     uint32_t fetch_pc = 0;
     uint32_t cls = 0;
     uint32_t outcome = 0;
+    uint32_t size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = 0;
     bool operator<(const ComputeBindWatchKey& other) const {
-        return std::tie(program, resource_addr, watched, binding, fetch_pc, cls, outcome) <
+        return std::tie(program, resource_addr, watched, binding, fetch_pc, cls, outcome,
+                        size, width, height, format) <
                std::tie(other.program, other.resource_addr, other.watched, other.binding,
-                        other.fetch_pc, other.cls, other.outcome);
+                        other.fetch_pc, other.cls, other.outcome, other.size, other.width,
+                        other.height, other.format);
     }
 };
 
@@ -735,7 +748,47 @@ inline ComputeBindWatchKey compute_bind_watch_key(uint64_t program, const Shader
     key.fetch_pc = resource.fetch_pc;
     key.cls = static_cast<uint32_t>(resource.cls);
     key.outcome = static_cast<uint32_t>(outcome);
+    key.size = resource.size;
+    key.width = resource.width;
+    key.height = resource.height;
+    key.format = static_cast<uint32_t>(resource.format);
     return key;
+}
+
+// THE production selection + dedup seam: which rows [compute-binds] emits for one dispatch. Range
+// filtering, key construction and the dedup insert all live here, so a test that calls this function
+// exercises the same code the reporter runs and a narrowing mutation anywhere in it is visible to
+// that test. report_compute_binding_watch below is then only environment parsing and fprintf.
+//
+// Split out for exactly that reason: an earlier regression tested compute_bind_watch_key alone and
+// therefore proved the helper builds the intended tuple while proving nothing about whether the
+// reporter deduped on it -- narrowing the key at the reporter's own insert left the test green.
+inline std::vector<ComputeBindWatchKey> compute_bind_watch_rows(
+    std::set<ComputeBindWatchKey>& reported, const std::vector<uint64_t>& watched,
+    uint64_t code_addr, const ShaderResourceTable* resources, ComputeBindOutcome outcome) {
+    std::vector<ComputeBindWatchKey> rows;
+    if (watched.empty() || !resources) return rows;
+    for (const auto& resource : resources->resources) {
+        // Match the whole span, not the base: a consumer names a surface by its base while a
+        // producer may bind a subrange or a mip, and requiring equality would report "nobody binds
+        // it" for a producer that plainly does. A size of 0 is one byte, not an open span.
+        const uint64_t begin = resource.gpu_addr;
+        const uint64_t end = begin + (resource.size ? resource.size : 1);
+        for (const uint64_t want : watched) {
+            if (!begin || want < begin || want >= end) continue;
+            const ComputeBindWatchKey key =
+                compute_bind_watch_key(code_addr, resource, want, outcome);
+            if (!reported.insert(key).second) continue;
+            rows.push_back(key);
+        }
+    }
+    return rows;
+}
+
+inline const char* compute_bind_outcome_name(ComputeBindOutcome outcome) {
+    return outcome == ComputeBindOutcome::Executed              ? "executed"
+         : outcome == ComputeBindOutcome::SkippedDescriptors    ? "skipped-descriptors"
+                                                                : "partial-recompile-empty";
 }
 
 // How many operations each instrumented exit was OFFERED, so a zero in the census can be read. A
