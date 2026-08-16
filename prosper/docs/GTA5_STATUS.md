@@ -925,9 +925,34 @@ trade for the question in this document — the bundle is wanted for its **resou
 descriptors**, not to reproduce the frame — but a replayed frame from such a bundle is not evidence
 about rendering, and must not be used as any.
 
-So the recipe that produces a GTA V bundle is both flags together; neither alone is enough. Until one
-exists, every conclusion in this section is from log statistics rather than from the frame's actual
-contents.
+**Gate 3 — the window that clears gate 1 then exceeds the 2 GiB bundle limit.**
+
+```
+[grab] frame-bundle: submit 42862 failed (frame bundle unique bytes 2155499889
+       exceeded limit 2147483648); grab aborted
+[grab] frame-bundle: frame 153 ended at submit 42861
+```
+
+So `PROSPER_CAPTURE_FRAMES=240` dies at frame **153**, having accumulated 2.15 GB. The useful number
+behind it: **42,861 submits across 153 frames ≈ 280 submits per frame, ≈ 14 MB of unique bytes per
+frame.** That is the sizing rule for this title — a window much above ~140 frames cannot complete,
+and nothing near that is needed, since one frame already carries ~280 submits.
+
+The three gates are **sequential and each masks the next**, which is why this took several runs to
+walk: widen the window and you meet provenance; clear provenance and you meet the size limit. The
+combination that gets through is a **small** window plus the override:
+
+```bash
+PROSPER_CAPTURE_FRAMES=8 PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1 \
+PROSPER_GRAB_BUNDLE_AFTER_MS=380000 PROSPER_CAPTURE_DIR=~/<dir> \
+PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700 \
+PROSPER_PAD_SCRIPT=@scripts/gta5/reach-story-mode.pad \
+SDL_VIDEODRIVER=offscreen ./prosper-app <DUMP_ROOT>/PPSA04263-app0
+```
+
+Until a bundle exists, every conclusion in this section is from log statistics rather than from the
+frame's actual contents.
 
 ## The hang is NOT the only blocker — two more, measured (2026-08-15)
 
