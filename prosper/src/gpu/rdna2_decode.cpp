@@ -969,13 +969,30 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 const uint32_t d1 = code[1];
                 const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
                 // GTA V's screen-space compute passes use one additional exact DPP family:
-                // V_MOV_B32 / V_MIN_F32 / V_MAX_F32 ROW_ROR:8 with full masks and
-                // BOUND_CTRL=1. Keep the opcode and bound behavior in this admission predicate so
-                // other operations, rotate amounts, and BC0 remain fail-visible.
+                // V_MOV_B32 / V_MIN_F32 / V_MAX_F32 with full masks and BOUND_CTRL=1, over a
+                // lane-XOR permutation. Keep the opcode and bound behavior in this admission
+                // predicate so other operations, strides, and BC0 remain fail-visible.
+                //
+                // The family spans two controls that are the same permutation: ROW_ROR:8 (0x128),
+                // which was admitted first, and ROW_XMASK:n (0x160..0x16f), which is XOR n by
+                // definition -- and XOR 8 is exactly (row_lane - 8) modulo 16, so ROW_ROR:8 IS
+                // ROW_XMASK:8. The emitter already lowered the 8 case through an XOR of the lane
+                // id, so admitting the other strides adds control values to a lowering that was
+                // always general, rather than a new lowering. Every stride below 16 touches only
+                // bits 0..3, so the source lane stays in its own architectural DPP16 row for all of
+                // them, which is the property the ROR:8 form already relied on.
+                //
+                // XMASK:0 (0x160) stays out: it is the identity, so its result is
+                // indistinguishable from a decode error, and this predicate is meant to fail
+                // visibly. Live evidence for the widening is GTA V PPSA04263 kernels 0x205b545c00
+                // (pc=90) and 0x205b54ee00 (pc=98), both V_MIN_F32 ROW_XMASK:4, full masks, BC=1 --
+                // 1920x1080 screen-space dispatches that never executed on a routed boot.
                 const uint32_t vop1_opcode = (w >> 9) & 0xffu;
                 const uint32_t vop2_opcode = (w >> 25) & 0x3fu;
+                const bool row_xor_ctrl = ctrl == 0x128u ||
+                    (ctrl > 0x160u && ctrl <= 0x16fu);
                 const bool gta_row_ror8 =
-                    ctrl == 0x128u && ((d1 >> 19) & 1u) == 1u &&
+                    row_xor_ctrl && ((d1 >> 19) & 1u) == 1u &&
                     ((vf == Rdna2Format::VOP1 && vop1_opcode == 0x01u) ||
                      (vf == Rdna2Format::VOP2 &&
                       (vop2_opcode == 0x0fu || vop2_opcode == 0x10u)));
