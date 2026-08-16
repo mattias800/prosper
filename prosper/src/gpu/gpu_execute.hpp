@@ -825,6 +825,11 @@ void notify_compute_authority_boundary(const ComputeAuthorityBoundary& boundary)
 // without making prosper_core depend on Vulkan.
 using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
+// Names the PM4 packet responsible for the next guest write, for PROSPER_GUEST_WRITE_WATCH. Thread
+// local and reset by the caller; a watch line that says only "a guest write covered this" cannot
+// distinguish a 512 KiB DMA_DATA fill from an 8-byte completion label, and those imply opposite
+// things about whether the surface's contents were replaced.
+void set_guest_gpu_write_origin(const char* origin);
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 // A backend can prove that a dispatched write reproduced the exact guest bytes while renderer-owned
 // aliases at the same address may still hold divergent state. Notify those alias owners without

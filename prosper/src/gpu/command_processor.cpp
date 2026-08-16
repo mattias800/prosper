@@ -161,6 +161,8 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 bool guest_writable(uint64_t addr, uint32_t bytes);
 // Guest GPU writes invalidate renderer-owned copies of overlapping resources.
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
+// Names the PM4 packet responsible for the next notify, for PROSPER_GUEST_WRITE_WATCH.
+void set_guest_gpu_write_origin(const char* origin);
 // The 64 KiB Global Data Share (gpu_executor.cpp, declared in gpu_execute.hpp). DMA_DATA can name a
 // GDS offset rather than a guest address as its destination, and shaders reach the same backing.
 uint8_t* compute_gds_backing();
@@ -2478,7 +2480,9 @@ static void honor_eop_write(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
                 (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
+    set_guest_gpu_write_origin("RELEASE_MEM");
     notify_guest_gpu_write(c.rel_addr, c.rel_data_sel == 1 ? 4 : 8);
+    set_guest_gpu_write_origin(nullptr);
     wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
@@ -2504,7 +2508,9 @@ static void honor_event_write(const Pm4Command& c) {
     uint64_t v = gpu_clock64();
     write_trap_scan("EVENT", c.event_addr, pre, &v, sizeof v, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
+    set_guest_gpu_write_origin("EVENT_WRITE");
     notify_guest_gpu_write(c.event_addr, sizeof v);
+    set_guest_gpu_write_origin(nullptr);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
     clockfence_record(c.event_addr, pre, v, pkt_addr(c), 2);
     if (getenv("PROSPER_GFXLOG"))
@@ -2801,7 +2807,9 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
                     slot == 0 ? "fill" : "copy", (unsigned long long)ordinal,
                     (unsigned long long)c.dd_dst, c.dd_bytes);
     }
+    set_guest_gpu_write_origin("DMA_DATA");
     notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
+    set_guest_gpu_write_origin(nullptr);
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
     if (writer_provenance_enabled() &&
         (c.dd_bytes >= 256 || writer_provenance_full_enabled()))
@@ -2865,7 +2873,9 @@ static void honor_write_data(const Pm4Command& c) {
         write_trap_scan("WDATA", c.wd_addr, peek_qword(c.wd_addr), c.wd_data,
                         (uint64_t)c.wd_num * 4, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
+    set_guest_gpu_write_origin("WRITE_DATA");
     notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
+    set_guest_gpu_write_origin(nullptr);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
     poolshift_check("WDATA", c.wd_addr, (uint64_t)c.wd_num * 4, c.wd_num ? c.wd_data[0] : 0, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))

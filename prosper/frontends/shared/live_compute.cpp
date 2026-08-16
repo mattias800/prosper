@@ -4156,8 +4156,11 @@ std::optional<bool> execute_cpu_fast_path(const prosper::gpu::ComputeItem& item)
     }
     // Match the Vulkan path's conservative invalidation contract: padding beyond the exact launch
     // remains untouched, but every alias of the declared resource must be considered stale.
-    if (resource->gpu_addr)
+    if (resource->gpu_addr) {
+        prosper::gpu::set_guest_gpu_write_origin("compute-writeback(cpu-fill)");
         prosper::gpu::notify_guest_gpu_write(resource->gpu_addr, resource->size);
+        prosper::gpu::set_guest_gpu_write_origin(nullptr);
+    }
     if (!resource->host_data && prosper::gpu::writer_provenance_enabled())
         prosper::gpu::record_guest_write(
             prosper::gpu::GuestWriterKind::ComputeBuffer,
@@ -8034,7 +8037,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
                 ctx.unmap_memory(buffer.memory);
                 if (buffer.resource->gpu_addr)
+                    set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
                     notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
+                    set_guest_gpu_write_origin(nullptr);
                 if (!buffer.resource->host_data && writer_provenance_enabled())
                     record_guest_write(GuestWriterKind::ComputeBuffer,
                                        buffer.resource->gpu_addr, buffer.guest_bytes,
@@ -8131,11 +8136,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              buffer.resource->size);
             ctx.unmap_memory(buffer.memory);
             if (buffer.resource->gpu_addr) {
-                if (changed)
+                if (changed) {
+                    set_guest_gpu_write_origin("compute-writeback(buffer-full)");
                     notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
-                else
+                    set_guest_gpu_write_origin(nullptr);
+                } else {
                     notify_guest_gpu_write_preserving_bytes(
                         buffer.resource->gpu_addr, buffer.resource->size);
+                }
             }
             if (buffer.persistent)
                 ctx.validate_cached_buffer_source(buffer.cache_key);

@@ -8785,7 +8785,11 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                 copy.bytes > copy.destination_size || copy.bytes > source_size)
                 return;
             std::memmove(copy.destination_data, source, copy.bytes);
-            if (!destination_gds) notify_guest_gpu_write(copy.dst, copy.bytes);
+            if (!destination_gds) {
+                set_guest_gpu_write_origin("DMA_DATA(live-target)");
+                notify_guest_gpu_write(copy.dst, copy.bytes);
+                set_guest_gpu_write_origin(nullptr);
+            }
         });
 }
 
@@ -10882,9 +10886,18 @@ void report_guest_write_watch(uint64_t addr, uint64_t size, const char* origin) 
     }
 }
 
+// Thread-local origin for the next guest write, so PROSPER_GUEST_WRITE_WATCH can name the PM4
+// packet that produced it. "a guest write covers this surface" and "a DMA_DATA fill of 512 KiB
+// covers this surface" are different facts, and only the second says whether the depth contents
+// were actually replaced.
+thread_local const char* g_guest_write_origin = "gpu";
+void set_guest_gpu_write_origin(const char* origin) {
+    g_guest_write_origin = origin ? origin : "gpu";
+}
+
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
-    report_guest_write_watch(addr, size, "gpu");
+    report_guest_write_watch(addr, size, g_guest_write_origin);
     // Page-protection watches observe guest CPU stores, but device/DMA writes can mutate the same
     // direct-memory pages without a CPU protection fault. Mark the virtual range dirty as part of the
     // existing authoritative GPU-write notification so cross-submit texture/compute caches never trust
