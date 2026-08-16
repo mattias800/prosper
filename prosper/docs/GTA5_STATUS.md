@@ -3066,6 +3066,18 @@ falsification.
   pixels; it is a bridge-health improvement whose visual effect is nil.
   (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
   compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
+- **`0x205b658800`'s M0 read is a pure save/restore, so any value will do.** *Solid, and it was my own
+  proposal.* `pc=82 s_mov_b32 s6, m0` is immediately followed by `pc=83 s_movk_i32 m0, 0`, which reads
+  as a textbook save around a clobbering sequence — and `pc=232 s_mov_b32 m0, s6` does restore it. But
+  the program then uses `s6` **as data** at `pc=263` and `pc=266` (VOP2 sources), and nothing rewrites
+  `s6` between the restore and those uses. The launch value of M0 is read back and computed with. So
+  resolving an untracked M0 to a fabricated 0 would produce silently wrong arithmetic in exactly the
+  kernel the change was meant to enable, which is the worst failure direction available — it computes
+  instead of rejecting. Two tests already refuse the general form (`rdna2_spirv_struct`: M0 carries the
+  GDS append base in `[31:16]` and the LDS base in `[15:0]`, and the exact `v_writelane_b32 v20, m0, 1`
+  site requires a *proven* scalar). **The blocker is not the lowering — it is that nothing here knows
+  the Gen5 compute launch value of M0.** Until that is evidence rather than a guess, this kernel stays
+  rejected.
 - **The composite's scene-colour T# is stale, mis-derived, or points somewhere prosper invented.**
   *Solid, and this is the version to cite* — it supersedes the provenance argument in the entry
   further down, which reached the right answer by a route that does not establish it (see the note
