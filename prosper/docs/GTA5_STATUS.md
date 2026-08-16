@@ -892,20 +892,29 @@ depends on those three has not been established.
 frame look wrong", and on this title it fails **twice, for unrelated reasons**. Each failure reads as
 "frame capture does not work on GTA V", which is why the first one hid the second for a day.
 
-**Gate 1 — the capture window is one present wide, and this title does not submit on every present.**
+**Gate 1 — the capture window is a PRESENT COUNT, and a present count is not a unit of time.**
 Earlier attempts at 170 s with `PROSPER_CAPTURE_FRAMES=1` and 16 reported *"the capture window
 contained no GPU submits"*, which read as a window/submit mismatch of unknown kind. The newer
 diagnostic names it exactly:
 
 ```
-[grab] frame-bundle: window had no submits; widen it with PROSPER_CAPTURE_FRAMES=N (1..240)
 [grab] frame-bundle: during this window the submit hook was reached=0, 0 while inactive,
-       0 while not capturing; window was open 1 ms for 1 presents
+       0 while not capturing; window was open 1 ms for 1 presents      # FRAMES=1
+       ... window was open  6 ms for   8 presents                      # FRAMES=8
+       ... window was open 38 ms for  64 presents                      # FRAMES=64
 ```
 
-`reached=0` with the window open **1 ms** settles it: the hook never fired, so nothing was
-mis-classified — the window simply closed between submits. **`PROSPER_CAPTURE_FRAMES=240` clears it**
-and the capture reaches real submits (observed: submit 34146).
+`reached=0` settles that nothing was mis-classified — the hook never fired. The rate is the finding:
+this title flips in **bursts**, ~0.6 ms per present against a ~23–25/s average, so a window's
+wall-clock duration is effectively random and usually far too short to contain a submit. Widening the
+count does not reliably help, because a burst consumes it: 64 presents elapsed in 38 ms and saw
+nothing.
+
+**The fix is `PROSPER_CAPTURE_WAIT_FOR_SUBMITS=1`** (`gpu_timeline.cpp`, opt-in), which extends the
+window until at least one submit is captured, bounded by the same 240-present ceiling, and never
+shortens a window that already worked. This was already diagnosed on this title under #2549 with the
+same burst measurements — recorded here because three separate frame counts were tried before that
+flag was found, and the failure message points at `PROSPER_CAPTURE_FRAMES` instead.
 
 **Gate 2 — the bundle then aborts on indirect-pointer provenance.**
 
@@ -925,25 +934,33 @@ trade for the question in this document — the bundle is wanted for its **resou
 descriptors**, not to reproduce the frame — but a replayed frame from such a bundle is not evidence
 about rendering, and must not be used as any.
 
-**Gate 3 — the window that clears gate 1 then exceeds the 2 GiB bundle limit.**
+**Gate 3 — GTA V's working set exceeds the F9 grab's 2 GiB default budget.**
 
 ```
 [grab] frame-bundle: submit 42862 failed (frame bundle unique bytes 2155499889
-       exceeded limit 2147483648); grab aborted
-[grab] frame-bundle: frame 153 ended at submit 42861
+       exceeded limit 2147483648); grab aborted        # FRAMES=240, died at frame 153
+[grab] frame-bundle: submit 35716 failed (frame bundle unique bytes 2236660079
+       exceeded limit 2147483648); grab aborted        # FRAMES=4 + WAIT_FOR_SUBMITS
 ```
 
-So `PROSPER_CAPTURE_FRAMES=240` dies at frame **153**, having accumulated 2.15 GB. The useful number
-behind it: **42,861 submits across 153 frames ≈ 280 submits per frame, ≈ 14 MB of unique bytes per
-frame.** That is the sizing rule for this title — a window much above ~140 frames cannot complete,
-and nothing near that is needed, since one frame already carries ~280 submits.
+**Read those two together, because the pair is the finding:** 153 frames cost 2.155 GB and *four*
+frames cost 2.237 GB. The bytes are therefore **not** per-frame deltas — they are dominated by the
+resident working set the first captured frame pulls in, so shrinking the window does not shrink the
+bundle and there is no frame count that fits under 2 GiB. (An earlier revision of this section
+divided 42,861 submits by 153 frames and published "≈ 14 MB per frame" as a sizing rule. That
+arithmetic is right and the inference from it is wrong: the 4-frame run falsifies it outright.)
+
+The lever is the budget, not the window: **`PROSPER_CAPTURE_BUNDLE_MAX_MB`** on `prosper-app`, which
+accepts 64..3072 MiB against a 2048 MiB default.
 
 The three gates are **sequential and each masks the next**, which is why this took several runs to
-walk: widen the window and you meet provenance; clear provenance and you meet the size limit. The
-combination that gets through is a **small** window plus the override:
+walk: widen the window and you meet provenance; clear provenance and you meet the size limit; and
+widening the window is the wrong lever for gate 1 anyway. The combination that gets through is a
+**small** window that waits for submits, plus the override:
 
 ```bash
-PROSPER_CAPTURE_FRAMES=8 PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1 \
+PROSPER_CAPTURE_FRAMES=1 PROSPER_CAPTURE_WAIT_FOR_SUBMITS=1 \
+PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1 PROSPER_CAPTURE_BUNDLE_MAX_MB=3072 \
 PROSPER_GRAB_BUNDLE_AFTER_MS=380000 PROSPER_CAPTURE_DIR=~/<dir> \
 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700 \
