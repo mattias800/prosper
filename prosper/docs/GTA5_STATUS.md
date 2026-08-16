@@ -3353,6 +3353,18 @@ falsification.
   This also corrects a methodological claim of mine: **this title's run-to-run variance at 400 s is
   small (0.15%)**. The large spread I attributed to variance earlier was the 200 s phase problem, so
   differences above ~1% at 400 s are real and worth acting on.
+- **A `gpu-preserving` writeback is invalidating the depth, so sparing it will help.** *Solid.* The
+  premise is right and interesting: `PROSPER_GUEST_WRITE_WATCH` with a **positive control** (the HTILE
+  base, which fires) shows the writes that invalidate this title's 4K scene depth come from prosper's
+  **own** compute writeback — `compute-writeback(cpu-fill)` and `gpu-preserving`, 655,360 bytes on
+  `0x2055310000`. The emulator discards its own rendered depth in response to its own bookkeeping, and
+  a write whose caller *proved* the bytes unchanged cannot encode a new fast clear. So the fix was
+  plumbed: a `guest_gpu_write_is_preserving()` flag around the observer call, consumed only on the
+  HTILE path and only when the depth and stencil planes are untouched.
+  **It is inert.** Total scene-depth invalidations across three same-route runs: **2,497** (no HTILE
+  work), **2,253** (expand-pattern fix), **2,299** (expand + preserving) — the second change is inside
+  the run-to-run spread. The `gpu-preserving` origin is a small minority of these writes;
+  `compute-writeback(cpu-fill)` dominates. Reverted rather than left as dead API.
 - **One of the never-executing compute kernels writes the scene colour.** *Solid.* This was the
   last standing candidate after every draw, DMA and resolve path came back empty, and it had a real
   gap behind it: `PROSPER_COMPUTE_BINDS` enumerates *resolved* resource tables, and those kernels are
