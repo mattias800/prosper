@@ -3353,6 +3353,23 @@ falsification.
   This also corrects a methodological claim of mine: **this title's run-to-run variance at 400 s is
   small (0.15%)**. The large spread I attributed to variance earlier was the 200 s phase problem, so
   differences above ~1% at 400 s are real and worth acting on.
+- **The fresh-image depth value is the defect; supplying the observed clear value fixes it.** *Solid,
+  and this retires the whole depth-clear line.* The strongest-looking lead in this document: the
+  resolve gets a freshly created attachment, its mixed GREATER/LESS draws cannot share one initial
+  value, and `PROSPER_DEPTH_CLEAR=0.0` took it from 10 of 122 read-back passes with colour to 68 of
+  126 **at full 4K coverage** while 1.0 took it to 0 of 124.
+  So the value was supplied properly rather than forced: a clear-hint registry keyed by depth base,
+  written when a uniform HTILE fast clear is observed (word `0x00000000` → 0.0, the reverse-Z far
+  plane, consistent with the measured forward `vp{min=0 max=1}` viewport and GREATER compares), and
+  consumed after the explicit-enable branch and before the #371 approximation. It worked exactly as
+  designed — **70 of 130 passes with colour, max 8,294,400 (100%)**, reproducing the forced arm — and
+  **246/246 stayed green.**
+  **Then I opened the frame: a white blob, blue haze, no world geometry, and the radar GONE.** The
+  buffer fills with something that blooms. Identical in appearance to `PROSPER_NO_DEPTH=1`. Reverted.
+  **What this kills is bigger than the patch:** the `DEPTH_CLEAR=0.0` result that motivated three
+  separate attempts was bloom all along, and no amount of choosing a better initial depth value will
+  render this world. See instrument trap 181 — I had already recorded that these counters cannot
+  separate world from bloom, and still had to be shown it a second time by the image.
 - **A `gpu-preserving` writeback is invalidating the depth, so sparing it will help.** *Solid.* The
   premise is right and interesting: `PROSPER_GUEST_WRITE_WATCH` with a **positive control** (the HTILE
   base, which fires) shows the writes that invalidate this title's 4K scene depth come from prosper's
