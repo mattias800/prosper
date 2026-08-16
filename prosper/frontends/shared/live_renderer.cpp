@@ -4005,6 +4005,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::array<std::vector<float>, 6> faces;
                             uint32_t slices_found = 0;
                             std::string cube_error;
+                            // Publish the consumer descriptor's layer stride so the DS invalidation
+                            // can address each face's own bytes. This is the only authority this
+                            // title offers: it never programs DB_DEPTH_SLICE.
+                            if (r.layer_stride_bytes)
+                                prosper::test::note_ds_layer_stride(r.gpu_addr,
+                                                                    r.layer_stride_bytes);
                             uint32_t present_mask = 0, known_mask = 0;
                             const bool complete = prosper::test::read_persistent_ds_cube_depth(
                                 r.gpu_addr, tw, th, faces, slices_found, cube_error,

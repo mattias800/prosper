@@ -2490,11 +2490,70 @@ inline RenderHostBufferPoolStats render_host_buffer_pool_stats() {
 struct PersistentDsKey {
     uint64_t dr = 0, dw = 0, sr = 0, sw = 0, htile = 0;
     uint32_t w = 0, h = 0, fmt = 0, slice = 0;
+    // Bytes between consecutive slices of a layered allocation, from the producer's own
+    // DB_DEPTH_SLICE. Deliberately NOT part of identity: two views of one allocation that disagree
+    // about the stride are a decode error, not two surfaces, and making it part of the key would
+    // silently split them into two images instead of surfacing that.
+    uint64_t slice_bytes = 0;
     bool operator==(const PersistentDsKey& o) const {
         return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw && htile == o.htile &&
                w == o.w && h == o.h && fmt == o.fmt && slice == o.slice;
     }
 };
+
+// DB_DEPTH_SLICE.SLICE_TILE_MAX gives the per-slice size as (SLICE_TILE_MAX + 1) * 64 bytes. This is
+// the PRODUCER's own statement of the layer stride, and the only authority available at attachment
+// time -- the consumer descriptor's layer_stride is exact too but arrives with a sample, which is
+// after the invalidation that needs it. Zero when the register was never programmed, which callers
+// must treat as "unknown" rather than as a zero stride.
+// CONFIDENCE: HIGH (field layout in pm4_registers.hpp; equation cross-checked against an independent
+// implementation of the same register, #2542).
+// Layer strides learned from a CONSUMER descriptor, keyed by depth allocation base.
+//
+// GTA V never programs DB_DEPTH_SLICE -- it reads 0x00000000 on every depth surface in a routed boot,
+// including the six-layer cubes -- so the producer authority below yields nothing for this title. The
+// cube T# does carry an exact layer stride, but it arrives with a SAMPLE, which is after the
+// invalidations that need it. Publishing it here lets the invalidation become slice-exact from the
+// first cube sample onward; before that it falls back to whole-allocation behaviour, which is the
+// safe direction (over-invalidation costs a re-render, under-invalidation shows stale pixels).
+inline std::unordered_map<uint64_t, uint64_t>& ds_layer_stride_registry() {
+    static std::unordered_map<uint64_t, uint64_t> strides;
+    return strides;
+}
+inline std::mutex& ds_layer_stride_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+// Records a stride, and reports a DISAGREEMENT rather than silently taking the newer one: two views
+// of one allocation that differ about the stride mean a decode error somewhere, and quietly
+// overwriting would turn that into wrong invalidation ranges instead of a visible complaint.
+inline void note_ds_layer_stride(uint64_t base, uint64_t stride) {
+    if (!base || !stride) return;
+    std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
+    auto [it, inserted] = ds_layer_stride_registry().try_emplace(base, stride);
+    if (!inserted && it->second != stride) {
+        static std::set<uint64_t> complained;
+        if (complained.insert(base).second)
+            std::fprintf(stderr,
+                         "[ds-stride] CONFLICT base=0x%llx had %llu, now told %llu; keeping the "
+                         "first\n",
+                         (unsigned long long)base, (unsigned long long)it->second,
+                         (unsigned long long)stride);
+    }
+}
+inline uint64_t ds_layer_stride_for(uint64_t base) {
+    if (!base) return 0;
+    std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
+    const auto found = ds_layer_stride_registry().find(base);
+    return found == ds_layer_stride_registry().end() ? 0 : found->second;
+}
+
+inline uint64_t ds_slice_bytes_from_db_depth_slice(uint32_t db_depth_slice) {
+    const uint32_t tile_max = (db_depth_slice >> prosper::agc::Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT) &
+                              prosper::agc::Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_MASK;
+    if (!tile_max) return 0;                       // never programmed
+    return (static_cast<uint64_t>(tile_max) + 1ull) * 64ull;
+}
 
 // DB_DEPTH_VIEW.SLICE_START, including its two high bits (SLICE_START occupies bits 0..10 with
 // SLICE_START_HI at 11..12; SLICE_MAX is bits 13..23). A single-face attachment programs
@@ -2582,8 +2641,25 @@ inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_de
 inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelineState& ps,
                                              uint64_t htile, uint32_t width, uint32_t height,
                                              uint32_t format) {
+    const uint64_t slice_bytes = ds_slice_bytes_from_db_depth_slice(ps.db_depth_slice);
+    if (getenv("PROSPER_DS_SLICE_CENSUS")) {
+        static std::mutex mutex;
+        static std::set<std::tuple<uint64_t, uint32_t, uint64_t>> seen;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            first = seen.emplace(ps.depth_read_base, width, slice_bytes).second;
+        }
+        if (first)
+            fprintf(stderr,
+                    "[ds-stride] base=0x%llx %ux%u db_depth_slice=0x%08x -> slice_bytes=%llu "
+                    "(natural D32 would be %llu)\n",
+                    (unsigned long long)ps.depth_read_base, width, height, ps.db_depth_slice,
+                    (unsigned long long)slice_bytes,
+                    (unsigned long long)(static_cast<uint64_t>(width) * height * 4ull));
+    }
     return {ps.depth_read_base, ps.depth_write_base, ps.stencil_read_base, ps.stencil_write_base,
-            htile, width, height, format, ds_depth_view_slice_start(ps.db_depth_view)};
+            htile, width, height, format, ds_depth_view_slice_start(ps.db_depth_view), slice_bytes};
 }
 
 inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
@@ -2802,12 +2878,27 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         const uint64_t htile_blocks = static_cast<uint64_t>((key.w + 7) / 8) *
                                       ((key.h + 7) / 8);
         const uint64_t htile_size = (htile_blocks * 4 + 0x7fff) & ~0x7fffull;
+        // Each slice owns its OWN bytes. Testing every face against the allocation's FIRST slice
+        // meant one write evicted an entire cube -- and, symmetrically, a write to face 5's bytes
+        // was attributed to face 0. GTA V's cube shadows lost faces this way faster than they were
+        // re-rendered, leaving one or two of six resident whenever the cube was sampled.
+        //
+        // The offset needs the layer stride. Where the producer never programmed DB_DEPTH_SLICE the
+        // stride is unknown, and the honest fallback is the old whole-allocation behaviour: a
+        // guessed stride would silently retain faces a real write had invalidated, which is the one
+        // error direction that shows up as stale pixels rather than as a missing surface.
+        // Producer register first, then a stride learned from a consumer descriptor, then the old
+        // whole-allocation behaviour. GTA V only ever reaches the second.
+        const uint64_t learned = key.slice_bytes ? key.slice_bytes
+                                                 : ds_layer_stride_for(key.dr ? key.dr : key.dw);
+        const uint64_t slice_offset = learned ? static_cast<uint64_t>(key.slice) * learned : 0;
+        const uint64_t slice_depth_bytes = learned ? learned : depth_size;
         const bool depth_overlap =
-            guest_ranges_overlap(addr, size, key.dr, depth_size) ||
-            guest_ranges_overlap(addr, size, key.dw, depth_size);
+            guest_ranges_overlap(addr, size, key.dr + slice_offset, slice_depth_bytes) ||
+            guest_ranges_overlap(addr, size, key.dw + slice_offset, slice_depth_bytes);
         const bool stencil_overlap =
-            guest_ranges_overlap(addr, size, key.sr, stencil_size) ||
-            guest_ranges_overlap(addr, size, key.sw, stencil_size);
+            guest_ranges_overlap(addr, size, key.sr + slice_offset, stencil_size) ||
+            guest_ranges_overlap(addr, size, key.sw + slice_offset, stencil_size);
         const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
         if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
         if (depth_overlap || htile_overlap) image.depth_valid = false;
