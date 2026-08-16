@@ -2994,6 +2994,59 @@ Two facts fix the frontier:
 So the world is not lost in the composite and not lost at scanout: **the producer of the scene-colour
 buffer is missing entirely.**
 
+### Run the route for 400 s, not 200 s — a 200 s run is mostly LOADING (2026-08-16)
+
+**This qualifies every per-frame statistic below, including several I wrote earlier the same day.**
+The routed boot reaches established gameplay only near the end of a 200 s run, so a 200 s sample is
+dominated by the loading phase and its ratios describe that phase rather than gameplay. Measured with
+`screenshot --count 10` (samples every 200 s), by distinct colours in the presented frame:
+
+| t | non-black px | distinct RGB colours |
+| --- | --- | --- |
+| 200 s | 1,131,517 | **241** |
+| 400 s | 1,757,394 | **3,756** |
+
+and an earlier 200 s run reported `distinct_rgb_colors: 2` — a frame that is black to the eye, whose
+1,051,186 "non-black" pixels sit at luminance 1-2 (instrument trap 160).
+
+The same counts at 400 s against 200 s show how much the phase moves them:
+
+| | 200 s | 400 s |
+| --- | --- | --- |
+| lighting `0x20431c0000` passes | 132 | **746** |
+| composite `0x2056740000` passes | 9 | **56** |
+| scene colour `0x2063380000` as a target | 1 | **1** |
+| scene colour sampled | 200 | **1,375** |
+
+So "the 3D chain runs in only ~2% of frames" was an artifact of stopping at 200 s, and should not be
+read as a throttling defect. **The one number that does not move is the one that matters**: the guest
+binds `0x2063380000` as a colour target exactly once — a start-up clear — while sampling it 1,375
+times in 400 s.
+
+**What the frame actually looks like at 400 s**, which is not what the 200 s captures suggested: the
+radar renders completely (map, blips, player arrow, N compass, legend bar), the tutorial text is
+crisp, and three world lights render with correct bloom halos. It is a real gameplay frame missing
+its base scene, not a black screen. With `PROSPER_RTT_ALIAS=2063380000:20431c0000` the same frame
+shows the bank interior with correct perspective, a lit doorway and architectural detail —
+**19,623 distinct colours against 3,756**.
+
+**Composite input inventory at 400 s** (max `rgb_nonblack` over the run, and pass count):
+
+| input | taps | content | passes |
+| --- | --- | --- | --- |
+| `0x2063380000` 4K f11f11f10 | x24 | **0** | 1 |
+| `0x2085de0000` 4K f16 | x6 | 4,330,576 | 636 |
+| `0x206e6a0000` 1080p f16 | x4 | **0** | 56 |
+| `0x206e640000` 240x135 f16 | x2 | **0** | 56 |
+| `0x20602a0000` 1080p f11f11f10 | x1 | 30,700 | 111 |
+| `0x2066be0000` 1080p f11f11f10 | x1 | 112,361 | 110 |
+| `0x206b4e0000` 960x540 un8 | x1 | 518,400 | 1 |
+
+Three inputs are empty: the scene colour and the two luminance/exposure-chain buffers. The sparse
+bloom buffers are what the three visible lights come through. Note the **format split**: the working
+HDR chain (`0x20df360000`, `0x2078ea0000`, `0x2074ee0000`, all heavily sampled) is `f16`, while the
+empty tap is `f11f11f10` — so the missing producer is a **format conversion** of a chain that works.
+
 ### The producer is missing from the GUEST's command stream, not from prosper's decode
 
 This was worth establishing before writing any more emulator code, and it is now exhaustive. Every
@@ -3078,6 +3131,14 @@ falsification.
   site requires a *proven* scalar). **The blocker is not the lowering — it is that nothing here knows
   the Gen5 compute launch value of M0.** Until that is evidence rather than a guess, this kernel stays
   rejected.
+- **One of the never-executing compute kernels writes the scene colour.** *Solid.* This was the
+  last standing candidate after every draw, DMA and resolve path came back empty, and it had a real
+  gap behind it: `PROSPER_COMPUTE_BINDS` enumerates *resolved* resource tables, and those kernels are
+  exactly the ones whose tables fail to resolve, so that instrument was void for them (recorded
+  above). Closed with a different one: `PROSPER_DYNTRACE_FAIL=1` **with no address filter** traces
+  every failed program in a single run and prints each MIMG's decoded T# base. Across all seven,
+  **zero mention of `0x2063380000`**, against 20+ distinct bases printed — so the instrument
+  demonstrably worked and the null is about the title. No failing compute kernel binds it.
 - **The composite's scene-colour T# is stale, mis-derived, or points somewhere prosper invented.**
   *Solid, and this is the version to cite* — it supersedes the provenance argument in the entry
   further down, which reached the right answer by a route that does not establish it (see the note
