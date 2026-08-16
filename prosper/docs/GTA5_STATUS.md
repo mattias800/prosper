@@ -3046,6 +3046,18 @@ falsification.
   pixels; it is a bridge-health improvement whose visual effect is nil.
   (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
   compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
+- **`0x2063380000` and `0x20431c0000` are two virtual mappings of the same physical memory.** *Solid.*
+  This was the best remaining structural explanation — it would have accounted for the guest rendering
+  to one name and sampling the other, and for the alias experiment working *exactly*. `PROSPER_MEMLOG=1`
+  refutes it: both live in the same mapping (`va=0x203de00000 len=0x120f00000 phys=0x111000000`) at
+  **different physical offsets**, `0x136580000` for the scene colour against `0x1163c0000` for the
+  lighting buffer. They are distinct memory. (The run does contain one genuine physical alias —
+  `va 0x2168da0000` and `va 0x2169580000` share `phys 0x23b0b0000` — but that pair is in the swapchain
+  range and is unrelated.)
+- **The single bind of `0x2063380000` is the pass that should have drawn the scene.** *Solid.* It is at
+  **0.0% of the run** — line 83 of 1,441,036 colour-state records — with `raw-format=6`,
+  `resolved-cwm=f`. A start-up initialisation clear, thousands of frames before the 3D chain begins at
+  ~87%. There is no gameplay-time bind to recover.
 - **Predicated jumps are dropping the composite (the #319 shape, one title over).** *Solid.* The
   polarity in `command_processor.cpp` (`skip = cond != 0`) is `CONFIDENCE: MED` and pinned on another
   title, so this was a fair suspicion. Measured across a whole routed run: **8,192+ folded jumps,
