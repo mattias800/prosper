@@ -4302,7 +4302,108 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             resource_rtt_hit = true;
                         }
                         bool cube_done = dcc_fast_clear_done && is_cube;
-                        if (is_cube && !rtt_hit && !dcc_fast_clear_done) {
+                        // CUBE DEPTH BRIDGE. A guest depth cube is ONE six-layer allocation whose
+                        // faces prosper retains as separate DS images (each keyed by its
+                        // DB_DEPTH_VIEW slice). The recompiler lowers a cube sample onto a single
+                        // vertically stacked w x 6h image, so the faces are gathered and restacked
+                        // here -- nothing can bind six images as one cube.
+                        //
+                        // Without this the sample fell through to a guest-byte decode of memory the
+                        // renderer never writes, i.e. zeros. For an omnidirectional shadow map zero
+                        // is one pole of the depth range, so every shadow test answered the same way
+                        // everywhere; a two-pole experiment showed the value can drive GTA V's
+                        // lighting output from its normal content to exactly zero, so this input is
+                        // load-bearing rather than cosmetic.
+                        //
+                        // The guest surface is Z16 (DB_Z_INFO.FORMAT=1) while prosper canonicalises
+                        // host attachments to D32_SFLOAT, so the conversion is NUMERIC -- clamp to
+                        // [0,1] and quantise -- not a bit reinterpretation, and it must not invert:
+                        // reversed-Z is already carried by the stored values and by the comparison
+                        // direction. CONFIDENCE: MED on the 8-bit staging below; the value is
+                        // faithful, the precision is not the guest's, and a shadow compare is
+                        // precision-sensitive. Recorded rather than hidden.
+                        bool cube_depth_bridged = false;
+                        if (is_cube && !rtt_hit && !fr.is_storage_image && r.depth == 6u &&
+                            prosper::test::is_retained_ds_plane(r.gpu_addr)) {
+                            std::array<std::vector<float>, 6> faces;
+                            uint32_t slices_found = 0;
+                            std::string cube_error;
+                            // Publish the consumer descriptor's layer stride so the DS invalidation
+                            // can address each face's own bytes. This is the only authority this
+                            // title offers: it never programs DB_DEPTH_SLICE.
+                            if (r.layer_stride_bytes)
+                                prosper::test::note_ds_layer_stride(r.gpu_addr,
+                                                                    r.layer_stride_bytes);
+                            uint32_t present_mask = 0, known_mask = 0;
+                            const bool complete = prosper::test::read_persistent_ds_cube_depth(
+                                r.gpu_addr, tw, th, faces, slices_found, cube_error,
+                                &present_mask, &known_mask);
+                            // Residency DISTRIBUTION, not a first-sight snapshot. "1 of 6 faces"
+                            // seen once is consistent with three different worlds: the guest
+                            // amortises faces across frames, prosper's invalidation evicts them
+                            // faster than they are re-rendered, or the sample simply landed
+                            // mid-sequence. A histogram over every sample separates them -- if the
+                            // count never reaches 6, no timing argument survives.
+                            {
+                                static std::mutex cube_mutex;
+                                static std::map<std::pair<uint64_t, uint32_t>, uint64_t> hist;
+                                static std::map<uint64_t, std::pair<uint32_t, uint32_t>> masks;
+                                static uint64_t samples = 0;
+                                std::lock_guard lock(cube_mutex);
+                                ++hist[{r.gpu_addr, slices_found}];
+                                auto& seen_masks = masks[r.gpu_addr];
+                                seen_masks.first |= present_mask;   // any slice ever VALID
+                                seen_masks.second |= known_mask;    // any slice ever KNOWN
+                                if (((++samples) & (samples - 1)) == 0 && samples >= 64) {
+                                    fprintf(stderr,
+                                            "[cube-depth] residency after %llu cube samples "
+                                            "(faces resident -> times seen):\n",
+                                            (unsigned long long)samples);
+                                    for (const auto& e : hist)
+                                        fprintf(stderr,
+                                                "[cube-depth]   addr=0x%llx faces=%u/6 x%llu%s\n",
+                                                (unsigned long long)e.first.first, e.first.second,
+                                                (unsigned long long)e.second,
+                                                e.first.second == 6u ? "  <-- bridgeable" : "");
+                                    for (const auto& e : masks)
+                                        fprintf(stderr,
+                                                "[cube-depth]   addr=0x%llx slices ever VALID=0x%02x "
+                                                "ever KNOWN=0x%02x (bit n = slice n; 0x3f = all six)"
+                                                "\n",
+                                                (unsigned long long)e.first, e.second.first,
+                                                e.second.second);
+                                }
+                            }
+                            (void)cube_error;
+                            if (complete && texture_pixels.size() >=
+                                    static_cast<size_t>(tw) * th * 6u * 4u) {
+                                for (uint32_t face = 0; face < 6u; ++face) {
+                                    const std::vector<float>& src = faces[face];
+                                    uint8_t* dst = texture_pixels.data() +
+                                        static_cast<size_t>(face) * tw * th * 4u;
+                                    for (size_t i = 0; i < static_cast<size_t>(tw) * th &&
+                                                       i < src.size(); ++i) {
+                                        float d = src[i];
+                                        d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
+                                        const uint8_t q = static_cast<uint8_t>(d * 255.0f + 0.5f);
+                                        dst[i * 4 + 0] = q;
+                                        dst[i * 4 + 1] = q;
+                                        dst[i * 4 + 2] = q;
+                                        dst[i * 4 + 3] = 0xffu;
+                                    }
+                                }
+                                cube_depth_bridged = true;
+                                rtt_hit = true;          // do not overwrite with a guest-byte decode
+                                resource_rtt_hit = true;
+                                // The loop above wrote all SIX faces into texture_pixels. Publishing
+                                // is driven by `cube_done` -- `fr.th = cube_done ? th * 6u : th` at
+                                // the upload seam -- so leaving it false uploaded one face and
+                                // silently dropped five, and the stacked-face lowering could never
+                                // see them. The ordinary cube path sets this for the same reason.
+                                cube_done = true;
+                            }
+                        }
+                        if (is_cube && !rtt_hit && !dcc_fast_clear_done && !cube_depth_bridged) {
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                 !PROSPER_ENV_VALUE("PROSPER_NODETILE");
@@ -6206,12 +6307,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // silently drop any ordinary draws grouped after it. Key on it so a resolve is always
                     // its own pass.
                     const bool resolve0 = items[pass_i].ps.cb_resolve;
+                    // The DEPTH/STENCIL attachment is part of a pass's target identity, not just its
+                    // colour attachments.
+                    //
+                    // A render pass has ONE depth attachment, and the backend picks one cached DS
+                    // image for the whole grouped call from its first meaningful draw. Grouping on
+                    // colour alone therefore let a single call span draws that name different DS
+                    // surfaces -- or, for a layered surface, different DB_DEPTH_VIEW SLICES of one
+                    // allocation. Every such draw then rendered into the first face the call
+                    // happened to select.
+                    //
+                    // Measured on GTA V (Codex, #2542): one grouped call crosses DB_DEPTH_VIEW from
+                    // slice 0 to slice 1 at draw 65, so several guest cube faces were being rendered
+                    // into one host face. That also makes any "the cube has six valid faces"
+                    // measurement void: the handles existed, their contents did not correspond to
+                    // six guest faces.
+                    auto ds_identity = [](const prosper::gpu::DrawItem& draw) {
+                        return std::tuple(draw.ps.depth_read_base, draw.ps.depth_write_base,
+                                          draw.ps.stencil_read_base, draw.ps.stencil_write_base,
+                                          draw.ps.htile_data_base,
+                                          prosper::test::ds_depth_view_slice_start(
+                                              draw.ps.db_depth_view));
+                    };
+                    const auto ds0 = ds_identity(items[pass_i]);
                     std::vector<const prosper::gpu::DrawItem*> pass;
                     auto same_targets = [&](const prosper::gpu::DrawItem& draw) {
                         if (draw.color0_base != base ||
                             active_color_count(draw) != requested_color_count ||
                             active_format(draw, 0) != format0)
                             return false;
+                        if (ds_identity(draw) != ds0) return false;
                         for (uint32_t slot = 1; slot < requested_color_count; ++slot)
                             if (active_color(draw, slot) != pass_bases[slot] ||
                                 active_format(draw, slot) != pass_formats[slot]) return false;
