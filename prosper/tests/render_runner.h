@@ -4013,6 +4013,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // whose value came out 1.0 is rejecting its own geometry.
     if (getenv("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
         uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
+        uint32_t greater_colour = 0, less_colour = 0;
         int first_op = -1;
         // What DB_DEPTH_CLEAR actually holds, whether or not a draw enables it. #371 forbids
         // CONSUMING it without an explicit enable -- Astro Bot leaves packed 1920x1080 max
@@ -4029,9 +4030,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 first_clear_value = d.ps->depth_clear_value;
             }
             if (d.ps->depth_clear_enable) ++explicit_clear;
+            // Split by whether the draw WRITES COLOUR. The initial value should serve the draws
+            // whose output is lost when they fail, and a depth-only or mask draw loses nothing
+            // visible. Plain majority ignored this and reproduced the old answer on exactly the
+            // passes that matter (7 vs 7, and 6 vs 7 the wrong way).
+            const bool writes_colour = std::any_of(
+                d.ps->color_targets.begin(), d.ps->color_targets.end(),
+                [](const auto& t) { return t.write_mask != 0; });
             switch (d.ps->depth_compare_op) {
-                case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL: ++greater; break;
-                case VK_COMPARE_OP_LESS: case VK_COMPARE_OP_LESS_OR_EQUAL: ++less; break;
+                case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL:
+                    ++greater; if (writes_colour) ++greater_colour; break;
+                case VK_COMPARE_OP_LESS: case VK_COMPARE_OP_LESS_OR_EQUAL:
+                    ++less; if (writes_colour) ++less_colour; break;
                 default: ++other; break;
             }
         }
@@ -4043,10 +4053,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if ((n & (n - 1)) == 0)
             fprintf(stderr,
                     "[depth-clear-why] target=0x%llx derived=%.3f reg_clear=%.6g first_op=%d "
-                    "explicit=%u compares{greater=%u less=%u other=%u} draws=%zu (x%llu)\n",
+                    "explicit=%u compares{greater=%u less=%u other=%u} "
+                    "colour{greater=%u less=%u} draws=%zu (x%llu)\n",
                     (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
                     depth_clear, first_clear_value, first_op, explicit_clear, greater, less, other,
-                    logical_draws.size(), (unsigned long long)n);
+                    greater_colour, less_colour, logical_draws.size(), (unsigned long long)n);
     }
     if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
