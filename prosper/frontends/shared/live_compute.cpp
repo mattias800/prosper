@@ -2255,6 +2255,22 @@ struct VulkanComputeContext {
                 std::fprintf(stderr, "[compute] storage-buffer int64 atomics %s "
                                      "(inherited from the adopted device)\n",
                              shared.storage_buffer_int64_atomics ? "ENABLED" : "unavailable");
+                // Same both-directions rule, one field over -- and this one decides whether a whole
+                // class of kernel can compile at all. A shader that reads VCC or EXEC as scalar DATA
+                // is materialised from subgroupBallot, and only when the native subgroup IS the guest
+                // wave; without the contract that operand is unresolvable and the kernel is rejected
+                // outright. Which of the four features is missing is the actionable half, so name
+                // them individually rather than printing the conjunction.
+                std::fprintf(stderr,
+                             "[compute] native subgroup contract %s (size_control=%d "
+                             "full_subgroups=%d vote=%d arithmetic=%d, sizes %u..%u) "
+                             "(inherited from the adopted device)\n",
+                             native_subgroup_contract ? "ENABLED" : "unavailable",
+                             (int)shared.compute_subgroup_size_control,
+                             (int)shared.compute_full_subgroups,
+                             (int)shared.compute_subgroup_vote,
+                             (int)shared.compute_subgroup_arithmetic,
+                             min_native_subgroup_size, max_native_subgroup_size);
                 return true;
             }
             // Anything failing here must fall through to a private device rather than killing the
