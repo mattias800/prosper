@@ -3131,6 +3131,33 @@ falsification.
   site requires a *proven* scalar). **The blocker is not the lowering — it is that nothing here knows
   the Gen5 compute launch value of M0.** Until that is evidence rather than a guess, this kernel stays
   rejected.
+- **The lighting resolve's empty output is a readback artifact.** *Solid, and it was the right
+  suspicion.* `[rtt] pass`'s counters come from `rendered_pixels`, which is EMPTY when a readback is
+  deferred, so `px_nonzero=0 rgb_nonblack=0` was ambiguous with "we never looked". The `src=<bytes>`
+  field settles it per pass, and the first run separated the two cases in opposite directions:
+  `0x20431c0000` is **read back on 760 of 760 passes**, so the lighting finding is real and now rests
+  on evidence that could have refuted it — of 122 read-back passes with 15+ draws (the G-buffer
+  resolve) only **10** carry colour, while 470 of 638 small 1-4 draw passes on the same target do.
+  Meanwhile `0x2067e40000` — a full-screen draw I was about to investigate for "reads a populated
+  texture, writes nothing" — is **not read back on 56 of 57 passes**, and that lead is void.
+- **The lighting resolve is black because its shadow cascades are empty.** *Solid.* The natural
+  reading: the six cascades it samples all report `MISS -- guest bytes`, and a shadow-map zero is the
+  NEAR plane, so every shadow test would read "occluded" and the pass would emit black over a perfect
+  G-buffer. `PROSPER_RTT_GUESTPEEK` measures the guest backing directly and it is **populated**:
+  `0x20954c0000` 100% non-zero, `0x2094ec0000` 100%, `0x20948c0000` 100%, `0x20945c0000` 100%,
+  `0x208f340000` 83.3%, `0x2093cc0000` 50% (one outlier, `0x2094bc0000`, is 0%). The miss path reads
+  real shadow data. Note this also means the existing `PROSPER_DS_UNBRIDGED_FAR` discriminator cannot
+  speak to these surfaces at all — it fires only for addresses that ARE a retained DS plane, and these
+  are not retained.
+- **`PROSPER_DS_HTILE_INVALIDATE=0` is neutral.** *Superseded — it is HARMFUL, and the original
+  measurement was phase-biased.* The neutral result was taken on a 200 s route, i.e. mostly loading.
+  Re-run at 400 s against two controls: SCANOUT `rgb_nonblack` **1,958,474** and **1,955,614** for the
+  controls — agreeing to **0.15%**, so the metric is stable at this phase — against **1,397,471** for
+  the arm, a **29% loss**. Keeping HTILE invalidation ON (the default) is right, and the arm is
+  retired as a candidate fix rather than merely unhelpful.
+  This also corrects a methodological claim of mine: **this title's run-to-run variance at 400 s is
+  small (0.15%)**. The large spread I attributed to variance earlier was the 200 s phase problem, so
+  differences above ~1% at 400 s are real and worth acting on.
 - **One of the never-executing compute kernels writes the scene colour.** *Solid.* This was the
   last standing candidate after every draw, DMA and resolve path came back empty, and it had a real
   gap behind it: `PROSPER_COMPUTE_BINDS` enumerates *resolved* resource tables, and those kernels are
