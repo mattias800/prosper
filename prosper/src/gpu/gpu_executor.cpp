@@ -2093,24 +2093,83 @@ void log_compute_dispatch(uint64_t program, uint64_t submit_no, size_t dispatch_
 // descriptors are garbage on its first fold and valid afterwards is skipped once and runs from then
 // on. One line cannot distinguish 1-of-438 from 438-of-438, and those are opposite states of the
 // title. Ratios, not first sightings.
-inline void note_compute_program_outcome(uint64_t code_addr, bool executed) {
+inline void note_compute_program_outcome(uint64_t code_addr, bool executed,
+                                        uint32_t gx = 0, uint32_t gy = 0, uint32_t gz = 0,
+                                        uint32_t lx = 0, uint32_t ly = 0) {
     static const bool on = std::getenv("PROSPER_COMPUTE_PROGRAM_CENSUS") != nullptr;
     if (!on) return;
     static std::mutex mutex;
-    static std::map<uint64_t, std::pair<uint64_t, uint64_t>> outcomes;   // addr -> {executed, skipped}
+    struct Outcome { uint64_t executed = 0, skipped = 0; uint32_t gx = 0, gy = 0, gz = 0, lx = 0, ly = 0; };
+    static std::map<uint64_t, Outcome> outcomes;
     static std::atomic<uint64_t> total{0};
     const uint64_t n = total.fetch_add(1) + 1;
     std::lock_guard lock(mutex);
     auto& entry = outcomes[code_addr];
-    (executed ? entry.first : entry.second) += 1;
+    (executed ? entry.executed : entry.skipped) += 1;
+    // The dispatch grid is what identifies a kernel's ROLE without resolving its descriptors, which
+    // is the whole difficulty for a program that never executes. A full-screen 4K pass at 8x8 groups
+    // is 480x270; anything much smaller is not writing the scene.
+    if (gx) { entry.gx = gx; entry.gy = gy; entry.gz = gz; entry.lx = lx; entry.ly = ly; }
     if ((n & (n - 1)) != 0 || n < 512) return;
     std::fprintf(stderr, "[compute-census] %llu dispatch decisions over %zu program(s)\n",
                  (unsigned long long)n, outcomes.size());
     for (const auto& [addr, counts] : outcomes)
-        if (counts.second)   // only programs that skipped at least once are interesting
-            std::fprintf(stderr, "[compute-census]   program=0x%llx executed=%llu skipped=%llu\n",
-                         (unsigned long long)addr, (unsigned long long)counts.first,
-                         (unsigned long long)counts.second);
+        if (counts.skipped)   // only programs that skipped at least once are interesting
+            std::fprintf(stderr,
+                         "[compute-census]   program=0x%llx executed=%llu skipped=%llu "
+                         "groups=%ux%ux%u local=%ux%u threads=%ux%u\n",
+                         (unsigned long long)addr, (unsigned long long)counts.executed,
+                         (unsigned long long)counts.skipped, counts.gx, counts.gy, counts.gz,
+                         counts.lx, counts.ly, counts.gx * counts.lx, counts.gy * counts.ly);
+}
+
+// PROSPER_COMPUTE_BINDS=<hex addr>[,<hex addr>…] — name every compute program that binds one of these
+// guest addresses, executed or skipped, with the binding's class and size.
+//
+// The question it answers is "who was supposed to write this surface". A render-target census sees
+// draws, the write watches see DMA/WRITE_DATA/RELEASE_MEM, and between them a surface produced by a
+// compute STORE is invisible: its address appears only inside a dispatch's resource table, which
+// nothing enumerates. GTA V's 4K HDR scene colour 0x2063380000 is the case -- sampled 24x per
+// composite, written by nothing any existing instrument can see.
+inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourceTable* resources,
+                                         bool executed) {
+    struct Watch { std::vector<uint64_t> addrs; };
+    static const Watch watch = [] {
+        Watch w;
+        const char* spec = std::getenv("PROSPER_COMPUTE_BINDS");
+        if (!spec || !*spec) return w;
+        for (const char* cursor = spec; *cursor;) {
+            char* end = nullptr;
+            const uint64_t value = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            w.addrs.push_back(value);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        return w;
+    }();
+    if (watch.addrs.empty() || !resources) return;
+    for (const auto& resource : resources->resources) {
+        // Match the whole span, not the base: a consumer names a surface by its base while a
+        // producer may bind a subrange or a mip, and requiring equality would report "nobody binds
+        // it" for a producer that plainly does.
+        const uint64_t begin = resource.gpu_addr;
+        const uint64_t end = begin + (resource.size ? resource.size : 1);
+        for (const uint64_t want : watch.addrs) {
+            if (!begin || want < begin || want >= end) continue;
+            static std::mutex mutex;
+            static std::set<std::pair<uint64_t, uint64_t>> reported;
+            std::lock_guard lock(mutex);
+            if (!reported.insert({code_addr, resource.gpu_addr}).second) continue;
+            std::fprintf(stderr,
+                         "[compute-binds] 0x%llx bound by program=0x%llx binding=%u class=%u "
+                         "addr=0x%llx size=%llu %ux%u fmt=%u executed=%d\n",
+                         (unsigned long long)want, (unsigned long long)code_addr, resource.binding,
+                         static_cast<unsigned>(resource.cls),
+                         (unsigned long long)resource.gpu_addr,
+                         (unsigned long long)resource.size, resource.width, resource.height,
+                         static_cast<unsigned>(resource.format), (int)executed);
+        }
+    }
 }
 
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
@@ -8209,7 +8268,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                 }
             }
-            note_compute_program_outcome(code_addr, false);
+            note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
+                                        launch.groups_z, launch.local_x, launch.local_y);
             continue;
         }
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
@@ -8247,13 +8307,17 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          resource.fetch_pc);
                 }
             }
-            note_compute_program_outcome(code_addr, false);
+            note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
+                                        launch.groups_z, launch.local_x, launch.local_y);
+            report_compute_binding_watch(code_addr, item.resources.get(), false);
             continue;
         }
         // Image bindings (sampled textures + storage images) execute through the live backend's
         // image paths (#590, live_compute.cpp); shapes it cannot bind correctly are skipped there,
         // loudly and per-item, without aborting the rest of the batch.
-        note_compute_program_outcome(code_addr, true);
+        note_compute_program_outcome(code_addr, true, launch.groups_x, launch.groups_y,
+                                    launch.groups_z, launch.local_x, launch.local_y);
+        report_compute_binding_watch(code_addr, item.resources.get(), true);
         items.push_back(std::move(item));
     }
     return items;
