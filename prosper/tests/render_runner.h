@@ -4014,10 +4014,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (getenv("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
         uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
         int first_op = -1;
+        // What DB_DEPTH_CLEAR actually holds, whether or not a draw enables it. #371 forbids
+        // CONSUMING it without an explicit enable -- Astro Bot leaves packed 1920x1080 max
+        // coordinates in the register, which read as 2.15e-36 and rejected whole scenes -- but
+        // reading it here is free and says whether a plausible clear value is even present on the
+        // passes that need one. A surface fast-cleared through HTILE metadata sets no draw's
+        // depth_clear_enable, so the value it was cleared to is invisible to the latch above.
+        float first_clear_value = -1.0f;
         for (const auto& d : logical_draws) {
             if (!d.ps) continue;
             if (!(d.ps->depth_test_enable || effective_depth_clear(d.ps))) continue;
-            if (first_op < 0) first_op = static_cast<int>(d.ps->depth_compare_op);
+            if (first_op < 0) {
+                first_op = static_cast<int>(d.ps->depth_compare_op);
+                first_clear_value = d.ps->depth_clear_value;
+            }
             if (d.ps->depth_clear_enable) ++explicit_clear;
             switch (d.ps->depth_compare_op) {
                 case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL: ++greater; break;
@@ -4032,10 +4042,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                    depth_clear, greater, less, other}];
         if ((n & (n - 1)) == 0)
             fprintf(stderr,
-                    "[depth-clear-why] target=0x%llx derived=%.3f first_op=%d explicit=%u "
-                    "compares{greater=%u less=%u other=%u} draws=%zu (x%llu)\n",
+                    "[depth-clear-why] target=0x%llx derived=%.3f reg_clear=%.6g first_op=%d "
+                    "explicit=%u compares{greater=%u less=%u other=%u} draws=%zu (x%llu)\n",
                     (unsigned long long)(color_target ? color_target->persistent_id : 0ull),
-                    depth_clear, first_op, explicit_clear, greater, less, other,
+                    depth_clear, first_clear_value, first_op, explicit_clear, greater, less, other,
                     logical_draws.size(), (unsigned long long)n);
     }
     if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))

@@ -3191,10 +3191,21 @@ to drop the retained contents, and the defect is one step later —
 > programmed (for reverse-Z, the far value 0.0, which its GREATER light volumes pass against). The
 > fresh-image approximation guesses **1.0** on this 7:7 mixed pass, and they all fail.
 
-So the fix is to **supply the fast-clear value** rather than to suppress the invalidation. The value
-is available in principle from `DB_DEPTH_CLEAR` at clear time or from the uniform HTILE word itself;
-what is missing is that a clear performed through HTILE metadata sets no draw's
-`depth_clear_enable`, so the existing "explicit clear wins" branch never sees it.
+So the fix is to **supply the fast-clear value** rather than to suppress the invalidation. And the
+obvious source for it is closed by measurement: `PROSPER_DEPTH_CLEAR_WHY` also prints what
+`DB_DEPTH_CLEAR` holds on those passes, and it is **`7.19391e-34`** — a denormal from bits that are
+packed integer coordinates rather than a depth value. That is precisely the #371 pathology the latch
+comment warns about ("Astro Bot even leaves the packed 1920x1080 max coordinates there ... initialized
+every LEQUAL surface to 2.15e-36 and rejected the entire scene"), so **reading the register at pass
+time cannot work, and the existing refusal to consume it without an explicit enable is right.**
+
+(The value was visible from the very first `PROSPER_DSLOG` run of this investigation —
+`clear=0/7.19391e-34` on the `0x2052ac0000` line — and went unrecognised for a long time.)
+
+What is missing is therefore narrower than "a clear value": a clear performed through **HTILE
+metadata** sets no draw's `depth_clear_enable`, so the value it cleared to is never observed at all.
+Capturing it has to happen **at the moment of the clear**, not recovered afterwards from register
+state that has since been reused.
 
 Also note the blunt version stays falsified: `PROSPER_DS_HTILE_INVALIDATE=0` suppresses invalidation
 wholesale and *loses* 29% of presented content, which is exactly what should happen if the clears are
