@@ -3009,9 +3009,20 @@ path that can write a surface has an instrument, and all of them are empty for `
 | async-compute queue | `q=` in the WaitRegMem line | ACB *is* processed (38 `q=A` vs 2 `q=D`) |
 | predicated jumps | `PROSPER_PREDLOG`, now sampled across the whole run | **8,192+ jumps, `pred=0` on every one, `skip=0`** |
 | whole-submit rejection | `[agc] ordered DMA submit rejected` | zero |
-| **the guest's own register writes** | `PROSPER_COLORSTATETRACE=3840x2160` | across **1,437,781** 4K colour-state records the guest programs `0x2063380000` as a colour target **exactly once** |
+| **the guest's own register writes** | `PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled, all eight MRT slots, no dimension filter | **1 draw out of 65,536**, slot 0, against 7,989 for the lighting buffer `0x20431c0000` in the same run |
 
 That last row is the decisive one. prosper is not losing the producer — **the guest never issues it.**
+
+It is stated from `PROSPER_TARGET_WATCH` rather than from `PROSPER_COLORSTATETRACE` deliberately, and
+the difference is not cosmetic. The colour-state trace agreed (1 record in 1,437,781) but could not
+have disagreed convincingly: invoked as `=3840x2160` it **filters by dimension**, so a bind at any
+other extent is absent without saying so, and the natural way to read its output — grepping
+`color0=` — misses slots 1..7, which carry 157,855 records each on this route. Two independent ways
+to conclude "the guest never renders here" from a measurement that could not have seen it.
+`PROSPER_TARGET_WATCH` is exact, unsampled and slot-complete, and its own comment explains why a
+sampled census cannot answer an "ever" question at all. **Pass its addresses with a `0x` prefix** —
+it parses base-0, so bare digits are read as decimal and it will confidently report nothing about a
+different address (instrument trap 180).
 It allocates and clears its own 4K HDR scene buffer once, samples it 24× per frame forever, and never
 renders to it.
 
