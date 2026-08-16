@@ -3258,7 +3258,6 @@ path that can write a surface has an instrument, and all of them are empty for `
 | predicated jumps | `PROSPER_PREDLOG`, now sampled across the whole run | **8,192+ jumps, `pred=0` on every one, `skip=0`** |
 | whole-submit rejection | `[agc] ordered DMA submit rejected` | zero |
 | **the guest's own register writes** | `PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled, all eight MRT slots, no dimension filter | **1 draw out of 65,536**, slot 0, against 7,989 for the lighting buffer `0x20431c0000` in the same run |
-
 | **prosper-built packets prosper never decodes** | `[pm4] undecoded prosper sub-op` (new, ungated) | one family, `r=0x00 op=0x10` — a plain `IT_NOP` pad |
 | AGC copy builders | firmware NID list vs registrations, with the unimplemented logger verified live | `sceAgcDcbCopyData` / `AcbCopyData` are **unregistered**, and the title **never calls them** |
 
