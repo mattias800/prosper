@@ -989,8 +989,13 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 // 1920x1080 screen-space dispatches that never executed on a routed boot.
                 const uint32_t vop1_opcode = (w >> 9) & 0xffu;
                 const uint32_t vop2_opcode = (w >> 25) & 0x3fu;
+                // ROW_XMASK:0 (0x160) is a legal member of the family whose stride is the
+                // identity. It was excluded because a no-op permutation is hard to tell from a decode
+                // error by its RESULT -- which is a statement about diagnosis, not about whether the
+                // guest may issue it. Membership is decided by the control's range; the emitter
+                // carries the stride separately.
                 const bool row_xor_ctrl = ctrl == 0x128u ||
-                    (ctrl > 0x160u && ctrl <= 0x16fu);
+                    (ctrl >= 0x160u && ctrl <= 0x16fu);
                 const bool gta_row_ror8 =
                     row_xor_ctrl && ((d1 >> 19) & 1u) == 1u &&
                     ((vf == Rdna2Format::VOP1 && vop1_opcode == 0x01u) ||

@@ -4131,6 +4131,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 cube_depth_bridged = true;
                                 rtt_hit = true;          // do not overwrite with a guest-byte decode
                                 resource_rtt_hit = true;
+                                // The loop above wrote all SIX faces into texture_pixels. Publishing
+                                // is driven by `cube_done` -- `fr.th = cube_done ? th * 6u : th` at
+                                // the upload seam -- so leaving it false uploaded one face and
+                                // silently dropped five, and the stacked-face lowering could never
+                                // see them. The ordinary cube path sets this for the same reason.
+                                cube_done = true;
                             }
                         }
                         if (is_cube && !rtt_hit && !dcc_fast_clear_done && !cube_depth_bridged) {

@@ -7910,10 +7910,17 @@ enum class DppRowRor8Op : uint32_t {
 //
 // XMASK:0 is excluded deliberately -- it is the identity, so admitting it would add a control that
 // cannot be distinguished from a decode error by its result. Fail closed on it like everything else.
-inline uint32_t dpp_row_xor_stride(uint32_t dpp_ctrl) {
-    if (dpp_ctrl == 0x128u) return 8u;
-    if (dpp_ctrl > 0x160u && dpp_ctrl <= 0x16fu) return dpp_ctrl - 0x160u;
-    return 0u;
+// Membership and stride are SEPARATE answers. Folding them into one return made 0 mean both "stride
+// zero" and "not in this family", which excluded ROW_XMASK:0 -- a legal member whose stride happens to
+// be the identity. That is a representation artifact, not a semantic reason to refuse a guest
+// instruction, so the caller asks the two questions independently.
+inline bool dpp_row_xor_ctrl(uint32_t dpp_ctrl, uint32_t* stride = nullptr) {
+    uint32_t s = 0;
+    if (dpp_ctrl == 0x128u) s = 8u;
+    else if (dpp_ctrl >= 0x160u && dpp_ctrl <= 0x16fu) s = dpp_ctrl - 0x160u;
+    else return false;
+    if (stride) *stride = s;
+    return true;
 }
 
 // Exact bounded row-rotate family emitted by GTA V's screen-space compute passes. The decoder has
@@ -7921,7 +7928,7 @@ inline uint32_t dpp_row_xor_stride(uint32_t dpp_ctrl) {
 // emitter and CFG dispatcher share one fail-closed contract. VOP1 MOV has only the permuted SRC0;
 // the two VOP2 float operations combine that value with the destination lane's unpermuted SRC1.
 DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
-    if (!in.has_dpp || !in.dpp_bound_ctrl || !dpp_row_xor_stride(in.dpp_ctrl) ||
+    if (!in.has_dpp || !in.dpp_bound_ctrl || !dpp_row_xor_ctrl(in.dpp_ctrl) ||
         in.dpp_row_mask != 0xfu || in.dpp_bank_mask != 0xfu ||
         in.dst.kind != OperandKind::VGPR || in.src[0].kind != OperandKind::VGPR)
         return DppRowRor8Op::None;
@@ -10399,8 +10406,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // when the host subgroup width differs from the guest wave width.
             if (in.has_dpp) {
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                const uint32_t row_xor = dpp_row_xor_stride(in.dpp_ctrl);
-                const bool row_ror8 = row_xor != 0;
+                uint32_t row_xor = 0;
+                const bool row_ror8 = dpp_row_xor_ctrl(in.dpp_ctrl, &row_xor);
                 if (row_ror8) {
                     // Direct shuffle is valid only when one native subgroup is exactly one guest
                     // wave. Portable/default-subgroup compute is routed through synchronized CFG
@@ -10905,8 +10912,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // ROW_SHR in the proven one-live-lane NGG projection supplies zero for lane 0.
             if (in.has_dpp) {
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                const uint32_t row_xor = dpp_row_xor_stride(in.dpp_ctrl);
-                const bool row_ror8 = row_xor != 0;
+                uint32_t row_xor = 0;
+                const bool row_ror8 = dpp_row_xor_ctrl(in.dpp_ctrl, &row_xor);
                 const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
@@ -14452,11 +14459,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // failed to resolve, so its volume is bounded by the defect it reports. Behind
                 // PROSPER_DBG it was unreachable in practice on any routed boot.
                 static std::mutex mimg_mutex;
-                static std::set<std::pair<uint32_t, int>> mimg_reported;
+                // Keyed by PROGRAM as well as (pc, srsrc): every shader has a pc 16, so a
+                // pc-only key lets the first program to reach one silence all later programs and
+                // attribute its line to a shader the reader is not looking at.
+                static std::set<std::tuple<uint64_t, uint32_t, int>> mimg_reported;
                 bool first_report = false;
                 {
                     std::lock_guard<std::mutex> lock(mimg_mutex);
-                    first_report = mimg_reported.emplace(in.pc, in.src[1].value).second;
+                    first_report = mimg_reported.emplace(b.diagnostic.program_address, in.pc,
+                                                         in.src[1].value).second;
                 }
                 if (!first_report) { ok = false; return true; }
                 uint32_t srt_tag = 0;
@@ -14794,18 +14805,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // resource does not read -- 0x2052ac0000 resolves through the sampled-depth bridge,
                 // whose pixels come from a retained Vulkan image rather than from compressed memory.
                 static std::mutex mip_mutex;
-                static std::set<uint32_t> mip_reported;
+                // Same program-scoped key as [mimg-mip-why]; see the note there.
+                static std::set<std::pair<uint64_t, uint32_t>> mip_reported;
                 bool first_mip = false;
                 {
                     std::lock_guard<std::mutex> lock(mip_mutex);
-                    first_mip = mip_reported.insert(in.pc).second;
+                    first_mip = mip_reported.emplace(b.diagnostic.program_address, in.pc).second;
                 }
                 if (first_mip)
                     std::fprintf(stderr,
-                                 "[mimg-mip] image_load_mip declined pc=%u shape=%d "
+                                 "[mimg-mip] program=0x%llx image_load_mip declined pc=%u shape=%d "
                                  "proven_zero_mip=%d img_dim=%u/%u samples=%u mips=%u mip_tail=%d "
                                  "compressed=%d array_in_gfx=%d\n",
-                                 in.pc, (int)rdna2_mimg_zero_mip_shape(in),
+                                 (unsigned long long)b.diagnostic.program_address, in.pc,
+                                 (int)rdna2_mimg_zero_mip_shape(in),
                                  (int)res->proven_zero_mip, res->img_dim, in.mimg_dim,
                                  res->sample_count, res->declared_mip_levels,
                                  (int)res->in_mip_tail, (int)res->compression_enabled,
@@ -20098,7 +20111,8 @@ bool emit_cfg_state_machine(
                 uint32_t valid_source = 0;
                 const uint32_t rotated = b.subgroup_row_xor(
                     src0_value, state.exec,
-                    dpp_row_xor_stride(dpp_row_ror8->dpp_ctrl), &valid_source);
+                    [&]{ uint32_t st = 0; dpp_row_xor_ctrl(dpp_row_ror8->dpp_ctrl, &st); return st; }(),
+                    &valid_source);
                 const uint32_t bounded = b.sel(valid_source, rotated, zero);
                 uint32_t result = bounded;
                 if (operation == DppRowRor8Op::MinF32)

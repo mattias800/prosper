@@ -708,58 +708,6 @@ HLE(agc_dcb_jump) {  // sceAgcDcbJump(dcb, ?, ?, target_addr, num_dw)
     cmd[4] = 0;   // predicated flag — set by sceAgcSetPacketPredication on this returned packet
     return (uint64_t)(uintptr_t)cmd;
 }
-// sceAgcAcbJump — the async-compute sibling of sceAgcDcbJump, and the same defect one queue over.
-//
-// The DCB family above was implemented for #319 after exactly this signature: with the jump
-// unimplemented (return 0, no packet), the side segment it calls is never walked, so the composite
-// never executes and the presented backbuffer holds only the draws that went straight to scanout.
-// Grand Theft Auto V PPSA04263 presents that picture -- HUD and radar over an absent 3D world -- and
-// it drives its post-process chain through the ACB, where `sceAgcAcbJump` and
-// `sceAgcAcbJumpGetSize` were both still unregistered and answering 0 through the default stub.
-//
-// The packet is queue-agnostic: prosper's R_JUMP is decoded in pm4_decode.cpp without reference to
-// which ring carried it, exactly as R_DMA_DATA already serves sceAgcDcbDmaData and sceAgcAcbDmaData
-// from one case. So the builder is the DCB one; only the entry point is new.
-//
-// CONFIDENCE: MED on the argument roles. They are taken from the DCB sibling (a3=target,
-// a4=dword count), which is pinned by live capture over 100k+ calls, and the two calls are a
-// documented Gen5 pair -- but no capture yet pins the ACB form independently. The guard below is
-// what keeps that honest: a target that is not guest-readable, or a dword count outside a sane
-// span, means the assumed roles are wrong, and it refuses to emit rather than sending the command
-// processor to a bogus address. PROSPER_PREDLOG prints every call so the roles can be confirmed
-// against a live run instead of assumed.
-HLE9(agc_acb_jump) {  // sceAgcAcbJump(acb, ...) — argument roles NOT yet pinned; see below
-    static std::atomic<uint64_t> calls{0}, refused{0};
-    const uint64_t k = calls.fetch_add(1);
-    // A jump segment is a command stream, so bound it the way the ring itself is bounded. 1 MiB of
-    // dwords is far above any observed segment (the DCB composite segments are tens of dwords) and
-    // far below a wild value produced by reading the wrong argument.
-    const bool sane = a3 >= 0x10000 && a4 > 0 && a4 <= (1u << 20) &&
-                      gpu::guest_readable(a3, static_cast<uint32_t>(a4 * sizeof(uint32_t)));
-    if (getenv("PROSPER_PREDLOG") && (k < 32 || (k % 4096) == 0))
-        fprintf(stderr,
-                "[pred] AcbJump #%llu acb=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx "
-                "a5=0x%llx a6=0x%llx a7=0x%llx a8=0x%llx sane=%d\n",
-                (unsigned long long)k, (unsigned long long)a0, (unsigned long long)a1,
-                (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4,
-                (unsigned long long)a5, (unsigned long long)a6, (unsigned long long)a7,
-                (unsigned long long)a8, (int)sane);
-    if (!sane) {
-        // Loud and bounded: a wrong ABI must not read as "implemented and quiet".
-        const uint64_t r = refused.fetch_add(1);
-        if (r < 8)
-            fprintf(stderr,
-                    "[agc] AcbJump REFUSED (assumed ABI does not hold) acb=0x%llx target=0x%llx "
-                    "ndw=0x%llx — no packet emitted\n",
-                    (unsigned long long)a0, (unsigned long long)a3, (unsigned long long)a4);
-        return 0;
-    }
-    uint32_t* cmd; if (!begin_packet(a0, kDwJump, IT_NOP, R_JUMP, &cmd)) return 0;
-    cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
-    cmd[3] = (uint32_t)a4;
-    cmd[4] = 0;   // predicated flag — set by sceAgcSetPacketPredication on this returned packet
-    return (uint64_t)(uintptr_t)cmd;
-}
 HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_addr) / (dcb, 1, 0, 1, 0)=end
     if (getenv("PROSPER_PREDLOG")) {
         static std::atomic<uint64_t> n{0};
@@ -3052,12 +3000,6 @@ HLE(agc_cb_dispatch_indirect) {
 // CONFIDENCE: MED — units (bytes) and the sum/allocate contract are pinned from live render-thread
 // disassembly; exact per-command dword counts mirror prosper's own builders.
 HLE(agc_dcb_jump_get_size)        { (void)a0; return kDwJump * 4u; }
-// DELIBERATELY NOT REGISTERED while agc_acb_jump's argument roles are unpinned. GetSize is what the
-// guest RESERVES for the packet (AGC_PACKET_SIZES.md), so answering 20 while the builder declines to
-// fill those bytes leaves an uninitialised hole the command processor would then walk -- strictly
-// worse than the unregistered default of 0, which reserves nothing. Register it in the same change
-// that pins the ABI and makes the builder emit.
-HLE(agc_acb_jump_get_size)        { (void)a0; return kDwJump * 4u; }
 HLE(agc_dcb_acquire_mem_get_size) { (void)a0; return kDwAcquireMem * 4u; }
 HLE(agc_dcb_rewind_get_size)      { (void)a0; return 2u * 4u; }   // PM4 REWIND, 2 dwords (reserve-only)
 HLE(agc_cb_eop_action_get_size)   { (void)a0; return kDwReleaseMem * 4u; }
@@ -3108,7 +3050,6 @@ void register_agc_hle() {
     // because the rest of this file registers the NID as its own display name by convention.
     #define RN_SUBMIT_NAMED(nid, fn, name) Hle::register_fn(nid, (HleFn)(fn), name, &prosper_gpu_submit_scope_end)
     RN("VEGu4dixjUg", agc_dcb_jump_get_size);        // sceAgcDcbJumpGetSize (#1137)
-    RN("e1DFTg+Sd8U", agc_acb_jump);                 // sceAgcAcbJump — async-compute sibling of DcbJump
     RN("-vnlTPPXPrw", agc_dcb_acquire_mem_get_size); // sceAgcDcbAcquireMemGetSize
     RN("ewobAQeMo5k", agc_dcb_acquire_mem_get_size); // sceAgcAcbAcquireMemGetSize (same size)
     RN("QIXCsbipds0", agc_dcb_rewind_get_size);      // sceAgcDcbRewindGetSize

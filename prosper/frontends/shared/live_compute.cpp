@@ -8052,10 +8052,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     }
                 }
                 ctx.unmap_memory(buffer.memory);
-                if (buffer.resource->gpu_addr)
+                if (buffer.resource->gpu_addr) {
                     set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
                     notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.guest_bytes);
                     set_guest_gpu_write_origin(nullptr);
+                }
                 if (!buffer.resource->host_data && writer_provenance_enabled())
                     record_guest_write(GuestWriterKind::ComputeBuffer,
                                        buffer.resource->gpu_addr, buffer.guest_bytes,

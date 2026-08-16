@@ -502,6 +502,33 @@ int main() {
           gvr0.dpp_bound_ctrl && isV(gvr0.dst, 0) &&
           isV(gvr0.src[0], 0) && isV(gvr0.src[1], 0),
           "GTA V in-place V_MIN_F32 ROW_ROR:8 packet decodes its DPP SRC0");
+    // ROW_XMASK:n (0x160..0x16f) is the same permutation family as ROW_ROR:8 -- XMASK is XOR n by
+    // definition and XOR 8 is exactly (row_lane - 8) mod 16 -- so the decoder admits it under the
+    // identical contract. GTA V PPSA04263 kernels 0x205b545c00 (pc=90) and 0x205b54ee00 (pc=98) are
+    // the live shape: V_MIN_F32 row_xmask:4, full masks, BOUND_CTRL=1.
+    const uint32_t gta_vmin_row_xmask4[] = { 0x1e0202fau, 0xff096401u };
+    Rdna2Inst gxm = rdna2_decode_one(gta_vmin_row_xmask4, 2);
+    CHECK(gxm.fmt == Rdna2Format::VOP2 && gxm.opcode == 0x0fu &&
+          gxm.len_dwords == 2u && !gxm.has_modifier && gxm.has_dpp &&
+          gxm.dpp_ctrl == 0x164u && gxm.dpp_bound_ctrl &&
+          gxm.dpp_row_mask == 0xfu && gxm.dpp_bank_mask == 0xfu &&
+          isV(gxm.dst, 1) && isV(gxm.src[0], 1) && isV(gxm.src[1], 1),
+          "GTA V V_MIN_F32 ROW_XMASK:4 packet retains exact control and operands");
+    // The identity member. Its stride is 0, which is a legal permutation and must not be confused
+    // with "not in this family" -- the two were once the same value and XMASK:0 was refused for it.
+    const uint32_t vmin_row_xmask0[] = { 0x1e0202fau, 0xff096001u };
+    Rdna2Inst gx0 = rdna2_decode_one(vmin_row_xmask0, 2);
+    CHECK(gx0.fmt == Rdna2Format::VOP2 && gx0.opcode == 0x0fu && gx0.has_dpp &&
+          gx0.dpp_ctrl == 0x160u && gx0.dpp_bound_ctrl,
+          "ROW_XMASK:0 is admitted as the identity member of the lane-XOR family");
+    // The contract is unchanged for everything else: one control OUTSIDE the family, and one inside
+    // it carrying an opcode the family does not admit, both stay undecoded as DPP.
+    const uint32_t vmin_row_xmask_out[] = { 0x1e0202fau, 0xff097001u };   // ctrl 0x170
+    CHECK(!rdna2_decode_one(vmin_row_xmask_out, 2).has_dpp,
+          "a control past ROW_XMASK:15 is not admitted");
+    const uint32_t vadd_row_xmask4[] = { 0x060202fau, 0xff096401u };      // VOP2 opcode 0x03
+    CHECK(!rdna2_decode_one(vadd_row_xmask4, 2).has_dpp,
+          "ROW_XMASK with an opcode outside MOV/MIN/MAX is not admitted");
     const uint32_t gta_vmax_row_ror8[] = { 0x200406fau, 0xff092803u };
     Rdna2Inst gvx = rdna2_decode_one(gta_vmax_row_ror8, 2);
     CHECK(gvx.fmt == Rdna2Format::VOP2 && gvx.opcode == 0x10u &&
