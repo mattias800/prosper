@@ -3089,8 +3089,34 @@ the G-buffer's own, and whatever produces its improvement has another mechanism.
 change was reverted; `PROSPER_DEPTH_CLEAR_WHY` and its counts were kept.
 
 **The depth-test finding above still stands** — `PROSPER_NO_DEPTH=1` is a per-test lever, not a
-per-surface value, and it takes the pass from 10 to 65. What remains unpinned is *why* the test
-rejects. `PROSPER_NO_STENCIL=1` is the next arm.
+per-surface value, and it takes the pass from 10 to 65.
+
+### How much presented content each depth/stencil arm recovers (400 s, same route)
+
+The single most useful table here, because it is measured on the **presented frame** rather than on
+an intermediate, and because two independent controls bound the noise at **0.15%** — so every row
+below is real.
+
+| arm | SCANOUT `rgb_nonblack` | vs control |
+| --- | --- | --- |
+| control (`src`) | 1,958,474 | — |
+| control (`long`) | 1,955,614 | −0.15% |
+| **`PROSPER_NO_DEPTH=1`** | **2,810,666** | **+43.5%** |
+| `PROSPER_DEPTH_CLEAR=0.0` | 2,248,371 | +14.8% |
+| **`PROSPER_NO_STENCIL=1`** | **2,104,048** | **+7.4%** |
+| majority depth-clear derivation | 1,942,739 | −0.8% (refuted, reverted) |
+
+**Depth rejection is the dominant loss and stencil rejection is a real second one.** They are
+independent: disabling either alone recovers content. None of these is a fix — each disables a test
+the guest asked for — but together they say the depth/stencil state bound to the lighting resolve
+does not hold what the guest's draws expect to test against.
+
+That is consistent with the DS bridge's own declines on this route: `0x2054aa0000` (the stencil
+plane) declines `stencil-invalid` up to **846** times, and `0x2052ac0000` (depth) `depth-invalid`
+up to 826. **But note the trap already recorded above**: suppressing those declines wholesale with
+`PROSPER_DS_HTILE_INVALIDATE=0` *loses* 29% of presented content, so the invalidation is protecting
+something real and "make the bridge always valid" is not the fix either. The open question is what
+the correct contents are, not how to stop declining them.
 
 **Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
 same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
