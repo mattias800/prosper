@@ -3146,6 +3146,42 @@ image the initial value could not matter, yet `PROSPER_DEPTH_CLEAR=1.0` drives t
 freshly-created attachment.** That is a DS-retention problem across the G-buffer → lighting
 transition, not a clear-value problem, and it explains why every value-shaped fix has failed.
 
+### The complete chain, end to end
+
+`PROSPER_DSLOG`'s per-pass line reports `persistent` and `valid=<layout>/<depth>/<stencil>` for the
+resolve's 14/15-draw passes, and every one of them is keyed correctly to the scene surfaces
+(`dr=dw=2052ac0000`, `sr=sw=2054aa0000`, `htile=2055310000`):
+
+| passes | state | derived initial |
+| --- | --- | --- |
+| **207** | `persistent=1 valid=1/`**`0`**`/1` — the retained image EXISTS, its **depth aspect is invalid** | **1.0** |
+| 63 | `persistent=1 valid=1/1/1` | 0.0 |
+| 60 | `persistent=1 valid=0/0/0` | 1.0 |
+| 51 (draws=14) | `persistent=1 valid=1/1/1` | 0.0 |
+
+So retention is not missing — **validity is**. The pass holds the right retained image and cannot
+load it, so it falls through to the fresh-image approximation, which on a 7:7 mixed pass is
+unsatisfiable and lands on 1.0, which always-fails the GREATER light volumes.
+
+```
+HTILE write  ->  depth_valid = false  ->  cannot LOAD retained depth
+             ->  fresh-image approximation runs
+             ->  mixed 7:7 compares derive 1.0
+             ->  every GREATER light-volume draw always-fails
+             ->  lighting resolve emits nothing  ->  black world
+```
+
+The first link is already measured elsewhere in this document: **730 of 900 invalidations of
+`0x2052ac0000` are HTILE-only overlap** (`depth=0 stencil=0 htile_hit=1`, a 655,360-byte write at
+`0x2055310000`), and HTILE conservatively discards both aspects.
+
+**The fix is the one the invalidation comment already names, and it is now motivated by a full causal
+chain rather than a hunch: an HTILE write must invalidate depth only when it encodes a fast CLEAR,
+not when it is an ordinary metadata refresh.** That needs HTILE decoded. Note the blunt version is
+already falsified — `PROSPER_DS_HTILE_INVALIDATE=0` suppresses the invalidation wholesale and *loses*
+29% of presented content, because surfaces the guest really did rewrite then keep stale contents. The
+discrimination has to be per-write, not per-switch.
+
 **Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
 same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
 `live_renderer.cpp` in the `PROSPER_DS_UNBRIDGED_FAR` comment).
