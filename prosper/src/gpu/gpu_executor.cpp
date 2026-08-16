@@ -2084,6 +2084,35 @@ void log_compute_dispatch(uint64_t program, uint64_t submit_no, size_t dispatch_
                  static_cast<unsigned long long>(order), outcome, geometry);
 }
 
+// PROSPER_COMPUTE_PROGRAM_CENSUS=1 — per program, how many dispatches EXECUTED and how many were
+// skipped.
+//
+// `[compute] skip unsupported program` prints once per program address by design, so a run showing
+// twelve skip lines has been read as "twelve programs are disabled". That does not follow: the skip
+// is a `continue` inside the per-dispatch loop, so every dispatch is re-decided, and a program whose
+// descriptors are garbage on its first fold and valid afterwards is skipped once and runs from then
+// on. One line cannot distinguish 1-of-438 from 438-of-438, and those are opposite states of the
+// title. Ratios, not first sightings.
+inline void note_compute_program_outcome(uint64_t code_addr, bool executed) {
+    static const bool on = std::getenv("PROSPER_COMPUTE_PROGRAM_CENSUS") != nullptr;
+    if (!on) return;
+    static std::mutex mutex;
+    static std::map<uint64_t, std::pair<uint64_t, uint64_t>> outcomes;   // addr -> {executed, skipped}
+    static std::atomic<uint64_t> total{0};
+    const uint64_t n = total.fetch_add(1) + 1;
+    std::lock_guard lock(mutex);
+    auto& entry = outcomes[code_addr];
+    (executed ? entry.first : entry.second) += 1;
+    if ((n & (n - 1)) != 0 || n < 512) return;
+    std::fprintf(stderr, "[compute-census] %llu dispatch decisions over %zu program(s)\n",
+                 (unsigned long long)n, outcomes.size());
+    for (const auto& [addr, counts] : outcomes)
+        if (counts.second)   // only programs that skipped at least once are interesting
+            std::fprintf(stderr, "[compute-census]   program=0x%llx executed=%llu skipped=%llu\n",
+                         (unsigned long long)addr, (unsigned long long)counts.first,
+                         (unsigned long long)counts.second);
+}
+
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
     static std::mutex mutex;
     static std::set<uint64_t> logged;
@@ -8180,6 +8209,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                 }
             }
+            note_compute_program_outcome(code_addr, false);
             continue;
         }
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
@@ -8217,11 +8247,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          resource.fetch_pc);
                 }
             }
+            note_compute_program_outcome(code_addr, false);
             continue;
         }
         // Image bindings (sampled textures + storage images) execute through the live backend's
         // image paths (#590, live_compute.cpp); shapes it cannot bind correctly are skipped there,
         // loudly and per-item, without aborting the rest of the batch.
+        note_compute_program_outcome(code_addr, true);
         items.push_back(std::move(item));
     }
     return items;
