@@ -1,6 +1,8 @@
 // pm4_decode.cpp — see pm4_decode.hpp. Pure PM4 type-3 stream walker.
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
+#include <set>
 #include "pm4_decode.hpp"
 
 namespace prosper::gpu {
@@ -251,7 +253,33 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 1) c.num_regs = pl[0];
                     if (npl >= 3) c.regs_vaddr = lo_hi(pl + 1);
                     break;
-                default: c.kind = K::Unknown; break;
+                default:
+                    // A prosper-built packet whose sub-op nothing decodes. This fell to Unknown in
+                    // silence, and it is a different miss from the raw-opcode one reported below: the
+                    // header IS ours, so the guest went through an HLE builder and the gap is on our
+                    // side -- a builder that emits an R_ value the decoder never learned, whose
+                    // packet is then dropped with no trace at all.
+                    //
+                    // That silence is exactly what an investigation into a surface "written by
+                    // nothing" cannot afford: every other instrument observes DECODED work, so a
+                    // packet lost here is invisible to all of them. Reported once per distinct
+                    // sub-op, ungated, matching the raw-opcode reporter beside it.
+                    {
+                        static std::mutex sub_mutex;
+                        static std::set<uint32_t> seen_sub;
+                        bool first = false;
+                        {
+                            std::lock_guard<std::mutex> lock(sub_mutex);
+                            first = seen_sub.insert(c.r).second;
+                        }
+                        if (first)
+                            std::fprintf(stderr,
+                                         "[pm4] undecoded prosper sub-op r=0x%02x op=0x%02x "
+                                         "len=%u dwords\n",
+                                         c.r, c.op, (unsigned)(npl + 1));
+                    }
+                    c.kind = K::Unknown;
+                    break;
             }
         } else {
             c.kind = K::Unknown;

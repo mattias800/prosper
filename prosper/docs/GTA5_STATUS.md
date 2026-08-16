@@ -3259,7 +3259,18 @@ path that can write a surface has an instrument, and all of them are empty for `
 | whole-submit rejection | `[agc] ordered DMA submit rejected` | zero |
 | **the guest's own register writes** | `PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled, all eight MRT slots, no dimension filter | **1 draw out of 65,536**, slot 0, against 7,989 for the lighting buffer `0x20431c0000` in the same run |
 
+| **prosper-built packets prosper never decodes** | `[pm4] undecoded prosper sub-op` (new, ungated) | one family, `r=0x00 op=0x10` — a plain `IT_NOP` pad |
+| AGC copy builders | firmware NID list vs registrations, with the unimplemented logger verified live | `sceAgcDcbCopyData` / `AcbCopyData` are **unregistered**, and the title **never calls them** |
+
 That last row is the decisive one. prosper is not losing the producer — **the guest never issues it.**
+
+**Every null above now carries a positive control**, which was not true when this section was first
+written. `PROSPER_GUEST_WRITE_WATCH` produced no output at all on the early runs — including for the
+heavily-rendered lighting buffer — so its silence proved nothing; watching the HTILE base alongside
+makes it fire 22 times in the same run while the scene colour stays at zero. The
+undecoded-sub-op reporter closes the last structural gap: the raw-opcode reporter beside it only
+catches opcodes prosper does not recognise, while a packet prosper's own builders emit with a sub-op
+the decoder never learned would have been dropped in complete silence. There are none but NOPs.
 
 It is stated from `PROSPER_TARGET_WATCH` rather than from `PROSPER_COLORSTATETRACE` deliberately, and
 the difference is not cosmetic. The colour-state trace agreed (1 record in 1,437,781) but could not
