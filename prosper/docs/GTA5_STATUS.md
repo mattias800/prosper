@@ -192,6 +192,32 @@ pc158 is the same shape. Those two are the only unresolved uses of the nineteen.
 **So the whole "GTA V has no 3D world" chain reduces to one buffer-array descriptor that does not
 const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
 
+> **Read the table below as first sightings, not as outcomes — 2026-08-16.** Every row is a program
+> that rejected *at least once*. `[compute] skip unsupported program` prints **once per program
+> address** by design (`report_compute_recompile_skip_once`), and the skip itself is a `continue`
+> inside the per-dispatch loop, so each dispatch is decided again. A row therefore says nothing about
+> how often the program runs, and this document previously read the twelve rows as twelve disabled
+> programs. `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports the ratio, and it splits them in two:
+>
+> | mostly runs (executed / skipped) | never runs (executed / skipped) |
+> | --- | --- |
+> | `0x413cf9200` 369 / 12 · `0x413dc6700` 352 / 11 | `0x2042f49a00` 0 / 129 |
+> | `0x413cf9a00` 351 / 30 · `0x413cee500` 349 / 9 | `0x205b545c00` 0 / 127 · `0x205b54ee00` 0 / 129 |
+> | `0x413d63700` 344 / 14 · `0x413d14100` 343 / 38 | `0x205b5e8600` 0 / 128 · `0x205b654a00` 0 / 128 |
+> | `0x413cf9d00` 342 / 42 · `0x413ce6000` 103 / 16 | `0x205b657200` 0 / 128 · `0x205b658800` 0 / 128 |
+> | `0x413d85e00` 137 / 2 (+6 more at 32–35 / 1) | `0x413ce5200` 0 / 93 · `0x413e1df00` 0 / 85 |
+>
+> **The frontier is the nine on the right**, and note that `0x413cf9200` — the program carrying the
+> entire hardcoded 15-site contract in `rdna2_gta5_cf9200_contract.cpp` — is on the *left*, running
+> 369 of 381 dispatches.
+>
+> The two columns need different work. The left column is a **descriptor-timing** problem, now with a
+> measured mechanism: `PROSPER_COMPUTE_MEMPROBE=413cf9200:0:c0:4` shows the first fold reading
+> `bfe767f8:7ee0001a:40e938ea:bfaa07e0` at `(user_sgprs[0..1])+0xc0` — SOPP instruction words, i.e.
+> the SRT is not written yet — while every later fold reads `9cc76000:00200020:0000000a:00005204`, a
+> valid V# (`base=0x209cc76000`, `stride=32`, `records=10`). One probe reports `CHANGED` between them
+> directly. The right column rejects on six *different* opcodes and is a genuine recompiler gap.
+
 The full reject census, now legible — every one is `mode=unresolved-operand`, i.e. every one is a
 descriptor that does not resolve rather than an instruction that is not implemented:
 
