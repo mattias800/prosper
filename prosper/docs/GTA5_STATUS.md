@@ -212,7 +212,8 @@ const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
 > same permutation family as the already-admitted `ROW_ROR:8` — `ROW_XMASK:n` is XOR n, and XOR 8 is
 > exactly `(row_lane - 8) mod 16`, so the lowering was general and only the decoder's admitted control
 > values were not). Both went `executed=0 skipped=52` → zero skips on the same route. The remaining
-> seven need, in order of tractability: cross-block VCC dataflow (`0x205b5e8600`), an untracked M0
+> seven need, in order of tractability: a VCC_LO operand that resolves to no mask value
+> (`0x205b5e8600` — **not** cross-block dataflow; see `## Ruled out`), an untracked M0
 > read (`0x205b658800`), `image_bvh_intersect_ray` (`0x205b654a00`, `0x205b657200`), `IMAGE_LOAD_MIP`
 > on a compressed surface (`0x2042f49a00`), and a descriptor contract (`0x413ce5200`, `0x413e1df00`).
 >
@@ -3307,7 +3308,8 @@ the evidence cannot support, and the correction is recorded rather than silently
 overstatement had already reached the PR body and #2542.
 
 **The exact next step, and it closes the gap rather than working around it:** make those two kernels
-recompile — cross-block VCC dataflow for `0x205b5e8600`, `image_bvh_intersect_ray` for
+recompile — the unresolved VCC_LO operand at `0x205b5e8600` pc=314 (a scratch-SGPR bitfield, not a
+lane mask, and not cross-block: see `## Ruled out`), `image_bvh_intersect_ray` for
 `0x205b657200` — so their resource tables resolve in full, then re-run `PROSPER_COMPUTE_BINDS` over
 the completed tables. Until then a null across that population is not evidence. This is the same work
 already queued as recompiler frontier, so it is not extra: it is the census and the candidate fix at
@@ -3484,8 +3486,32 @@ falsification.
 - **A missing device capability blocks the rejected compute kernels.** *Solid.* The native subgroup
   contract is **ENABLED** on this machine (`size_control=1 full_subgroups=1 vote=1 arithmetic=1`,
   sizes 32..64, AMD Radeon 8060S / RADV STRIX_HALO), so `0x205b5e8600`'s VCC_LO read is not blocked by
-  a capability. Its mask is untracked because the write is in another basic block — a cross-block
-  dataflow limit, which is different work.
+  a capability. **The second sentence of this row used to read "its mask is untracked because the
+  write is in another basic block — a cross-block dataflow limit"; that is wrong, see the next row.**
+- **`0x205b5e8600` needs cross-block VCC lane-mask dataflow.** *Falsified, and it would have cost a
+  large piece of the wrong work.* Disassembled independently with `llvm-mc -mcpu=gfx1030` rather than
+  from prosper's own listing, the reject site is:
+  ```
+  pc=313  s_lshl_b32 vcc_lo, s80, 14
+  pc=314  s_and_b32  vcc_lo, vcc_lo, 0x1c000     <- the rejected instruction
+  pc=318  v_add3_u32 v2, vcc_lo, v3, v2
+  ```
+  **There is no lane mask here at all.** The compiler allocated VCC_LO as an ordinary scratch SGPR;
+  the value is `(s80 << 14) & 0x1c000`, a bitfield, consumed by an integer add. Nor is it cross-block:
+  the two writes and the read are all in the block starting at pc=310. So the queued work item
+  "implement cross-block VCC lane-mask dataflow" does not describe this kernel, and implementing it
+  would not clear this reject.
+  Two synthetic reproductions of the shape — a straight-line scalar recycle of VCC_LO after a
+  `v_cmp`, and the same overwrite placed after a CFG merge so it dominates every read — **both
+  recompile** on this head, so the minimal shape is already supported and the cause is something in
+  the kernel's surrounding context (a VCC bool tag that survives with no bool value, making
+  `wave32_live_mask_operand` select the lane-mask path at `rdna2_to_spirv.cpp:9280` while `mask()`
+  then resolves VCC_LO to 0 and sets `ok = false`). Closing it needs the real kernel recompiled with
+  its actual resource context, not another synthetic case. `CONFIDENCE: HIGH` on the disassembly and
+  on both negative reproductions; `CONFIDENCE: LOW` on the parenthesised mechanism.
+  Note also that the reject-census table above says every row is `mode=unresolved-operand`, *"i.e.
+  every one is a descriptor that does not resolve"* — that gloss holds for the MUBUF/MIMG/SMEM rows
+  and **not** for this one, where the unresolved operand is a register, not a descriptor.
 - **`no-entry` at 81% of DS-bridge calls is a defect.** *Instrument.* `find_persistent_ds_sampled` is
   consulted for **every sampled binding**, so `no-entry` counts every ordinary colour texture in the
   frame; the code says so at `tests/render_runner.h:2796` ("the no-entry bucket is unbounded and is
