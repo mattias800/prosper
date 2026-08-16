@@ -2900,6 +2900,74 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             guest_ranges_overlap(addr, size, key.sr + slice_offset, stencil_size) ||
             guest_ranges_overlap(addr, size, key.sw + slice_offset, stencil_size);
         const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
+        // Does this HTILE write look like a fast CLEAR or like a metadata refresh?
+        //
+        // The rule above discards BOTH aspects on any HTILE overlap, because the metadata *can*
+        // describe a fast clear. That is true of a clear and false of a HiZ refresh, and the two are
+        // separable from the bytes the write left behind: a clear writes ONE value to every tile,
+        // while a refresh writes per-tile zmin/zmax that vary across the surface.
+        //
+        // SAMPLE THE WHOLE PLANE, STRIDED. A first attempt read the leading 4 KiB and reported every
+        // write uniform, which made the discriminator inert and looked like evidence that these are
+        // all real clears. 4 KiB of a 512 KiB plane is the top-left corner of the frame -- the most
+        // likely place for one flat surface (a ceiling, a wall) to fill every tile -- so that test
+        // could not have found a non-uniform refresh even where one existed. A strided sweep over
+        // the full plane cannot be fooled the same way.
+        //
+        // The error direction stays safe: a refresh that is genuinely uniform everywhere is read as
+        // a clear and invalidates, which is exactly today's behaviour. Only a demonstrably
+        // NON-uniform write, which no fast clear can produce, is spared.
+        //
+        // Why it matters on GTA V PPSA04263: 730 of 900 invalidations of the 4K scene depth
+        // 0x2052ac0000 are HTILE-only. Each discards depth the G-buffer had just written, and the
+        // deferred lighting resolve then finds it invalid on 171 of the passes that depth-test,
+        // falls through to the fresh-image approximation -- unsatisfiable on its mixed
+        // GREATER/LESS compares -- and its light volumes always-fail. CONFIDENCE: MED.
+        //
+        // PROSPER_DS_HTILE_UNIFORM=0 restores the unconditional behaviour for A/B.
+        bool htile_is_clear = true;
+        uint32_t htile_word = 0;   // the uniform value, when there is one
+        if (htile_overlap) {
+            static const bool discriminate = [] {
+                const char* v = getenv("PROSPER_DS_HTILE_UNIFORM");
+                return !(v && v[0] == '0');
+            }();
+            if (discriminate && key.htile && htile_size >= 8 &&
+                prosper::gpu::guest_readable(key.htile, static_cast<uint32_t>(
+                    std::min<uint64_t>(htile_size, 1u << 20)))) {
+                const uint64_t span = std::min<uint64_t>(htile_size, 1u << 20);
+                const uint32_t* words = reinterpret_cast<const uint32_t*>(
+                    static_cast<uintptr_t>(key.htile));
+                const size_t count = static_cast<size_t>(span / sizeof(uint32_t));
+                // ~256 probes spread across the plane: enough to catch per-tile variation anywhere
+                // in the frame, cheap enough to run on every HTILE write.
+                const size_t stride = count > 256 ? count / 256 : 1;
+                const uint32_t first = words[0];
+                for (size_t i = stride; i < count; i += stride)
+                    if (words[i] != first) { htile_is_clear = false; break; }
+                htile_word = first;
+                // A uniform plane is necessary but not sufficient: BOTH a fast clear and a
+                // decompress write one value everywhere, and they mean opposite things for the
+                // depth plane. The VALUE separates them.
+                //
+                // 0xfffffff0 is the expanded/decompressed pattern -- zmin/zmax driven to the full
+                // range with the compression field cleared -- which is what a depth EXPAND writes
+                // when the surface is about to be sampled. It says "this depth is now stored plainly",
+                // i.e. the contents are intact and simply no longer compressed. Invalidating on it
+                // discards a depth buffer that was not modified.
+                //
+                // Measured on a routed 400 s GTA V PPSA04263 boot: 2,791 invalidating HTILE writes
+                // carry 0xfffffff0 and 2,496 carry 0x00000000, and the title samples its scene depth
+                // (the composite binds 0x2052ac0000), which is exactly what forces an expand. Every
+                // other value, including the 0x00000000 fast clear, keeps the old behaviour.
+                //
+                // CONFIDENCE: MED. The pattern's meaning is read from the value's shape and the
+                // surrounding behaviour (interleaved with depth rendering, contents re-validated by
+                // the next depth pass) rather than from a decoded HTILE spec, so it is deliberately
+                // narrow: one exact word, and everything else still invalidates.
+                if (htile_is_clear && first == 0xfffffff0u) htile_is_clear = false;
+            }
+        }
         if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
         // Which aspect a write actually hit, and the byte count that decided it. The count is the
         // interesting half: `slice_depth_bytes` comes from a LEARNED stride, so an over-large stride
@@ -2910,12 +2978,12 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         if (log_detail)
             fprintf(stderr,
                     "[ds] invalidate dr=0x%llx sr=0x%llx htile=0x%llx slice=%u depth=%d stencil=%d "
-                    "htile_hit=%d origin=%s addr=0x%llx size=%llu learned=%llu depth_bytes=%llu "
+                    "htile_hit=%d htile_clear=%d htile_word=0x%08x origin=%s addr=0x%llx size=%llu learned=%llu depth_bytes=%llu "
                     "stencil_bytes=%llu htile_bytes=%llu gap=%lld\n",
                     (unsigned long long)key.dr, (unsigned long long)key.sr,
                     (unsigned long long)key.htile, key.slice,
                     (int)depth_overlap, (int)stencil_overlap, (int)htile_overlap,
-                    prosper::gpu::guest_gpu_write_origin(),
+                    (int)htile_is_clear, htile_word, prosper::gpu::guest_gpu_write_origin(),
                     (unsigned long long)addr, (unsigned long long)size,
                     (unsigned long long)learned, (unsigned long long)slice_depth_bytes,
                     (unsigned long long)stencil_size, (unsigned long long)htile_size,
@@ -2937,7 +3005,8 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             const char* v = getenv("PROSPER_DS_HTILE_INVALIDATE");
             return !(v && v[0] == '0');
         }();
-        const bool htile_kill = htile_overlap && htile_invalidates;
+        // Only a fast clear discards the aspects; a metadata refresh leaves them intact.
+        const bool htile_kill = htile_overlap && htile_invalidates && htile_is_clear;
         if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
         if (depth_overlap || htile_kill) image.depth_valid = false;
         if (stencil_overlap || htile_kill) image.stencil_valid = false;
