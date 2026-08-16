@@ -229,8 +229,16 @@ const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
 > valid V# (`base=0x209cc76000`, `stride=32`, `records=10`). One probe reports `CHANGED` between them
 > directly. The right column rejects on six *different* opcodes and is a genuine recompiler gap.
 
-The full reject census, now legible — every one is `mode=unresolved-operand`, i.e. every one is a
-descriptor that does not resolve rather than an instruction that is not implemented:
+The full reject census, now legible. Every one is `mode=unresolved-operand` — an **operand** the
+recompiler could not resolve, rather than an instruction it does not implement.
+
+**That is as far as the mode goes, and this line used to claim more.** It read *"i.e. every one is a
+descriptor that does not resolve"*, which is true of the MUBUF / MIMG / SMEM / FLAT rows and **false
+of `0x205b5e8600`**, whose unresolved operand is a *register* (VCC_LO used as scratch scalar data —
+see `## Ruled out`). The retracted gloss is what made "descriptor" the assumed shape of every row
+here, and it sent this kernel's frontier item off as cross-block lane-mask dataflow, which its
+disassembly does not contain. Read the mode as "some operand did not resolve" and open the row's
+instruction before assuming which kind:
 
 | program | pc | fmt/op |
 | --- | --- | --- |

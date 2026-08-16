@@ -7,6 +7,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <set>
 
 using namespace prosper::gpu;
 
@@ -142,6 +143,65 @@ int main() {
         CHECK(tbl->resources[1].table_index_count == 4 &&
                   tbl->resources[1].table_entry_stride == 16,
               "binding assignment preserves the array count and stride it did not set");
+    }
+
+    {
+        // PROSPER_COMPUTE_BINDS dedup seam. The reporter answers "who was supposed to write this
+        // surface", so a key that collapses two USES of one guest base can print the read view and
+        // hide the write view -- which reads as "no compute producer", the conclusion the instrument
+        // exists to prevent. A compute table deliberately carries per-use resources: the same
+        // allocation appears as a sampled Texture and again as a StorageImage, each with its own
+        // binding, and each may carry a distinct fetch_pc.
+        constexpr uint64_t kProgram = 0x205b5e8600ull;
+        constexpr uint64_t kBase = 0x2063380000ull;
+        std::set<prosper::gpu::ComputeBindWatchKey> seen;
+        auto admit = [&](const ShaderResource& r) {
+            return seen.insert(prosper::gpu::compute_bind_watch_key(
+                                   kProgram, r, kBase,
+                                   prosper::gpu::ComputeBindOutcome::Executed))
+                .second;
+        };
+
+        ShaderResource sampled;
+        sampled.cls = ResourceClass::Texture;
+        sampled.gpu_addr = kBase;
+        sampled.binding = 3;
+        sampled.fetch_pc = 128;
+
+        ShaderResource stored = sampled;          // SAME base, same program, same watched address
+        stored.cls = ResourceClass::StorageImage; // different USE
+        stored.binding = 7;
+        stored.fetch_pc = 964;
+
+        CHECK(admit(sampled), "the first use of a watched base reports");
+        CHECK(admit(stored),
+              "a second use of the SAME base with a distinct binding/class reports too "
+              "(a narrower key hides the write view behind the read view)");
+        CHECK(!admit(stored), "an identical observation is still suppressed");
+
+        // Each identity dimension must stand on its own: mutate exactly one and the row survives.
+        ShaderResource other_pc = sampled;
+        other_pc.fetch_pc = 512;
+        CHECK(admit(other_pc), "two fetch pcs of one base are distinct observations");
+        ShaderResource other_binding = sampled;
+        other_binding.binding = 11;
+        CHECK(admit(other_binding), "two bindings of one base are distinct observations");
+
+        // Outcome is part of the identity as well: a skip must not suppress a later execution of the
+        // same program+resource, or the surviving line reports a skip for a dispatch that ran.
+        const bool executed_then_skipped =
+            seen.insert(prosper::gpu::compute_bind_watch_key(
+                            kProgram, sampled, kBase,
+                            prosper::gpu::ComputeBindOutcome::SkippedDescriptors))
+                .second;
+        CHECK(executed_then_skipped,
+              "a skipped observation does not collapse into an executed one");
+        // And two watched addresses inside one resource span are two answers, not one.
+        CHECK(seen.insert(prosper::gpu::compute_bind_watch_key(
+                              kProgram, sampled, kBase + 0x1000ull,
+                              prosper::gpu::ComputeBindOutcome::Executed))
+                  .second,
+              "a second watched address in the same span is its own observation");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

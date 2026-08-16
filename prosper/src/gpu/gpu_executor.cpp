@@ -2140,7 +2140,9 @@ inline void note_compute_program_outcome(uint64_t code_addr, bool executed,
 // evidence that it does not bind the address. Only `executed` and `skipped-descriptors` rows come
 // from a fully resolved table. Read a null across a failing-shader population as "unproven", never
 // as "cleared". CONFIDENCE: HIGH (the coverage gap is measured, not assumed).
-enum class ComputeBindOutcome { Executed, SkippedDescriptors, RecompileEmpty };
+// `ComputeBindOutcome`, `ComputeBindWatchKey` and `compute_bind_watch_key` live in gpu_execute.hpp so
+// the dedup seam is reachable from a test; that header carries why the key must span every dimension
+// this line prints.
 
 inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourceTable* resources,
                                          ComputeBindOutcome outcome) {
@@ -2167,23 +2169,24 @@ inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourc
         const uint64_t end = begin + (resource.size ? resource.size : 1);
         for (const uint64_t want : watch.addrs) {
             if (!begin || want < begin || want >= end) continue;
-            // Dedup on every dimension the line reports. Keying on (program, resource) alone loses
-            // real observations: two watched addresses inside ONE resource span collapse to whichever
-            // matched first, and an early skip suppresses the later executed row for the same pair --
-            // so the surviving line reads `outcome=skipped-*` for a program that went on to run.
+            // Dedup on every dimension the line reports -- built by compute_bind_watch_key so the two
+            // cannot drift apart. See gpu_execute.hpp for what a narrower key loses; the short form is
+            // that one guest base carries several per-use resources, and collapsing them can print the
+            // read view of a surface while hiding the write view.
             static std::mutex mutex;
-            static std::set<std::tuple<uint64_t, uint64_t, uint64_t, int>> reported;
+            static std::set<ComputeBindWatchKey> reported;
             std::lock_guard lock(mutex);
-            if (!reported.insert({code_addr, resource.gpu_addr, want, (int)outcome}).second) continue;
+            if (!reported.insert(compute_bind_watch_key(code_addr, resource, want, outcome)).second)
+                continue;
             const char* outcome_name = outcome == ComputeBindOutcome::Executed ? "executed"
                                      : outcome == ComputeBindOutcome::SkippedDescriptors
                                            ? "skipped-descriptors"
                                            : "partial-recompile-empty";
             std::fprintf(stderr,
                          "[compute-binds] 0x%llx bound by program=0x%llx binding=%u class=%u "
-                         "addr=0x%llx size=%llu %ux%u fmt=%u outcome=%s\n",
+                         "fetch_pc=%u addr=0x%llx size=%llu %ux%u fmt=%u outcome=%s\n",
                          (unsigned long long)want, (unsigned long long)code_addr, resource.binding,
-                         static_cast<unsigned>(resource.cls),
+                         static_cast<unsigned>(resource.cls), resource.fetch_pc,
                          (unsigned long long)resource.gpu_addr,
                          (unsigned long long)resource.size, resource.width, resource.height,
                          static_cast<unsigned>(resource.format), outcome_name);

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <tuple>
 #include <memory>
 #include <vector>
 #include <set>
@@ -692,6 +693,49 @@ ParallelDrawRealizationStats parallel_draw_realization_stats();
 inline bool dropped_draw_census_enabled() {
     static const bool on = std::getenv("PROSPER_DROPPED_DRAW_CENSUS") != nullptr;
     return on;
+}
+
+// What became of the dispatch a [compute-binds] row describes. `RecompileEmpty` rows come from a
+// resource table that is incomplete by construction, so they are a lower bound on that program's
+// bindings -- see the contract above report_compute_binding_watch.
+enum class ComputeBindOutcome { Executed, SkippedDescriptors, RecompileEmpty };
+
+// The identity a [compute-binds] row asserts, and therefore the exact key its dedup must use.
+//
+// A key NARROWER than the line silently drops rows that differ in what the reader is reading, and
+// this reporter had that defect: keyed on (program, gpu_addr) alone, it collapsed distinct bindings
+// at one guest base. Compute tables deliberately carry per-use resources -- the same allocation
+// appears once as a sampled Texture and again as a StorageImage, or under two fetch pcs -- and each
+// use gets its own binding. Whichever was encountered first suppressed the rest, so in a producer
+// hunt the surviving row could be the READ view while the WRITE view went unprinted: the exact
+// "nothing writes this surface" conclusion the instrument exists to prevent. Build the key with
+// compute_bind_watch_key so every printed dimension is in it by construction.
+struct ComputeBindWatchKey {
+    uint64_t program = 0;
+    uint64_t resource_addr = 0;
+    uint64_t watched = 0;
+    uint32_t binding = 0;
+    uint32_t fetch_pc = 0;
+    uint32_t cls = 0;
+    uint32_t outcome = 0;
+    bool operator<(const ComputeBindWatchKey& other) const {
+        return std::tie(program, resource_addr, watched, binding, fetch_pc, cls, outcome) <
+               std::tie(other.program, other.resource_addr, other.watched, other.binding,
+                        other.fetch_pc, other.cls, other.outcome);
+    }
+};
+
+inline ComputeBindWatchKey compute_bind_watch_key(uint64_t program, const ShaderResource& resource,
+                                                  uint64_t watched, ComputeBindOutcome outcome) {
+    ComputeBindWatchKey key;
+    key.program = program;
+    key.resource_addr = resource.gpu_addr;
+    key.watched = watched;
+    key.binding = resource.binding;
+    key.fetch_pc = resource.fetch_pc;
+    key.cls = static_cast<uint32_t>(resource.cls);
+    key.outcome = static_cast<uint32_t>(outcome);
+    return key;
 }
 
 // How many operations each instrumented exit was OFFERED, so a zero in the census can be read. A
