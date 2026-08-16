@@ -9343,7 +9343,24 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
 // (#1636). Callers that do not want a diagnostic keep passing nothing.
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item, OperationRealizationFailure* failure = nullptr) {
+    if (dropped_draw_census_enabled())
+        retained_draw_attempts().fetch_add(1, std::memory_order_relaxed);
     const auto note = [&](RealizationFailureReason reason) {
+        // These two exits are the census's blind spot, and it is the blind spot that matters most
+        // for a "written by nothing" surface: they drop an operation BEFORE any render state is
+        // extracted, so the draw never reaches the sites that report a colour target and the
+        // surface reads as one the guest never rendered to. Derive the target here -- only when the
+        // census is on, because extract_render_state is not free -- so an indirect operation's
+        // destination is nameable.
+        if (index < st.draws.size() && dropped_draw_census_enabled()) {
+            const RenderState rs = extract_render_state(
+                use_per_draw_policy(st) ? st.state_at_draw(index) : st);
+            report_dropped_draw_target(
+                rs.color0_base,
+                reason == RealizationFailureReason::RetainedDrawNotSelected ? "retained-not-selected"
+                                                                            : "indirect-arguments",
+                rs.cb_target_mask, rs.cb_shader_mask);
+        }
         // An out-of-range index has no planned operation to attach to, and a record whose identity
         // matches nothing fails validate_failure_diagnostics for the WHOLE capture. Report nothing
         // rather than poison the capture; the caller still sees false.

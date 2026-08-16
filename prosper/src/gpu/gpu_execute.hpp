@@ -685,10 +685,28 @@ ParallelDrawRealizationStats parallel_draw_realization_stats();
 // into .prgcap, and both the in-memory validator and the reader bound-check it against that maximum.
 // Per-target tally of draws discarded before they reach the renderer, by reason. Reported at powers
 // of two so a routed boot stays readable.
+// Whether the census below will record anything. Exposed so a caller that must DERIVE a colour
+// target to report one -- the retained/indirect exits run before any render state is extracted --
+// can skip that work entirely when the census is off, instead of paying for a diagnostic nobody
+// asked for on every dropped operation.
+inline bool dropped_draw_census_enabled() {
+    static const bool on = std::getenv("PROSPER_DROPPED_DRAW_CENSUS") != nullptr;
+    return on;
+}
+
+// How many operations each instrumented exit was OFFERED, so a zero in the census can be read. A
+// drop reason reporting nothing is ambiguous between "this exit rejects nothing" and "this exit
+// never runs on this route", and those are opposite conclusions: the first retires a hypothesis,
+// the second means the instrument is blind and the hypothesis is untouched. Only the attempt count
+// separates them.
+inline std::atomic<uint64_t>& retained_draw_attempts() {
+    static std::atomic<uint64_t> attempts{0};
+    return attempts;
+}
+
 inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
                                        uint32_t cb_target_mask, uint32_t cb_shader_mask) {
-    static const bool on = std::getenv("PROSPER_DROPPED_DRAW_CENSUS") != nullptr;
-    if (!on) return;
+    if (!dropped_draw_census_enabled()) return;
     static std::mutex mutex;
     static std::map<std::pair<uint64_t, std::string>, uint64_t> dropped;
     static std::atomic<uint64_t> total{0};
@@ -711,6 +729,12 @@ inline void report_dropped_draw_target(uint64_t color0_base, const char* reason,
                              (unsigned long long)ranked[i].first);
             std::fprintf(stderr, "[dropped-draw]   (latest masks: target=0x%08x shader=0x%08x)\n",
                          cb_target_mask, cb_shader_mask);
+            // Makes a zero readable: with retained-draw attempts in the thousands and no
+            // `retained-not-selected` / `indirect-arguments` row above, the indirect path demonstrably
+            // ran and demonstrably dropped nothing. With attempts at zero the same empty census says
+            // only that the instrument never fired.
+            std::fprintf(stderr, "[dropped-draw]   (retained/indirect draw attempts: %llu)\n",
+                         (unsigned long long)retained_draw_attempts().load());
         }
     }
 }
