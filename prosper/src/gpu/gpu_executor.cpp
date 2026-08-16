@@ -2084,6 +2084,100 @@ void log_compute_dispatch(uint64_t program, uint64_t submit_no, size_t dispatch_
                  static_cast<unsigned long long>(order), outcome, geometry);
 }
 
+// PROSPER_COMPUTE_PROGRAM_CENSUS=1 — per program, how many dispatches EXECUTED and how many were
+// skipped.
+//
+// `[compute] skip unsupported program` prints once per program address by design, so a run showing
+// twelve skip lines has been read as "twelve programs are disabled". That does not follow: the skip
+// is a `continue` inside the per-dispatch loop, so every dispatch is re-decided, and a program whose
+// descriptors are garbage on its first fold and valid afterwards is skipped once and runs from then
+// on. One line cannot distinguish 1-of-438 from 438-of-438, and those are opposite states of the
+// title. Ratios, not first sightings.
+inline void note_compute_program_outcome(uint64_t code_addr, bool executed,
+                                        uint32_t gx = 0, uint32_t gy = 0, uint32_t gz = 0,
+                                        uint32_t lx = 0, uint32_t ly = 0) {
+    static const bool on = std::getenv("PROSPER_COMPUTE_PROGRAM_CENSUS") != nullptr;
+    if (!on) return;
+    static std::mutex mutex;
+    struct Outcome { uint64_t executed = 0, skipped = 0; uint32_t gx = 0, gy = 0, gz = 0, lx = 0, ly = 0; };
+    static std::map<uint64_t, Outcome> outcomes;
+    static std::atomic<uint64_t> total{0};
+    const uint64_t n = total.fetch_add(1) + 1;
+    std::lock_guard lock(mutex);
+    auto& entry = outcomes[code_addr];
+    (executed ? entry.executed : entry.skipped) += 1;
+    // The dispatch grid is what identifies a kernel's ROLE without resolving its descriptors, which
+    // is the whole difficulty for a program that never executes. A full-screen 4K pass at 8x8 groups
+    // is 480x270; anything much smaller is not writing the scene.
+    if (gx) { entry.gx = gx; entry.gy = gy; entry.gz = gz; entry.lx = lx; entry.ly = ly; }
+    if ((n & (n - 1)) != 0 || n < 512) return;
+    std::fprintf(stderr, "[compute-census] %llu dispatch decisions over %zu program(s)\n",
+                 (unsigned long long)n, outcomes.size());
+    for (const auto& [addr, counts] : outcomes)
+        if (counts.skipped)   // only programs that skipped at least once are interesting
+            std::fprintf(stderr,
+                         "[compute-census]   program=0x%llx executed=%llu skipped=%llu "
+                         "groups=%ux%ux%u local=%ux%u threads=%ux%u\n",
+                         (unsigned long long)addr, (unsigned long long)counts.executed,
+                         (unsigned long long)counts.skipped, counts.gx, counts.gy, counts.gz,
+                         counts.lx, counts.ly, counts.gx * counts.lx, counts.gy * counts.ly);
+}
+
+// PROSPER_COMPUTE_BINDS=<hex addr>[,<hex addr>…] — name every compute program that binds one of these
+// guest addresses, with the binding's class and size and what became of the dispatch.
+//
+// The question it answers is "who was supposed to write this surface". A render-target census sees
+// draws, the write watches see DMA/WRITE_DATA/RELEASE_MEM, and between them a surface produced by a
+// compute STORE is invisible: its address appears only inside a dispatch's resource table, which
+// nothing enumerates. GTA V's 4K HDR scene colour 0x2063380000 is the case -- sampled 24x per
+// composite, written by nothing any existing instrument can see.
+//
+// WHAT ITS NULL DOES AND DOES NOT COVER. The instrument reads the *resource table*, so it can only
+// see bindings the resource build resolved. For a program whose recompile failed, that table is
+// built from a walk that is itself incomplete -- PROSPER_DYNTRACE_FAIL measured 15 of 21 image ops
+// recovered for 0x205b5e8600 and 4 of 6 for 0x205b657200 -- so a `partial-recompile-empty` row is a
+// lower bound on that program's bindings, and the ABSENCE of a row for such a program is not
+// evidence that it does not bind the address. Only `executed` and `skipped-descriptors` rows come
+// from a fully resolved table. Read a null across a failing-shader population as "unproven", never
+// as "cleared". CONFIDENCE: HIGH (the coverage gap is measured, not assumed).
+// `ComputeBindOutcome`, `ComputeBindWatchKey`, `compute_bind_watch_key` and the selection/dedup seam
+// `compute_bind_watch_rows` all live in gpu_execute.hpp, where the regression reaches them. This
+// function is deliberately only environment parsing and formatting: every decision about WHICH rows
+// exist -- range filtering, key construction, dedup -- is in the tested function, so a narrowing
+// anywhere in that logic fails the regression instead of passing it.
+inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourceTable* resources,
+                                         ComputeBindOutcome outcome) {
+    static const std::vector<uint64_t> watch = [] {
+        std::vector<uint64_t> addrs;
+        const char* spec = std::getenv("PROSPER_COMPUTE_BINDS");
+        if (!spec || !*spec) return addrs;
+        for (const char* cursor = spec; *cursor;) {
+            char* end = nullptr;
+            const uint64_t value = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            addrs.push_back(value);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        return addrs;
+    }();
+    if (watch.empty() || !resources) return;
+    static std::mutex mutex;
+    static std::set<ComputeBindWatchKey> reported;
+    std::vector<ComputeBindWatchKey> rows;
+    {
+        std::lock_guard lock(mutex);
+        rows = compute_bind_watch_rows(reported, watch, code_addr, resources, outcome);
+    }
+    for (const ComputeBindWatchKey& row : rows)
+        std::fprintf(stderr,
+                     "[compute-binds] 0x%llx bound by program=0x%llx binding=%u class=%u "
+                     "fetch_pc=%u addr=0x%llx size=%llu %ux%u fmt=%u outcome=%s\n",
+                     (unsigned long long)row.watched, (unsigned long long)row.program, row.binding,
+                     row.cls, row.fetch_pc, (unsigned long long)row.resource_addr,
+                     (unsigned long long)row.size, row.width, row.height, row.format,
+                     compute_bind_outcome_name(static_cast<ComputeBindOutcome>(row.outcome)));
+}
+
 bool report_compute_recompile_skip_once(RecompileDiagnosticContext diagnostic) {
     static std::mutex mutex;
     static std::set<uint64_t> logged;
@@ -3380,6 +3474,32 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         const bool proven_zero_mip_at_use =
             rdna2_mimg_zero_mip_shape(in, &mip_vgpr) &&
             same_block_zero_vgprs.test(mip_vgpr);
+        // Why the proof failed, at the site that knows. `[mimg-mip]` downstream reports
+        // `proven_zero_mip=0` and stops there, which is the bool this line produced -- it cannot say
+        // whether the mip register was never written in this block, was written from a scalar the
+        // fold could not evaluate, or was discarded by an EXEC write. Those are three different
+        // pieces of work and the difference is only visible here. Deduped per pc, ungated for the
+        // same reason the downstream line is: PROSPER_DBG desyncs the routed repro.
+        if (rdna2_mimg_zero_mip_shape(in, &mip_vgpr)) {
+            // Dedup by (PROGRAM, pc). A pc-only key collides across programs -- every shader has a
+            // pc=16 -- so the first program to reach a pc silently speaks for every later one, and
+            // the line then describes a kernel the reader is not looking at.
+            static std::mutex why_mutex;
+            static std::set<std::pair<const uint32_t*, uint32_t>> why_reported;
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(why_mutex);
+                first = why_reported.insert({code, in.pc}).second;
+            }
+            if (first)
+                std::fprintf(stderr,
+                             "[mimg-mip-why] program=0x%llx pc=%u proven_at_use=%d mip_vgpr=v%u "
+                             "in_zero_set=%d exec_pristine=%d cfg_known=%d\n",
+                             (unsigned long long)(uintptr_t)code, in.pc,
+                             (int)proven_zero_mip_at_use, mip_vgpr,
+                             mip_vgpr < 256 ? (int)same_block_zero_vgprs.test(mip_vgpr) : -1,
+                             (int)zero_mip_exec_pristine, (int)zero_mip_cfg_known);
+        }
         // #2132. RESTORE FIRST, THEN SAVE — the order is load-bearing and getting it wrong
         // reproduces the very defect this rule exists to fix (#2202 review, B3). One instruction can
         // be BOTH a qualifying target and the sole-predecessor branch of a later target: a block
@@ -8029,6 +8149,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  "recompile-empty");
             record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv,
                            &config);
+            // Report the bindings a recompile-failed program DID resolve. Without this call the one
+            // population the watch is most often pointed at -- the failing shaders -- produced no rows
+            // at all, so its silence read as "these programs do not bind the address" when the
+            // instrument had simply never looked at them. The row is labelled partial because the
+            // table behind it is incomplete by construction (see the contract above the function).
+            report_compute_binding_watch(code_addr, item.resources.get(),
+                                         ComputeBindOutcome::RecompileEmpty);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
             // const-fold walk trace + user-data dump forced on (once per distinct program) — the
             // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp).
@@ -8180,6 +8307,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                 }
             }
+            note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
+                                        launch.groups_z, launch.local_x, launch.local_y);
             continue;
         }
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
@@ -8217,11 +8346,17 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                          resource.fetch_pc);
                 }
             }
+            note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
+                                        launch.groups_z, launch.local_x, launch.local_y);
+            report_compute_binding_watch(code_addr, item.resources.get(), ComputeBindOutcome::SkippedDescriptors);
             continue;
         }
         // Image bindings (sampled textures + storage images) execute through the live backend's
         // image paths (#590, live_compute.cpp); shapes it cannot bind correctly are skipped there,
         // loudly and per-item, without aborting the rest of the batch.
+        note_compute_program_outcome(code_addr, true, launch.groups_x, launch.groups_y,
+                                    launch.groups_z, launch.local_x, launch.local_y);
+        report_compute_binding_watch(code_addr, item.resources.get(), ComputeBindOutcome::Executed);
         items.push_back(std::move(item));
     }
     return items;
@@ -8785,7 +8920,11 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                 copy.bytes > copy.destination_size || copy.bytes > source_size)
                 return;
             std::memmove(copy.destination_data, source, copy.bytes);
-            if (!destination_gds) notify_guest_gpu_write(copy.dst, copy.bytes);
+            if (!destination_gds) {
+                set_guest_gpu_write_origin("DMA_DATA(live-target)");
+                notify_guest_gpu_write(copy.dst, copy.bytes);
+                set_guest_gpu_write_origin(nullptr);
+            }
         });
 }
 
@@ -9339,7 +9478,24 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
 // (#1636). Callers that do not want a diagnostic keep passing nothing.
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item, OperationRealizationFailure* failure = nullptr) {
+    if (dropped_draw_census_enabled())
+        retained_draw_attempts().fetch_add(1, std::memory_order_relaxed);
     const auto note = [&](RealizationFailureReason reason) {
+        // These two exits are the census's blind spot, and it is the blind spot that matters most
+        // for a "written by nothing" surface: they drop an operation BEFORE any render state is
+        // extracted, so the draw never reaches the sites that report a colour target and the
+        // surface reads as one the guest never rendered to. Derive the target here -- only when the
+        // census is on, because extract_render_state is not free -- so an indirect operation's
+        // destination is nameable.
+        if (index < st.draws.size() && dropped_draw_census_enabled()) {
+            const RenderState rs = extract_render_state(
+                use_per_draw_policy(st) ? st.state_at_draw(index) : st);
+            report_dropped_draw_target(
+                rs.color0_base,
+                reason == RealizationFailureReason::RetainedDrawNotSelected ? "retained-not-selected"
+                                                                            : "indirect-arguments",
+                rs.cb_target_mask, rs.cb_shader_mask);
+        }
         // An out-of-range index has no planned operation to attach to, and a record whose identity
         // matches nothing fails validate_failure_diagnostics for the WHOLE capture. Report nothing
         // rather than poison the capture; the caller still sees false.
@@ -10844,8 +11000,57 @@ LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
     g_guest_gpu_write_observer = std::move(observer);
 }
+// PROSPER_GUEST_WRITE_WATCH=0xADDR[,0xADDR…] — report every guest-side GPU write that overlaps a
+// named address, with the caller that produced it.
+//
+// A colour-target census answers "which DRAW wrote this surface", and a compute address watch
+// answers "which DISPATCH bound it". Neither can see a DMA_DATA copy, a WRITE_DATA, a RELEASE_MEM or
+// an EVENT_WRITE, so a surface filled by any of those reads as "written by nothing" in both -- which
+// is exactly the state GTA V's 4K HDR scene colour is in, and the reason a third instrument is
+// needed before concluding that nothing fills it.
+void report_guest_write_watch(uint64_t addr, uint64_t size, const char* origin) {
+    static const std::vector<uint64_t> watched = [] {
+        std::vector<uint64_t> out;
+        const char* spec = std::getenv("PROSPER_GUEST_WRITE_WATCH");
+        for (const char* p = spec; p && *p;) {
+            char* end = nullptr;
+            const uint64_t v = std::strtoull(p, &end, 0);
+            if (end == p) break;
+            if (v) out.push_back(v);
+            p = (*end == ',') ? end + 1 : end;
+        }
+        return out;
+    }();
+    if (watched.empty()) return;
+    for (const uint64_t want : watched) {
+        // Any overlap counts: a fill of a 4K surface is one large range, not a write at its base.
+        if (!(addr <= want && want < addr + size)) continue;
+        static std::mutex mutex;
+        static std::map<std::pair<uint64_t, std::string>, uint64_t> seen;
+        std::lock_guard lock(mutex);
+        const uint64_t n = ++seen[{want, origin}];
+        if (n <= 4 || (n & (n - 1)) == 0)
+            std::fprintf(stderr,
+                         "[guest-write-watch] 0x%llx covered by %s write addr=0x%llx size=%llu "
+                         "(x%llu)\n",
+                         (unsigned long long)want, origin, (unsigned long long)addr,
+                         (unsigned long long)size, (unsigned long long)n);
+    }
+}
+
+// Thread-local origin for the next guest write, so PROSPER_GUEST_WRITE_WATCH can name the PM4
+// packet that produced it. "a guest write covers this surface" and "a DMA_DATA fill of 512 KiB
+// covers this surface" are different facts, and only the second says whether the depth contents
+// were actually replaced.
+thread_local const char* g_guest_write_origin = "gpu";
+void set_guest_gpu_write_origin(const char* origin) {
+    g_guest_write_origin = origin ? origin : "gpu";
+}
+const char* guest_gpu_write_origin() { return g_guest_write_origin; }
+
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    report_guest_write_watch(addr, size, g_guest_write_origin);
     // Page-protection watches observe guest CPU stores, but device/DMA writes can mutate the same
     // direct-memory pages without a CPU protection fault. Mark the virtual range dirty as part of the
     // existing authoritative GPU-write notification so cross-submit texture/compute caches never trust
@@ -10862,6 +11067,7 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
 }
 void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    report_guest_write_watch(addr, size, "gpu-preserving");
     // The observer owns renderer-resident aliases (color/depth targets and their CPU snapshots),
     // which may differ from the exact guest bytes even when a compute result does not. Guest-memory
     // caches, page watches, and the submit journal remain valid because the caller proved that those

@@ -192,8 +192,53 @@ pc158 is the same shape. Those two are the only unresolved uses of the nineteen.
 **So the whole "GTA V has no 3D world" chain reduces to one buffer-array descriptor that does not
 const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
 
-The full reject census, now legible — every one is `mode=unresolved-operand`, i.e. every one is a
-descriptor that does not resolve rather than an instruction that is not implemented:
+> **Read the table below as first sightings, not as outcomes — 2026-08-16.** Every row is a program
+> that rejected *at least once*. `[compute] skip unsupported program` prints **once per program
+> address** by design (`report_compute_recompile_skip_once`), and the skip itself is a `continue`
+> inside the per-dispatch loop, so each dispatch is decided again. A row therefore says nothing about
+> how often the program runs, and this document previously read the twelve rows as twelve disabled
+> programs. `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports the ratio, and it splits them in two:
+>
+> | mostly runs (executed / skipped) | never runs (executed / skipped) |
+> | --- | --- |
+> | `0x413cf9200` 369 / 12 · `0x413dc6700` 352 / 11 | `0x2042f49a00` 0 / 129 |
+> | `0x413cf9a00` 351 / 30 · `0x413cee500` 349 / 9 | `0x205b545c00` 0 / 127 · `0x205b54ee00` 0 / 129 |
+> | `0x413d63700` 344 / 14 · `0x413d14100` 343 / 38 | `0x205b5e8600` 0 / 128 · `0x205b654a00` 0 / 128 |
+> | `0x413cf9d00` 342 / 42 · `0x413ce6000` 103 / 16 | `0x205b657200` 0 / 128 · `0x205b658800` 0 / 128 |
+> | `0x413d85e00` 137 / 2 (+6 more at 32–35 / 1) | `0x413ce5200` 0 / 93 · `0x413e1df00` 0 / 85 |
+>
+> **Update 2026-08-16: the right column is now SEVEN.** `0x205b545c00` and `0x205b54ee00` execute
+> every dispatch since the DPP lane-XOR family was admitted (`ROW_XMASK:n`, `0x160..0x16f`, is the
+> same permutation family as the already-admitted `ROW_ROR:8` — `ROW_XMASK:n` is XOR n, and XOR 8 is
+> exactly `(row_lane - 8) mod 16`, so the lowering was general and only the decoder's admitted control
+> values were not). Both went `executed=0 skipped=52` → zero skips on the same route. The remaining
+> seven need, in order of tractability: a VCC_LO operand that resolves to no mask value
+> (`0x205b5e8600` — **not** cross-block dataflow; see `## Ruled out`), an untracked M0
+> read (`0x205b658800`), `image_bvh_intersect_ray` (`0x205b654a00`, `0x205b657200`), `IMAGE_LOAD_MIP`
+> on a compressed surface (`0x2042f49a00`), and a descriptor contract (`0x413ce5200`, `0x413e1df00`).
+>
+> **The frontier is the seven on the right** (the count above this line, not the nine it was before
+> the preceding update cleared two), and note that `0x413cf9200` — the program carrying the
+> entire hardcoded 15-site contract in `rdna2_gta5_cf9200_contract.cpp` — is on the *left*, running
+> 369 of 381 dispatches.
+>
+> The two columns need different work. The left column is a **descriptor-timing** problem, now with a
+> measured mechanism: `PROSPER_COMPUTE_MEMPROBE=413cf9200:0:c0:4` shows the first fold reading
+> `bfe767f8:7ee0001a:40e938ea:bfaa07e0` at `(user_sgprs[0..1])+0xc0` — SOPP instruction words, i.e.
+> the SRT is not written yet — while every later fold reads `9cc76000:00200020:0000000a:00005204`, a
+> valid V# (`base=0x209cc76000`, `stride=32`, `records=10`). One probe reports `CHANGED` between them
+> directly. The right column rejects on six *different* opcodes and is a genuine recompiler gap.
+
+The full reject census, now legible. Every one is `mode=unresolved-operand` — an **operand** the
+recompiler could not resolve, rather than an instruction it does not implement.
+
+**That is as far as the mode goes, and this line used to claim more.** It read *"i.e. every one is a
+descriptor that does not resolve"*, which is true of the MUBUF / MIMG / SMEM / FLAT rows and **false
+of `0x205b5e8600`**, whose unresolved operand is a *register* (VCC_LO used as scratch scalar data —
+see `## Ruled out`). The retracted gloss is what made "descriptor" the assumed shape of every row
+here, and it sent this kernel's frontier item off as cross-block lane-mask dataflow, which its
+disassembly does not contain. Read the mode as "some operand did not resolve" and open the row's
+instruction before assuming which kind:
 
 | program | pc | fmt/op |
 | --- | --- | --- |
@@ -1829,6 +1874,56 @@ table is a **missing program**, not a miscompiled one, and the fix is to make it
 charter's rule that an unsupported program is a fatal gap rather than an acceptable skip, these are
 the next thing to implement regardless of how this particular question resolves.
 
+## RETRACTED: "cube shadows are not the missing world" (2026-08-16)
+
+That conclusion is **void, not a demonstrated negative**, and the reason is worth more than the claim.
+
+Pass grouping's `same_targets` compared colour targets, formats and resolve mode — and **not the
+depth/stencil attachment**. A render pass has one depth attachment and the backend selects one cached
+DS image for the whole grouped call from its first meaningful draw, so a single call could span draws
+naming different DS surfaces, or different `DB_DEPTH_VIEW` **slices of one layered allocation**. Every
+such draw rendered into whichever face the call happened to select. Codex measured one grouped call
+crossing slice 0 → slice 1 at draw 65.
+
+So when I reported "six valid faces" under `PROSPER_DS_GUEST_WRITE_INVALIDATE=0`, the six *handles*
+existed and their *contents* did not correspond to six guest faces. The lever I thought I had moved
+was never moved.
+
+**Fixed — but NOT on master, and not in the PR that carries this document.** The grouping split and
+the cube-face bridge live in the stacked follow-up **#2553**, which is unmerged at the time of
+writing; review moved them out of #2552 because they change renderer behaviour at production seams
+and need regressions of their own. Everything measured in this subsection was measured with that
+branch applied. Do not read the table below as describing current master, and check #2553's state
+before building on it.
+
+Grouping there splits on DS identity — depth/stencil bases, HTILE base, and the
+`DB_DEPTH_VIEW` slice. Measured on the same route with defaults (invalidation ON):
+
+| cube | faces valid before | after |
+| --- | --- | --- |
+| `0x2094ec0000` | 1 (`0x01`) | **5** (`0x1f`) |
+| `0x20948c0000` | 1 (`0x01`) | **3** (`0x07`) |
+| `0x208f340000` | 4 (`0x1e`) | 4 (`0x1e`) |
+| `0x2097ec0000` | 5 (`0x3e`) | 5 (`0x3e`) |
+
+Multiple guest faces really were being rendered into one host face, and the earlier per-slice census
+could not see it because the census counted the passes the backend *made*, not the faces the guest
+*asked for*.
+
+**The cube A/B is still open.** Reaching 6/6 requires the invalidation switch, which perturbs the
+frame on its own (the HUD disappears in that arm), so "world still black with the cube bridged" is
+not a clean measurement either. The honest state is: the bridge works when faces are resident, the
+grouping defect that corrupted them is fixed, and whether the cube is load-bearing for the world is
+**not yet established in either direction**.
+
+### The pattern, again
+
+This is the third time this session a negative result turned out to be void because the lever was not
+actually moved — after the compute-program "never executes" retraction and the RTTLOG readback that
+materialised the pixels it measured. Each time the surface evidence looked sufficient. The thing that
+caught all three was someone asking *what would have to be true for this measurement to mean what I
+think it means* — twice that someone was Codex.
+
 ## Fifth review round on #2550, all four fixed (2026-08-15)
 
 **1 (blocker) — MRT1 was still discarded under the live renderer's calling convention.** The live
@@ -2875,12 +2970,561 @@ arguments live and it is still not provenance — one process VA space can hold 
 several high-32 prefixes, so accepting an address because 12 bytes are readable admits dispatching
 group counts read out of an unrelated live allocation.
 
+## The frame's dataflow, end to end (2026-08-16)
+
+Reassembled with `tools/gpu_timeline/rtt_pass_graph.py` from a `PROSPER_RTTLOG=1` routed boot. This
+is the map to reason against; **it locates the break precisely, and the break is not where the draw
+and target censuses pointed.**
+
+```
+G-buffer (5 MRTs, 11-28 draws)            albedo 0x207fe40000  100%   <- complete and correct
+  0x207fe40000 0x2083e00000 0x2081e20000  normals 0x207de60000  99.7%
+  0x2085de0000 0x207de60000
+        |
+        v
+deferred lighting  -> 0x20431c0000  19 draws   rgb_nonblack = 0        <-- THE BREAK
+        |              reads the whole G-buffer + 6 shadow surfaces
+        v
+        0x20471e0000  1 draw   45.1%   (reads 0x20431c0000 x14)
+        ...later passes raise 0x20431c0000 to 45.3% (3,757,533 px)
+                                                   |
+                                                   |  NOTHING CARRIES IT ACROSS
+                                                   x
+final composite -> 0x2056740000  1 draw  13.5%
+        <- 0x2063380000  3840x2160 f11f11f10  x24   <-- scene colour, WRITTEN BY NOTHING
+        <- 0x2085de0000  x6, bloom pyramid 1920x1080 / 960x540 / 240x135
+        v
+   0x2058720000  13.5%   ->   SCANOUT 0x2162cd0000  13.5%   (this 13.5% is the HUD)
+```
+
+Two facts fix the frontier:
+
+1. **The deferred-lighting pass consumes a complete G-buffer and emits nothing.** Its 19 draws read
+   albedo at 100% and normals at 99.7% and produce `rgb_nonblack=0`. Later passes populate
+   `0x20431c0000` to 45%, so the buffer is not broken — the lighting resolve specifically is.
+2. **The composite samples `0x2063380000` 24 times per frame, and nothing on any decoded path writes
+   it.** Across 6,561 frames it is bound as a render target **exactly once**, for one draw, with no
+   inputs and no output (`px_nonzero=0`) — that is a clear, not a composite. No draw (0/131,072 over
+   all 8 slots), no compute, no resolve, no guest-side GPU write, no DS plane, no dropped draw.
+   Meanwhile the lit scene sits in `0x20431c0000` / `0x20471e0000`, which the composite never reads.
+
+So the world is not lost in the composite and not lost at scanout: **the producer of the scene-colour
+buffer is missing entirely.**
+
+### Run the route for 400 s, not 200 s — a 200 s run is mostly LOADING (2026-08-16)
+
+**This qualifies every per-frame statistic below, including several I wrote earlier the same day.**
+The routed boot reaches established gameplay only near the end of a 200 s run, so a 200 s sample is
+dominated by the loading phase and its ratios describe that phase rather than gameplay. Measured with
+`screenshot --count 10` (samples every 200 s), by distinct colours in the presented frame:
+
+| t | non-black px | distinct RGB colours |
+| --- | --- | --- |
+| 200 s | 1,131,517 | **241** |
+| 400 s | 1,757,394 | **3,756** |
+
+and an earlier 200 s run reported `distinct_rgb_colors: 2` — a frame that is black to the eye, whose
+1,051,186 "non-black" pixels sit at luminance 1-2 (instrument trap 160).
+
+The same counts at 400 s against 200 s show how much the phase moves them:
+
+| | 200 s | 400 s |
+| --- | --- | --- |
+| lighting `0x20431c0000` passes | 132 | **746** |
+| composite `0x2056740000` passes | 9 | **56** |
+| scene colour `0x2063380000` as a target | 1 | **1** |
+| scene colour sampled | 200 | **1,375** |
+
+So "the 3D chain runs in only ~2% of frames" was an artifact of stopping at 200 s, and should not be
+read as a throttling defect. **The one number that does not move is the one that matters**: the guest
+binds `0x2063380000` as a colour target exactly once — a start-up clear — while sampling it 1,375
+times in 400 s.
+
+**What the frame actually looks like at 400 s**, which is not what the 200 s captures suggested: the
+radar renders completely (map, blips, player arrow, N compass, legend bar), the tutorial text is
+crisp, and three world lights render with correct bloom halos. It is a real gameplay frame missing
+its base scene, not a black screen. With `PROSPER_RTT_ALIAS=2063380000:20431c0000` the same frame
+shows the bank interior with correct perspective, a lit doorway and architectural detail —
+**19,623 distinct colours against 3,756**.
+
+**Composite input inventory at 400 s** (max `rgb_nonblack` over the run, and pass count):
+
+| input | taps | content | passes |
+| --- | --- | --- | --- |
+| `0x2063380000` 4K f11f11f10 | x24 | **0** | 1 |
+| `0x2085de0000` 4K f16 | x6 | 4,330,576 | 636 |
+| `0x206e6a0000` 1080p f16 | x4 | **0** | 56 |
+| `0x206e640000` 240x135 f16 | x2 | **0** | 56 |
+| `0x20602a0000` 1080p f11f11f10 | x1 | 30,700 | 111 |
+| `0x2066be0000` 1080p f11f11f10 | x1 | 112,361 | 110 |
+| `0x206b4e0000` 960x540 un8 | x1 | 518,400 | 1 |
+
+Three inputs are empty: the scene colour and the two luminance/exposure-chain buffers. The sparse
+bloom buffers are what the three visible lights come through. Note the **format split**: the working
+HDR chain (`0x20df360000`, `0x2078ea0000`, `0x2074ee0000`, all heavily sampled) is `f16`, while the
+empty tap is `f11f11f10` — so the missing producer is a **format conversion** of a chain that works.
+
+### The deferred lighting resolve is rejected by the DEPTH TEST (2026-08-16)
+
+**This is the sharpest result in this document and it is a prosper defect, not a missing guest
+producer.** It is separate from the absent scene-colour producer below; both are live.
+
+The lighting resolve — the 15+ draw pass that consumes the whole G-buffer — emits colour in only
+**10 of 122** read-back passes (readback confirmed per pass via `src=`, so these zeros are
+measurements and not deferred readbacks). `PROSPER_NO_DEPTH=1` disables the depth test and nothing
+else:
+
+| | control | `PROSPER_NO_DEPTH=1` |
+| --- | --- | --- |
+| read-back passes with 15+ draws | 122 | 120 |
+| ...of which carry colour | **10 (8%)** | **65 (54%)** |
+| max `rgb_nonblack` | 3,798,218 (46%) | **8,294,400 (100%)** |
+
+A full 4K frame of coverage appears the moment the depth test stops rejecting. So the light-volume
+draws are executing and being discarded per-fragment.
+
+**`PROSPER_DEPTH_CLEAR` moves it too, at both poles** — and reading that as a statement about this
+pass's initial value is the mistake this paragraph exists to prevent:
+
+| arm | passes with content | max `rgb_nonblack` |
+| --- | --- | --- |
+| control (derived clear) | 10 of 122 | 3,798,218 |
+| `PROSPER_DEPTH_CLEAR=0.0` | **68 of 126** | **8,294,400 (100%)** |
+| `PROSPER_DEPTH_CLEAR=1.0` | **0 of 124** | 0 |
+
+`PROSPER_DEPTH_CLEAR_WHY=1` (new) then showed that mixed-compare passes really do exist and really do
+latch the wrong pole — the fresh-image value is **first-draw-wins**, so a pass measuring
+`greater=15 less=5` derives **1.000** and always-fails its fifteen GREATER draws. That is the #457
+class one level deeper, and it looked like the fix.
+
+**It is not the fix, and this is recorded so it is not retried.** Deriving the value by *majority*
+instead of arrival order — identical wherever a pass's draws agree, so no existing shape changes, and
+246/246 stayed green — made the measured target **worse**: 0 of 111 read-back passes with content
+against 10 of 122, with SCANOUT unmoved. So the global `PROSPER_DEPTH_CLEAR=0.0` arm was never
+evidence about *this pass's* initial value: it forces **every** depth surface in the frame including
+the G-buffer's own, and whatever produces its improvement has another mechanism. The behavioural
+change was reverted; `PROSPER_DEPTH_CLEAR_WHY` and its counts were kept.
+
+**The depth-test finding above still stands** — `PROSPER_NO_DEPTH=1` is a per-test lever, not a
+per-surface value, and it takes the pass from 10 to 65.
+
+### How much presented content each depth/stencil arm recovers (400 s, same route)
+
+The single most useful table here, because it is measured on the **presented frame** rather than on
+an intermediate, and because two independent controls bound the noise at **0.15%** — so every row
+below is real.
+
+| arm | SCANOUT `rgb_nonblack` | vs control |
+| --- | --- | --- |
+| control (`src`) | 1,958,474 | — |
+| control (`long`) | 1,955,614 | −0.15% |
+| **`PROSPER_NO_DEPTH=1`** | **2,810,666** | **+43.5%** |
+| `PROSPER_DEPTH_CLEAR=0.0` | 2,248,371 | +14.8% |
+| **`PROSPER_NO_STENCIL=1`** | **2,104,048** | **+7.4%** |
+| majority depth-clear derivation | 1,942,739 | −0.8% (refuted, reverted) |
+
+> ## RETRACTED — the metric measures BLOOM, not world content
+>
+> **Every number in the table above is real and its interpretation was wrong.** `rgb_nonblack` rises
+> under those arms because a blown-out white blob and a blue haze flood the frame, not because the
+> world appears. **I only found this by opening the images**, which is the whole lesson:
+>
+> - `PROSPER_NO_DEPTH=1` (2,810,666, +43.5%): a large overexposed blob, blue haze, **no world
+>   geometry, and the radar is GONE**. Strictly worse than the control to look at.
+> - `PROSPER_NO_STENCIL=1` (2,104,048, +7.4%): the same blob and haze; radar and tutorial text
+>   survive; still **no world geometry**.
+> - `PROSPER_RTT_ALIAS` — the one arm that genuinely shows the bank interior — scores **19,623
+>   distinct colours against the control's 30,262.** It shows *more* world with *fewer* colours.
+>
+> So on this title neither `nonblack_rgb_pixels` nor `distinct_rgb_colors` separates "the world
+> rendered" from "bloom flooded the screen", and they can rank a worse frame higher. This is the
+> `## Ruled out` list's colour-metric trap in a new costume: **a bloom smear fools the metric exactly
+> as a gradient does.** Quote these counters only alongside the image.
+>
+> **What survives:** the depth and stencil tests do change what reaches the lighting buffer, and
+> `PROSPER_DEPTH_CLEAR=1.0` still drives it to zero while `0.0` does not, so the fresh-image value is
+> a real lever on that buffer. What does NOT survive is "disabling the test recovers presented
+> content" — it recovers bloom. The mixed-compare and fresh-attachment findings below are unaffected;
+> they are structural facts about the pass, not pixel counts.
+
+**These arms are diagnostics, not fixes** — each disables a test the guest asked for.
+
+That is consistent with the DS bridge's own declines on this route: `0x2054aa0000` (the stencil
+plane) declines `stencil-invalid` up to **846** times, and `0x2052ac0000` (depth) `depth-invalid`
+up to 826. **But note the trap already recorded above**: suppressing those declines wholesale with
+`PROSPER_DS_HTILE_INVALIDATE=0` *loses* 29% of presented content, so the invalidation is protecting
+something real and "make the bridge always valid" is not the fix either. The open question is what
+the correct contents are, not how to stop declining them.
+
+### Why no initial value can work: the resolve mixes GREATER and LESS draws 7:7
+
+`PROSPER_DEPTH_CLEAR_WHY=1` prints the derived value per **colour target**, which is what makes this
+answerable. For `0x20431c0000`:
+
+| pass shape | derived | correct? |
+| --- | --- | --- |
+| `greater=66 less=0`, `greater=8 less=0`, `greater=4 less=0`, … | 0.000 | yes |
+| **`greater=7 less=7` draws=15** | **1.000** | **unsatisfiable** |
+| **`greater=6 less=7` draws=14** | **1.000** | **unsatisfiable** |
+
+The mixed passes **are** the 14/15-draw resolve, `first_op=1` (LESS) latches the far value, and the
+six or seven GREATER draws then always-fail against it.
+
+**This is also exactly why the majority rule failed, and the failure is informative rather than
+embarrassing:** at 7 versus 7 the tie-break falls back to first-draw (LESS → 1.0), and at 6 versus 7
+the majority *is* LESS → 1.0. Majority reproduces the old answer on precisely the passes that matter.
+**No single fresh-image value can serve a pass that mixes both compare directions against one
+attachment** — the approximation is not merely mis-tuned here, it is unsatisfiable by construction.
+
+And the attachment really is fresh, which the poles already proved: if it were LOADed from a retained
+image the initial value could not matter, yet `PROSPER_DEPTH_CLEAR=1.0` drives the resolve to **0 of
+124** passes with content.
+
+**So the direction is: this pass must LOAD the G-buffer's real depth/stencil rather than receive a
+freshly-created attachment.** That is a DS-retention problem across the G-buffer → lighting
+transition, not a clear-value problem, and it explains why every value-shaped fix has failed.
+
+### The complete chain, end to end
+
+`PROSPER_DSLOG`'s per-pass line reports `persistent` and `valid=<layout>/<depth>/<stencil>` for the
+resolve's 14/15-draw passes, and every one of them is keyed correctly to the scene surfaces
+(`dr=dw=2052ac0000`, `sr=sw=2054aa0000`, `htile=2055310000`):
+
+| resolve passes (14/15 draws, 4K) | count |
+| --- | --- |
+| depth **used**, retained depth **INVALID** → falls back to the fresh-image approximation | **171** |
+| depth used, retained depth valid | 179 |
+| depth not used at all (`use=0/1`, stencil only) | 175 |
+
+So retention is not missing — **validity is**, on about half the passes that actually depth-test.
+
+> **Correction, and it is the kind worth reading.** An earlier revision of this section cited "207
+> passes with `valid=1/0/1`" as the dominant case. Those passes carry `use=`**`0`**`/1` — depth is not
+> used at all, their per-draw lines read `depth=0/0/opN` with the test disabled — so their depth
+> invalidity is irrelevant and they do not belong in this chain. The `valid=` field says whether an
+> aspect *could* be loaded; only `use=` says whether the pass asked. **Reading a validity column
+> without its use column overstates the population**, which is what happened here. The pass holds the right retained image and cannot
+load it, so it falls through to the fresh-image approximation, which on a 7:7 mixed pass is
+unsatisfiable and lands on 1.0, which always-fails the GREATER light volumes.
+
+```
+HTILE write  ->  depth_valid = false  ->  cannot LOAD retained depth
+             ->  fresh-image approximation runs
+             ->  mixed 7:7 compares derive 1.0
+             ->  every GREATER light-volume draw always-fails
+             ->  lighting resolve emits nothing  ->  black world
+```
+
+The first link is already measured elsewhere in this document: **730 of 900 invalidations of
+`0x2052ac0000` are HTILE-only overlap** (`depth=0 stencil=0 htile_hit=1`, a 655,360-byte write at
+`0x2055310000`), and HTILE conservatively discards both aspects.
+
+**The obvious fix — "invalidate only on a fast CLEAR, not on a metadata refresh" — was implemented,
+measured, and is INERT here, and the measurement reframes the problem.** A fast clear writes one
+value to every tile while a per-tile zmin/zmax refresh does not, so post-write uniformity separates
+them without decoding HTILE's layout. Measured on a routed 400 s boot: **all 4,959 HTILE-overlap
+writes leave the plane uniform** (`htile_clear=1`), so the discriminator classifies every one as a
+clear, behaviour is unchanged, and the code was reverted rather than left dead.
+
+**What that tells us is more useful than the fix would have been: these really do look like fast
+clears, so invalidating depth is CORRECT.** The guest is clearing its depth buffer, prosper is right
+to drop the retained contents, and the defect is one step later —
+
+> when an HTILE fast clear invalidates depth, prosper has **no clear value** and falls back to
+> guessing one from the pass's compare ops. On hardware the clear value is whatever the guest
+> programmed (for reverse-Z, the far value 0.0, which its GREATER light volumes pass against). The
+> fresh-image approximation guesses **1.0** on this 7:7 mixed pass, and they all fail.
+
+So the fix is to **supply the fast-clear value** rather than to suppress the invalidation. And the
+obvious source for it is closed by measurement: `PROSPER_DEPTH_CLEAR_WHY` also prints what
+`DB_DEPTH_CLEAR` holds on those passes, and it is **`7.19391e-34`** — a denormal from bits that are
+packed integer coordinates rather than a depth value. That is precisely the #371 pathology the latch
+comment warns about ("Astro Bot even leaves the packed 1920x1080 max coordinates there ... initialized
+every LEQUAL surface to 2.15e-36 and rejected the entire scene"), so **reading the register at pass
+time cannot work, and the existing refusal to consume it without an explicit enable is right.**
+
+(The value was visible from the very first `PROSPER_DSLOG` run of this investigation —
+`clear=0/7.19391e-34` on the `0x2052ac0000` line — and went unrecognised for a long time.)
+
+What is missing is therefore narrower than "a clear value": a clear performed through **HTILE
+metadata** sets no draw's `depth_clear_enable`, so the value it cleared to is never observed at all.
+Capturing it has to happen **at the moment of the clear**, not recovered afterwards from register
+state that has since been reused.
+
+Also note the blunt version stays falsified: `PROSPER_DS_HTILE_INVALIDATE=0` suppresses invalidation
+wholesale and *loses* 29% of presented content, which is exactly what should happen if the clears are
+real.
+
+**Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
+same family of override made the radar vanish when it was applied to the main 4K depth, recorded at
+`live_renderer.cpp` in the `PROSPER_DS_UNBRIDGED_FAR` comment).
+
+### The missing operation, named exactly (2026-08-16)
+
+Tracing the post chain backwards from the composite finds where scene content *does* enter it, and
+that pins what is absent to a single conversion.
+
+**The bloom pyramid works, and its source is the lit scene.** The pass writing `0x205f1a0000`
+(1920x1080) reads `0x20471e0000` — the 4K **f16** buffer holding the lit scene — and carries
+**44% non-black**. The chain below it (960x540 → 480x270 → 240x135 and back up) is populated
+throughout. So the guest demonstrably *can* read the lit scene, and does, for bloom.
+
+Meanwhile the composite's base tap `0x2063380000` (4K **f11f11f10**) is empty. That is exactly the
+picture on screen: **bloom-lit sources appear, the base scene does not.**
+
+So the absent operation is now a single named conversion:
+
+> **4K f16 `0x20471e0000` → 4K f11f11f10 `0x2063380000`**, once per frame.
+
+**Aliasing the composite's tap to either lit buffer renders the world with the HUD intact** —
+`PROSPER_RTT_ALIAS=2063380000:20471e0000` gives **5,413,464 non-black (65% of frame)** and a bank wall
+in correct perspective with its architectural lines, the lit source and its bloom, and the complete
+radar. (`…:20431c0000` shows a different, darker part of the same room.) Both are diagnostics; neither
+is a fix, because prosper must not invent a copy the guest did not issue.
+
+**And they are not the same memory.** `PROSPER_MEMLOG` gives three distinct physical addresses —
+scene colour `0x136580000`, HDR/bloom source `0x11a3e0000`, lighting `0x1163c0000` — so prosper is
+right to keep them separate and there is no aliasing fix hiding here.
+
+**Which makes guest logic the leading remaining explanation — leading, not sole.** The guest allocates
+the buffer, clears it once at start-up, samples it 24x per frame forever, reads its *source* for bloom
+in the same frame, and never runs the pass that fills it, so something prosper answers upstream
+plausibly selects that path. That is a different hunt from everything above — a guest-decision
+question, not a GPU one. It shares the frontier with one unfinished measurement: the image ops inside
+the failing compute kernels that no instrument has resolved (see the section below for exactly which,
+and why their null does not count yet).
+
+### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
+
+Read the boundary in this heading before using the table. Every path that can write a surface **and
+that prosper resolves** has an instrument, and all of them are empty for `0x2063380000`. That is a
+real and useful result, and it is weaker than the claim this section used to make.
+
+**What stays outside the census.** Every instrument below enumerates *resolved* state — a decoded
+packet, a built resource table, a bound target. The seven compute programs that fail to recompile do
+not have fully resolved tables: `PROSPER_DYNTRACE_FAIL` recovered **15 of 21 image ops** for
+`0x205b5e8600` and **4 of 6** for `0x205b657200`, and the candidate-word scan that was meant to
+cover the remainder is non-exhaustive in coverage, validation and direction by its own documented
+contract (`live_renderer.cpp`, above `scan_for_descriptors_once`). So the unrecovered image ops in
+those kernels are **unproven, not cleared** — no instrument here has looked at them.
+
+**The supported conclusion**, therefore: *no observed decoded path produces this surface; guest-side
+path selection is the leading hypothesis; the unresolved operations inside the seven failing compute
+kernels remain outside the census.* An earlier revision of this section said the elimination was
+exhaustive and that "the guest never issues it" — that overstated the evidence in the one direction
+the evidence cannot support, and the correction is recorded rather than silently applied because the
+overstatement had already reached the PR body and #2542.
+
+**The exact next step, and it closes the gap rather than working around it:** make those two kernels
+recompile — the unresolved VCC_LO operand at `0x205b5e8600` pc=314 (a scratch-SGPR bitfield, not a
+lane mask, and not cross-block: see `## Ruled out`), `image_bvh_intersect_ray` for
+`0x205b657200` — so their resource tables resolve in full, then re-run `PROSPER_COMPUTE_BINDS` over
+the completed tables. Until then a null across that population is not evidence. This is the same work
+already queued as recompiler frontier, so it is not extra: it is the census and the candidate fix at
+once.
+
+The instruments and their results:
+
+| path | instrument | result |
+| --- | --- | --- |
+| draws, every drop class | `PROSPER_DROPPED_DRAW_CENSUS`, extended to `RetainedDrawNotSelected` + `IndirectArguments` | 256 drops, all on two other targets; **7,871 retained/indirect attempts, 0 dropped** |
+| DMA / WRITE_DATA / RELEASE_MEM / EVENT_WRITE | `PROSPER_GUEST_WRITE_WATCH` | nothing |
+| DS planes | `PROSPER_DSBRIDGE_LOG` | not a plane of any retained surface |
+| guest CPU | `PROSPER_RTT_GUESTPEEK` | 0/1048576 bytes non-zero, stable to sample #1024 |
+| undecoded PM4 | `[pm4] unknown raw type-3 opcode` (ungated) | **zero unknown opcodes on the whole route** |
+| async-compute queue | `q=` in the WaitRegMem line | ACB *is* processed (38 `q=A` vs 2 `q=D`) |
+| predicated jumps | `PROSPER_PREDLOG`, now sampled across the whole run | **8,192+ jumps, `pred=0` on every one, `skip=0`** |
+| whole-submit rejection | `[agc] ordered DMA submit rejected` | zero |
+| **the guest's own register writes** | `PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled, all eight MRT slots, no dimension filter | **1 draw out of 65,536**, slot 0, against 7,989 for the lighting buffer `0x20431c0000` in the same run |
+| **prosper-built packets prosper never decodes** | `[pm4] undecoded prosper sub-op` (new, ungated) | one family, `r=0x00 op=0x10` — a plain `IT_NOP` pad |
+| AGC copy builders | firmware NID list vs registrations, with the unimplemented logger verified live | `sceAgcDcbCopyData` / `AcbCopyData` are **unregistered**, and the title **never calls them** |
+
+That last row is the strongest one: prosper is not losing a producer *through the copy builders*,
+because the title never calls them. Note what it does and does not settle — it removes one candidate
+producer completely, and says nothing about the unresolved image ops named above.
+
+**Every null above now carries a positive control**, which was not true when this section was first
+written. `PROSPER_GUEST_WRITE_WATCH` produced no output at all on the early runs — including for the
+heavily-rendered lighting buffer — so its silence proved nothing; watching the HTILE base alongside
+makes it fire 22 times in the same run while the scene colour stays at zero. The
+undecoded-sub-op reporter closes the last structural gap: the raw-opcode reporter beside it only
+catches opcodes prosper does not recognise, while a packet prosper's own builders emit with a sub-op
+the decoder never learned would have been dropped in complete silence. There are none but NOPs.
+
+It is stated from `PROSPER_TARGET_WATCH` rather than from `PROSPER_COLORSTATETRACE` deliberately, and
+the difference is not cosmetic. The colour-state trace agreed (1 record in 1,437,781) but could not
+have disagreed convincingly: invoked as `=3840x2160` it **filters by dimension**, so a bind at any
+other extent is absent without saying so, and the natural way to read its output — grepping
+`color0=` — misses slots 1..7, which carry 157,855 records each on this route. Two independent ways
+to conclude "the guest never renders here" from a measurement that could not have seen it.
+`PROSPER_TARGET_WATCH` is exact, unsampled and slot-complete, and its own comment explains why a
+sampled census cannot answer an "ever" question at all. **Pass its addresses with a `0x` prefix** —
+it parses base-0, so bare digits are read as decimal and it will confidently report nothing about a
+different address (instrument trap 180).
+It allocates and clears its own 4K HDR scene buffer once, samples it 24× per frame forever, and never
+renders to it.
+
+And the emptiness is not confined to that one surface: **the entire post-process chain is clears.**
+The first bloom level `0x20602a0000` is written by one draw with *no sampled inputs* and
+`px_nonzero=0`, exactly like the scene colour's single pass. A whole phase of the frame is missing
+its work while the lighting that feeds it is 45% populated.
+
+### What that leaves, and the caveat on the compute census
+
+The remaining candidate is the compute chain, and specifically the nine programs that never execute.
+**Six of them — the `0x205b5*` cluster — dispatch at exactly 1920×1080**, which is the post-chain's
+own resolution (`0x20602a0000`, `0x2066be0000` and the rest are all 1920×1080). The only 4K one,
+`0x2042f49a00`, is a depth decompress: `PROSPER_COMPUTE_MEMPROBE=2042f49a00:0:40:16` decodes its
+source T#s to `0x2052ac0000` (depth) and `0x2054aa0000` (stencil) with `0x2055310000` (HTILE) as
+metadata, and it stores to plain copies at `0x204b1a0000` / `0x204d180000` / `0x204da00000`.
+
+**`PROSPER_COMPUTE_BINDS` reports zero programs binding `0x2063380000`, and that null is VOID for
+exactly the population in question.** The instrument enumerates a dispatch's resolved resource table,
+and the never-executing programs are precisely the ones whose resource tables fail to resolve — so it
+cannot see their bindings however correct it is. The positive control that "validated" it
+(`0x20431c0000`, many rows) was bound by an *executing* program, which tests the discriminator and
+not the domain. Do not cite that zero as evidence about the nine.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **Sampled-depth invalidation is starving the deferred-lighting pass.** *Solid.* The lighting pass
+  does read the scene depth `0x2052ac0000` through the bridge, and that bridge did decline — 826 times
+  on `depth-invalid` — so the hypothesis was well-founded. It is still wrong. 730 of the 900
+  invalidations of that surface are **HTILE-only** overlap (`depth=0 stencil=0 htile_hit=1`, a
+  655,360-byte write at the HTILE base `0x2055310000`), and HTILE conservatively discards both
+  aspects. Suppressing that with `PROSPER_DS_HTILE_INVALIDATE=0` moved the lever as hard as it can
+  move: **depth-invalid declines 1063 → 0, stencil-invalid 852 → 0, depth hits 42,183 → 44,406,
+  stencil hits 2,934 → 3,917** — and SCANOUT came back **byte-identical** (1,121,820 / 1,051,186
+  `rgb_nonblack`). A bridge that now never declines an aspect still yields the same black world, so
+  depth availability is not the constraint on the lighting output. Do not re-run this arm expecting
+  pixels; it is a bridge-health improvement whose visual effect is nil.
+  (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
+  compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
+- **`0x205b658800`'s M0 read is consumed as data, so a fabricated value is unsafe.** *RETRACTED — the
+  read is a pure save/restore after all, and the retraction is more instructive than the entry.*
+  I withdrew a proposed M0 fix on the grounds that the saved value is used as data: `pc=82` saves M0
+  into `s6`, `pc=232` restores it, and `pc=263`/`pc=266` then appear to consume `s6` as VOP2 sources
+  with nothing writing it in between. **That reading is wrong.** `pc=261` and `pc=264` are VOP3
+  opcode `0x360` — `v_readlane_b32 s6, v31, N` — which is an architectural **SGPR** write, so `s6` is
+  dead before `pc=263` and the launch value really is only round-tripped.
+  **How the error was made is the point.** I checked the claim with `shader_inspect`, whose generic
+  operand printer spells that destination `dst=vgpr:6`. That is the decoder's own representation, not
+  an ISA oracle — and this repo already knows better in two places: `rdna2_decode.cpp:127`
+  (*"v_readlane_b32 writes an SGPR"*) and the emitter at `rdna2_to_spirv.cpp:11620`, which treats the
+  destination as `sDST`. **Validating a decoder's output with that decoder's own listing is not a
+  check**, which the charter says in as many words; an independent disassembly (`llvm-mc -mcpu=gfx1030`)
+  settles it in one command. Caught in review (#2552).
+  **Consequence:** the M0 poison-tag approach is viable again and should be reconsidered — resolve an
+  untracked M0 to 0 while marking the destination unproven, so a restore is harmless while
+  `V_WRITELANE` and descriptor uses still reject.
+- **The composite's scene-colour T# is stale, mis-derived, or points somewhere prosper invented.**
+  *Solid, and this is the version to cite* — it supersedes the provenance argument in the entry
+  further down, which reached the right answer by a route that does not establish it (see the note
+  there). Aim the shared dynamic fold at the composite pixel shader:
+  `PROSPER_DYNTRACE=1 PROSPER_DYNTRACE_ADDR=205b34be00 PROSPER_DYNTRACE_ONCE=1`. It prints the eight
+  raw T# dwords read from the guest's own table, and the composite's are
+  `20633800 c2400000 021bc3bf 91b003ac 00000000 00700000 00000000 00000000` → `base=0x2063380000`,
+  with `have_t8=1` (came through a successful scalar load) and an immediate SRT key (`key=0x0` /
+  `key=0x60`). **prosper decodes the guest's live descriptor correctly. The guest itself points its
+  composite at the buffer it never fills.**
+- **GTA V submits command buffers through an entry point prosper does not implement.** *Solid.* This
+  was the one gap every other instrument was blind to by construction — they all observe *decoded*
+  streams, and a stream never handed to the decoder is invisible to all of them. prosper registers
+  **2 of the 17** `Submit*` exports in `libSceAgcDriver` (`SubmitDcb`, `SubmitAcb`); the other
+  fifteen include `SubmitMultiDcbs` (`6UzEidRZwkg`), `SubmitMultiAcbs` (`HF3YllT3mXU`),
+  `SubmitCommandBuffer` (`b4fpgH5ZXxQ`), `SubmitMultiCommandBuffers` (`Fj7r9EHzF38`),
+  `SubmitMultiCommandBuffersDirect` (`xmWi73o1BR0`), `AgrSubmitDcb` (`AhGvpITrf4M`) and
+  `AgrSubmitMultiDcbs` (`+T8Xo6LtFJI`). **GTA V calls none of them** — zero mentions across a routed
+  run, and the unimplemented-NID logger demonstrably fires for that library in the same run (it names
+  three other `libSceAgc` NIDs). The registration gap is real and worth closing for other titles; it
+  is not this title's defect.
+- **`sceAgcDcbRewind` lets commands past a ring wrap go unseen.** *Solid, by review rather than
+  measurement* (Codex, #2542): `IT_REWIND` (type-3 `0x59`, two dwords, `(initial_state & 1) << 31`) is
+  a **validity wait**, not ring control — the decoder's whole behaviour is `while (!Valid()) yield`,
+  then advance normally. It never moves the command pointer or delimits a submitted range. The stub
+  also leaves no hole: only the builder advances the cursor, so later builders append compactly.
+  What *is* missing is the validity synchronisation, which can let post-Rewind packets run before
+  their producer publishes them — worth implementing, but log the call count and `initial_state`
+  first, because an unconditional no-op is only safe if the title always passes 1.
+- **`0x2063380000` and `0x20431c0000` are two virtual mappings of the same physical memory.** *Solid.*
+  This was the best remaining structural explanation — it would have accounted for the guest rendering
+  to one name and sampling the other, and for the alias experiment working *exactly*. `PROSPER_MEMLOG=1`
+  refutes it: both live in the same mapping (`va=0x203de00000 len=0x120f00000 phys=0x111000000`) at
+  **different physical offsets**, `0x136580000` for the scene colour against `0x1163c0000` for the
+  lighting buffer. They are distinct memory. (The run does contain one genuine physical alias —
+  `va 0x2168da0000` and `va 0x2169580000` share `phys 0x23b0b0000` — but that pair is in the swapchain
+  range and is unrelated.)
+- **The single bind of `0x2063380000` is the pass that should have drawn the scene.** *Solid.* It is at
+  **0.0% of the run** — line 83 of 1,441,036 colour-state records — with `raw-format=6`,
+  `resolved-cwm=f`. A start-up initialisation clear, thousands of frames before the 3D chain begins at
+  ~87%. There is no gameplay-time bind to recover.
+- **Predicated jumps are dropping the composite (the #319 shape, one title over).** *Solid.* The
+  polarity in `command_processor.cpp` (`skip = cond != 0`) is `CONFIDENCE: MED` and pinned on another
+  title, so this was a fair suspicion. Measured across a whole routed run: **8,192+ folded jumps,
+  `pred=0` on every one, `skip=0`.** GTA V does not predicate its jumps at all. The old 96-line cap on
+  that log is why this looked open — it expired thousands of frames before the 3D chain begins at
+  ~87% of the run, so it only ever described the loading screen.
+- **`sceAgcAcbJump` is the missing producer (the #319 defect on the async-compute queue).** *Solid.*
+  It was genuinely unregistered, and `hle_agc.cpp:675` records that the DCB sibling's absence made
+  "the composite never execute" — GTA V's exact picture, and GTA V does drive post-processing through
+  the ACB. But a builder mirroring the DCB argument roles refuses on the first call:
+  `target=0x0 ndw=0x21 a5=0x5 a6=<the acb again> a7=0x1 a8=0x2ec`, so `a3` is not the target and the
+  roles do not transfer. It is also called **exactly once** in a 200 s route, so it cannot be a
+  per-frame producer under any ABI. **The builder and its NID registration were removed entirely**
+  (review of #2552): a handler whose argument roles are known to be wrong is not a neutral observer —
+  registering it moves the call off the unregistered-NID path that would otherwise report it, so the
+  guess would have been inherited as a decoded contract. The call is left unregistered.
+- **The composite's scene-colour T# is stale or mis-derived — argued from `rtt-guestpeek`
+  provenance.** *The conclusion is right; THIS derivation is not, and it is the derivation that would
+  have been inherited.* The argument was: the working `0x20431c0000` and the empty `0x2063380000`
+  resolve identically (no SRT key, no SGPR key, matched by fetch pc), so provenance gives the failing
+  one no special status. Codex refuted the premise (#2542): **`sgpr_base != UINT32_MAX` means direct
+  user-SGPR origin, not "fresh by construction"** — a draw can inherit SH state and the value can be an
+  earlier bind, and only `PROSPER_UDPROV`'s last-write order establishes freshness relative to *this*
+  draw. Likewise a valid `srt_offset` means an immediate-key table load, not that prosper cached the
+  T#: `resolve_dynamic_fetch` rereads the table per stage build, and a first realization can still
+  observe guest memory before its writer. So identical provenance fields never ruled staleness out.
+  **Use the raw-T# entry above instead** — it reads the guest's actual descriptor dwords and settles
+  the same question by measurement. Recorded rather than deleted because a `## Ruled out` row wearing
+  a plausible argument is exactly what the next reader will not re-derive.
+- **A missing device capability blocks the rejected compute kernels.** *Solid.* The native subgroup
+  contract is **ENABLED** on this machine (`size_control=1 full_subgroups=1 vote=1 arithmetic=1`,
+  sizes 32..64, AMD Radeon 8060S / RADV STRIX_HALO), so `0x205b5e8600`'s VCC_LO read is not blocked by
+  a capability. **The second sentence of this row used to read "its mask is untracked because the
+  write is in another basic block — a cross-block dataflow limit"; that is wrong, see the next row.**
+- **`0x205b5e8600` needs cross-block VCC lane-mask dataflow.** *Falsified, and it would have cost a
+  large piece of the wrong work.* Disassembled independently with `llvm-mc -mcpu=gfx1030` rather than
+  from prosper's own listing, the reject site is:
+  ```
+  pc=313  s_lshl_b32 vcc_lo, s80, 14
+  pc=314  s_and_b32  vcc_lo, vcc_lo, 0x1c000     <- the rejected instruction
+  pc=318  v_add3_u32 v2, vcc_lo, v3, v2
+  ```
+  **There is no lane mask here at all.** The compiler allocated VCC_LO as an ordinary scratch SGPR;
+  the value is `(s80 << 14) & 0x1c000`, a bitfield, consumed by an integer add. Nor is it cross-block:
+  the two writes and the read are all in the block starting at pc=310. So the queued work item
+  "implement cross-block VCC lane-mask dataflow" does not describe this kernel, and implementing it
+  would not clear this reject.
+  Two synthetic reproductions of the shape — a straight-line scalar recycle of VCC_LO after a
+  `v_cmp`, and the same overwrite placed after a CFG merge so it dominates every read — **both
+  recompile** on this head, so the minimal shape is already supported and the cause is something in
+  the kernel's surrounding context (a VCC bool tag that survives with no bool value, making
+  `wave32_live_mask_operand` select the lane-mask path at `rdna2_to_spirv.cpp:9280` while `mask()`
+  then resolves VCC_LO to 0 and sets `ok = false`). Closing it needs the real kernel recompiled with
+  its actual resource context, not another synthetic case. `CONFIDENCE: HIGH` on the disassembly and
+  on both negative reproductions; `CONFIDENCE: LOW` on the parenthesised mechanism.
+  Note also that the reject-census table above says every row is `mode=unresolved-operand`, *"i.e.
+  every one is a descriptor that does not resolve"* — that gloss holds for the MUBUF/MIMG/SMEM rows
+  and **not** for this one, where the unresolved operand is a register, not a descriptor.
+- **`no-entry` at 81% of DS-bridge calls is a defect.** *Instrument.* `find_persistent_ds_sampled` is
+  consulted for **every sampled binding**, so `no-entry` counts every ordinary colour texture in the
+  frame; the code says so at `tests/render_runner.h:2796` ("the no-entry bucket is unbounded and is
+  genuinely just 'not ours'"). Of the ~45,700 decisions that concern a real DS plane, ~92% hit. Read
+  the *ranked per-address* declines, never the bucket total.
 - **The 72 direct draws are failing / are culled / have colour writes masked.** They execute at full
   3840x2160 with `effective=3f` and zero realization failures in the window that presents black. The
   world is drawn by *indirect* operations, which the latch above dropped untried. #2481.

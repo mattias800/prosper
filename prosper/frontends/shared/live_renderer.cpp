@@ -642,10 +642,154 @@ bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
         !cache_disabled && compression_supported && cache_limit && source_size;
 }
 
+// PROSPER_RTT_ALIAS=<sampled>:<served>[,<sampled>:<served>…] — diagnostic ONLY, off by default.
+//
+// Serve one sampled surface from another surface's cache entry. It answers exactly one question, and
+// only by experiment: when a consumer samples an address nothing writes, is that address a distinct
+// buffer whose producer is missing, or the SAME buffer the renderer already holds under a different
+// base?  Those two have identical signatures in every census -- the pass graph, the target census
+// and the write watches all report "written by nothing" either way -- and they call for opposite
+// work: find the missing producer, or fix a base decode.
+//
+// GTA V PPSA04263 is the worked case. Its final composite samples the 4K HDR scene colour
+// 0x2063380000 24x per frame, and across 6,561 frames that address is a render target exactly once,
+// for a clear. Meanwhile the lit scene sits in 0x20431c0000, which the composite never reads.
+// Aliasing one onto the other decides between the two readings in a single run.
+//
+// This is not a repair and must never become one: it makes a consumer read bytes the guest did not
+// point it at, so a picture appearing under it is evidence about the DECODE, never a fix. Leave it
+// unset outside an A/B.
+// PROSPER_SCAN_DESCRIPTOR=<hex surface base>[,<hex base>…] — count CANDIDATE descriptor words in
+// guest memory whose value matches a surface's base field, once, from the render thread.
+//
+// READ THE NEGATIVES CAREFULLY. This is a candidate-word scan, not a descriptor enumerator, and it is
+// not exhaustive in three separate ways:
+//   * COVERAGE. It probes 2 MiB-aligned spans in a fixed window and keeps only spans that are
+//     readable IN FULL, so a descriptor in a partially mapped span, or in a mapping outside the
+//     window, is never examined. The report prints the spans kept and skipped so the coverage is
+//     visible rather than assumed.
+//   * VALIDATION. A matching dword is only the value a base field WOULD hold; the following words are
+//     printed but not checked against a descriptor layout. A hit is a candidate, not proof that a
+//     descriptor lives there, and an ordinary integer can match.
+//   * DIRECTION. A descriptor does not encode read/write intent -- that lives in the shader
+//     instruction -- so a hit cannot distinguish a producer's view of a surface from a consumer's.
+// **A zero therefore cannot establish that no producer exists.** It bounds where one was not found,
+// which is a weaker and different claim.
+//
+// COST: it runs SYNCHRONOUSLY on the render callback and may read several GiB, so the frame it fires
+// on stalls visibly. Opt-in and one-shot for that reason; never leave it set for a timing run.
+//
+// The question it exists for is the one left over when every write path comes back empty: a surface
+// nothing writes is either one the guest genuinely never produces, or one whose producer prosper
+// failed to RESOLVE -- and an unresolved producer is invisible to every instrument that enumerates
+// resolved tables. `PROSPER_DYNTRACE_FAIL` prints only the descriptors the const-fold evaluated;
+// measured on GTA V's failing kernels it printed 15 of 21 image ops for 0x205b5e8600 and 4 of 6 for
+// 0x205b657200, so its null covered most of that population and not all of it.
+//
+// A descriptor's base field holds the address shifted right by 8, so a surface's candidates are
+// findable by matching that dword. Use the result as a lead to follow, not as a census.
+void scan_for_descriptors_once(uint64_t submit_index) {
+    struct Spec { std::vector<uint64_t> bases; uint64_t at_submit = 0; };
+    static const Spec spec = [] {
+        Spec parsed;
+        const char* text = getenv("PROSPER_SCAN_DESCRIPTOR");
+        if (!text || !*text) return parsed;
+        for (const char* cursor = text; *cursor;) {
+            char* end = nullptr;
+            const uint64_t value = strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            parsed.bases.push_back(value);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        // SUBMITS, not frames: the caller passes g_this_submit. Named for what it counts -- the two
+        // differ by more than an order of magnitude on a routed run, so a threshold read as frames
+        // fires at a moment the operator did not ask for.
+        const char* at = getenv("PROSPER_SCAN_DESCRIPTOR_AT_SUBMIT");
+        parsed.at_submit = at ? strtoull(at, nullptr, 10) : 6000;
+        return parsed;
+    }();
+    if (spec.bases.empty()) return;
+    static std::atomic<bool> done{false};
+    if (submit_index < spec.at_submit || done.exchange(true)) return;
+
+    // The guest's direct-memory mapping, discovered by probing rather than assumed: walk 2 MiB steps
+    // over the region PS5 titles map and keep the readable spans.
+    constexpr uint64_t kStep = 2ull << 20;
+    constexpr uint64_t kBegin = 0x2000000000ull, kEnd = 0x2200000000ull;
+    size_t spans = 0, skipped_spans = 0, scanned_mb = 0;
+    std::map<uint64_t, uint64_t> hits;   // surface base -> count
+    std::map<uint64_t, std::map<std::string, uint64_t>> shapes;  // base -> shape -> count
+    for (uint64_t page = kBegin; page < kEnd; page += kStep) {
+        if (!prosper::gpu::guest_readable(page, static_cast<uint32_t>(kStep))) {
+            ++skipped_spans;   // unmapped OR only partially mapped -- not examined
+            continue;
+        }
+        ++spans; scanned_mb += kStep >> 20;
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(page));
+        const size_t count = kStep / sizeof(uint32_t);
+        for (size_t i = 0; i < count; ++i) {
+            for (const uint64_t base : spec.bases) {
+                if (words[i] != static_cast<uint32_t>(base >> 8)) continue;
+                ++hits[base];
+                // A bare dword match is not yet a descriptor: the same bit pattern occurs in ordinary
+                // data. Decode the eight words that would follow if this were a T# and group by their
+                // SHAPE, so a real descriptor set stands out from coincidence and two descriptors that
+                // describe the surface differently (a producer's view versus a consumer's) separate.
+                if (i + 8 > count) continue;
+                char sig[128];
+                snprintf(sig, sizeof sig, "w1=%08x w2=%08x w3=%08x w4=%08x w7=%08x",
+                         words[i + 1], words[i + 2], words[i + 3], words[i + 4], words[i + 7]);
+                shapes[base][sig] += 1;
+            }
+        }
+    }
+    fprintf(stderr,
+            "[descr-scan] examined %zu MiB over %zu fully-readable spans at submit %llu; %zu span(s) "
+            "SKIPPED (unmapped or partially mapped) -- negatives are NOT exhaustive\n",
+            scanned_mb, spans, (unsigned long long)submit_index, skipped_spans);
+    for (const uint64_t base : spec.bases) {
+        fprintf(stderr,
+                "[descr-scan] 0x%llx: %llu CANDIDATE word(s) match its base field, %zu distinct "
+                "following shape(s) -- unvalidated, and direction (producer vs consumer) unknown\n",
+                (unsigned long long)base, (unsigned long long)hits[base], shapes[base].size());
+        size_t shown = 0;
+        for (const auto& [sig, n] : shapes[base]) {
+            if (shown++ >= 8) break;
+            fprintf(stderr, "[descr-scan]     x%-4llu %s\n", (unsigned long long)n, sig.c_str());
+        }
+    }
+}
+
+uint64_t texture_rtt_alias(uint64_t gpu_address) {
+    struct Alias { uint64_t from, to; };
+    static const std::vector<Alias> aliases = [] {
+        std::vector<Alias> parsed;
+        const char* spec = getenv("PROSPER_RTT_ALIAS");
+        if (!spec || !*spec) return parsed;
+        for (const char* cursor = spec; *cursor;) {
+            char* end = nullptr;
+            const uint64_t from = strtoull(cursor, &end, 16);
+            if (end == cursor || *end != ':') break;
+            cursor = end + 1;
+            const uint64_t to = strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            parsed.push_back({from, to});
+            fprintf(stderr, "[rtt-alias] sampling 0x%llx will be served from 0x%llx\n",
+                    (unsigned long long)from, (unsigned long long)to);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    for (const Alias& alias : aliases)
+        if (alias.from == gpu_address) return alias.to;
+    return gpu_address;
+}
+
 uint64_t texture_decode_source_address(uint64_t gpu_address,
                                        uint32_t image_dimension,
                                        bool in_mip_tail,
                                        uint32_t layer_mip_offset_bytes) {
+    gpu_address = texture_rtt_alias(gpu_address);
     if (image_dimension != 5u || in_mip_tail ||
         gpu_address > UINT64_MAX - layer_mip_offset_bytes)
         return gpu_address;
@@ -1246,6 +1390,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
             static const int g_rttlog_max_submit = getenv("PROSPER_RTTLOG_MAX_SUBMIT")
                 ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
+            scan_for_descriptors_once(static_cast<uint64_t>(g_this_submit < 0 ? 0 : g_this_submit));
             const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
             const bool rtt_log = PROSPER_ENV_VALUE("PROSPER_RTTLOG") && rtt_log_in_range;
@@ -3824,14 +3969,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (rtt_log && PROSPER_ENV_ON("PROSPER_RTT_GUESTPEEK") &&
                                 sampled_source_addr &&
                                 prosper::gpu::guest_readable(sampled_source_addr, 4096)) {
+                                // Re-peek on a power-of-two schedule per address rather than once.
+                                // A once-only peek reports the FIRST sighting, and a surface's first
+                                // sighting is routinely its emptiest moment -- sampled during
+                                // start-up before the guest has written it. That reads as "the guest
+                                // never wrote this", which is the exact conclusion the peek exists to
+                                // test, so the instrument would confirm it by construction. The
+                                // schedule keeps the volume bounded (about 20 lines per surface over
+                                // a million samples) while making the steady state observable.
                                 static std::mutex peek_mutex;
-                                static std::set<uint64_t> peeked;
-                                bool first = false;
+                                static std::map<uint64_t, uint64_t> peek_counts;
+                                uint64_t seen = 0;
                                 {
                                     std::lock_guard lock(peek_mutex);
-                                    first = peeked.insert(sampled_source_addr).second;
+                                    seen = ++peek_counts[sampled_source_addr];
                                 }
-                                if (first) {
+                                if ((seen & (seen - 1)) == 0) {
                                     size_t window = std::min<size_t>(
                                         prosper::gpu::gpu_capture_resource_footprint(r),
                                         size_t(1) << 20);
@@ -3845,10 +3998,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         static_cast<uintptr_t>(sampled_source_addr));
                                     for (size_t i = 0; i < window; ++i) nz += bytes[i] != 0;
                                     fprintf(stderr,
-                                            "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u guest "
-                                            "non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
+                                            "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u sample#%llu "
+                                            "srt=0x%x sgpr=%u pc=%u "
+                                            "guest non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
                                             (unsigned long long)sampled_source_addr, tw, th,
-                                            (unsigned)r.format, nz, window,
+                                            (unsigned)r.format, (unsigned long long)seen,
+                                            // Descriptor PROVENANCE, which decides whether a wrong
+                                            // address can be stale at all. sgpr_base valid means the
+                                            // descriptor came from THIS draw's user data and is fresh
+                                            // by construction; srt_offset valid means it was loaded
+                                            // from a table, which a first-fold read can pin.
+                                            r.srt_offset, r.sgpr_base, r.fetch_pc,
+                                            nz, window,
                                             window ? 100.0 * nz / window : 0.0,
                                             has_uniform_live_rtt ? "HIT-UNIFORM"
                                                 : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU"
@@ -5898,6 +6059,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // active_color1(): a fixed-function resolve exports nothing, so its color1_write_mask
                     // is 0 and active_color1 would report no destination. Without this the resolved surface
                     // the display later samples never receives the scene and the frame is a uniform fill.
+                    // Census every MODE=RESOLVE pass: source, destination and whether the
+                    // destination is one prosper can even express. prosper takes the destination
+                    // from `color1_base` alone, so a guest resolving into any other slot is
+                    // invisible to the resolve path -- a surface filled that way would read as
+                    // "written by nothing" in every other census.
+                    if (!pass.empty() && pass.front()->ps.cb_resolve &&
+                        PROSPER_ENV_ON("PROSPER_RESOLVE_CENSUS")) {
+                        static std::mutex mutex;
+                        static std::map<std::pair<uint64_t, uint64_t>, uint64_t> seen;
+                        const uint64_t rsrc = pass.front()->color0_base;
+                        const uint64_t rdst = pass.front()->color1_base;
+                        std::lock_guard lock(mutex);
+                        const uint64_t n = ++seen[{rsrc, rdst}];
+                        if (n <= 2 || (n & (n - 1)) == 0)
+                            fprintf(stderr,
+                                    "[resolve-census] src=0x%llx dst(color1)=0x%llx x%llu%s\n",
+                                    (unsigned long long)rsrc, (unsigned long long)rdst,
+                                    (unsigned long long)n,
+                                    rdst ? "" : "  <-- NO EXPRESSIBLE DESTINATION");
+                    }
                     static const bool no_resolve = getenv("PROSPER_NO_RESOLVE") != nullptr;
                     if (!pass.empty() && pass.front()->ps.cb_resolve && !no_resolve) {
                         const uint64_t rsrc = pass.front()->color0_base;
@@ -6147,13 +6328,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool viewport_extent_valid = viewport_native_w && viewport_native_h &&
                             viewport_native_w <= std::max<uint64_t>(4096u, max_native_w) &&
                             viewport_native_h <= std::max<uint64_t>(4096u, max_native_h);
-                        if (PROSPER_ENV_ON("PROSPER_DSLOG") && (viewport_native_w || viewport_native_h)) {
+                        // Log the UNDECIDABLE case too. Gating this on a non-zero derived extent hid
+                        // the only outcome that silently changes the DS identity: a depth-only pass
+                        // whose draws carry no viewport register derives 0x0, falls through to the
+                        // global frame extent, and mints a second cache entry for a surface that
+                        // already has a correctly-sized one. A diagnostic that prints only when the
+                        // inference succeeded cannot report the inference not happening.
+                        if (PROSPER_ENV_ON("PROSPER_DSLOG")) {
+                            const size_t with_viewport = static_cast<size_t>(std::count_if(
+                                pass.begin(), pass.end(),
+                                [](const auto* draw) { return draw->ps.has_viewport; }));
                             fprintf(stderr,
-                                    "[ds] viewport-derived extent %llux%llu (presentation %ux%u) -> %s\n",
+                                    "[ds] viewport-derived extent %llux%llu (presentation %ux%u, "
+                                    "%zu/%zu draws with viewport) -> %s\n",
                                     (unsigned long long)viewport_native_w,
                                     (unsigned long long)viewport_native_h,
-                                    max_native_w, max_native_h,
-                                    viewport_extent_valid ? "accept" : "reject");
+                                    max_native_w, max_native_h, with_viewport, pass.size(),
+                                    viewport_extent_valid ? "accept"
+                                        : (viewport_native_w || viewport_native_h) ? "reject"
+                                                                                   : "undecidable");
                         }
                         if (viewport_extent_valid) {
                             native_w = std::max(native_w, static_cast<uint32_t>(viewport_native_w));
@@ -6623,8 +6816,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::snprintf(needle, sizeof needle, "0x%llx",
                                           (unsigned long long)pass_bases[slot]);
                             if (dump_spec.find(needle) != std::string::npos) {
+                                static std::map<uint64_t, size_t> slot_busiest;
                                 static std::map<uint64_t, int> slot_counted;
-                                if (slot_counted[pass_bases[slot]]++ % dump_pass_every == 0) {
+                                const bool slot_peak = pass.size() > slot_busiest[pass_bases[slot]];
+                                if (slot_peak) slot_busiest[pass_bases[slot]] = pass.size();
+                                if (slot_peak &&
+                                    slot_counted[pass_bases[slot]]++ % dump_pass_every == 0) {
                                     const std::vector<uint8_t> shot = inspection_rgba8(
                                         pixels, gw, gh, pass_formats[slot]);
                                     const char* dir = getenv("PROSPER_FRAME_DIR");
@@ -6783,8 +6980,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::snprintf(needle, sizeof needle, "0x%llx",
                                           (unsigned long long)base);
                             if (dump_spec.find(needle) != std::string::npos) {
+                                // Keep the occurrence with the MOST DRAWS, not the last. A
+                                // G-buffer target is written by one heavy pass and then touched by
+                                // several small ones, so "last write wins" reliably captures a
+                                // near-empty tail and reads as "this channel is empty" -- which it
+                                // did, for three channels that a draw census showed at 54%.
+                                static std::map<uint64_t, size_t> busiest;
                                 static std::map<uint64_t, int> counted;
-                                if (counted[base]++ % dump_pass_every == 0) {
+                                const bool new_peak = pass.size() > busiest[base];
+                                if (new_peak) busiest[base] = pass.size();
+                                if (new_peak && counted[base]++ % dump_pass_every == 0) {
                                     const std::vector<uint8_t> shot = inspection_rgba8(
                                         rendered_pixels, gw, gh, pass_format);
                                     const char* dir = getenv("PROSPER_FRAME_DIR");
@@ -6817,9 +7022,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (size_t p = 0; p + 3 < inspected.size(); p += 4)
                             rgb_nz += (inspected[p] != 0 || inspected[p + 1] != 0 ||
                                        inspected[p + 2] != 0);
+                        // `src=` is load-bearing, not decoration. Both counters are computed from
+                        // `rendered_pixels`, so a pass whose readback was deferred reports
+                        // `px_nonzero=0 rgb_nonblack=0` -- identical to a genuinely black target, and
+                        // indistinguishable from it without this field. The `[dump-pass]` line four
+                        // lines up already guards exactly this ("as 'the target is black' rather than
+                        // 'we never looked'"); this line did not, and readbacks are deferred routinely
+                        // -- `[readback-why]` buckets nine distinct reasons.
+                        //
+                        // It matters most for the conclusion it silently supports. Every "this pass
+                        // reads populated inputs and emits nothing" reading on GTA V rests on these
+                        // two counters, and "we never looked" produces that reading for free.
                         fprintf(stderr, "[rtt] pass target=0x%llx extent=%ux%u native=%ux%u (%zu draws) "
-                                "px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
-                                (unsigned long long)base, gw, gh, native_w, native_h, pass.size(), nz, rgb_nz, g_rtt.size(),
+                                "src=%zuB px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
+                                (unsigned long long)base, gw, gh, native_w, native_h, pass.size(),
+                                rendered_pixels.size(), nz, rgb_nz, g_rtt.size(),
                                 is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : "");
                     }
                     // PROSPER_DUMP_DRAWSTEPS: for a pass targeting a SCANOUT buffer, re-render the pass
