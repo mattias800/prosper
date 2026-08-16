@@ -207,6 +207,15 @@ const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
 > | `0x413cf9d00` 342 / 42 · `0x413ce6000` 103 / 16 | `0x205b657200` 0 / 128 · `0x205b658800` 0 / 128 |
 > | `0x413d85e00` 137 / 2 (+6 more at 32–35 / 1) | `0x413ce5200` 0 / 93 · `0x413e1df00` 0 / 85 |
 >
+> **Update 2026-08-16: the right column is now SEVEN.** `0x205b545c00` and `0x205b54ee00` execute
+> every dispatch since the DPP lane-XOR family was admitted (`ROW_XMASK:n`, `0x160..0x16f`, is the
+> same permutation family as the already-admitted `ROW_ROR:8` — `ROW_XMASK:n` is XOR n, and XOR 8 is
+> exactly `(row_lane - 8) mod 16`, so the lowering was general and only the decoder's admitted control
+> values were not). Both went `executed=0 skipped=52` → zero skips on the same route. The remaining
+> seven need, in order of tractability: cross-block VCC dataflow (`0x205b5e8600`), an untracked M0
+> read (`0x205b658800`), `image_bvh_intersect_ray` (`0x205b654a00`, `0x205b657200`), `IMAGE_LOAD_MIP`
+> on a compressed surface (`0x2042f49a00`), and a descriptor contract (`0x413ce5200`, `0x413e1df00`).
+>
 > **The frontier is the nine on the right**, and note that `0x413cf9200` — the program carrying the
 > entire hardcoded 15-site contract in `rdna2_gta5_cf9200_contract.cpp` — is on the *left*, running
 > 369 of 381 dispatches.

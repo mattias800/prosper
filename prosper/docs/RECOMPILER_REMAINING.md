@@ -199,6 +199,27 @@ graphics blocker is the boot wall, the highest-value next steps are, in order:
 Marginal instruction-coverage ops (e.g. `v_cndmask_b32_e64`, `s_bfe_u64`) can still be added safely but
 **complete no additional shader** on their own, so they are deferred in favour of the above.
 
+## Read the reject's `dpp=` / `sdwa=` fields before believing `mode=unresolved-operand`
+
+`unresolved-operand` means "the lowering exists and an operand did not resolve", which reads as a
+descriptor problem — and it is, most of the time. But the modifier fields on the same line can
+contradict it, and when they do they are the answer.
+
+Worked example (2026-08-16, GTA V PPSA04263). Two 1920×1080 screen-space kernels rejected on
+`V_MIN_F32 … row_xmask:4 row_mask:0xf bank_mask:0xf bound_ctrl:1` with `mode=unresolved-operand`. The
+operand in question was `src=250`, which is the **DPP marker** — yet the same line printed
+**`modifier=1 dpp=0`**. That pair is the tell: the second dword was consumed as a modifier word, the
+DECODER declined the control value, so the instruction never became a DPP instruction and the DPP
+lowering was never reached. Chasing the descriptor would have been chasing nothing.
+
+The fix was to admit the control, not to write a lowering: `ROW_ROR:8` (`0x128`) and `ROW_XMASK:n`
+(`0x160..0x16f`) are one family — `ROW_XMASK:n` is XOR n by definition and XOR 8 is exactly
+`(row_lane - 8) mod 16`, so `ROW_ROR:8` **is** `ROW_XMASK:8`, and `subgroup_row_ror8` had always been
+written as an XOR of the lane id. Every stride below 16 touches only bits 0..3, so the source lane
+stays inside its own architectural DPP16 row — which is what makes the whole family exact
+*independently of the host subgroup width*, and it was never specific to 8. `XMASK:0` is excluded
+deliberately: it is the identity, so its result cannot be distinguished from a decode error.
+
 ## Ruled out
 
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
