@@ -3152,14 +3152,20 @@ transition, not a clear-value problem, and it explains why every value-shaped fi
 resolve's 14/15-draw passes, and every one of them is keyed correctly to the scene surfaces
 (`dr=dw=2052ac0000`, `sr=sw=2054aa0000`, `htile=2055310000`):
 
-| passes | state | derived initial |
-| --- | --- | --- |
-| **207** | `persistent=1 valid=1/`**`0`**`/1` — the retained image EXISTS, its **depth aspect is invalid** | **1.0** |
-| 63 | `persistent=1 valid=1/1/1` | 0.0 |
-| 60 | `persistent=1 valid=0/0/0` | 1.0 |
-| 51 (draws=14) | `persistent=1 valid=1/1/1` | 0.0 |
+| resolve passes (14/15 draws, 4K) | count |
+| --- | --- |
+| depth **used**, retained depth **INVALID** → falls back to the fresh-image approximation | **171** |
+| depth used, retained depth valid | 179 |
+| depth not used at all (`use=0/1`, stencil only) | 175 |
 
-So retention is not missing — **validity is**. The pass holds the right retained image and cannot
+So retention is not missing — **validity is**, on about half the passes that actually depth-test.
+
+> **Correction, and it is the kind worth reading.** An earlier revision of this section cited "207
+> passes with `valid=1/0/1`" as the dominant case. Those passes carry `use=`**`0`**`/1` — depth is not
+> used at all, their per-draw lines read `depth=0/0/opN` with the test disabled — so their depth
+> invalidity is irrelevant and they do not belong in this chain. The `valid=` field says whether an
+> aspect *could* be loaded; only `use=` says whether the pass asked. **Reading a validity column
+> without its use column overstates the population**, which is what happened here. The pass holds the right retained image and cannot
 load it, so it falls through to the fresh-image approximation, which on a 7:7 mixed pass is
 unsatisfiable and lands on 1.0, which always-fails the GREATER light volumes.
 
