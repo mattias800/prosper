@@ -5080,12 +5080,24 @@ void GpuState::apply(const Pm4Command& c) {
                 skip = (cond != 0);
             }
             if (getenv("PROSPER_PREDLOG")) {
-                static int logged = 0;
-                if (logged++ < 96)
-                    fprintf(stderr, "[pred] fold Jump target=0x%llx ndw=%u pred=%u cond@0x%llx=0x%llx -> %s\n",
-                            (unsigned long long)c.jump_addr, c.jump_dwords, c.jump_pred,
-                            (unsigned long long)pred_cond_addr, (unsigned long long)cond,
-                            skip ? "SKIP" : "EXEC");
+                // A flat first-N cap answers only about start-up. On a routed GTA V boot the 3D
+                // chain does not begin until roughly 87% of the run, so a 96-line cap expired
+                // thousands of frames before the phase under investigation and reported the loading
+                // screen's jumps as though they were gameplay's. Log on a power-of-two schedule so
+                // the whole run is sampled at bounded volume, and carry running EXEC/SKIP totals so
+                // the ratio is readable without counting lines.
+                static std::atomic<uint64_t> seen{0}, executed{0}, skipped{0};
+                const uint64_t n = seen.fetch_add(1) + 1;
+                (skip ? skipped : executed).fetch_add(1, std::memory_order_relaxed);
+                if (n <= 32 || (n & (n - 1)) == 0)
+                    fprintf(stderr,
+                            "[pred] fold Jump #%llu target=0x%llx ndw=%u pred=%u cond@0x%llx=0x%llx "
+                            "-> %s (exec=%llu skip=%llu)\n",
+                            (unsigned long long)n, (unsigned long long)c.jump_addr, c.jump_dwords,
+                            c.jump_pred, (unsigned long long)pred_cond_addr,
+                            (unsigned long long)cond, skip ? "SKIP" : "EXEC",
+                            (unsigned long long)executed.load(),
+                            (unsigned long long)skipped.load());
             }
             if (skip) break;
             if (!guest_readable(c.jump_addr, c.jump_dwords * 4)) break;   // whole segment must be mapped

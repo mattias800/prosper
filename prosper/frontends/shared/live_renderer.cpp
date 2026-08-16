@@ -3897,9 +3897,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     for (size_t i = 0; i < window; ++i) nz += bytes[i] != 0;
                                     fprintf(stderr,
                                             "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u sample#%llu "
+                                            "srt=0x%x sgpr=%u pc=%u "
                                             "guest non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
                                             (unsigned long long)sampled_source_addr, tw, th,
-                                            (unsigned)r.format, (unsigned long long)seen, nz, window,
+                                            (unsigned)r.format, (unsigned long long)seen,
+                                            // Descriptor PROVENANCE, which decides whether a wrong
+                                            // address can be stale at all. sgpr_base valid means the
+                                            // descriptor came from THIS draw's user data and is fresh
+                                            // by construction; srt_offset valid means it was loaded
+                                            // from a table, which a first-fold read can pin.
+                                            r.srt_offset, r.sgpr_base, r.fetch_pc,
+                                            nz, window,
                                             window ? 100.0 * nz / window : 0.0,
                                             has_uniform_live_rtt ? "HIT-UNIFORM"
                                                 : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU"
