@@ -659,6 +659,84 @@ bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
 // This is not a repair and must never become one: it makes a consumer read bytes the guest did not
 // point it at, so a picture appearing under it is evidence about the DECODE, never a fix. Leave it
 // unset outside an A/B.
+// PROSPER_SCAN_DESCRIPTOR=<hex surface base>[,<hex base>…] — find every V#/T# in guest memory that
+// POINTS AT a surface, once, from the render thread.
+//
+// The question it answers is the one left over when every write path comes back empty: a surface
+// nothing writes is either one the guest genuinely never produces, or one whose producer prosper
+// failed to RESOLVE -- and an unresolved producer is invisible to every instrument that enumerates
+// resolved tables. `PROSPER_DYNTRACE_FAIL` prints only the descriptors the const-fold managed to
+// evaluate; measured on GTA V's failing kernels it printed 15 of 21 image ops for 0x205b5e8600 and 4
+// of 6 for 0x205b657200, so its null covered most of the population and not all of it.
+//
+// A descriptor's base field is the address shifted right by 8, so the surface is findable by scanning
+// mapped guest memory for that dword. Every hit is a table entry naming the surface; the count
+// separates "only consumers know about it" from "a producer's table names it too".
+//
+// One-shot and bounded: it runs on the first render callback after the requested frame, reports, and
+// never runs again.
+void scan_for_descriptors_once(uint64_t frame_index) {
+    struct Spec { std::vector<uint64_t> bases; uint64_t at_frame = 0; };
+    static const Spec spec = [] {
+        Spec parsed;
+        const char* text = getenv("PROSPER_SCAN_DESCRIPTOR");
+        if (!text || !*text) return parsed;
+        for (const char* cursor = text; *cursor;) {
+            char* end = nullptr;
+            const uint64_t value = strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            parsed.bases.push_back(value);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        const char* at = getenv("PROSPER_SCAN_DESCRIPTOR_AT_FRAME");
+        parsed.at_frame = at ? strtoull(at, nullptr, 10) : 6000;
+        return parsed;
+    }();
+    if (spec.bases.empty()) return;
+    static std::atomic<bool> done{false};
+    if (frame_index < spec.at_frame || done.exchange(true)) return;
+
+    // The guest's direct-memory mapping, discovered by probing rather than assumed: walk 2 MiB steps
+    // over the region PS5 titles map and keep the readable spans.
+    constexpr uint64_t kStep = 2ull << 20;
+    constexpr uint64_t kBegin = 0x2000000000ull, kEnd = 0x2200000000ull;
+    size_t spans = 0, scanned_mb = 0;
+    std::map<uint64_t, uint64_t> hits;   // surface base -> count
+    std::map<uint64_t, std::map<std::string, uint64_t>> shapes;  // base -> shape -> count
+    for (uint64_t page = kBegin; page < kEnd; page += kStep) {
+        if (!prosper::gpu::guest_readable(page, static_cast<uint32_t>(kStep))) continue;
+        ++spans; scanned_mb += kStep >> 20;
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(page));
+        const size_t count = kStep / sizeof(uint32_t);
+        for (size_t i = 0; i < count; ++i) {
+            for (const uint64_t base : spec.bases) {
+                if (words[i] != static_cast<uint32_t>(base >> 8)) continue;
+                ++hits[base];
+                // A bare dword match is not yet a descriptor: the same bit pattern occurs in ordinary
+                // data. Decode the eight words that would follow if this were a T# and group by their
+                // SHAPE, so a real descriptor set stands out from coincidence and two descriptors that
+                // describe the surface differently (a producer's view versus a consumer's) separate.
+                if (i + 8 > count) continue;
+                char sig[128];
+                snprintf(sig, sizeof sig, "w1=%08x w2=%08x w3=%08x w4=%08x w7=%08x",
+                         words[i + 1], words[i + 2], words[i + 3], words[i + 4], words[i + 7]);
+                shapes[base][sig] += 1;
+            }
+        }
+    }
+    fprintf(stderr, "[descr-scan] scanned %zu MiB over %zu readable spans at frame %llu\n",
+            scanned_mb, spans, (unsigned long long)frame_index);
+    for (const uint64_t base : spec.bases) {
+        fprintf(stderr, "[descr-scan] 0x%llx: %llu word(s) match, %zu distinct following shape(s)\n",
+                (unsigned long long)base, (unsigned long long)hits[base], shapes[base].size());
+        size_t shown = 0;
+        for (const auto& [sig, n] : shapes[base]) {
+            if (shown++ >= 8) break;
+            fprintf(stderr, "[descr-scan]     x%-4llu %s\n", (unsigned long long)n, sig.c_str());
+        }
+    }
+}
+
 uint64_t texture_rtt_alias(uint64_t gpu_address) {
     struct Alias { uint64_t from, to; };
     static const std::vector<Alias> aliases = [] {
@@ -1289,6 +1367,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
             static const int g_rttlog_max_submit = getenv("PROSPER_RTTLOG_MAX_SUBMIT")
                 ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
+            scan_for_descriptors_once(static_cast<uint64_t>(g_this_submit < 0 ? 0 : g_this_submit));
             const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
             const bool rtt_log = PROSPER_ENV_VALUE("PROSPER_RTTLOG") && rtt_log_in_range;

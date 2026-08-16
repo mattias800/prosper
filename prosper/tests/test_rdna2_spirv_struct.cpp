@@ -860,10 +860,10 @@ bool compute_dpp_add_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& 
 // amount must select lane-amount inside a DPP16 row, shuffle both the value and its EXEC bit, add
 // only for EXEC-active destinations with an in-bounds active source, and otherwise keep the old
 // in-place VGPR before that value is persisted by the dispatcher.
-// The lane-XOR DPP family lowers to `shuffle(value, lane ^ stride)`. Decoder admission tests cannot
-// see the stride at all -- mutating the lowering to a constant XOR 8 leaves every admission test
-// green -- so this reads the emitted SPIR-V and requires the XOR constant to be the packet's own
-// stride, feeding a subgroup shuffle's lane operand.
+// The lane-XOR DPP family lowers to `shuffle(value, lane ^ stride)`. This is a STRUCTURAL lowering
+// check: it inspects the emitted SPIR-V and does not execute it. Decoder admission tests cannot see
+// the stride at all -- mutating the lowering to a constant XOR 8 leaves every admission test green --
+// so this requires the XOR constant to be the packet's own stride, feeding a shuffle's lane operand.
 bool compute_dpp_row_xor_uses_stride(const std::vector<uint32_t>& spv, uint32_t stride) {
     constexpr uint32_t OpConstant = 43, OpBitwiseXor = 198, OpGroupNonUniformShuffle = 345;
     std::unordered_map<uint32_t, uint32_t> constants;      // id -> literal
@@ -2643,6 +2643,44 @@ int main() {
         return 1;
     }
     printf("  [ok]   DPP lane-XOR family lowers with the packet's own stride (0, 4, 8)\n");
+
+    // The three checks above only reach the straight-line/native emitter. The CFG-state-machine
+    // dispatcher calls subgroup_row_xor from its OWN site, and mutating that one back to a constant
+    // XOR 8 leaves every check above green -- so the family needs a fixture that forces the
+    // dispatcher. This is the existing GTA V DPP ladder shape (two alternate paths parked on static
+    // events, plus the nested/backward CFG tail that forces the portable dispatcher) with the add
+    // ladder replaced by the live V_MIN_F32 lane-XOR packets.
+    std::vector<uint32_t> gta_compute_dpp_xmask_cfg = {
+        0x7e280281u,                         // pc0:  v_mov_b32 v20,1
+        0x7d840100u,                         // pc1:  v_cmp_eq_u32 vcc,v0,v0
+        0xbf860009u,                         // pc2:  alternate ladder -> pc12
+        0x1e2828fau, 0xff096414u,            // pc3:  v_min_f32 v20, v20 row_xmask:4 bc:1, v20
+        0x1e2828fau, 0xff096014u,            // pc5:  v_min_f32 v20, v20 row_xmask:0 bc:1, v20
+        0x1e2828fau, 0xff096414u,            // pc7:  row_xmask:4
+        0x1e2828fau, 0xff092814u,            // pc9:  row_ror:8 (the family's original member)
+        0xbf820008u,                         // pc11: join -> pc20
+        0x1e2828fau, 0xff096414u,            // pc12: alternate path, same family
+        0x1e2828fau, 0xff096014u,            // pc14
+        0x1e2828fau, 0xff096414u,            // pc16
+        0x1e2828fau, 0xff092814u,            // pc18
+        // Same reduced nested/backward compute CFG the add fixture uses to force the dispatcher.
+        0xbe800380u, 0x7e000280u, 0x7e020300u,
+        0xd7610013u, 0x00014a7eu, 0xd7610013u, 0x0001507fu,
+        0xd760000eu, 0x00014b13u, 0xd760000fu, 0x00015113u, 0xbefe040eu,
+        0xe00c2000u, 0x80020400u, 0x7db900f9u, 0x86050007u,
+        0x7d020200u, 0xbf860006u, 0xbf0a8204u, 0x360000fdu, 0xbf840001u,
+        0x81008100u, 0x81008100u, 0xbf82fff4u, 0xbf810000u,
+    };
+    const auto xmask_cfg_spv = recompile_compute(
+        gta_compute_dpp_xmask_cfg.data(), gta_compute_dpp_xmask_cfg.size(),
+        &gta_compute_dpp_table, native_gta_compute_dpp_config);
+    if (xmask_cfg_spv.empty() ||
+        !compute_dpp_row_xor_uses_stride(xmask_cfg_spv, 4u) ||
+        !compute_dpp_row_xor_uses_stride(xmask_cfg_spv, 8u)) {
+        printf("  [FAIL] CFG dispatcher did not lower the lane-XOR family with the packet stride\n");
+        return 1;
+    }
+    printf("  [ok]   CFG dispatcher lowers the lane-XOR family with the packet's own stride\n");
 
     std::vector<uint32_t> gta_compute_dpp_distinct_source = gta_compute_dpp_add_cfg;
     std::vector<uint32_t> gta_compute_dpp_bound_ctrl = gta_compute_dpp_add_cfg;
