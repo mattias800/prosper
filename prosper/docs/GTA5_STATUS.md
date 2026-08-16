@@ -3046,6 +3046,35 @@ falsification.
   pixels; it is a bridge-health improvement whose visual effect is nil.
   (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
   compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
+- **The composite's scene-colour T# is stale, mis-derived, or points somewhere prosper invented.**
+  *Solid, and this is the version to cite* — it supersedes the provenance argument in the entry
+  further down, which reached the right answer by a route that does not establish it (see the note
+  there). Aim the shared dynamic fold at the composite pixel shader:
+  `PROSPER_DYNTRACE=1 PROSPER_DYNTRACE_ADDR=205b34be00 PROSPER_DYNTRACE_ONCE=1`. It prints the eight
+  raw T# dwords read from the guest's own table, and the composite's are
+  `20633800 c2400000 021bc3bf 91b003ac 00000000 00700000 00000000 00000000` → `base=0x2063380000`,
+  with `have_t8=1` (came through a successful scalar load) and an immediate SRT key (`key=0x0` /
+  `key=0x60`). **prosper decodes the guest's live descriptor correctly. The guest itself points its
+  composite at the buffer it never fills.**
+- **GTA V submits command buffers through an entry point prosper does not implement.** *Solid.* This
+  was the one gap every other instrument was blind to by construction — they all observe *decoded*
+  streams, and a stream never handed to the decoder is invisible to all of them. prosper registers
+  **2 of the 17** `Submit*` exports in `libSceAgcDriver` (`SubmitDcb`, `SubmitAcb`); the other
+  fifteen include `SubmitMultiDcbs` (`6UzEidRZwkg`), `SubmitMultiAcbs` (`HF3YllT3mXU`),
+  `SubmitCommandBuffer` (`b4fpgH5ZXxQ`), `SubmitMultiCommandBuffers` (`Fj7r9EHzF38`),
+  `SubmitMultiCommandBuffersDirect` (`xmWi73o1BR0`), `AgrSubmitDcb` (`AhGvpITrf4M`) and
+  `AgrSubmitMultiDcbs` (`+T8Xo6LtFJI`). **GTA V calls none of them** — zero mentions across a routed
+  run, and the unimplemented-NID logger demonstrably fires for that library in the same run (it names
+  three other `libSceAgc` NIDs). The registration gap is real and worth closing for other titles; it
+  is not this title's defect.
+- **`sceAgcDcbRewind` lets commands past a ring wrap go unseen.** *Solid, by review rather than
+  measurement* (Codex, #2542): `IT_REWIND` (type-3 `0x59`, two dwords, `(initial_state & 1) << 31`) is
+  a **validity wait**, not ring control — the decoder's whole behaviour is `while (!Valid()) yield`,
+  then advance normally. It never moves the command pointer or delimits a submitted range. The stub
+  also leaves no hole: only the builder advances the cursor, so later builders append compactly.
+  What *is* missing is the validity synchronisation, which can let post-Rewind packets run before
+  their producer publishes them — worth implementing, but log the call count and `initial_state`
+  first, because an unconditional no-op is only safe if the title always passes 1.
 - **`0x2063380000` and `0x20431c0000` are two virtual mappings of the same physical memory.** *Solid.*
   This was the best remaining structural explanation — it would have accounted for the guest rendering
   to one name and sampling the other, and for the alias experiment working *exactly*. `PROSPER_MEMLOG=1`
@@ -3071,12 +3100,19 @@ falsification.
   `target=0x0 ndw=0x21 a5=0x5 a6=<the acb again> a7=0x1 a8=0x2ec`, so `a3` is not the target and the
   roles do not transfer. It is also called **exactly once** in a 200 s route, so it cannot be a
   per-frame producer under any ABI. Left registered as a logging observer that returns 0.
-- **The composite's scene-colour T# is stale or mis-derived.** *Solid.* `PROSPER_RTT_GUESTPEEK` now
-  prints descriptor provenance, and the working buffer `0x20431c0000` and the empty `0x2063380000`
-  resolve **identically** — no SRT key, no SGPR key, matched by fetch pc. Provenance gives the failing
-  one no special status. Reinforced by the colour-state census above: the guest itself programs that
-  address as a target exactly once in 1.4M records, so there is nothing for a stale descriptor to be
-  stale *about*.
+- **The composite's scene-colour T# is stale or mis-derived — argued from `rtt-guestpeek`
+  provenance.** *The conclusion is right; THIS derivation is not, and it is the derivation that would
+  have been inherited.* The argument was: the working `0x20431c0000` and the empty `0x2063380000`
+  resolve identically (no SRT key, no SGPR key, matched by fetch pc), so provenance gives the failing
+  one no special status. Codex refuted the premise (#2542): **`sgpr_base != UINT32_MAX` means direct
+  user-SGPR origin, not "fresh by construction"** — a draw can inherit SH state and the value can be an
+  earlier bind, and only `PROSPER_UDPROV`'s last-write order establishes freshness relative to *this*
+  draw. Likewise a valid `srt_offset` means an immediate-key table load, not that prosper cached the
+  T#: `resolve_dynamic_fetch` rereads the table per stage build, and a first realization can still
+  observe guest memory before its writer. So identical provenance fields never ruled staleness out.
+  **Use the raw-T# entry above instead** — it reads the guest's actual descriptor dwords and settles
+  the same question by measurement. Recorded rather than deleted because a `## Ruled out` row wearing
+  a plausible argument is exactly what the next reader will not re-derive.
 - **A missing device capability blocks the rejected compute kernels.** *Solid.* The native subgroup
   contract is **ENABLED** on this machine (`size_control=1 full_subgroups=1 vote=1 arithmetic=1`,
   sizes 32..64, AMD Radeon 8060S / RADV STRIX_HALO), so `0x205b5e8600`'s VCC_LO read is not blocked by
