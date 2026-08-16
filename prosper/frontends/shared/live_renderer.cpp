@@ -642,10 +642,53 @@ bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
         !cache_disabled && compression_supported && cache_limit && source_size;
 }
 
+// PROSPER_RTT_ALIAS=<sampled>:<served>[,<sampled>:<served>…] — diagnostic ONLY, off by default.
+//
+// Serve one sampled surface from another surface's cache entry. It answers exactly one question, and
+// only by experiment: when a consumer samples an address nothing writes, is that address a distinct
+// buffer whose producer is missing, or the SAME buffer the renderer already holds under a different
+// base?  Those two have identical signatures in every census -- the pass graph, the target census
+// and the write watches all report "written by nothing" either way -- and they call for opposite
+// work: find the missing producer, or fix a base decode.
+//
+// GTA V PPSA04263 is the worked case. Its final composite samples the 4K HDR scene colour
+// 0x2063380000 24x per frame, and across 6,561 frames that address is a render target exactly once,
+// for a clear. Meanwhile the lit scene sits in 0x20431c0000, which the composite never reads.
+// Aliasing one onto the other decides between the two readings in a single run.
+//
+// This is not a repair and must never become one: it makes a consumer read bytes the guest did not
+// point it at, so a picture appearing under it is evidence about the DECODE, never a fix. Leave it
+// unset outside an A/B.
+uint64_t texture_rtt_alias(uint64_t gpu_address) {
+    struct Alias { uint64_t from, to; };
+    static const std::vector<Alias> aliases = [] {
+        std::vector<Alias> parsed;
+        const char* spec = getenv("PROSPER_RTT_ALIAS");
+        if (!spec || !*spec) return parsed;
+        for (const char* cursor = spec; *cursor;) {
+            char* end = nullptr;
+            const uint64_t from = strtoull(cursor, &end, 16);
+            if (end == cursor || *end != ':') break;
+            cursor = end + 1;
+            const uint64_t to = strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            parsed.push_back({from, to});
+            fprintf(stderr, "[rtt-alias] sampling 0x%llx will be served from 0x%llx\n",
+                    (unsigned long long)from, (unsigned long long)to);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    for (const Alias& alias : aliases)
+        if (alias.from == gpu_address) return alias.to;
+    return gpu_address;
+}
+
 uint64_t texture_decode_source_address(uint64_t gpu_address,
                                        uint32_t image_dimension,
                                        bool in_mip_tail,
                                        uint32_t layer_mip_offset_bytes) {
+    gpu_address = texture_rtt_alias(gpu_address);
     if (image_dimension != 5u || in_mip_tail ||
         gpu_address > UINT64_MAX - layer_mip_offset_bytes)
         return gpu_address;
@@ -3824,14 +3867,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (rtt_log && PROSPER_ENV_ON("PROSPER_RTT_GUESTPEEK") &&
                                 sampled_source_addr &&
                                 prosper::gpu::guest_readable(sampled_source_addr, 4096)) {
+                                // Re-peek on a power-of-two schedule per address rather than once.
+                                // A once-only peek reports the FIRST sighting, and a surface's first
+                                // sighting is routinely its emptiest moment -- sampled during
+                                // start-up before the guest has written it. That reads as "the guest
+                                // never wrote this", which is the exact conclusion the peek exists to
+                                // test, so the instrument would confirm it by construction. The
+                                // schedule keeps the volume bounded (about 20 lines per surface over
+                                // a million samples) while making the steady state observable.
                                 static std::mutex peek_mutex;
-                                static std::set<uint64_t> peeked;
-                                bool first = false;
+                                static std::map<uint64_t, uint64_t> peek_counts;
+                                uint64_t seen = 0;
                                 {
                                     std::lock_guard lock(peek_mutex);
-                                    first = peeked.insert(sampled_source_addr).second;
+                                    seen = ++peek_counts[sampled_source_addr];
                                 }
-                                if (first) {
+                                if ((seen & (seen - 1)) == 0) {
                                     size_t window = std::min<size_t>(
                                         prosper::gpu::gpu_capture_resource_footprint(r),
                                         size_t(1) << 20);
@@ -3845,10 +3896,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         static_cast<uintptr_t>(sampled_source_addr));
                                     for (size_t i = 0; i < window; ++i) nz += bytes[i] != 0;
                                     fprintf(stderr,
-                                            "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u guest "
-                                            "non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
+                                            "[rtt-guestpeek] addr=0x%llx %ux%u fmt=%u sample#%llu "
+                                            "guest non-zero=%zu/%zu bytes (%.1f%%) resolved=%s\n",
                                             (unsigned long long)sampled_source_addr, tw, th,
-                                            (unsigned)r.format, nz, window,
+                                            (unsigned)r.format, (unsigned long long)seen, nz, window,
                                             window ? 100.0 * nz / window : 0.0,
                                             has_uniform_live_rtt ? "HIT-UNIFORM"
                                                 : rtt_hit ? (has_gpu_live_rtt ? "HIT-GPU"
