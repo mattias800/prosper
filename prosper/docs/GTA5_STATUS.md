@@ -886,15 +886,48 @@ Three 4K DCC-compressed **sampled** images remain unsupported (fmt 1/4/9). That 
 resource from the storage image above — the storage image is not compressed. Whether the composite
 depends on those three has not been established.
 
-### The instrument that would answer this, and why it has not yet
+### The instrument that would answer this — TWO sequential gates, both now identified (2026-08-16)
 
 `PROSPER_GRAB_BUNDLE_AFTER_MS` on `prosper-app` is the documented fastest loop for "why does this
-frame look wrong". It was tried at 170 s with `PROSPER_CAPTURE_FRAMES=1` and again with 16, and both
-report **"the capture window contained no GPU submits"** while the same run shows 271 `[agc]`, 60
-`[compute]` and 43 `[render]` lines and reaches 191 s of route. So the capture window and the
-submits are not lining up, and **that mismatch is itself the next thing to understand** — without a
-bundle there is no draw-level view of the frame, and every conclusion above is from log statistics
-rather than from the frame's actual contents.
+frame look wrong", and on this title it fails **twice, for unrelated reasons**. Each failure reads as
+"frame capture does not work on GTA V", which is why the first one hid the second for a day.
+
+**Gate 1 — the capture window is one present wide, and this title does not submit on every present.**
+Earlier attempts at 170 s with `PROSPER_CAPTURE_FRAMES=1` and 16 reported *"the capture window
+contained no GPU submits"*, which read as a window/submit mismatch of unknown kind. The newer
+diagnostic names it exactly:
+
+```
+[grab] frame-bundle: window had no submits; widen it with PROSPER_CAPTURE_FRAMES=N (1..240)
+[grab] frame-bundle: during this window the submit hook was reached=0, 0 while inactive,
+       0 while not capturing; window was open 1 ms for 1 presents
+```
+
+`reached=0` with the window open **1 ms** settles it: the hook never fired, so nothing was
+mis-classified — the window simply closed between submits. **`PROSPER_CAPTURE_FRAMES=240` clears it**
+and the capture reaches real submits (observed: submit 34146).
+
+**Gate 2 — the bundle then aborts on indirect-pointer provenance.**
+
+```
+[grab] frame-bundle: submit 34146 failed (indirect-pointer relocation lacks exact compute
+       provenance); grab aborted
+```
+
+`validate_captured_indirect_pointer_relocations` requires capture format ≥ v53, a captured recompile
+config, an in-range raw shader index, **and exactly one** indirect-pointer carrier. GTA V fails one of
+these, and until 2026-08-16 the message was the same sentence for all four, so the log could not say
+which arm to pursue; it now names the failing precondition and prints the carrier/marker counts.
+
+**`PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1` accepts it and writes the bundle**, with the tool
+stating the limit itself: *"THIS BUNDLE IS FOR INSPECTION, NOT FAITHFUL REPLAY."* That is the right
+trade for the question in this document — the bundle is wanted for its **resource tables and
+descriptors**, not to reproduce the frame — but a replayed frame from such a bundle is not evidence
+about rendering, and must not be used as any.
+
+So the recipe that produces a GTA V bundle is both flags together; neither alone is enough. Until one
+exists, every conclusion in this section is from log statistics rather than from the frame's actual
+contents.
 
 ## The hang is NOT the only blocker — two more, measured (2026-08-15)
 

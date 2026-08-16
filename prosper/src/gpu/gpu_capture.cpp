@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <string>
 #include <bit>
 #include <cerrno>
 #include <cstdio>
@@ -1858,12 +1859,23 @@ bool validate_captured_indirect_pointer_relocations(
         error = "indirect-pointer relocation marker/carrier count mismatch";
         return false;
     }
-    if (capture.format_version < 53u || candidates != 1u ||
-        !compute.recompile_config_available ||
-        compute.raw_shader_index >= capture.raw_shader_versions.size()) {
-        if (capture_allow_unproven_provenance("an indirect-pointer relocation",
-                                              "no exact compute provenance")) return true;
-        error = "indirect-pointer relocation lacks exact compute provenance";
+    // Name WHICH precondition failed. These four are independent, they fail for unrelated reasons,
+    // and the one that fires decides whether the gap is a stale capture, a missing config, or a shape
+    // this validator was simply never written for -- but the message used to be the same sentence for
+    // all four, so the only way to tell them apart was to read this function. A whole title's F9
+    // bundles aborted on it (GTA V PPSA04263) with nothing in the log to say which arm to pursue.
+    const char* missing =
+        capture.format_version < 53u                                    ? "capture format older than v53"
+        : !compute.recompile_config_available                           ? "no captured recompile config"
+        : compute.raw_shader_index >= capture.raw_shader_versions.size() ? "raw shader index out of range"
+        : candidates != 1u                                              ? "carrier count is not exactly 1"
+                                                                        : nullptr;
+    if (missing) {
+        if (capture_allow_unproven_provenance("an indirect-pointer relocation", missing)) return true;
+        error = std::string("indirect-pointer relocation lacks exact compute provenance (") +
+                missing + ", carriers=" + std::to_string(candidates) +
+                " markers=" + std::to_string(marked) +
+                " format_version=" + std::to_string(capture.format_version) + ")";
         return false;
     }
     const auto& config = compute.recompile_config;
