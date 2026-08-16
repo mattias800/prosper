@@ -6286,13 +6286,25 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool viewport_extent_valid = viewport_native_w && viewport_native_h &&
                             viewport_native_w <= std::max<uint64_t>(4096u, max_native_w) &&
                             viewport_native_h <= std::max<uint64_t>(4096u, max_native_h);
-                        if (PROSPER_ENV_ON("PROSPER_DSLOG") && (viewport_native_w || viewport_native_h)) {
+                        // Log the UNDECIDABLE case too. Gating this on a non-zero derived extent hid
+                        // the only outcome that silently changes the DS identity: a depth-only pass
+                        // whose draws carry no viewport register derives 0x0, falls through to the
+                        // global frame extent, and mints a second cache entry for a surface that
+                        // already has a correctly-sized one. A diagnostic that prints only when the
+                        // inference succeeded cannot report the inference not happening.
+                        if (PROSPER_ENV_ON("PROSPER_DSLOG")) {
+                            const size_t with_viewport = static_cast<size_t>(std::count_if(
+                                pass.begin(), pass.end(),
+                                [](const auto* draw) { return draw->ps.has_viewport; }));
                             fprintf(stderr,
-                                    "[ds] viewport-derived extent %llux%llu (presentation %ux%u) -> %s\n",
+                                    "[ds] viewport-derived extent %llux%llu (presentation %ux%u, "
+                                    "%zu/%zu draws with viewport) -> %s\n",
                                     (unsigned long long)viewport_native_w,
                                     (unsigned long long)viewport_native_h,
-                                    max_native_w, max_native_h,
-                                    viewport_extent_valid ? "accept" : "reject");
+                                    max_native_w, max_native_h, with_viewport, pass.size(),
+                                    viewport_extent_valid ? "accept"
+                                        : (viewport_native_w || viewport_native_h) ? "reject"
+                                                                                   : "undecidable");
                         }
                         if (viewport_extent_valid) {
                             native_w = std::max(native_w, static_cast<uint32_t>(viewport_native_w));

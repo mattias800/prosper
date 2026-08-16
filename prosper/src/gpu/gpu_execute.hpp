@@ -830,6 +830,11 @@ void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
 // distinguish a 512 KiB DMA_DATA fill from an 8-byte completion label, and those imply opposite
 // things about whether the surface's contents were replaced.
 void set_guest_gpu_write_origin(const char* origin);
+// The same tag, readable by an observer. The DS invalidation runs inside the observer callback, so
+// it can name the packet that cost a surface its contents instead of reporting only that something
+// did -- "HTILE overlap discarded a rendered 4K depth buffer" and "a DMA_DATA fast clear replaced
+// it" are the same line without this, and only the second means the discard was correct.
+const char* guest_gpu_write_origin();
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 // A backend can prove that a dispatched write reproduced the exact guest bytes while renderer-owned
 // aliases at the same address may still hold divergent state. Notify those alias owners without

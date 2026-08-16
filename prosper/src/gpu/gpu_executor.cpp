@@ -10894,6 +10894,7 @@ thread_local const char* g_guest_write_origin = "gpu";
 void set_guest_gpu_write_origin(const char* origin) {
     g_guest_write_origin = origin ? origin : "gpu";
 }
+const char* guest_gpu_write_origin() { return g_guest_write_origin; }
 
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;

@@ -2901,8 +2901,46 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             guest_ranges_overlap(addr, size, key.sw + slice_offset, stencil_size);
         const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
         if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
-        if (depth_overlap || htile_overlap) image.depth_valid = false;
-        if (stencil_overlap || htile_overlap) image.stencil_valid = false;
+        // Which aspect a write actually hit, and the byte count that decided it. The count is the
+        // interesting half: `slice_depth_bytes` comes from a LEARNED stride, so an over-large stride
+        // silently widens the depth range past its own allocation and attributes a neighbouring
+        // plane's write to depth. That misattribution is invisible in the aggregate line below --
+        // it reports how many entries were touched, never which aspect or why.
+        static const bool log_detail = getenv("PROSPER_DSLOG") != nullptr;
+        if (log_detail)
+            fprintf(stderr,
+                    "[ds] invalidate dr=0x%llx sr=0x%llx htile=0x%llx slice=%u depth=%d stencil=%d "
+                    "htile_hit=%d origin=%s addr=0x%llx size=%llu learned=%llu depth_bytes=%llu "
+                    "stencil_bytes=%llu htile_bytes=%llu gap=%lld\n",
+                    (unsigned long long)key.dr, (unsigned long long)key.sr,
+                    (unsigned long long)key.htile, key.slice,
+                    (int)depth_overlap, (int)stencil_overlap, (int)htile_overlap,
+                    prosper::gpu::guest_gpu_write_origin(),
+                    (unsigned long long)addr, (unsigned long long)size,
+                    (unsigned long long)learned, (unsigned long long)slice_depth_bytes,
+                    (unsigned long long)stencil_size, (unsigned long long)htile_size,
+                    (long long)((key.sr ? key.sr : key.sw) - (key.dr ? key.dr : key.dw)));
+        // PROSPER_DS_HTILE_INVALIDATE=0 -- experiment arm, default ON (historical behaviour).
+        //
+        // The retained depth image is a Vulkan image; guest memory does not back it. So a guest
+        // write can only invalidate it by making guest memory authoritative for content the image
+        // claims to hold. For the DEPTH and STENCIL planes that is exactly what a write means. For
+        // HTILE it is true of a fast CLEAR (the metadata says "this tile is value X" and the plane
+        // bytes are then ignored) and false of every other HTILE update -- a compute HiZ refresh
+        // rewrites the metadata while the depth values it describes are unchanged.
+        //
+        // GTA V takes the second path 730 times per 200 s route against 135 real stencil writes,
+        // and each one discards a fully rendered 4K depth buffer that the deferred lighting pass
+        // samples on the very next pass. The arm exists to measure that split before any behaviour
+        // is changed; decoding HTILE to tell a clear from a refresh is the actual fix.
+        static const bool htile_invalidates = []() {
+            const char* v = getenv("PROSPER_DS_HTILE_INVALIDATE");
+            return !(v && v[0] == '0');
+        }();
+        const bool htile_kill = htile_overlap && htile_invalidates;
+        if (!depth_overlap && !stencil_overlap && !htile_kill) continue;
+        if (depth_overlap || htile_kill) image.depth_valid = false;
+        if (stencil_overlap || htile_kill) image.stencil_valid = false;
         ++invalidated;
     }
     if (invalidated && getenv("PROSPER_DSLOG"))
@@ -4005,6 +4043,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
+        // The key carries the PASS extent, so one guest depth surface reached through two passes of
+        // different extent becomes two independent entries -- and the larger one's guest range is
+        // sized from that extent, which is how a 512x512 shadow cascade acquires a 33 MB depth range
+        // that swallows its neighbours. Log the first sighting of each identity so the producing
+        // pass is nameable rather than inferred.
+        static const bool log_new_ds = getenv("PROSPER_DSLOG") != nullptr;
+        if (log_new_ds && !cached_ds->image)
+            fprintf(stderr, "[ds] new-entry dr=0x%llx dw=0x%llx sr=0x%llx slice=%u extent=%ux%u\n",
+                    (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
+                    (unsigned long long)ds_key.sr, ds_key.slice, ds_key.w, ds_key.h);
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
         ds_layout_initialized = cached_ds->layout_initialized;
         depth_was_valid = cached_ds->depth_valid;
