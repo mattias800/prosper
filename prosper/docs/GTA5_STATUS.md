@@ -3386,6 +3386,43 @@ question, not a GPU one. It shares the frontier with one unfinished measurement:
 the failing compute kernels that no instrument has resolved (see the section below for exactly which,
 and why their null does not count yet).
 
+### The failing kernels bind 4K WRITE-capable storage images (2026-08-17)
+
+The section below draws the census boundary at "the unresolved operations inside the failing compute
+kernels remain outside the census". This looks *inside* that boundary for the first time, using a
+diagnostic that was already ungated and already in every routed log: `[compute-table]`, which dumps a
+program's whole resource table once per program that fails to recompile.
+
+**Two failing programs bind a storage image of exactly 33,177,600 bytes = 3840 × 2160 × 4** — the
+size of a 4K f11f11f10 surface, the very thing the composite's base tap is and does not contain:
+
+| program | binding | guest address | reject |
+| --- | --- | --- | --- |
+| `0x2042f49a00` | 6 | `0x204da00000`, **identical on all four runs** | `pc=16`, MIMG `op=0x1`, `mode=unresolved-operand` |
+| `0x205b557e00` | 13 | run-local (`0x2070f20000`, `0x2072f00000`) | `pc=314`, MIMG `op=0x0`, `srt_tag=0xa0`, `key_res=null pc_res=null` |
+
+`class=4` is `StorageImage` — read/written by `image_load`/`image_store` **without a sampler**, i.e.
+the class a compute producer writes through. `0x205b557e00` also samples a 3840×2160 renderer-owned
+RTT that reports *"has no readable snapshot -> dispatch skipped (#590)"*, so it reads a 4K surface and
+writes a 4K surface, and never runs.
+
+**This is the shape of the missing producer, and it is not proof.** What is established: failing
+kernels do bind 4K write-capable images, so the population the census excluded is not empty and is not
+irrelevant. What is *not* established: that either surface **is** the composite's base tap. Addresses
+are run-local, the tap was identified in an older run, and nothing here correlates the two — the
+honest statement is a size and class match on a population that was previously unexamined.
+
+**The failing population is also much larger than this document has been recording.** The reject
+census table above lists 13 programs; a routed boot has **30, 32, 36 and 35 distinct failing programs**
+across four runs on 2026-08-17. So "the seven failing kernels" understates it by roughly a factor of
+five, and any statement of the form "all the failing kernels were cleared" should be read against a
+count that was never that small.
+
+**Next step, and it is cheap:** re-run with `PROSPER_COMPUTE_BINDS=<tap address for that run>` — the
+instrument now reports the recompile-failure population as `outcome=partial-recompile-empty` instead
+of silently skipping it, which is exactly the population these two programs are in. Deriving the tap
+address for the *same* run is the only remaining piece.
+
 ### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 
 Read the boundary in this heading before using the table. Every path that can write a surface **and
