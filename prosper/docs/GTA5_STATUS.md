@@ -3066,13 +3066,31 @@ else:
 A full 4K frame of coverage appears the moment the depth test stops rejecting. So the light-volume
 draws are executing and being discarded per-fragment.
 
-**What this rules IN, and the part that is not yet pinned.** The rejection means the depth attachment
-bound to that pass holds real content that the light volumes fail against — if it held the derived
-"compare-appropriate always-pass" value (#371) nothing would be rejected at all. So the candidates
-are a compare-direction mismatch (GTA V uses reversed-Z, where near is 1.0 and the same clear byte
-means the opposite thing), light-volume geometry at the wrong depth, or the pass being handed a
-depth attachment that is not the one the G-buffer wrote. `PROSPER_DEPTH_CLEAR=<float>` and
-`PROSPER_NO_STENCIL=1` are the next two arms; both exist already.
+**`PROSPER_DEPTH_CLEAR` moves it too, at both poles** — and reading that as a statement about this
+pass's initial value is the mistake this paragraph exists to prevent:
+
+| arm | passes with content | max `rgb_nonblack` |
+| --- | --- | --- |
+| control (derived clear) | 10 of 122 | 3,798,218 |
+| `PROSPER_DEPTH_CLEAR=0.0` | **68 of 126** | **8,294,400 (100%)** |
+| `PROSPER_DEPTH_CLEAR=1.0` | **0 of 124** | 0 |
+
+`PROSPER_DEPTH_CLEAR_WHY=1` (new) then showed that mixed-compare passes really do exist and really do
+latch the wrong pole — the fresh-image value is **first-draw-wins**, so a pass measuring
+`greater=15 less=5` derives **1.000** and always-fails its fifteen GREATER draws. That is the #457
+class one level deeper, and it looked like the fix.
+
+**It is not the fix, and this is recorded so it is not retried.** Deriving the value by *majority*
+instead of arrival order — identical wherever a pass's draws agree, so no existing shape changes, and
+246/246 stayed green — made the measured target **worse**: 0 of 111 read-back passes with content
+against 10 of 122, with SCANOUT unmoved. So the global `PROSPER_DEPTH_CLEAR=0.0` arm was never
+evidence about *this pass's* initial value: it forces **every** depth surface in the frame including
+the G-buffer's own, and whatever produces its improvement has another mechanism. The behavioural
+change was reverted; `PROSPER_DEPTH_CLEAR_WHY` and its counts were kept.
+
+**The depth-test finding above still stands** — `PROSPER_NO_DEPTH=1` is a per-test lever, not a
+per-surface value, and it takes the pass from 10 to 65. What remains unpinned is *why* the test
+rejects. `PROSPER_NO_STENCIL=1` is the next arm.
 
 **Do not read `PROSPER_NO_DEPTH=1` as a fix** — it is a discriminator and it breaks other things (the
 same family of override made the radar vanish when it was applied to the main 4K depth, recorded at

@@ -3907,6 +3907,41 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return depth_clear_effective(ps->depth_clear_enable, ps->depth_test_enable,
                                      ps->depth_write_enable, ps->depth_compare_op);
     };
+    // How many of this pass's depth-testing draws want each polarity of always-pass initial value.
+    //
+    // The latch below is first-draw-wins, which is exact for a pass whose draws agree and arbitrary
+    // for one whose draws do not. A MIXED pass has no initial value that is always-pass for both
+    // directions, so some draws must lose; picking by arrival order decides that by accident.
+    //
+    // GTA V PPSA04263's deferred lighting resolve is the worked case. Measured with
+    // PROSPER_DEPTH_CLEAR_WHY on a routed 400 s boot, its passes read e.g.
+    // `greater=15 less=5 -> derived=1.000` and `greater=12 less=7 -> derived=1.000`: a handful of
+    // LESS draws arrive first, latch the far value for a reverse-Z surface, and the GREATER majority
+    // -- the light volumes -- is then always-fail against it. The pass emits colour in 10 of 122
+    // read-back passes; forcing the other pole (PROSPER_DEPTH_CLEAR=0.0) takes it to 68 of 126 at
+    // full 4K coverage, and forcing 1.0 takes it to 0 of 124. Both poles run, so the value is what
+    // decides it.
+    //
+    // Choosing by majority looked like the fix and IS NOT -- recorded here so it is not retried.
+    // Implemented and measured on the same routed 400 s boot: the lighting resolve went to 0 of 111
+    // read-back passes with content, against 10 of 122 for the first-draw rule, and SCANOUT did not
+    // move. So the global PROSPER_DEPTH_CLEAR=0.0 arm that motivated it was not evidence about this
+    // pass's initial value at all -- that switch forces EVERY depth surface in the frame, including
+    // the G-buffer's own, and the improvement it produced has some other mechanism. The counts below
+    // are kept only to feed PROSPER_DEPTH_CLEAR_WHY, which is what showed the mixed passes exist.
+    uint32_t depth_greater_draws = 0, depth_less_draws = 0;
+    for (const auto& d : logical_draws) {
+        if (!d.ps) continue;
+        if (!(d.ps->depth_test_enable || effective_depth_clear(d.ps))) continue;
+        if (d.ps->depth_clear_enable) continue;   // an explicit clear does not vote
+        switch (d.ps->depth_compare_op) {
+            case VK_COMPARE_OP_GREATER:
+            case VK_COMPARE_OP_GREATER_OR_EQUAL: ++depth_greater_draws; break;
+            case VK_COMPARE_OP_LESS:
+            case VK_COMPARE_OP_LESS_OR_EQUAL:    ++depth_less_draws;    break;
+            default: break;                       // ALWAYS/NEVER do not depend on the initial value
+        }
+    }
     for (const auto& d : draws) {
         if (!d.ps) continue;
         if (d.ps->depth_test_enable || effective_depth_clear(d.ps)) use_depth = true;
@@ -3968,6 +4003,39 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // The #371 approximation picks the compare-appropriate always-pass value; sweeping this
     // instead reveals whether a pass's draws sit at DIFFERENT depths (a mid value culls some
     // draws but not others), i.e. whether real guest depth contents would gate them.
+    // PROSPER_DEPTH_CLEAR_WHY=1 — how a pass's fresh-image depth value was derived, next to what its
+    // draws actually compare with.
+    //
+    // The latch above is FIRST-DRAW-WINS, so one draw fixes the initial value for every later draw in
+    // the pass. #457 already fixed one instance of that class (a stencil-only first draw forcing the
+    // wrong reverse-Z depth value); this reports whether it is happening again on the depth side,
+    // which the derived float alone cannot show. A pass whose draws are predominantly GREATER but
+    // whose value came out 1.0 is rejecting its own geometry.
+    if (getenv("PROSPER_DEPTH_CLEAR_WHY") && use_depth) {
+        uint32_t greater = 0, less = 0, other = 0, explicit_clear = 0;
+        int first_op = -1;
+        for (const auto& d : logical_draws) {
+            if (!d.ps) continue;
+            if (!(d.ps->depth_test_enable || effective_depth_clear(d.ps))) continue;
+            if (first_op < 0) first_op = static_cast<int>(d.ps->depth_compare_op);
+            if (d.ps->depth_clear_enable) ++explicit_clear;
+            switch (d.ps->depth_compare_op) {
+                case VK_COMPARE_OP_GREATER: case VK_COMPARE_OP_GREATER_OR_EQUAL: ++greater; break;
+                case VK_COMPARE_OP_LESS: case VK_COMPARE_OP_LESS_OR_EQUAL: ++less; break;
+                default: ++other; break;
+            }
+        }
+        static std::mutex why_mutex;
+        static std::map<std::tuple<float, uint32_t, uint32_t, uint32_t>, uint64_t> seen;
+        std::lock_guard lock(why_mutex);
+        const uint64_t n = ++seen[{depth_clear, greater, less, other}];
+        if ((n & (n - 1)) == 0)
+            fprintf(stderr,
+                    "[depth-clear-why] derived=%.3f first_op=%d explicit=%u compares{greater=%u "
+                    "less=%u other=%u} draws=%zu (x%llu)\n",
+                    depth_clear, first_op, explicit_clear, greater, less, other,
+                    logical_draws.size(), (unsigned long long)n);
+    }
     if (const char* v = getenv("PROSPER_DEPTH_CLEAR"))
         depth_clear = strtof(v, nullptr);
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
