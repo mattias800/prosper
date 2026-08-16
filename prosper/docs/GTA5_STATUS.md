@@ -2918,12 +2918,73 @@ arguments live and it is still not provenance — one process VA space can hold 
 several high-32 prefixes, so accepting an address because 12 bytes are readable admits dispatching
 group counts read out of an unrelated live allocation.
 
+## The frame's dataflow, end to end (2026-08-16)
+
+Reassembled with `tools/gpu_timeline/rtt_pass_graph.py` from a `PROSPER_RTTLOG=1` routed boot. This
+is the map to reason against; **it locates the break precisely, and the break is not where the draw
+and target censuses pointed.**
+
+```
+G-buffer (5 MRTs, 11-28 draws)            albedo 0x207fe40000  100%   <- complete and correct
+  0x207fe40000 0x2083e00000 0x2081e20000  normals 0x207de60000  99.7%
+  0x2085de0000 0x207de60000
+        |
+        v
+deferred lighting  -> 0x20431c0000  19 draws   rgb_nonblack = 0        <-- THE BREAK
+        |              reads the whole G-buffer + 6 shadow surfaces
+        v
+        0x20471e0000  1 draw   45.1%   (reads 0x20431c0000 x14)
+        ...later passes raise 0x20431c0000 to 45.3% (3,757,533 px)
+                                                   |
+                                                   |  NOTHING CARRIES IT ACROSS
+                                                   x
+final composite -> 0x2056740000  1 draw  13.5%
+        <- 0x2063380000  3840x2160 f11f11f10  x24   <-- scene colour, WRITTEN BY NOTHING
+        <- 0x2085de0000  x6, bloom pyramid 1920x1080 / 960x540 / 240x135
+        v
+   0x2058720000  13.5%   ->   SCANOUT 0x2162cd0000  13.5%   (this 13.5% is the HUD)
+```
+
+Two facts fix the frontier:
+
+1. **The deferred-lighting pass consumes a complete G-buffer and emits nothing.** Its 19 draws read
+   albedo at 100% and normals at 99.7% and produce `rgb_nonblack=0`. Later passes populate
+   `0x20431c0000` to 45%, so the buffer is not broken — the lighting resolve specifically is.
+2. **The composite samples `0x2063380000` 24 times per frame, and nothing on any decoded path writes
+   it.** Across 6,561 frames it is bound as a render target **exactly once**, for one draw, with no
+   inputs and no output (`px_nonzero=0`) — that is a clear, not a composite. No draw (0/131,072 over
+   all 8 slots), no compute, no resolve, no guest-side GPU write, no DS plane, no dropped draw.
+   Meanwhile the lit scene sits in `0x20431c0000` / `0x20471e0000`, which the composite never reads.
+
+So the world is not lost in the composite and not lost at scanout: **the producer of the scene-colour
+buffer is missing entirely.** The leading candidate is a declined compute dispatch — see the
+descriptor-key note below — because compute is the one producer class whose failures leave no pass
+line at all.
+
 ## Ruled out
 
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **Sampled-depth invalidation is starving the deferred-lighting pass.** *Solid.* The lighting pass
+  does read the scene depth `0x2052ac0000` through the bridge, and that bridge did decline — 826 times
+  on `depth-invalid` — so the hypothesis was well-founded. It is still wrong. 730 of the 900
+  invalidations of that surface are **HTILE-only** overlap (`depth=0 stencil=0 htile_hit=1`, a
+  655,360-byte write at the HTILE base `0x2055310000`), and HTILE conservatively discards both
+  aspects. Suppressing that with `PROSPER_DS_HTILE_INVALIDATE=0` moved the lever as hard as it can
+  move: **depth-invalid declines 1063 → 0, stencil-invalid 852 → 0, depth hits 42,183 → 44,406,
+  stencil hits 2,934 → 3,917** — and SCANOUT came back **byte-identical** (1,121,820 / 1,051,186
+  `rgb_nonblack`). A bridge that now never declines an aspect still yields the same black world, so
+  depth availability is not the constraint on the lighting output. Do not re-run this arm expecting
+  pixels; it is a bridge-health improvement whose visual effect is nil.
+  (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
+  compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
+- **`no-entry` at 81% of DS-bridge calls is a defect.** *Instrument.* `find_persistent_ds_sampled` is
+  consulted for **every sampled binding**, so `no-entry` counts every ordinary colour texture in the
+  frame; the code says so at `tests/render_runner.h:2796` ("the no-entry bucket is unbounded and is
+  genuinely just 'not ours'"). Of the ~45,700 decisions that concern a real DS plane, ~92% hit. Read
+  the *ranked per-address* declines, never the bucket total.
 - **The 72 direct draws are failing / are culled / have colour writes masked.** They execute at full
   3840x2160 with `effective=3f` and zero realization failures in the window that presents black. The
   world is drawn by *indirect* operations, which the latch above dropped untried. #2481.
