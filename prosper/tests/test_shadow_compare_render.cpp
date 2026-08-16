@@ -933,28 +933,6 @@ int main() {
         }
     }
 
-    {
-        // Layer-stride registry lifetime. The registry is keyed by guest BASE and lives for the
-        // process, so a base is not a stable identity -- the guest frees an allocation and maps
-        // another at the same address. It used to keep the FIRST value forever, which made a stale
-        // stride permanent under reuse; the stride sizes the range an invalidation covers, so a
-        // wrong one leaves stale pixels resident or evicts a neighbouring slice.
-        const uint64_t base = 0x5ad0000000ull;   // not used by any render above
-        prosper::test::note_ds_layer_stride(base, 4096);
-        CHECK(prosper::test::ds_layer_stride_for(base) == 4096,
-              "layer stride registry records a first observation");
-        prosper::test::note_ds_layer_stride(base, 8192);
-        CHECK(prosper::test::ds_layer_stride_for(base) == 8192,
-              "a later layer-stride observation replaces the earlier one (base reuse)");
-        // Zero means "unknown" and must never overwrite a known stride with it.
-        prosper::test::note_ds_layer_stride(base, 0);
-        CHECK(prosper::test::ds_layer_stride_for(base) == 8192,
-              "an unknown (zero) stride does not erase a known one");
-        // An unrelated base is unaffected -- the registry is per-surface, not global state.
-        CHECK(prosper::test::ds_layer_stride_for(base + 0x100000ull) == 0,
-              "layer stride registry does not leak across bases");
-    }
-
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
