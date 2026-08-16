@@ -3418,10 +3418,50 @@ across four runs on 2026-08-17. So "the seven failing kernels" understates it by
 five, and any statement of the form "all the failing kernels were cleared" should be read against a
 count that was never that small.
 
-**Next step, and it is cheap:** re-run with `PROSPER_COMPUTE_BINDS=<tap address for that run>` — the
-instrument now reports the recompile-failure population as `outcome=partial-recompile-empty` instead
-of silently skipping it, which is exactly the population these two programs are in. Deriving the tap
-address for the *same* run is the only remaining piece.
+#### Watching that surface: the only WRITE-class binding of it came from a dispatch that did not run
+
+`PROSPER_COMPUTE_BINDS=204da00000` on a routed boot, 219 rows, 4 distinct programs. Two of them are
+the whole result:
+
+```
+[compute-binds] 0x204da00000 bound by program=0x2042f49a00 binding=6 class=4 fetch_pc=21
+                addr=0x204da00000 size=33177600 3840x2160 outcome=partial-recompile-empty
+[compute-binds] 0x204da00000 bound by program=0x205b557e00 binding=7 class=2 fetch_pc=19
+                addr=0x204da00000 size=33177600 3840x2160 outcome=executed
+```
+
+One 4K surface. `class=4` is `StorageImage`, the write-capable class; `class=2` is `Texture`,
+sampled-only. **The write-class binding is on a dispatch whose recompile failed — it did not run —
+while the sampled binding is on a dispatch that executed.** Across the whole run no executed dispatch
+was observed binding this surface write-class.
+
+Two qualifications, because both matter for how far this can be pushed:
+
+- **Recompile success is per-dispatch, not per-program.** Both programs also appear in the skip list
+  (`0x2042f49a00` at `pc=16` MIMG `op=0x1`; `0x205b557e00` at `pc=314` MIMG `op=0x0`), and a program's
+  resource table differs between dispatches, so the same code address can resolve in one invocation
+  and not in another. The claim is therefore about *observed bindings*, not about programs.
+- **This surface has not been shown to be the composite's base tap.** It is 4K, 33,177,600 bytes, and
+  written by nothing that ran — the right shape, on the right scale, in the population the census
+  excluded. That is a lead, not an identification.
+
+**The remaining 217 rows are instrument noise worth knowing about:** they come from two programs
+binding 256 MB constant buffers whose spans happen to *contain* the watched address. That is the
+documented "match the whole span, not the base" behaviour doing its job, but it means this instrument
+needs its output filtered by `class=` and by an exact `addr=` match before the signal is visible.
+
+**This row existed only because of the fix in `acaea037`.** Before it, `report_compute_binding_watch`
+returned from the `item.spirv.empty()` branch without reporting, so a recompile-failed dispatch
+produced no row at all — and this census would have shown the executed *consumer* and nothing else,
+i.e. exactly the false "no compute producer writes this surface" conclusion. The reviewer's finding
+that the instrument's null did not cover failing shaders is what made this visible.
+
+**Next step, now concrete:** make `0x2042f49a00` recompile. Its reject is a single named instruction —
+`pc=16`, MIMG `op=0x1` (`IMAGE_LOAD_MIP`), `mode=unresolved-operand`, `dmask=0x1 dim=1 glc=1` — and
+the `[mimg-mip-why]` lines for that program report `proven_at_use=1 mip_vgpr=v2 in_zero_set=1
+exec_pristine=1 cfg_known=1` at pcs 16/18/21/25, so the mip level is proven and the failure is the
+descriptor, not the mip analysis. Then re-run this census and see whether the write-class binding
+becomes `outcome=executed`.
 
 ### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 
