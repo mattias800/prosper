@@ -216,7 +216,8 @@ const-fold at pc156 of `0x413ce6000`.** That is the next thing to implement.
 > read (`0x205b658800`), `image_bvh_intersect_ray` (`0x205b654a00`, `0x205b657200`), `IMAGE_LOAD_MIP`
 > on a compressed surface (`0x2042f49a00`), and a descriptor contract (`0x413ce5200`, `0x413e1df00`).
 >
-> **The frontier is the nine on the right**, and note that `0x413cf9200` — the program carrying the
+> **The frontier is the seven on the right** (the count above this line, not the nine it was before
+> the preceding update cleared two), and note that `0x413cf9200` — the program carrying the
 > entire hardcoded 15-site contract in `rdna2_gta5_cf9200_contract.cpp` — is on the *left*, running
 > 369 of 381 dispatches.
 >
@@ -1879,7 +1880,14 @@ So when I reported "six valid faces" under `PROSPER_DS_GUEST_WRITE_INVALIDATE=0`
 existed and their *contents* did not correspond to six guest faces. The lever I thought I had moved
 was never moved.
 
-**Fixed**: grouping now splits on DS identity — depth/stencil bases, HTILE base, and the
+**Fixed — but NOT on master, and not in the PR that carries this document.** The grouping split and
+the cube-face bridge live in the stacked follow-up **#2553**, which is unmerged at the time of
+writing; review moved them out of #2552 because they change renderer behaviour at production seams
+and need regressions of their own. Everything measured in this subsection was measured with that
+branch applied. Do not read the table below as describing current master, and check #2553's state
+before building on it.
+
+Grouping there splits on DS identity — depth/stencil bases, HTILE base, and the
 `DB_DEPTH_VIEW` slice. Measured on the same route with defaults (invalidation ON):
 
 | cube | faces valid before | after |
@@ -3269,16 +3277,43 @@ is a fix, because prosper must not invent a copy the guest did not issue.
 scene colour `0x136580000`, HDR/bloom source `0x11a3e0000`, lighting `0x1163c0000` — so prosper is
 right to keep them separate and there is no aliasing fix hiding here.
 
-**Which leaves guest logic as the only remaining explanation.** The guest allocates the buffer, clears
-it once at start-up, samples it 24x per frame forever, reads its *source* for bloom in the same frame,
-and never runs the pass that fills it. Something prosper answers upstream selects that path. That is a
-different hunt from everything above — a guest-decision question, not a GPU one — and it is where the
-next session should start.
+**Which makes guest logic the leading remaining explanation — leading, not sole.** The guest allocates
+the buffer, clears it once at start-up, samples it 24x per frame forever, reads its *source* for bloom
+in the same frame, and never runs the pass that fills it, so something prosper answers upstream
+plausibly selects that path. That is a different hunt from everything above — a guest-decision
+question, not a GPU one. It shares the frontier with one unfinished measurement: the image ops inside
+the failing compute kernels that no instrument has resolved (see the section below for exactly which,
+and why their null does not count yet).
 
-### The producer is missing from the GUEST's command stream, not from prosper's decode
+### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 
-This was worth establishing before writing any more emulator code, and it is now exhaustive. Every
-path that can write a surface has an instrument, and all of them are empty for `0x2063380000`:
+Read the boundary in this heading before using the table. Every path that can write a surface **and
+that prosper resolves** has an instrument, and all of them are empty for `0x2063380000`. That is a
+real and useful result, and it is weaker than the claim this section used to make.
+
+**What stays outside the census.** Every instrument below enumerates *resolved* state — a decoded
+packet, a built resource table, a bound target. The seven compute programs that fail to recompile do
+not have fully resolved tables: `PROSPER_DYNTRACE_FAIL` recovered **15 of 21 image ops** for
+`0x205b5e8600` and **4 of 6** for `0x205b657200`, and the candidate-word scan that was meant to
+cover the remainder is non-exhaustive in coverage, validation and direction by its own documented
+contract (`live_renderer.cpp`, above `scan_for_descriptors_once`). So the unrecovered image ops in
+those kernels are **unproven, not cleared** — no instrument here has looked at them.
+
+**The supported conclusion**, therefore: *no observed decoded path produces this surface; guest-side
+path selection is the leading hypothesis; the unresolved operations inside the seven failing compute
+kernels remain outside the census.* An earlier revision of this section said the elimination was
+exhaustive and that "the guest never issues it" — that overstated the evidence in the one direction
+the evidence cannot support, and the correction is recorded rather than silently applied because the
+overstatement had already reached the PR body and #2542.
+
+**The exact next step, and it closes the gap rather than working around it:** make those two kernels
+recompile — cross-block VCC dataflow for `0x205b5e8600`, `image_bvh_intersect_ray` for
+`0x205b657200` — so their resource tables resolve in full, then re-run `PROSPER_COMPUTE_BINDS` over
+the completed tables. Until then a null across that population is not evidence. This is the same work
+already queued as recompiler frontier, so it is not extra: it is the census and the candidate fix at
+once.
+
+The instruments and their results:
 
 | path | instrument | result |
 | --- | --- | --- |
@@ -3294,7 +3329,9 @@ path that can write a surface has an instrument, and all of them are empty for `
 | **prosper-built packets prosper never decodes** | `[pm4] undecoded prosper sub-op` (new, ungated) | one family, `r=0x00 op=0x10` — a plain `IT_NOP` pad |
 | AGC copy builders | firmware NID list vs registrations, with the unimplemented logger verified live | `sceAgcDcbCopyData` / `AcbCopyData` are **unregistered**, and the title **never calls them** |
 
-That last row is the decisive one. prosper is not losing the producer — **the guest never issues it.**
+That last row is the strongest one: prosper is not losing a producer *through the copy builders*,
+because the title never calls them. Note what it does and does not settle — it removes one candidate
+producer completely, and says nothing about the unresolved image ops named above.
 
 **Every null above now carries a positive control**, which was not true when this section was first
 written. `PROSPER_GUEST_WRITE_WATCH` produced no output at all on the early runs — including for the
@@ -3427,7 +3464,10 @@ falsification.
   the ACB. But a builder mirroring the DCB argument roles refuses on the first call:
   `target=0x0 ndw=0x21 a5=0x5 a6=<the acb again> a7=0x1 a8=0x2ec`, so `a3` is not the target and the
   roles do not transfer. It is also called **exactly once** in a 200 s route, so it cannot be a
-  per-frame producer under any ABI. Left registered as a logging observer that returns 0.
+  per-frame producer under any ABI. **The builder and its NID registration were removed entirely**
+  (review of #2552): a handler whose argument roles are known to be wrong is not a neutral observer —
+  registering it moves the call off the unregistered-NID path that would otherwise report it, so the
+  guess would have been inherited as a decoded contract. The call is left unregistered.
 - **The composite's scene-colour T# is stale or mis-derived — argued from `rtt-guestpeek`
   provenance.** *The conclusion is right; THIS derivation is not, and it is the derivation that would
   have been inherited.* The argument was: the working `0x20431c0000` and the empty `0x2063380000`

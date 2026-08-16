@@ -217,8 +217,11 @@ The fix was to admit the control, not to write a lowering: `ROW_ROR:8` (`0x128`)
 `(row_lane - 8) mod 16`, so `ROW_ROR:8` **is** `ROW_XMASK:8`, and `subgroup_row_ror8` had always been
 written as an XOR of the lane id. Every stride below 16 touches only bits 0..3, so the source lane
 stays inside its own architectural DPP16 row — which is what makes the whole family exact
-*independently of the host subgroup width*, and it was never specific to 8. `XMASK:0` is excluded
-deliberately: it is the identity, so its result cannot be distinguished from a decode error.
+*independently of the host subgroup width*, and it was never specific to 8. `XMASK:0` is **included**:
+it is the identity permutation, and lowering it as a lane-XOR by 0 is what the hardware does. An
+earlier revision excluded it so an identity result could not be mistaken for a decode error, but
+excluding it does not fail visibly either — it falls through to the generic reject and names a
+defined control as unsupported, which is the worse signal of the two.
 
 ## Ruled out
 

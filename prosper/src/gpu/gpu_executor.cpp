@@ -2124,15 +2124,26 @@ inline void note_compute_program_outcome(uint64_t code_addr, bool executed,
 }
 
 // PROSPER_COMPUTE_BINDS=<hex addr>[,<hex addr>…] — name every compute program that binds one of these
-// guest addresses, executed or skipped, with the binding's class and size.
+// guest addresses, with the binding's class and size and what became of the dispatch.
 //
 // The question it answers is "who was supposed to write this surface". A render-target census sees
 // draws, the write watches see DMA/WRITE_DATA/RELEASE_MEM, and between them a surface produced by a
 // compute STORE is invisible: its address appears only inside a dispatch's resource table, which
 // nothing enumerates. GTA V's 4K HDR scene colour 0x2063380000 is the case -- sampled 24x per
 // composite, written by nothing any existing instrument can see.
+//
+// WHAT ITS NULL DOES AND DOES NOT COVER. The instrument reads the *resource table*, so it can only
+// see bindings the resource build resolved. For a program whose recompile failed, that table is
+// built from a walk that is itself incomplete -- PROSPER_DYNTRACE_FAIL measured 15 of 21 image ops
+// recovered for 0x205b5e8600 and 4 of 6 for 0x205b657200 -- so a `partial-recompile-empty` row is a
+// lower bound on that program's bindings, and the ABSENCE of a row for such a program is not
+// evidence that it does not bind the address. Only `executed` and `skipped-descriptors` rows come
+// from a fully resolved table. Read a null across a failing-shader population as "unproven", never
+// as "cleared". CONFIDENCE: HIGH (the coverage gap is measured, not assumed).
+enum class ComputeBindOutcome { Executed, SkippedDescriptors, RecompileEmpty };
+
 inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourceTable* resources,
-                                         bool executed) {
+                                         ComputeBindOutcome outcome) {
     struct Watch { std::vector<uint64_t> addrs; };
     static const Watch watch = [] {
         Watch w;
@@ -2156,18 +2167,26 @@ inline void report_compute_binding_watch(uint64_t code_addr, const ShaderResourc
         const uint64_t end = begin + (resource.size ? resource.size : 1);
         for (const uint64_t want : watch.addrs) {
             if (!begin || want < begin || want >= end) continue;
+            // Dedup on every dimension the line reports. Keying on (program, resource) alone loses
+            // real observations: two watched addresses inside ONE resource span collapse to whichever
+            // matched first, and an early skip suppresses the later executed row for the same pair --
+            // so the surviving line reads `outcome=skipped-*` for a program that went on to run.
             static std::mutex mutex;
-            static std::set<std::pair<uint64_t, uint64_t>> reported;
+            static std::set<std::tuple<uint64_t, uint64_t, uint64_t, int>> reported;
             std::lock_guard lock(mutex);
-            if (!reported.insert({code_addr, resource.gpu_addr}).second) continue;
+            if (!reported.insert({code_addr, resource.gpu_addr, want, (int)outcome}).second) continue;
+            const char* outcome_name = outcome == ComputeBindOutcome::Executed ? "executed"
+                                     : outcome == ComputeBindOutcome::SkippedDescriptors
+                                           ? "skipped-descriptors"
+                                           : "partial-recompile-empty";
             std::fprintf(stderr,
                          "[compute-binds] 0x%llx bound by program=0x%llx binding=%u class=%u "
-                         "addr=0x%llx size=%llu %ux%u fmt=%u executed=%d\n",
+                         "addr=0x%llx size=%llu %ux%u fmt=%u outcome=%s\n",
                          (unsigned long long)want, (unsigned long long)code_addr, resource.binding,
                          static_cast<unsigned>(resource.cls),
                          (unsigned long long)resource.gpu_addr,
                          (unsigned long long)resource.size, resource.width, resource.height,
-                         static_cast<unsigned>(resource.format), (int)executed);
+                         static_cast<unsigned>(resource.format), outcome_name);
         }
     }
 }
@@ -8143,6 +8162,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  "recompile-empty");
             record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv,
                            &config);
+            // Report the bindings a recompile-failed program DID resolve. Without this call the one
+            // population the watch is most often pointed at -- the failing shaders -- produced no rows
+            // at all, so its silence read as "these programs do not bind the address" when the
+            // instrument had simply never looked at them. The row is labelled partial because the
+            // table behind it is incomplete by construction (see the contract above the function).
+            report_compute_binding_watch(code_addr, item.resources.get(),
+                                         ComputeBindOutcome::RecompileEmpty);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
             // const-fold walk trace + user-data dump forced on (once per distinct program) — the
             // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp).
@@ -8335,7 +8361,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
             note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
                                         launch.groups_z, launch.local_x, launch.local_y);
-            report_compute_binding_watch(code_addr, item.resources.get(), false);
+            report_compute_binding_watch(code_addr, item.resources.get(), ComputeBindOutcome::SkippedDescriptors);
             continue;
         }
         // Image bindings (sampled textures + storage images) execute through the live backend's
@@ -8343,7 +8369,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // loudly and per-item, without aborting the rest of the batch.
         note_compute_program_outcome(code_addr, true, launch.groups_x, launch.groups_y,
                                     launch.groups_z, launch.local_x, launch.local_y);
-        report_compute_binding_watch(code_addr, item.resources.get(), true);
+        report_compute_binding_watch(code_addr, item.resources.get(), ComputeBindOutcome::Executed);
         items.push_back(std::move(item));
     }
     return items;

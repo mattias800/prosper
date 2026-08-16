@@ -982,9 +982,13 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 // bits 0..3, so the source lane stays in its own architectural DPP16 row for all of
                 // them, which is the property the ROR:8 form already relied on.
                 //
-                // XMASK:0 (0x160) stays out: it is the identity, so its result is
-                // indistinguishable from a decode error, and this predicate is meant to fail
-                // visibly. Live evidence for the widening is GTA V PPSA04263 kernels 0x205b545c00
+                // XMASK:0 (0x160) is admitted with the rest of the family. It is the identity
+                // permutation, and an earlier revision excluded it on the grounds that an identity
+                // result is indistinguishable from a decode error -- but exclusion does not fail
+                // visibly either, it falls through to the generic reject with the encoding named as
+                // unsupported, which is a WORSE signal for a control the family plainly defines.
+                // Admitting it lowers to a lane-XOR by 0, which is exactly what the hardware does.
+                // Live evidence for the widening is GTA V PPSA04263 kernels 0x205b545c00
                 // (pc=90) and 0x205b54ee00 (pc=98), both V_MIN_F32 ROW_XMASK:4, full masks, BC=1 --
                 // 1920x1080 screen-space dispatches that never executed on a routed boot.
                 const uint32_t vop1_opcode = (w >> 9) & 0xffu;

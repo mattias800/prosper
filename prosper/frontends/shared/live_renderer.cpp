@@ -688,8 +688,8 @@ bool persistent_texture_decode_cache_eligible(bool guest_decode_candidate,
 //
 // A descriptor's base field holds the address shifted right by 8, so a surface's candidates are
 // findable by matching that dword. Use the result as a lead to follow, not as a census.
-void scan_for_descriptors_once(uint64_t frame_index) {
-    struct Spec { std::vector<uint64_t> bases; uint64_t at_frame = 0; };
+void scan_for_descriptors_once(uint64_t submit_index) {
+    struct Spec { std::vector<uint64_t> bases; uint64_t at_submit = 0; };
     static const Spec spec = [] {
         Spec parsed;
         const char* text = getenv("PROSPER_SCAN_DESCRIPTOR");
@@ -701,13 +701,16 @@ void scan_for_descriptors_once(uint64_t frame_index) {
             parsed.bases.push_back(value);
             cursor = (*end == ',') ? end + 1 : end;
         }
-        const char* at = getenv("PROSPER_SCAN_DESCRIPTOR_AT_FRAME");
-        parsed.at_frame = at ? strtoull(at, nullptr, 10) : 6000;
+        // SUBMITS, not frames: the caller passes g_this_submit. Named for what it counts -- the two
+        // differ by more than an order of magnitude on a routed run, so a threshold read as frames
+        // fires at a moment the operator did not ask for.
+        const char* at = getenv("PROSPER_SCAN_DESCRIPTOR_AT_SUBMIT");
+        parsed.at_submit = at ? strtoull(at, nullptr, 10) : 6000;
         return parsed;
     }();
     if (spec.bases.empty()) return;
     static std::atomic<bool> done{false};
-    if (frame_index < spec.at_frame || done.exchange(true)) return;
+    if (submit_index < spec.at_submit || done.exchange(true)) return;
 
     // The guest's direct-memory mapping, discovered by probing rather than assumed: walk 2 MiB steps
     // over the region PS5 titles map and keep the readable spans.
@@ -741,9 +744,9 @@ void scan_for_descriptors_once(uint64_t frame_index) {
         }
     }
     fprintf(stderr,
-            "[descr-scan] examined %zu MiB over %zu fully-readable spans at frame %llu; %zu span(s) "
+            "[descr-scan] examined %zu MiB over %zu fully-readable spans at submit %llu; %zu span(s) "
             "SKIPPED (unmapped or partially mapped) -- negatives are NOT exhaustive\n",
-            scanned_mb, spans, (unsigned long long)frame_index, skipped_spans);
+            scanned_mb, spans, (unsigned long long)submit_index, skipped_spans);
     for (const uint64_t base : spec.bases) {
         fprintf(stderr,
                 "[descr-scan] 0x%llx: %llu CANDIDATE word(s) match its base field, %zu distinct "
