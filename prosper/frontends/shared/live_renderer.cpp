@@ -6732,8 +6732,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::snprintf(needle, sizeof needle, "0x%llx",
                                           (unsigned long long)pass_bases[slot]);
                             if (dump_spec.find(needle) != std::string::npos) {
+                                static std::map<uint64_t, size_t> slot_busiest;
                                 static std::map<uint64_t, int> slot_counted;
-                                if (slot_counted[pass_bases[slot]]++ % dump_pass_every == 0) {
+                                const bool slot_peak = pass.size() > slot_busiest[pass_bases[slot]];
+                                if (slot_peak) slot_busiest[pass_bases[slot]] = pass.size();
+                                if (slot_peak &&
+                                    slot_counted[pass_bases[slot]]++ % dump_pass_every == 0) {
                                     const std::vector<uint8_t> shot = inspection_rgba8(
                                         pixels, gw, gh, pass_formats[slot]);
                                     const char* dir = getenv("PROSPER_FRAME_DIR");
@@ -6892,8 +6896,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             std::snprintf(needle, sizeof needle, "0x%llx",
                                           (unsigned long long)base);
                             if (dump_spec.find(needle) != std::string::npos) {
+                                // Keep the occurrence with the MOST DRAWS, not the last. A
+                                // G-buffer target is written by one heavy pass and then touched by
+                                // several small ones, so "last write wins" reliably captures a
+                                // near-empty tail and reads as "this channel is empty" -- which it
+                                // did, for three channels that a draw census showed at 54%.
+                                static std::map<uint64_t, size_t> busiest;
                                 static std::map<uint64_t, int> counted;
-                                if (counted[base]++ % dump_pass_every == 0) {
+                                const bool new_peak = pass.size() > busiest[base];
+                                if (new_peak) busiest[base] = pass.size();
+                                if (new_peak && counted[base]++ % dump_pass_every == 0) {
                                     const std::vector<uint8_t> shot = inspection_rgba8(
                                         rendered_pixels, gw, gh, pass_format);
                                     const char* dir = getenv("PROSPER_FRAME_DIR");

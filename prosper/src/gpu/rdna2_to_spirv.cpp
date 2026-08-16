@@ -14416,9 +14416,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 (in.opcode != 0x00 && !storage_only_op && in.opcode != 0x0e &&
                  res && res->cls != ResourceClass::Texture))
                 res = nullptr;
-            if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
-                && getenv("PROSPER_DBG")) {
+            if (!res || (res->cls != ResourceClass::Texture &&
+                         res->cls != ResourceClass::StorageImage)) {
                 // Resolution-failure diagnostic: which provenance step failed for this image op.
+                //
+                // Ungated, and deduped per (pc, srsrc). It fires only when an image op has already
+                // failed to resolve, so its volume is bounded by the defect it reports. Behind
+                // PROSPER_DBG it was unreachable in practice on any routed boot.
+                static std::mutex mimg_mutex;
+                static std::set<std::pair<uint32_t, int>> mimg_reported;
+                bool first_report = false;
+                {
+                    std::lock_guard<std::mutex> lock(mimg_mutex);
+                    first_report = mimg_reported.emplace(in.pc, in.src[1].value).second;
+                }
+                if (!first_report) { ok = false; return true; }
                 uint32_t srt_tag = 0;
                 const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
                 const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
@@ -14740,6 +14752,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                  res->img_dim != in.mimg_dim || res->sample_count != 1u ||
                  res->declared_mip_levels != 1u || res->in_mip_tail ||
                  res->compression_enabled || (in.mimg_dim == 5u && !b.is_compute))) {
+                // Name the sub-condition. Seven terms collapse into one
+                // `mode=unresolved-operand`, and an investigation cannot act on that: "the mip is
+                // not proven zero" and "the resource declares compression" are different pieces of
+                // work. Ungated and deduped per pc, so it costs one line per declining site --
+                // PROSPER_DBG, the usual home for this, produces a ~1.5 GB log and desyncs the pad
+                // script badly enough that the route never reaches the phase being diagnosed.
+                //
+                // Measured on GTA V's 0x2042f49a00, a compute pass that reads the main depth and
+                // stencil and writes two 4K storage images the frame goes on to sample:
+                //   pc=16 shape=1 proven_zero_mip=0 ... compressed=1
+                // so exactly two terms hold it, and one of them describes guest bytes that this
+                // resource does not read -- 0x2052ac0000 resolves through the sampled-depth bridge,
+                // whose pixels come from a retained Vulkan image rather than from compressed memory.
+                static std::mutex mip_mutex;
+                static std::set<uint32_t> mip_reported;
+                bool first_mip = false;
+                {
+                    std::lock_guard<std::mutex> lock(mip_mutex);
+                    first_mip = mip_reported.insert(in.pc).second;
+                }
+                if (first_mip)
+                    std::fprintf(stderr,
+                                 "[mimg-mip] image_load_mip declined pc=%u shape=%d "
+                                 "proven_zero_mip=%d img_dim=%u/%u samples=%u mips=%u mip_tail=%d "
+                                 "compressed=%d array_in_gfx=%d\n",
+                                 in.pc, (int)rdna2_mimg_zero_mip_shape(in),
+                                 (int)res->proven_zero_mip, res->img_dim, in.mimg_dim,
+                                 res->sample_count, res->declared_mip_levels,
+                                 (int)res->in_mip_tail, (int)res->compression_enabled,
+                                 (int)(in.mimg_dim == 5u && !b.is_compute));
                 ok = false;
                 return true;
             }
