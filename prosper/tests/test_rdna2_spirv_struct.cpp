@@ -860,6 +860,37 @@ bool compute_dpp_add_row_shr_updates_dispatch_vgpr(const std::vector<uint32_t>& 
 // amount must select lane-amount inside a DPP16 row, shuffle both the value and its EXEC bit, add
 // only for EXEC-active destinations with an in-bounds active source, and otherwise keep the old
 // in-place VGPR before that value is persisted by the dispatcher.
+// The lane-XOR DPP family lowers to `shuffle(value, lane ^ stride)`. Decoder admission tests cannot
+// see the stride at all -- mutating the lowering to a constant XOR 8 leaves every admission test
+// green -- so this reads the emitted SPIR-V and requires the XOR constant to be the packet's own
+// stride, feeding a subgroup shuffle's lane operand.
+bool compute_dpp_row_xor_uses_stride(const std::vector<uint32_t>& spv, uint32_t stride) {
+    constexpr uint32_t OpConstant = 43, OpBitwiseXor = 198, OpGroupNonUniformShuffle = 345;
+    std::unordered_map<uint32_t, uint32_t> constants;      // id -> literal
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> xors;   // id -> (a, b)
+    std::vector<uint32_t> shuffle_lanes;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return false;
+        if (op == OpConstant && wc == 4) constants[spv[i + 2]] = spv[i + 3];
+        else if (op == OpBitwiseXor && wc == 5) xors[spv[i + 2]] = {spv[i + 3], spv[i + 4]};
+        else if (op == OpGroupNonUniformShuffle && wc == 6) shuffle_lanes.push_back(spv[i + 5]);
+        i += wc;
+    }
+    // The identity member still XORs -- by zero -- so requiring the constant is uniform across the
+    // family and keeps XMASK:0 distinguishable from "no lowering emitted".
+    for (uint32_t lane : shuffle_lanes) {
+        const auto x = xors.find(lane);
+        if (x == xors.end()) continue;
+        for (uint32_t side : {x->second.first, x->second.second}) {
+            const auto c = constants.find(side);
+            if (c != constants.end() && c->second == stride) return true;
+        }
+    }
+    return false;
+}
+
 bool compute_dpp_add_native_row_shr_updates_dispatch_vgpr(
     const std::vector<uint32_t>& spv) {
     constexpr uint32_t OpConstant = 43, OpLoad = 61, OpStore = 62,
@@ -2567,6 +2598,51 @@ int main() {
         printf("  [FAIL] native Wave64 CFG rejected GTA V DPP add ladders\n");
         return 1;
     }
+
+    // GTA V PPSA04263 0x205b545c00 pc=90 / 0x205b54ee00 pc=98: V_MIN_F32 row_xmask:4, full masks,
+    // BOUND_CTRL=1, in place on v1. ROW_XMASK:n is XOR n, and ROW_ROR:8 is the same permutation as
+    // XMASK:8, so one lowering serves the family -- these assert it uses the PACKET's stride.
+    ComputeShaderConfig xor_config = portable_wave64_compute_config;
+    xor_config.local_x = 64;
+    xor_config.native_subgroup_size = 64;
+    const uint32_t dpp_row_xmask4[] = {
+        0x7e020281u,                     // v_mov_b32 v1, 1
+        0x1e0202fau, 0xff096401u,        // v_min_f32 v1, v1 row_xmask:4 bound_ctrl:1, v1
+        0xbf810000u,                     // s_endpgm
+    };
+    const auto xmask4_spv = recompile_compute(dpp_row_xmask4, std::size(dpp_row_xmask4),
+                                              nullptr, xor_config);
+    if (xmask4_spv.empty() || !compute_dpp_row_xor_uses_stride(xmask4_spv, 4u)) {
+        printf("  [FAIL] ROW_XMASK:4 did not lower to a shuffle of lane ^ 4\n");
+        return 1;
+    }
+    // The identity member lowers through the same seam with stride 0. A lowering hard-wired to any
+    // single stride fails one of these two.
+    const uint32_t dpp_row_xmask0[] = {
+        0x7e020281u,
+        0x1e0202fau, 0xff096001u,        // v_min_f32 v1, v1 row_xmask:0 bound_ctrl:1, v1
+        0xbf810000u,
+    };
+    const auto xmask0_spv = recompile_compute(dpp_row_xmask0, std::size(dpp_row_xmask0),
+                                              nullptr, xor_config);
+    if (xmask0_spv.empty() || !compute_dpp_row_xor_uses_stride(xmask0_spv, 0u)) {
+        printf("  [FAIL] ROW_XMASK:0 did not lower to a shuffle of lane ^ 0\n");
+        return 1;
+    }
+    // And ROW_ROR:8, the family's original member, must still lower to XOR 8 -- the widening must not
+    // have moved the case that already worked.
+    const uint32_t dpp_row_ror8_min[] = {
+        0x7e020281u,
+        0x1e0202fau, 0xff092801u,        // v_min_f32 v1, v1 row_ror:8 bound_ctrl:1, v1
+        0xbf810000u,
+    };
+    const auto ror8_spv = recompile_compute(dpp_row_ror8_min, std::size(dpp_row_ror8_min),
+                                            nullptr, xor_config);
+    if (ror8_spv.empty() || !compute_dpp_row_xor_uses_stride(ror8_spv, 8u)) {
+        printf("  [FAIL] ROW_ROR:8 no longer lowers to a shuffle of lane ^ 8\n");
+        return 1;
+    }
+    printf("  [ok]   DPP lane-XOR family lowers with the packet's own stride (0, 4, 8)\n");
 
     std::vector<uint32_t> gta_compute_dpp_distinct_source = gta_compute_dpp_add_cfg;
     std::vector<uint32_t> gta_compute_dpp_bound_ctrl = gta_compute_dpp_add_cfg;

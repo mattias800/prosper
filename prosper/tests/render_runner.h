@@ -2527,6 +2527,17 @@ inline std::mutex& ds_layer_stride_mutex() {
 // Records a stride, and reports a DISAGREEMENT rather than silently taking the newer one: two views
 // of one allocation that differ about the stride mean a decode error somewhere, and quietly
 // overwriting would turn that into wrong invalidation ranges instead of a visible complaint.
+// A LATER observation replaces an earlier one. The registry is keyed by guest base and lives for the
+// process, so a base is not a stable identity: the guest frees an allocation and maps another at the
+// same address, and the entry then describes memory that no longer exists. Keeping the first value
+// made that stale stride permanent, and the consequence is not the safe direction -- the stride sizes
+// the range an invalidation covers, so a wrong one either leaves stale pixels resident
+// (under-invalidation) or evicts a neighbouring slice that was still good (over-invalidation).
+//
+// A stride observed NOW describes the allocation that exists now, which is the best available claim
+// about the surface being invalidated. The conflict is still reported once per base, because a
+// genuine disagreement between two live views is a decode error worth seeing; what changed is which
+// value survives it.
 inline void note_ds_layer_stride(uint64_t base, uint64_t stride) {
     if (!base || !stride) return;
     std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
@@ -2535,10 +2546,11 @@ inline void note_ds_layer_stride(uint64_t base, uint64_t stride) {
         static std::set<uint64_t> complained;
         if (complained.insert(base).second)
             std::fprintf(stderr,
-                         "[ds-stride] CONFLICT base=0x%llx had %llu, now told %llu; keeping the "
-                         "first\n",
+                         "[ds-stride] base=0x%llx had %llu, now told %llu; taking the later value "
+                         "(a base is reused, so the newer observation describes the live surface)\n",
                          (unsigned long long)base, (unsigned long long)it->second,
                          (unsigned long long)stride);
+        it->second = stride;
     }
 }
 inline uint64_t ds_layer_stride_for(uint64_t base) {

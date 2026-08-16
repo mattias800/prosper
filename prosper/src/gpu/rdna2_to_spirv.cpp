@@ -7908,8 +7908,9 @@ enum class DppRowRor8Op : uint32_t {
 // definition, and XOR 8 is exactly (row_lane - 8) modulo 16, so ROW_ROR:8 IS ROW_XMASK:8. The
 // emitter already lowered the 8 case through an XOR; this only lets the other strides reach it.
 //
-// XMASK:0 is excluded deliberately -- it is the identity, so admitting it would add a control that
-// cannot be distinguished from a decode error by its result. Fail closed on it like everything else.
+// XMASK:0 is included: its stride is the identity, which is a legal permutation. It was once excluded
+// because a no-op is hard to tell from a decode error BY ITS RESULT -- a statement about diagnosis,
+// not about whether the guest may issue the instruction.
 // Membership and stride are SEPARATE answers. Folding them into one return made 0 mean both "stride
 // zero" and "not in this family", which excluded ROW_XMASK:0 -- a legal member whose stride happens to
 // be the identity. That is a representation artifact, not a semantic reason to refuse a guest

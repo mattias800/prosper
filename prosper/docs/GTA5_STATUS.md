@@ -3357,91 +3357,23 @@ falsification.
   pixels; it is a bridge-health improvement whose visual effect is nil.
   (The arm remains default-**on**, i.e. historical behaviour, because separating a fast clear from a
   compute HiZ refresh needs HTILE decoded, and only the first justifies discarding depth.)
-- **`0x205b658800`'s M0 read is a pure save/restore, so any value will do.** *Solid, and it was my own
-  proposal.* `pc=82 s_mov_b32 s6, m0` is immediately followed by `pc=83 s_movk_i32 m0, 0`, which reads
-  as a textbook save around a clobbering sequence — and `pc=232 s_mov_b32 m0, s6` does restore it. But
-  the program then uses `s6` **as data** at `pc=263` and `pc=266` (VOP2 sources), and nothing rewrites
-  `s6` between the restore and those uses. The launch value of M0 is read back and computed with. So
-  resolving an untracked M0 to a fabricated 0 would produce silently wrong arithmetic in exactly the
-  kernel the change was meant to enable, which is the worst failure direction available — it computes
-  instead of rejecting. Two tests already refuse the general form (`rdna2_spirv_struct`: M0 carries the
-  GDS append base in `[31:16]` and the LDS base in `[15:0]`, and the exact `v_writelane_b32 v20, m0, 1`
-  site requires a *proven* scalar). **The blocker is not the lowering — it is that nothing here knows
-  the Gen5 compute launch value of M0.** Until that is evidence rather than a guess, this kernel stays
-  rejected.
-- **The lighting resolve's empty output is a readback artifact.** *Solid, and it was the right
-  suspicion.* `[rtt] pass`'s counters come from `rendered_pixels`, which is EMPTY when a readback is
-  deferred, so `px_nonzero=0 rgb_nonblack=0` was ambiguous with "we never looked". The `src=<bytes>`
-  field settles it per pass, and the first run separated the two cases in opposite directions:
-  `0x20431c0000` is **read back on 760 of 760 passes**, so the lighting finding is real and now rests
-  on evidence that could have refuted it — of 122 read-back passes with 15+ draws (the G-buffer
-  resolve) only **10** carry colour, while 470 of 638 small 1-4 draw passes on the same target do.
-  Meanwhile `0x2067e40000` — a full-screen draw I was about to investigate for "reads a populated
-  texture, writes nothing" — is **not read back on 56 of 57 passes**, and that lead is void.
-- **The lighting resolve is black because its shadow cascades are empty.** *Solid.* The natural
-  reading: the six cascades it samples all report `MISS -- guest bytes`, and a shadow-map zero is the
-  NEAR plane, so every shadow test would read "occluded" and the pass would emit black over a perfect
-  G-buffer. `PROSPER_RTT_GUESTPEEK` measures the guest backing directly and it is **populated**:
-  `0x20954c0000` 100% non-zero, `0x2094ec0000` 100%, `0x20948c0000` 100%, `0x20945c0000` 100%,
-  `0x208f340000` 83.3%, `0x2093cc0000` 50% (one outlier, `0x2094bc0000`, is 0%). The miss path reads
-  real shadow data. Note this also means the existing `PROSPER_DS_UNBRIDGED_FAR` discriminator cannot
-  speak to these surfaces at all — it fires only for addresses that ARE a retained DS plane, and these
-  are not retained.
-- **`PROSPER_DS_HTILE_INVALIDATE=0` is neutral.** *Superseded — it is HARMFUL, and the original
-  measurement was phase-biased.* The neutral result was taken on a 200 s route, i.e. mostly loading.
-  Re-run at 400 s against two controls: SCANOUT `rgb_nonblack` **1,958,474** and **1,955,614** for the
-  controls — agreeing to **0.15%**, so the metric is stable at this phase — against **1,397,471** for
-  the arm, a **29% loss**. Keeping HTILE invalidation ON (the default) is right, and the arm is
-  retired as a candidate fix rather than merely unhelpful.
-  This also corrects a methodological claim of mine: **this title's run-to-run variance at 400 s is
-  small (0.15%)**. The large spread I attributed to variance earlier was the 200 s phase problem, so
-  differences above ~1% at 400 s are real and worth acting on.
-- **The fresh-image depth value is the defect; supplying the observed clear value fixes it.** *Solid,
-  and this retires the whole depth-clear line.* The strongest-looking lead in this document: the
-  resolve gets a freshly created attachment, its mixed GREATER/LESS draws cannot share one initial
-  value, and `PROSPER_DEPTH_CLEAR=0.0` took it from 10 of 122 read-back passes with colour to 68 of
-  126 **at full 4K coverage** while 1.0 took it to 0 of 124.
-  So the value was supplied properly rather than forced: a clear-hint registry keyed by depth base,
-  written when a uniform HTILE fast clear is observed (word `0x00000000` → 0.0, the reverse-Z far
-  plane, consistent with the measured forward `vp{min=0 max=1}` viewport and GREATER compares), and
-  consumed after the explicit-enable branch and before the #371 approximation. It worked exactly as
-  designed — **70 of 130 passes with colour, max 8,294,400 (100%)**, reproducing the forced arm — and
-  **246/246 stayed green.**
-  **Then I opened the frame: a white blob, blue haze, no world geometry, and the radar GONE.** The
-  buffer fills with something that blooms. Identical in appearance to `PROSPER_NO_DEPTH=1`. Reverted.
-  **What this kills is bigger than the patch:** the `DEPTH_CLEAR=0.0` result that motivated three
-  separate attempts was bloom all along, and no amount of choosing a better initial depth value will
-  render this world. See instrument trap 181 — I had already recorded that these counters cannot
-  separate world from bloom, and still had to be shown it a second time by the image.
-- **A `gpu-preserving` writeback is invalidating the depth, so sparing it will help.** *Solid.* The
-  premise is right and interesting: `PROSPER_GUEST_WRITE_WATCH` with a **positive control** (the HTILE
-  base, which fires) shows the writes that invalidate this title's 4K scene depth come from prosper's
-  **own** compute writeback — `compute-writeback(cpu-fill)` and `gpu-preserving`, 655,360 bytes on
-  `0x2055310000`. The emulator discards its own rendered depth in response to its own bookkeeping, and
-  a write whose caller *proved* the bytes unchanged cannot encode a new fast clear. So the fix was
-  plumbed: a `guest_gpu_write_is_preserving()` flag around the observer call, consumed only on the
-  HTILE path and only when the depth and stencil planes are untouched.
-  **It is inert.** Total scene-depth invalidations across three same-route runs: **2,497** (no HTILE
-  work), **2,253** (expand-pattern fix), **2,299** (expand + preserving) — the second change is inside
-  the run-to-run spread. The `gpu-preserving` origin is a small minority of these writes;
-  `compute-writeback(cpu-fill)` dominates. Reverted rather than left as dead API.
-- **An unimplemented Sony stub is gating the missing conversion pass.** *Solid.* The natural next
-  hypothesis once the defect moved to guest logic: 22 NIDs answer 0, and one of them could be the
-  input to the decision. Call counts say no. `PROSPER_PROGRESS=100 PROSPER_PROGRESS_UNIMPL=1` dumps
-  the per-NID table (it rides the heartbeat and needs ~12 of them, so a coarse `PROSPER_PROGRESS`
-  never reaches it): over a 400 s routed boot **every unimplemented NID is called once or twice**,
-  the sole exception being `libSceRemoteplay::g3PNjYKWqnQ` at 19. `libSceAgc::MlEw1feXcjg`
-  (`sceAgcQueueEndOfPipeActionPatchData`) — the most plausible GPU-gating candidate — is called
-  **once**. Nothing is polled per frame, so no stub is positioned to gate a per-frame pass.
-  (`libSceAgc::Ikfdt-rIqCE` remains unidentified: it is in no library of the 3.20 firmware dump.)
-- **One of the never-executing compute kernels writes the scene colour.** *Solid.* This was the
-  last standing candidate after every draw, DMA and resolve path came back empty, and it had a real
-  gap behind it: `PROSPER_COMPUTE_BINDS` enumerates *resolved* resource tables, and those kernels are
-  exactly the ones whose tables fail to resolve, so that instrument was void for them (recorded
-  above). Closed with a different one: `PROSPER_DYNTRACE_FAIL=1` **with no address filter** traces
-  every failed program in a single run and prints each MIMG's decoded T# base. Across all seven,
-  **zero mention of `0x2063380000`**, against 20+ distinct bases printed — so the instrument
-  demonstrably worked and the null is about the title. No failing compute kernel binds it.
+- **`0x205b658800`'s M0 read is consumed as data, so a fabricated value is unsafe.** *RETRACTED — the
+  read is a pure save/restore after all, and the retraction is more instructive than the entry.*
+  I withdrew a proposed M0 fix on the grounds that the saved value is used as data: `pc=82` saves M0
+  into `s6`, `pc=232` restores it, and `pc=263`/`pc=266` then appear to consume `s6` as VOP2 sources
+  with nothing writing it in between. **That reading is wrong.** `pc=261` and `pc=264` are VOP3
+  opcode `0x360` — `v_readlane_b32 s6, v31, N` — which is an architectural **SGPR** write, so `s6` is
+  dead before `pc=263` and the launch value really is only round-tripped.
+  **How the error was made is the point.** I checked the claim with `shader_inspect`, whose generic
+  operand printer spells that destination `dst=vgpr:6`. That is the decoder's own representation, not
+  an ISA oracle — and this repo already knows better in two places: `rdna2_decode.cpp:127`
+  (*"v_readlane_b32 writes an SGPR"*) and the emitter at `rdna2_to_spirv.cpp:11620`, which treats the
+  destination as `sDST`. **Validating a decoder's output with that decoder's own listing is not a
+  check**, which the charter says in as many words; an independent disassembly (`llvm-mc -mcpu=gfx1030`)
+  settles it in one command. Caught in review (#2552).
+  **Consequence:** the M0 poison-tag approach is viable again and should be reconsidered — resolve an
+  untracked M0 to 0 while marking the destination unproven, so a restore is harmless while
+  `V_WRITELANE` and descriptor uses still reject.
 - **The composite's scene-colour T# is stale, mis-derived, or points somewhere prosper invented.**
   *Solid, and this is the version to cite* — it supersedes the provenance argument in the entry
   further down, which reached the right answer by a route that does not establish it (see the note
