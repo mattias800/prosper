@@ -2167,7 +2167,13 @@ HLE(k_pthread_create) {
     // The trampoline enters guest code on an explicit Sony stack. The host pthread itself retains a
     // glibc-owned stack large enough for static TLS and native start/exit bookkeeping.
     int attr_rc = pthread_attr_setstacksize(&la, supplied_stack ? kStackFloor : ssz);
-    if (attr_rc) { pthread_attr_destroy(&la); return (uint64_t)(unsigned)attr_rc; }
+    // fbsd_errno, not the raw host number (#1612): the sibling failure paths below already map, and
+    // this one is the last of #2178's three "raw host errno" rows. It matters more here than at the
+    // other two because this body is ALREADY aliased -- `scePthreadCreate` was therefore reporting
+    // `0x80020000 | <host errno>` on this path, the exact "worse than the bare value it replaces"
+    // outcome #2178 warns about. Benign today (pthread_attr_setstacksize reports EINVAL, which is 22
+    // on FreeBSD and on every host prosper builds for), which is also why no test arm can see it.
+    if (attr_rc) { pthread_attr_destroy(&la); return fbsd_errno(attr_rc); }
     pthread_attr_setdetachstate(&la, detach);
     auto* ts = new (std::nothrow) ThreadStart{};
     if (!ts) { pthread_attr_destroy(&la); return 12; }         // ENOMEM (FreeBSD and host agree)
