@@ -1619,11 +1619,13 @@ if(TARGET prosper_core)
       # Real runtime PRX loading (#639). Hermetic: the test writes its own synthetic PRX outside
       # Media/Plugins, so it needs no game dump — but it maps that module at the fixed runtime-module
       # base and EXECUTES its module_start, whose bytes the test emits by hand, so it is host-x86-64
-      # only. Its scratch root goes in the build tree, never /tmp.
+      # only. Its scratch root goes in the build tree, never /tmp — no path is passed here, so the
+      # test derives one per process from tests/test_scratch.h. Passing a fixed
+      # "${CMAKE_CURRENT_BINARY_DIR}/runtime-prx-test-root" is what #2582 was about: two ctest runs
+      # against one build directory then shared the .prx they each write and map.
       add_executable(test_runtime_prx_load tests/test_runtime_prx_load.cpp)
       target_link_libraries(test_runtime_prx_load PRIVATE prosper_core)
-      add_test(NAME runtime_prx_load
-               COMMAND test_runtime_prx_load "${CMAKE_CURRENT_BINARY_DIR}/runtime-prx-test-root")
+      add_test(NAME runtime_prx_load COMMAND test_runtime_prx_load)
     endif()
 
     # Regression test for the real setjmp/longjmp impl (x86-64 asm; used by the GC's root scan).
