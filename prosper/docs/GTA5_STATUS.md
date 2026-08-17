@@ -889,8 +889,11 @@ depends on those three has not been established.
 ### The instrument that would answer this — THREE sequential gates, each masking the next (2026-08-16)
 
 `PROSPER_GRAB_BUNDLE_AFTER_MS` on `prosper-app` is the documented fastest loop for "why does this
-frame look wrong", and on this title it fails **twice, for unrelated reasons**. Each failure reads as
-"frame capture does not work on GTA V", which is why the first one hid the second for a day.
+frame look wrong", and on this title it fails **three times, for unrelated reasons**. Each failure
+reads as "frame capture does not work on GTA V", and because they are **sequential** every fix reveals
+the next one rather than the bundle: clear the empty window and you meet the provenance abort, clear
+provenance and you meet the byte budget. That masking is why this took several runs to walk, and why
+the third gate — which no setting can clear — was the last to be seen.
 
 **Gate 1 — the capture window is a PRESENT COUNT, and a present count is not a unit of time.**
 Earlier attempts at 170 s with `PROSPER_CAPTURE_FRAMES=1` and 16 reported *"the capture window
