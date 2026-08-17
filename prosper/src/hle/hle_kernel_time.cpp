@@ -539,6 +539,14 @@ HLE(k_ok)              { return 0; }                       // generic success no
 // different answer, not which ones do, and "441 sites" is a lower bound on reach (it follows one
 // stub level and one call deep). The `test eax,eax` half matters as much as the errno half — it is
 // the plain defensive form of the same gate and never mentions 0x805A1001.
+// RE-MEASURED 2026-08-17 (PR #2637), and it moved in the direction that strengthens this: the scan
+// used to stop at the first branch, so a site that tested generically and compared the errno inside
+// its ERROR ARM was counted in the `test eax,eax` half. Reading the arms, the same 445 sites across
+// the same 66 modules split const=307 / nonzero=82 / gate-open=43 / undecodable=13, against
+// const=237 / nonzero=208 with `--no-follow-arms`. So **70 more sites name 0x805A1001 than this
+// paragraph could see**, and the 43 `gate-open` + 13 `undecodable` are honestly unresolved rather
+// than counted as insensitive. (The 441/204 recorded above is the older reading; the site total has
+// since drifted by four, which was not investigated.)
 //
 // What prosper can honestly answer is which ids the guest asked it to load. The sysmodule id space
 // is the set of *optional* modules an application must request; the always-resident libraries

@@ -724,13 +724,31 @@ split, and it is deliberately a **three**-way one, not two:
 #                 undecodable=2699
 ```
 
-**Not-gated is not the same as cleared.** Only the **157** `ignored`-only rows are struck off; the
-**132** unresolved rows carry at least one `forward` window (the result left the window still live —
-returned, spilled or tail-jumped, so the gate is in a caller) or at least one `undecodable` one, and
-**2,699 of the 24,308 windows — 11.1% — are undecodable**, which is a void sample rather than a
-negative. Anyone narrowing the candidate list from this table must work through those 132 by hand
-rather than treat the 247 as the whole search space. Two further properties matter more than the
-numbers:
+**Re-measured 2026-08-17 (PR #2637): the scan now reads the error arm, and most of that
+`undecodable` share was an artifact of the instrument, not a property of the module.** Same module,
+same 24,308 windows, same 536 called imports:
+
+```text
+#   254 gated, 202 ignored-only (cannot matter), 80 neither (no gate, and >=1 site not cleared)
+#   180 rows carry >=1 site the scan could not resolve (gate-open/forward/undecodable)
+#   site buckets: alu-gate=522 const=1 forward=1817 gate-open=897 ignored=18462 nonzero=2287
+#                 other-cmp=313 undecodable=9
+```
+
+`undecodable` fell from **2,699 windows to 9**: the old figure was almost entirely the *last*
+instruction of each fixed-size window being cut in half and decoding as `(bad)`/`.byte`, so the
+"11.1% of all windows are a void sample" line below was reading a truncation artifact as a finding.
+`ignored`-only rows rose 157 → 202 and the same "neither" count fell 132 → 80, because following the
+branches resolves sites that used to end at the first one. The new `gate-open` bucket is the honest
+residue: a row can gate on the result and still be unresolved, which is why **180** — not 80 — is the
+number of rows that need a hand read.
+
+**Not-gated is not the same as cleared.** Only the `ignored`-only rows are struck off; an unresolved
+row carries at least one `forward`/`gate-open` site (the result left the scan's reach still live —
+returned, spilled or tail-jumped, so the gate is in a caller) or at least one `undecodable` one,
+which is a void sample rather than a negative. Anyone narrowing the candidate list from this table
+must work through those by hand rather than treat the gated rows as the whole search space. Two
+further properties matter more than the numbers:
 
 - It is a **static upper bound on what can matter**, not a list of what runs. Cross it with the boot
   census (`hle_calls --launch --values`) before treating any row as live: the
