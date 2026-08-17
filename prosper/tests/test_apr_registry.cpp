@@ -28,6 +28,8 @@ namespace prosper {
     void        prosper_apr_reset_for_test();
     int         prosper_apr_match_by_size(uint64_t size, std::string* out_path);
     std::string prosper_apr_path_for_id(uint32_t id);
+    // #1674 test seam: live APR completion bindings recorded for one command-buffer address.
+    size_t      prosper_apr_binding_count_for_test(uint64_t cb);
 }
 using namespace prosper;
 
@@ -684,6 +686,100 @@ int main() {
             // guarded: POSIX suppresses the writes deliberately, Windows never had them.
             CHECK(out1 == kResidue && out2 == kResidue,
                   "#1629: the plain submit writes NO result slots — a2/a3 are residue, not outputs");
+        }
+    }
+
+    // #1674: a command-buffer destructor must drop the completion binding for EVERY flavor.
+    //
+    // The registry is keyed by the command buffer's guest ADDRESS. The destructor used to erase
+    // only entries with `deduplicate_completion` set — true only for the PS5 3.20 eager NID
+    // (o67gODLFpls) — so a binding made through the legacy NID (H896Pt-yB4I) survived the
+    // destructor forever. Two harms, and this block asserts both:
+    //   - the registry grows without bound, and every submit linear-scans it under a lock;
+    //   - a later, unrelated allocation that lands on the same address inherits the dead
+    //     binding's equeue/id/tag, so its submit echoes the dead tag to the dead queue instead of
+    //     handing the caller a fresh token through the result slots.
+    //
+    // The observable for the second harm is the submit path's own branch: a BOUND cb (nonzero
+    // equeue) suppresses the result slots and posts the tag; an UNBOUND cb writes a fresh token
+    // into both slots and posts nothing. So "the slots were written" IS "no binding was found",
+    // which is exactly the property under test — no equeue, no worker thread, no timing.
+    //
+    // The equeue used here is a plain nonzero sentinel, never a real SceKernelEqueue: that keeps
+    // the binding on the `tag_echo` branch (which is what suppresses the slots) while
+    // prosper_eq_post_apr_token's identity guard rejects the post, so the test cannot deliver an
+    // event to anything. The point being tested is which BRANCH submit takes, not what the queue
+    // receives.
+    {
+        HleFn bind_legacy  = Hle::lookup("H896Pt-yB4I");    // legacy: deduplicate_completion=false
+        HleFn bind_320     = Hle::lookup("o67gODLFpls");    // PS5 3.20: deduplicate_completion=true
+        HleFn destruct_apr = Hle::lookup("Qs1xtplKo0U");    // sceAmprAprCommandBufferDestructor
+        HleFn destruct_cb  = Hle::lookup("GuchCTefuZw");    // sceAmprCommandBufferDestructor
+        HleFn submit       = Hle::lookup("ASoW5WE-UPo");    // ...AndGetResult (writes result slots)
+        CHECK(bind_legacy && bind_320 && destruct_apr && destruct_cb && submit,
+              "#1674: both bind NIDs, both destructor NIDs and AndGetResult all resolve");
+
+        if (bind_legacy && bind_320 && destruct_apr && destruct_cb && submit) {
+            constexpr uint64_t kResidue = 0xdeadbeefcafef00dull;
+            // Nonzero so the binding is "bound" (submit's test is the EQUEUE, not the tag), and
+            // deliberately not a live queue so prosper_eq_identity() answers 0 and the post is
+            // dropped by its own lifetime guard.
+            constexpr uint64_t kFakeEq  = 0x5ec0ffee0000ull;
+            alignas(64) uint8_t cb_x_storage[256] = {};
+            alignas(64) uint8_t cb_y_storage[256] = {};
+            const uint64_t cb_x = (uint64_t)(uintptr_t)cb_x_storage;
+            const uint64_t cb_y = (uint64_t)(uintptr_t)cb_y_storage;
+            alignas(8) uint64_t s1 = kResidue, s2 = kResidue;
+            const uint64_t p1 = (uint64_t)(uintptr_t)&s1, p2 = (uint64_t)(uintptr_t)&s2;
+
+            // --- legacy binding: recorded, then honoured by submit (the discriminator's other pole)
+            bind_legacy(cb_x, kFakeEq, /*id=*/0x7501, /*tag=*/0x10000000000003e8ull, 0, 0);
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
+                  "#1674: a legacy H896Pt-yB4I bind records exactly one binding for the cb");
+            s1 = s2 = kResidue;
+            submit(cb_x, 1, p1, p2, 0, 0);
+            CHECK(s1 == kResidue && s2 == kResidue,
+                  "#1674 control: while the legacy binding is LIVE, submit suppresses both result "
+                  "slots (so a later write to them is a real state change, not a no-op)");
+
+            // --- the destructor must prune it. Before the fix this erased nothing.
+            destruct_apr(cb_x, 0, 0, 0, 0, 0);
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 0,
+                  "#1674: sceAmprAprCommandBufferDestructor prunes a LEGACY binding");
+
+            // --- the aliasing half: the address is reused by an unrelated buffer that never
+            //     bound anything, and its submit must behave as unbound.
+            s1 = s2 = kResidue;
+            submit(cb_x, 1, p1, p2, 0, 0);
+            CHECK(s1 != kResidue && s2 != kResidue && s1 == s2,
+                  "#1674: a cb reusing the destructed address does NOT inherit the dead binding — "
+                  "submit hands it a fresh token instead of echoing the dead tag/equeue");
+
+            // --- the 3.20 flavor keeps being pruned (the behaviour the old predicate did have),
+            //     and the other destructor NID prunes too.
+            bind_320(cb_x, kFakeEq, /*id=*/0x7501, /*tag=*/0x10000000000003e9ull, 0, 0);
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
+                  "#1674: a PS5 3.20 o67gODLFpls bind records one binding for the cb");
+            destruct_cb(cb_x, 0, 0, 0, 0, 0);
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 0,
+                  "#1674: sceAmprCommandBufferDestructor prunes a 3.20 binding (unchanged)");
+
+            // --- and it prunes ONLY the destructed buffer: a live binding on another address
+            //     must survive, or the fix would have traded a leak for a lost completion.
+            bind_legacy(cb_x, kFakeEq, 0x7501, 0x10000000000003eaull, 0, 0);
+            bind_legacy(cb_y, kFakeEq, 0x7501, 0x10000000000003ebull, 0, 0);
+            destruct_apr(cb_x, 0, 0, 0, 0, 0);
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 0 &&
+                  prosper_apr_binding_count_for_test(cb_y) == 1,
+                  "#1674: destroying one cb leaves an unrelated cb's binding intact");
+            s1 = s2 = kResidue;
+            submit(cb_y, 1, p1, p2, 0, 0);
+            CHECK(s1 == kResidue && s2 == kResidue,
+                  "#1674: the surviving binding is still HONOURED — cb_y's submit stays on the "
+                  "bound path and writes no result slots");
+            destruct_apr(cb_y, 0, 0, 0, 0, 0);
+            CHECK(prosper_apr_binding_count_for_test(cb_y) == 0,
+                  "#1674: the registry is empty for both buffers once both are destructed");
         }
     }
 
