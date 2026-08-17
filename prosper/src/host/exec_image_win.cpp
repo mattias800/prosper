@@ -24,6 +24,7 @@
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 #include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
+#include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -1336,7 +1337,10 @@ std::string describe_code_address(uint64_t address) {
     if (std::strcmp(module, "mapped/host") != 0) {
         std::snprintf(text, sizeof text, "%s+0x%llx", module,
                       (unsigned long long)prosper::guest_module_offset(address));
-        return text;
+        // #2551 — see the identical note in exec_image_linux.cpp. Kept in step deliberately: this
+        // function is the shared guest-address label, and a platform that omitted the annotation
+        // would report the same fault two different ways.
+        return std::string(text) + prosper::il2cpp::annotation_for_guest_va(address);
     }
     const auto* dos = &__ImageBase;
     const auto base = (uint64_t)(uintptr_t)dos;

@@ -231,6 +231,18 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
+  # `print(__doc__)` is a usage message only while the header is a docstring; rewritten as `#`
+  # comments it prints the literal string `None` and the tool still exits non-zero, so nothing
+  # looks broken and the caller is told nothing (#2399). Three tools have shipped that way, the
+  # last of them twice -- resolve.py regressed in #2642 inside the very change that added a line
+  # to its usage block, with nine checks green, because the only guard in the tree named xref.py.
+  # So this asks the whole tree instead of one file. Unlike ctest_gate_checker above, the scan
+  # itself is registered rather than only the selftest: the root it needs is ${CMAKE_SOURCE_DIR},
+  # known at configure time, so it runs from any build directory. --selftest runs beside it
+  # because a walk that matches nothing and a clean tree otherwise print the same thing.
+  add_test(NAME tools_usage_text
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_usage_text.py"
+                   --selftest --root "${CMAKE_SOURCE_DIR}")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
   # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
   # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
@@ -408,6 +420,28 @@ if(TARGET prosper_core)
   add_executable(test_hle_no_shadow tests/test_hle_no_shadow.cpp)
   target_link_libraries(test_hle_no_shadow PRIVATE prosper_core)
   add_test(NAME hle_no_shadow COMMAND test_hle_no_shadow)
+
+  # Runtime IL2CPP symbolication (#2551): name the C# method containing a live guest PC. The
+  # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
+  # into a silent skip. The binary doubles as the probe the agreement test drives.
+  add_executable(test_il2cpp_symbols tests/test_il2cpp_symbols.cpp)
+  target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
+  add_test(NAME il2cpp_symbol_resolution
+           COMMAND test_il2cpp_symbols
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
+  if(Python3_Interpreter_FOUND)
+    # ...and the runtime resolver must answer exactly what tools/il2cpp/resolve.py answers. They
+    # share the record set by construction (resolve.py emits the table the runtime reads), but the
+    # nearest-preceding rule, its window and its tie handling are implemented twice, so this drives
+    # both CLIs over one synthesized corpus and requires them to agree address-for-address.
+    add_test(NAME il2cpp_symtab_agreement
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/il2cpp/test_symtab_agreement.py"
+                     "$<TARGET_FILE:test_il2cpp_symbols>")
+  else()
+    prosper_add_skipped_test(il2cpp_symtab_agreement
+      "il2cpp_symtab_agreement drives tools/il2cpp/resolve.py; no Python 3 interpreter was found.")
+  endif()
 
   # Ground truth for tools/re/hle_handler_map.py: the registry register_builtin_hle() really builds
   # (#2070). Pure setup — no game dump, no GPU — so the static parser can be reconciled against the

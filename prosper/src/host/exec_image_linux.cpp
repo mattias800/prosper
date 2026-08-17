@@ -8,6 +8,7 @@
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
 #include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
+#include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -3487,7 +3488,14 @@ std::string describe_code_address(uint64_t address) {
     if (std::strcmp(module, "mapped/host") != 0) {
         std::snprintf(text, sizeof text, "%s+0x%llx", module,
                       (unsigned long long)prosper::guest_module_offset(address));
-        return text;
+        // #2551: name the C# method containing an IL2CPP address, when a symbol table was supplied
+        // (PROSPER_IL2CPP_SYMBOLS). This is the one place every existing consumer of a guest code
+        // address already funnels through — the app's fault backtrace, screenshot's, the Windows
+        // thread-trace — so wiring it here symbolicates all of them without touching any of them.
+        // Returns "" for a non-IL2CPP address and for an unconfigured run, so default output is
+        // unchanged; std::string because a method name can be far longer than `text` (PPSA24651's
+        // longest is 570 chars).
+        return std::string(text) + prosper::il2cpp::annotation_for_guest_va(address);
     }
     // Host frame. dladdr resolves the containing object and, when the symbol is exported, its name.
     Dl_info info{};
