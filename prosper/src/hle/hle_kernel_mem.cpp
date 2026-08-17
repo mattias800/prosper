@@ -338,13 +338,30 @@ namespace {
             }
         return false;
     }
-    void apr_cb_destroy_320_binding(uint64_t cb) {
+    // Drop every binding for a command buffer the guest has destructed (#1674). Deliberately NOT
+    // filtered on `deduplicate_completion`: that flag says the binding came through the PS5 3.20
+    // eager NID (o67gODLFpls), and the legacy NID (H896Pt-yB4I) leaves it false. Filtering on it
+    // made the destructor a no-op for every legacy binding, which is two defects rather than one:
+    //   - the vector never shrank, and apr_cb_submit_state linear-scans it under `state.mx` on
+    //     EVERY submit, so a title that constructs a fresh cb per read pays an unbounded scan;
+    //   - the correctness half: entries are keyed by the command buffer's guest ADDRESS. A buffer
+    //     that is freed and whose address is later reused by an UNRELATED allocation matched the
+    //     dead entry, so submitting the new buffer echoed the dead binding's tag to the dead
+    //     binding's equeue instead of handing the caller a fresh token through the result slots.
+    //     The `eq_identity` guard does not cover this — it only suppresses the post if the OLD
+    //     equeue has since been destroyed, and engines keep one long-lived APR equeue.
+    // Erasing by predicate rather than by first match is defence-in-depth: apr_cb_set_equeue
+    // updates in place, so a duplicate should be unreachable, and a destructor is exactly the
+    // wrong place to leave one behind if it ever becomes reachable.
+    // CONFIDENCE: HIGH — a destructor call is the guest stating the object is gone, and the two
+    // NIDs that reach here (Qs1xtplKo0U / GuchCTefuZw) are destructors for both binding flavors.
+    void apr_cb_destroy_binding(uint64_t cb) {
+        if (!cb) return;
         AprBoundState& state = apr_bound_state();
         std::lock_guard<std::mutex> lk(state.mx);
-        auto it = std::find_if(state.cbs.begin(), state.cbs.end(), [&](const AprBoundCb& b) {
-            return b.cb == cb && b.deduplicate_completion;
-        });
-        if (it != state.cbs.end()) state.cbs.erase(it);
+        state.cbs.erase(std::remove_if(state.cbs.begin(), state.cbs.end(),
+                                       [&](const AprBoundCb& b) { return b.cb == cb; }),
+                        state.cbs.end());
     }
     // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
     // flavors of sceAmprAprCommandBufferReadFile through ONE wrapper (identical guest-RA chains):
@@ -366,6 +383,16 @@ namespace {
     // positive crashes the listener).
     std::mutex g_apr_eventful_mx;
     std::unordered_map<uint64_t, bool> g_apr_eventful;   // req/cb ptr -> eventful (updated per ReadFile)
+}
+// Test seam for #1674: how many bindings the registry currently holds for one command-buffer
+// address. 0 after a destructor, 1 while bound. Reading it is the direct observable for the
+// leak half; the aliasing half is observed through the submit path's result slots.
+size_t prosper_apr_binding_count_for_test(uint64_t cb) {
+    AprBoundState& state = apr_bound_state();
+    std::lock_guard<std::mutex> lk(state.mx);
+    size_t n = 0;
+    for (const auto& b : state.cbs) if (b.cb == cb) ++n;
+    return n;
 }
 void prosper_apr_mark_eventful(uint64_t req, bool eventful) {
     std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
@@ -2063,7 +2090,7 @@ HLE(k_ampr_measure_write_equeue) { // sSAUCCU1dv4 = sceAmprMeasureCommandSizeWri
 }
 HLE(k_ampr_destruct_320) {
     ampr_arglog("AmprCommandBufferDestructor", a0, a1, a2, a3, a4, a5);
-    apr_cb_destroy_320_binding(a0);
+    apr_cb_destroy_binding(a0);
     ampr_cb_destroy_320(a0);
     return 0;
 }
@@ -5783,7 +5810,13 @@ HLE(k_ampr_apr_cb_construct_stub) {
 HLE(k_ampr_set_buffer_stub) {
     return ampr_arglog("N-FSPA4S3nI(SetBuffer, WINDOWS STUB)", a0, a1, a2, a3, a4, a5);
 }
-HLE(k_ampr_destruct) { ampr_cb_destroy_320(a0); return 0; }
+// #1674: this half destroyed the capacity/offset record but never the completion BINDING, so on
+// Windows no binding of either flavor was ever pruned — strictly worse than the POSIX bug, which
+// at least pruned the 3.20 ones. The binding registry has been shared by both halves since #2139
+// (`k_ampr_append_equeue_legacy`/`_320` call the same `apr_cb_set_equeue`), so the teardown must be
+// shared too: a registry one half fills and the other never empties is the divergence #2139 and
+// #1970 both existed to remove.
+HLE(k_ampr_destruct) { apr_cb_destroy_binding(a0); ampr_cb_destroy_320(a0); return 0; }
 HLE(k_ampr_getsize) {
     if (uint64_t capacity = ampr_cb_capacity(a0)) return capacity;
     // Byte-for-byte the POSIX arm's contract (#1970). The `a0 == g_apr_last_cb` test is NOT

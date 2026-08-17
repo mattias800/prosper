@@ -18,6 +18,38 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   #1895 to treat registration warnings as read failures is corrected and regression-tested by
   [#1901](https://github.com/mattias800/prosper/issues/1901).
 
+- **A generation/identity stamp on the APR completion binding would close the reused-address
+  aliasing window — false, and it cannot work at the seam that needs it.**
+  [#1674](https://github.com/mattias800/prosper/issues/1674) suggested one, by analogy with the
+  `eq_identity` equeue-lifetime guard. The analogy does not carry: `eq_identity` works because the
+  *producer* retains the value it must later re-present. Here the only key the submit path has is
+  the command buffer's guest **address** — `apr_cb_submit_state(cb, …)` receives nothing else — so
+  a generation stamped on the entry has nothing to be compared against and can never reject a
+  stale match. Making it work would require pruning at **construct** time instead, and
+  `ampr_cb_construct` is explicitly documented as also serving as a *refresh* of a live object
+  ("several SDK flows refresh a live object through a constructor-shaped call whose size slots are
+  all zero/pointers"), so pruning there would drop bindings that are still awaiting a completion —
+  reintroducing the #180/#2139 class of stall to fix a leak. The destructor is the only call that
+  states the object is gone, so pruning there (both flavors, both platform halves) is the whole
+  fix. Bounding the binding vector by capacity was rejected for the same reason: evicting the
+  oldest entry drops a live completion.
+
+- **"The APR binding leak is bounded in practice — no live title is known to grow the list" — false,
+  measured 2026-08-17.** [#1674](https://github.com/mattias800/prosper/issues/1674) recorded this on
+  the reasoning that CRI reuses a fixed array of 20 command buffers and the UE4 flows reuse pooled
+  ones. A probe over 43 local dumps (`boot_trace`, 40 s each, 29 exercised APR) found the opposite:
+  **8 titles leak legacy bindings, 13,822 entries in 40 s each** — 5,885 on `PPSA02101`, 4,335 on
+  *Nikoderiko* `PPSA23760`, 1,076 on *Little Nightmares III* `PPSA05143` — and every entry is
+  rescanned under `state.mx` by every later submit. The leak was live on roughly a third of the
+  titles that touch APR, and it grew with session length. Fixed by
+  [#2560](https://github.com/mattias800/prosper/pull/2560).
+  The *aliasing* half of the same issue is the part that really was unhit: over the same sweep, the
+  divergent case (a legacy binding destructed, not re-bound, then submitted) occurred **0 times**,
+  while the looser "submit for an address that had any destructor called on it" occurred **13,486
+  times across 15 titles** — so the pattern is reachable and the guests simply keep their legacy-bound
+  and destruct-reused buffer pools disjoint. **Do not re-run this sweep to re-establish either half**;
+  re-run it only to test a *new* binding-lifetime change.
+
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
 
 DOLL now boots fully and runs a **stable frame loop**. Two blockers cleared this session:
