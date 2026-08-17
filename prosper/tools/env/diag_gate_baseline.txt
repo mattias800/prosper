@@ -28,12 +28,33 @@
 # the pair delivered. A shared family cannot be the end of an argument, so it does not get to be a
 # class that reads like a clearance.
 #
-# #2628 SHARPENED THE SCANNER, so this file shrank from 93 keys to 54 and 15 of the survivors
-# re-keyed. That is the direction which can silently disable a rule, so the rows were NOT
-# regenerated: every surviving row was matched to its predecessor by the finding's own file:line,
-# and 38 removals and 15 re-keys were read one at a time. Rows that re-keyed carry
-# `[#2628 re-keyed; was ...]` so the previous requirement stays greppable. What went away, by the
-# mechanism that produced it:
+# #2628 SHARPENED THE SCANNER, so this file shrank from 93 keys to 54. That is the direction which
+# can silently disable a rule, so the rows were NOT regenerated: every surviving row was matched to
+# its predecessor by the finding's own file:line, and every removal and re-key was read one at a
+# time. Rows that re-keyed carry `[#2628 re-keyed; was ...]` so the previous requirement stays
+# greppable.
+#
+# THE COUNTS, AND THE CONVENTION THEY ARE COUNTED UNDER -- stated because the obvious alternative
+# gives different numbers and the two were mixed in an earlier revision of this header:
+#
+#   ROWS IN THIS FILE          39 unchanged  + 14 re-keyed + 1 new = 54
+#   KEYS ON THE PREVIOUS FILE  39 unchanged  + 14 named as a predecessor by a marker
+#                                            + 40 with no successor recorded = 93
+#
+# The convention is: count ROWS here, and account for the previous file's keys by whether a marker
+# names them. Both numbers are then things a merger can GREP, which is the only property that
+# matters -- these counts exist to tell whoever merges the sibling branch how many rows to expect,
+# so a count they cannot reproduce with `grep` sends them hunting for a row nobody lost.
+#   * `grep -c '\[#2628 re-keyed; was'` over this file returns 15, not 14. The fifteenth hit is the
+#     mention four lines above this one. `grep -v '^#'` first.
+#   * The rejected alternative counts the PREVIOUS file's keys by which surviving row absorbed
+#     them, giving 39 + 16 + 38 or 39 + 17 + 37 depending on whether a SPLIT-LOCAL and a TWO-GATE
+#     sharing one line count as the same absorption. That it has two defensible answers is the
+#     reason it is not used: a number nobody can re-derive identically is worse than a coarser one.
+#     It is not wrong, and it is why 14 markers do not account for 54 departed keys -- see the
+#     PROSPER_RTTLOG+PROSPER_RTTLOG_MIN_SUBMIT row below.
+#
+# What went away, by the mechanism that produced it:
 #   * a negated env test read as a requirement -- the `PROSPER_NO_*` opt-out idiom, the default-on
 #     PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET mode, and BOTH of the convention's own rule-2
 #     shapes (guest_write_watch.cpp:1372's refusal, gpu_timeline.cpp:2288/:2742's half-a-pair
@@ -51,7 +72,11 @@
 # Regenerate the key list with:
 #     python3 tools/env/check_diag_gates.py <root> --emit-baseline
 # then re-apply the classifications. Never let a regeneration silently downgrade a `defect` row to
-# `unreviewed` -- that is the laundering this tool exists to prevent, performed by hand.
+# `unreviewed` -- that is the laundering this tool exists to prevent, performed by hand. Since #2628
+# that sentence is also ENFORCED: the class counts below must match the rows, and the `unreviewed`
+# count must equal UNREVIEWED_BUDGET in check_diag_gates.py exactly, in both directions. So a
+# regeneration fails the gate, and paying debt down requires tightening the budget in the same
+# commit. (Note that --emit-baseline currently writes its banner to stdout as well -- #2649.)
 #   benign: 2
 #   config-echo: 10
 #   defect: 2
@@ -82,7 +107,7 @@ SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_width|PROSPER_GPU_TIMELINE_CA
 TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DETILE+PROSPER_DUMP_RAWTILE  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_DETILE+PROSPER_DUMP_RAWTILE+PROSPER_NODETILE`]
 TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_MRT_CENSUS+PROSPER_MRT_SHAPE_FOR  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_MRT_CENSUS+PROSPER_MRT_SHAPE_FOR+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`]
 TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RENDER_TIMING+PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MIN_SUBMIT  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`]
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MIN_SUBMIT  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT`] -- THIS ROW ABSORBED THREE predecessor keys, and only the one recorded here carries a note that still applies. The other two are `PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET` and `PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`. DO NOT carry the first one's note across when merging #2572: it opens `benign: LAMBDA ALIAS plus defaults. The {GFXLOG|RENDER_REFVS|SKIP_DRAW} clause comes from build_bds (live_renderer.cpp:5602)`, and that clause is exactly what #2628 removed -- the argument is about a requirement this row no longer has. The recorded predecessor's note transfers whole, and was re-checked against the source: MIN/MAX are an optional submit WINDOW defaulting to 0..INT_MAX (:1415-1416 falls back to 0, :1417-1418 to INT_MAX, which is why alias_is_a_gate() retires only MAX), and the arming switch is PROSPER_RTTLOG alone (:1422). #2572
 TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_GUESTPEEK  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_GUESTPEEK+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`]
 TWO-GATE|src/gpu/command_processor.cpp|report|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # unreviewed: not judged
 TWO-GATE|src/gpu/command_processor.cpp|report|PROSPER_INIT_TRIP+PROSPER_MB3_FREELIST_GUARD  # unreviewed: not judged

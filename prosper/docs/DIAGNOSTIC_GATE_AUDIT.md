@@ -78,9 +78,33 @@ Classification of the 54 keys, from `tools/env/diag_gate_baseline.txt`:
 | `unreviewed` | 40 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
 
 Before #2628 the same tree read **177 findings / 93 keys** against **61** predicates. The drop is the
-scanner getting *narrower*, not the tree getting cleaner — nothing in `src/` changed. The predicate
-count falls furthest because most of what it lost were `PROSPER_NO_*` opt-outs, which were being
-recorded as requirements exactly backwards.
+scanner getting *narrower*, not the tree getting cleaner — nothing in `src/` changed.
+
+**18 predicates stopped resolving, and "they were `PROSPER_NO_*` opt-outs" covers only 13 of them.**
+The other five are worth naming, because a predicate that resolves to nothing is invisible
+afterwards and the summary is where anyone would look for it:
+
+- **13** are `PROSPER_NO_*` / `PROSPER_TEST_DISABLE_*` opt-outs (`compute_memory_pool_enabled`,
+  `descriptor_pool_reuse_enabled`, `native_2d_transfer_enabled`, `udprov_collection_enabled`, …),
+  which were being recorded as requirements exactly backwards. Dropping them is the fix.
+- **`time_compute_address_matches`** (`live_compute.cpp:2983`) returns `true` when
+  `PROSPER_COMPUTE_TIMING_CODE` is unset. Dropping it is also a fix — `master` recorded a
+  requirement that does not exist.
+- **`sclog_condition` / `sclog_semaphore` / `sclog`** (`hle_kernel.cpp:117`, `:122`, `:127`) is the
+  one case where the *understating* direction bites. What they lost was inverted and wrong — `master`
+  recorded `sclog_condition` as requiring `{PROSPER_SYNCLOG_SEMA_ONLY}` when the body is
+  `thread_enabled && !semaphore_only` — but their real requirement is `PROSPER_SYNCLOG`, and that is
+  now recorded nowhere. It arrives transitively through `sclog_thread_enabled()` →
+  `sclog_time_enabled()` (`:102`, `getenv("PROSPER_SYNCLOG") != nullptr; if (!enabled) return
+  false;`), and `predicate_clauses()` does not expand *other* predicates. Measured rather than
+  inferred: `sclog_thread_enabled` resolves on **neither** scanner, so the chain was already broken
+  one level below this change — no baseline row depended on it and nothing regressed, but "the
+  predicate count fell because of opt-outs" is not the whole story.
+- **`software_decode_allowed`** stopped resolving because its two definitions now genuinely
+  **disagree**: `vaapi_backend.cpp:52` defaults to *true* and reads `=0` as "hardware only", while
+  `media_foundation_backend.cpp:43` defaults to *false* and reads `=0` as *enabling*. Same switch,
+  opposite meaning per platform. Filed as **#2648**; the scanner found it, which is the tool paying
+  for itself in a direction it was not built for.
 
 **There is deliberately no class meaning "the variables share a name family, so it is probably
 fine".** An earlier revision had one, and it was the single most misreadable thing in this document:
@@ -111,6 +135,23 @@ dropped the required one, silently weakening a `defect` row's key. A predicate b
 function body: guards impose their negation, an early truthy return ends the accumulation, and a
 predicate with two truthy exits requires their **disjunction**.
 
+**That fifth limit was invisible to every total, and that is the most useful thing in this
+section.** Both readings — the flat one and the structured one — produce the identical **103
+findings / 54 keys**. Only the *content* of one key differs:
+
+```
+structured   TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN
+flat         TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL_ADDR|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN
+```
+
+`gpu_executor.cpp:402` is `if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;` — required —
+and `:403-404` reads `PROSPER_DYNTRACE_FAIL_ADDR` into an optional filter. The flat read keeps
+exactly the wrong one, so a reader following that `defect` row would arm the filter and get silence:
+the defect this document is about, committed by the tool that detects it. **No count could have
+caught it** — not the finding total, not the key total, not a diff of "the numbers went down as
+expected". Only reading the key did. Treat "the totals moved the way I predicted" as evidence about
+volume and never about content.
+
 **Every one of those changes reports fewer findings, which is the direction that silently disables a
 rule** — the `SPLIT-LOCAL` row in [Ruled out](#ruled-out) is this scanner having already done it
 once. So:
@@ -125,8 +166,34 @@ once. So:
   the alternation, correctly, because it is an optional address filter — and the row was carried
   across by hand rather than regenerated;
 - the baseline was rebuilt by matching each surviving finding to its predecessor at the same
-  `file:line`, not by `--emit-baseline`. 53 of the 54 rows resolve to a predecessor; 15 re-keyed and
-  say so in the note.
+  `file:line`, not by `--emit-baseline`. 53 of the 54 rows resolve to a predecessor; **14** re-keyed
+  and say so in the note.
+
+The counts, and the convention they are counted under — stated because the obvious alternative gives
+different numbers, and an earlier revision of this section mixed the two:
+
+| | rows in the new baseline | keys in the old one |
+| --- | --- | --- |
+| unchanged | 39 | 39 |
+| re-keyed (carry `[#2628 re-keyed; was …]`) | 14 | 14 named as a predecessor |
+| new | 1 | — |
+| no successor recorded | — | 40 |
+| **total** | **54** | **93** |
+
+Count **rows** in the new file, and account for the old file's keys by whether a marker names them.
+Both are then reproducible with `grep`, which is the only property that matters here: these counts
+tell whoever merges the sibling branch how many rows to expect, so a count they cannot re-derive
+sends them hunting for a row nobody lost. Two footnotes, both of which have already misled a reader:
+
+- `grep -c '\[#2628 re-keyed; was'` over the baseline returns **15**. The fifteenth hit is the
+  header prose that names the marker. Filter comments first.
+- The rejected alternative counts the *old* keys by which surviving row absorbed them, and gives
+  39 + 16 + 38 **or** 39 + 17 + 37 depending on whether a `SPLIT-LOCAL` and a `TWO-GATE` sharing one
+  source line count as the same absorption. Having two defensible answers is precisely why it is not
+  the convention. It is not wrong, though, and it is what explains the apparent gap between 14
+  markers and 54 departed keys: one surviving row absorbs **three** old keys
+  (`…|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MIN_SUBMIT`), and its note records the one predecessor
+  whose argument still applies while naming the other two.
 
 **One row is new, and it is the rule working rather than decaying.** `diagnostic_elapsed_ms`
 (`live_renderer.cpp:534`) is called under `PROSPER_PASS_LOG` and under `PROSPER_DUMP_PERSISTENT`.
@@ -198,6 +265,32 @@ classification and an issue link. A baseline row that no longer reproduces **als
 landed, so delete the row. The second half matters as much as the first — a baseline nobody is
 forced to update stops describing the tree, which is this document's whole subject.
 
+### The baseline's own integrity — what guards the NOTES
+
+Both halves above are about **keys**. Until #2628 nothing in the tool looked at a **note**:
+`load_baseline()` kept it only so `--list` could echo it, and the header's class counts were skipped
+as comments. So a row could keep a current key and lose the judgement that is the only reason the
+row is worth having, and every check stayed green. `baseline_integrity()` closes that, with three
+rules:
+
+1. every row carries a class from `BASELINE_CLASSES`;
+2. the header's class counts match the rows, for all four classes;
+3. the `unreviewed` count equals `UNREVIEWED_BUDGET` **exactly** — asserted, not bounded, so that
+   *paying* debt also demands an edit and the ratchet tightens instead of drifting.
+
+Rule 3 is the one with teeth. `--emit-baseline` classifies **every** row `unreviewed`, so "just
+regenerate the baseline" — the repair everyone reaches for, and the one the header has warned
+against in prose since #2149 — now fails loudly instead of laundering a `defect` row into an
+unjudged one. Measured: with the three rules neutered in `main()` and nothing else changed, a
+baseline holding the current 54 keys with all 14 judgements replaced by `unreviewed` reports
+`== all checks passed ==`, exit 0.
+
+**What it cannot see, stated so nobody quotes it as more:** a baseline copied *whole* from one
+branch over another is internally consistent by construction and passes all three rules. Nothing
+inside one file can detect that. Only merge **order** protects against it — land the branch that
+rebuilds the keys first, so the second merger's "keep mine" resolution is the one that fails loudly
+rather than the one that passes silently.
+
 ## What the scanner cannot see
 
 Stated here rather than left implied, because a clean run of an instrument that cannot observe the
@@ -222,6 +315,10 @@ thing is the exact failure this document exists to prevent.
 - A **braceless `if` body is not scoped**: in `if (a) if (b) x = c;` the write to `x` is attributed
   to the enclosing block. This is why the defaulted-alias rule only fires on a *literal* right-hand
   side — a computed one may sit under a condition the scanner never saw.
+- **`-1` counts as a falsy default**, because `DEFAULT_RHS_RE` lists it. So `X ? atoi(X) : -1` keeps
+  its alias and stays a gate although `-1` is truthy in C. That over-reports rather than
+  under-reports, and it is consistent with the one place the tool states which literals mean
+  "unset", so it is left alone — but a finding resting on such a ternary is a candidate to re-read.
 - A **statement split across lines after its `if`** is outside that `if`'s gate: the scanner handles
   one condition per line, so `if (getenv("A"))\n    fprintf(...)` is read as ungated. Braces avoid
   it.
@@ -256,10 +353,11 @@ this tree can print an unmeasured field"*.
   not: the gate is `getenv() != nullptr`, so `0`, `off` and the empty string all enter the block and
   apply `range_start = prefix`. #2146.
 - **"A `TWO-GATE` finding means arming the obviously-named switch leaves you in silence."** Not on
-  its own, and #2628 removed 38 baseline keys where it was false by construction: the second clause
-  was a negated test, an opt-out that is on by default, an alias holding a compiled-in default, or a
-  lambda's body leaking into its call sites. The finding is a *candidate*; the check is to open each
-  name's declaration and read its polarity and its default. #2572 / #2628.
+  its own, and #2628 removed 40 baseline keys — 35 of them `TWO-GATE` — where it was false by
+  construction: the second clause was a negated test, an opt-out that is on by default, an alias
+  holding a compiled-in default, or a lambda's body leaking into its call sites. The finding is a
+  *candidate*; the check is to open each name's declaration and read its polarity and its default.
+  #2572 / #2628.
 - **"A rising `TWO-GATE` count means the convention is decaying."** Rules 1 and 2 both *create*
   findings — an armed-state banner (`command_processor.cpp:1572`) and a refusal that names the
   missing switch (`guest_write_watch.cpp:1372`) are each conditioned on two variables by

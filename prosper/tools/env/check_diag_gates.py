@@ -97,6 +97,25 @@ from pathlib import Path
 SCAN_DIRS = ("src", "frontends", "tools", "tests")
 SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp")
 
+# The four classifications a baseline row may carry. `unreviewed` is honest debt; the other three
+# are judgements, and the JUDGEMENT is the expensive artifact in that file -- each cost a human
+# reading a diagnostic and deciding whether its zero can lie. See baseline_integrity().
+BASELINE_CLASSES = ("defect", "config-echo", "benign", "unreviewed")
+
+# How many `unreviewed` rows the baseline is allowed to carry -- asserted EXACTLY, not as a ceiling.
+#
+# Exactly, because the two directions are different events and both want a human:
+#   more than this -> debt was ADDED. `--emit-baseline` writes EVERY row as `unreviewed`, so this
+#     is precisely what "just regenerate the baseline" looks like after it has laundered a `defect`
+#     row into an unjudged one. That is the failure this whole file exists to prevent, and until
+#     now nothing in the tool could see it: load_baseline() kept the note only so `--list` could
+#     echo it, and the header's class counts were skipped as comments.
+#   fewer than this -> debt was PAID. Tightening the number is then a one-line, visible, reviewable
+#     edit, and the ratchet is self-arming: it can only be loosened deliberately and in the diff.
+# #2572 is annotating the remaining rows; when it lands this becomes 0 and no unjudged row can
+# enter the baseline again.
+UNREVIEWED_BUDGET = 40
+
 ENV_NAME = r"PROSPER_[A-Z0-9_]+"
 # Every way this tree asks for a PROSPER_* variable. `env_enabled("X")` and friends pass the name
 # as an argument, so anchor on the LITERAL rather than on a fixed list of callee names -- the same
@@ -1686,6 +1705,140 @@ def load_baseline(path: Path) -> dict[str, str]:
     return entries
 
 
+def _header_class_counts(text: str) -> dict[str, int]:
+    """The `#   benign: 2` block. Only the four known class names are read, so a typo in the header
+    surfaces as "no count declared for <class>" rather than as a silently accepted new class."""
+    declared: dict[str, int] = {}
+    for line in text.split("\n"):
+        m = re.match(r"^#\s+([a-z][a-z-]*):\s*(\d+)\s*$", line)
+        if m and m.group(1) in BASELINE_CLASSES:
+            declared[m.group(1)] = int(m.group(2))
+    return declared
+
+
+def baseline_integrity(text: str, budget: int = UNREVIEWED_BUDGET) -> list[str]:
+    """Check the baseline against ITSELF. Returns one message per failure; empty means sound.
+
+    The gate above this one gets half the job. It fails on a stale KEY and on a missing KEY, and it
+    is completely indifferent to a NOTE -- so a row can keep its key and lose the judgement that is
+    the only reason the row is worth having, with nothing in CI able to tell. That asymmetry is not
+    hypothetical: two branches rewrote this file at once (#2628 and #2572), and the resolution
+    everyone reaches for -- "keep my side of the conflict" -- passes every check while discarding
+    the other lane's 79 notes, with no conflict left over and a diff that reads as your own edit
+    (the trap-41 / #1701 shape).
+
+    Three rules, each cheap and each falsifiable:
+
+      1. every row carries a class from BASELINE_CLASSES;
+      2. the header's own class counts match the rows, for all four classes -- a summary nobody
+         checks is the same silent-drift door one level up, and this file's header is quoted
+         verbatim in docs/DIAGNOSTIC_GATE_AUDIT.md;
+      3. the `unreviewed` count equals UNREVIEWED_BUDGET exactly (see that constant).
+
+    Rule 3 is the one with teeth, because `unreviewed` is what a regeneration turns every judgement
+    into. What none of the three can see, stated so nobody quotes this as more than it is: a
+    baseline copied WHOLE from one branch over another is internally consistent by construction and
+    passes all three. Only merge ORDER protects against that -- land the branch that rebuilds the
+    keys first, so the second merger's "keep mine" resolution is the one that fails loudly.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _sep, note = line.partition("  #")
+        rows.append((key.strip(), note.strip()))
+
+    failures: list[str] = []
+    counts = {cls: 0 for cls in BASELINE_CLASSES}
+    for key, note in rows:
+        cls = note.split(":", 1)[0].strip()
+        if cls in counts:
+            counts[cls] += 1
+        else:
+            failures.append(
+                f"row carries no recognised classification (want one of "
+                f"{', '.join(BASELINE_CLASSES)}): {key}")
+
+    declared = _header_class_counts(text)
+    for cls in BASELINE_CLASSES:
+        if cls not in declared:
+            failures.append(f"the header declares no count for `{cls}` -- add `#   {cls}: "
+                            f"{counts[cls]}` to the class-count block")
+        elif declared[cls] != counts[cls]:
+            failures.append(f"the header says `{cls}: {declared[cls]}` and the rows say "
+                            f"{counts[cls]} -- one of the two was edited without the other")
+
+    if counts["unreviewed"] > budget:
+        failures.append(
+            f"{counts['unreviewed']} `unreviewed` row(s) against a budget of {budget} -- unjudged "
+            f"debt was ADDED. If this came from `--emit-baseline`, it has overwritten judgements: "
+            f"that command classifies every row `unreviewed`, so a `defect` row is laundered into "
+            f"an unjudged one by a command that looks like housekeeping. Re-apply the notes.")
+    elif counts["unreviewed"] < budget:
+        failures.append(
+            f"{counts['unreviewed']} `unreviewed` row(s) against a budget of {budget} -- debt was "
+            f"PAID. Tighten UNREVIEWED_BUDGET in check_diag_gates.py to {counts['unreviewed']} so "
+            f"the ratchet holds; leaving it slack lets the same number of rows silently return.")
+    return failures
+
+
+# Arms for baseline_integrity(). Each pair differs ONLY in the property under test, and every
+# must-fail half is a mutation of the must-pass one -- a rule that cannot be shown to fire is not a
+# rule, and this file's own `## Ruled out` records a check of exactly that kind sitting inert.
+_SOUND_BASELINE = """\
+# A baseline.
+#   defect: 1
+#   config-echo: 0
+#   benign: 1
+#   unreviewed: 2
+#
+TWO-GATE|src/a.cpp|report|PROSPER_A+PROSPER_B  # defect: the printer needs both. #2149
+SPLIT-LOCAL|src/b.cpp|hits|PROSPER_C  # benign: structural, not a count of things observed. #2572
+TWO-GATE|src/c.cpp|report|PROSPER_D+PROSPER_E  # unreviewed: not judged
+TWO-GATE|src/d.cpp|report|PROSPER_F+PROSPER_G  # unreviewed: not judged
+"""
+
+BASELINE_INTEGRITY_TESTS = (
+    ("a sound baseline passes", _SOUND_BASELINE, 2, ""),
+    ("an unclassified row is caught",
+     _SOUND_BASELINE.replace("# defect: the printer needs both. #2149", "# ok, looks fine"),
+     2, "no recognised classification"),
+    ("a header count that disagrees with the rows is caught",
+     _SOUND_BASELINE.replace("#   benign: 1", "#   benign: 2"), 2, "was edited without the other"),
+    ("a class missing from the header is caught",
+     _SOUND_BASELINE.replace("#   config-echo: 0\n", ""), 2, "declares no count for `config-echo`"),
+    # The two rule-3 arms. Both mutate the SAME file in the same place; only the direction differs,
+    # and the messages have to differ too -- "debt was added" and "debt was paid" call for opposite
+    # actions from whoever reads them.
+    ("a judgement downgraded to `unreviewed` is caught",
+     _SOUND_BASELINE.replace("# benign: structural, not a count of things observed. #2572",
+                             "# unreviewed: not judged").replace("#   benign: 1", "#   benign: 0")
+                    .replace("#   unreviewed: 2", "#   unreviewed: 3"),
+     2, "debt was ADDED"),
+    ("debt paid without tightening the ratchet is caught", _SOUND_BASELINE, 3, "debt was PAID"),
+)
+
+
+def run_baseline_integrity_test(verbose: bool = False) -> int:
+    bad = 0
+    for label, text, budget, want in BASELINE_INTEGRITY_TESTS:
+        got = baseline_integrity(text, budget)
+        ok = (not got) if not want else any(want in g for g in got)
+        if not ok:
+            bad += 1
+            print(f"  [FAIL] baseline-integrity: {label}")
+            print(f"         want={want or '<no failures>'}")
+            print(f"         got ={got or '<no failures>'}")
+        elif verbose:
+            print(f"  [ok]   baseline-integrity: {label}")
+    if not bad:
+        print(f"  [ok]   baseline integrity: {len(BASELINE_INTEGRITY_TESTS)} arms "
+              f"({sum(1 for _l, _t, _b, w in BASELINE_INTEGRITY_TESTS if not w)} positive, "
+              f"{sum(1 for _l, _t, _b, w in BASELINE_INTEGRITY_TESTS if w)} must-fail)")
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", nargs="?", help="checkout root containing src/ frontends/ tools/ tests/")
@@ -1698,7 +1851,8 @@ def main() -> int:
     args = ap.parse_args()
 
     print("== check_diag_gates ==")
-    if run_self_test(args.verbose) or run_key_stability_test(args.verbose):
+    if (run_self_test(args.verbose) or run_key_stability_test(args.verbose)
+            or run_baseline_integrity_test(args.verbose)):
         return 1
     if args.selftest:
         print("== all checks passed ==")
@@ -1730,7 +1884,10 @@ def main() -> int:
             print(f"{key}  # unreviewed")
         return 0
 
-    baseline = load_baseline(here.parent / "diag_gate_baseline.txt")
+    baseline_path = here.parent / "diag_gate_baseline.txt"
+    baseline = load_baseline(baseline_path)
+    integrity = (baseline_integrity(baseline_path.read_text(encoding="utf-8"))
+                 if baseline_path.is_file() else [])
     by_key = {f.key(): f for f in findings}
     new = [f for k, f in sorted(by_key.items()) if k not in baseline]
     stale = [k for k in sorted(baseline) if k not in by_key]
@@ -1747,10 +1904,19 @@ def main() -> int:
             if k in baseline and baseline[k]:
                 print(f"      {baseline[k]}")
 
-    if not new and not stale:
+    if not integrity:
+        print(f"  [ok]   baseline notes: {len(baseline)} row(s) classified, header counts agree, "
+              f"{UNREVIEWED_BUDGET} unreviewed as budgeted")
+
+    if not new and not stale and not integrity:
         print("== all checks passed ==")
         return 0
 
+    if integrity:
+        print(f"  [FAIL] {len(integrity)} baseline integrity problem(s) -- the KEYS may be current "
+              f"while the JUDGEMENTS are not:")
+        for msg in integrity:
+            print(f"    {msg}")
     if new:
         print(f"  [FAIL] {len(new)} finding(s) not in the baseline:")
         for f in new:
@@ -1761,7 +1927,7 @@ def main() -> int:
         print(f"  [FAIL] {len(stale)} baseline entry(ies) no longer reproduce -- delete the row:")
         for k in stale:
             print(f"    {k}")
-    print(f"== {len(new) + len(stale)} failure(s) ==")
+    print(f"== {len(new) + len(stale) + len(integrity)} failure(s) ==")
     return 1
 
 
