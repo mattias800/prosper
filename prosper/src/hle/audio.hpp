@@ -8,6 +8,7 @@
 // itself via audio_set_sink(), keeping prosper_core dependency-free and unit-testable.
 #pragma once
 #include <cmath>
+#include <cstddef>   // std::size_t — a header must carry its own includes, not inherit its includer's
 #include <cstdint>
 
 namespace prosper {
@@ -124,7 +125,7 @@ AudioGrainVerdict audio_classify_stamped_grain(bool same_address, bool matches_s
 // byte-wise count — the obvious way to ask "is this buffer empty" — reports a buffer the guest
 // legitimately cleared with negative zero as non-zero, and the probe then answers `Overwritten`
 // for exactly the case it exists to identify.
-uint64_t audio_count_nonzero_samples(const void* pcm, size_t bytes, bool s16);
+uint64_t audio_count_nonzero_samples(const void* pcm, std::size_t bytes, bool s16);
 
 // Pluggable audio backend. All calls arrive on the guest's audio thread; output() MAY block to
 // pace it (as real hardware does — sceAudioOutOutput blocks until the ring has room).

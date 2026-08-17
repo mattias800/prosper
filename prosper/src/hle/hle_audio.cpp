@@ -161,7 +161,7 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
     return true;
 }
 
-uint64_t audio_count_nonzero_samples(const void* pcm, size_t bytes, bool s16) {
+uint64_t audio_count_nonzero_samples(const void* pcm, std::size_t bytes, bool s16) {
     if (!pcm) return 0;
     uint64_t n = 0;
     if (s16) {
