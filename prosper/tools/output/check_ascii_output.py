@@ -513,13 +513,23 @@ def classify(rel: str, kind: str) -> str:
     return "fail"
 
 
-# The two that pin the order above, plus the two that keep them honest.
+# The full 3x2 truth table: every kind offenders_in() can produce, in and out of the quarantine.
+#
+# It is exhaustive on purpose, and the reason is worth the four extra lines. The first version had
+# only the four `char`/`byte` rows and pinned the ORDER without pinning the FUNCTION: `unicode`
+# never appeared, so `if kind in ("byte", "unicode"): return "note"` passed every arm while routing
+# the \u tier to a silent note -- a false clean on exactly the tier that exists to stop someone
+# spelling an em dash as an escape to walk around a byte scan. Review measured that mutation
+# leaving ALL 53 arms green. A set of arms drawn as a sample of a small finite domain is a sample;
+# enumerated, it is a proof.
 CLASSIFY_TESTS = [
     # (relpath, kind, expected bucket)
-    ("src/gpu/render_state.cpp", "byte", "note"),    # quarantined AND a byte escape -> still a note
-    ("src/hle/other.cpp",        "byte", "note"),    # ... identical outcome anywhere else
-    ("src/gpu/render_state.cpp", "char", "ledger"),  # quarantined and a real character -> ledger
-    ("src/hle/other.cpp",        "char", "fail"),    # the ordinary case
+    ("src/gpu/render_state.cpp", "byte",    "note"),    # quarantined AND a byte escape -> a note
+    ("src/hle/other.cpp",        "byte",    "note"),    # ... identical outcome anywhere else
+    ("src/gpu/render_state.cpp", "char",    "ledger"),  # quarantined, a real character -> ledger
+    ("src/hle/other.cpp",        "char",    "fail"),    # the ordinary case
+    ("src/hle/other.cpp",        "unicode", "fail"),    # the \u tier is a failure, not a note
+    ("src/gpu/render_state.cpp", "unicode", "ledger"),  # ... and inside the quarantine, the ledger
 ]
 
 
