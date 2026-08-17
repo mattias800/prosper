@@ -4,10 +4,12 @@
 // fill the destination.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "test_scratch.h"
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 using namespace prosper;
 
@@ -389,7 +391,11 @@ int main() {
         CHECK(read_file(0, 0, 0, 0xffffffffull, 0, 0) == 20,
               "32-bit-offset read command measures 20 bytes");
 
-        const char* fixture_path = "prosper-test-ampr-measure.tmp";
+        // #1621: the per-case scratch directory, not a fixed name in the shared ctest working
+        // directory — a failed assertion or a crash used to leave this behind in the build root.
+        const std::string fixture_path_storage =
+            prosper_test::test_scratch_file("prosper-test-ampr-measure.tmp");
+        const char* fixture_path = fixture_path_storage.c_str();
         const std::array<uint8_t, 4> fixture = {0x10, 0x20, 0x30, 0x40};
         bool fixture_written = false;
         if (FILE* file = std::fopen(fixture_path, "wb")) {

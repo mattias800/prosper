@@ -18,6 +18,8 @@
 #ifndef _WIN32
 #include <sys/mman.h>   // mmap/munmap — WriteAddress fault-safety check (#1149/#1154)
 #endif
+#include "test_scratch.h"
+
 #include "../src/host/exec_image.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "../src/hle/dispatch.hpp"
@@ -154,7 +156,11 @@ int main() {
 
     // The AMPR builder is a DMA-style read: callers may consume their destination buffer directly,
     // not only the completion record's data pointer. Evergate loads globalgamemanagers this way.
-    const char* fixture_path = "prosper-test-apr-read.tmp";
+    // #1621: every fixture below lives in this process's own scratch directory, not under a fixed
+    // relative name in the shared ctest working directory.
+    const std::string fixture_path_storage =
+        prosper_test::test_scratch_file("prosper-test-apr-read.tmp");
+    const char* fixture_path = fixture_path_storage.c_str();
     std::array<uint8_t, 257> expected{};
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 29u + 7u);
     FILE* fixture = std::fopen(fixture_path, "wb");
@@ -201,7 +207,9 @@ int main() {
     // #1901: equal total sizes do not make real ID-resolved reads ambiguous. Register a second,
     // byte-distinct fixture through the public resolve HLE so this also proves its warning describes
     // only the unresolved-id fallback rather than falsely declaring both files unreadable.
-    const char* collision_path = "prosper-test-apr-read-collision.tmp";
+    const std::string collision_path_storage =
+        prosper_test::test_scratch_file("prosper-test-apr-read-collision.tmp");
+    const char* collision_path = collision_path_storage.c_str();
     std::array<uint8_t, expected.size()> collision_bytes{};
     for (size_t i = 0; i < collision_bytes.size(); ++i)
         collision_bytes[i] = (uint8_t)(i * 17u + 11u);
@@ -268,7 +276,9 @@ int main() {
           "colliding valid-id reads report method=id");
 
     // An unknown id may use total-size correlation only when exactly one registered file matches.
-    const char* unique_path = "prosper-test-apr-read-fallback.tmp";
+    const std::string unique_path_storage =
+        prosper_test::test_scratch_file("prosper-test-apr-read-fallback.tmp");
+    const char* unique_path = unique_path_storage.c_str();
     std::array<uint8_t, 263> unique_bytes{};
     for (size_t i = 0; i < unique_bytes.size(); ++i)
         unique_bytes[i] = (uint8_t)(i * 23u + 19u);
@@ -414,15 +424,21 @@ int main() {
     CHECK(resolve_ids != nullptr && wait_cb != nullptr,
           "APR id-only resolver and synchronous completion wait registered");
 
-    const char* wp_full = "prosper-test-apr-prefix.tmp";   // prefix + tail == this path
-    const char* wp_prefix = "prosper-test-apr-";
+    // #1621: the SHAPE of this name is part of the test — APR's path-prefix resolution is exercised
+    // by splitting it into a prefix and a tail and having the HLE rejoin them. So the scratch
+    // directory goes into the PREFIX ("<scratch dir>/prosper-test-apr-") and the tail is left exactly
+    // as it was; wp_full stays prefix + tail by construction rather than by a repeated literal.
+    const std::string wp_prefix_storage = prosper_test::test_scratch_file("prosper-test-apr-");
+    const char* wp_prefix = wp_prefix_storage.c_str();
     const char* wp_tail   = "prefix.tmp";
+    const std::string wp_full_storage = wp_prefix_storage + wp_tail;   // prefix + tail == this path
+    const char* wp_full = wp_full_storage.c_str();
     std::array<uint8_t, 321> wp_bytes{};
     for (size_t i = 0; i < wp_bytes.size(); ++i) wp_bytes[i] = (uint8_t)(i * 13u + 5u);
     if (FILE* wf = std::fopen(wp_full, "wb")) { std::fwrite(wp_bytes.data(), 1, wp_bytes.size(), wf); std::fclose(wf); }
 
     if (resolve_prefix && resolve_plain) {
-        // The prefix path is prepended: prefix="prosper-test-apr-", paths[0]="prefix.tmp".
+        // The prefix path is prepended: prefix="<scratch dir>/prosper-test-apr-", paths[0]="prefix.tmp".
         const char* paths[1] = { wp_tail };
         uint32_t ids[1] = { 0xdeadbeef }; uint64_t sizes[1] = { 0xdead }; uint32_t error_index = 0xdead;
         uint64_t r = resolve_prefix((uint64_t)(uintptr_t)wp_prefix, (uint64_t)(uintptr_t)paths, 1,
@@ -459,7 +475,7 @@ int main() {
             // ordinary path that already exists. This is what turns the correctly loaded ACB into
             // an audible bank rather than a silent mixer.
             namespace fs = std::filesystem;
-            const fs::path app0 = "prosper-test-apr-app0";
+            const fs::path app0 = prosper_test::test_scratch_path("prosper-test-apr-app0");
             const fs::path raw_sound = app0 / "raw" / "sound";
             fs::create_directories(raw_sound);
             const fs::path awb = raw_sound / "fallback.awb";
@@ -508,7 +524,10 @@ int main() {
         // trapping startup in a multi-billion-iteration loop. Resolve the preceding valid entry,
         // then fail at the missing entry with its scalar index and without writing past that scalar.
         prosper_apr_reset_for_test();
-        const char* miss_paths[2] = { wp_full, "prosper-test-apr-does-not-exist.tmp" };
+        const std::string absent_path_storage =
+            prosper_test::test_scratch_file("prosper-test-apr-does-not-exist.tmp");
+        const char* absent_path = absent_path_storage.c_str();
+        const char* miss_paths[2] = { wp_full, absent_path };
         uint32_t miss_ids[2] = { 0x55, 0x55 }; uint64_t miss_sizes[2] = { 0x55, 0x55 };
         uint32_t miss_error_guard[3] = { 0x11111111u, 0xDEADBEEFu, 0x22222222u };
         uint64_t rm = resolve_plain((uint64_t)(uintptr_t)miss_paths, 2,
@@ -536,12 +555,13 @@ int main() {
         // that genuinely EXISTS, so the tail sentinel additionally distinguishes "stamped" from
         // "resolved anyway" (which would mean the batch did not stop).
         prosper_apr_reset_for_test();
-        const char* decoy_path = "prosper-test-apr-decoy-container.tmp";   // registry-only, never opened
+        const std::string decoy_path_storage =
+            prosper_test::test_scratch_file("prosper-test-apr-decoy-container.tmp");
+        const char* decoy_path = decoy_path_storage.c_str();   // registry-only, never opened
         const uint32_t decoy_id = prosper_apr_register(decoy_path, 4096);
         CHECK(decoy_id == 1 && prosper_apr_path_for_id(1) == decoy_path,
               "#1951 setup: a live id 1 names the decoy container");
-        const char* tail_paths[4] = { wp_full, wp_full,
-                                      "prosper-test-apr-does-not-exist.tmp", wp_full };
+        const char* tail_paths[4] = { wp_full, wp_full, absent_path, wp_full };
         uint32_t tail_ids[4] = { decoy_id, decoy_id, decoy_id, decoy_id };
         uint64_t tail_sizes[4] = { 0x5a5a, 0x5a5a, 0x5a5a, 0x5a5a };
         uint32_t tail_error_guard[3] = { 0x11111111u, 0xDEADBEEFu, 0x22222222u };

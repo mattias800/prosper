@@ -2,6 +2,7 @@
 // In particular, Windows CRT text mode treats 0x1a as EOF and translates CRLF.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "test_scratch.h"
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -71,7 +72,15 @@ int main() {
 #else
     setenv("PROSPER_DENY_SUBSTR", ".TMPDENY", 1);
 #endif
-    const char* path = "prosper-test-file-binary.tmp";
+    // #1621: fixtures live in this process's own scratch directory rather than under fixed relative
+    // names in the shared ctest working directory. Three of them are ALSO addressed as guest paths
+    // ("/app0/<name>"), and app0 is re-rooted at that same directory below — so their basenames are
+    // named constants and the guest spellings are built from those, never from the host path.
+    static constexpr const char* kFixtureName = "prosper-test-file-binary.tmp";
+    static constexpr const char* kMkdirDirName = "prosper-test-mkdir-eexist.tmp";
+    static constexpr const char* kMissingName = "prosper-test-file-binary-missing.tmp";
+    const std::string path_storage = prosper_test::test_scratch_file(kFixtureName);
+    const char* path = path_storage.c_str();
     std::array<uint8_t, 512> expected{};
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 37u + 11u);
     expected[7] = 0x1a;
@@ -167,7 +176,8 @@ int main() {
 
     // Creating an existing directory is a failure, not an idempotent success. Linux previously
     // suppressed EEXIST while Windows propagated it, so save-directory control flow differed by host.
-    const char* dir_path = "prosper-test-mkdir-eexist.tmp";
+    const std::string dir_path_storage = prosper_test::test_scratch_file(kMkdirDirName);
+    const char* dir_path = dir_path_storage.c_str();
     std::error_code remove_error;
     std::filesystem::remove_all(dir_path, remove_error);
     int64_t mkdir_first = mkdir_fn
@@ -186,9 +196,9 @@ int main() {
     CHECK(duplicate_errno == EEXIST, "mkdir preserves EEXIST for the caller");
     CHECK(kernel_mkdir_duplicate == 0x80020011u,
           "sceKernelMkdir returns SCE_KERNEL_ERROR_EEXIST directly");
-    set_app0_root(std::filesystem::current_path().string());
-    const std::string reachable_file = std::string("/app0/") + path;
-    const std::string reachable_directory = std::string("/app0/") + dir_path;
+    set_app0_root(prosper_test::test_scratch_dir().string());
+    const std::string reachable_file = std::string("/app0/") + kFixtureName;
+    const std::string reachable_directory = std::string("/app0/") + kMkdirDirName;
     CHECK(kernel_reachability_fn &&
               kernel_reachability_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0, 0, 0, 0, 0) == 0,
           "sceKernelCheckReachability finds a translated guest file");
@@ -407,7 +417,8 @@ int main() {
     // Windows CRT refuses to open a directory at all, so the HLE must retain an emulator-owned
     // directory cursor instead of reporting a successful empty enumeration. Astro Bot discovers
     // each intro cinematic sublevel through this exact contract.
-    const std::filesystem::path dents_path = "prosper-test-getdents.tmp";
+    const std::filesystem::path dents_path =
+        prosper_test::test_scratch_path("prosper-test-getdents.tmp");
     std::filesystem::remove_all(dents_path, remove_error);
     std::filesystem::create_directories(dents_path / "c01");
     std::filesystem::create_directories(dents_path / "c02b");
@@ -518,7 +529,8 @@ int main() {
     std::filesystem::remove_all(dents_path, remove_error);
 
     std::array<uint8_t, 512> actual{};
-    const char* missing_path = "prosper-test-file-binary-missing.tmp";
+    const std::string missing_path_storage = prosper_test::test_scratch_file(kMissingName);
+    const char* missing_path = missing_path_storage.c_str();
     std::error_code missing_remove_error;
     std::filesystem::remove(missing_path, missing_remove_error);
     errno = 0;
@@ -537,7 +549,9 @@ int main() {
     // PROSPER_DENY_SUBSTR case-insensitivity (#1237): the fixture EXISTS on disk, but its name
     // contains a CASE VARIANT of the armed ".tmpdeny" substring — the deny must still fire.
     {
-        const char* deny_fixture = "prosper-deny-fixture.TmpDeny";
+        const std::string deny_fixture_storage =
+            prosper_test::test_scratch_file("prosper-deny-fixture.TmpDeny");
+        const char* deny_fixture = deny_fixture_storage.c_str();
         FILE* deny_out = std::fopen(deny_fixture, "wb");
         CHECK(deny_out != nullptr, "create deny fixture");
         if (deny_out) { std::fputs("x", deny_out); std::fclose(deny_out); }
@@ -560,9 +574,9 @@ int main() {
             HleFn close_fn = Hle::lookup(nid_hash("sceKernelClose"));
             if (close_fn) close_fn(root_fd, 0, 0, 0, 0, 0);
         }
+        const std::string reentry_guest_path = std::string("/app0/../app0/") + kFixtureName;
         const uint64_t reentry_fd = open_fn
-            ? open_fn((uint64_t)(uintptr_t)"/app0/../app0/prosper-test-file-binary.tmp",
-                      0, 0, 0, 0, 0)
+            ? open_fn((uint64_t)(uintptr_t)reentry_guest_path.c_str(), 0, 0, 0, 0, 0)
             : 0;
         CHECK((int64_t)reentry_fd >= 3, "'/app0/../app0/<file>' re-enters the mount");
         if ((int64_t)reentry_fd >= 3) {
@@ -574,7 +588,7 @@ int main() {
         CHECK((uint32_t)sibling == 0x80020002u,
               "'/app0/../etc' keeps the sandbox-traversal deny (ENOENT)");
     }
-    const std::string unreachable_file = std::string("/app0/") + missing_path;
+    const std::string unreachable_file = std::string("/app0/") + kMissingName;
     std::string overlong_path(256, 'a');
     CHECK(kernel_reachability_fn &&
               kernel_reachability_fn((uint64_t)(uintptr_t)unreachable_file.c_str(), 0, 0, 0, 0, 0) ==
@@ -668,7 +682,9 @@ int main() {
     check_missing_path_contract("Rmdir", rmdir_fn, kernel_rmdir_fn);
     check_missing_path_contract("Unlink", unlink_fn, kernel_unlink_fn);
 
-    const char* missing_rename_target = "prosper-test-file-binary-missing-renamed.tmp";
+    const std::string missing_rename_target_storage =
+        prosper_test::test_scratch_file("prosper-test-file-binary-missing-renamed.tmp");
+    const char* missing_rename_target = missing_rename_target_storage.c_str();
     std::filesystem::remove(missing_rename_target, missing_remove_error);
     errno = 0;
     int64_t libc_missing_rename = rename_fn
@@ -691,7 +707,9 @@ int main() {
     CHECK(kernel_missing_truncate == 0x80020002u,
           "sceKernelTruncate returns SCE_KERNEL_ERROR_ENOENT directly");
 
-    const char* truncate_path = "prosper-test-kernel-truncate.tmp";
+    const std::string truncate_path_storage =
+        prosper_test::test_scratch_file("prosper-test-kernel-truncate.tmp");
+    const char* truncate_path = truncate_path_storage.c_str();
     std::filesystem::remove(truncate_path, missing_remove_error);
     FILE* truncate_out = std::fopen(truncate_path, "wb");
     bool truncate_fixture_written = false;
@@ -712,7 +730,9 @@ int main() {
           "sceKernelTruncate resizes a path on both hosts");
     std::filesystem::remove(truncate_path, missing_remove_error);
 
-    const char* descriptor_resize_path = "prosper-test-kernel-ftruncate.tmp";
+    const std::string descriptor_resize_path_storage =
+        prosper_test::test_scratch_file("prosper-test-kernel-ftruncate.tmp");
+    const char* descriptor_resize_path = descriptor_resize_path_storage.c_str();
     std::filesystem::remove(descriptor_resize_path, missing_remove_error);
     FILE* descriptor_resize_out = std::fopen(descriptor_resize_path, "wb");
     bool descriptor_resize_fixture_written = false;
@@ -760,8 +780,10 @@ int main() {
 #ifndef _WIN32
     // Linux ELOOP is 40, while FreeBSD/Orbis ELOOP is 62. A real symlink cycle guards
     // against accidentally embedding the host errno in a kernel result.
-    const char* loop_a = "prosper-test-open-loop-a.tmp";
-    const char* loop_b = "prosper-test-open-loop-b.tmp";
+    const std::string loop_a_storage = prosper_test::test_scratch_file("prosper-test-open-loop-a.tmp");
+    const std::string loop_b_storage = prosper_test::test_scratch_file("prosper-test-open-loop-b.tmp");
+    const char* loop_a = loop_a_storage.c_str();
+    const char* loop_b = loop_b_storage.c_str();
     std::error_code symlink_error;
     std::filesystem::remove(loop_a, symlink_error);
     std::filesystem::remove(loop_b, symlink_error);
@@ -1217,7 +1239,9 @@ int main() {
 
     // The same rule applies after earlier chunks were delivered. The fixture is one full bounce
     // chunk plus 512 bytes; only the committed first chunk may be consumed/reported.
-    const char* large_path = "prosper-test-file-binary-large.tmp";
+    const std::string large_path_storage =
+        prosper_test::test_scratch_file("prosper-test-file-binary-large.tmp");
+    const char* large_path = large_path_storage.c_str();
     FILE* large_out = std::fopen(large_path, "wb");
     bool large_written = large_out != nullptr;
     if (large_out) {
