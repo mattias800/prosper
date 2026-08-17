@@ -286,11 +286,228 @@ static void test_stereo_downmix() {
     for (auto& e : guard) CHECK(e.left == 7.0f && e.right == 7.0f);   // untouched by every refusal
 }
 
+// The decision rule behind PROSPER_AUDIO_STAMP (hle_audio.cpp). The probe answers the one question
+// no amount of reading a guest buffer can: does the guest WRITE the grain prosper reads? Its whole
+// output is a four-way verdict, and two of the four are inversions of each other — so the ordering
+// of the tests inside the classifier is the entire correctness surface, and a live log looks
+// perfectly plausible with them swapped.
+static void test_stamped_grain_verdicts() {
+    using V = AudioGrainVerdict;
+
+    // The stamp is deliberately non-zero in every sample, so a SURVIVING stamp carries a large
+    // non-zero count. A classifier that decided emptiness without consulting identity therefore
+    // reports `Overwritten` — "the guest is filling this buffer with signal" — for the case that
+    // actually means "prosper is reading memory the guest never touches", inverting the probe's
+    // whole answer. This arm is what fails when the identity test is dropped.
+    //
+    // What it does NOT pin, stated because the comment here first claimed it did: the ORDER of the
+    // identity and emptiness tests. Swapping them is behaviour-preserving, since a surviving stamp
+    // is never empty, and the mutation arm that swapped them passed. The order that IS pinned is
+    // the address check coming first, by the two `false` arms below.
+    CHECK(audio_classify_stamped_grain(true, true, 2048) == V::Intact);
+    CHECK(audio_classify_stamped_grain(true, false, 0) == V::Cleared);
+    CHECK(audio_classify_stamped_grain(true, false, 2048) == V::Overwritten);
+    // A stamp read back from a DIFFERENT buffer says nothing about either buffer, so the address
+    // check must come first — including in the case that would otherwise look like a clean verdict.
+    CHECK(audio_classify_stamped_grain(false, true, 2048) == V::PointerMoved);
+    CHECK(audio_classify_stamped_grain(false, false, 0) == V::PointerMoved);
+
+    // The counting rule the verdict is drawn from. It must agree with AudioSignalStats::nonzero,
+    // because a disagreement would let the stamp probe and PROSPER_AUDIO_FLOW report different
+    // answers about the same buffer.
+    float zeros[64]{};
+    CHECK(audio_count_nonzero_samples(zeros, sizeof zeros, false) == 0);
+
+    // -0.0f is THE boundary case, and it is not academic: a guest mixer that clears with a negated
+    // accumulator leaves negative zeros, whose BYTES are not zero. A byte-wise emptiness test — the
+    // obvious implementation — calls that buffer non-empty, and the probe then answers
+    // `Overwritten` for precisely the cleared buffer it exists to identify.
+    float negzeros[64];
+    for (float& v : negzeros) v = -0.0f;
+    CHECK(audio_count_nonzero_samples(negzeros, sizeof negzeros, false) == 0);
+    bool any_byte_set = false;
+    for (const uint8_t* b = (const uint8_t*)negzeros; b < (const uint8_t*)(negzeros + 64); ++b)
+        if (*b) any_byte_set = true;
+    CHECK(any_byte_set);            // the trap is real: these bytes are NOT zero
+    AudioSignalStats negstats;
+    for (float v : negzeros) negstats.add(v);
+    CHECK(negstats.nonzero == 0);   // and the flow probe agrees with the count above
+
+    float mixed[8] = {0.0f, 0.25f, 0.0f, -0.5f, 0.0f, 0.0f, 1.0f, -0.0f};
+    CHECK(audio_count_nonzero_samples(mixed, sizeof mixed, false) == 3);
+    int16_t s16[8] = {0, 1, 0, -1, 0, 0, 32767, 0};
+    CHECK(audio_count_nonzero_samples(s16, sizeof s16, true) == 3);
+    CHECK(audio_count_nonzero_samples(nullptr, 64, false) == 0);
+    CHECK(audio_count_nonzero_samples(mixed, 0, false) == 0);
+}
+
+// --- END-TO-END bed routing: which GUEST channel reaches which HOST channel, at what gain ------
+//
+// test_stereo_downmix above pins the fold TABLE against literal values. This measures what the mix
+// loop actually DOES with that table, by pushing one unit impulse per source channel through the
+// real sceAudioOut2 entrypoints and reading the stereo grain the host sink receives. The two are
+// different claims and neither implies the other: a correct table applied through a wrong stride,
+// a wrong tap list, or a wrong side produces exactly the output a wrong table would, and no
+// assertion on the pure function can see it.
+//
+// It also reports the result, because that report is the answer to the question #1720 asks — "which
+// guest channel landed in which host channel, and with what orientation" — for every width the fold
+// accepts, rather than for the two widths (8 and 12) the existing arms happen to exercise.
+//
+// The oracle for the bulk of the comparison is audio_stereo_downmix() itself, which is DELIBERATE
+// and is the point: it tests the application, not the table. So that this cannot degenerate into a
+// tautology if both ever drift together, a handful of placements are additionally asserted against
+// LITERALS below, chosen at widths the rest of the file never pushes end-to-end.
+static void test_bed_routing_matrix() {
+    audio_reset();
+    CapturingSink sink;
+    audio_set_sink(&sink);
+
+    constexpr uint32_t kGrain = 64;
+    uint8_t ctx_param[0x40]{};
+    CHECK(call("sceAudioOut2ContextResetParam", PTR(ctx_param)) == 0);
+    *(uint32_t*)(ctx_param + 0x10) = kGrain;
+    uint64_t ctx = 0;
+    CHECK(call("sceAudioOut2ContextCreate", PTR(ctx_param), 0, 0, PTR(&ctx)) == 0);
+
+    struct PortParam {
+        uint16_t type, pad;
+        uint32_t data_format, rate, flags;
+        uint64_t user;
+        uint32_t reserved[10];
+    } pp{};
+    static_assert(sizeof(PortParam) == 0x40);
+    pp.type = 0;                       // MAIN: the only type folded into the host bed
+    pp.rate = 48000;
+
+    uint64_t pcm_ptr = 0;
+    struct Attribute { uint32_t id, reserved; uint64_t value, value_size; } attr{
+        0, 0, PTR(&pcm_ptr), sizeof(pcm_ptr)
+    };
+
+    printf("  [bed-routing] measured guest channel -> host L/R, through the real AudioOut2 mix loop\n");
+    for (uint32_t w = 1; w <= kAudioMaxBedChannels; ++w) {
+        AudioStereoGain declared[kAudioMaxBedChannels];
+        const unsigned  unplaced = audio_stereo_downmix(w, declared, kAudioMaxBedChannels);
+        CHECK(unplaced == (w > 8 ? w - 8 : 0));
+
+        pp.data_format = (w << 8);     // f32, w channels
+        uint64_t port = 0;
+        CHECK(call("sceAudioOut2PortCreate", ctx, PTR(&pp), PTR(&port)) == 0);
+
+        printf("  [bed-routing] width=%-2u", w);
+        std::vector<float> grain((size_t)kGrain * w);
+        for (uint32_t c = 0; c < w; ++c) {
+            // One channel at unit level, every other channel exactly zero. Isolation is what makes
+            // the reading a per-channel GAIN rather than a sum that several wrong matrices share.
+            std::fill(grain.begin(), grain.end(), 0.0f);
+            for (uint32_t f = 0; f < kGrain; ++f) grain[(size_t)f * w + c] = 1.0f;
+            pcm_ptr = PTR(grain.data());
+            sink.outs.clear();
+            CHECK(call("sceAudioOut2PortSetAttributes", port, PTR(&attr), 1) == 0);
+            CHECK(call("sceAudioOut2ContextPush", ctx, 1) == 0);
+            CHECK(sink.outs.size() == 1);
+            if (sink.outs.size() != 1) continue;
+            CHECK(sink.outs[0].frames == (int)kGrain);
+            const float* out = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+            const float measured_l = out[0], measured_r = out[1];
+            // A steady input must give a steady output: a per-frame drift would mean the fold is
+            // reading across frame boundaries, which a single-frame check cannot see.
+            for (uint32_t f = 1; f < kGrain; ++f) {
+                CHECK(out[f * 2 + 0] == measured_l);
+                CHECK(out[f * 2 + 1] == measured_r);
+            }
+            CHECK(std::abs(measured_l - declared[c].left) < 1e-6f);
+            CHECK(std::abs(measured_r - declared[c].right) < 1e-6f);
+            printf(" | ch%u L%.3f R%.3f%s", c, measured_l, measured_r,
+                   (declared[c].left == 0.0f && declared[c].right == 0.0f) ? " UNPLACED" : "");
+            // The unplaced tier measured end to end, for EVERY width above 8 rather than only the
+            // one Dragon Quest VII happens to use: a channel with no known position must contribute
+            // exactly nothing to either side, not merely something small.
+            if (c >= 8) {
+                CHECK(measured_l == 0.0f);
+                CHECK(measured_r == 0.0f);
+            }
+        }
+        printf("\n");
+        CHECK(call("sceAudioOut2PortDestroy", port) == 0);
+        sink.outs.clear();
+    }
+
+    // Literal anchors, so the loop above cannot pass by agreeing with a table that has itself
+    // drifted. These are deliberately at widths 3, 5, 6 and 7 — the ones no other end-to-end arm in
+    // this file pushes, which is exactly where an application bug could live undetected.
+    struct { uint32_t width, channel; float left, right; } anchors[] = {
+        {3, 2, 0.70710678f, 0.70710678f},   // 3ch centre: -3 dB into BOTH sides
+        {5, 3, 0.70710678f, 0.0f},          // 5ch surround left: left ONLY
+        {5, 4, 0.0f, 0.70710678f},          // 5ch surround right: right ONLY
+        {6, 3, 0.5f, 0.5f},                 // 5.1 LFE: -6 dB into both
+        {7, 6, 0.35355339f, 0.35355339f},   // 6.1 rear centre: -3 dB halved across the pair
+    };
+    for (auto& a : anchors) {
+        pp.data_format = (a.width << 8);
+        uint64_t port = 0;
+        CHECK(call("sceAudioOut2PortCreate", ctx, PTR(&pp), PTR(&port)) == 0);
+        std::vector<float> grain((size_t)kGrain * a.width, 0.0f);
+        for (uint32_t f = 0; f < kGrain; ++f) grain[(size_t)f * a.width + a.channel] = 1.0f;
+        pcm_ptr = PTR(grain.data());
+        sink.outs.clear();
+        CHECK(call("sceAudioOut2PortSetAttributes", port, PTR(&attr), 1) == 0);
+        CHECK(call("sceAudioOut2ContextPush", ctx, 1) == 0);
+        CHECK(sink.outs.size() == 1);
+        if (!sink.outs.empty()) {
+            const float* out = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+            CHECK(std::abs(out[0] - a.left) < 1e-6f);
+            CHECK(std::abs(out[1] - a.right) < 1e-6f);
+        }
+        CHECK(call("sceAudioOut2PortDestroy", port) == 0);
+        sink.outs.clear();
+    }
+
+    // The same measurement over an S16 bed. Not symmetry for its own sake: every other end-to-end
+    // AudioOut2 arm in this file that uses S16 is STEREO, so before this the multichannel fold had
+    // no S16 coverage at all — `sample_at`'s integer branch, the `tmp_s16` sizing and the
+    // conversion were only ever exercised through the 2-channel identity fold, where a stride or
+    // scale error cannot show. Full-scale-half (16384 -> exactly 0.5) keeps the expected products
+    // exact in binary floating point, so a 1e-6 tolerance is measuring the fold and not the codec.
+    for (uint32_t w : {(uint32_t)6, (uint32_t)12}) {
+        AudioStereoGain declared[kAudioMaxBedChannels];
+        audio_stereo_downmix(w, declared, kAudioMaxBedChannels);
+        pp.data_format = (w << 8) | 1u;                 // s16, w channels
+        uint64_t port = 0;
+        CHECK(call("sceAudioOut2PortCreate", ctx, PTR(&pp), PTR(&port)) == 0);
+        printf("  [bed-routing] width=%-2u s16", w);
+        std::vector<int16_t> grain((size_t)kGrain * w);
+        for (uint32_t c = 0; c < w; ++c) {
+            std::fill(grain.begin(), grain.end(), (int16_t)0);
+            for (uint32_t f = 0; f < kGrain; ++f) grain[(size_t)f * w + c] = 16384;
+            pcm_ptr = PTR(grain.data());
+            sink.outs.clear();
+            CHECK(call("sceAudioOut2PortSetAttributes", port, PTR(&attr), 1) == 0);
+            CHECK(call("sceAudioOut2ContextPush", ctx, 1) == 0);
+            CHECK(sink.outs.size() == 1);
+            if (sink.outs.size() != 1) continue;
+            const float* out = reinterpret_cast<const float*>(sink.outs[0].pcm.data());
+            CHECK(std::abs(out[0] - declared[c].left * 0.5f) < 1e-6f);
+            CHECK(std::abs(out[1] - declared[c].right * 0.5f) < 1e-6f);
+            printf(" | ch%u L%.3f R%.3f", c, out[0], out[1]);
+        }
+        printf("\n");
+        CHECK(call("sceAudioOut2PortDestroy", port) == 0);
+        sink.outs.clear();
+    }
+
+    CHECK(call("sceAudioOut2ContextDestroy", ctx) == 0);
+    audio_reset();
+}
+
 int main() {
     printf("== test_audio ==\n");
     register_builtin_hle();
     test_signal_stats();
     test_stereo_downmix();
+    test_stamped_grain_verdicts();
+    test_bed_routing_matrix();
 
     // --- 1. format decoding (all 8 SceAudioOutParamFormat values + an unknown) ---------------
     struct { uint32_t param; int ch; AudioFmt fmt; } fmts[] = {

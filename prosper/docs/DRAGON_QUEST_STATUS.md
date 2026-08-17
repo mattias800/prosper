@@ -365,8 +365,22 @@ current build.
   without resting on the mapping it is used to support. Within the residue, ch4/ch6 correlate +0.96 and ch5/ch7 +0.95 while ch4/ch5 is -0.04, so
   the surround tier pairs even=left / odd=right; ch2 correlates near-equally with both groups
   (centre-like). Reproduced identically on a second independent 150 s run.
-  **The 8-channel port (ctx1/port2) remains exactly zero** — 0 non-zero of 55,175,168 samples —
-  even though prosper forwards it. That is a separate open question (#1721), not this fix.
+  **The 8-channel port (ctx1/port2) is exactly zero — and that is the GUEST's silence, not
+  prosper's blindness (#1721, settled).** 0 non-zero of 55,175,168 samples, and prosper forwards it
+  anyway. The reading is now measured rather than inferred, because an exact zero from a read cannot
+  by itself distinguish "the guest mixes silence here" from "prosper is reading a buffer the guest
+  never fills" — a wrong address is exactly as zero as a silent mix. `PROSPER_AUDIO_STAMP=2:8:13000`
+  (see `AUDIO.md`) writes a per-channel-distinct pattern into that port's own grain after consuming
+  it and reports what comes back on the next push: **`CLEARED` on every arm** — the stamp is gone
+  and the grain is exactly zero, so the guest *actively writes* the buffer at `0x250101e000` and
+  writes silence into it. A live bus carrying nothing. The control that makes this worth quoting ran
+  on the same port in the same run: the probe's own read-back reported **256 non-zero samples on
+  each of the 8 channels**, so the reader demonstrably can report a non-zero sample here. Calibrated
+  against port1 in an identical run at the same offset, which returns `OVERWRITTEN` — the guest
+  filling it with content. Two further hypotheses are dead: this title imports exactly **14**
+  AudioOut2 entrypoints and `sceAudioOut2ContextBedWrite` is not among them (nor in any of the 44
+  local dumps), so there is no second PCM path prosper could be missing; and it never imports
+  `sceAudioOut2GetSpeakerInfo`, so nothing in its own setup names the bed order.
   **Rung 4 for audio: the project owner confirmed by ear that the music plays and sounds right.**
   That establishes real audio reaching the device at sane levels through the guest's own path. It
   establishes **nothing about the channel order** — with ten of the twelve channels empty, every

@@ -161,6 +161,45 @@ bool audio2_reserve_queue_slot(uint32_t& queued, uint32_t queue_depth) {
     return true;
 }
 
+uint64_t audio_count_nonzero_samples(const void* pcm, size_t bytes, bool s16) {
+    if (!pcm) return 0;
+    uint64_t n = 0;
+    if (s16) {
+        const auto* s = static_cast<const int16_t*>(pcm);
+        for (size_t i = 0, m = bytes / sizeof(int16_t); i < m; ++i)
+            if (s[i] != 0) ++n;
+    } else {
+        const auto* s = static_cast<const float*>(pcm);
+        // `!= 0.0f`, never a byte test: -0.0f compares equal to zero and has a non-zero bit
+        // pattern, and NaN compares unequal to zero, which is the same treatment
+        // AudioSignalStats gives both.
+        for (size_t i = 0, m = bytes / sizeof(float); i < m; ++i)
+            if (s[i] != 0.0f) ++n;
+    }
+    return n;
+}
+
+AudioGrainVerdict audio_classify_stamped_grain(bool same_address, bool matches_stamp,
+                                               uint64_t nonzero_samples) {
+    // Two properties are load-bearing, and a third that looks like it is, is not. Recorded because
+    // the difference was established by mutation rather than by reading, and reading had it wrong:
+    //   1. The address check must precede both content tests. A stamp read back from a DIFFERENT
+    //      buffer says nothing about either one, and the double-buffered case is otherwise reported
+    //      as a clean verdict about a buffer nobody looked at.
+    //   2. The identity test must EXIST. The stamp is deliberately non-zero in every sample, so a
+    //      surviving stamp carries a large non-zero count; drop this line and "prosper is reading
+    //      memory the guest never writes" is reported as "the port is healthy" — the exact inversion
+    //      the probe exists to prevent.
+    //   3. Whether identity is tested BEFORE or AFTER emptiness is immaterial, and the first version
+    //      of this comment claimed otherwise. Swapping them is behaviour-preserving for as long as
+    //      property 2's invariant holds, because the two conditions are then mutually exclusive: a
+    //      surviving stamp is never empty. The swap arm PASSED, which is what corrected the comment.
+    if (!same_address) return AudioGrainVerdict::PointerMoved;
+    if (matches_stamp) return AudioGrainVerdict::Intact;
+    if (nonzero_samples == 0) return AudioGrainVerdict::Cleared;
+    return AudioGrainVerdict::Overwritten;
+}
+
 // Stereo fold-down for a MAIN speaker bed. See audio.hpp for the contract.
 //
 // The bed order for 1..8 channels is FL, FR, FC, LFE, then surround pairs, with the small layouts
@@ -995,14 +1034,41 @@ void audio_layout_report() {
                      (unsigned long long)lp.last_ptr, (unsigned long long)lp.ptr_updates);
         else
             snprintf(stride_note, sizeof stride_note, "stride=n/a (no PCM pointer observed)");
+        // What prosper DID with each channel, printed beside what the channel measured as. The two
+        // halves of the layout question are "what role does this channel play in the guest's mix"
+        // (rms/hf/corr, above) and "where did prosper send it" — and until now the second half was
+        // only ever readable by opening hle_audio.cpp and applying the table by hand, which is
+        // exactly the step nobody takes while reading a log. A channel that measures as a surround
+        // feed and folds to `UNPLACED`, or one that measures centre-like and folds hard to one
+        // side, is then visible in the same two lines instead of in an offline derivation.
+        // Only a MAIN port is folded at all; anything else is not mixed to the host bed, so
+        // claiming a placement for it would be a straight falsehood.
+        AudioStereoGain fold[kA2MaxChannels]{};
+        const bool      folded = lp.type == 0;
+        const unsigned  unplaced =
+            folded ? audio_stereo_downmix(lp.channels, fold, kA2MaxChannels) : lp.channels;
+        char fold_note[96];
+        if (!folded)
+            snprintf(fold_note, sizeof fold_note, "fold=n/a (non-MAIN: not mixed to the host bed)");
+        else if (unplaced)
+            snprintf(fold_note, sizeof fold_note, "fold=7.1 + %u UNPLACED", unplaced);
+        else
+            snprintf(fold_note, sizeof fold_note, "fold=all %u placed", lp.channels);
         fprintf(stderr,
-                "[audio-layout] port%u ctx%u type=0x%x fmt=0x%x channels=%u grain=%u frames=%llu %s\n",
+                "[audio-layout] port%u ctx%u type=0x%x fmt=0x%x channels=%u grain=%u frames=%llu %s %s\n",
                 i + 1, lp.ctx_slot, lp.type, lp.data_format, lp.channels, lp.grain,
-                (unsigned long long)lp.frames, stride_note);
+                (unsigned long long)lp.frames, stride_note, fold_note);
         for (uint32_t c = 0; c < lp.channels; ++c) {
             const double hf = rms[c] > 0.0 ? std::sqrt(lp.diff_sumsq[c] / n) / rms[c] : 0.0;
-            fprintf(stderr, "[audio-layout]   ch%-2u rms=%.6f peak=%.6f nonzero=%5.1f%% hf=%.4f corr=",
+            fprintf(stderr, "[audio-layout]   ch%-2u rms=%.6f peak=%.6f nonzero=%5.1f%% hf=%.4f",
                     c, rms[c], lp.peak[c], 100.0 * (double)lp.nonzero[c] / n, hf);
+            if (!folded)
+                fprintf(stderr, " fold=n/a  ");
+            else if (fold[c].left == 0.0f && fold[c].right == 0.0f)
+                fprintf(stderr, " fold=UNPLACED");
+            else
+                fprintf(stderr, " fold=L%.3f/R%.3f", (double)fold[c].left, (double)fold[c].right);
+            fprintf(stderr, " corr=");
             for (uint32_t e = 0; e < lp.channels; ++e) {
                 const uint32_t lo = c < e ? c : e, hi = c < e ? e : c;
                 const double denom = rms[lo] * rms[hi] * n;
@@ -1166,6 +1232,291 @@ bool a2_store_zeros(uint64_t dst, size_t n) {
     std::vector<uint8_t> z(n, 0);
     return audio_store_bytes(dst, z.data(), n);
 }
+
+// The AudioOut2 grain write-back probe. It lives here, after the fault-safe guest memory
+// helpers it is built on, and is used by the mix loop further down.
+namespace {
+
+// --- PROSPER_AUDIO_STAMP: is the grain prosper READS the grain the guest WRITES? ---------------
+//
+// A port whose PCM reads as exactly zero for a whole run has two causes that need opposite fixes,
+// and NOTHING in PROSPER_AUDIO_FLOW or PROSPER_AUDIO_LAYOUT can separate them, because every
+// statistic those probes publish is computed from the same read:
+//   (a) the guest holds the bus open and mixes silence into it — a non-defect, and
+//   (b) prosper is reading a buffer the guest never fills — a pointer published once at setup and
+//       thereafter stale, a second buffer of a pair we never see, a read taken at the wrong point
+//       in the guest's fill cycle. Real audio is being lost, silently and invisibly.
+// A wrong address is exactly as zero as a silent mix, so "nonzero=0/55175168" is a statement about
+// an instrument until something outside that instrument says otherwise. This is that something.
+//
+// It settles the question by WRITING. Once the mix has consumed a grain, the probe stamps the
+// guest's own grain buffer with a per-channel-distinct pattern, and on the NEXT push classifies
+// what came back. The single fact it establishes is whether the guest WRITES this buffer between
+// two pushes, which is exactly the fact no amount of reading can supply:
+//   OVERWRITTEN  the stamp is gone and non-zero content is in its place -> the guest actively fills
+//                this buffer with signal. A live bus carrying audio: the HEALTHY signature, and the
+//                one to calibrate the probe against on a port already measured to carry content.
+//   CLEARED      the stamp is gone and the grain is exactly zero -> the guest actively writes this
+//                buffer and writes SILENCE into it. Case (a), now measured rather than assumed:
+//                the port is a live bus with nothing on it, and not prosper's defect.
+//   INTACT       the stamp survived byte-for-byte -> the guest did not touch this buffer at all
+//                between two pushes. Case (b): prosper is reading memory the guest does not fill,
+//                and the port's zero says nothing whatever about the guest's mix.
+//   POINTER-MOVED the guest republished a different address before we could read the stamp back —
+//                itself a finding (this port is double-buffered), and the reason the probe keys its
+//                classification on the address it actually stamped rather than on the port slot.
+// Note which way OVERWRITTEN cuts, because the name invites the opposite reading: prosper's own
+// push-time read is of the SAME buffer a few microseconds earlier, so content found here is content
+// the mix loop got. OVERWRITTEN is a report that the path works, not that something was missed.
+//
+// The probe is SELF-VALIDATING, which is the whole reason it is trustworthy: the stamp is read back
+// IMMEDIATELY after being written, through the same audio_read_bytes_partial() the mix loop uses,
+// and a probe whose own read-back does not return the stamp prints PROBE-INVALID and NO verdict.
+// That read-back is a positive instance of "this exact port can report a non-zero sample",
+// constructed by hand and outside whatever produced the null — a control drawn from the same
+// silent guest would only ever have re-confirmed the silence.
+//
+// Guest memory is left byte-identical: an INTACT stamp is rolled back to the bytes that were there
+// before it, and in every other case the guest has already replaced them itself. The probe is
+// opt-in, names ONE port, and stops after a bounded number of pushes — the pushes it stamps do
+// carry the stamp into the following push's flow/layout statistics, so an unbounded version would
+// corrupt the very totals the investigation is reading.
+//
+//   PROSPER_AUDIO_STAMP=<port>[:<pushes>[:<after>]]
+//       port    1-based, as printed by [audio-flow] / [audio-layout].
+//       pushes  how many pushes to stamp. Default 8, maximum 64.
+//       after   how many of the port's pushes to let past FIRST. Default 0.
+// `after` is not a convenience. The probe has to be calibrated against a port whose answer is
+// already known, and the only such port is one measured to carry content — but a title's first
+// pushes are routinely silent while it boots, so a probe armed at push 0 would classify the
+// KNOWN-GOOD port as CLEARED and "confirm" an instrument that was reading the wrong thing. At
+// 188 pushes/s, `after` is the port's own clock: 9400 lands the stamp about fifty seconds in.
+// A malformed value DISABLES the probe loudly rather than stamping some other port: a typo must
+// cost a measurement, never produce a wrong one.
+struct StampState {
+    uint64_t             addr = 0;        // the address the outstanding stamp was written to
+    std::vector<uint8_t> pattern;         // exactly what was written there
+    std::vector<uint8_t> original;        // what was there before, for the INTACT rollback
+    bool                 pending = false;
+    uint32_t             done = 0;        // pushes stamped so far, against the budget
+    uint64_t             seen = 0;        // pushes of this port observed, against `after`
+    bool                 disabled = false;
+};
+
+bool audio_stamp_config(uint32_t& port, uint32_t& pushes, uint64_t& after) {
+    static int      parsed = -1;
+    static uint32_t cfg_port = 0, cfg_pushes = 8;
+    static uint64_t cfg_after = 0;
+    if (parsed < 0) {
+        parsed = 0;
+        if (const char* e = getenv("PROSPER_AUDIO_STAMP"); e && *e) {
+            char*               end = nullptr;
+            const unsigned long v = strtoul(e, &end, 0);
+            bool                ok = end != e && v >= 1 && v <= kA2MaxPorts;
+            if (ok && *end == ':') {
+                char*               end2 = nullptr;
+                const unsigned long n = strtoul(end + 1, &end2, 0);
+                if (end2 == end + 1 || n < 1 || n > 64) ok = false;
+                else {
+                    cfg_pushes = (uint32_t)n;
+                    if (*end2 == ':') {
+                        char*               end3 = nullptr;
+                        const unsigned long a = strtoull(end2 + 1, &end3, 0);
+                        if (end3 == end2 + 1 || *end3 != '\0') ok = false;
+                        else cfg_after = (uint64_t)a;
+                    } else if (*end2 != '\0') {
+                        ok = false;
+                    }
+                }
+            } else if (ok && *end != '\0') {
+                ok = false;
+            }
+            if (ok) { cfg_port = (uint32_t)v; parsed = 1; }
+            else
+                fprintf(stderr, "[audio-stamp] PROSPER_AUDIO_STAMP=\"%s\" is malformed (expected "
+                                "<port 1..%u>[:<pushes 1..64>[:<after>]]); probe DISABLED\n",
+                        e, (unsigned)kA2MaxPorts);
+        }
+    }
+    port = cfg_port;
+    pushes = cfg_pushes;
+    after = cfg_after;
+    return parsed == 1;
+}
+
+// Non-zero SAMPLES per channel, and the run peak, for one interleaved grain. Reported rather than a
+// raw non-zero byte count: bytes are not comparable with anything else in this subsystem, whereas
+// per-channel sample counts line up directly with the `nonzero%` column of PROSPER_AUDIO_LAYOUT and
+// say WHICH channels the guest fills — which is the interesting half of an OVERWRITTEN verdict.
+// Returns the TOTAL, which must equal audio_count_nonzero_samples() over the same buffer: the
+// verdict is drawn from that shared rule, and this per-channel breakdown only says where the
+// samples sit.
+uint64_t audio_stamp_channel_stats(const std::vector<uint8_t>& buf, uint32_t channels,
+                                   uint32_t data_type, uint64_t* nonzero_out, double& peak_out) {
+    for (uint32_t c = 0; c < channels && c < kA2MaxChannels; ++c) nonzero_out[c] = 0;
+    peak_out = 0.0;
+    uint64_t     total = 0;
+    const size_t sample_bytes = data_type == 0 ? sizeof(float) : sizeof(int16_t);
+    for (size_t i = 0, n = buf.size() / sample_bytes; i < n; ++i) {
+        const float v = data_type == 0 ? reinterpret_cast<const float*>(buf.data())[i]
+                                       : (float)reinterpret_cast<const int16_t*>(buf.data())[i] *
+                                             (1.0f / 32768.0f);
+        if (v != 0.0f) {
+            ++total;
+            if ((i % channels) < kA2MaxChannels) ++nonzero_out[i % channels];
+        }
+        const double a = v < 0 ? -(double)v : (double)v;
+        if (v == v && a > peak_out) peak_out = a;   // NaN never raises the peak, as elsewhere here
+    }
+    return total;
+}
+
+void audio_stamp_print_channels(const char* label, const uint64_t* nonzero, uint32_t channels,
+                                double peak) {
+    fprintf(stderr, "               %s peak=%.6f non-zero samples:", label, peak);
+    for (uint32_t c = 0; c < channels && c < kA2MaxChannels; ++c)
+        fprintf(stderr, " ch%u=%llu", c, (unsigned long long)nonzero[c]);
+    fprintf(stderr, "\n");
+}
+
+// Per-channel-distinct and every sample non-zero, so the read-back doubles as a channel-identity
+// check: whichever channel index a value comes back on is the index prosper's stride arithmetic
+// put it at. Magnitudes stay under 0.5 at the widest bed so a stamp that does reach a device is
+// not a full-scale bang.
+void audio_stamp_fill(std::vector<uint8_t>& out, size_t n, uint32_t channels, uint32_t data_type) {
+    out.assign(n, 0);
+    if (data_type == 0) {
+        auto* s = reinterpret_cast<float*>(out.data());
+        for (size_t i = 0, m = n / sizeof(float); i < m; ++i)
+            s[i] = (float)((i % channels) + 1) / 32.0f;
+    } else {
+        auto* s = reinterpret_cast<int16_t*>(out.data());
+        for (size_t i = 0, m = n / sizeof(int16_t); i < m; ++i)
+            s[i] = (int16_t)(((i % channels) + 1) * 1024);
+    }
+}
+
+// Called from the mix loop with g_a2_mx held, once per push, for the one selected port, AFTER that
+// push's grain has been read and measured — so the probe never perturbs the reading it explains.
+void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint32_t data_type,
+                      uint32_t grain) {
+    uint32_t want_port = 0, budget = 0;
+    uint64_t after = 0;
+    if (!audio_stamp_config(want_port, budget, after)) return;
+    if (port_index + 1 != want_port) return;
+
+    static StampState st;
+    if (st.disabled || st.done >= budget) return;
+    if (st.seen++ < after) {
+        if (st.seen == 1)
+            fprintf(stderr, "[audio-stamp] port%u: armed, waiting %llu pushes before the first "
+                            "stamp\n", port_index + 1, (unsigned long long)after);
+        return;
+    }
+    const size_t sample_bytes = data_type == 0 ? sizeof(float) : sizeof(int16_t);
+    const size_t want = sample_bytes * (size_t)channels * grain;
+    if (!pcm || !want || !channels) return;
+
+    // An INDEPENDENT read of the same range: the classification must not inherit whatever the mix
+    // loop's read did, or a broken read would validate itself.
+    std::vector<uint8_t> now(want);
+    const size_t got = audio_read_bytes_partial(pcm, now.data(), want);
+    if (got != want) {
+        fprintf(stderr, "[audio-stamp] port%u: read 0x%llx +%zu returned %zu bytes; "
+                        "probe DISABLED (a partial grain cannot be classified)\n",
+                port_index + 1, (unsigned long long)pcm, want, got);
+        st.disabled = true;
+        return;
+    }
+
+    if (st.pending) {
+        uint64_t ch_now[kA2MaxChannels]{};
+        double   peak_now = 0.0;
+        const uint64_t total_now =
+            audio_stamp_channel_stats(now, channels, data_type, ch_now, peak_now);
+        const bool matches_stamp = st.pattern.size() == now.size() &&
+                                   std::memcmp(st.pattern.data(), now.data(), now.size()) == 0;
+        switch (audio_classify_stamped_grain(st.addr == pcm, matches_stamp, total_now)) {
+        case AudioGrainVerdict::PointerMoved:
+            fprintf(stderr, "[audio-stamp] port%u POINTER-MOVED: stamped 0x%llx, this push "
+                            "published 0x%llx — the port is double-buffered, so a zero read of "
+                            "either buffer alone proves nothing\n",
+                    port_index + 1, (unsigned long long)st.addr, (unsigned long long)pcm);
+            break;
+        case AudioGrainVerdict::Intact:
+            fprintf(stderr, "[audio-stamp] port%u INTACT: the stamp written to 0x%llx last push "
+                            "survived byte-for-byte — the guest did NOT write this buffer between "
+                            "pushes, so prosper is reading memory the guest does not fill and this "
+                            "port's zero says nothing about the guest's mix\n",
+                    port_index + 1, (unsigned long long)st.addr);
+            // Leave guest memory exactly as it was found.
+            if (!audio_store_bytes(pcm, st.original.data(), st.original.size()))
+                fprintf(stderr, "[audio-stamp] port%u: rollback of the intact stamp FAILED; the "
+                                "buffer still holds the probe pattern\n", port_index + 1);
+            break;
+        case AudioGrainVerdict::Cleared:
+            fprintf(stderr, "[audio-stamp] port%u CLEARED: the stamp written to 0x%llx last push "
+                            "is gone and the grain is exactly zero — the guest ACTIVELY writes "
+                            "this buffer and writes silence into it. The port is a live bus "
+                            "carrying no signal, not a buffer prosper is failing to read\n",
+                    port_index + 1, (unsigned long long)st.addr);
+            break;
+        case AudioGrainVerdict::Overwritten:
+            // The HEALTHY signature. prosper's own push-time read is of this same buffer a few
+            // microseconds earlier, so content found here is content the mix loop received — this
+            // says the path works, not that something was missed.
+            fprintf(stderr, "[audio-stamp] port%u OVERWRITTEN: the stamp written to 0x%llx last "
+                            "push is gone and the guest has filled the buffer with %llu non-zero "
+                            "samples — a live bus carrying signal, which is what a working port "
+                            "looks like\n",
+                    port_index + 1, (unsigned long long)st.addr, (unsigned long long)total_now);
+            audio_stamp_print_channels("guest content:", ch_now, channels, peak_now);
+            break;
+        }
+        st.pending = false;
+    }
+
+    audio_stamp_fill(st.pattern, want, channels, data_type);
+    st.original = now;
+    if (!audio_store_bytes(pcm, st.pattern.data(), st.pattern.size())) {
+        fprintf(stderr, "[audio-stamp] port%u: writing the stamp to 0x%llx FAILED; probe DISABLED "
+                        "(guest memory untouched)\n", port_index + 1, (unsigned long long)pcm);
+        st.disabled = true;
+        return;
+    }
+    // THE POSITIVE CONTROL, and the reason a verdict from this probe is worth anything: read the
+    // stamp back through the very call the mix loop uses. If a non-zero grain written by hand to
+    // this port's own buffer does not come back non-zero, the probe cannot distinguish silence
+    // from blindness and must not pretend to.
+    std::vector<uint8_t> back(want);
+    const size_t back_got = audio_read_bytes_partial(pcm, back.data(), want);
+    if (back_got != want || std::memcmp(back.data(), st.pattern.data(), want) != 0) {
+        fprintf(stderr, "[audio-stamp] port%u PROBE-INVALID: read back %zu of %zu stamped bytes "
+                        "and they do not match what was written — this port's read path cannot be "
+                        "shown to report a non-zero sample, so NO verdict is drawn from it\n",
+                port_index + 1, back_got, want);
+        st.disabled = true;
+        st.pending = false;
+        return;
+    }
+    // Report the control quantitatively, per channel, so "the reader could have seen it" is a
+    // number in the log rather than an assertion in a PR.
+    uint64_t ch_back[kA2MaxChannels]{};
+    double   peak_back = 0.0;
+    audio_stamp_channel_stats(back, channels, data_type, ch_back, peak_back);
+    fprintf(stderr, "[audio-stamp] port%u stamp %u/%u written to 0x%llx (%zu bytes, %u ch); "
+                    "read-back OK — this port CAN report a non-zero sample\n",
+            port_index + 1, st.done + 1, budget, (unsigned long long)pcm, want, channels);
+    audio_stamp_print_channels("positive control:", ch_back, channels, peak_back);
+    st.addr = pcm;
+    st.pending = true;
+    ++st.done;
+    if (st.done >= budget)
+        fprintf(stderr, "[audio-stamp] port%u: stamp budget (%u) spent; the verdict above is the "
+                        "probe's whole output\n", port_index + 1, budget);
+}
+
+} // namespace
 
 // ---- libSceAudioIn: headless, silent, real-time paced ----------------------------------
 //
@@ -1770,6 +2121,10 @@ HLE(audio2_ctx_push) {
                 }
                 if (ps.type != 0) ++fp.skip_not_main; else ++fp.mixed;
             }
+            // AFTER this push's grain has been read and measured, and before the mix (which works
+            // from the host-side copy in `tmp`, so it is unaffected): ask whether the guest writes
+            // the buffer we just read. Opt-in, one port, bounded. See PROSPER_AUDIO_STAMP above.
+            audio_stamp_step((uint32_t)this_pidx, ps.pcm_ptr, channels, data_type, grain);
             if (probe) {
                 static uint64_t call_ct[kA2MaxPorts] = {0};
                 const size_t nf = frames_got * channels;
