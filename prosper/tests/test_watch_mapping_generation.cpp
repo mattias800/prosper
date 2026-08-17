@@ -31,10 +31,23 @@
 //
 // Arm C is a wiring check over the production source, in the shape #1932/#2576 established: the
 // live arms can only exercise the call sites they happen to reach, and the handler has thirteen.
-// It asserts that EVERY protection change in exec_image_linux.cpp routes through the notifying
-// wrapper, and that the notifier itself is still lock-free -- a "helpful" change that made it also
-// maintain the mapping registry would take a mutex and reintroduce the signal-handler deadlock that
-// is the reason this entry point exists at all.
+// It asserts three things about each of the three notifying wrappers -- exec_image_linux.cpp's
+// watch_mprotect, and guest_write_watch.cpp's watch_mprotect and watch_virtual_protect:
+//
+//   1. every protection change in the file routes through the wrapper (check_wrapped), so the
+//      wrapper's own body holds the file's ONLY bare mprotect/VirtualProtect call;
+//   2. that body publishes the change AFTER making it (check_notify_after) -- the order is a
+//      requirement, not a style, and the reason is traced in guest_memory_map.hpp: consumers tag
+//      a memoized answer with a generation read BEFORE their probe, so a notify published before
+//      the change can be inherited by a probe that predates it, which is #2393 again and this
+//      time permanent rather than self-healing;
+//   3. the notifier itself is still lock-free -- a "helpful" change that made it also maintain the
+//      mapping registry would take a mutex and reintroduce the signal-handler deadlock that is the
+//      reason this entry point exists at all.
+//
+// (1) and (2) are complementary and neither alone is enough. Without (1) a new unwrapped call site
+// is invisible; without (2) the wrapper can be reordered into the broken form with every other
+// check still green, which is exactly the hole an earlier revision of this file left open.
 
 #include <cstdint>
 #include <cstdio>
@@ -143,6 +156,75 @@ void check_wrapped(const std::string& text, const char* needle, const char* pref
     check(bare == 1, what);
 }
 
+// Extract the body of the function whose declaration contains `signature` -- everything between
+// its opening brace and the matching close. Brace counting is naive about braces inside string
+// and character literals; none of these wrapper bodies contains one, and a miscount would end the
+// body early and make the caller FAIL loudly rather than pass wrongly.
+bool function_body(const std::string& text, const char* signature, std::string& out) {
+    const size_t at = text.find(signature);
+    if (at == std::string::npos) return false;
+    const size_t open = text.find('{', at);
+    if (open == std::string::npos) return false;
+    int depth = 0;
+    for (size_t i = open; i < text.size(); ++i) {
+        if (text[i] == '{') ++depth;
+        else if (text[i] == '}' && --depth == 0) {
+            out = text.substr(open + 1, i - open - 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+// THE ORDERING ASSERTION, and the point of finding 2 on this PR's first review. Within the
+// wrapper's own body: the protection syscall appears exactly once, a notify appears, and the
+// notify comes AFTER the syscall.
+//
+// "What else could satisfy this?" -- deliberately, as little as possible:
+//   * it is scoped to the body, so the explanatory comment above the wrapper (which names both
+//     the syscall and the notifier) cannot satisfy it, and neither can any other function;
+//   * it requires the syscall EXACTLY once, so a second, unpublished change smuggled into the
+//     same body fails rather than hiding behind the first;
+//   * it compares positions, so notify-before fails -- which a mere "the notifier is mentioned
+//     somewhere in this file" check, the form this replaces, cannot detect at all;
+//   * it takes the LAST notify, so a wrapper that published both before and after still passes:
+//     that is redundant but correct, and the assertion must not fail on a correct body.
+// Together with check_wrapped() -- which establishes that this body holds the file's only bare
+// call -- every protection change in the file is published, and published after the fact.
+//
+// This is deliberately not an exact-text match on the two lines. The property is the ordering,
+// not one spelling of it: a rename of the local or a reflow is a false red, while any reordering
+// that keeps the same two lines adjacent-but-swapped would still be caught here.
+void check_notify_after(const std::string& text, const char* signature, const char* syscall,
+                        const char* what) {
+    std::string body;
+    if (!function_body(text, signature, body)) {
+        std::fprintf(stderr, "  (could not locate the body of `%s`)\n", signature);
+        check(false, what);
+        return;
+    }
+    const size_t call = body.find(syscall);
+    const size_t again = call == std::string::npos ? std::string::npos
+                                                  : body.find(syscall, call + 1);
+    const size_t notify = body.rfind("notify_guest_page_protection_changed()");
+
+    if (call == std::string::npos)
+        std::fprintf(stderr, "  (the wrapper's body contains no `%s` call)\n", syscall);
+    else if (again != std::string::npos)
+        std::fprintf(stderr, "  (the wrapper's body contains more than one `%s` call; each one "
+                             "needs its own publication)\n", syscall);
+    else if (notify == std::string::npos)
+        std::fprintf(stderr, "  (the wrapper never publishes the change)\n");
+    else if (notify < call)
+        std::fprintf(stderr, "  (the wrapper publishes BEFORE the change: a reader whose "
+                             "sync_generation lands between the two caches a positive tagged with "
+                             "the NEW generation, and nothing ever expires it -- #2393 again)\n");
+
+    check(call != std::string::npos && again == std::string::npos &&
+              notify != std::string::npos && notify > call,
+          what);
+}
+
 void test_production_wiring() {
     // Both paths are supplied by the build (CMAKE_CURRENT_SOURCE_DIR) and deliberately never
     // printed: they are absolute paths on whoever's machine ran the build.
@@ -158,10 +240,8 @@ void test_production_wiring() {
     check_wrapped(handler, "mprotect(", "watch_",
                   "wiring: every protection change in the Linux fault handler routes through "
                   "watch_mprotect()");
-    check(handler.find("const int rc = mprotect(addr, len, prot);\n"
-                       "        prosper::host::notify_guest_page_protection_changed();")
-              != std::string::npos,
-          "wiring: the fault handler's watch_mprotect() advances the generation after the mprotect");
+    check_notify_after(handler, "int watch_mprotect(void* addr, size_t len, int prot)", "mprotect(",
+                       "wiring: the fault handler's watch_mprotect() publishes AFTER the mprotect");
 
     // The same invariant, the same remedy, in the file that arms the production write-watch. Both
     // of its arms are checked from here even though only the POSIX one compiles on Linux -- a
@@ -179,8 +259,15 @@ void test_production_wiring() {
     check_wrapped(watch, "VirtualProtect(", "watch_virtual_",
                   "wiring: every protection change in guest_write_watch.cpp's Windows arm routes "
                   "through watch_virtual_protect()");
-    check(watch.find("notify_guest_page_protection_changed();") != std::string::npos,
-          "wiring: guest_write_watch.cpp advances the guest mapping generation");
+    // The ordering, pinned on BOTH of this file's wrappers exactly as it is on the handler's.
+    // This replaces a "the notifier is mentioned somewhere in this file" check, which was green
+    // for every arrangement of these five lines including the broken one.
+    check_notify_after(watch, "int watch_mprotect(void* addr, size_t len, int prot)", "mprotect(",
+                       "wiring: guest_write_watch.cpp's watch_mprotect() publishes AFTER the "
+                       "mprotect");
+    check_notify_after(watch, "BOOL watch_virtual_protect(", "VirtualProtect(",
+                       "wiring: guest_write_watch.cpp's watch_virtual_protect() publishes AFTER "
+                       "the VirtualProtect");
 
     std::string header;
     if (!read_file(PROSPER_GUEST_MEMORY_MAP_SOURCE, header)) {

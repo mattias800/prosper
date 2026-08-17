@@ -108,7 +108,13 @@ inline void advance_guest_mapping_generation() {
 // THE INVARIANT (#2393). Stated here, at the definition, because it is load-bearing for code
 // in two other subsystems and used to be written down nowhere:
 //
-//     EVERY change to guest page protection must advance guest_mapping_generation().
+//     EVERY change to guest page protection must advance guest_mapping_generation(),
+//     and must advance it AFTER the change, never before.
+//
+// The ordering half is a real requirement and not a house style -- advancing first leaves a
+// consumer able to cache a positive tagged with the NEW value, which never expires. The mechanism
+// is traced in full on notify_guest_page_protection_changed() below; read it before reordering
+// anything here.
 //
 // Two thread-local caches in src/gpu/gpu_executor.cpp memoize positive answers -- "this span is
 // readable", "this span is writable" -- and drop everything when this counter moves. They are
@@ -156,12 +162,41 @@ inline uint64_t guest_mapping_generation() {
 // not know the enclosing mapping's real protection and cannot restore the entry on disarm. That
 // would trade a transient stale positive for a permanent stale negative.
 //
-// Ordering: call it AFTER the protection change, matching the kernel-memory HLE's own
-// change-then-notify order. Neither order closes the instantaneous window in which another
-// thread reads the counter, then the protection changes, then that thread consults its
-// now-stale memo -- protection cannot be changed and published atomically, and the uncached
-// /proc/self/maps path this replaced had the identical window between its parse and its
-// caller's use. What this does close is the UNBOUNDED staleness, which is the actual defect.
+// ORDERING IS REQUIRED, NOT STYLISTIC. Call this AFTER the protection change. The two orders are
+// not mirror images of one narrow window: they differ in whether a wrong answer SELF-HEALS or is
+// PERMANENT, and notify-before reintroduces #2393 verbatim.
+//
+// Why, traced through the consumer. gpu_executor.cpp's caches tag a memoized answer with a counter
+// value read BEFORE they probe the OS: guest_writable_cache_hit() calls sync_generation() first,
+// and the insert on the miss path (cache_guest_writable_range) never re-reads the counter. So a
+// cached positive always carries the value that was current before its own probe ran, and
+// publishing after the change is what makes that tag necessarily older than the published value:
+//
+//   * AFTER -- mprotect at T_m, fetch_add at T_b > T_m. A probe that answered "writable" ran
+//     before T_m, so the tag it recorded was read before T_m and therefore before T_b: strictly
+//     older than the value now published, and the next call's sync_generation drops it. Staleness
+//     is bounded by one in-flight query and self-heals.
+//   * BEFORE -- fetch_add at T_b, mprotect at T_m > T_b. A reader whose sync_generation lands in
+//     (T_b, T_m) reads the NEW value, drops its memo, probes a page that is still writable, and
+//     caches that positive tagged with the NEW value. After T_m the page is read-only and no
+//     further advance is coming, so guest_writable keeps answering TRUE for a read-only page on
+//     that thread until something unrelated moves the counter. Unbounded staleness -- which is
+//     the defect this notifier exists to close.
+//
+// (T_b, T_m) is narrow. What is not narrow is the consequence: one order costs a single stale
+// answer, the other costs every answer thereafter. The guest-facing k_mprotect path is
+// change-then-notify for this same reason, not merely by convention.
+//
+// The CONSUMER half of the contract is equally load-bearing and lives in gpu_executor.cpp: the
+// generation must be read BEFORE the probe whose result it tags. A cache that read it afterwards
+// would be broken under this order too -- its tag could be a value published after the very
+// change its probe was too early to see. Do not move that read.
+//
+// One window is genuinely not closed, and cannot be: a thread may read the counter, then the
+// protection changes, then it consults the memo it had already tagged. Protection cannot be
+// changed and published atomically. That window is one in-flight query wide, self-heals on the
+// next call, and the uncached /proc/self/maps path this replaced had the identical window between
+// its parse and its caller's use.
 inline void notify_guest_page_protection_changed() {
     static_assert(std::atomic<uint64_t>::is_always_lock_free,
                   "guest_mapping_generation must be lock-free: it is advanced from a SIGSEGV/"
