@@ -2499,8 +2499,8 @@ struct PersistentDsKey {
     // never reached the invalidation at all, and one that reprogrammed it was ignored in favour of
     // the frozen first value -- silently, because an excluded field cannot cause a lookup to miss.
     //
-    // The stride now lives in `ds_layer_stride_registry()`, keyed by the surface identity and
-    // refreshed on every attachment, so the invalidation always reads the latest observation.
+    // The stride now lives in `ds_layer_stride_registry()`, keyed by the surface identity, so the
+    // invalidation reads the latest observation rather than one frozen on the key.
     bool operator==(const PersistentDsKey& o) const {
         return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw && htile == o.htile &&
                w == o.w && h == o.h && fmt == o.fmt && slice == o.slice;
@@ -2964,8 +2964,8 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // re-rendered, leaving one or two of six resident whenever the cube was sampled.
         //
         // The offset needs the layer stride, which the registry answers for this surface identity --
-        // producer register first, then a consumer descriptor, then 0 for "unknown" and the old
-        // whole-allocation behaviour. Reading it here rather than off `key` is what keeps it fresh:
+        // from a consumer descriptor, or 0 for "unknown" and the old whole-allocation behaviour.
+        // Reading it here rather than off `key` is what keeps it fresh:
         // the keys iterated by this loop are the ones stored at entry creation, so a stride carried
         // on the key was whatever the FIRST attachment saw, forever.
         const uint64_t learned =
@@ -2985,9 +2985,14 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // UNSAFE error direction twice over: a real write to stencil slice N is missed, leaving
         // stale stencil resident, and a neighbouring slice's write can be misattributed to this one.
         // No authority for a stencil-plane layer stride exists here -- the consumer T# that supplies
-        // the depth one describes the depth aspect -- so stencil keeps the whole-allocation
-        // behaviour it has on master rather than adopting a stride that is known to be wrong.
-        // Making stencil slice-exact needs its own stride: #2670.
+        // the depth one describes the depth aspect -- so stencil keeps exactly the behaviour it has
+        // on master rather than adopting a stride known to be wrong.
+        //
+        // Be precise about what that behaviour is, because "whole-allocation" would flatter it:
+        // `stencil_size` is w*h, ONE slice's worth, tested at the plane base. For a layered stencil
+        // surface a write to slice N > 0 is therefore still missed. That is a real gap and it is the
+        // unsafe direction -- it is simply not a gap this change introduces or widens, and adopting
+        // the depth stride would have made it worse rather than better. #2670 carries it.
         const bool stencil_overlap =
             guest_ranges_overlap(addr, size, key.sr, stencil_size) ||
             guest_ranges_overlap(addr, size, key.sw, stencil_size);
