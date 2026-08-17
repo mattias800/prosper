@@ -103,7 +103,7 @@ Every executable image in the local corpus scanned for `sceVideodec2Decode`'s NI
 | title | reaches `Decode` | codec | measured under default-on decoding |
 | --- | --- | --- | --- |
 | *Tales of Graces f Remastered* `PPSA19991` | yes | 1 (AVC High, 1920x1088) | plays its opening movie; 15 distinct samples against 12 identical before |
-| *Sonic Origins* `PPSA05325` | yes | 1 (AVC High, 3840x2160) | moves off the flat white it held indefinitely; 8 distinct 4K samples |
+| *Sonic Origins* `PPSA05325` | yes | 1 (AVC High, 3840x2160) | the pure-white hold is **passed through, not eliminated** — still one flat white frame at 80 s, then 14,871 / 8,978 / 13,351 / 9,294 / 9,372 colours to the end of a 180 s window. #2267 |
 | *Sonic Racing: CrossWorlds* `PPSA08804` | yes | 2382845 (VP9) | carried **through** its post-logo wall — another lane's measurement, `SONIC_CROSSWORLDS_STATUS.md` |
 | *Dragon Quest VII Reimagined* `PPSA17942` | no — `QueryComputeMemoryInfo` only | — | unaffected |
 | *Balan Wonderworld* `PPSA02058` | no record | — | unaffected |
@@ -112,15 +112,32 @@ Every executable image in the local corpus scanned for `sceVideodec2Decode`'s NI
 A title that never reaches `Decode` cannot be affected: the decode path is entered only from inside
 `sceVideodec2Decode` on a live decoder handle.
 
+**Decoding a movie does not make prosper render it.** On `PPSA05325` every presented sample is
+`source=guest_scanout` and **68 of 68** `[rtt] GUEST SCANOUT` lines still report *"no present source
+and no renderer target"* — the same figure #2267 measured before any of this. The renderer authors
+nothing on that title either way; what changed is that the buffer the guest flips now contains
+decoded pictures instead of a cleared page. Do not read a title advancing past a movie as evidence
+that its rendering works.
+
 ## Open
 
 - **`VdecOutput::format`** is the one field still unestablished, and prosper writes 0. It is a Sony
   enum whose values are not derivable from anything local, and a wrong constant is a
-  correctly-decoded picture the guest reads wrongly — silent. Two titles now composite a
-  byte-verified picture with `format = 0`, which is evidence they tolerate it and **not** evidence
-  that no guest reads the field. `PROSPER_VDEC2_FORMAT` sweeps candidates without a rebuild, and a
-  ctest arm pins that the value it names reaches the guest's struct — so a sweep's null is about the
-  guest rather than about the instrument.
+  correctly-decoded picture the guest reads wrongly — silent.
+
+  **The strongest evidence on it is not in this document's own lane**: #2267 records a four-value
+  sweep (0/1/2/4) on *Sonic Origins*' intro measuring mean channel values over non-background pixels,
+  and all four arms agree to one decimal — so the field does not drive that title's colour path.
+  That comment is also worth reading for how it nearly went wrong: the first comparison was frame
+  *hashes*, which differ across arms **by construction** when the subject is a playing video, and a
+  guaranteed difference was about to be reported as signal.
+
+  Two more titles now composite a byte-verified picture with `format = 0`. Taken together that is
+  evidence these guests tolerate 0 and **not** evidence that no guest reads the field — one title's
+  null does not generalise, and a value that happens to mean something specific could still change
+  behaviour. `PROSPER_VDEC2_FORMAT` sweeps candidates without a rebuild, and a ctest arm pins that
+  the value it names reaches the guest's struct, so a sweep's null is about the guest rather than
+  about the instrument.
 - **`sceVideodec2Flush` does not drain the decoder** — #2562.
 - **`sceVideodec2Reset` closes and reopens instead of `avcodec_flush_buffers`**, which discards the
   parsed SPS/PPS as well as the DPB — #2585. `CONFIDENCE: MED` on the current mechanism.
