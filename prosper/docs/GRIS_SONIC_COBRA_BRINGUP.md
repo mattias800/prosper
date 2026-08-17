@@ -729,19 +729,22 @@ split, and it is deliberately a **three**-way one, not two:
 same 24,308 windows, same 536 called imports:
 
 ```text
-#   254 gated, 202 ignored-only (cannot matter), 80 neither (no gate, and >=1 site not cleared)
-#   180 rows carry >=1 site the scan could not resolve (gate-open/forward/undecodable)
-#   site buckets: alu-gate=522 const=1 forward=1817 gate-open=897 ignored=18462 nonzero=2287
-#                 other-cmp=313 undecodable=9
+#   254 gated, 192 ignored-only (cannot matter), 90 neither (no gate, and >=1 site not cleared)
+#   241 rows carry >=1 site the scan could not resolve (gate-open/forward/undecodable)
+#   site buckets: alu-gate=517 const=1 forward=2013 gate-open=1053 ignored=18270 nonzero=2133
+#                 other-cmp=313 undecodable=8
 ```
 
-`undecodable` fell from **2,699 windows to 9**: the old figure was almost entirely the *last*
+`undecodable` fell from **2,699 windows to 8**: the old figure was almost entirely the *last*
 instruction of each fixed-size window being cut in half and decoding as `(bad)`/`.byte`, so the
-"11.1% of all windows are a void sample" line below was reading a truncation artifact as a finding.
-`ignored`-only rows rose 157 → 202 and the same "neither" count fell 132 → 80, because following the
+11.1%-of-all-windows void share this section originally reported was a truncation artifact read as a
+finding.
+`ignored`-only rows rose 157 → 192 and the same "neither" count fell 132 → 90, because following the
 branches resolves sites that used to end at the first one. The new `gate-open` bucket is the honest
-residue: a row can gate on the result and still be unresolved, which is why **180** — not 80 — is the
-number of rows that need a hand read.
+residue, and it cuts the other way: a row can gate on the result and still be unresolved, and a value
+handed to a callee in an argument register is not dead either — so **241** rows, not 90, need a hand
+read. That is more than the 132 this section originally reported, and it is the more accurate number:
+the old walk was clearing sites it had not established anything about.
 
 **Not-gated is not the same as cleared.** Only the `ignored`-only rows are struck off; an unresolved
 row carries at least one `forward`/`gate-open` site (the result left the scan's reach still live —

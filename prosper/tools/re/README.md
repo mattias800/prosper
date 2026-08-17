@@ -270,16 +270,16 @@ Rows sort by gated call sites descending, so the head of the table is libc, and 
 block is the part to read first:
 
 ```text
-Ovb2dSJOAuE  strcmp                libSceLibcInternal  sites=981 gated=979 gate-open=65 nonzero=912 …
+Ovb2dSJOAuE  strcmp                libSceLibcInternal  sites=981 gated=979 gate-open=66 nonzero=911 …
 …
 fMP5NHUOaMk  sceSysmoduleIsLoaded  libSceSysmodule     sites=5   gated=5   const=1 gate-open=1 nonzero=3
 …
 # <path>: 536 imported NIDs are called; 254 shown at --min-gated=1
-#   254 gated, 202 ignored-only (cannot matter), 80 neither (no gate, and >=1 site not cleared)
-#   180 rows carry >=1 site the scan could not resolve (gate-open/forward/undecodable) — read
+#   254 gated, 192 ignored-only (cannot matter), 90 neither (no gate, and >=1 site not cleared)
+#   241 rows carry >=1 site the scan could not resolve (gate-open/forward/undecodable) -- read
 #   those by hand
-#   site buckets: alu-gate=522 const=1 forward=1817 gate-open=897 ignored=18462 nonzero=2287
-#                 other-cmp=313 undecodable=9
+#   site buckets: alu-gate=517 const=1 forward=2013 gate-open=1053 ignored=18270 nonzero=2133
+#                 other-cmp=313 undecodable=8
 ```
 
 **Not-gated is not the same as cleared, and neither is gated.** `ignored` is the only bucket that
