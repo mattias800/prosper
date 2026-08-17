@@ -22,12 +22,19 @@ jobs:
       # strictly spirv-val-gated. #1711 is what shipped through the gap. spv_validate now fails
       # when the validator is absent, so removing this line breaks the job instead of silently
       # switching the gate off again.
+      # gdb is the same shape of gap, measured rather than assumed: the Ubuntu 24.04 runner image
+      # ships gcc/g++/cmake but NOT gdb, so `hle_calls_value_capture` — the only guard on the #2075
+      # class, a value capture that silently records nothing — reported
+      # `10/250 Test #10: hle_calls_value_capture ***Skipped` on every CI run since it landed. That
+      # skip is legible by design (SKIP_RETURN_CODE 77 names it in the summary) rather than silent,
+      # which is why this is a one-line install and not a redesign: the test drives a real gdb over a
+      # real no-debug-info binary because nothing else reproduces the defect.
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
             libavutil-dev libswresample-dev libswscale-dev libva-dev \
-            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers spirv-tools
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers spirv-tools gdb
 
       # #1675: Vulkan was disabled here because it was never installed, not by choice — and that
       # silently removed 27 tests (~1,700 assertions) from every "green" CI run, including every
