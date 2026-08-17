@@ -91,23 +91,44 @@ enum class ImportState : uint8_t {
 // has exact HTILE materialization, so this was never going to stay DCC-only.
 enum class MaterializedSource : uint8_t { None, ExactDcc, ExactHtile };
 
+// The COMPLETE physical identity of an image over a byte range — every field that changes how those
+// bytes are interpreted.
+//
+// It mirrors the existing exact storage cache key (`ComputeImageCacheKey` in the live compute backend)
+// field for field rather than keeping a convenient subset, because a partial identity is what makes
+// "same bytes" mean "same image" when it does not: equal extent, tile mode and pitch still leave a 3D
+// versus arrayed view, a shifted mip, a mip-tail placement, or a different replay-owned backing
+// interpreting the same range differently. Adapters derive this from that key; comparison here is
+// EXACT, and stays exact until some broader alias is independently proved safe.
+struct SampledSourceLayout {
+    uint64_t base_addr = 0;
+    uintptr_t host_data = 0;          // owned-backing identity: two captures may share a guest address
+    uint32_t guest_bytes = 0;
+    uint32_t resource_bytes = 0;
+    uint32_t width = 0, height = 0, depth = 0;
+    uint32_t img_dim = 0;
+    uint32_t tile_mode = 0;
+    uint32_t linear_row_pitch = 0;
+    uint32_t layer_stride = 0, layer_mip_offset = 0;
+    uint32_t mip_tail_offset = 0, mip_tail_bytes = 0, mip_tail_x = 0, mip_tail_y = 0;
+    bool in_mip_tail = false;
+    DataFormat format = DataFormat::Float32;
+    uint32_t num_components = 1;
+
+    bool operator==(const SampledSourceLayout& other) const = default;
+};
+
 // Exact producer provenance for "prosper's own writeback established these bytes".
 //
 // The most dangerous positive authority there is: one mistaken assignment licenses raw bytes while the
 // metadata says they are encoded. So it is verified in this seam from a record, not asserted by a
-// caller — and identity is more than submit ordering. The bytes are only authoritative if the
-// allocation, its version, the byte range AND the layout used to interpret it all match.
+// caller — and identity is more than submit ordering.
 struct ProducerWritebackRecord {
     bool present = false;
-    uint64_t base_addr = 0;
+    SampledSourceLayout layout;
+    uint64_t content_version = 0;
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
-    uint64_t content_version = 0;
-    uint32_t width = 0, height = 0, depth = 1;
-    uint32_t tile_mode = 0;
-    uint32_t row_pitch = 0;
-    DataFormat format = DataFormat::Float32;
-    uint32_t num_components = 1;
     // Ordering: the consumer must come after the producer in the same submit timeline.
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
@@ -115,21 +136,17 @@ struct ProducerWritebackRecord {
 
 // What the consumer is about to read, in the same terms, so the seam can compare rather than trust.
 struct ConsumerReadRequest {
-    uint64_t base_addr = 0;
+    SampledSourceLayout layout;
+    uint64_t content_version = 0;
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
-    uint64_t content_version = 0;
-    uint32_t width = 0, height = 0, depth = 1;
-    uint32_t tile_mode = 0;
-    uint32_t row_pitch = 0;
-    DataFormat format = DataFormat::Float32;
-    uint32_t num_components = 1;
     uint64_t submit_no = 0;
     uint64_t command_order = 0;
 };
 
-// True only when the record covers this exact read, in order, with a layout that interprets the same
-// bytes the same way.
+// True only when the record covers this exact read, in order, over an identical physical layout whose
+// texel width is actually establishable. Range arithmetic is overflow-checked: an unchecked
+// offset + size wraps, and a wrapped end compares as CONTAINED, which authorizes an arbitrary read.
 bool producer_writeback_covers_read(const ProducerWritebackRecord& record,
                                    const ConsumerReadRequest& read);
 

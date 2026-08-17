@@ -39,6 +39,13 @@ size_t exact_metadata_span(const MetadataPlaneShape& shape) {
                                                        shape.sample_count, shape.meta_pipe_aligned);
             return 0;
         case CompressionMetadataKind::Dcc: {
+            // The DCC helper's published contract is SINGLE-SAMPLE base-level SW_64KB_R_X. It takes no
+            // sample count, so it cannot reject a multisample shape -- this caller must, or a 4xAA
+            // colour surface receives the single-sample span and an all-0xff prefix over that wrong
+            // window authorizes the base. That is the same self-consistent wrong footprint this whole
+            // resolver exists to make inexpressible.
+            if (shape.sample_count != 1u) return 0;
+            if (shape.img_dim == 6u) return 0;   // 2D_MSAA is not a single-sample colour shape
             const uint32_t bytes_per_texel = texel_bytes(shape.format, shape.num_components);
             if (!bytes_per_texel) return 0;
             const uint32_t layers =
@@ -81,22 +88,27 @@ MetadataProof resolve_metadata_proof(const MetadataPlaneShape& shape, const uint
 bool producer_writeback_covers_read(const ProducerWritebackRecord& record,
                                    const ConsumerReadRequest& read) {
     if (!record.present) return false;
-    // Same allocation, same version of its contents.
-    if (record.base_addr != read.base_addr) return false;
+
+    // EXACT physical identity. Anything else and the same bytes are a different image -- a 3D versus
+    // arrayed view, a shifted mip, a different mip-tail placement, or a different owned backing.
+    if (!(record.layout == read.layout)) return false;
+
+    // The layout must actually establish how wide a texel is. Two unknown formats both report 0, and
+    // comparing 0 == 0 would accept them as compatible -- zero means "cannot establish", not "matches".
+    if (!texel_bytes(read.layout.format, read.layout.num_components)) return false;
+
+    // Same version of the contents.
     if (record.content_version != read.content_version) return false;
-    // The producer's written range must COVER the consumer's read range.
+
+    // Overflow-checked containment. `offset + size` wraps on a hostile or buggy input, and a wrapped
+    // end compares as CONTAINED -- a record covering [0,64) would admit a read at UINT64_MAX-3 of 8
+    // bytes, whose end computes as 4.
+    if (!record.byte_size || !read.byte_size) return false;
+    if (record.byte_size > UINT64_MAX - record.byte_offset) return false;
+    if (read.byte_size > UINT64_MAX - read.byte_offset) return false;
     if (read.byte_offset < record.byte_offset) return false;
-    const uint64_t record_end = record.byte_offset + record.byte_size;
-    const uint64_t read_end = read.byte_offset + read.byte_size;
-    if (!record.byte_size || !read.byte_size || read_end > record_end) return false;
-    // The layout must interpret those bytes the same way. Identical addresses with a different tile
-    // mode, pitch, extent or texel width are a different image over the same memory.
-    if (record.width != read.width || record.height != read.height || record.depth != read.depth)
-        return false;
-    if (record.tile_mode != read.tile_mode || record.row_pitch != read.row_pitch) return false;
-    if (texel_bytes(record.format, record.num_components) !=
-        texel_bytes(read.format, read.num_components))
-        return false;
+    if (read.byte_offset + read.byte_size > record.byte_offset + record.byte_size) return false;
+
     // Ordering: the consumer must come after the producer on the same submit timeline.
     if (record.submit_no != read.submit_no) return false;
     return record.command_order < read.command_order;
