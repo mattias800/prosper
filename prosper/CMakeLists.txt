@@ -216,7 +216,6 @@ if(Python3_Interpreter_FOUND)
   # divergence would hand out a number the gate then rejects, on somebody else's PR, hours later.
   add_test(NAME trap_number
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/docs/test_trap_number.py")
->>>>>>> d69cda2c (tools(docs): trap_number.py — allocate a row number against master AND every open PR)
   # Parsing/gating logic of the Vulkan validation guard (#1704). Pure — it does not create a Vulkan
   # instance, so it runs everywhere. A parser that stops matching the layer's message framing would
   # report a clean suite forever, which is the one way this guard can fail silently.

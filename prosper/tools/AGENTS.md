@@ -483,7 +483,6 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   PR claims the same number it says so and suggests stepping *clear* of the contested band rather than
   to the next free number, since every loser stepping to "next free" collides again one number up.
   `ctest -R trap_number` covers it.
->>>>>>> e2a972fe (fix(tools/docs): address review B1-B4 and N1-N5, and renumber the trap row to 188)
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the
