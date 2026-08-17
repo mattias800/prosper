@@ -4,9 +4,12 @@
 WHY. The instrument-trap table's whole value is that other documents, source comments and tests
 point AT it by number -- `// instrument trap 104 records that a read-only probe's DURATION can
 decide...` in `src/gpu/command_processor.cpp`, `See instrument-trap 41` in `CLAUDE.md`,
-`Recorded as instrument trap 114` in a status doc. Measured on `origin/master` 2026-08-17: **95
-lines across 50 files, naming 91 distinct rows** -- and roughly half are `.cpp`/`.hpp`/test comments
-rather than prose, so this is a contract compiled files depend on, not a documentation nicety.
+`Recorded as instrument trap 114` in a status doc. Roughly half of them are `.cpp`/`.hpp`/test
+comments rather than prose, so this is a contract compiled files depend on, not a documentation
+nicety. **This file deliberately quotes no total**: it PRINTS the live figure on every run, and an
+earlier draft froze a number here that had already been corrected twice elsewhere (#2621 review) --
+citing a stale count inside the tool that measures it is the exact failure the tool exists to
+prevent. Run it if you want the number.
 
 Nothing checked that those references resolve. `check_numbered_table.py` validates the TABLE --
 structure, arity, uniqueness, ascent, and (with `--baseline`) that no row was deleted. It has no
@@ -22,8 +25,11 @@ WHAT COUNTS AS A REFERENCE. `trap 41`, `traps 55 and 56`, `instrument trap 104`,
 43`, `orchestration trap 68`, and comma lists like `traps 64, 116 and 121`. The word must not be
 preceded by an identifier character, which is what keeps the RDNA2 shader tests' `s_trap 1` and
 `v_trap` out -- those are instruction mnemonics and have nothing to do with this table. That
-exclusion is measured rather than assumed: without it the corpus reports 4 spurious references, all
-in `tests/test_recompile_coverage.cpp` and its neighbours.
+exclusion is measured rather than assumed: on `origin/master` `7413647a`, removing the leading
+boundary admits exactly **4** extra matches -- `s_trap 0` in `test_dynfetch_fold.cpp`,
+`test_indirect_pointer_static_footprint.cpp` and `test_rdna2_to_spirv.cpp`, and `s_trap 1` in
+`test_recompile_coverage.cpp`. **Three of them cite row 0**, which does not exist, so they would not
+merely be noise: they would turn this repo-wide required gate red on correct code.
 
 WHAT IT CANNOT SEE, stated so silence is not read as coverage:
   * A reference that names a row which EXISTS but is the wrong one. Only a reader can tell that; a
@@ -48,12 +54,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_numbered_table import parse_tables  # noqa: E402
 
-# `(?<![A-Za-z0-9_])` is what excludes `s_trap 1` / `v_trap 3`: an RDNA2 mnemonic, not a citation.
-# The separator after the word may be a space or a hyphen ("instrument-trap 43" appears in CLAUDE.md).
+# Three things this regex has to get right, each measured against the real corpus rather than
+# reasoned about (#2621 review):
+#
+#  1. A LEADING boundary, so `s_trap 1` / `v_trap 3` -- RDNA2 mnemonics -- are not citations. Two
+#     forms, because the prefix decides which: an explicitly prefixed citation ("instrument-trap 43")
+#     legitimately follows a hyphen, while a BARE `trap` after a hyphen is part of a compound word.
+#     Without that split, `prosper/tools/AGENTS.md:100`'s pasted log line `[agc] WRITE-TRAP #1[...]`
+#     would count as a reference to row 1.
+#  2. A TRAILING boundary on the number. Without it `\d{1,3}` bites a prefix out of anything longer
+#     and the result is a citation to a row that was never written:
+#         `trap 0x40`   -> row 0     (turns this repo-wide gate RED on correct code)
+#         `traps 1234`  -> row 123   (silently WRONG -- resolves today, points at an unrelated row)
+#         `trap 41.5ms` -> row 41    (spurious, resolves)
+#     `(?![\w.])` rejects all three: the match fails outright rather than truncating.
+#  3. An optional `#`. `trap #16`, `trap #35` and `instrument trap #13` are live in-repo citation
+#     forms (DRAGON_QUEST_STATUS.md, OREGON_TRAIL_STATUS.md, SYBERIA_STATUS.md); missing them while
+#     the success line says "all resolving" would be a completeness claim the tool does not have.
+#
 # The tail captures comma/and lists so "traps 64, 116 and 121" yields three references, not one.
 CITATION = re.compile(
-    r"(?<![A-Za-z0-9_])(?:instrument[- ]|orchestration )?traps?[- ]"
-    r"(\d{1,3}(?:\s*,\s*\d{1,3})*(?:\s*(?:,\s*)?and\s+\d{1,3})?)",
+    r"(?:(?<![A-Za-z0-9_])(?:instrument[- ]|orchestration )|(?<![A-Za-z0-9_-]))"
+    r"traps?[- ]#?"
+    r"(\d{1,3}(?:\s*,\s*#?\d{1,3})*(?:\s*(?:,\s*)?and\s+#?\d{1,3})?)"
+    r"(?![\w.])",
     re.IGNORECASE,
 )
 NUMBER = re.compile(r"\d{1,3}")

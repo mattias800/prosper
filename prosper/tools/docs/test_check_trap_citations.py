@@ -75,9 +75,48 @@ case("every dangling reference is reported, not just the first",
 print("correct shapes that must NOT fire:")
 
 case("a resolving reference passes", "// instrument trap 7 explains it\n", want_rc=0)
-case("the hyphenated form resolves", "// see instrument-trap 3\n", want_rc=0)
-case("the orchestration form resolves", "// per orchestration trap 2\n", want_rc=0)
 case("a plain list of resolving numbers passes", "// traps 1, 2 and 3\n", want_rc=0)
+
+# THE PREFIX FORMS ARE ASSERTED IN THE FAILING DIRECTION, and that is not stylistic. An arm that
+# says "`instrument-trap 3` passes" is VOID: if the parser stopped recognising the form entirely it
+# would find no reference at all and still exit 0, so rc=0 cannot distinguish "recognised and
+# resolved" from "never seen". The #2621 review caught exactly this — deleting the whole
+# `(?:instrument[- ]|orchestration )` group left three such arms green, because the bare `trap N`
+# inside each string still matched. Only a citation that must be REPORTED proves it was parsed.
+case("the hyphenated form is recognised (asserted by failing)",
+     "// see instrument-trap 99\n", want_rc=1, expect_text="cites row 99")
+case("the spaced instrument form is recognised (asserted by failing)",
+     "// see instrument trap 99\n", want_rc=1, expect_text="cites row 99")
+case("the orchestration form is recognised (asserted by failing)",
+     "// per orchestration trap 99\n", want_rc=1, expect_text="cites row 99")
+
+# `trap #NN` is live in this repository — DRAGON_QUEST_STATUS.md, OREGON_TRAIL_STATUS.md and
+# SYBERIA_STATUS.md all use it. Missing it while the success line says "all resolving" would be a
+# completeness claim the tool does not have (#2621 review).
+case("the hash form is recognised (asserted by failing)",
+     "// see instrument trap #99\n", want_rc=1, expect_text="cites row 99")
+case("...and a resolving hash reference passes", "// see trap #7\n", want_rc=0)
+
+# ...but a hash after a COMPOUND WORD is not a citation. `[agc] WRITE-TRAP #1[val=…]` is a pasted
+# diagnostic line in tools/AGENTS.md, and accepting `#` naively turns it into a reference to row 1.
+# This is why the leading boundary is split: an explicitly prefixed citation may follow a hyphen
+# ("instrument-trap 43"), a bare one may not.
+# NOTE the operand: the real log line reads `WRITE-TRAP #1`, and a fixture using 1 would be the
+# THIRD void arm in this file — 1 is a valid row, so the case passes whether the compound word was
+# excluded or matched-and-resolved. Every "must not fire" arm here uses a number the fixture table
+# does not hold, which is the only thing that makes rc=0 mean "not matched".
+case("a hyphenated compound word with a hash is not a citation",
+     "    [agc] WRITE-TRAP #99[val=0x5a]\n", want_rc=0)
+
+# B1 (#2621 review) — the number needs a TRAILING boundary or `\d{1,3}` bites a prefix out of
+# anything longer. Each of these was a real defect: the first turns a repo-wide required gate RED on
+# correct code, the second is worse because it SILENTLY resolves to an unrelated row.
+case("a hex vector is not a citation to row 0",
+     "// trap 0x40 is the debug vector\n", want_rc=0)
+case("a longer number is not truncated into a valid row",
+     "// the guest traps 1234 times per frame\n", want_rc=0)
+case("a decimal measurement is not a citation",
+     "// trap 41.5 ms of overhead\n", want_rc=0)
 
 # THE discriminating false positive. `s_trap` is an RDNA2 instruction mnemonic and appears in the
 # shader recompiler's tests; without the identifier-character lookbehind the real corpus reports

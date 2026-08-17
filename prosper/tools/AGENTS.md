@@ -433,13 +433,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   existed read as perfectly correct — a plausible number in a plausible sentence, findable only by
   opening the table and counting, which nobody does for a number in a code comment. **That is the
   more expensive half:** a duplicate row is visible the moment you look at the table, while a stale
-  by-number reference quietly sends the next agent to an unrelated entry. Measured on `origin/master`
-  2026-08-17: **118 references on 110 lines in 46 files, naming 63 distinct rows, all resolving —
-  and 50 of those references are `.cpp`/`.hpp`/`.py` comments**, so this is a contract compiled files
-  depend on. Deliberately narrow about what counts as a reference, because it scans every tracked
-  file and one that fires on ordinary prose gets disabled: `s_trap 1` in the shader tests is an RDNA2
-  mnemonic, excluded by an identifier-character lookbehind that is measured rather than assumed
-  (without it the corpus reports 3 spurious hits). Run by the CI `Docs` job;
+  by-number reference quietly sends the next agent to an unrelated entry. Roughly half the references
+  are `.cpp`/`.hpp`/`.py` comments rather than prose, so this is a contract compiled files depend on;
+  the tool prints the live counts on every run, so no figure is quoted here to go stale. Deliberately
+  narrow about what counts as a reference, because it scans every tracked file and one that fires on
+  ordinary prose gets disabled — `trap 41`, `traps 55 and 56`, `instrument-trap 43` and `trap #13`
+  count, while `s_trap 1` (an RDNA2 mnemonic), `WRITE-TRAP #1` (a pasted log line), `trap 0x40`,
+  `traps 1234` and `entry 99` do not. Each exclusion is measured: removing the leading boundary
+  admits 4 extra matches, **3 of which cite row 0** and would turn this repo-wide gate red on correct
+  code; removing the trailing boundary makes `\|d{1,3}` bite a prefix out of `0x40` and `1234`, the
+  second resolving **silently** to an unrelated row. Run by the CI `Docs` job;
   `ctest -R trap_citation_checker` covers it.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
