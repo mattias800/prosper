@@ -10,18 +10,15 @@
 // from "two live views disagree", so it reported the first as loudly as the second and resolved
 // neither correctly.
 //
-// THE SECOND DEFECT, same family. The producer's stride rode on `PersistentDsKey` as a member
-// excluded from operator== and from the hash. The cache is keyed by that struct and the invalidation
-// loop iterates the STORED keys, so the stride it read was whatever the attachment that CREATED the
-// entry happened to see. A producer that programmed DB_DEPTH_SLICE on a later attachment never
-// reached the invalidation, and one that reprogrammed it was ignored in favour of the frozen value.
-// An excluded field cannot make a lookup miss, so nothing ever surfaced it. The stride now lives in
-// the registry, refreshed on every attachment; arm 7 is that case.
+// THE SECOND DEFECT, same family. The stride rode on `PersistentDsKey` as a member excluded from
+// operator== and from the hash. The cache is keyed by that struct and the invalidation loop iterates
+// the STORED keys, so the stride it read was frozen at whatever the attachment that CREATED the
+// entry saw. An excluded field cannot make a lookup miss, so nothing ever surfaced it. The stride
+// now lives in the registry, keyed by identity.
 //
 // The arms below are built so that the KEY CHANGE is what they detect, not the plumbing. Restoring
-// base-alone keying fails arms 1-3 outright, and re-freezing the stride fails arm 7; they are
-// constructed by hand at this header's own production functions, which are the ones the renderer
-// calls.
+// base-alone keying fails arms 1-3 outright, and collapsing the recorder/lookup identity fails arm 8; they are constructed by hand at this header's own production functions, which are
+// the ones the renderer calls.
 #include "render_runner.h"
 
 #include <cstdio>
@@ -34,10 +31,8 @@ static void check(bool ok, const char* what) {
 }
 
 using prosper::test::ds_layer_stride_for;
-using prosper::test::ds_slice_bytes_from_db_depth_slice;
 using prosper::test::ds_stride_identity_base;
 using prosper::test::note_ds_layer_stride;
-using prosper::test::note_ds_producer_slice_bytes;
 using prosper::test::PersistentDsKey;
 using prosper::test::PersistentDsKeyHash;
 
@@ -88,34 +83,7 @@ int main() {
     check(ds_layer_stride_for(0x2060000000ull, 64, 64) == 0,
           "a zero stride is not recorded, so the identity stays unknown");
 
-    // ---- 6. Precedence: the producer's register outranks a consumer descriptor ------------------
-    constexpr uint64_t kProducerBase = 0x2070000000ull;
-    note_ds_layer_stride(kProducerBase, 128, 128, 0x1000u);
-    check(ds_layer_stride_for(kProducerBase, 128, 128) == 0x1000u,
-          "with only a consumer stride, the consumer's answers");
-    note_ds_producer_slice_bytes(kProducerBase, 128, 128, 0x4000u);
-    check(ds_layer_stride_for(kProducerBase, 128, 128) == 0x4000u,
-          "a producer stride outranks a consumer one for the same identity");
-
-    // ---- 7. A producer stride published LATE still reaches the lookup --------------------------
-    // This is the defect that moved slice_bytes off PersistentDsKey. The cache is keyed by that
-    // struct and the invalidation loop iterates the STORED keys, so a stride carried on the key was
-    // frozen at entry creation: a producer that programmed DB_DEPTH_SLICE only on a later attachment
-    // never reached the invalidation, and one that reprogrammed it was ignored in favour of the
-    // frozen first value. Here the surface is known to the registry BEFORE the producer speaks.
-    constexpr uint64_t kLateBase = 0x2080000000ull;
-    note_ds_layer_stride(kLateBase, 2048, 2048, 0x2000u);          // entry exists, consumer only
-    note_ds_producer_slice_bytes(kLateBase, 2048, 2048, 0x9000u);  // producer programs it later
-    check(ds_layer_stride_for(kLateBase, 2048, 2048) == 0x9000u,
-          "a producer stride published after the entry exists still reaches the lookup");
-    note_ds_producer_slice_bytes(kLateBase, 2048, 2048, 0xa000u);  // and reprogrammed later still
-    check(ds_layer_stride_for(kLateBase, 2048, 2048) == 0xa000u,
-          "a REPROGRAMMED producer stride replaces the earlier one rather than being frozen");
-    note_ds_producer_slice_bytes(kLateBase, 2048, 2048, 0);        // "never programmed" on this pass
-    check(ds_layer_stride_for(kLateBase, 2048, 2048) == 0xa000u,
-          "an unprogrammed (zero) producer register does not erase a known stride");
-
-    // ---- 7b. Recorder and lookup agree on WHICH base identifies a surface -----------------------
+    // ---- 6. Recorder and lookup agree on WHICH base identifies a surface -----------------------
     // A depth surface that is written but never read has depth_read_base == 0. If the recorder keyed
     // on the read base and the lookup on the write base, they would never meet and per-slice
     // invalidation would silently never engage for exactly those surfaces -- a divergence invisible
@@ -136,19 +104,7 @@ int main() {
               "a write-only surface's stride round-trips through the shared identity");
     }
 
-    // ---- 8. DB_DEPTH_SLICE decode ---------------------------------------------------------------
-    // SLICE_TILE_MAX gives the per-slice size as (SLICE_TILE_MAX + 1) * 64 bytes; a never-programmed
-    // register reads 0 and must surface as "unknown", not as a zero stride.
-    check(ds_slice_bytes_from_db_depth_slice(0) == 0,
-          "an unprogrammed DB_DEPTH_SLICE is unknown, not a zero stride");
-    {
-        const uint32_t tile_max = 1023u;
-        const uint32_t reg = tile_max << prosper::agc::Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT;
-        check(ds_slice_bytes_from_db_depth_slice(reg) == (uint64_t)(tile_max + 1u) * 64ull,
-              "SLICE_TILE_MAX decodes as (tile_max + 1) * 64 bytes");
-    }
-
-    // ---- 9. PersistentDsKey is a pure identity --------------------------------------------------
+    // ---- 7. PersistentDsKey is a pure identity --------------------------------------------------
     // Every member takes part in equality and in the hash. This is the falsifiable half: dropping
     // any field from operator== must fail here. It is also what keeps the struct honest -- the
     // stride used to live here as a member excluded from both, and that exclusion is exactly what
@@ -185,29 +141,26 @@ int main() {
         }
     }
 
-    // ---- 10. END TO END through BOTH production seams -------------------------------------------
-    // Arm 7b tests `ds_stride_identity_base` in isolation, which cannot detect a CALL SITE that
-    // fails to use it -- the divergence would live in the gap between the recorder and the lookup,
-    // and a test of the shared helper stays green through it. This arm closes that gap: the stride
-    // is published by `persistent_ds_key_for` (the shipping construction seam) and resolved by
+    // ---- 8. END TO END through BOTH production seams -------------------------------------------
+    // Arm 6 tests `ds_stride_identity_base` in isolation, which cannot detect a CALL SITE that fails
+    // to use it -- the divergence would live in the gap between publisher and lookup, and a test of
+    // the shared helper stays green through it. This arm closes that gap: the identity is built by
+    // `persistent_ds_key_for` (the shipping construction seam) and consumed by
     // `invalidate_persistent_ds_guest_write` (the shipping consumer), with nothing hand-fed between
-    // them. The surface is WRITE-ONLY, which is exactly the case a read-base-keyed recorder loses.
+    // them. The surface is WRITE-ONLY, the case a read-base-keyed lookup loses.
     //
-    // If the two sites disagree about which base identifies the surface, the stride resolves as
-    // unknown, per-slice precision collapses to whole-allocation, and the sibling slice below is
-    // evicted along with the target -- so the second check is the detector.
+    // The fixture is PHYSICAL: a 256x256 D32 slice is 256*256*4 = 262144 bytes, so the layer stride
+    // is 262144 (tightly packed). An earlier revision used 16384, which is smaller than one slice
+    // and therefore describes a layout that cannot exist -- the slices would overlap.
     {
         constexpr uint64_t kBase = 0x20b0000000ull;
         constexpr uint32_t kW = 256, kH = 256;
-        constexpr uint32_t kTileMax = 255u;              // (255 + 1) * 64 = 16384 bytes per slice
-        constexpr uint64_t kSliceBytes = 16384ull;
+        constexpr uint64_t kSliceBytes = 262144ull;      // == kW * kH * 4, tightly packed
 
         auto key_for_slice = [&](uint32_t slice_index) {
             prosper::gpu::ResolvedPipelineState ps;
             ps.depth_read_base = 0;                      // write-only: the divergence case
             ps.depth_write_base = kBase;
-            ps.db_depth_slice = kTileMax
-                                << prosper::agc::Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT;
             ps.db_depth_view = slice_index;
             return prosper::test::persistent_ds_key_for(ps, /*htile=*/0, kW, kH, /*format=*/7);
         };
@@ -216,6 +169,9 @@ int main() {
         const PersistentDsKey k0 = key_for_slice(0);
         const PersistentDsKey k3 = key_for_slice(3);
         check(!(k0 == k3), "two slices of one write-only allocation are distinct identities");
+
+        // Publish the stride under the identity the lookup will use.
+        note_ds_layer_stride(ds_stride_identity_base(0, kBase), kW, kH, kSliceBytes);
         cache[k0].depth_valid = true;
         cache[k3].depth_valid = true;
 
@@ -225,6 +181,52 @@ int main() {
               "a guest write inside slice 3 invalidates slice 3");
         check(cache[k0].depth_valid,
               "...and leaves slice 0 resident -- per-slice precision survived both seams");
+        // Note which check is the detector, because it is not the one you would guess: with a
+        // physical stride, losing it collapses the window to ONE slice at the base, and the slice-3
+        // address then falls outside that window entirely -- so a recorder/lookup divergence makes
+        // the FIRST check fail (slice 3 never invalidated), not the second.
+    }
+
+    // ---- 9. The stencil plane is NOT strided by the DEPTH plane's layer stride -------------------
+    // `learned` is the depth layer stride. Stencil is a separate allocation with its own layout --
+    // 1 byte/pixel against depth's 4 -- so striding into it by depth's value lands about 4x too far
+    // out. That is the unsafe direction twice: a real write to stencil slice N is missed (stale
+    // stencil resident) and a write that belongs to no slice of this surface can be misattributed
+    // to it. This arm pins the second half, which is the observable one.
+    {
+        constexpr uint64_t kDepth = 0x20c0000000ull;
+        constexpr uint64_t kStencil = 0x20d0000000ull;   // far from depth, so ranges cannot alias
+        constexpr uint32_t kW = 256, kH = 256;
+        constexpr uint64_t kDepthSlice = 262144ull;      // depth layer stride
+        constexpr uint64_t kStencilBytes = 65536ull;     // kW * kH, one byte per pixel
+
+        prosper::gpu::ResolvedPipelineState ps;
+        ps.depth_read_base = kDepth;
+        ps.depth_write_base = kDepth;
+        ps.stencil_read_base = kStencil;
+        ps.stencil_write_base = kStencil;
+        ps.db_depth_view = 3;
+        const PersistentDsKey k = prosper::test::persistent_ds_key_for(ps, 0, kW, kH, 7);
+        note_ds_layer_stride(ds_stride_identity_base(kDepth, kDepth), kW, kH, kDepthSlice);
+
+        auto& cache = prosper::test::persistent_ds_cache();
+        cache[k].depth_valid = true;
+        cache[k].stencil_valid = true;
+
+        // Where the DEPTH-strided bug would look for slice 3's stencil: kStencil + 3 * 262144.
+        // The whole stencil allocation is only 6 * 65536 = 393216 bytes, so this address is past the
+        // end of it and belongs to no slice of this surface. Invalidating on it is the misattribution.
+        prosper::test::invalidate_persistent_ds_guest_write(kStencil + 3ull * kDepthSlice + 64ull, 128);
+        check(cache[k].stencil_valid,
+              "a write beyond the stencil allocation, where a depth-strided offset would look, does "
+              "not invalidate stencil");
+
+        // A write inside the stencil window IS caught -- so the arm above is not passing merely
+        // because stencil invalidation stopped working altogether.
+        prosper::test::invalidate_persistent_ds_guest_write(kStencil + 64ull, 128);
+        check(!cache[k].stencil_valid, "a write inside the stencil plane still invalidates stencil");
+        check(cache[k].depth_valid,
+              "...and a stencil-only write leaves the depth aspect valid");
     }
 
     if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }

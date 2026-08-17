@@ -2507,21 +2507,26 @@ struct PersistentDsKey {
     }
 };
 
-// DB_DEPTH_SLICE.SLICE_TILE_MAX gives the per-slice size as (SLICE_TILE_MAX + 1) * 64 bytes. This is
-// the PRODUCER's own statement of the layer stride, and the only authority available at attachment
-// time -- the consumer descriptor's layer_stride is exact too but arrives with a sample, which is
-// after the invalidation that needs it. Zero when the register was never programmed, which callers
-// must treat as "unknown" rather than as a zero stride.
-// CONFIDENCE: HIGH (field layout in pm4_registers.hpp; equation cross-checked against an independent
-// implementation of the same register, #2542).
-// Layer strides learned from a CONSUMER descriptor, keyed by depth allocation base.
+// Layer strides learned from a CONSUMER descriptor (a cube/array T#'s own layer_stride), which is
+// the ONLY authority this file trusts for a layer stride.
 //
-// GTA V never programs DB_DEPTH_SLICE -- it reads 0x00000000 on every depth surface in a routed boot,
-// including the six-layer cubes -- so the producer authority below yields nothing for this title. The
-// cube T# does carry an exact layer stride, but it arrives with a SAMPLE, which is after the
-// invalidations that need it. Publishing it here lets the invalidation become slice-exact from the
-// first cube sample onward; before that it falls back to whole-allocation behaviour, which is the
-// safe direction (over-invalidation costs a re-render, under-invalidation shows stale pixels).
+// WHY THERE IS NO PRODUCER AUTHORITY HERE. An earlier revision of this branch also derived a stride
+// from DB_DEPTH_SLICE.SLICE_TILE_MAX and gave it PRECEDENCE over the consumer's exact value, at
+// CONFIDENCE: HIGH. That was wrong three times over and is removed:
+//   * `DB_DEPTH_SLICE` at dword 0x17 with a SLICE_TILE_MAX field is the gfx6-8 register. The PS5 is
+//     RDNA2 (gfx10), where the depth extent moved to DB_DEPTH_SIZE_XY at 0x7 -- which prosper itself
+//     decodes, in `render_state.cpp`. Nothing in the repo consumed 0x16/0x17 before that revision.
+//   * even on gfx6-8, (SLICE_TILE_MAX + 1) * 64 is a count of PIXELS, not of bytes.
+//   * GTA V reads 0x00000000 on every depth surface in a routed boot, cubes included, which is
+//     equally consistent with "the register is not programmed" and with "the register is not there".
+//     A zero cannot distinguish those, so it is not evidence for the decode.
+// A consumer layer_stride arrives with a SAMPLE, i.e. after the invalidation that would have wanted
+// it, so the first cube sample is what makes invalidation slice-exact; before that it falls back to
+// whole-allocation behaviour. That fallback is the safe direction (over-invalidation costs a
+// re-render; under-invalidation shows stale pixels), which is exactly why an unvalidated decode that
+// OUTRANKS an exact value is the wrong trade. Re-adding a producer authority needs the gfx10
+// register, its units, and a title that actually programs it. See #2669.
+//
 // The IDENTITY of a layer-stride observation: (base, width, height), never `base` alone.
 //
 // A guest base is not a stable identity. The guest frees an allocation and maps another at the same
@@ -2556,15 +2561,10 @@ struct DsLayerStrideKeyHash {
     }
 };
 
-// One entry per identity, carrying BOTH authorities separately because they are separate claims that
-// can each be wrong on their own: the producer's own DB_DEPTH_SLICE, and the layer stride a consumer
-// descriptor carries. Keeping them apart is what lets the lookup state the precedence once, and lets
-// each report its own disagreement without the other's noise.
+// One entry per identity. A single authority, so there is no precedence to get wrong.
 struct DsLayerStrideEntry {
     uint64_t consumer_stride = 0;
-    uint64_t producer_stride = 0;
     bool consumer_conflict_reported = false;
-    bool producer_conflict_reported = false;
 };
 
 inline std::unordered_map<DsLayerStrideKey, DsLayerStrideEntry, DsLayerStrideKeyHash>&
@@ -2601,74 +2601,36 @@ inline void note_ds_layer_stride(uint64_t base, uint32_t width, uint32_t height,
     entry.consumer_stride = stride;
 }
 
-// Records the PRODUCER's own DB_DEPTH_SLICE-derived stride. Called on every attachment, which is the
-// point: the value it replaces was frozen on the cache key at entry creation, so a producer that
-// programmed or reprogrammed DB_DEPTH_SLICE later never reached the invalidation path.
+// Which of a DS surface's two depth bases identifies it in the stride registry.
 //
-// Cost: this is per grouped PASS, not per draw, and the zero check below returns before the lock --
-// so a title that never programs DB_DEPTH_SLICE (GTA V reads 0x00000000 on every depth surface in a
-// routed boot) pays two compares and never contends.
+// This binds every site that HAS both bases -- today that is the invalidation lookup, which reads
+// them off `PersistentDsKey`. A surface written but never read has depth_read_base == 0, so a site
+// picking the read base and a site picking the write base would never meet, and per-slice
+// invalidation would silently never engage for exactly those surfaces. That divergence cannot be
+// spotted by reading either site alone, which is why this is a function and not a convention.
 //
-// A zero is "never programmed", not "a stride of zero", so it is dropped rather than recorded --
-// unknown must not erase known. A disagreement is reported once per identity: with a complete
-// identity this is not allocation reuse, so it is either a genuine reprogramming or a decode error,
-// and the newer value describes the attachment in front of us either way.
-inline void note_ds_producer_slice_bytes(uint64_t base, uint32_t width, uint32_t height,
-                                         uint64_t slice_bytes) {
-    if (!base || !slice_bytes) return;
-    const DsLayerStrideKey key{base, width, height};
-    std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
-    DsLayerStrideEntry& entry = ds_layer_stride_registry()[key];
-    if (entry.producer_stride && entry.producer_stride != slice_bytes) {
-        if (!entry.producer_conflict_reported) {
-            entry.producer_conflict_reported = true;
-            std::fprintf(stderr,
-                         "[ds-stride] producer disagreement at base=0x%llx %ux%u: DB_DEPTH_SLICE gave "
-                         "%llu, now gives %llu for the same surface identity\n",
-                         (unsigned long long)base, width, height,
-                         (unsigned long long)entry.producer_stride,
-                         (unsigned long long)slice_bytes);
-        }
-    }
-    entry.producer_stride = slice_bytes;
-}
-
-// Which of a DS surface's two depth bases identifies it in the stride registry. Both the recorder
-// and the lookup MUST use this one expression: a surface that is written but never read has
-// depth_read_base == 0, so a recorder keyed on the read base and a lookup keyed on the write base
-// would never meet, and per-slice invalidation would silently never engage for exactly those
-// surfaces. That divergence cannot be spotted by reading either site alone, which is why it is a
-// function and not a convention.
+// The consumer recorder in the live renderer is NOT such a site and does not call this: it holds one
+// address, the guest address it sampled, and publishes under that. An earlier version of this
+// comment claimed "both the recorder and the lookup MUST use this one expression", which was never
+// true of the recorder -- an invariant asserted over a site that could not obey it. If a recorder
+// ever does gain both bases, route it through here.
 inline uint64_t ds_stride_identity_base(uint64_t depth_read_base, uint64_t depth_write_base) {
     return depth_read_base ? depth_read_base : depth_write_base;
 }
 
-// The layer stride for a surface identity, or 0 when neither authority has published one -- which
+// The layer stride for a surface identity, or 0 when no consumer descriptor has published one -- which
 // callers must read as "unknown" and fall back to whole-allocation behaviour, never as a stride of
 // zero. A guessed stride would silently retain faces a real write had invalidated, which is the one
 // error direction that shows as stale pixels rather than as a missing surface.
 //
-// PRECEDENCE, stated once here rather than at the call site: the producer's own DB_DEPTH_SLICE
-// first, then a stride learned from a consumer descriptor. The producer's register is the surface's
-// own declaration of its layout; a consumer's layer_stride is exact too but arrives with a SAMPLE,
-// which is after the invalidation that needs it. GTA V only ever reaches the second -- it never
-// programs DB_DEPTH_SLICE, reading 0x00000000 on every depth surface in a routed boot, including the
-// six-layer cubes.
+// There is exactly one authority: a consumer descriptor's layer_stride. See the note above the
+// registry for why the DB_DEPTH_SLICE-derived producer stride was removed rather than demoted.
 inline uint64_t ds_layer_stride_for(uint64_t base, uint32_t width, uint32_t height) {
     if (!base) return 0;
     const DsLayerStrideKey key{base, width, height};
     std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
     const auto found = ds_layer_stride_registry().find(key);
-    if (found == ds_layer_stride_registry().end()) return 0;
-    return found->second.producer_stride ? found->second.producer_stride
-                                         : found->second.consumer_stride;
-}
-
-inline uint64_t ds_slice_bytes_from_db_depth_slice(uint32_t db_depth_slice) {
-    const uint32_t tile_max = (db_depth_slice >> prosper::agc::Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT) &
-                              prosper::agc::Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_MASK;
-    if (!tile_max) return 0;                       // never programmed
-    return (static_cast<uint64_t>(tile_max) + 1ull) * 64ull;
+    return found == ds_layer_stride_registry().end() ? 0 : found->second.consumer_stride;
 }
 
 // DB_DEPTH_VIEW.SLICE_START, including its two high bits (SLICE_START occupies bits 0..10 with
@@ -2757,30 +2719,24 @@ inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_de
 inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelineState& ps,
                                              uint64_t htile, uint32_t width, uint32_t height,
                                              uint32_t format) {
-    const uint64_t slice_bytes = ds_slice_bytes_from_db_depth_slice(ps.db_depth_slice);
-    // Publish the producer's stride on EVERY attachment, not once when the cache entry is created.
-    // This is what makes a later or reprogrammed DB_DEPTH_SLICE reach the invalidation path; storing
-    // it on the key froze it at entry creation (see PersistentDsKey).
-    note_ds_producer_slice_bytes(ds_stride_identity_base(ps.depth_read_base, ps.depth_write_base),
-                                 width, height, slice_bytes);
+    // A census of the RAW dword only. It deliberately DERIVES NOTHING: the question this instrument
+    // exists to answer is whether any title programs 0x17 at all on a gfx10 part, and a decode
+    // printed beside the raw value would pre-judge exactly that. Observation is evidence; a decode
+    // is a claim. (#2669)
     if (getenv("PROSPER_DS_SLICE_CENSUS")) {
         static std::mutex mutex;
-        // (base, width, HEIGHT, slice_bytes) -- height was missing, so two surfaces sharing a base
-        // and width but differing in height collapsed to one census line and the second never
-        // printed. A census that silently under-reports is the instrument lying about the subject.
-        static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint64_t>> seen;
+        // (base, width, HEIGHT, raw) -- height was missing, so two surfaces sharing a base and width
+        // but differing in height collapsed to one line and the second never printed. A census that
+        // silently under-reports is the instrument lying about the subject.
+        static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> seen;
         bool first = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            first = seen.emplace(ps.depth_read_base, width, height, slice_bytes).second;
+            first = seen.emplace(ps.depth_read_base, width, height, ps.db_depth_slice).second;
         }
         if (first)
-            fprintf(stderr,
-                    "[ds-stride] base=0x%llx %ux%u db_depth_slice=0x%08x -> slice_bytes=%llu "
-                    "(natural D32 would be %llu)\n",
-                    (unsigned long long)ps.depth_read_base, width, height, ps.db_depth_slice,
-                    (unsigned long long)slice_bytes,
-                    (unsigned long long)(static_cast<uint64_t>(width) * height * 4ull));
+            fprintf(stderr, "[ds-slice-census] base=0x%llx %ux%u db_depth_slice(0x17)=0x%08x\n",
+                    (unsigned long long)ps.depth_read_base, width, height, ps.db_depth_slice);
     }
     return {ps.depth_read_base, ps.depth_write_base, ps.stencil_read_base, ps.stencil_write_base,
             htile, width, height, format, ds_depth_view_slice_start(ps.db_depth_view)};
@@ -3016,12 +2972,25 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
             ds_layer_stride_for(ds_stride_identity_base(key.dr, key.dw), key.w, key.h);
         const uint64_t slice_offset = learned ? static_cast<uint64_t>(key.slice) * learned : 0;
         const uint64_t slice_depth_bytes = learned ? learned : depth_size;
+        // Offset a base only when there IS one. `guest_ranges_overlap` refuses a zero base, but
+        // `0 + slice_offset` is not zero for any slice > 0, so adding first would slip a bogus low
+        // address past that guard and test it against a real write.
+        auto plane = [](uint64_t base, uint64_t offset) { return base ? base + offset : 0; };
         const bool depth_overlap =
-            guest_ranges_overlap(addr, size, key.dr + slice_offset, slice_depth_bytes) ||
-            guest_ranges_overlap(addr, size, key.dw + slice_offset, slice_depth_bytes);
+            guest_ranges_overlap(addr, size, plane(key.dr, slice_offset), slice_depth_bytes) ||
+            guest_ranges_overlap(addr, size, plane(key.dw, slice_offset), slice_depth_bytes);
+        // STENCIL IS NOT OFFSET, and that is deliberate. `learned` is the DEPTH plane's layer
+        // stride; stencil is a separate allocation with its own layout (1 byte/pixel against
+        // depth's 4), so striding into it by depth's value lands roughly 4x too far out. That is the
+        // UNSAFE error direction twice over: a real write to stencil slice N is missed, leaving
+        // stale stencil resident, and a neighbouring slice's write can be misattributed to this one.
+        // No authority for a stencil-plane layer stride exists here -- the consumer T# that supplies
+        // the depth one describes the depth aspect -- so stencil keeps the whole-allocation
+        // behaviour it has on master rather than adopting a stride that is known to be wrong.
+        // Making stencil slice-exact needs its own stride: #2670.
         const bool stencil_overlap =
-            guest_ranges_overlap(addr, size, key.sr + slice_offset, stencil_size) ||
-            guest_ranges_overlap(addr, size, key.sw + slice_offset, stencil_size);
+            guest_ranges_overlap(addr, size, key.sr, stencil_size) ||
+            guest_ranges_overlap(addr, size, key.sw, stencil_size);
         const bool htile_overlap = guest_ranges_overlap(addr, size, key.htile, htile_size);
         if (!depth_overlap && !stencil_overlap && !htile_overlap) continue;
         // Which aspect a write actually hit, and the byte count that decided it. The count is the
@@ -3595,11 +3564,24 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
         if (error.empty()) error = "retained DS depth transfer did not complete";
         return false;
     }
+    // This is a pure TRANSFER_DST readback, so its memory may be HOST_CACHED and NOT HOST_COHERENT
+    // -- the allocator above actively prefers HOST_CACHED for this usage. Reading the mapping
+    // without invalidating first returns whatever the CPU cache happens to hold, which for a
+    // freshly-allocated buffer is plausible-looking garbage rather than an obvious failure. Both
+    // sibling readbacks in this file do this; this one did not.
+    const MappedReadbackPlan mapping = mapped_readback_plan(depth_bytes);
     void* mapped = nullptr;
-    if (vkMapMemory(ctx.dev, memory, 0, depth_bytes, 0, &mapped) != VK_SUCCESS || !mapped) {
+    if (vkMapMemory(ctx.dev, memory, 0, mapping.map_size, 0, &mapped) != VK_SUCCESS || !mapped) {
         vkDestroyBuffer(ctx.dev, buffer, nullptr);
         vkFreeMemory(ctx.dev, memory, nullptr);
         error = "cannot map retained DS depth readback";
+        return false;
+    }
+    if (!invalidate_mapped_readback(ctx, memory, mapping)) {
+        vkUnmapMemory(ctx.dev, memory);
+        vkDestroyBuffer(ctx.dev, buffer, nullptr);
+        vkFreeMemory(ctx.dev, memory, nullptr);
+        error = "cannot invalidate retained DS depth readback";
         return false;
     }
     out.resize(static_cast<size_t>(width) * height);
