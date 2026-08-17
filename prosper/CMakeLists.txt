@@ -135,6 +135,12 @@ if(Python3_Interpreter_FOUND)
   # cases are regressions for classifier bugs found only after a table had been published (#2002).
   add_test(NAME re_nid_gate_classifier
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_nid_gate_scan.py")
+  # stub_nid_map inverts that resolution to answer "which import is the stub at address X?" while
+  # reading a call chain. Both ways it can be wrong are silent: a dropped stub entry point makes a
+  # real import report NOT A STUB, and a dropped fail-visible line makes "not an import" and "wrong
+  # address" the same empty output (#2186).
+  add_test(NAME re_stub_nid_map
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_stub_nid_map.py")
   # prx_to_elf.py writes an ELF header by hand, four bytes apart from a field that means something
   # else entirely — #2016 put the program-header count in the section-header-count slot, and the
   # result was a malformed image no consumer complained about until binutils refused the file. The
