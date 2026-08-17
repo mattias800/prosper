@@ -20,6 +20,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>   // dup/dup2/close, for the stderr capture the #1955 loudness checks use
+#endif
 
 using namespace prosper;
 
@@ -268,12 +271,36 @@ public:
 static std::vector<uint8_t> guest_container;
 static constexpr size_t kGuestMediaOffset = 4096;
 static constexpr size_t kGuestMediaBytes = 5000;
-static int guest_file_open_calls = 0, guest_file_close_calls = 0;
+// Larger than avp_add_source's 1 MiB read chunk, and NOT a multiple of it. The original fixture's
+// 5,000-byte media is smaller than one chunk, so its read loop runs exactly ONE iteration: the
+// multi-chunk path, the short-read path and the position arithmetic across a chunk boundary are all
+// structurally inexpressible against it, and a passing suite said nothing about them.
+static constexpr size_t kGuestBigMediaBytes = 2u * 1024 * 1024 + 12345;
+static int guest_file_open_calls = 0, guest_file_close_calls = 0, guest_file_read_calls = 0;
 static void* guest_file_expected_object = nullptr;
 static bool guest_file_is_open = false;
+// Reader behaviour knobs. Each defaults to the honest whole-request reader, so the arms that
+// predate them are unaffected; reset_guest_file_reader() restores that default between arms.
+static size_t guest_media_len = kGuestMediaBytes;   // what size() reports and read() serves
+static uint32_t guest_read_cap = 0;                 // >0: never serve more than this per call
+static bool guest_read_overcounts = false;          // report MORE read than the request allowed
+static bool guest_open_fails = false;               // open() refuses; the rest would have worked
+
+static void reset_guest_file_reader(size_t media_len) {
+    guest_file_open_calls = guest_file_close_calls = guest_file_read_calls = 0;
+    guest_file_is_open = false;
+    guest_media_len = media_len;
+    guest_read_cap = 0;
+    guest_read_overcounts = false;
+    guest_open_fails = false;
+    guest_container.assign(kGuestMediaOffset + media_len, 0x11);
+    for (size_t i = 0; i < media_len; ++i)
+        guest_container[kGuestMediaOffset + i] = static_cast<uint8_t>(0x40 + (i % 191));
+}
 
 static int32_t PROSPER_SYSV_ABI on_avplayer_file_open(void* object, const char* path) {
     if (object != guest_file_expected_object || !path) return -1;
+    if (guest_open_fails) return -1;
     guest_file_open_calls++;
     guest_file_is_open = true;
     return 5;
@@ -286,16 +313,66 @@ static int32_t PROSPER_SYSV_ABI on_avplayer_file_close(void* object) {
 }
 static uint64_t PROSPER_SYSV_ABI on_avplayer_file_size(void* object) {
     if (object != guest_file_expected_object || !guest_file_is_open) return 0;
-    return kGuestMediaBytes;
+    return guest_media_len;
 }
 static int32_t PROSPER_SYSV_ABI on_avplayer_file_read(void* object, uint8_t* buffer,
                                                       uint64_t position, uint32_t length) {
     if (object != guest_file_expected_object || !guest_file_is_open || !buffer) return -1;
-    if (position >= kGuestMediaBytes) return 0;
-    const uint64_t available = kGuestMediaBytes - position;
-    const uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(length, available));
+    guest_file_read_calls++;
+    if (position >= guest_media_len) return 0;
+    const uint64_t available = guest_media_len - position;
+    uint32_t take = static_cast<uint32_t>(std::min<uint64_t>(length, available));
+    if (guest_read_cap) take = std::min<uint32_t>(take, guest_read_cap);
     memcpy(buffer, guest_container.data() + kGuestMediaOffset + position, take);
+    // The lie is in the RETURN VALUE only: writing past `length` here would be a genuine overflow
+    // of prosper's buffer and would corrupt the test rather than exercise it. A guest whose reader
+    // over-reports is the case prosper must refuse, and this models it without committing it.
+    if (guest_read_overcounts) return static_cast<int32_t>(length) + 1;
     return static_cast<int32_t>(take);
+}
+
+// Capture fd 2 for the duration of a call, so "this path is LOUD on a default run" is a testable
+// claim rather than a comment. It is the whole contract of the fallback branches: each one goes on
+// to demux the host file from offset 0, and a silent fallback is indistinguishable from the guest's
+// reader having worked. The checks match a stable substring, never a whole formatted line.
+class StderrCapture {
+public:
+    StderrCapture() {
+        fflush(stderr);
+        saved_fd_ = dup(2);
+        tmp_ = tmpfile();
+        if (tmp_ && saved_fd_ >= 0) { dup2(fileno(tmp_), 2); armed_ = true; }
+    }
+    // The instrument must say when it did not run. A dup/tmpfile failure yields an EMPTY capture,
+    // which every "is this path loud?" check below would read as "the message was not printed" --
+    // a confident verdict about the subject produced entirely by the apparatus. Assert this.
+    bool armed() const { return armed_; }
+    StderrCapture(const StderrCapture&) = delete;             // owns an fd and a FILE*
+    StderrCapture& operator=(const StderrCapture&) = delete;
+    std::string finish() {
+        if (!active_) return text_;
+        active_ = false;
+        fflush(stderr);
+        if (saved_fd_ >= 0) { dup2(saved_fd_, 2); close(saved_fd_); saved_fd_ = -1; }
+        if (tmp_) {
+            fseek(tmp_, 0, SEEK_SET);
+            char buf[4096];
+            size_t got = 0;
+            while ((got = fread(buf, 1, sizeof(buf), tmp_)) > 0) text_.append(buf, got);
+            fclose(tmp_);
+            tmp_ = nullptr;
+        }
+        return text_;
+    }
+    ~StderrCapture() { finish(); }
+private:
+    int saved_fd_ = -1;
+    FILE* tmp_ = nullptr;
+    bool active_ = true, armed_ = false;
+    std::string text_;
+};
+static bool says(const std::string& haystack, const char* needle) {
+    return haystack.find(needle) != std::string::npos;
 }
 #endif
 
@@ -876,11 +953,7 @@ int main() {
     // callbacks. Ignoring them made prosper demux the container's first bytes, which are a different
     // format entirely. The source must therefore come from the guest's reader, not the host path.
     {
-        guest_container.assign(kGuestMediaOffset + kGuestMediaBytes, 0x11);
-        for (size_t i = 0; i < kGuestMediaBytes; ++i)
-            guest_container[kGuestMediaOffset + i] = static_cast<uint8_t>(0x40 + (i % 191));
-        guest_file_open_calls = guest_file_close_calls = 0;
-        guest_file_is_open = false;
+        reset_guest_file_reader(kGuestMediaBytes);
         int file_object = 0x5678;
         guest_file_expected_object = &file_object;
 
@@ -917,6 +990,174 @@ int main() {
                   fallback.opened_path == "C:/prosper-test-app0/movie.mp4",
               "a failing guest reader falls back to the host path instead of failing the source");
         close(fallback_handle, 0, 0, 0, 0, 0);
+        prosper::video::set_backend(nullptr);   // do not leave a stack backend installed
+    }
+
+    // ---- the read LOOP, which nothing above has ever run twice (#1955) -------------------------
+    // The fixture's media is 5,000 bytes against a 1 MiB read chunk, so every check above passes
+    // with a single readOffset call. Multi-chunk assembly, an honest short read, and the position
+    // arithmetic that carries across a chunk boundary are the parts of the loop that carry the risk,
+    // and they were structurally inexpressible. Serve 2 MiB + 12,345 bytes through a reader that
+    // never gives more than 700,000 at a time: >=4 calls, none of them chunk-aligned.
+    {
+        reset_guest_file_reader(kGuestBigMediaBytes);
+        guest_read_cap = 700'000;
+        int file_object = 0x9abc;
+        guest_file_expected_object = &file_object;
+
+        MemorySourceBackend memory_backend;
+        prosper::video::set_backend(&memory_backend);
+        AvpInitData file_data{};
+        file_data.event.event_callback = (void*)&on_avplayer_event;
+        file_data.file.obj = guest_file_expected_object;
+        file_data.file.open = (void*)&on_avplayer_file_open;
+        file_data.file.close = (void*)&on_avplayer_file_close;
+        file_data.file.read_offset = (void*)&on_avplayer_file_read;
+        file_data.file.size = (void*)&on_avplayer_file_size;
+        uint64_t h = init((uint64_t)(uintptr_t)&file_data, 0, 0, 0, 0, 0);
+        const char container_source[] = "/app0/Media/resources.resource";
+        CHECK(add(h, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0) == 0,
+              "a multi-chunk source with a short-returning guest reader opens");
+        CHECK(guest_file_read_calls >= 4,
+              "the read loop really iterated (a one-call media proves nothing about it)");
+        CHECK(memory_backend.memory_open_calls == 1 && memory_backend.host_open_calls == 0,
+              "a short-returning reader is honest, not a failure: no fallback to the host path");
+        CHECK(memory_backend.received.size() == kGuestBigMediaBytes &&
+                  memcmp(memory_backend.received.data(),
+                         guest_container.data() + kGuestMediaOffset, kGuestBigMediaBytes) == 0,
+              "multi-chunk assembly reproduces the guest's byte range exactly, tail included");
+        close(h, 0, 0, 0, 0, 0);
+        prosper::video::set_backend(nullptr);
+    }
+
+    // ---- a reader that OVER-reports must never reach the demuxer (#1955) -----------------------
+    // Believing a count larger than the buffer space offered walks `position` past the media length,
+    // ends the loop with success still set, and hands the zero-filled tail to the demuxer as if it
+    // were the complete clip -- a silent truncation that surfaces as a corrupt stream far from here.
+    // MemorySourceBackend is the discriminator that makes this visible: open_memory SUCCEEDS and the
+    // host open() FAILS, so "used the guest bytes" and "fell back" cannot be confused.
+    {
+        reset_guest_file_reader(kGuestBigMediaBytes);
+        guest_read_overcounts = true;
+        int file_object = 0xdef0;
+        guest_file_expected_object = &file_object;
+
+        MemorySourceBackend memory_backend;
+        prosper::video::set_backend(&memory_backend);
+        AvpInitData file_data{};
+        file_data.event.event_callback = (void*)&on_avplayer_event;
+        file_data.file.obj = guest_file_expected_object;
+        file_data.file.open = (void*)&on_avplayer_file_open;
+        file_data.file.close = (void*)&on_avplayer_file_close;
+        file_data.file.read_offset = (void*)&on_avplayer_file_read;
+        file_data.file.size = (void*)&on_avplayer_file_size;
+        uint64_t h = init((uint64_t)(uintptr_t)&file_data, 0, 0, 0, 0, 0);
+        const char container_source[] = "/app0/Media/resources.resource";
+        StderrCapture captured;
+        const uint64_t rc = add(h, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool armed = captured.armed();
+        const std::string log = captured.finish();
+        CHECK(armed, "the stderr capture armed (an empty capture would be the apparatus, not a finding)");
+        CHECK(rc == 0, "an over-reporting reader still leaves the source in a graceful state");
+        // THE ARM. Reverting the over-count refusal makes this exact check fail: memory_open_calls
+        // becomes 1 and the backend receives a truncated buffer.
+        CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 1,
+              "media assembled from an over-reporting reader is REFUSED, never handed to the demuxer");
+        CHECK(guest_file_open_calls == 1 && guest_file_close_calls == 1,
+              "the refused reader is still closed -- a refusal is not a leak");
+        CHECK(says(log, "returned") && says(log, "refusing the media") && says(log, "#1955"),
+              "the refusal is LOUD on a default run (no PROSPER_AVPLOG needed)");
+        close(h, 0, 0, 0, 0, 0);
+        prosper::video::set_backend(nullptr);
+    }
+
+    // ---- every decline is loud, because every decline demuxes the WRONG BYTES (#1955) ----------
+    // Two ways prosper ends up opening the host file at offset 0 while the guest was telling it the
+    // media is a byte range: the reader's open() refuses, and the table arrives with only some of
+    // its four entries. Both used to be silent at default verbosity -- indistinguishable, in a log,
+    // from the guest never having supplied a table at all.
+    {
+        reset_guest_file_reader(kGuestMediaBytes);
+        guest_open_fails = true;
+        int file_object = 0x1234;
+        guest_file_expected_object = &file_object;
+
+        MemorySourceBackend memory_backend;
+        prosper::video::set_backend(&memory_backend);
+        AvpInitData file_data{};
+        file_data.event.event_callback = (void*)&on_avplayer_event;
+        file_data.file.obj = guest_file_expected_object;
+        file_data.file.open = (void*)&on_avplayer_file_open;
+        file_data.file.close = (void*)&on_avplayer_file_close;
+        file_data.file.read_offset = (void*)&on_avplayer_file_read;
+        file_data.file.size = (void*)&on_avplayer_file_size;
+        uint64_t h = init((uint64_t)(uintptr_t)&file_data, 0, 0, 0, 0, 0);
+        const char container_source[] = "/app0/Media/resources.resource";
+        StderrCapture captured;
+        add(h, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool armed = captured.armed();
+        const std::string log = captured.finish();
+        CHECK(armed, "the stderr capture armed for the refused-open arm");
+        CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 1,
+              "a reader whose open() refuses falls back to the host path");
+        CHECK(guest_file_close_calls == 0,
+              "close() is not called for an open() that never succeeded");
+        // THE ARM. Re-gating this message on avp_log() empties the capture and fails the check.
+        CHECK(says(log, "guest file-replacement open") && says(log, "falling back to the host path"),
+              "a refused open() is LOUD on a default run");
+        close(h, 0, 0, 0, 0, 0);
+
+        // A table with some entries missing. prosper cannot call through a null member, so it must
+        // ignore the table -- but ignoring it is a degradation, not a neutral outcome, and the run
+        // has to say so.
+        reset_guest_file_reader(kGuestMediaBytes);
+        guest_file_expected_object = &file_object;
+        AvpInitData partial = file_data;
+        partial.file.size = nullptr;                 // one entry short of usable
+        uint64_t ph = init((uint64_t)(uintptr_t)&partial, 0, 0, 0, 0, 0);
+        StderrCapture partial_captured;
+        add(ph, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool partial_armed = partial_captured.armed();
+        const std::string partial_log = partial_captured.finish();
+        CHECK(partial_armed, "the stderr capture armed for the incomplete-table arm");
+        CHECK(guest_file_open_calls == 0 && guest_file_read_calls == 0,
+              "an incomplete table is never called through (a null member would fault)");
+        CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 2,
+              "an incomplete table falls back to the host path");
+        // THE ARM. Removing avp_has_partial_file_replacement's report empties the capture.
+        CHECK(says(partial_log, "INCOMPLETE") && says(partial_log, "#1955"),
+              "an incomplete table is reported rather than silently treated as absent");
+        close(ph, 0, 0, 0, 0, 0);
+
+        // ---- and the SILENCE, which is the claim protecting every other title -------------------
+        // "A title with no table behaves exactly as before" is the one guarantee here that is a
+        // negative, and a negative is the direction that fails quietly: an over-broad report would
+        // add default-run noise to every title in the corpus and no existing check would notice.
+        // avp_has_partial_file_replacement must be FALSE for an all-null table, so assert it through
+        // the same instrument that proves the positive cases are loud.
+        AvpInitData no_table{};
+        no_table.event.event_callback = (void*)&on_avplayer_event;   // memory + file left all-null
+        uint64_t nh = init((uint64_t)(uintptr_t)&no_table, 0, 0, 0, 0, 0);
+        StderrCapture silent_captured;
+        add(nh, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool silent_armed = silent_captured.armed();
+        const std::string silent_log = silent_captured.finish();
+        CHECK(silent_armed, "the stderr capture armed for the no-table arm");
+        // `silent_armed &&` folded into the NEGATIVE check on purpose: a negative assertion is
+        // fail-open on an unarmed capture -- an instrument that never ran reads as "the message was
+        // not printed", which is the answer this check is looking for. Positive arms cannot fail
+        // that way, so only this one needs it inside the condition rather than beside it.
+        CHECK(silent_armed && !says(silent_log, "INCOMPLETE") &&
+                  !says(silent_log, "file-replacement"),
+              "a title with NO table says nothing new on a default run");
+        CHECK(guest_file_open_calls == 0 && guest_file_read_calls == 0,
+              "a title with NO table calls no guest reader");
+        CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 3,
+              "a title with NO table takes the host path, exactly as before");
+        close(nh, 0, 0, 0, 0, 0);
+
+        prosper::video::set_backend(nullptr);
+        guest_file_expected_object = nullptr;
     }
 #endif
     prosper::video::set_backend(nullptr);
