@@ -141,21 +141,32 @@ rasteriser; they are listed in `ci.yml` with a reproduction command and tracked 
 tests cannot run in CI at all — dumps are copyrighted and gitignored — and now report `(Skipped)` rather
 than passing.
 
-**Two dump-backed tests are pinned to *The Messenger* specifically, not to "some dump".** If you
-configure with `-DGAME_DUMP=` pointing at any other title, `module_loads_eboot` and
-`boot_reaches_first_syscall` fail locally while everything else passes, and the failure looks like a
-regression in the loader:
+**Three dump-backed tests are pinned to *The Messenger* specifically, not to "some dump" — and they
+now report `(Skipped)` instead of failing (#1573).** `module_loads_eboot` pins `PPSA24651-app0`'s
+import, segment and relocation counts (`tests/test_module.cpp`); `boot_reaches_first_syscall` links
+that title's own `Media/Modules/Il2cppUserAssemblies.prx` and `PS5Util.prx`; `real_shader_render`
+recompiles and renders the RDNA2 blobs embedded in its eboot. Configure with `-DGAME_DUMP=` pointing
+at another title and all three used to go red for a reason nothing in the ctest output named —
+measured on `PPSA01826-app0` (The Pathless), **243/246 with these three failed**:
 
 ```text
-module_loads_eboot        imports=610 expected 612 / distinct import libs=34 expected 35
+module_loads_eboot          imports=1665 expected 612 / distinct import libs=50 expected 35
 boot_reaches_first_syscall  link: load .../Media/Modules/Il2cppUserAssemblies.prx: cannot open file
+real_shader_render          [FAIL] found the game's embedded RDNA2 shader blobs
 ```
 
-`612` imports and `35` import libraries are `PPSA24651-app0`'s numbers (`tests/test_module.cpp`), and
-that dump is the `GAME_DUMP` default in `CMakeLists.txt`. The second test wants The Messenger's IL2CPP
-module layout. So a build configured against, say, Blue Prince for renderer work reports **171/173
-with those two red**, and that result is expected rather than a regression — confirm it by running the
-same two tests on unmodified master with the same `-DGAME_DUMP`, which is the cheap discriminator.
+Every plausible reading of that — master is broken, this dump is corrupt, bisect — is wrong, and it is
+exactly the run a bring-up agent makes first on a new title.
+
+CMake now derives the configured dump's title id (`sce_sys/param.json`'s `titleId`, falling back to the
+`PPSAxxxxx-app0` directory name) and registers those three as **visible ctest skips** naming both the
+required and the configured id when it is not `PPSA24651`. The same run is now **243 passed, 3 skipped
+out of 246, exit 0**; the reason is printed at configure time and is in the test's own output under
+`ctest -V`. Point `-DGAME_DUMP=` back at `PPSA24651-app0`, re-run cmake, and they execute again.
+
+If **neither** source yields a title id the three are registered and run exactly as before. A detection
+failure has to stay fail-visible: silently converting three real guards into permanent skips would be
+the same defect this section is about, pointed the other way.
 
 ## Rule of thumb
 

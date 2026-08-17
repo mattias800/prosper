@@ -219,6 +219,72 @@ else()
   message(STATUS "Game dump not found at ${GAME_DUMP} — skipping dump-backed tests")
 endif()
 
+# Which title `GAME_DUMP` actually points at (#1573). A handful of ctest cases assert against ONE
+# title's bytes — import counts, an IL2CPP module layout, that title's embedded shader blobs — so
+# pointing GAME_DUMP at a different game turns them red for a reason nothing in the ctest output
+# names. A bring-up agent's first action on a new title is exactly that configure, so the red run is
+# the first thing they see, and every plausible reading of it (master is broken / this dump is
+# corrupt / bisect) is wrong.
+#
+# `sce_sys/param.json`'s `titleId` is authoritative; the `PPSAxxxxx-app0` directory name is a second,
+# independent source for a dump laid out without `sce_sys/`. If NEITHER yields an id the title-gated
+# cases are registered and RUN as before — a detection failure must stay fail-visible rather than
+# converting three real guards into silent skips, which is the defect this whole area is about.
+# CONFIDENCE: HIGH (both sources read directly from every dump on the dev box).
+set(GAME_DUMP_TITLE_ID "")
+if(HAVE_GAME_DUMP)
+  if(EXISTS "${GAME_DUMP}/sce_sys/param.json")
+    file(READ "${GAME_DUMP}/sce_sys/param.json" prosper_param_json)
+    string(JSON prosper_param_title_id ERROR_VARIABLE prosper_param_error
+           GET "${prosper_param_json}" "titleId")
+    if(NOT prosper_param_error)
+      set(GAME_DUMP_TITLE_ID "${prosper_param_title_id}")
+    endif()
+    unset(prosper_param_json)
+  endif()
+  if(GAME_DUMP_TITLE_ID STREQUAL "")
+    get_filename_component(prosper_dump_dir_name "${GAME_DUMP}" NAME)
+    if(prosper_dump_dir_name MATCHES "^([A-Z]+[0-9]+)")
+      set(GAME_DUMP_TITLE_ID "${CMAKE_MATCH_1}")
+    endif()
+  endif()
+  if(GAME_DUMP_TITLE_ID STREQUAL "")
+    message(STATUS "Game dump title id could not be determined from ${GAME_DUMP} — "
+                   "title-specific tests will run against it")
+  else()
+    message(STATUS "Game dump title id: ${GAME_DUMP_TITLE_ID}")
+  endif()
+endif()
+
+# Register `name` as a ctest case that is SKIPPED with `reason`, rather than not registered at all.
+# `cmake -E echo` prints the reason and exits 0; SKIP_REGULAR_EXPRESSION is what turns that into a
+# `(Skipped)` result. The point is that the case still occupies a line in the ctest summary: a test
+# that silently disappears from the registered set costs coverage with no line to read and no count
+# to compare against (the failure mode `docs/VERIFICATION.md` § CI records for the Vulkan flag).
+function(prosper_add_skipped_test name reason)
+  add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -E echo "SKIPPED: ${reason}")
+  set_tests_properties(${name} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: ")
+endfunction()
+
+# Register a ctest case that asserts against ONE title's content. Runs normally when GAME_DUMP is
+# that title (or when no title id could be derived); otherwise registers a visible skip naming both
+# the required title and the configured one, so the reason is in the run instead of in a doc.
+function(prosper_add_title_gated_test name title)
+  if(GAME_DUMP_TITLE_ID STREQUAL "${title}" OR GAME_DUMP_TITLE_ID STREQUAL "")
+    add_test(NAME ${name} COMMAND ${ARGN})
+  else()
+    prosper_add_skipped_test(${name}
+      "${name} asserts against ${title}'s own content; GAME_DUMP is configured with \
+${GAME_DUMP_TITLE_ID}. Re-run cmake with -DGAME_DUMP=<dump root>/${title}-app0 to exercise it.")
+    # Also say it here. ctest prints `(Skipped)` but not the reason unless it is run with `-V`, and
+    # configure is the moment the reader chose the dump — so this is where the explanation lands in
+    # front of them without their having to know to ask for it.
+    message(STATUS
+      "ctest case '${name}' will be SKIPPED: it asserts against ${title}'s own content, "
+      "GAME_DUMP is ${GAME_DUMP_TITLE_ID}")
+  endif()
+endfunction()
+
 if(TARGET prosper_core)
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
@@ -231,8 +297,9 @@ if(TARGET prosper_core)
   add_executable(test_module tests/test_module.cpp)
   target_link_libraries(test_module PRIVATE prosper_core)
   if(HAVE_GAME_DUMP)
-    add_test(NAME module_loads_eboot
-             COMMAND test_module "${GAME_DUMP}/eboot.bin")
+    # Messenger-specific: the assertions pin PPSA24651's import/segment/relocation counts (#1573).
+    prosper_add_title_gated_test(module_loads_eboot PPSA24651
+             test_module "${GAME_DUMP}/eboot.bin")
   endif()
 
   add_executable(test_nid tests/test_nid.cpp)
@@ -1397,8 +1464,9 @@ if(TARGET prosper_core)
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
     if(HAVE_GAME_DUMP)
-      add_test(NAME boot_reaches_first_syscall
-               COMMAND test_boot_linux "${GAME_DUMP}")
+      # Messenger-specific: links THIS title's own Il2cppUserAssemblies.prx / PS5Util.prx (#1573).
+      prosper_add_title_gated_test(boot_reaches_first_syscall PPSA24651
+               test_boot_linux "${GAME_DUMP}")
     endif()
 
     if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
@@ -1712,7 +1780,10 @@ if(TARGET prosper_core)
       if(HAVE_GAME_DUMP)
         add_executable(test_real_shader_render tests/test_real_shader_render.cpp)
         target_link_libraries(test_real_shader_render PRIVATE prosper_core Vulkan::Vulkan)
-        add_test(NAME real_shader_render COMMAND test_real_shader_render "${GAME_DUMP}/eboot.bin")
+        # Messenger-specific: it recompiles and renders the RDNA2 blobs embedded in THIS title's
+        # eboot, so a dump whose eboot carries none (or none that fully translate) fails (#1573).
+        prosper_add_title_gated_test(real_shader_render PPSA24651
+                 test_real_shader_render "${GAME_DUMP}/eboot.bin")
       endif()
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()

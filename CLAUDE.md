@@ -211,6 +211,11 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   cmake --build . -j8
   ctest --no-tests=error              # report the discovered count and exit code
   ```
+  **Configuring `-DGAME_DUMP` at a title other than `PPSA24651` reports three cases as `(Skipped)`,
+  not as failures** (#1573): `module_loads_eboot`, `boot_reaches_first_syscall` and
+  `real_shader_render` assert against *The Messenger's* own bytes. CMake derives the dump's title id
+  and names both ids in the skip. So a bring-up agent's first `ctest` on a new title is green with a
+  smaller executed set — read the skip count, not just the exit code. `docs/VERIFICATION.md` § CI.
 - **Write run artifacts and build temporaries to the real disk, never `/tmp`.** On the Linux box `/tmp`
   is a **RAM-backed tmpfs sized at 50% of RAM, with a per-user quota shared by every concurrent agent**.
   A single `.prgcap` is 200 MB–2.7 GB, a 4K `.bmp` is 24 MB, and a `PROSPER_GFXLOG`/`PROSPER_DBG` run log
