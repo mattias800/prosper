@@ -3456,12 +3456,48 @@ produced no row at all — and this census would have shown the executed *consum
 i.e. exactly the false "no compute producer writes this surface" conclusion. The reviewer's finding
 that the instrument's null did not cover failing shaders is what made this visible.
 
-**Next step, now concrete:** make `0x2042f49a00` recompile. Its reject is a single named instruction —
-`pc=16`, MIMG `op=0x1` (`IMAGE_LOAD_MIP`), `mode=unresolved-operand`, `dmask=0x1 dim=1 glc=1` — and
-the `[mimg-mip-why]` lines for that program report `proven_at_use=1 mip_vgpr=v2 in_zero_set=1
-exec_pristine=1 cfg_known=1` at pcs 16/18/21/25, so the mip level is proven and the failure is the
-descriptor, not the mip analysis. Then re-run this census and see whether the write-class binding
-becomes `outcome=executed`.
+#### Done: the producer executes now, and the world is still absent (2026-08-17)
+
+`0x2042f49a00`'s reject was one term. `shader_resource_allows_zero_mip_specialization` ANDed
+`!compression_enabled`, clearing a proof the per-use fold had already established — hence the apparent
+contradiction between `[mimg-mip-why] proven_at_use=1` and `[mimg-mip] proven_zero_mip=0`. Compression
+describes how bytes are **encoded**; the predicate is about which LOD is **addressed**. Split in
+`a8637c31`, after the bind-time guard it depends on landed in `1fbd77a7`.
+
+```
+before:  program=0x2042f49a00 binding=6 class=4  outcome=partial-recompile-empty
+after:   program=0x2042f49a00 binding=6 class=4  outcome=executed
+```
+
+**The guard fires on the same program in the same run**, exactly as designed:
+
+```
+[compute] program 0x2042f49a00 image 0x2052ac0000 ... compressed sampled source without authority
+          (no imported image, no fast clear, metadata does not prove the base allocation
+          uncompressed) -> dispatch skipped (#590)
+```
+
+That is binding 4 — the depth read at pc=16 — on a dispatch whose retained-depth import missed. It
+declined instead of reading compressed guest bytes. Both outcomes occur in one run because the import
+is available *sometimes*: `hit(depth=69965)` against `declined addr=0x2052ac0000 reason=depth-invalid
+x37751`, with the retained surface reporting `dvalid=0 svalid=1`.
+
+**The world is still black.** Radar and status bars render as before; no 3D. A necessary step, not the
+fix.
+
+**A regression was nearly reported here and was not.** The first post-change screenshot at
+`PROSPER_CAPTURE_SCREENSHOT_AT_FRAME=4200` was fully black including the HUD — worse than the known
+baseline. The pre-change run at the **same trigger** is equally black: host frame 4200 is an
+early/transition moment, while the HUD-visible baseline comes from the 380 s grab at guest present
+~4137. Different sample point, not different behaviour. **Compare frames only against a control taken
+with the identical trigger** — on this route an unmatched pair looks exactly like a regression.
+
+**The frontier is now depth validity, not the recompiler.** This dispatch reads the main depth and
+needs the retained image to be *valid* when it runs; `dvalid=0` says it frequently is not, and one
+address accounts for 37,751 of the run's 40,826 `depth-invalid` declines. That is HTILE
+materialization/retention work, and it connects to the DS-invalidation changes split into #2553. Also
+open from review: the import-hit/import-miss regression at the production binding site, and making
+`PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS` fail closed for the compressed case.
 
 ### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 
