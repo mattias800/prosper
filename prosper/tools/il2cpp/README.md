@@ -27,19 +27,108 @@ managed logic (scene load, boot state machines) during emulator debugging.
 
 4. `out/dump.cs` lists every method with a `// RVA: 0x...` comment; `out/script.json`
    has the machine-readable `{Address, Name}` list. The runtime address is
-   `module load base + RVA`. Both PPSA24651 (The Messenger) and PPSA02664 load the
-   IL2CPP PRX at `0x440000000`, so RVA == script.json Address == a prosper
-   `[btrace] il+0x<offset>` frame. `DoFirstLogin` (RVA `0x2140D0`) → `0x4402140D0`.
+   `module load base + RVA`, and the base is not a guess: `boot_program.cpp:129` maps
+   `Media/Modules/Il2cppUserAssemblies.prx` at `BOOT_IL2CPP` (`boot_program.hpp:21`,
+   currently `0x440000000`), so RVA == script.json Address == a prosper
+   `Il2cpp+0x<offset>` label. Read the constant rather than the literal — the eboot's
+   base already moved once (#825) and every diagnostic that had hard-coded the old one
+   went on printing plausible offsets that landed nowhere.
+   Worked example, PPSA02664: `SCS.UserManagement.SCSUserManager$$DoFirstLogin` is at RVA
+   `0x2140D0`, so it runs at `0x4402140D0`. (That RVA is title-specific — in PPSA24651 the
+   same offset is 0xf0 into `SonicBloom.Koreo.Koreographer$$GetMusicSampleTime`. Both
+   measured 2026-08-17 with Il2CppDumper v6.7.46.)
 
 5. Symbolicate addresses / btrace chains with `resolve.py`:
 
        python3 resolve.py /tmp/out/script.json il+0x1764ce2 0x11e63c
-       # il+0x1764ce2  ->  Unity.PSN.PS5.Async.WorkerThread$$RunProc (+0xa2)
+       # il+0x1764ce2  ->  Unity.PSN.PS5.Aysnc.WorkerThread$$RunProc  (+0xa2)
        echo '[btrace] ... chain=il+0xde92e9,il+0xde9159' | python3 resolve.py /tmp/out/script.json -
+
+   (`Aysnc` is not a typo in this README: that is how Unity's own PSN plugin spells the
+   namespace. Measured 2026-08-17 with Il2CppDumper v6.7.46 — the only match for
+   `WorkerThread$$RunProc` is `Unity.PSN.PS5.Aysnc.WorkerThread$$RunProc` in BOTH
+   PPSA24651 and PPSA02664. This line used to read `Async`, which resolves to nothing.
+   `0x1764ce2` is PPSA24651's RVA for it; in PPSA02664 that offset has no managed method.)
 
    NOTE: prosper's `[btrace]` validated unwinder must accept INDIRECT call sites
    (`0xFF` at v-2/-3/-6/-7), not just `0xE8` (call rel32) — IL2CPP dispatches
    managed methods indirectly, so an 0xE8-only filter drops every managed frame.
+
+## Runtime symbolication — naming the method during the run (#2551)
+
+Steps 1–5 are offline: they answer "what method is at this address" *after* the fact.
+prosper can also do it **in-process**, so a guest backtrace names the C# method instead
+of printing an address somebody has to go and correlate:
+
+```
+[app] guest backtrace: 0x440de92e9 (Il2cpp+0xde92e9 System.Threading.WaitHandle$$WaitOneNative+0xd9)
+```
+
+Two commands, both one-off per title:
+
+```bash
+python3 resolve.py /tmp/out/script.json --emit-symtab ~/PPSA24651.symtab   # from step 4's script.json
+export PROSPER_IL2CPP_SYMBOLS=~/PPSA24651.symtab                          # then run prosper normally
+```
+
+`--emit-symtab` writes a flat `<hex-rva> <name>` table from resolve.py's **own** loader, and
+`src/host/il2cpp_symbols.cpp` reads that. script.json itself is deliberately *not* parsed at
+runtime — it is 36.8 MB for PPSA24651 against 5.6 MB for the symtab, and a second JSON parser
+would be a re-derivation of a mapping resolve.py already gets right. The ctest case
+`il2cpp_symtab_agreement` drives both CLIs over one synthesized corpus and requires them to agree
+address-for-address.
+
+**Coverage is exactly one function: `describe_code_address()`** (`src/host/exec_image_linux.cpp`,
+`exec_image_win.cpp`). That is the shared guest-address label, so every consumer of it is
+symbolicated at once — the app's `[app] guest backtrace` after a fault, `tools/screenshot`'s, and
+the Windows `[thread-trace]`. Diagnostics that call `guest_module_name()`/`guest_module_offset()`
+directly (`hle_agc`'s `ra=`, `hle_file`'s MISS attribution, `boot_trace`'s fault backtrace) still
+print bare offsets; pipe those through `resolve.py` as before. Extending them is a one-line change
+each and was left undone deliberately rather than touched blind.
+
+### What a failed resolution looks like — four distinct answers, never silence
+
+A resolver that answers "nothing" when it means "I did not run" is this project's most expensive
+recurring defect, so the four outcomes are spelled differently:
+
+| situation | label |
+| --- | --- |
+| `PROSPER_IL2CPP_SYMBOLS` unset | `Il2cpp+0xde92e9` — unchanged, no claim made |
+| set, but the file could not be loaded | `Il2cpp+0xde92e9 <il2cpp-symbols-unavailable>` |
+| loaded, no managed method covers the address | `Il2cpp+0xde92e9 <no-managed-method>` |
+| loaded and covered | `Il2cpp+0xde92e9 System.Threading.WaitHandle$$WaitOneNative+0xd9` |
+
+Every load also prints one line to stderr, on success **and** failure, so "how many symbols do I
+actually have" is never inferred from the absence of names:
+
+```
+[il2cpp-sym] loaded 87851 symbols from ~/PPSA24651.symtab (window=0x8000)
+[il2cpp-sym] NOT LOADED from ~/typo.symtab: cannot open file (guest addresses stay unsymbolicated)
+```
+
+Pointing the variable at a raw `script.json` is **refused**, naming the header it wanted, rather
+than being read as a table with zero symbols.
+
+`<no-managed-method>` is a real and common answer, not a failure: 26 of 36 live IL2CPP addresses
+sampled from a running PPSA24651 boot were in the il2cpp *runtime* (the VM's own native C++, which
+is compiled into the same PRX below the managed-method region — PPSA24651's lowest managed method
+is at RVA `0x1e3e00`), and `resolve.py` reports exactly the same thing for them.
+
+### Limits
+
+- **One module.** Only the IL2CPP aperture is symbolicated; the Unity player eboot and the system
+  PRXs are stripped C++ and stay bare offsets. Use `tools/guest_bt/` when you want a whole *stack*
+  rather than a single address — it unwinds guest threads through the HLE stub boundary and already
+  consumes a `script.json` for managed names.
+- **Nearest-preceding, windowed at `0x8000`.** script.json gives method starts, never lengths, so an
+  address more than 32 KiB past a start is reported as `<no-managed-method>` rather than attributed.
+  The window is declared in the symtab header and read from it, so resolve.py remains the one place
+  it is defined.
+- **The symtab is derived from the gitignored dump — do not commit one** (same rule as `dump.cs` /
+  `script.json`). `tests/data/il2cpp_symtab_fixture.symtab` is hand-written and contains no dumper
+  output.
+- IL2CPP layout is version-dependent; a symtab is only valid for the exact module it was dumped
+  from. Nothing detects a mismatched pair, so a stale symtab yields confident wrong names.
 
 ## What binutils can and cannot do with the flattened ELF
 

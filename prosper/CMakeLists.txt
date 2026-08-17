@@ -409,6 +409,28 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_no_shadow PRIVATE prosper_core)
   add_test(NAME hle_no_shadow COMMAND test_hle_no_shadow)
 
+  # Runtime IL2CPP symbolication (#2551): name the C# method containing a live guest PC. The
+  # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
+  # into a silent skip. The binary doubles as the probe the agreement test drives.
+  add_executable(test_il2cpp_symbols tests/test_il2cpp_symbols.cpp)
+  target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
+  add_test(NAME il2cpp_symbol_resolution
+           COMMAND test_il2cpp_symbols
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
+  if(Python3_Interpreter_FOUND)
+    # ...and the runtime resolver must answer exactly what tools/il2cpp/resolve.py answers. They
+    # share the record set by construction (resolve.py emits the table the runtime reads), but the
+    # nearest-preceding rule, its window and its tie handling are implemented twice, so this drives
+    # both CLIs over one synthesized corpus and requires them to agree address-for-address.
+    add_test(NAME il2cpp_symtab_agreement
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/il2cpp/test_symtab_agreement.py"
+                     "$<TARGET_FILE:test_il2cpp_symbols>")
+  else()
+    prosper_add_skipped_test(il2cpp_symtab_agreement
+      "il2cpp_symtab_agreement drives tools/il2cpp/resolve.py; no Python 3 interpreter was found.")
+  endif()
+
   # Ground truth for tools/re/hle_handler_map.py: the registry register_builtin_hle() really builds
   # (#2070). Pure setup — no game dump, no GPU — so the static parser can be reconciled against the
   # compiled binary on every run instead of being trusted.
