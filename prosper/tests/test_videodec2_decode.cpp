@@ -7,13 +7,15 @@
 // distinguish it from a decoder that is about to produce a frame, so it waits for one that cannot
 // arrive, with nothing in the log.
 //
-// Two arms, selected by argv so each runs in its own process (the opt-out is read once into a
-// function-local static, which is deliberate: this is a per-frame path):
+// Three arms, selected by argv so each runs in its own process (each arm's environment variable is
+// read once into a function-local static, which is deliberate: this is a per-frame path):
 //
-//   (default)     a backend that offers the access-unit path is USED. The guest's frame buffer
-//                 receives the NV12 picture and VdecOutput reports valid/pictures/dimensions.
-//   --no-decode   PROSPER_VDEC2_NO_DECODE=1 restores the old no-picture behaviour, so the A/B that
-//                 justified turning decoding on by default stays runnable.
+//   (default)        a backend that offers the access-unit path is USED. The guest's frame buffer
+//                    receives the NV12 picture and VdecOutput reports valid/pictures/dimensions.
+//   --no-decode      PROSPER_VDEC2_NO_DECODE=1 restores the old no-picture behaviour, so the A/B
+//                    that justified turning decoding on by default stays runnable.
+//   --format-probe   PROSPER_VDEC2_FORMAT reaches the guest's struct — see kFormatProbe for why a
+//                    sweep instrument needs its own positive control.
 //
 // WHAT THIS TEST DOES AND DOES NOT PROVE. The backend here is a fake that returns a synthetic NV12
 // picture, so this is a test of the HLE PLUMBING — that the handler opens a decoder, submits the
@@ -132,9 +134,12 @@ private:
 // whether a guest reads it, which is the open question.
 constexpr uint32_t kFormatProbe = 0x2a;
 
+// _putenv rather than _putenv_s on Windows: MinGW-w64 declares the _s form only for a new enough
+// CRT, and this test builds on every platform in CI.
 void set_env(const char* name, const char* value) {
 #if defined(_WIN32)
-    _putenv_s(name, value);
+    const std::string assignment = std::string(name) + "=" + value;
+    _putenv(assignment.c_str());
 #else
     setenv(name, value, 1);
 #endif

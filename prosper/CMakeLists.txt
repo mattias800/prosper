@@ -341,8 +341,9 @@ if(TARGET prosper_core)
   target_link_libraries(test_avplayer PRIVATE prosper_core)
   add_test(NAME avplayer_hle COMMAND test_avplayer)
 
-  # #2270. Two ctest entries over ONE binary, because the opt-out is read once into a function-local
-  # static (deliberately — this is a per-frame path), so both arms cannot run in one process.
+  # #2270. Three ctest entries over ONE binary, because each arm's environment variable is read once
+  # into a function-local static (deliberately — this is a per-frame path), so the arms cannot share
+  # a process.
   add_executable(test_videodec2_decode tests/test_videodec2_decode.cpp)
   target_link_libraries(test_videodec2_decode PRIVATE prosper_core)
   add_test(NAME videodec2_decode COMMAND test_videodec2_decode)
