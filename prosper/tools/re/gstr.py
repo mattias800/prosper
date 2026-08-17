@@ -18,9 +18,17 @@ auto-detecting UTF-16LE (UE4's TCHAR) as well as ASCII.
 The intended pipeline is to feed it every data reference of a frame's function at once:
 
     python3 tools/re/xref.py <flat.elf> from 0x2121d9e \
-      | awk '/^   (lea|load) /{print $3}' \
-      | xargs python3 tools/re/gstr.py <flat.elf> \
-      | grep '"'
+      | awk '/ (lea|load) +-> /{print $NF}' \
+      | xargs python3 tools/re/gstr.py <flat.elf> --strings-only
+
+The awk matches on the arrow and takes the LAST field, deliberately. `xref.py from` prints an
+access-class column (`[& ]`, `[rw]`) ahead of the kind, added in #2025, and that column tokenises
+differently per class -- `[& ]` splits into two awk fields where `[rw]` is one -- so a fixed field
+index is right for some lines and wrong for others. The recipe here used to be
+`awk '/^   (lea|load) /{print $3}'`, written before that column existed; against the current output
+it matches nothing at all, `xargs` then runs gstr with no addresses, gstr reads an empty stdin, and
+the whole pipeline prints nothing and exits 0. That is the same silent-empty failure #2399 records
+one tool upstream: a documented invocation that answers "nothing" when it means "I did not run".
 
 Flatten a module first with `python3 tools/il2cpp/prx_to_elf.py <eboot.bin> <flat.elf>`, or reuse
 the images `tools/guest_bt/guest_bt.py` already caches under `tools/guest_bt/.cache/`.

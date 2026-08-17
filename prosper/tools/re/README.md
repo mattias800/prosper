@@ -40,6 +40,36 @@ python3 tools/re/xref.py /tmp/eboot.elf to 0x20698a5
 `from ADDRESS` lists references made by the function window containing that address; `reloc ADDRESS`
 restricts output to relative data relocations.
 
+### How to read a zero — and the CLI contract that makes a zero readable
+
+`xref.py`'s arguments are **positional**: `xref.py <module.elf> {to|from|reloc|imm} <argument>`.
+There are no option flags. `xref.py --help` prints that usage; anything that is not one of the four
+modes is **refused**, loudly and with a non-zero exit.
+
+That is a contract, not a nicety, because the one answer this tool must never give by accident is a
+confident zero. `xref.py <elf> --addr 0x…` used to clear the argument-count check, parse the module,
+decode half a million reference sites, then fall off the end of the mode chain and exit **0 with no
+output at all** — indistinguishable from "nothing references this address", which is a conclusion
+strong enough to redirect an investigation (#2399; the reporter fell back to a hand-rolled byte scan
+and had to retract its false positives, #2396).
+
+So the exit status means exactly one of two things:
+
+| exit | meaning |
+| --- | --- |
+| `0` | the query ran; the printed counts **are** the answer, zero included |
+| `2` | refused — nothing was searched, and no number printed is a result |
+
+Every query prints, before its answer, how many references the decoder found **across the whole
+module**. That number is what separates "this address has no references" from "this run found
+nothing at all", and it is printed on hits and misses alike so a saved transcript carries its own
+validity check. A zero result says so on its own line, and an address lying outside every `PT_LOAD`
+(checked against `p_memsz`, so a `.bss` flag byte is *inside*) is called out as the likeliest cause —
+usually a runtime address nobody rebased to an image-relative one (#1659).
+
+Two zeros are still worth nothing until you have done one more thing: a string of 22 bytes or fewer
+needs `imm` (see below), and an address you cannot find at all needs the load base subtracted.
+
 ## Find who builds a SHORT string — `to` cannot, and its zero is misleading
 
 A short string may have **no address to reference**. Clang materialises a `std::string` built from a

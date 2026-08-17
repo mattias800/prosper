@@ -3,7 +3,9 @@
 
 import importlib.util
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 
@@ -345,7 +347,148 @@ def refusal():
     print("xref refusal: PASS")
 
 
+def cli():
+    """#2399: the command line must never answer a question it did not ask.
+
+    Two symptoms, and they were cause and effect. `xref.py --help` printed the literal string
+    `None` -- `main()` did `print(__doc__)` on a bad invocation, and every line of the module header
+    was a `#` comment, so there was no docstring to print. Told nothing, the caller guessed
+    `xref.py <elf> --addr 0x…`; that is four argv entries, so it cleared the arity check, parsed a
+    real 27 MB module, decoded half a million reference sites -- and then fell off the end of an
+    if/elif chain with no `else`, printing NOTHING and exiting 0. For an address with two real
+    references. An empty exit-0 run is byte-identical to "no references found", and "nobody
+    references this address" is a conclusion strong enough to redirect an investigation; the
+    reporter hand-rolled a byte scan instead and had to retract its false positives (#2396).
+
+    Every arm here is CLI-level, through a subprocess, because that is the layer that failed: the
+    decoder was never wrong. The fixture is built in-process rather than taken from a dump, so the
+    arms cannot silently skip in CI (#1675).
+    """
+    xref = os.path.join(HERE, "xref.py")
+
+    def run(*args):
+        p = subprocess.run([sys.executable, xref, *args], capture_output=True, text=True)
+        return p.returncode, p.stdout, p.stderr
+
+    # One executable PT_LOAD whose memsz reaches well past its filesz -- the .bss tail. Guest flag
+    # bytes live there, and on PPSA24651 the `storeb` target 0x1f4f3f0 is 0x13288 past the last
+    # segment's filesz with two real references, so the tail is not a corner case.
+    raw = bytearray(0x200)
+    raw[:4] = b"\x7fELF"
+    struct.pack_into("<Q", raw, 0x20, 0x40)
+    struct.pack_into("<HH", raw, 0x36, 56, 1)
+    struct.pack_into("<IIQQQQQQ", raw, 0x40,
+                     1, 5, 0x100, 0x1000, 0, 0x100, 0x2000, 0x1000)   # filesz 0x100, memsz 0x2000
+    called = 0x1080          # in the file-backed part
+    bss_flag = 0x2000        # in the memsz tail only
+    unreferenced = 0x1090    # mapped, file-backed, and referenced by nothing
+    outside = 0x900000       # in no segment at all -- an un-rebased runtime address
+    code = bytearray(b"\x90" * 0x100)
+    code[0x00:0x05] = b"\xe8" + rel32(0x1000, 5, called)
+    code[0x05:0x0c] = b"\xc6\x05" + rel32(0x1005, 7, bss_flag) + b"\x01"
+    raw[0x100:0x200] = code
+
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "fixture.elf")
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        # --- the root cause, asserted directly. `print(__doc__)` is only a usage message if there
+        # --- is a docstring; a header made of `#` comments leaves __doc__ None.
+        assert XREF.__doc__ is not None, "xref.py has no module docstring; --help would print None"
+
+        # --- symptom 1: help must be usage, and an explicit help request is a SUCCESS.
+        for flag in ("--help", "-h"):
+            rc, out, err = run(flag)
+            assert rc == 0, (flag, rc, out, err)
+            assert out.strip() != "None" and "None" != out.strip(), (flag, out)
+            # Naming every mode is the specific thing whose absence sent the reporter to `--addr`.
+            for mode in ("to", "from", "reloc", "imm"):
+                assert mode in out, (flag, mode, out)
+            assert "POSITIONAL" in out, out
+
+        # Too few arguments is a refusal, not a help request: it must be non-zero and say why.
+        rc, out, err = run(path)
+        assert rc != 0, (rc, out, err)
+        assert (out + err).strip() != "None", (out, err)
+        assert "expected 3 arguments" in err, err
+
+        # --- the answer the tool must give, so the arm below has something to be measured against.
+        rc, out, err = run(path, "to", hex(called))
+        assert rc == 0, (rc, out, err)
+        assert "code references to 0x%x: 1" % called in out, out
+        assert "call" in out, out
+
+        # --- symptom 2, the whole point: the reporter's invocation, on an address that DOES have a
+        # --- reference (the arm above proves it). Before the fix this printed zero bytes and exited
+        # --- 0. The assertion is written as "must not be a silent success" rather than as an exact
+        # --- message, because any loud failure is acceptable and silence never is.
+        rc, out, err = run(path, "--addr", hex(called))
+        assert not (rc == 0 and not out.strip() and not err.strip()), (
+            "an invented flag produced a silent exit-0 run: this is #2399")
+        assert rc != 0, (rc, out, err)
+        assert "--addr" in err and "not a mode" in err, err
+        # ...and the hint that closes the loop, since guessing the syntax is what started it.
+        assert "positional" in err.lower(), err
+
+        # A mode that is merely misspelled -- not flag-shaped -- must be refused on the same path.
+        rc, out, err = run(path, "too", hex(called))
+        assert rc != 0 and "not a mode" in err, (rc, out, err)
+
+        # A non-numeric address for a numeric mode is refused, not tracebacked past.
+        rc, out, err = run(path, "to", "not_an_address")
+        assert rc != 0 and "is not an address" in err, (rc, out, err)
+        assert "Traceback" not in err, err
+
+        # --- a genuine zero must announce itself AS a zero, and carry the evidence that the run
+        # --- happened: the module-wide decoded count. That number is what distinguishes "this
+        # --- address has no references" from "this run found nothing at all".
+        rc, out, err = run(path, "to", hex(unreferenced))
+        assert rc == 0, (rc, out, err)
+        assert "0 references of any decoded kind" in out, out
+        assert "real answer, not a failed run" in out, out
+        assert "decoded 2 code reference sites" in out, out
+
+        # --- the unmapped warning, and BOTH of its arms. An address in no segment is the commonest
+        # --- cause of an honest-looking zero (a runtime address nobody rebased, #1659)...
+        rc, out, err = run(path, "to", hex(outside))
+        assert rc == 0 and "WARNING" in out and "outside every PT_LOAD" in out, (rc, out)
+
+        # ...and this is the arm that keeps the warning honest: a .bss address, past filesz and
+        # inside memsz, with a real `storeb` writing it. It must be ANSWERED and NOT warned about.
+        # Checking the range against p_filesz instead of p_memsz passes every other arm here and
+        # fails this one -- which is how that mistake was caught on a live PPSA24651 query.
+        rc, out, err = run(path, "to", hex(bss_flag))
+        assert rc == 0, (rc, out, err)
+        assert "code references to 0x%x: 1 (1 write" % bss_flag in out, out
+        assert "WARNING" not in out, ("a referenced .bss address must not be flagged unmapped", out)
+
+        # `from` printed a bare header and nothing else on an empty window, which reads as a
+        # truncated run rather than as an answer.
+        rc, out, err = run(path, "from", hex(outside))
+        assert rc == 0 and "0 distinct targets" in out, (rc, out)
+
+        # `imm` takes an arbitrary needle, so a help flag in the ARGUMENT slot is a search term.
+        # Treating it as a help request would make `imm` unable to ask about its own flag strings.
+        rc, out, err = run(path, "imm", "--help")
+        assert rc == 0, (rc, out, err)
+        assert "inline-immediate constructions of '--help'" in out, out
+        assert "usage:" not in out, out
+
+        # --- the mutation arm for the whole file, run against the tool exactly as shipped: with
+        # --- master's xref.py in place of this one, the `--addr` arm above is a silent exit 0.
+        # --- Reproduce by copying this test next to the old xref.py:
+        # ---     git show <base>:prosper/tools/re/xref.py > <scratch>/xref.py
+        # ---     cp prosper/tools/re/test_xref.py <scratch>/ && python3 <scratch>/test_xref.py
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("xref cli: PASS")
+
+
 if __name__ == "__main__":
     main()
     imm()
     refusal()
+    cli()

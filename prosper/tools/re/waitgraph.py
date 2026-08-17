@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
+"""waitgraph.py — build a wait-for graph for a TOTALLY deadlocked guest.
+
+usage:
+    tools/re/waitgraph.py <dump-file> [<dump-file> ...]
+
+Produce the input with:
+    PROSPER_SYNC_RING=4000000 PROSPER_APP_GUEST_DUMP_MS=110000 \\
+    PROSPER_APP_GUEST_DUMP_PATH=<dump.txt>  prosper-app <game>
+
+Both inputs may be the same file: `prosper-app`'s timed dump appends the thread snapshot and the
+sync ring together, which is the intended way to use this.
+
+For each parked thread T waiting on object O it draws an edge to the thread that most recently woke
+O. A ROOT is a parked thread whose object nothing has ever woken — usually the real defect. A CYCLE
+is a lock-ordering deadlock. Roots with no cycle mean starvation or a lost wakeup, not lock ordering.
+
+Caveat: only the CONDITION-slot paths record wake events, so a thread parked in an `address` (raw
+futex) wait ALWAYS looks like a root — because no producer was ever recorded for its object, not
+because none exists. Those are reported separately; do not read them as findings.
+"""
 # waitgraph.py — build a wait-for graph for a TOTALLY deadlocked guest.
+#
+# The usage block above is the module DOCSTRING, not a comment, because the bad-invocation path
+# below prints `__doc__` — and a header made only of `#` comments makes that print the literal
+# string `None` (#2399, where the same arrangement in xref.py sent a caller to invented syntax).
 #
 # When every guest thread is parked, `PROSPER_APP_GUEST_DUMP_PATH` tells you WHERE each thread
 # stopped and `PROSPER_SYNC_RING` tells you what happened before they stopped. Neither, alone, tells
