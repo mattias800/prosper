@@ -1143,7 +1143,12 @@ int main() {
         const bool silent_armed = silent_captured.armed();
         const std::string silent_log = silent_captured.finish();
         CHECK(silent_armed, "the stderr capture armed for the no-table arm");
-        CHECK(!says(silent_log, "INCOMPLETE") && !says(silent_log, "file-replacement"),
+        // `silent_armed &&` folded into the NEGATIVE check on purpose: a negative assertion is
+        // fail-open on an unarmed capture -- an instrument that never ran reads as "the message was
+        // not printed", which is the answer this check is looking for. Positive arms cannot fail
+        // that way, so only this one needs it inside the condition rather than beside it.
+        CHECK(silent_armed && !says(silent_log, "INCOMPLETE") &&
+                  !says(silent_log, "file-replacement"),
               "a title with NO table says nothing new on a default run");
         CHECK(guest_file_open_calls == 0 && guest_file_read_calls == 0,
               "a title with NO table calls no guest reader");
