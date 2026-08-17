@@ -19,7 +19,7 @@
 // report that opened #2582 concluded "the only variable left between the passing and failing arms is
 // concurrent machine load", because the flake only ever appeared while the box was busy and the run
 // stretched from 0.01 s on CI to 861 s here. **That is false, and believing it costs you the fix:**
-// the pre-#2592 `test_file_binary` reproduces all 16 of its failures on an IDLE box, in ~40 s, with
+// the pre-#2592 `test_file_binary` reproduces all 16 of its failures on an IDLE box, in 29 s, with
 // nothing running but one competing writer —
 //
 //     $ cd <empty dir>                       # arm A: the fixed-name build binary
@@ -33,9 +33,9 @@
 // scratch fixture fails the identical 16, so the pass is the path moving rather than the lever going
 // dead. The failure TEXT names chmod, utimes, dup and binary reads, so it reads as an HLE defect and
 // not as a filename; that is the whole trap. Two more instances measured the same day: 6 concurrent
-// `test_runtime_prx_load` sharing one root failed 4 with "no module was loaded" (fixed here), and 6
-// concurrent `spv_validate` sharing one output directory reported `spirv-val REJECTED it: Invalid
-// SPIR-V magic number` against correct emitters (#2632).
+// `test_runtime_prx_load` sharing one root failed 4 with "no module was loaded" (fixed in #2633),
+// and 6 concurrent `spv_validate` sharing one output directory reported `spirv-val REJECTED it:
+// Invalid SPIR-V magic number` against correct emitters (#2632).
 //
 // The root comes from `PROSPER_TEST_SCRATCH_DIR`, which `prosper/CMakeLists.txt` sets per ctest
 // case to `<build-dir>/test-scratch/<ctest case name>`; running a test binary by hand instead uses
