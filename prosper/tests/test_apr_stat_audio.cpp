@@ -24,6 +24,7 @@
 
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "test_scratch.h"
 
 namespace prosper {
     uint32_t prosper_apr_register(const std::string& path, uint64_t size);
@@ -45,7 +46,9 @@ int main() {
     CHECK(stat_fn != nullptr, "sceKernelAprGetFileStat registered");
 
     // A fixture file with a known, non-trivial size that the handler will host-stat.
-    const char* fixture = "test_apr_stat_fixture.bin";
+    // #1621: per-case scratch directory, not a fixed name in the shared ctest working directory.
+    const std::string fixture_storage = prosper_test::test_scratch_file("test_apr_stat_fixture.bin");
+    const char* fixture = fixture_storage.c_str();
     {
         FILE* f = std::fopen(fixture, "wb");
         CHECK(f != nullptr, "create APR stat fixture file");
