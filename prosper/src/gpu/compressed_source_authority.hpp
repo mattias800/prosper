@@ -1,26 +1,30 @@
 // WHICH representation of a sampled source is authoritative — and, as a consequence, whether the
 // guest base allocation may be read as ordinary texels.
 //
-// One pure decision over explicit facts, shared by both backends, because getting it wrong in either
-// is a silent-wrong-pixels defect. The compute backend asks before guest preparation; the graphics
-// backend asks before decode/detile. Previously neither asked explicitly: compute checked only that
-// the base was *readable*, and graphics merely warned. A mapped base allocation whose texels actually
-// live in DCC or HTILE decodes to plausible garbage, which is strictly worse than declining — it
-// arrives as wrong pixels instead of a visible skip.
+// One pure decision over facts the CALLER CANNOT SELF-CERTIFY, shared by both backends, because
+// getting it wrong in either is a silent-wrong-pixels defect. The compute backend asks before guest
+// preparation; the graphics backend asks before decode/detile. Previously neither asked explicitly:
+// compute checked only that the base was *readable*, and graphics merely warned. A mapped base
+// allocation whose texels live in DCC or HTILE decodes to plausible garbage, which is strictly worse
+// than declining — it arrives as wrong pixels instead of a visible skip.
 //
-// THE DISTINCTION THAT MATTERS, and an earlier draft of this file got it wrong: an imported image is
-// authority to consume THAT IMAGE. It is not permission to read the guest base. Those are different
-// selected sources, so the decision names the source rather than answering a single "may I read"
-// boolean — which would have licensed exactly the wrong thing for an imported binding.
+// WHY THE INPUT TYPES LOOK PARANOID. An earlier draft took `metadata_bytes` and
+// `expected_metadata_bytes` and proved only that the two were equal — both supplied by the adapter. The
+// original defect survived that unchanged: call the colour-DCC footprint helper for an HTILE resource,
+// read exactly that wrong-sized window, pass the same number twice, and a uniform prefix authorizes the
+// base. A shared decision exists so the adapters are NOT trusted; every authority below is therefore
+// either derived here from the resource shape, or minted by the verifier that can actually establish
+// it. A plain `bool` authority is a way for one careless adapter assignment to license raw bytes.
 //
 // This is deliberately NOT part of the zero-mip proof. Compression describes how bytes are ENCODED;
 // that proof is about which LOD is ADDRESSED. Conflating them turned "we cannot decode these bytes"
-// into "this whole program is unsupported", dropping every other thing the program did. Compile on the
-// semantic proof; select the source here, at bind time.
+// into "this whole program is unsupported", dropping every other thing the program did.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "shader_resources.hpp"   // DataFormat
 
 namespace prosper::gpu {
 
@@ -31,37 +35,133 @@ namespace prosper::gpu {
 // `meta_data_address` for a depth parent and the DCC address there otherwise — the SAME field. So the
 // bit is not an aspect tag, and the T# format alone is not enough either (a Float32x1 view is not
 // necessarily depth). The kind is established by correlating the metadata address with retained
-// depth/HTILE state, which is why it is an INPUT here rather than something this function derives.
+// depth/HTILE state, which is why it is an input rather than something derived from the descriptor.
 enum class CompressionMetadataKind : uint8_t { Unknown, Dcc, Htile };
+
+// The physical shape a metadata plane belongs to. The resolver derives the plane's exact span from
+// this, so no caller can assert a span of its own choosing.
+struct MetadataPlaneShape {
+    CompressionMetadataKind kind = CompressionMetadataKind::Unknown;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 1;
+    uint32_t img_dim = 0;
+    uint32_t sample_count = 1;
+    uint32_t tile_mode = 0;
+    DataFormat format = DataFormat::Float32;
+    uint32_t num_components = 1;
+    bool meta_pipe_aligned = false;
+};
+
+// What the metadata plane establishes. Only `ProvesPlain` can contribute authority, and only the
+// resolver below can produce it.
+enum class MetadataProof : uint8_t {
+    Absent,             // no plane supplied, or fewer bytes readable than the exact span needs
+    UnknownKind,        // aspect unknown: which pattern means "decompressed" is undefined
+    NoExactFootprint,   // kind known, but no exact span is derivable for THIS shape
+    NotDecompressed,    // exact span read; the state is not provably decompressed
+    ProvesPlain,        // exact span read; the kind's OWN proof is satisfied
+};
+
+// Derive the exact plane span from `shape` and apply the proof belonging to `shape.kind`.
+//
+// `readable_bytes` says how much of the plane the caller can actually read — it is a bound, never the
+// span. If the derived span exceeds it, the answer is `Absent`, not a proof over a short window.
+//
+// `NoExactFootprint` is a real and load-bearing answer, not an omission: single-sample HTILE has no
+// exact footprint in this tree today, and GTA V's main depth is exactly that shape. Such a surface may
+// still be imported or exactly materialized — but its metadata must never authorize its base.
+MetadataProof resolve_metadata_proof(const MetadataPlaneShape& shape, const uint8_t* plane,
+                                     size_t readable_bytes);
+
+// Whether an import exists for this binding and whether it will be consumed.
+//
+// A tri-state rather than two bools: the pair permitted `selected && !available`, and "available"
+// conflated an exactly compatible import with a renderer lookup that was later rejected for
+// device/format/extent. Only an exactly compatible import can meaningfully be *bypassed*.
+enum class ImportState : uint8_t {
+    Unavailable,          // no compatible import for this binding
+    Selected,             // an exactly compatible import that the backend WILL consume
+    BypassedCompatible,   // an exactly compatible import the caller has chosen not to consume
+};
+
+// Pixels produced by an exact compressed materialization, named by the materializer that produced
+// them. Untyped, this was a boolean that reported `ExactDccMaterialization` for an HTILE plane and made
+// "Unknown authorizes nothing" false through a fact claiming DCC without proving DCC. Graphics already
+// has exact HTILE materialization, so this was never going to stay DCC-only.
+enum class MaterializedSource : uint8_t { None, ExactDcc, ExactHtile };
+
+// Exact producer provenance for "prosper's own writeback established these bytes".
+//
+// The most dangerous positive authority there is: one mistaken assignment licenses raw bytes while the
+// metadata says they are encoded. So it is verified in this seam from a record, not asserted by a
+// caller — and identity is more than submit ordering. The bytes are only authoritative if the
+// allocation, its version, the byte range AND the layout used to interpret it all match.
+struct ProducerWritebackRecord {
+    bool present = false;
+    uint64_t base_addr = 0;
+    uint64_t byte_offset = 0;
+    uint64_t byte_size = 0;
+    uint64_t content_version = 0;
+    uint32_t width = 0, height = 0, depth = 1;
+    uint32_t tile_mode = 0;
+    uint32_t row_pitch = 0;
+    DataFormat format = DataFormat::Float32;
+    uint32_t num_components = 1;
+    // Ordering: the consumer must come after the producer in the same submit timeline.
+    uint64_t submit_no = 0;
+    uint64_t command_order = 0;
+};
+
+// What the consumer is about to read, in the same terms, so the seam can compare rather than trust.
+struct ConsumerReadRequest {
+    uint64_t base_addr = 0;
+    uint64_t byte_offset = 0;
+    uint64_t byte_size = 0;
+    uint64_t content_version = 0;
+    uint32_t width = 0, height = 0, depth = 1;
+    uint32_t tile_mode = 0;
+    uint32_t row_pitch = 0;
+    DataFormat format = DataFormat::Float32;
+    uint32_t num_components = 1;
+    uint64_t submit_no = 0;
+    uint64_t command_order = 0;
+};
+
+// True only when the record covers this exact read, in order, with a layout that interprets the same
+// bytes the same way.
+bool producer_writeback_covers_read(const ProducerWritebackRecord& record,
+                                   const ConsumerReadRequest& read);
 
 // The source the backend is authorized to consume.
 enum class SampledSourceRepresentation : uint8_t {
     None,               // declined; consume nothing
     ImportedImage,      // a retained renderer-owned image — NOT permission to read the base
-    MaterializedPixels, // pixels produced by an exactly supported compressed decode
+    MaterializedPixels, // pixels produced by an exact compressed materialization
     GuestBase,          // the guest base allocation, read as ordinary texels
 };
 
-// Why that source was selected. Stable and typed so tests assert the decision rather than log text,
-// and so a decline is attributable instead of sharing an anonymous skip with unrelated reasons.
+// Why that source was selected. Typed so tests assert the decision rather than log text, and so a
+// decline is attributable instead of sharing an anonymous skip with unrelated reasons.
 enum class SampledSourceReason : uint8_t {
-    UncompressedDescriptor,             // no metadata compression declared
-    RendererImageImport,                // the import is the representation actually selected
-    ExactDccMaterialization,            // uniform DCC fast clear, materialized exactly
-    DccUncompressedBase,                // DCC metadata proves the base holds ordinary texels
-    HtileUncompressedBase,              // HTILE metadata proves the same, by ITS OWN proof
-    OrderedProducerWriteback,           // prosper's own ordered writeback established these bytes
-    DeclinedUnknownMetadataKind,        // aspect unknown: no proof exists to apply
-    DeclinedUnsupportedMetadataState,   // kind known, state not provably decompressed
-    DeclinedImportBypassed,             // an import exists but the caller will not consume it
-    DeclinedNoAuthority,                // compressed, and nothing establishes any source
+    UncompressedDescriptor,
+    RendererImageImport,
+    ExactDccMaterialization,
+    ExactHtileMaterialization,
+    DccUncompressedBase,
+    HtileUncompressedBase,
+    OrderedProducerWriteback,
+    DeclinedUnknownMetadataKind,
+    DeclinedNoExactMetadataFootprint,
+    DeclinedUnsupportedMetadataState,
+    DeclinedImportBypassed,
+    DeclinedNoAuthority,
 };
 
 struct SampledSourceDecision {
     SampledSourceRepresentation representation = SampledSourceRepresentation::None;
     SampledSourceReason reason = SampledSourceReason::DeclinedNoAuthority;
 
-    // Only one representation licenses interpreting the guest allocation as plain texels.
     bool may_read_guest_base() const {
         return representation == SampledSourceRepresentation::GuestBase;
     }
@@ -70,31 +170,22 @@ struct SampledSourceDecision {
 struct SampledSourceFacts {
     bool compression_enabled = false;
 
-    // The metadata plane, and how many bytes this surface's kind says it should be. A window that is
-    // not exactly the expected size proves nothing: a short read can be uniform by accident, and a
-    // wrong-kind footprint is precisely the case where the caller's sizing is not to be trusted.
-    CompressionMetadataKind kind = CompressionMetadataKind::Unknown;
-    const uint8_t* metadata = nullptr;
-    size_t metadata_bytes = 0;
-    size_t expected_metadata_bytes = 0;
+    ImportState import_state = ImportState::Unavailable;
+    MaterializedSource materialized = MaterializedSource::None;
 
-    // An import exists for this binding at all.
-    bool import_available = false;
-    // ...and the caller will actually consume it. A recovery switch that has chosen to bypass the
-    // imported image leaves this false, and that is a DECLINE rather than a fallback to guest bytes.
-    bool import_selected = false;
+    // The metadata plane's shape and readable extent. The proof is resolved HERE, from the shape.
+    MetadataPlaneShape metadata_shape;
+    const uint8_t* metadata_plane = nullptr;
+    size_t metadata_readable_bytes = 0;
 
-    bool exact_materialization = false;
-
-    // prosper's own ordered writeback established the base bytes. This must be EXACT provenance —
-    // same base identity, range and version, in order — not "prosper wrote this address at some
-    // earlier time". The ordered-submit journal is the intended input.
-    bool ordered_producer_writeback = false;
+    ProducerWritebackRecord producer;
+    ConsumerReadRequest read;
 };
 
 SampledSourceDecision sampled_source_decision(const SampledSourceFacts& facts);
 
 const char* sampled_source_representation_name(SampledSourceRepresentation representation);
 const char* sampled_source_reason_name(SampledSourceReason reason);
+const char* metadata_proof_name(MetadataProof proof);
 
 }  // namespace prosper::gpu
