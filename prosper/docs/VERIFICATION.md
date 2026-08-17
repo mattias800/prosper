@@ -137,9 +137,42 @@ Two guards keep that from recurring, and both matter more than the flag itself:
 **Windows/MinGW and macOS still disable Vulkan**, so layers 2–4 are Linux-and-local only there.
 
 Four tests are excluded by name on lavapipe because they pass on real hardware and fail on the software
-rasteriser; they are listed in `ci.yml` with a reproduction command and tracked in #1681. Dump-backed
-tests cannot run in CI at all — dumps are copyrighted and gitignored — and now report `(Skipped)` rather
-than passing.
+rasteriser; they are listed in `ci.yml` with a reproduction command and tracked in #1681.
+
+### Dump-gated tests — the census, and how the gap is reported (#1675)
+
+Dump-backed tests cannot run in CI at all: dumps are copyrighted and gitignored. **Six registered ctest
+cases are gated on a local game dump**, and this is the complete list, with the assertions each one
+actually executes (measured against `PPSA24651-app0`, not counted from the source):
+
+| ctest case | binary | assertions with a dump |
+| --- | --- | --- |
+| `module_loads_eboot` | `test_module` | 25 |
+| `nid_hash_matches_imports` | `test_nid` | 4 |
+| `trap_identifies_imports` | `test_trap_linux` | 15 |
+| `boot_reaches_first_syscall` | `test_boot_linux` | 2 depth gates (no `CHECK` macro) |
+| `real_shader_render` | `test_real_shader_render` | 4 |
+| `plugin_autolink` | `test_plugin_autolink` | 34, of which **14** are behind the dump branch |
+
+All six now report **`(Skipped)`** when there is no dump, by two different mechanisms, and the
+difference between them is the point:
+
+* `plugin_autolink` **runs** and returns `SKIP_RETURN_CODE` (77) from inside the binary, because 20 of
+  its 34 assertions do not need a dump and must still execute. Same for `mb3_poison_scan`, which skips
+  on a failed fixed mapping rather than on a dump.
+* the other five are registered by CMake as **skip cases** when `HAVE_GAME_DUMP` is off. Before that
+  they were not registered at all: `origin/master` `20153833` registered **241** cases without a dump
+  against **246** with one, and nothing in either run named the five that vanished or the 48 assertions
+  behind them. An unregistered test is invisible by construction — no line to read, no count to compare
+  against — which is the same failure the Vulkan flag caused above. Both configurations now register
+  246, and `ci.yml` asserts all six by name so a future edit cannot quietly drop back to 241.
+
+**A `(Skipped)` line is a legible gap, not a closed one.** These assertions still do not run anywhere
+except on a machine with the dump. Closing it for the loader assertions specifically means synthesizing
+fixture modules (a pair of tiny generated SELF/PRX files exporting one shared NID would exercise
+`link_program`'s export table, collision guard and alias recording with no dump) — tracked in #2567.
+The other five are pinned to one real title's bytes and cannot be synthesized without becoming
+different tests.
 
 **Three dump-backed tests are pinned to *The Messenger* specifically, not to "some dump" — and they
 now report `(Skipped)` instead of failing (#1573).** `module_loads_eboot` pins `PPSA24651-app0`'s

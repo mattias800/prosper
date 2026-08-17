@@ -266,6 +266,21 @@ function(prosper_add_skipped_test name reason)
   set_tests_properties(${name} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: ")
 endfunction()
 
+# The no-dump half of the same rule (#1675). Dumps are copyrighted and gitignored, so CI will never
+# have one — but a case that needs one must still REPORT that rather than vanishing. Measured before
+# this existed: a local configure registered 246 cases and a dumpless one 241, and the five that
+# disappeared carried 48 executed assertions plus test_boot_linux's two depth gates. Nothing in
+# either run named the difference; an unregistered test has no line to read and no count to compare
+# against, so the smaller suite was indistinguishable from full coverage.
+#
+# Use this in the `else()` of an `if(HAVE_GAME_DUMP)`, inside whatever platform/Vulkan block already
+# guards the case, so the skip appears exactly where the real case would have.
+function(prosper_add_dumpless_skipped_test name)
+  prosper_add_skipped_test(${name}
+    "${name} needs a local PS5 game dump and none is configured (-DGAME_DUMP=<dump root>). \
+Dumps are gitignored and cannot be committed, so this case never executes in CI.")
+endfunction()
+
 # Register a ctest case that asserts against ONE title's content. Runs normally when GAME_DUMP is
 # that title (or when no title id could be derived); otherwise registers a visible skip naming both
 # the required title and the configured one, so the reason is in the run instead of in a doc.
@@ -300,6 +315,8 @@ if(TARGET prosper_core)
     # Messenger-specific: the assertions pin PPSA24651's import/segment/relocation counts (#1573).
     prosper_add_title_gated_test(module_loads_eboot PPSA24651
              test_module "${GAME_DUMP}/eboot.bin")
+  else()
+    prosper_add_dumpless_skipped_test(module_loads_eboot)   # 25 assertions (#1675)
   endif()
 
   add_executable(test_nid tests/test_nid.cpp)
@@ -307,6 +324,8 @@ if(TARGET prosper_core)
   if(HAVE_GAME_DUMP)
     add_test(NAME nid_hash_matches_imports
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
+  else()
+    prosper_add_dumpless_skipped_test(nid_hash_matches_imports)   # 4 assertions (#1675)
   endif()
 
   add_executable(test_hle_registered tests/test_hle_registered.cpp)
@@ -1449,6 +1468,8 @@ if(TARGET prosper_core)
     if(HAVE_GAME_DUMP)
       add_test(NAME trap_identifies_imports
                COMMAND test_trap_linux "${GAME_DUMP}")
+    else()
+      prosper_add_dumpless_skipped_test(trap_identifies_imports)   # 15 assertions (#1675)
     endif()
 
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
@@ -1457,6 +1478,8 @@ if(TARGET prosper_core)
       # Messenger-specific: links THIS title's own Il2cppUserAssemblies.prx / PS5Util.prx (#1573).
       prosper_add_title_gated_test(boot_reaches_first_syscall PPSA24651
                test_boot_linux "${GAME_DUMP}")
+    else()
+      prosper_add_dumpless_skipped_test(boot_reaches_first_syscall)   # 2 depth gates (#1675)
     endif()
 
     if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
@@ -1774,6 +1797,8 @@ if(TARGET prosper_core)
         # eboot, so a dump whose eboot carries none (or none that fully translate) fails (#1573).
         prosper_add_title_gated_test(real_shader_render PPSA24651
                  test_real_shader_render "${GAME_DUMP}/eboot.bin")
+      else()
+        prosper_add_dumpless_skipped_test(real_shader_render)   # 4 assertions (#1675)
       endif()
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()

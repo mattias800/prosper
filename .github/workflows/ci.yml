@@ -56,6 +56,21 @@ jobs:
           echo "Vulkan-gated suite present; total registered: \
             $(ctest --test-dir prosper/build-ci -N | tail -1 | grep -oE '[0-9]+$')"
 
+      # The same guard for the DUMP-gated set (#1675). CI never has a dump, so these five cannot run
+      # here — but they must still be REGISTERED, as skips, so the gap has a line in the summary. On
+      # master before this they were simply absent: 241 registered here against 246 locally, with
+      # nothing in either run naming the five that vanished or the 48 assertions behind them.
+      # Registration is exactly what a future edit could silently undo, so it is what this checks.
+      - name: Verify the dump-gated tests are registered as skips
+        run: |
+          for t in module_loads_eboot nid_hash_matches_imports trap_identifies_imports \
+                   boot_reaches_first_syscall real_shader_render plugin_autolink; do
+            if ! ctest --test-dir prosper/build-ci -N -R "^${t}$" | grep -q "Test *#"; then
+              echo "::error::${t} is not registered — a dump-gated case vanished instead of reporting a skip (see #1675)"
+              exit 1
+            fi
+          done
+
       - name: Build
         run: cmake --build prosper/build-ci
 
