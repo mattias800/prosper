@@ -30,6 +30,12 @@ AppParamDeclaration g_app_params;
 constexpr int kMaxMountDiagnostics = 64;
 int g_mount_diagnostics = 0;
 
+// Format-checked, following hle_ult.cpp's log_line precedent. An always-on instrument is exactly
+// the place a format-string mismatch must be a compile error rather than a garbled log line that
+// someone later reads as evidence.
+#if defined(__GNUC__) || defined(__clang__)
+void log_addcontent_event(const char* format, ...) __attribute__((format(printf, 1, 2)));
+#endif
 void log_addcontent_event(const char* format, ...) {
     if (g_mount_diagnostics > kMaxMountDiagnostics) return;
     if (g_mount_diagnostics == kMaxMountDiagnostics) {
