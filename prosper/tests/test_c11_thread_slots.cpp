@@ -106,8 +106,12 @@ void* initialised_waiter(void*) {
     return nullptr;
 }
 
-bool spin_until(const std::atomic<int>& flag, int deciseconds) {
-    for (int i = 0; i < deciseconds * 100 && !flag.load(std::memory_order_acquire); ++i)
+// Deliberately GENEROUS, and only ever used for CONTROLS — "did the worker start", "did it acquire
+// after the release". None of them is a timing assertion, so a tight bound here would only turn
+// machine load into a red build on a box that routinely runs at load 30+. The one assertion in this
+// file that IS about timing — "still waiting 200 ms later" — does not go through this helper.
+bool spin_until(const std::atomic<int>& flag, int seconds) {
+    for (int i = 0; i < seconds * 1000 && !flag.load(std::memory_order_acquire); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     return flag.load(std::memory_order_acquire) != 0;
 }
