@@ -732,10 +732,21 @@ namespace { inline uint64_t fbsd_errno(int host) {
 // CONFIDENCE: HIGH on the table above (read out of libthr and libc, the guest's own platform);
 // CONFIDENCE: MED that Sony's libkernel did not re-write these bodies, which no evidence in the
 // corpus can currently settle either way — a title observed testing a Destroy result would.
-HLE(k_mutex_destroy) { auto* m = (pthread_mutex_t*)pt_claim_slot(a0);   // #2176: claim, then retire
-    if (m) { guest_mutex_unregister(m); retire_sync_object(m, SyncObjectKind::Mutex,
+//
+// The body lives in `guest_mutex_destroy_slot` so the C11 `_Mtx_destroy` spelling runs THIS code
+// rather than a second, weaker copy of it (#2619). The copy it used to run read the slot with a bare
+// truthiness test and never cleared it, which made a double `_Mtx_destroy` a double FREE ~30 s
+// later, left the slot naming quarantined storage a later `_Mtx_lock` would happily take, and
+// handed `kPtDestroyed` (0xDEA) to `pthread_mutex_destroy` and `free` if the object had already been
+// destroyed through the Sony spelling. `pt_claim_slot` closes all three at once, which is why it is
+// the shared primitive rather than three separate guards.
+uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
+    auto* m = (pthread_mutex_t*)pt_claim_slot(slot_addr);   // #2176: claim, then retire
+    if (m) { guest_mutex_unregister(m); retire_sync_object(m, kind,
                                     [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); }
-    return 0; }
+    return 0;
+}
+HLE(k_mutex_destroy) { return guest_mutex_destroy_slot(a0, SyncObjectKind::Mutex); }
 // PROSPER_MUTEX_FAILLOG: report any mutex op that returns a non-zero (EINVAL/EDEADLK/...) result,
 // with the guest slot address and the host object it resolved to. Diagnostic for the macOS
 // guest-side "std::mutex lock failed: Invalid argument" terminate — a host EINVAL(22) surfaces as
@@ -792,26 +803,38 @@ namespace {
     inline void mtx_waitlog_report_block(pthread_mutex_t*, uint64_t) {}
 }
 #endif
-HLE(k_mutex_lock)    {
-    auto* m = ensure_mutex(a0); if (!m) return 0x16;
-    if (guest_mutex_self_deadlock(m)) return mtx_report("lock", a0, m, EDEADLK);
-    mtx_waitlog_report_block(m, a0);
+// Lock and unlock are bodies rather than handlers for the same reason destroy is: the C11
+// `_Mtx_lock` / `_Mtx_unlock` forward to exactly these libkernel entry points on hardware, and
+// before #2623 they reached `interruptible_mutex_lock` / `pthread_mutex_unlock` DIRECTLY, skipping
+// `guest_mutex_self_deadlock` and the `guest_mutex_acquired` / `guest_mutex_released` ownership map.
+// That map is Windows-only, and so was the damage: `ensure_mutex` forces ERRORCHECK there, so a
+// static mutex first touched through the C11 spelling was registered with `owner == 0` and stayed
+// that way — a same-thread relock got winpthreads' raw EDEADLK instead of the clean refusal, and a
+// `_Mtx_unlock` of a Sony-locked mutex left `owner` stale, refusing the next legitimate
+// `scePthreadMutexLock` forever. Sharing the body removes the divergence rather than duplicating
+// the three calls that fix it.
+uint64_t guest_mutex_lock_slot(uint64_t slot_addr) {
+    auto* m = ensure_mutex(slot_addr); if (!m) return 0x16;
+    if (guest_mutex_self_deadlock(m)) return mtx_report("lock", slot_addr, m, EDEADLK);
+    mtx_waitlog_report_block(m, slot_addr);
     const int result = interruptible_mutex_lock(m);
     if (result == 0) { guest_mutex_acquired(m); mtx_waitlog_record(m); }
-    return mtx_report("lock", a0, m, result);
+    return mtx_report("lock", slot_addr, m, result);
 }
+uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
+    auto* m = ensure_mutex(slot_addr); if (!m) return 0x16;
+    const int result = pthread_mutex_unlock(m);
+    if (result == 0) { guest_mutex_released(m); mtx_waitlog_clear(m); }
+    return mtx_report("unlock", slot_addr, m, result);
+}
+HLE(k_mutex_lock)    { return guest_mutex_lock_slot(a0); }
 HLE(k_mutex_trylock) {
     auto* m = ensure_mutex(a0); if (!m) return 0x16;
     const int result = pthread_mutex_trylock(m);
     if (result == 0) { guest_mutex_acquired(m); mtx_waitlog_record(m); }
     return mtx_report("trylock", a0, m, result);
 }
-HLE(k_mutex_unlock)  {
-    auto* m = ensure_mutex(a0); if (!m) return 0x16;
-    const int result = pthread_mutex_unlock(m);
-    if (result == 0) { guest_mutex_released(m); mtx_waitlog_clear(m); }
-    return mtx_report("unlock", a0, m, result);
-}
+HLE(k_mutex_unlock)  { return guest_mutex_unlock_slot(a0); }
 
 // --- Sony vs POSIX failure encoding for the shared pthread bodies (#1945, family of #1612) -------
 // The handler bodies above are registered under BOTH spellings. They are not the same contract:
@@ -1023,32 +1046,57 @@ SCE_PTHREAD_ALIAS(k_sce_condattr_setclock,     k_condattr_setclock)
 SCE_PTHREAD_ALIAS(k_sce_condattr_getclock,     k_condattr_getclock)
 SCE_PTHREAD_ALIAS(k_sce_condattr_setpshared,   k_condattr_setpshared)
 SCE_PTHREAD_ALIAS(k_sce_condattr_getpshared,   k_condattr_getpshared)
-HLE(k_cond_destroy) {
+// Shared with the C11 `_Cnd_destroy`, whose eleven-byte guest wrapper is a single call to THIS very
+// entry point (see the table in pthread_slot.hpp). What that establishes is the EFFECT, not a return
+// value: whatever this body does to the object is what happens on hardware through the C11 spelling
+// too, so the refusal below belongs to both. It does NOT establish that `_Cnd_destroy` forwards the
+// result — eleven bytes with no `xor eax,eax` is the shape of a void wrapper, and pthread_slot.hpp
+// works that reading through (#2636); the C11 handler encodes nothing and answers 0.
+// Its old private body retired unconditionally, so the EBUSY refusal below did not exist through that
+// spelling: a thread parked on the condvar had its object quarantined out from under it, which is
+// #2168's failure re-entered through a different door (#2619 / #2623).
+uint64_t guest_cond_destroy_slot(uint64_t slot_addr, SyncObjectKind kind) {
     // #2168: refuse a condvar that still has waiters, the way FreeBSD's _thr_cond_destroy does.
     // Checked BEFORE pt_claim_slot, because claiming retires the slot -- answering EBUSY after
     // clearing it would be the worst of both: the guest keeps a handle it is told is still live,
     // pointing at storage prosper has already quarantined.
-    if (auto* existing = (pthread_cond_t*)pt_peek_slot(a0)) {
+    if (auto* existing = (pthread_cond_t*)pt_peek_slot(slot_addr)) {
         if (guest_cond_has_waiters(existing))
-            // Bare errno here; the Sony spelling encodes it via SCE_PTHREAD_ALIAS below.
+            // Bare errno here; each spelling encodes it its own way at its own entry point.
             return static_cast<uint64_t>(prosper::hle::FreeBsdErrno::EBusy);
     }
-    if (auto* cond = (pthread_cond_t*)pt_claim_slot(a0)) {   // #2176: claim, then retire
+    if (auto* cond = (pthread_cond_t*)pt_claim_slot(slot_addr)) {   // #2176: claim, then retire
         // Quarantined, not freed, and the host `pthread_cond_destroy` runs at reclaim rather than
         // here — see the contract block above k_mutex_destroy and sync_retire.hpp (#2042). A thread
         // parked in interruptible_cond_wait is inside this very object.
         interruptible_cond_forget(cond);
         guest_cond_unregister(cond);
-        retire_sync_object(cond, SyncObjectKind::Cond,
+        retire_sync_object(cond, kind,
                            [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); });
     }
     return 0;
 }
+HLE(k_cond_destroy) { return guest_cond_destroy_slot(a0, SyncObjectKind::Cond); }
 // #2168 makes this body fallible, so the Sony spelling needs the encoding split -- previously it
 // was registered straight onto k_cond_destroy with the comment "always 0", which was true until now.
 SCE_PTHREAD_ALIAS(k_sce_cond_destroy, k_cond_destroy)
-HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
-HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_broadcast(c); } return 0; }
+// `guest_cond_advance` is the missed-wakeup guard: `interruptible_cond_clock_timedwait` converts a
+// non-realtime deadline by waiting in slices, and a signal that lands between two slices is
+// recovered ONLY by observing the generation change. The C11 `_Cnd_signal`/`_Cnd_broadcast` did not
+// bump it (#2623), so a guest signalling through the C11 spelling and waiting through the Sony one
+// — possible on the SAME object since #2596 made both resolve the same slot — could lose the wakeup
+// and time out instead. Sharing the body is what stops the pair drifting again.
+void guest_cond_signal_slot(uint64_t slot_addr) {
+    if (auto* c = ensure_cond(slot_addr)) { guest_cond_advance(c); interruptible_cond_signal(c); }
+}
+void guest_cond_broadcast_slot(uint64_t slot_addr) {
+    if (auto* c = ensure_cond(slot_addr)) { guest_cond_advance(c); interruptible_cond_broadcast(c); }
+}
+HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); guest_cond_signal_slot(a0); return 0; }
+HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); guest_cond_broadcast_slot(a0); return 0; }
+uint64_t guest_cond_generation_for_test(pthread_cond_t* cond) {
+    return guest_cond_snapshot(cond).generation;
+}
 // The two guest-slot resolvers, published for the C11 `_Mtx_*` / `_Cnd_*` handlers in
 // hle_kernel_time.cpp (#2596). They are thin by design: `ensure_mutex` / `ensure_cond` above hold
 // the whole contract -- FreeBSD's static-initialiser sentinels self-initialise (#793), a destroyed
@@ -1058,6 +1106,18 @@ HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu
 // initialised object as absent. On hardware it has no such guard: the shipped libc.prx's `_Cnd_wait`
 // is `call <scePthreadCondWait>; xor eax,eax; ret`, so the C11 spelling resolves its slots through
 // exactly this code. See pthread_slot.hpp.
+//
+// Sharing the RESOLVERS was only half of it, and #2619/#2623 are the other half: the C11 handlers
+// kept none of the per-object bookkeeping the Sony bodies keep, so they are now built on the WHOLE
+// operations published beside these two (`guest_mutex_lock_slot`, `guest_cond_destroy_slot`, …)
+// rather than on a resolver plus a private body.
+//
+// THESE TWO CONSEQUENTLY HAVE NO CALLERS LEFT, and that is stated rather than dressed up, because
+// the tempting justification ("_Mtx_init/_Cnd_init still need them") is simply false — those two
+// handlers allocate and initialise directly. They are kept for one checkable reason: the measured
+// mutation table in tests/test_c11_thread_slots.cpp names `guest_cond_from_slot` as the lever its
+// N4 arm pulls, so deleting them would silently retire a recorded, reproducible arm in a sibling
+// suite. If that table is ever re-derived against `ensure_cond` instead, delete these.
 pthread_mutex_t* guest_mutex_from_slot(uint64_t slot_addr) { return ensure_mutex(slot_addr); }
 pthread_cond_t*  guest_cond_from_slot(uint64_t slot_addr)  { return ensure_cond(slot_addr); }
 
@@ -1078,17 +1138,19 @@ pthread_cond_t*  guest_cond_from_slot(uint64_t slot_addr)  { return ensure_cond(
 // NOT changed, and deliberately: the C11 `_Cnd_wait` (hle_kernel_time.cpp `m_cnd_wait`) still
 // returns 0 unconditionally, because the SHIPPED guest libc.prx does exactly that -- its `_Cnd_wait`
 // is `call <scePthreadCondWait>; xor eax,eax; ret`. There the unconditional 0 is the contract
-// rather than a defect, and prosper reimplementing it faithfully is the point.
+// rather than a defect, and prosper reimplementing it faithfully is the point. What it now shares
+// with this spelling is the BODY below, including the #2168 waiter scope -- #2623: a thread parked
+// through the C11 spelling was invisible to `k_cond_destroy`'s busy check, so a destroy retired the
+// object out from under it. The RESULT is where the two spellings differ; the wait itself is not.
+uint64_t guest_cond_wait_slot(uint64_t cond_slot, uint64_t mutex_slot) {
+    auto* c = ensure_cond(cond_slot); auto* m = ensure_mutex(mutex_slot);
+    if (!c || !m) return 22;   // EINVAL — not a condition variable, or not a mutex. Bare; see the alias.
+    GuestCondWaiterScope waiting(c);   // #2168 -- covers every wait path in this body
+    return fbsd_errno(interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
+                                              nullptr, kGuestMutexCondWaitBookkeeping));
+}
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
-    uint64_t result;
-    { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
-      if (!c || !m) {
-          result = 22;   // EINVAL — not a condition variable, or not a mutex. Bare; see the alias.
-      } else {
-          GuestCondWaiterScope waiting(c);   // #2168 -- covers every wait path in this body
-          result = fbsd_errno(interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
-                                                      nullptr, kGuestMutexCondWaitBookkeeping));
-      } }
+    const uint64_t result = guest_cond_wait_slot(a0, a1);
     if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return result; }
 // The body above is registered under BOTH spellings, which is exactly why the fix could not live in
 // it alone: `pthread_cond_wait` must report the bare errno and `scePthreadCondWait` the encoded one,
@@ -1124,14 +1186,15 @@ HLE(k_cond_timedwait) {
     // branch added here cannot miss it; a future BODY still has to remember, which is why the
     // cond-wait bodies are the unit.
     //
-    // THREE bodies take this scope, and that is NOT the same as "all of them" -- the earlier
-    // wording here said "there are exactly three", and #2596 made it false while relying on it.
-    // The C11 `m_cnd_wait` (hle_kernel_time.cpp) is a fourth body that can park, because it now
-    // resolves a statically-initialised slot instead of skipping it, and it does NOT take the
-    // scope. So a thread parked through the C11 spelling is still invisible to the busy check
-    // below, and a destroy will retire the object out from under it -- #2168's exact failure
-    // through a different door. Tracked as #2623 with the file:line and the mechanism; recorded
-    // here rather than in the issue alone because a bare count is what the next reader trusts.
+    // DO NOT WRITE A COUNT HERE. The earlier wording said "the three cond-wait bodies are the unit
+    // and there are exactly three"; #2596 made that false while relying on it (the C11 `m_cnd_wait`
+    // became a fourth body that could park, and took no scope), and #2623 had to correct it. A bare
+    // count is exactly what the next reader trusts and nobody re-derives, so it is the wrong thing
+    // to record. What holds instead, and can be checked mechanically: every indefinite park now goes
+    // through `guest_cond_wait_slot`, which takes the scope itself, and the only bodies that call
+    // `interruptible_cond_*wait` outside it are the two TIMED ones -- this function and
+    // `k_sce_cond_timedwait`. `grep -n 'interruptible_cond_\(clock_\)\?timed\?wait' hle_kernel.cpp`
+    // is the check; anything it lists that is not scoped is a #2168 regression.
     GuestCondWaiterScope waiting(c);
     if (!a2) {
         int rc = interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
