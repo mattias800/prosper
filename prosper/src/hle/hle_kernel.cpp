@@ -1858,13 +1858,22 @@ HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam*
 // re-derive it as support for encoding. Rename was swept on the FAMILY RULE at CONFIDENCE: MED, not
 // on its call site, and any sweep of Getname stands on identical footing.
 //
-// WHAT IT DOES ESTABLISH is narrower and cuts the other way from the older rationale: this caller is
-// a byte-for-byte structural twin of the Rename caller 0x30 bytes above it — same prologue, same
-// test/je, same movsxd, same tail-jump into the same helper, same format specifier. So #2365's
-// reason for holding Getname back ("its contract is different: lookup failures on a call whose
-// success path writes through a buffer") is NOT VISIBLE at the only call site anyone has found. That
-// is not proof the contracts match; it is the removal of the one asymmetry that was cited for them
-// differing.
+// WHAT IT DOES ESTABLISH is narrower and cuts the other way from the older rationale: this caller
+// runs the SAME INSTRUCTION SEQUENCE as the Rename caller 0x30 bytes above it — same prologue, same
+// test/je, same movsxd, same tail-jump into the same helper, same format specifier — differing only
+// in the call/lea/jump displacements, as two calls to different imports must. (An earlier wording
+// said "byte-for-byte", which is literally false and was retracted by the reviewer who coined it;
+// the claim doing the work is that the SHAPE matches, not the bytes.) So the argument for holding
+// Getname back — "its contract is different: lookup failures on a call whose success path writes
+// through a buffer" — is NOT VISIBLE at the only call site anyone has found. That is not proof the
+// contracts match; it is the removal of the one asymmetry that was cited for them differing.
+//
+// Attribution, checked rather than assumed: that contract argument is stated in the Rename block
+// later in this file (#2382). **#2365's PR body gives a DIFFERENT reason** — that applying the rule
+// makes `test_pthread_names` fail, because the test asserts the bare values. So the blocker #2365
+// actually recorded is the test pins, which is precisely what #2595 is scoped to move. I have read
+// #2365's body, not its review thread, so do not read this as ruling out that the contract argument
+// was also made there.
 //
 // So the bare form here is the older default surviving, at CONFIDENCE: MED — not a measurement, and
 // not "unsettleable". It is not swept in #2573 because doing so moves `tests/test_pthread_names.cpp`'s
@@ -2829,7 +2838,7 @@ SCE_PTHREAD_ALIAS(k_sce_key_create,            k_key_create)
 // An earlier version of this comment read `0x%08x` as the guest naming the space it expects. It is
 // not: %08x ZERO-PADS to eight columns, so a bare 22 prints as 0x00000016 and an encoded one as
 // 0x80020016, and both render fine. `test eax,eax` above it is nonzero in either space too. So the
-// disassembly rules nothing out -- exactly the reason Getname below is not swept, applied one
+// disassembly rules nothing out -- exactly the reason Getname ABOVE is not swept, applied one
 // paragraph higher up. (Caught in review by Marlow, who checked it precisely because it was a
 // citation raising certainty in a direction already believed.)
 //

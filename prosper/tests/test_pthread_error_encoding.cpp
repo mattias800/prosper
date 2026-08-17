@@ -22,9 +22,18 @@
 //   M3  return the host errno instead of the FreeBSD one (#1612)         -> the EAGAIN row fails on both
 //   M4  apply the encoding to a non-error return                         -> the barrier serial-thread arm fails
 //
-//   M5  make a fallible body report 0 again (discard its result)          -> the CondWait row and
-//                                                                             its positive control
-//                                                                             fail together (#1983)
+//   M5  make the CondWait body report 0 again (discard its result)       -> its kRows row fails on
+//                                                                           BOTH spellings (#1983)
+//   M6  make the CondWait body REFUSE unconditionally                    -> §7's signalled-wait
+//                                                                           control fails (#1983)
+//
+// M5 and M6 are COMPLEMENTARY, and an earlier revision of this header got it wrong in the way that
+// matters most here: it claimed M5 kills §7's positive control too. It cannot. M5 makes the body
+// return 0 and §7 asserts 0, so §7 passes under M5 — the measured `FAIL (2)` is the kRows row's two
+// halves, Sony and POSIX, not §7. Conversely no kRows row can see M6: they all provoke a refusal, so
+// a body that refuses unconditionally satisfies every one of them. Neither arm covers the other, and
+// a row here claiming otherwise is worse than no row at all, because this header is exactly where a
+// future reader checks whether an arm still bites — and a false claim of coverage stops them looking.
 //
 // The M3 and M4 arms matter most. M1/M2 are provoked with a null object, which yields EINVAL — and
 // EINVAL is 22 on FreeBSD, on Linux, on Darwin and on MinGW, so a null-slot arm alone cannot tell a
