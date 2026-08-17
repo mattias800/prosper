@@ -4,6 +4,7 @@
 #include "sse4a.hpp"
 #include "x86_read_decode.hpp"
 #include "guest_write_watch.hpp"
+#include "trap_arbitration.hpp"   // #1932: which instrument owns an incoming SIGTRAP
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
 #include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
@@ -1421,9 +1422,28 @@ namespace {
         // other SIGTRAP while armed is a HW-breakpoint hit -> log registers, then disable + single-step
         // over it (TF), re-enabling on the step trap. No code bytes are touched (unlike int3), so this is
         // safe on hot/multi-threaded functions.
-        if (sig == SIGTRAP && ((g_hwbp_on && g_hwbp_fd >= 0) || g_hwwatch_fd >= 0)) {
+        //
+        // #1932: this branch used to accept ANY SIGTRAP while an HWBP/HWWATCH fd was live, so with
+        // PROSPER_BP armed as well it swallowed the int3 hit AND the step BP scheduled for it —
+        // fabricating an "[hwbp] rip=<bp addr>+1" record, skipping the guest's real instruction and
+        // crashing the title. Yield to PROSPER_BP whenever BP's own state proves ownership; see
+        // trap_arbitration.hpp for the full producer/consumer reasoning. The fd test is repeated
+        // here as a cheap pre-gate so a run WITHOUT these instruments does not pay a gettid on every
+        // SIGTRAP; hardware_breakpoint_claims_sigtrap() re-checks it and is the authority.
+        const bool hwbp_instrument_live = (g_hwbp_on && g_hwbp_fd >= 0) || g_hwwatch_fd >= 0;
+        HwbpThreadState* hwbp_state =
+            (sig == SIGTRAP && hwbp_instrument_live) ? hwbp_thread_state(cur_tid()) : nullptr;
+        if (sig == SIGTRAP && prosper::host::hardware_breakpoint_claims_sigtrap(
+                prosper::host::HardwareBreakpointTrapState{
+                    .armed = g_hwbp_on, .breakpoint_fd = g_hwbp_fd,
+                    .watchpoint_fd = g_hwwatch_fd,
+                    .stepping_this_thread =
+                        (hwbp_state && hwbp_state->stepping) || g_hwbp_stepping },
+                prosper::host::SoftwareBreakpointTrapState{
+                    .armed = g_bp_on, .stepping = g_bp_stepping, .addr = g_bp_addr },
+                (uint64_t)PROSPER_GREGS((ucontext_t*)uctx)[REG_RIP],
+                (PROSPER_GREGS((ucontext_t*)uctx)[REG_EFL] & 0x100ll) != 0)) {
             auto* uc = (ucontext_t*)uctx;
-            HwbpThreadState* hwbp_state = hwbp_thread_state(cur_tid());
             // Step-window: continuous single-step from driver hit N to the next driver hit. On each step,
             // find the live read cursor (a GP reg pointing inside [base,end]) and ring-log advances.
             if (g_stepwin_active && si->si_code == TRAP_TRACE) {
