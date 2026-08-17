@@ -82,7 +82,7 @@ int main() {
     // records today's reality and isn't a regression signal, so keep it a soft print, not a hard fail.
     auto rv = recompile_vertex(vs.data(), vs.size(), nullptr);
     auto rf = recompile_fragment(ps.data(), ps.size(), nullptr);
-    printf("  (table-less recompile: vs=%zu fs=%zu dwords — both stages resolve memory ops via their "
+    printf("  (table-less recompile: vs=%zu fs=%zu dwords -- both stages resolve memory ops via their "
            "per-draw ShaderResourceTable, so table-less is expected empty)\n", rv.size(), rf.size());
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

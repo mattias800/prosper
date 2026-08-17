@@ -773,7 +773,7 @@ int main() {
             // Holds on BOTH platforms and is the property that actually matters, so it is not
             // guarded: POSIX suppresses the writes deliberately, Windows never had them.
             CHECK(out1 == kResidue && out2 == kResidue,
-                  "#1629: the plain submit writes NO result slots — a2/a3 are residue, not outputs");
+                  "#1629: the plain submit writes NO result slots -- a2/a3 are residue, not outputs");
         }
     }
 
@@ -840,7 +840,7 @@ int main() {
             s1 = s2 = kResidue;
             submit(cb_x, 1, p1, p2, 0, 0);
             CHECK(s1 != kResidue && s2 != kResidue && s1 == s2,
-                  "#1674: a cb reusing the destructed address does NOT inherit the dead binding — "
+                  "#1674: a cb reusing the destructed address does NOT inherit the dead binding -- "
                   "submit hands it a fresh token instead of echoing the dead tag/equeue");
 
             // --- the 3.20 flavor keeps being pruned (the behaviour the old predicate did have),
@@ -863,7 +863,7 @@ int main() {
             s1 = s2 = kResidue;
             submit(cb_y, 1, p1, p2, 0, 0);
             CHECK(s1 == kResidue && s2 == kResidue,
-                  "#1674: the surviving binding is still HONOURED — cb_y's submit stays on the "
+                  "#1674: the surviving binding is still HONOURED -- cb_y's submit stays on the "
                   "bound path and writes no result slots");
             destruct_apr(cb_y, 0, 0, 0, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_y) == 0,

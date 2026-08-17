@@ -528,7 +528,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     unique and ascending, and requires that **no row present in the base is missing** (`--baseline`).
     Note the local baseline is `origin/master`, while **CI passes `HEAD^1`** — the base *as of when the
     event fired*. `origin/master` is the fresher and therefore stricter of the two, which is why it is
-    the right one to check by hand; the gap between them is the subject of instrument trap 188.
+    the right one to check by hand; the gap between them is the subject of instrument trap 189.
     **Gaps are legal** — `--sequential` and its gapless rule were removed on 2026-08-17 (#2089) because a
     gap is usually another lane's unmerged number, which no edit of *your* branch can supply, so the check
     served only to serialize independent lanes; the flag now errors and names its replacement. So if you
@@ -536,6 +536,12 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     wait for the number below yours. Before writing a row, allocate with
     `python3 prosper/tools/docs/trap_number.py`, which scans master **and every open PR** (#1729);
     reading master alone is what produced the #2574/#2581 collision.
+    **On a PR that touches a numbered table, run the gate against the MERGE RESULT immediately before
+    merging** — `python3 prosper/tools/docs/check_merge_result.py` fetches, merges into
+    `origin/master` in the object database (no checkout, no index), and runs the gate on the result.
+    A green `Docs` job is a statement about a merge that may no longer exist, and unlike a red one
+    nobody re-derives it (#2211, instrument trap 189); this is the only check that sees a concurrent
+    append, and it is stale the moment another lane lands, so run it last and merge promptly.
     Confirm the diff really is `.md`-only — `git diff --name-only origin/master...HEAD | grep -v '\.md$'`
     should be empty. The exception is about the *diff*, not the intent; one stray file makes it an
     ordinary PR again.

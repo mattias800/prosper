@@ -8,6 +8,7 @@
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
 #include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
+#include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -2358,7 +2359,7 @@ namespace {
                 char cb2[224];
                 int cn2 = snprintf(cb2, sizeof cb2,
                     "[prosper] CONCURRENT WORKER-THREAD FAULT: tid=%ld sig=%d addr=%p rip=0x%llx "
-                    "(image+0x%llx) — full dump suppressed, tid=%ld is already reporting\n",
+                    "(image+0x%llx) -- full dump suppressed, tid=%ld is already reporting\n",
                     fc.tid, fc.sig, (void*)(uintptr_t)fc.addr, (unsigned long long)fc.rip,
                     (unsigned long long)(g_base && fc.rip >= g_base ? fc.rip - g_base : fc.rip),
                     expected);
@@ -2456,7 +2457,7 @@ namespace {
                 // allocation, and this TU already calls it unqualified.
                 const char* tcb = !guest_tls_enabled() ? "n/a (guest %fs not enabled)"
                                 : saved_guest_fs       ? "yes"
-                                : "no (host TCB — a leak only if this thread should have had a guest TCB)";
+                                : "no (host TCB -- a leak only if this thread should have had a guest TCB)";
 #endif
                 char tb[224];
                 int t = snprintf(tb, sizeof tb,
@@ -3167,7 +3168,7 @@ void install_trap_handler() {
         const long parsed = strtol(s, &end, 0);
         if (end == s || (end && *end))
             fprintf(stderr, "[lazy-commit] NOT ARMED: PROSPER_LAZY_COMMIT_STRICT='%s' is not a "
-                            "number — the lazy commit stays enabled\n", s);
+                            "number -- the lazy commit stays enabled\n", s);
         else
             g_lazy_commit_strict = parsed != 0;
     }
@@ -3362,7 +3363,7 @@ void arm_hwbp() {
     char b[160];
     if (fd < 0) {
         int n = snprintf(b, sizeof b,
-                         "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — %s\n",
+                         "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) -- %s\n",
                          (unsigned long long)(g_hwbp_addr - g_base), errno,
                          already_anchored ? "this primary thread not armed"
                                           : "HW bp disabled");
@@ -3487,7 +3488,14 @@ std::string describe_code_address(uint64_t address) {
     if (std::strcmp(module, "mapped/host") != 0) {
         std::snprintf(text, sizeof text, "%s+0x%llx", module,
                       (unsigned long long)prosper::guest_module_offset(address));
-        return text;
+        // #2551: name the C# method containing an IL2CPP address, when a symbol table was supplied
+        // (PROSPER_IL2CPP_SYMBOLS). This is the one place every existing consumer of a guest code
+        // address already funnels through — the app's fault backtrace, screenshot's, the Windows
+        // thread-trace — so wiring it here symbolicates all of them without touching any of them.
+        // Returns "" for a non-IL2CPP address and for an unconfigured run, so default output is
+        // unchanged; std::string because a method name can be far longer than `text` (PPSA24651's
+        // longest is 570 chars).
+        return std::string(text) + prosper::il2cpp::annotation_for_guest_va(address);
     }
     // Host frame. dladdr resolves the containing object and, when the symbol is exported, its name.
     Dl_info info{};

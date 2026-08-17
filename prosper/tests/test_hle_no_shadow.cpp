@@ -44,7 +44,7 @@ int main() {
     if (shadows.empty()) printf("  (no NID registered twice with differing handlers)\n");
 
     if (unexpected) {
-        printf("== FAIL: %d unexpected shadowed registration(s) — a later register_*() silently\n"
+        printf("== FAIL: %d unexpected shadowed registration(s) -- a later register_*() silently\n"
                "   replaced a handler. If the WINNER is a naive stub shadowing a real impl, that is\n"
                "   the #330 bug (getter returns OK without writing its out-param). Remove the duplicate\n"
                "   (leave the function in one file), or allowlist it in kAllowed with a reason. ==\n",

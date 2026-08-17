@@ -29,6 +29,7 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <new>          // std::bad_alloc — the guest file-replacement buffer is guest-sized (#1955)
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -583,7 +584,7 @@ HLE(s_videodec2_query_decoder_memory) {
         if (!warned.exchange(true))
             fprintf(stderr,
                     "[vdec] QueryDecoderMemoryInfo: max_width/max_height are auto (%d x %d), so "
-                    "max_frame_size falls back to the 0x%llx FLOOR — this is not a derived size, and "
+                    "max_frame_size falls back to the 0x%llx FLOOR -- this is not a derived size, and "
                     "a real decoder must not write a picture into it unchecked (#1688)\n",
                     config->max_width, config->max_height, (unsigned long long)VDEC_MIN_MEMORY);
     }
@@ -929,7 +930,7 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     bool first = false;
     { std::lock_guard<std::mutex> lk(mx); first = (seen[which]++ == 0); }
     if (first)
-        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 — the "
+        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 -- the "
                         "AVC layout is unestablished; these arguments are the evidence)\n",
                 which, (unsigned long long)a0, (unsigned long long)a1,
                 (unsigned long long)a2, (unsigned long long)a3);
@@ -940,7 +941,7 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     bool report = false;
     { std::lock_guard<std::mutex> lk(bad_mx); report = (bad[which]++ < 4); }
     if (report)
-        fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx — rejected. If this "
+        fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx -- rejected. If this "
                         "is the AVC form, that size IS its layout evidence (#1658).\n",
                 which, (unsigned long long)out->size, sizeof(*out));
     return VDEC_ERR_STRUCT;
@@ -1079,10 +1080,11 @@ static_assert(sizeof(AvpStreamInfoEx) == 104 && offsetof(AvpStreamInfoEx, durati
 struct AvpPlayer {
     void* ev_obj = nullptr; AvpEventCb ev_cb = nullptr;
     AvpMemAllocator memory{};
-    // The guest's file-replacement table, retained verbatim from sceAvPlayerInit(Ex). #1955 asks
-    // whether a title that stores media inside a container file supplies one; nothing can answer
-    // that without recording what the guest actually passed, so keep it and report it under
-    // PROSPER_AVPLOG. prosper does not route source I/O through it yet.
+    // The guest's file-replacement table, retained verbatim from sceAvPlayerInit(Ex). When all four
+    // entries are present, sceAvPlayerAddSource(Ex) reads the media THROUGH it rather than opening
+    // the URI as a host path (#1955) — a title that stores a clip inside a container file has no
+    // other way to express the byte range. Reported under PROSPER_AVPLOG; every path that declines
+    // to use it reports unconditionally. See avp_add_source.
     AvpFileReplace file{};
     int32_t num_fb = 0;
     bool auto_start = false, have_source = false, synthetic = false;
@@ -1200,7 +1202,7 @@ bool avp_fill_video_ex(AvpVideoEx& out, uint32_t visible_w, uint32_t visible_h, 
     // keeps a future caller's mistake loud instead of silently corrupting its sampling.
     if (pitch < visible_w) {
         fprintf(stderr,
-                "[avp] REFUSING AvPlayerVideoEx: pitch %u < visible width %u — the staged surface and "
+                "[avp] REFUSING AvPlayerVideoEx: pitch %u < visible width %u -- the staged surface and "
                 "the published extent disagree; frame not published\n",
                 pitch, visible_w);
         return false;
@@ -1442,6 +1444,16 @@ bool avp_has_file_replacement(const AvpFileReplace& file) {
     return file.open && file.close && file.read_offset && file.size;
 }
 
+// A table with SOME entries set but not all four. prosper cannot use it — calling through the null
+// member would fault — but it also must not treat it as absence, because absence and "the guest DID
+// ask us to read through it and we declined" have opposite meanings for the bytes that get demuxed.
+// Split out so the caller can say which one it saw. CONFIDENCE: HIGH (this is a property of the
+// pointers prosper was handed, not an inference about the published contract).
+bool avp_has_partial_file_replacement(const AvpFileReplace& file) {
+    const bool any = file.open || file.close || file.read_offset || file.size;
+    return any && !avp_has_file_replacement(file);
+}
+
 int32_t avp_file_open(const AvpFileReplace& file, const char* path) {
 #if defined(_WIN32)
     return (int32_t)prosper_call_guest_sysv4(reinterpret_cast<uint64_t>(file.open),
@@ -1569,9 +1581,10 @@ bool avp_build_textures(const AvpMemAllocator& memory, int32_t requested,
 }
 
 // #1955 discriminator: report the guest's file-replacement table verbatim. A title that stores media
-// inside a container file can only express the byte range through these callbacks, and prosper opens
-// the URI as a host path instead. Whether a given title even supplies the table is a measurement, not
-// an assumption, so print all four entries (and "absent" when the table is null).
+// inside a container file can only express the byte range through these callbacks, so which titles
+// supply the table — and whether all four entries are there — is a measurement, not an assumption.
+// Print all four entries (and "absent" when the table is null); avp_add_source reports what it then
+// did with them.
 void avp_log_file_replacement(const char* entry, const AvpFileReplace& file) {
     const bool present = file.open || file.close || file.read_offset || file.size;
     fprintf(stderr,
@@ -1674,7 +1687,7 @@ HLE(s_avplayer_isactive) {   // bool sceAvPlayerIsActive(AvPlayerHandle)
         // than by delivering its frames is a title consuming nothing, and must never read as an
         // ordinary drain in a default run.
         fprintf(stderr,
-                "[avp] handle=0x%llx: the %llu ms source played out on the media clock — nothing "
+                "[avp] handle=0x%llx: the %llu ms source played out on the media clock -- nothing "
                 "requested a video frame for %llu ms and %llu ms of the media remained (#1973)\n",
                 (unsigned long long)a0, (unsigned long long)clock_duration_ms,
                 (unsigned long long)clock_idle_ms, (unsigned long long)clock_remaining_ms);
@@ -1783,13 +1796,34 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     // The read happens HERE, on the guest thread that called sceAvPlayerAddSource(Ex), because these
     // callbacks are guest code and need that thread's TCB; the decode worker is a prosper-owned host
     // thread and must never call them. The whole media is therefore buffered up front.
+    //
+    // EVERY branch below that declines the guest's reader falls back to opening the host path at
+    // offset 0 — which is exactly the #1955 defect when the guest asked us to read a byte range. So
+    // none of them may be silent: the messages here are deliberately NOT gated on PROSPER_AVPLOG,
+    // because a default run has to be able to say which branch it took. (The success line stays
+    // gated; it is the only one that is not a degradation.)
     std::vector<uint8_t> guest_media;
+    if (avp_has_partial_file_replacement(file)) {
+        // Not the same thing as no table. The guest asked to be read through, and prosper cannot
+        // oblige a table it would have to call a null member of, so it is about to demux the host
+        // file from offset 0 — the wrong bytes whenever the media is embedded.
+        fprintf(stderr,
+                "[avp] the guest file-replacement table for '%s' is INCOMPLETE "
+                "(open=%p close=%p read-offset=%p size=%p); ignoring it and falling back to the "
+                "host path (#1955)\n",
+                guest_path, file.open, file.close, file.read_offset, file.size);
+    }
     if (avp_has_file_replacement(file)) {
         const int32_t opened = avp_file_open(file, guest_path);
         const uint64_t media_bytes = opened >= 0 ? avp_file_size(file) : 0;
-        if (avp_log())
+        if (opened < 0) {
+            fprintf(stderr,
+                    "[avp] guest file-replacement open('%s') failed: %d -> falling back to the host "
+                    "path (#1955)\n", guest_path, (int)opened);
+        } else if (avp_log()) {
             fprintf(stderr, "[avp] guest file-replacement reader: open('%s') -> %d size=%llu bytes\n",
                     guest_path, (int)opened, (unsigned long long)media_bytes);
+        }
         if (opened >= 0) {
             // Bound the buffer: a guest that answers with a whole multi-hundred-megabyte container
             // is not describing a clip, and silently allocating that is worse than saying so.
@@ -1800,10 +1834,25 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                         "buffer it and falling back to the host path (#1955)\n",
                         guest_path, (unsigned long long)media_bytes);
             } else {
-                guest_media.resize(static_cast<size_t>(media_bytes));
+                // The cap bounds the request, not the machine: a host that cannot spare the buffer
+                // still throws here, and an uncaught bad_alloc inside an HLE handler ends the
+                // process rather than the movie. Degrade to the same loud fallback as every other
+                // branch. (Noted in #1975's review of #1974; it is a failure mode of exactly this
+                // block, so it is fixed here rather than left to the buffering optimisation.)
                 uint64_t position = 0;
                 bool read_ok = true;
-                while (position < media_bytes) {
+                try {
+                    guest_media.resize(static_cast<size_t>(media_bytes));
+                } catch (const std::bad_alloc&) {
+                    fprintf(stderr,
+                            "[avp] could not allocate %llu bytes for the guest file-replacement "
+                            "media of '%s'; falling back to the host path (#1955)\n",
+                            (unsigned long long)media_bytes, guest_path);
+                    read_ok = false;
+                }
+                // `read_ok &&` is load-bearing, not defensive: without it a failed resize leaves an
+                // EMPTY vector and the loop hands `data() + 0` to the guest's reader to write into.
+                while (read_ok && position < media_bytes) {
                     const uint64_t remaining = media_bytes - position;
                     const uint32_t chunk = static_cast<uint32_t>(
                         std::min<uint64_t>(remaining, 1u << 20));
@@ -1817,7 +1866,36 @@ static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
                         read_ok = false;
                         break;
                     }
+                    // A count LARGER than the buffer space offered is the one answer that must never
+                    // be believed. Taken at face value it advances `position` past `media_bytes`, the
+                    // loop exits with `read_ok` still true, and the zero-filled tail of the buffer is
+                    // handed to the demuxer AS IF it were the complete media — a silent truncation
+                    // that surfaces as a corrupt stream far from here. It also means the callee may
+                    // already have written past the space it was given, which prosper cannot undo but
+                    // must not build on. Refuse the media and say so.
+                    if (static_cast<uint32_t>(got) > chunk) {
+                        fprintf(stderr,
+                                "[avp] guest file-replacement read('%s') at offset %llu returned %d "
+                                "for a %u-byte request; refusing the media and falling back to the "
+                                "host path (#1955)\n",
+                                guest_path, (unsigned long long)position, (int)got, chunk);
+                        read_ok = false;
+                        break;
+                    }
                     position += static_cast<uint64_t>(got);
+                }
+                // With the over-count refused above, a loop that ran to completion can only have
+                // landed exactly on media_bytes. Assert it rather than assume it: a future edit to
+                // the arithmetic that stops short would otherwise deliver a short buffer as a
+                // complete one. (`read_ok` is already false on the allocation and read failures, so
+                // this reports only the case those two did not.)
+                if (read_ok && position != media_bytes) {
+                    fprintf(stderr,
+                            "[avp] guest file-replacement read('%s') assembled %llu of %llu bytes; "
+                            "refusing the media and falling back to the host path (#1955)\n",
+                            guest_path, (unsigned long long)position,
+                            (unsigned long long)media_bytes);
+                    read_ok = false;
                 }
                 if (!read_ok) guest_media.clear();
             }

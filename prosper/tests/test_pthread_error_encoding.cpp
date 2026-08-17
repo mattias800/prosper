@@ -226,10 +226,49 @@ bool wait_for(const std::atomic<int>& counter, int target) {
 // established that its absence is the right answer rather than an oversight.
 const char* const kInfallible[] = {
     "scePthreadMutexattrSetprotocol", "scePthreadMutexattrSetpshared", "scePthreadMutexattrDestroy",
-    "scePthreadMutexDestroy", "scePthreadCondattrDestroy", "scePthreadCondDestroy",
+    "scePthreadMutexDestroy", "scePthreadCondattrDestroy",
     "scePthreadCondSignal", "scePthreadCondBroadcast",
-    "scePthreadRwlockDestroy", "scePthreadSemDestroy", "scePthreadBarrierDestroy",
+    "scePthreadRwlockDestroy", "scePthreadSemDestroy",
     "scePthreadBarrierattrInit", "scePthreadBarrierattrDestroy", "scePthreadBarrierattrSetpshared",
+};
+
+// Bodies that CAN fail, but answer 0 for a NULL slot — so the sweep's null probe cannot reach their
+// failure path and they do not belong in either list above.
+//
+// They were listed as infallible when this file was written, and that was true then. #2359 (condvar)
+// and #2379 (barrier) landed #2168's busy-destroy contract: each now refuses an object that still
+// has waiters, and the guest sees `SCE_KERNEL_ERROR_EBUSY` (0x80020010) from BOTH Sony spellings.
+// They get there by opposite routes, and the difference is the axis #2182 polices, so do not
+// collapse it:
+//   * `k_barrier_destroy` encodes IN PLACE (hle_kernel.cpp:3045). It is Sony-only — nothing
+//     registers `pthread_barrier_destroy` onto that body — so there is no POSIX caller to mislead.
+//   * `k_cond_destroy` returns the BARE FreeBSD errno (hle_kernel.cpp:1033-1034) precisely BECAUSE
+//     the POSIX spelling is registered onto the same body -- grep
+//     `R("pthread_cond_destroy", k_cond_destroy)`, hle_kernel.cpp:4825 at the time of writing. The
+//     Sony spelling gets its 0x8002xxxx from the `SCE_PTHREAD_ALIAS` at :1049. Making this one
+//     encode in place would hand every POSIX caller a Sony-encoded value -- #1984's shape -- and
+//     `test_cond_destroy_busy.cpp` asserts the bare 16 for exactly that reason.
+//     (The line number is given with the symbol on purpose. This citation was already wrong once:
+//     it read :4810, correct when the reviewer wrote it and stale one rebase later, because a line
+//     number is a fact about a revision and a comment outlives revisions. That is #2665's class,
+//     and it bites hardest exactly here -- a reader who opens the cited line, finds an unrelated
+//     registration and concludes the claim is unsupported ends up believing the opposite of it.)
+// The `kInfallible` ARM still passed unchanged after both landings, because a null slot never
+// reaches the busy check -- so nothing failed, and the list's stated rationale ("returns 0 on every
+// path") silently went false while the assertion stayed green. That is the failure this split
+// exists to prevent: a passing arm is not evidence that the sentence justifying it is still true.
+//
+// The busy path itself is covered where it can actually be constructed — a thread must really be
+// parked in the object — by `test_cond_destroy_busy.cpp` and `test_barrier_destroy_busy.cpp`. What
+// is pinned HERE is only the null-slot half: these report success for an absent object rather than
+// inventing a failure. That is all this arm can see: `sce_pthread_rc(0)` is 0, so it reads the same
+// through the condvar's existing alias as it would through the barrier's direct registration, and
+// it would not notice an alias being added to or removed from either.
+// #2168's remaining third, `scePthreadMutexDestroy`, is still genuinely infallible above: it needs
+// owner tracking that deliberately does not exist on POSIX hosts (#719/#793).
+const char* const kFallibleButNullSucceeds[] = {
+    "scePthreadCondDestroy",      // #2359: EBUSY with waiters -- bare from the body, encoded by the alias
+    "scePthreadBarrierDestroy",   // #2379: EBUSY with threads parked -- encoded in the body itself
 };
 
 }  // namespace
@@ -298,7 +337,7 @@ int main() {
                   "a zero-count guest semaphore initializes");
             CHECK(sem_trywait((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0) == 0x80020023ull,
                   "scePthreadSemTrywait on an empty semaphore reports encoded FreeBSD EAGAIN "
-                  "(0x80020023) — not a bare 35, and not the host's 11");
+                  "(0x80020023) -- not a bare 35, and not the host's 11");
             // The POSIX half, and the sharpest arm in the file: -1 is the C contract, and the
             // 35 in errno is FreeBSD's EAGAIN where the host's is 11. An implementation that
             // published the host number would still return -1 here and would still look right to
@@ -308,7 +347,7 @@ int main() {
             CHECK(posix_rc == (uint64_t)(int64_t)-1,
                   "sem_trywait on the same semaphore returns -1, per C11 7.26 / sem_wait(3)");
             CHECK(errno == 35,
-                  "sem_trywait leaves FreeBSD EAGAIN (35) in errno — not the host's 11, which is "
+                  "sem_trywait leaves FreeBSD EAGAIN (35) in errno -- not the host's 11, which is "
                   "FreeBSD's EDEADLK and would turn a retryable wait into a deadlock report");
             sem_destroy((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0);
         }
@@ -337,7 +376,7 @@ int main() {
                 // A host whose ERRORCHECK unlock is permissive cannot run this arm. Say so rather
                 // than passing vacuously — an assertion that held while the mechanism never ran is
                 // the trap this repository keeps rediscovering.
-                printf("  [SKIP] this host permits unlocking an unheld ERRORCHECK mutex — the"
+                printf("  [SKIP] this host permits unlocking an unheld ERRORCHECK mutex -- the"
                        " EPERM half of the #2178 mutex arm cannot run here\n");
             } else {
                 CHECK(sony_rc == 0x80020001ull,
@@ -462,7 +501,7 @@ int main() {
             CHECK(pos_getspec(key, 0, 0, 0, 0, 0) == 0x2a,
                   "control: pthread_getspecific reads the small value back unencoded");
             CHECK(sce_getspec && sce_getspec(key, 0, 0, 0, 0, 0) == 0x2a,
-                  "control: scePthreadGetspecific reads back 0x2a, NOT 0x8002002a — the arm that "
+                  "control: scePthreadGetspecific reads back 0x2a, NOT 0x8002002a -- the arm that "
                   "catches a mechanical sweep reaching a value-returning handler");
             CHECK(sce_kdelete(key, 0, 0, 0, 0, 0) == 0,
                   "control: scePthreadKeyDelete of a real key reports 0");
@@ -544,6 +583,22 @@ int main() {
         CHECK(got == 0, msg);
     }
 
+    // The #2168 busy-destroy pair. Same observable assertion, deliberately a separate group and a
+    // separate label: these bodies DO have a failure path, it is simply unreachable through a null
+    // slot. Keeping them in kInfallible would keep asserting the right thing for a reason that
+    // stopped being true when #2359 and #2379 landed. See kFallibleButNullSucceeds.
+    printf("-- #2168 busy-destroy bodies: a NULL slot still reports success (the busy path is in "
+           "test_cond_destroy_busy / test_barrier_destroy_busy) --\n");
+    for (const char* name : kFallibleButNullSucceeds) {
+        char msg[192];
+        HleFn f = Hle::lookup(nid_hash(name));
+        if (!f) { snprintf(msg, sizeof msg, "%s is registered", name); CHECK(false, msg); continue; }
+        const uint64_t got = call0(f);
+        snprintf(msg, sizeof msg, "%-32s -> 0 for a null slot (fallible, but not here)  got 0x%llx",
+                 name, (unsigned long long)got);
+        CHECK(got == 0, msg);
+    }
+
     // ===== 9. #2575: join and detach must report their result, and only a real join writes back ===
     // Both bodies DISCARDED the host result and returned 0 on every path, so ESRCH, EINVAL and
     // EDEADLK all reached the guest as "the thread was joined, and here is its result" — with
@@ -586,7 +641,7 @@ int main() {
                 const uint64_t rc = sce_join((uint64_t)worker, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
                 CHECK(rc == 0, "control: scePthreadJoin of a real worker reports 0");
                 CHECK(out == (void*)0x5eed,
-                      "control: the worker's own exit value (0x5eed) reaches value_ptr — an arm that "
+                      "control: the worker's own exit value (0x5eed) reaches value_ptr -- an arm that "
                       "only checked rc == 0 would pass under the old always-0 body too");
             }
 
@@ -597,12 +652,12 @@ int main() {
             char msg[224];
             const int host_self_join = pthread_join(pthread_self(), nullptr);
             if (host_self_join == 0) {
-                printf("  [SKIP] this host's own pthread_join permits a thread to join itself — the "
+                printf("  [SKIP] this host's own pthread_join permits a thread to join itself -- the "
                        "#2575 EDEADLK arms cannot run here\n");
             } else {
                 snprintf(msg, sizeof msg,
                          "precondition: this HOST refuses a self-join with EDEADLK (host EDEADLK is "
-                         "%d here; got %d) — established by a direct host call, so no handler can "
+                         "%d here; got %d) -- established by a direct host call, so no handler can "
                          "manufacture the skip", EDEADLK, host_self_join);
                 CHECK(host_self_join == EDEADLK, msg);
 
@@ -612,7 +667,7 @@ int main() {
                 const uint64_t posix_rc = posix_join((uint64_t)pthread_self(), 0, 0, 0, 0, 0);
                 snprintf(msg, sizeof msg,
                          "pthread_join(self) reports bare FreeBSD EDEADLK (11), not this host's %d "
-                         "— %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
+                         "-- %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
                          EDEADLK, EDEADLK, (unsigned long long)posix_rc);
                 CHECK(posix_rc == 11, msg);
                 snprintf(msg, sizeof msg,
@@ -620,7 +675,7 @@ int main() {
                          (unsigned long long)sony_rc);
                 CHECK(sony_rc == 0x8002000bull, msg);
                 CHECK(untouched == (void*)0xC0FFEE,
-                      "a REFUSED join leaves value_ptr untouched — it used to be overwritten with "
+                      "a REFUSED join leaves value_ptr untouched -- it used to be overwritten with "
                       "NULL, which a guest reads as a legitimate NULL exit value");
             }
 
@@ -643,7 +698,7 @@ int main() {
                 const int host_double = pthread_detach(probe);
                 if (host_double == 0) {
                     printf("  [SKIP] this host's own pthread_detach accepts a second detach of the "
-                           "same thread — the #2575 detach refusal arms cannot run here\n");
+                           "same thread -- the #2575 detach refusal arms cannot run here\n");
                 } else {
                     snprintf(msg, sizeof msg,
                              "precondition: this HOST refuses a second detach with EINVAL (got %d)",
@@ -653,7 +708,7 @@ int main() {
                     CHECK(sce_detach((uint64_t)subject, 0, 0, 0, 0, 0) == 0,
                           "control: scePthreadDetach of a live joinable thread reports 0");
                     CHECK(pthread_detach(subject) == EINVAL,
-                          "control: …and it REALLY detached — the host now refuses a second detach. "
+                          "control: ...and it REALLY detached -- the host now refuses a second detach. "
                           "A body that reported 0 without calling through passes the line above and "
                           "fails this one");
                     CHECK(sce_detach((uint64_t)subject, 0, 0, 0, 0, 0) == kEncodedEINVAL,

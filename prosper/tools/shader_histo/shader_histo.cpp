@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
            cov_alu, cov_exp, cov_total, pct, cov_tabdep, pct_ctx, cov_unsup);
     printf("  shaders fully covered: %d table-less, %d given resource tables / stage (of %d)\n",
            shaders_full, shaders_full_ctx, shaders);
-    printf("  top blockers (first TRULY-unsupported inst per shader — table-dependent shapes excluded):\n");
+    printf("  top blockers (first TRULY-unsupported inst per shader -- table-dependent shapes excluded):\n");
     for (auto& [k, c] : blockers)
         printf("    %-6s op=0x%-4x blocks %u shader(s)\n", k.first < 0 ? "?" : fn[k.first], k.second, c);
     return 0;

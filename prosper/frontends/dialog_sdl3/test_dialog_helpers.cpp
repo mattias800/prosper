@@ -495,7 +495,7 @@ int main() {
         CHECK(n == 3 && buf[3] == 0 && buf[4] == 0xAAAA, "write_ime_text: clamps to max_len (no overrun past max_len+NUL)");
         for (auto& c : buf) c = 0xAAAA;
         n = write_ime_text((uint64_t)(uintptr_t)buf, 7, "caf\xC3\xA9");   // "café" (é = U+00E9)
-        CHECK(n == 4 && buf[3] == 0x00E9 && buf[4] == 0, "write_ime_text: multibyte UTF-8 é -> one UTF-16 unit");
+        CHECK(n == 4 && buf[3] == 0x00E9 && buf[4] == 0, "write_ime_text: multibyte UTF-8 U+00E9 -> one UTF-16 unit");
     }
 
     // UTF-16 surrogate pair round-trips (U+1F600 grinning face).

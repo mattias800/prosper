@@ -1071,7 +1071,7 @@ int main() {
               covers_block_bijectively(4,  8, 16,  8) &&
               covers_block_bijectively(8,  8,  8,  8) &&
               covers_block_bijectively(16, 4,  8,  8),
-              "SW_4KB_S3 maps one block bijectively for every texel size — full coverage, no aliasing");
+              "SW_4KB_S3 maps one block bijectively for every texel size -- full coverage, no aliasing");
     }
 
     // GFX10 thin/view-as-2D 3D SW_64KB_R_X. Each Z slice owns a padded 2D block grid, while Z

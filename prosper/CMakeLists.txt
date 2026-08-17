@@ -216,6 +216,13 @@ if(Python3_Interpreter_FOUND)
   # divergence would hand out a number the gate then rejects, on somebody else's PR, hours later.
   add_test(NAME trap_number
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/docs/test_trap_number.py")
+  # The pre-merge merge-result check (#2211). Its cases build real throwaway git repositories and
+  # run real merges: the git plumbing IS the tool, so a mocked merge would test nothing. The case
+  # that earns its keep is the clean merge whose RESULT holds a duplicate -- the state no head-time
+  # check can observe, because at head time the other branch's row did not exist.
+  add_test(NAME doc_merge_result_checker
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/docs/test_check_merge_result.py")
   # Parsing/gating logic of the Vulkan validation guard (#1704). Pure — it does not create a Vulkan
   # instance, so it runs everywhere. A parser that stops matching the layer's message framing would
   # report a clean suite forever, which is the one way this guard can fail silently.
@@ -231,6 +238,18 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
+  # `print(__doc__)` is a usage message only while the header is a docstring; rewritten as `#`
+  # comments it prints the literal string `None` and the tool still exits non-zero, so nothing
+  # looks broken and the caller is told nothing (#2399). Three tools have shipped that way, the
+  # last of them twice -- resolve.py regressed in #2642 inside the very change that added a line
+  # to its usage block, with nine checks green, because the only guard in the tree named xref.py.
+  # So this asks the whole tree instead of one file. Unlike ctest_gate_checker above, the scan
+  # itself is registered rather than only the selftest: the root it needs is ${CMAKE_SOURCE_DIR},
+  # known at configure time, so it runs from any build directory. --selftest runs beside it
+  # because a walk that matches nothing and a clean tree otherwise print the same thing.
+  add_test(NAME tools_usage_text
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_usage_text.py"
+                   --selftest --root "${CMAKE_SOURCE_DIR}")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
   # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
   # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
@@ -240,6 +259,18 @@ if(Python3_Interpreter_FOUND)
   # contained the defect.
   add_test(NAME cached_env_arming_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_cached_env.py"
+                   "${CMAKE_SOURCE_DIR}")
+  # stdout carries BYTES, and Windows decodes them as cp1252/cp437. One em dash in a printf literal
+  # therefore reaches a Windows user as three mojibake characters, so a grep for the line the tool
+  # itself printed does not match it -- and a test asserting on the rendered string fails on
+  # Windows only, which is how
+  # #2579 shipped five of them past a green Linux CI (#2588). Also runs in the Docs job, which
+  # needs nothing built: this is a text scan, and a defect it can see should not wait for a build.
+  # The scanner self-tests its own parsing AND its line numbers, because both failure modes are
+  # silent -- a pattern that stops matching reports a clean tree forever, and a drifted line counter
+  # sends the reader to innocent code while the real site goes unexamined (the first revision did).
+  add_test(NAME ascii_output_literals
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/output/check_ascii_output.py"
                    "${CMAKE_SOURCE_DIR}")
   # A diagnostic whose PRODUCER is armed by a different switch than its PRINTER reports unarmed
   # state as a confident, well-formed ZERO -- indistinguishable from a measured negative, and
@@ -396,6 +427,28 @@ if(TARGET prosper_core)
   add_executable(test_hle_no_shadow tests/test_hle_no_shadow.cpp)
   target_link_libraries(test_hle_no_shadow PRIVATE prosper_core)
   add_test(NAME hle_no_shadow COMMAND test_hle_no_shadow)
+
+  # Runtime IL2CPP symbolication (#2551): name the C# method containing a live guest PC. The
+  # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
+  # into a silent skip. The binary doubles as the probe the agreement test drives.
+  add_executable(test_il2cpp_symbols tests/test_il2cpp_symbols.cpp)
+  target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
+  add_test(NAME il2cpp_symbol_resolution
+           COMMAND test_il2cpp_symbols
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
+  if(Python3_Interpreter_FOUND)
+    # ...and the runtime resolver must answer exactly what tools/il2cpp/resolve.py answers. They
+    # share the record set by construction (resolve.py emits the table the runtime reads), but the
+    # nearest-preceding rule, its window and its tie handling are implemented twice, so this drives
+    # both CLIs over one synthesized corpus and requires them to agree address-for-address.
+    add_test(NAME il2cpp_symtab_agreement
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/il2cpp/test_symtab_agreement.py"
+                     "$<TARGET_FILE:test_il2cpp_symbols>")
+  else()
+    prosper_add_skipped_test(il2cpp_symtab_agreement
+      "il2cpp_symtab_agreement drives tools/il2cpp/resolve.py; no Python 3 interpreter was found.")
+  endif()
 
   # Ground truth for tools/re/hle_handler_map.py: the registry register_builtin_hle() really builds
   # (#2070). Pure setup — no game dump, no GPU — so the static parser can be reconciled against the
@@ -1019,6 +1072,26 @@ if(TARGET prosper_core)
     add_test(NAME plugin_autolink COMMAND test_plugin_autolink)
     set_tests_properties(plugin_autolink PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+
+  # link_program's structural contract on SYNTHESIZED modules (#2567). plugin_autolink's remaining
+  # 14 assertions — the export table, the collision guard's effect on link_program, and the #1635
+  # alias record — sat behind `if (argc >= 2)` plus a real Media/Plugins/PSN.prx, so they never ran
+  # in CI and never ran for an agent without that title installed. These two cases register
+  # UNCONDITIONALLY: their fixtures are minimal ET_SCE_DYNAMIC PRX modules emitted at test time by
+  # tests/synth_prx.h and tests/handmade_prx.h, so there is no dump, no network and no committed
+  # binary. Every byte is synthesized from the published ELF64 layout — nothing is carved out of a
+  # dump, which would put Sony-built code in a public repository.
+  #
+  # Two cases, not one, because "the loader accepts this" and "the loader refuses that" are different
+  # claims and the second is the one that gives the first its meaning: _reject holds the corrupted
+  # variants, each differing from a linking control in exactly one field.
+  add_executable(test_loader_synth_link tests/test_loader_synth_link.cpp)
+  target_link_libraries(test_loader_synth_link PRIVATE prosper_core)
+  add_test(NAME loader_synth_link COMMAND test_loader_synth_link)
+
+  add_executable(test_loader_synth_reject tests/test_loader_synth_reject.cpp)
+  target_link_libraries(test_loader_synth_reject PRIVATE prosper_core)
+  add_test(NAME loader_synth_reject COMMAND test_loader_synth_reject)
 
   # ATRAC9 decode (vendored LibAtrac9 + prosper glue): an embedded 16-superframe slice of a real PS5
   # snd0.at9 decodes bit-exact vs the LibAtrac9 reference (CRC32). Pure, no game dump; runs in CI.

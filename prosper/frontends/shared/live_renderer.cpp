@@ -284,7 +284,7 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
                   first = absent_reported.insert(wanted).second; }
                 if (first)
                     fprintf(stderr,
-                            "[rtt-inval] 0x%llx is NOT in the RTT cache at this drain — no snapshot "
+                            "[rtt-inval] 0x%llx is NOT in the RTT cache at this drain -- no snapshot "
                             "to invalidate\n", (unsigned long long)wanted);
                 continue;
             }

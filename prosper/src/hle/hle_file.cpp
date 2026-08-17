@@ -2245,7 +2245,7 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         std::string clash; int same_size = prosper_apr_match_by_size(size, &clash);
         id = prosper_apr_register(host, size);
         if (same_size > 0 && clash != host)
-            fprintf(stderr, "[apr] WARNING: %s and %s share byte size %llu — ID-resolved reads "
+            fprintf(stderr, "[apr] WARNING: %s and %s share byte size %llu -- ID-resolved reads "
                     "remain valid; unresolved-id size fallback will be refused as ambiguous "
                     "(issue #1901)\n",
                     host.c_str(), clash.c_str(), (unsigned long long)size);
@@ -2719,7 +2719,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     }
     uint64_t size = requested_size;
     if (offset > fsize) {
-        if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) — clamped\n",
+        if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) -- clamped\n",
                                (unsigned long long)offset, (unsigned long long)fsize);
         offset = fsize;
     }
