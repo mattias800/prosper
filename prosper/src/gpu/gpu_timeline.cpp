@@ -3080,6 +3080,9 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     // Latched before every early return, so the exit report can separate "the run produced no GPU
     // submits at all" from "it submitted plenty and the timeline was never recording" (#2564). Those
     // have opposite fixes and used to produce the identical observation: a missing .prgcap.
+    // Unconditional on purpose: gating it on the selector's environment would make the count itself
+    // depend on the thing being diagnosed. The very next line already pays an identical relaxed
+    // increment for the grab hook, so the marginal cost of this one is not measurable.
     g_timeline_submit_hook_reached.fetch_add(1, std::memory_order_relaxed);
     interactive_frame_bundle_on_submit(state, submit_no);
     if (!gpu_timeline_requested()) return;
