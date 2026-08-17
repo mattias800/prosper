@@ -208,6 +208,11 @@ uint64_t live_compute_buffer_gpu_result_skips();
 // Monotonic diagnostic count of retained sampled-image hits whose validated source omitted upload.
 // Capture/replay tests use this to prove residency without relying on timing-sensitive assertions.
 uint64_t live_compute_sampled_image_upload_skips();
+
+// How many bindings the compressed-source authority guard declined. Separate from the skip counters
+// above because the guard shares skip_image with unrelated reasons, so only a dedicated counter can
+// prove THIS guard fired rather than some other decline.
+uint64_t live_compute_compressed_source_authority_declines();
 // True only when an ordinary guest-backed 2D sampled image uses the same native Vulkan texel
 // representation as its typed storage counterpart. This is the format half of the retained-image
 // transfer contract; resource identity and write authority are checked separately at runtime.

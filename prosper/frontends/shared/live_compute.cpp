@@ -2453,6 +2453,12 @@ struct VulkanComputeContext {
 
 VulkanComputeContext* g_live_compute_context = nullptr;
 std::atomic<uint64_t> g_sampled_image_upload_skips{0};
+// Declines from the compressed-source authority guard specifically. A dedicated counter, not a
+// shared one, because the guard shares its decline path (skip_image) with several unrelated
+// reasons -- so a test asserting "the dispatch declined" cannot tell whether THIS guard fired.
+// Measured: without this counter, removing the guard's compression term left the regression green,
+// because a renderer-owned binding with no import declines for another reason anyway.
+std::atomic<uint64_t> g_compressed_source_authority_declines{0};
 std::atomic<uint64_t> g_cpu_fill_dispatches{0};
 
 struct BorrowedComputeImageLease {
@@ -6097,6 +6103,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (r->compression_enabled && !bi.imported &&
                         (renderer_owned || depth_import_eligible) &&
                         !sampled_metadata_proves_uncompressed) {
+                        g_compressed_source_authority_declines.fetch_add(
+                            1, std::memory_order_relaxed);
                         skip_image(r, "compressed sampled source without authority "
                                       "(no imported image, no fast clear, metadata does not prove "
                                       "the base allocation uncompressed)");
@@ -8950,6 +8958,10 @@ uint64_t live_compute_buffer_gpu_result_skips() {
 
 uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
+}
+
+uint64_t live_compute_compressed_source_authority_declines() {
+    return g_compressed_source_authority_declines.load(std::memory_order_relaxed);
 }
 
 uint64_t live_compute_storage_transfer_seeds() {
