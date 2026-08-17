@@ -46,6 +46,21 @@ they cannot claim a live tree is dead. Unproven means "left alone", which is why
 distinguishes "not merged" from "no evidence available" -- a `gh` outage must not silently turn
 into a wall of ACTIVE.
 
+What this deliberately does NOT protect, stated because each one looks covered:
+
+  ignored files   `git status` does not list gitignored content, so a tree whose only content is
+                  an ignored `build-linux/` or a run log reads as clean and goes with it. Mostly
+                  that is the point -- but the charter also tells agents to put run artifacts in
+                  "a gitignored worktree-local directory", so the dirty guard does not mean what
+                  a reader may assume. Move what you want to keep, or `git worktree lock` the tree.
+  detached trees  the recycled-branch cross-check keys on a branch name, so it cannot apply to a
+                  detached worktree; those qualify on the HEAD sha alone. Sound, because the sha
+                  matching a merged PR's headRefOid is what is being asserted -- but if that sha
+                  is reachable only from this worktree's HEAD, removing the tree does make the sha
+                  unreachable. The content is still on master via the squash.
+  non-Linux       the in-use guard needs `/proc`. Without it the tool fails closed and removes
+                  nothing at all, so on macOS and Windows this is a classifier only.
+
 Usage:
 
     tools/worktree_reclaim.py                      # census, touches nothing
@@ -246,8 +261,12 @@ def scan_processes(
 
     Deliberately scans ALL processes rather than a list of known binary names. The failure this
     guards against is a wedged interactive shell, and a shell is exactly what a name list misses.
-    Unreadable processes (other users, or exited mid-scan) are skipped -- so within a supported
-    platform this is a lower bound on holders, never an upper one, which is the safe direction.
+
+    Unreadable processes (other users, or exited mid-scan) are skipped, so this is a LOWER bound
+    on holders -- and that is the UNSAFE direction, not the safe one: under-detecting holders
+    yields "nobody is here" and hence REMOVABLE. An upper bound would be safe. Nothing here can
+    make the bound tight, which is precisely why `supported` exists and why the idle guard backs
+    this one up; do not read a short holder list as reassurance.
     """
     refs: list[tuple[int, str, str, str]] = []
     try:
@@ -304,22 +323,66 @@ def scan_processes(
 def attach_holders(trees: list[Worktree], refs: list[tuple[int, str, str, str]]) -> None:
     """Assign each reference to the most specific worktree containing it.
 
+    Matching is by (st_dev, st_ino) identity, NOT by path string. String matching produced a
+    demonstrated false negative here, which is the direction that deletes people's work:
+
+        `/home` is a symlink to `/var/home` on this host, so `t.real` is always the `/var/home`
+        spelling. Inside the ps5ys distrobox, however, `/home` is a real bind mount, so a
+        container process's `/proc/<pid>/cwd` reads back as `/home/...` -- a different string for
+        the same directory. Measured live: a `distrobox enter ps5ys -- bash -lc "cd <worktree> &&
+        ..."` process, which is exactly the build command the charter prescribes, was invisible to
+        the string index while a host process in the same tree was seen. Both paths stat to
+        dev=57 ino=10784453.
+
+    Inode identity closes that and any other aliasing (bind mounts, additional symlinks) in one
+    step, because it asks the question the guard actually means: is this process inside THIS
+    directory, however it happens to spell it.
+
     Walking up from the reference and taking the first hit is what makes "most specific" work:
-    every `.claude/worktrees/X` is inside the main checkout, so a plain prefix match would blame
-    main for a process that is really sitting in X.
+    every `.claude/worktrees/X` is inside the main checkout, so matching the outermost container
+    would blame main for a process that is really sitting in X.
     """
-    index = {t.real: t for t in trees}
-    for pid, kind, comm, path in refs:
+    by_key: dict[tuple[int, int], Worktree] = {}
+    for t in trees:
+        try:
+            st = os.stat(t.real)
+        except OSError:
+            continue  # a vanished tree cannot hold anything; `missing` covers it
+        by_key[(st.st_dev, st.st_ino)] = t
+
+    # Memoised per directory: without this the ancestor walk stats the same handful of parents
+    # tens of thousands of times over a full /proc sweep.
+    cache: dict[str, Worktree | None] = {}
+
+    def owner(path: str) -> Worktree | None:
+        chain: list[str] = []
         cur = path
+        found: Worktree | None = None
         while True:
-            t = index.get(cur)
-            if t is not None:
-                t.holders.append(Holder(pid=pid, kind=kind, comm=comm, path=path))
+            if cur in cache:
+                found = cache[cur]
+                break
+            chain.append(cur)
+            try:
+                st = os.stat(cur)
+                hit = by_key.get((st.st_dev, st.st_ino))
+            except OSError:
+                hit = None  # deleted fd target, or a path we may not stat; keep walking up
+            if hit is not None:
+                found = hit
                 break
             parent = os.path.dirname(cur)
             if parent == cur or len(parent) <= 1:
                 break
             cur = parent
+        for c in chain:
+            cache[c] = found
+        return found
+
+    for pid, kind, comm, path in refs:
+        t = owner(path)
+        if t is not None:
+            t.holders.append(Holder(pid=pid, kind=kind, comm=comm, path=path))
 
 
 # --------------------------------------------------------------------------- per-tree probes
@@ -425,12 +488,22 @@ def probe_ancestor(repo: str, trees: list[Worktree], base: str) -> None:
             t.merged_by = "ancestor"
 
 
+_GH_CACHE: dict[tuple[str, int], tuple[bool, str, dict[str, int], set[str]]] = {}
+
+
 def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, str]:
     """Cross-check against merged PRs. Returns (available, note).
 
     Two batched `gh` calls rather than one per tree; with hundreds of worktrees the per-tree form
     is both slow and rate-limited.
     """
+    cached = _GH_CACHE.get((repo, limit))
+    if cached is not None:
+        ok, note, by_oid, open_branches = cached
+        if ok:
+            _apply_github(trees, by_oid, open_branches)
+        return ok, note
+
     rc, out, err = run(
         [
             "gh", "pr", "list", "--state", "merged", "--limit", str(limit),
@@ -440,23 +513,29 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
         timeout=300,
     )
     if rc != 0:
-        return False, f"gh unavailable ({(err.strip() or 'rc=%d' % rc)[:120]})"
+        note = f"gh unavailable ({(err.strip() or 'rc=%d' % rc)[:120]})"
+        _GH_CACHE[(repo, limit)] = (False, note, {}, set())
+        return False, note
     try:
         merged = json.loads(out)
     except json.JSONDecodeError as e:
         return False, f"gh returned unparseable JSON ({e})"
 
-    rc2, out2, _ = run(
+    rc2, out2, err2 = run(
         ["gh", "pr", "list", "--state", "open", "--limit", str(limit), "--json", "number,headRefName"],
         cwd=repo,
         timeout=300,
     )
-    open_branches: set[str] = set()
-    if rc2 == 0:
-        try:
-            open_branches = {pr["headRefName"] for pr in json.loads(out2)}
-        except json.JSONDecodeError:
-            pass
+    # An empty open-PR set is the permissive answer -- it is what licenses squash-pr qualification
+    # for a named branch. So a FAILED query must not produce it: "the query broke" and "there are
+    # no open PRs" would otherwise be the same value, and a rate limit right after the paginated
+    # merged fetch is a realistic way to get there. Fail closed on the whole cross-check instead.
+    if rc2 != 0:
+        return False, f"gh open-PR query failed ({(err2.strip() or 'rc=%d' % rc2)[:120]})"
+    try:
+        open_branches = {pr["headRefName"] for pr in json.loads(out2)}
+    except json.JSONDecodeError as e:
+        return False, f"gh open-PR query returned unparseable JSON ({e})"
 
     by_oid: dict[str, int] = {}
     for pr in merged:
@@ -464,6 +543,18 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
         if oid:
             by_oid.setdefault(oid, pr["number"])
 
+    note = f"gh: {len(merged)} merged PRs, {len(open_branches)} open branches"
+    if len(merged) >= limit:
+        # Newest-first, so merged-list truncation drops the OLDEST PRs -- the trees most worth
+        # reclaiming. That direction is safe (they stay unqualified). Truncating the OPEN list
+        # would be unsafe, so say so loudly rather than quietly qualifying more trees.
+        note += f" -- WARNING: hit --gh-limit {limit}; raise it, results are truncated"
+    _GH_CACHE[(repo, limit)] = (True, note, by_oid, open_branches)
+    _apply_github(trees, by_oid, open_branches)
+    return True, note
+
+
+def _apply_github(trees: list[Worktree], by_oid: dict[str, int], open_branches: set[str]) -> None:
     for t in trees:
         if t.is_main or t.merged_by or not t.head:
             continue
@@ -475,8 +566,6 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
         if t.branch and t.branch in open_branches:
             continue
         t.merged_by = f"squash-pr#{num}"
-
-    return True, f"gh: {len(merged)} merged PRs, {len(open_branches)} open branches"
 
 
 # --------------------------------------------------------------------------- classification
@@ -508,7 +597,9 @@ def classify(t: Worktree, min_idle_hours: float, merge_evidence_available: bool,
         t.blockers.append("unmerged" if merge_evidence_available else "no-merge-evidence")
     if t.nested:
         t.blockers.append("nested")
-    if t.idle_hours is not None and t.idle_hours < min_idle_hours:
+    # None means every stat failed. Everything else in this list is fail-closed; an unknown
+    # answer must not be the one place that quietly permits removal.
+    if t.idle_hours is None or t.idle_hours < min_idle_hours:
         t.blockers.append("recent")
 
 
@@ -721,10 +812,12 @@ def recheck_and_remove(repo: str, t: Worktree, base: str, min_idle_hours: float,
     fresh_refs, holder_scan_ok = scan_processes(scan_fds=scan_fds, scan_maps=scan_maps)
     attach_holders(fresh, fresh_refs)
     probe_ancestor(repo, fresh, base)
-    if use_github and cur.merged_by is None:
-        probe_github(repo, fresh, gh_limit)
+    # Cached after the census, so this is a dict lookup rather than another paginated fetch --
+    # 145 candidates would otherwise mean 145 full merged-PR queries and a near-certain rate limit,
+    # whose symptom would be trees refusing under a mislabelled verdict.
+    gh_ok = probe_github(repo, fresh, gh_limit)[0] if use_github else False
     cur = next((w for w in fresh if w.real == t.real), cur)
-    classify(cur, min_idle_hours, merge_evidence_available=True,
+    classify(cur, min_idle_hours, merge_evidence_available=(use_github and gh_ok),
              holder_scan_ok=holder_scan_ok)
 
     if not cur.removable:
@@ -795,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(
             {
-                "meta": meta,
+                "meta": ({**meta, "repo": redact(meta["repo"])} if args.redact else meta),
                 "worktrees": [
                     {
                         "path": redact(t.real) if args.redact else t.real,

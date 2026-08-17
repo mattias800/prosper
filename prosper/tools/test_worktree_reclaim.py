@@ -377,8 +377,23 @@ def test_remove_takes_only_the_safe_tree() -> None:
 
 
 def test_removal_rechecks_state_rather_than_trusting_the_census() -> None:
-    """A tree that goes dirty after the census must still be refused at removal time."""
+    """A process that enters the tree AFTER the census must still stop the removal.
+
+    The race is deliberately expressed as a live holder rather than as a dirty file. A dirty file
+    is the wrong probe here: `git worktree remove` refuses dirty trees by itself, so that version
+    of this arm passed even with the entire re-check deleted -- git produced the identical
+    observable outcome and the arm could not tell "re-checked" from "trusted the census and got
+    lucky". Verified: with `recheck_and_remove` reduced to a bare `git worktree remove`, the dirty
+    form still reported ok.
+
+    Nothing in git checks for live processes, so only our re-check can refuse this one. It is also
+    the catastrophic case -- the tree wedges a running shell -- and it is exactly what the
+    re-check exists for.
+    """
     print("\n[recheck beats a stale census]")
+    if not holder_scan_supported():
+        print("  SKIP the discriminating form of this arm needs a readable /proc")
+        return
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         repo = build_repo(root)
@@ -388,13 +403,98 @@ def test_removal_rechecks_state_rather_than_trusting_the_census() -> None:
         trees, _ = survey(repo)
         check("census says removable", trees["racy"].state, "REMOVABLE")
 
-        # Simulate the race the tool exists to survive: work appears after the scan.
-        (wt / "file.txt").write_text("someone is mid-edit\n")
+        holder = spawn_holder(wt)  # an agent cd's in after the scan
+        try:
+            time.sleep(0.4)
+            removed = W.recheck_and_remove(str(repo), trees["racy"], "origin/master", 12.0,
+                                           False, False, False, 0, False)
+            check("recheck refuses", removed, False)
+            check("tree still on disk", wt.is_dir(), True)
+        finally:
+            holder.kill()
+            holder.wait()
 
-        removed = W.recheck_and_remove(str(repo), trees["racy"], "origin/master", 12.0,
-                                       False, False, False, 0, False)
-        check("recheck refuses", removed, False)
-        check("tree still on disk", wt.is_dir(), True)
+
+def test_holder_matching_survives_path_aliasing() -> None:
+    """A holder reached through a different spelling of the same directory must still count.
+
+    Regression for a demonstrated false negative. `/home` is a symlink to `/var/home` on this
+    host, so a worktree's canonical path is the `/var/home` form -- but inside the ps5ys distrobox
+    `/home` is a real bind mount, so a container process's `/proc/<pid>/cwd` reads back as
+    `/home/...`. A string-keyed index missed it entirely: measured live, a
+    `distrobox enter ps5ys -- bash -lc "cd <worktree> && ..."` process (the charter's own build
+    command) was invisible while a host process in the same tree was seen.
+
+    The fixture builds the alias by hand with a symlink rather than requiring a container, and
+    feeds the aliased path in as a reference. Under string matching this arm fails; under
+    (st_dev, st_ino) identity it passes.
+    """
+    print("\n[holder matching survives path aliasing]")
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        repo = build_repo(root)
+        wt = add_wt(repo, "aliased", "feat/aliased")
+
+        alias = root / "alias"
+        try:
+            alias.symlink_to(root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            print("  SKIP cannot create a directory symlink on this platform")
+            return
+        aliased_cwd = str(alias / "aliased" / "prosper-ish-subdir")
+        (Path(root / "aliased") / "prosper-ish-subdir").mkdir()
+
+        trees = W.list_worktrees(repo)
+        by_name = {t.name: t for t in trees}
+        check("alias really is a different string", aliased_cwd.startswith(str(by_name["aliased"].real)),
+              False, aliased_cwd)
+
+        W.attach_holders(trees, [(4242, "cwd", "bash", aliased_cwd)])
+        check("aliased holder is attributed", [h.pid for h in by_name["aliased"].holders], [4242])
+        check("and not to the main checkout", [h.pid for h in by_name[repo.name].holders], [])
+
+
+def test_fd_and_map_references_are_holders() -> None:
+    """An open fd or a mapping inside a tree counts, not only cwd.
+
+    Both are on by default in production and neither was covered: every other fixture passes
+    scan_fds=False, scan_maps=False for speed. A compiler writing an object file, or a running
+    binary mapped out of the tree, is the realistic holder that has no cwd there at all.
+    """
+    print("\n[fd and map references]")
+    if not holder_scan_supported():
+        print("  SKIP needs a readable /proc")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        repo = build_repo(root)
+        wt = add_wt(repo, "fdheld", "feat/fdheld")
+
+        # The artifact must be IGNORED, not merely untracked: an untracked file would make the
+        # tree dirty, and then the control below would pass because of the dirty guard rather
+        # than because the fd was released. Ignoring it means the open fd is the only difference
+        # between the two arms, which is what makes this a control at all.
+        (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (repo / ".git" / "info" / "exclude").write_text("artifact.bin\n")
+        target = wt / "artifact.bin"
+        target.write_bytes(b"x" * 4096)
+        age(wt, admin_of(repo, "fdheld"))
+
+        fh = open(target, "rb")  # a live fd, from a process whose cwd is elsewhere
+        try:
+            trees, _ = survey(repo, scan_fds=True, scan_maps=False)
+            held = trees["fdheld"]
+            check("fd holder refuses the tree", held.removable, False)
+            check("fd holder names in-use", "in-use" in held.blockers, True, str(held.blockers))
+            check("fd holder is this process",
+                  os.getpid() in [h.pid for h in held.holders if h.kind == "fd"], True)
+        finally:
+            fh.close()
+
+        # Control: with the same tree and no fd open, it is removable again -- so the arm above
+        # measured the fd, not some unrelated property of the fixture.
+        trees, _ = survey(repo, scan_fds=True, scan_maps=False)
+        check("removable once the fd is closed", trees["fdheld"].state, "REMOVABLE")
 
 
 def main() -> int:
@@ -408,6 +508,8 @@ def main() -> int:
         test_dry_run_is_the_default_and_removes_nothing,
         test_remove_takes_only_the_safe_tree,
         test_removal_rechecks_state_rather_than_trusting_the_census,
+        test_holder_matching_survives_path_aliasing,
+        test_fd_and_map_references_are_holders,
     ):
         fn()
     print()
