@@ -316,8 +316,11 @@ uint64_t h_a(uint64_t) { return 0; }
 // And a free-function forwarder, which is neither a macro nor a lambda.
 static void reg3(const char* nid, HleFn fn, const char* name) { Hle::register_fn(nid, fn, name); }
 void register_demo_hle() {
-    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // R2 is defined BEFORE the macro it expands to, which is legal (a macro body is expanded at the
+    // use site, not at definition) and is what makes the fixpoint load-bearing: a single discovery
+    // pass sees R2 forwarding to a name it does not yet know is a wrapper, and drops it silently.
     #define R2(str, fn) R(str, fn)
+    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R2("sceDemoAlpha", h_a);
     reg3("AAAAAAAAAAA", (HleFn)h_a, "sceDemoBeta");
     Hle::register_alias("BBBBBBBBBBB", (HleFn)h_a, "sceDemoGamma");
