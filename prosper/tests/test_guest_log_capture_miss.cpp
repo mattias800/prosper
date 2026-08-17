@@ -102,7 +102,12 @@ int main(int argc, char** argv) {
     // the std::atexit registration — which is the half of the fix that an in-process assertion is
     // structurally unable to see. Removing that one registration leaves every direct-call check
     // below passing while a real run goes silent again, which is precisely the original defect.
-    if (argc > 2 && std::string(argv[1]) == "--unfired-child") {
+    if (argc > 3 && std::string(argv[1]) == "--unfired-child") {
+        // The child redirects its OWN stderr rather than having the parent append a `2>` clause.
+        // Shell redirection would put a third quoted path into a command line that cmd.exe already
+        // parses awkwardly, and the reopened stream is still what the atexit handler writes to:
+        // stdio teardown runs after the exit handlers, so the report lands in this file.
+        if (!std::freopen(argv[3], "w", stderr)) return 2;
         set_test_env("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG", "LevelDocument Loaded: worldmap");
         set_test_env("PROSPER_CAPTURE_BUNDLE", argv[2]);
         const char guest[] = "LevelDocument Loaded: worldmap [worldmap]\n";
@@ -241,15 +246,17 @@ int main(int argc, char** argv) {
     // above calls the reporter directly and therefore cannot distinguish a registered exit handler
     // from an unregistered one.
     {
-        std::string self = argv[0];
-        if (self.find('/') == std::string::npos && self.find('\\') == std::string::npos)
-            self = "./" + self;
-        const auto child_err = scratch / ("prosper-guest-log-miss-child-" + std::to_string(nonce) + ".stderr");
-        // More than two quote characters, so cmd.exe does not strip the outermost pair and the
-        // string is used as written; /bin/sh treats it the same way. Paths here are the test
-        // binary and its own scratch directory.
-        const std::string command = "\"" + self + "\" --unfired-child \"" + bundle_path.string() +
-                                    "\" 2> \"" + child_err.string() + "\"";
+        // make_preferred() is load-bearing on Windows and a no-op elsewhere: CMake and
+        // std::filesystem hand back forward slashes, and cmd.exe will not run a program path
+        // spelled that way — it reads the leading `/` components as switches. The first Windows
+        // CI run failed on exactly that, and only because the note below printed the command.
+        std::filesystem::path self = std::filesystem::path(argv[0]).make_preferred();
+        if (!self.has_parent_path()) self = std::filesystem::path(".") / self;
+        const auto child_err =
+            (scratch / ("prosper-guest-log-miss-child-" + std::to_string(nonce) + ".stderr"))
+                .make_preferred();
+        const std::string command = "\"" + self.string() + "\" --unfired-child \"" +
+                                    bundle_path.string() + "\" \"" + child_err.string() + "\"";
         const int rc = std::system(command.c_str());
         std::string child_text;
         if (FILE* in = std::fopen(child_err.string().c_str(), "rb")) {
