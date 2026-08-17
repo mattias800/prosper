@@ -272,10 +272,14 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   Sampling also **stops** once the guest is dead *and* the present layer has published nothing for
   `--guest-fault-settle-seconds` (1 s), so the run no longer spends its remaining `--seconds` /
   `--timeout` re-photographing one frame (#2584: 24 of 25 PNGs were byte-identical). Every sample
-  already taken is kept and the verdict is unchanged; the summary reads `saved/requested` with
-  `stop=guest-fault` beside it, and the manifest summary carries `stop_reason`, so **a short PNG set
-  is not evidence of a crashed harness — read `stop_reason` before assuming a run was truncated**.
-  `--no-stop-after-guest-fault` restores full-length sampling.
+  already taken is kept; the summary reads `saved/requested` with `stop=guest-fault` beside it, and
+  the manifest summary carries `stop_reason`, so **a short PNG set is not evidence of a crashed
+  harness — read `stop_reason` before assuming a run was truncated**.
+  `--no-stop-after-guest-fault` restores full-length sampling. The stop cannot make a failing run
+  pass: the saved/requested assertion is excused only in `--seconds` mode with a sample taken,
+  **`--max-stale-seconds` / `--max-pixel-stale-seconds` disarm the stop outright** (they are maxima
+  over the samples taken, so a shortened run would report a smaller one), and every other flag
+  assertion is a floor that fewer samples can only push further from being met.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
   to print the GOT/PLT relocation slot each import lands in — the step that starts every

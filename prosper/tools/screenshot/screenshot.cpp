@@ -26,9 +26,19 @@
 //
 // It also stops sampling once that is established: the primary thread is dead AND the present layer
 // has published nothing for the settle window, so nothing new can arrive (#2584). Samples already
-// taken are kept, and the run finishes normally — same verdict, same manifest, same exit status,
-// without the redundant tail. The summary line reports `saved/requested` with `stop=guest-fault`
-// beside it so a short artifact set explains itself instead of reading as a truncated harness.
+// taken are kept and the run finishes normally, without the redundant tail. The summary line reports
+// `saved/requested` with `stop=guest-fault` beside it so a short artifact set explains itself
+// instead of reading as a truncated harness.
+//
+// What the stop can and cannot change, stated exactly, because "same assertions" is NOT true and
+// used to be claimed here (#2639 review B1):
+//   - the saved/requested assertion is EXCUSED, and only in wall-clock mode with a sample taken;
+//   - `--max-stale-seconds` / `--max-pixel-stale-seconds` DISARM the stop, because they are maxima
+//     over the samples taken and a shortened run would report a smaller one (`early_stop_armed`);
+//   - every other FLAG assertion is a floor (`--min-*`, `--require-*`) that fewer samples can only
+//     push further from being met, and the one non-flag assertion (an unwritable manifest) is still
+//     caught by the summary write and the fclose below. So the stop cannot make a run pass.
+// The verdict, the manifest and the exit status are otherwise the ones the full-length run produces.
 //
 // Reaching a rendering frame loop needs the guest switches the render frontier documents; this tool
 // defaults PROSPER_GUEST_ARGS=-force-gfx-direct (Unity/Messenger recipe) if it isn't already set,
@@ -399,6 +409,23 @@ int main(int argc, char** argv) {
     if (every < 1) every = 1;
     if (count < 1) count = 1;
 
+    // A staleness bound disarms the early stop, because both bounds are maxima over the samples that
+    // were TAKEN and the stop deletes the very interval they exist to catch (#2639 review B1; the
+    // reasoning is on `early_stop_armed`). From here on this variable is the EFFECTIVE policy: it is
+    // what the loop obeys and what the manifest run header records, so an archived artifact set
+    // states the policy it ran under rather than the one that was asked for.
+    {
+        const bool requested_stop = stop_after_guest_fault;
+        stop_after_guest_fault = screenshot::early_stop_armed(stop_after_guest_fault,
+                                                             max_stale_seconds,
+                                                             max_pixel_stale_seconds);
+        if (requested_stop && !stop_after_guest_fault)
+            fprintf(stderr, "[shot] early stop after a guest fault is DISARMED for this run: "
+                            "--max-stale-seconds / --max-pixel-stale-seconds measure the maximum "
+                            "gap across the samples taken, so stopping early would delete the "
+                            "interval they exist to catch. Sampling runs the full request.\n");
+    }
+
     // Title code = dump basename with a trailing "-app0" removed (e.g. PPSA24651-app0 -> PPSA24651).
     std::string code = dump;
     if (auto sl = code.find_last_of("/\\"); sl != std::string::npos) code = code.substr(sl + 1);
@@ -767,9 +794,11 @@ int main(int argc, char** argv) {
     if (saved != count && !short_run_explained)
         assertion_failed("saved %d/%d requested screenshots", saved, count);
     else if (saved != count)
+        // ASCII only: this is program output, and a UTF-8 punctuation mark in a printf literal is
+        // cp1252/cp437 mojibake on Windows and stops matching the grep a reader types (#2588).
         fprintf(stderr, "[shot] note: %d of %d requested samples were taken. The %d not taken were "
-                        "skipped because sampling stopped at the guest's death — each would have "
-                        "been a byte-for-byte copy of sample %d — not because the run was cut "
+                        "skipped because sampling stopped at the guest's death (each would have "
+                        "been a byte-for-byte copy of sample %d), not because the run was cut "
                         "short. This is not counted as a failure.\n",
                 saved, count, count - saved, saved - 1);
     if (manifest_failed)

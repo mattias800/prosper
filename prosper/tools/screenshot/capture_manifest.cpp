@@ -83,6 +83,11 @@ bool should_stop_after_guest_fault(const GuestOutcome& guest, bool enabled,
            seconds_since_present_advanced >= settle_seconds;
 }
 
+bool early_stop_armed(bool requested, double max_stale_seconds, double max_pixel_stale_seconds) {
+    // See the header for why a staleness bound vetoes the stop rather than merely being documented.
+    return requested && max_stale_seconds < 0 && max_pixel_stale_seconds < 0;
+}
+
 void normalize_capture_rgba(CaptureSource source, std::vector<uint8_t>& pixels) {
     // A republished guest scanout is normalized like a composited frame and for the same reason:
     // both reach the desktop through the OPAQUE swapchain, so neither one's alpha attenuates the

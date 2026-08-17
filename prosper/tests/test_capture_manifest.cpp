@@ -308,7 +308,7 @@ int main() {
               early.find("\"requested\":25") != std::string::npos &&
               early.find("\"stop_reason\":\"guest-fault\"") != std::string::npos &&
               early.find("\"timed_out\":false") != std::string::npos,
-              "a short run states saved, requested and why it is short — and is not a timeout");
+              "a short run states saved, requested and why it is short, and is not a timeout");
 
         CHECK(std::string(sampling_stop_name(SamplingStop::RequestSatisfied)) ==
                   "request-satisfied" &&
@@ -325,6 +325,57 @@ int main() {
         CHECK(stopped_run.find("\"stop_after_guest_fault\":false") != std::string::npos &&
               stopped_run.find("\"guest_fault_settle_seconds\":2.500000") != std::string::npos,
               "the run header records the early-stop policy that produced the artifact set");
+
+        // #2639 review B1. The finding was not the wording: ONE assertion family moves in the
+        // PASSING direction under a shortened run, and the live A/B could not have seen it, because
+        // neither arm set a `--max-*` flag and both therefore had the assertion off. So construct
+        // the hazard by hand, outside whatever produced that null -- the same route, sampled to the
+        // end of the request versus cut at the stop.
+        {
+            std::vector<uint8_t> frame(16 * 8 * 4, 0x44);
+            const CaptureObservation shot{CaptureSource::Rendered, 7, 7, 70, 0, 16, 8,
+                                          0xdeadbeef, 1.0};
+            CaptureTracker full, cut;
+            full.observe(shot, frame);
+            cut.observe(shot, frame);   // the single sample an early-stopped run takes
+            // The 24 byte-identical samples a full-length run goes on to take, one per second, from
+            // a guest that died at 0.4 s: same source identity, same pixels, advancing clock.
+            for (int second = 2; second <= 25; ++second) {
+                CaptureObservation later = shot;
+                later.elapsed_seconds = static_cast<double>(second);
+                full.observe(later, frame);
+            }
+            CHECK(full.max_stale_seconds() == 24.0 && full.max_pixel_stale_seconds() == 24.0,
+                  "a full-length run measures the whole quiet interval after the guest dies");
+            CHECK(cut.max_stale_seconds() == 0.0 && cut.max_pixel_stale_seconds() == 0.0,
+                  "an early-stopped run measures NO staleness: the tail it drops IS the evidence "
+                  "the staleness bounds are computed from");
+            // Which is the flip in full: one bound, two verdicts, same route.
+            const double bound = 5.0;
+            CHECK(full.max_pixel_stale_seconds() > bound &&
+                  !(cut.max_pixel_stale_seconds() > bound),
+                  "--max-pixel-stale-seconds 5 FAILS the full run and PASSES the shortened one");
+        }
+
+        // So the bound disarms the stop rather than being documented around it.
+        CHECK(early_stop_armed(true, -1.0, -1.0),
+              "with no staleness bound armed, the early stop is armed");
+        CHECK(!early_stop_armed(true, 5.0, -1.0),
+              "--max-stale-seconds disarms the early stop");
+        CHECK(!early_stop_armed(true, -1.0, 5.0),
+              "--max-pixel-stale-seconds disarms the early stop");
+        CHECK(!early_stop_armed(true, 0.0, -1.0),
+              "a ZERO staleness bound counts as armed: the assertions guard on >= 0, so reading "
+              "zero as absent would silently drop the strictest bound of all");
+        CHECK(!early_stop_armed(false, -1.0, -1.0),
+              "--no-stop-after-guest-fault stays off whatever the assertions ask for");
+
+        // The struct's own default is the policy an archived manifest reports for a producer that
+        // does not set it, so it must be the tool's default and not the "stop on the first poll
+        // after the fault" that zero means (#2639 review N1).
+        CHECK(CaptureRunConfig{}.guest_fault_settle_seconds == 1.0,
+              "the settle-window default matches the tool's, so a direct producer gets the same "
+              "policy the command line gives");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

@@ -148,6 +148,23 @@ bool should_stop_after_guest_fault(const GuestOutcome& guest, bool enabled,
                                    double seconds_since_present_advanced,
                                    double settle_seconds);
 
+// Is the early stop actually armed for this run? `requested` is what the command line asked for
+// (`--no-stop-after-guest-fault` clears it); the two staleness bounds VETO it.
+//
+// That veto is load-bearing, not defensive. `--max-stale-seconds` and `--max-pixel-stale-seconds`
+// are the only assertions in this tool derived from a MAXIMUM over the samples that were taken
+// (`CaptureTracker::observe` accumulates both, and only at a sample). Every other capture assertion
+// is a floor -- `--min-*`, `--require-*` -- and fewer samples can only push a floor further from
+// being satisfied, so a shortened run can only fail those. A maximum moves the other way: cutting
+// the tail deletes the quiet interval the bound exists to catch. Concretely, an `--allow-guest-fault`
+// run that fails today with ~24 s of measured pixel staleness would take one sample, report 0 s and
+// exit 0 -- a silently weakened assertion, which is the failure mode this project treats as the most
+// expensive. Documenting it would not undo it, so the bound disarms the stop and the run measures
+// the window it was asked to measure.
+//
+// A negative bound means "not armed", matching the `>= 0` guards on the assertions themselves.
+bool early_stop_armed(bool requested, double max_stale_seconds, double max_pixel_stale_seconds);
+
 struct CaptureRunConfig {
     std::string title;
     std::string timestamp;
@@ -175,7 +192,11 @@ struct CaptureRunConfig {
     uint32_t required_crc32 = 0;
     bool allow_guest_fault = false;
     bool stop_after_guest_fault = true;
-    double guest_fault_settle_seconds = 0;
+    // Tracks the tool's own default (`screenshot.cpp`). This field records the POLICY a run used, so
+    // a zero here is not inert: zero is "stop on the first poll after the fault", the opposite of
+    // the conservatism the settle window exists for. A producer that constructs this struct directly
+    // must not silently get a different policy than the command line gives (#2639 review N1).
+    double guest_fault_settle_seconds = 1.0;
 };
 
 class CaptureTracker {

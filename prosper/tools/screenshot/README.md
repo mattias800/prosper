@@ -101,7 +101,8 @@ that (#2007: a title that crashed 0.4 s into boot produced 25 identical PNGs and
   so a batch consumer can filter without re-reading the run log.
 - `--allow-guest-fault` is for routes that *intend* to sample a crashing title. It restores exit 0
   and reports `status=GUEST-FAULT-ALLOWED` — never `ok` — so the fault stays visible in the record,
-  and it does not disarm the `--min-*` / `--require-*` assertions.
+  and it does not disarm the `--min-*` / `--require-*` / `--max-*` assertions. (It is the flag that
+  makes the early stop below observable at all: without it a fault is exit 1 either way.)
 - A guest whose entry **returns** (a title exiting normally) is reported as `guest=returned` and is
   not a failure on its own; a run cut short by it still trips the saved/requested assertion.
 
@@ -123,7 +124,9 @@ sampling them, so the stop cannot silently truncate evidence; it can only remove
 already known-identical.
 
 - **Every sample already taken is kept**, and the run finishes normally: same verdict, same
-  assertions, same manifest, same exit status.
+  manifest, same exit status. The assertions are *not* untouched, and three bullets below state
+  exactly which: one assertion is excused, two disarm the stop outright, and the rest cannot be
+  affected in either direction.
 - **The short artifact set explains itself.** The summary line reads
   `done: 3/25 screenshot(s) … stop=guest-fault … status=GUEST-FAULT`, and the manifest summary
   carries `stop_reason` (`request-satisfied` | `timeout` | `guest-fault`) beside the `saved` and
@@ -134,6 +137,21 @@ already known-identical.
   is due again regardless of the guest and the remainder are guaranteed duplicates. In frame
   (`--every`) mode a dead, quiet guest produces no new frame for `due` to fire on, so nothing more
   would have been written and the shortfall still fails.
+- **`--max-stale-seconds` and `--max-pixel-stale-seconds` disarm the stop entirely.** Both are
+  *maxima over the samples that were taken* — `CaptureTracker::observe` accumulates them, and only at
+  a sample — so cutting the tail deletes precisely the quiet interval they exist to catch. A run with
+  `--allow-guest-fault --max-pixel-stale-seconds 5` that fails over the full window (25 samples,
+  ~24 s stale, exit 1 `FAILED`) would, if the stop were left armed, take one sample, report 0 s and
+  exit 0. So arming either bound keeps the full-length loop, and the manifest run header records
+  `"stop_after_guest_fault": false` — the policy the run actually used, not the one requested — with
+  the bounds themselves in the same `assertions` object next to it. The run log says so too.
+- **Nothing else the tool asserts can be affected.** Every remaining flag assertion is a floor —
+  `--min-distinct-frames`, `--min-pixel-distinct-frames`, `--min-present-count`, `--min-frame-seq`,
+  `--require-composited-frame`, `--require-crc32` — and fewer samples can only push a floor further
+  from being satisfied. The one assertion that is not a flag, *manifest could not be written
+  completely*, is an I/O check on the tool itself: a shortened run makes fewer sample writes, but the
+  summary write and the `fclose` still happen, so an unwritable manifest is still caught. The stop
+  can shorten a run; it cannot turn a failing run into a passing one.
 - **A guest that *returns* does not trigger this.** A title exiting on its own is not a dead guest,
   and a run cut short by it must keep tripping the saved/requested assertion, as above.
 - `--no-stop-after-guest-fault` restores the old full-length sampling, and both the flag and the
