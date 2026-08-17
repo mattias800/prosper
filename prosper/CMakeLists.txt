@@ -187,6 +187,12 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME doc_table_checker
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/docs/test_check_numbered_table.py")
+  # Every `trap NNN` reference in the repository must name a row that exists. Half this suite is
+  # FALSE-POSITIVE cases (`s_trap 1`, a bare number, "trapdoor"), because this checker scans every
+  # tracked file and one that fires on ordinary prose or on an RDNA2 mnemonic gets disabled.
+  add_test(NAME trap_citation_checker
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/docs/test_check_trap_citations.py")
   # Parsing/gating logic of the Vulkan validation guard (#1704). Pure — it does not create a Vulkan
   # instance, so it runs everywhere. A parser that stops matching the layer's message framing would
   # report a clean suite forever, which is the one way this guard can fail silently.
