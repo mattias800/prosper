@@ -34,7 +34,8 @@ public:
     // playback these titles use it for. Hardware acceleration can be layered on later without
     // changing this interface.
     int open_decoder(uint32_t codec) override;
-    bool decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame& out) override;
+    AuResult decode_au(int id, const uint8_t* au, size_t bytes,
+                       uint8_t* dst, uint64_t dst_bytes, AuPicture& out) override;
     void close_decoder(int id) override;
 
 private:
