@@ -1,15 +1,30 @@
 # Blue Prince (PPSA25009, Unity/IL2CPP) — status & investigation map
 
-Last revised: 2026-08-03 (snapshot route/reference triage; see Ruled out). Prior history:
-#1216 (closed — boot/blank-frame era), #1264 (Day One hold investigation), #1287 (visuals umbrella,
-open).
+Last revised: 2026-08-17 (ladder position reconciled against tracker #1808 and the checked-in guard;
+the investigation body below is unchanged and still dated 2026-08-03 — snapshot route/reference
+triage, see Ruled out). Prior history: #1216 (closed — boot/blank-frame era), #1264 (Day One hold
+investigation), #1287 (visuals umbrella, open).
 
 ## Ladder position
 
-**Rung 3 — gameplay with real GPU draws, sustained.** The scripted fresh-save route plays the
+**Rung 6 — reviewed automatic gameplay snapshot guard.** The scripted fresh-save route plays the
 intro cinematic, loads Day One, walks the manor approach, opens the front door, and explores
-Mount Holly's entrance hall/vestibule with the footstep HUD advancing. Materials and the display chain are now hardware-faithful offline (families 1-3
-resolved 2026-07-26); rung 4 needs the live oracle side-by-side plus families 4-5.
+Mount Holly's entrance hall/vestibule with the footstep HUD advancing. Materials and the display
+chain are now hardware-faithful offline (families 1-3 resolved 2026-07-26).
+
+Rung 3 was cleared by that route; rungs 4-6 were cleared afterwards and this section lagged behind
+them. Per tracker [#1808](https://github.com/mattias800/prosper/issues/1808) (2026-08-06, master
+`730d434e`): the live renderer is confirmed by eye, the hall has a checked-in PS5 hardware
+comparison ([`screenshots/issue-1287-hall-live-vs-oracle.png`](screenshots/issue-1287-hall-live-vs-oracle.png)),
+and `blue-prince-hall` guards the restored scene using reviewed evidence from two independent
+fresh-save runs. Both `blue-prince-title` and `blue-prince-hall` are registered in
+`tools/snapshot/snapshots.json`, the latter with a `review` note approving all 16 composited
+1920x1080 hall images from those two runs. The obsolete hall baseline was replaced by #1813,
+closing #1433.
+
+Rung 6 is not "finished": [#1287](https://github.com/mattias800/prosper/issues/1287) (floating
+black wall-lamp rectangles, centre-hall RGB-noise ball), #1284/#1733 (the CPU-side per-draw buffer
+path) and #1178 (intermittent boot) remain open against a guarded title.
 
 Reaching the frame loop uses the standard gated switches:
 
