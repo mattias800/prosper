@@ -218,9 +218,11 @@ bool draw_binds_color_target(const prosper::gpu::DrawItem& draw, uint64_t addr) 
 // ran", and a watched address absent from the cache says so explicitly rather than looking like a
 // silent zero.
 //
-// `strtoull(..., 0)` is used deliberately, so `0x` is required: a bare `2063380000` would parse as
-// DECIMAL and watch an unrelated address while reporting success. That exact base-0 mistake is
-// recorded as an instrument trap for PROSPER_TARGET_WATCH.
+// Addresses are parsed by the shared STRICT parser (`watch_list.hpp`), which requires an explicit `0x`,
+// full token consumption, no overflow and no zero address, and arms NOTHING on a malformed spec. An
+// earlier revision of this comment claimed `strtoull(..., 0)` was deliberate "so `0x` is required" —
+// that was simply false, since base 0 falls back to DECIMAL, and the comment made the bug read as
+// checked. The same trap is recorded for PROSPER_TARGET_WATCH, which now uses the same parser.
 struct RttInvalidateWatch {
     std::vector<uint64_t> addrs;
     std::atomic<uint64_t> writes_examined{0};

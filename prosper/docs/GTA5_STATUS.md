@@ -3389,7 +3389,7 @@ question, not a GPU one. It shares the frontier with one unfinished measurement:
 the failing compute kernels that no instrument has resolved (see the section below for exactly which,
 and why their null does not count yet).
 
-### The composite's tap is renderer-owned, bound by ONE observed draw, and never refreshed (2026-08-17)
+### The composite's tap is renderer-owned, bound by ONE observed draw, with no observed notified refresh (2026-08-17)
 
 Three measurements on the same routed boot, each with its denominator, narrow the tap
 `0x2063380000` (`Float10_11_11`, 4K) to a single remaining question.
