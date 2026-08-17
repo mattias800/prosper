@@ -69,6 +69,15 @@ silently stops describing the tree, which is the same failure class this tool ex
   - A disjunction is treated as ungated: `if (getenv("A") || flag)` imposes no requirement, and
     `if (getenv("A") || getenv("B"))` imposes none either. That understates deliberately -- it is
     the direction that produces no false accusation.
+  - A NEGATED env test imposes nothing, for the same reason: `if (!getenv("X"))` and the opt-out
+    `getenv("PROSPER_NO_X") == nullptr` both run on a default boot. Corollary, and a real gap:
+    `if (getenv("X")) return;` genuinely does make the remainder require X to be UNSET, which is a
+    coupling this tool has no way to express and therefore does not report.
+  - An argument list is read as one conjunct, so `f(getenv("A") != nullptr, limit_from_B)` yields
+    the any-of clause `{A|B}` rather than the two independent parameters it is. That widens a
+    clause, which is the understating direction for TWO-GATE.
+  - A braceless `if` body is not scoped: `if (a) if (b) x = c;` attributes `x` to the enclosing
+    block. LITERAL_RHS_RE exists because of this -- see the defaulted-alias rule in run().
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
@@ -87,6 +96,25 @@ from pathlib import Path
 
 SCAN_DIRS = ("src", "frontends", "tools", "tests")
 SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp")
+
+# The four classifications a baseline row may carry. `unreviewed` is honest debt; the other three
+# are judgements, and the JUDGEMENT is the expensive artifact in that file -- each cost a human
+# reading a diagnostic and deciding whether its zero can lie. See baseline_integrity().
+BASELINE_CLASSES = ("defect", "config-echo", "benign", "unreviewed")
+
+# How many `unreviewed` rows the baseline is allowed to carry -- asserted EXACTLY, not as a ceiling.
+#
+# Exactly, because the two directions are different events and both want a human:
+#   more than this -> debt was ADDED. `--emit-baseline` writes EVERY row as `unreviewed`, so this
+#     is precisely what "just regenerate the baseline" looks like after it has laundered a `defect`
+#     row into an unjudged one. That is the failure this whole file exists to prevent, and until
+#     now nothing in the tool could see it: load_baseline() kept the note only so `--list` could
+#     echo it, and the header's class counts were skipped as comments.
+#   fewer than this -> debt was PAID. Tightening the number is then a one-line, visible, reviewable
+#     edit, and the ratchet is self-arming: it can only be loosened deliberately and in the diff.
+# #2572 is annotating the remaining rows; when it lands this becomes 0 and no unjudged row can
+# enter the baseline again.
+UNREVIEWED_BUDGET = 40
 
 ENV_NAME = r"PROSPER_[A-Z0-9_]+"
 # Every way this tree asks for a PROSPER_* variable. `env_enabled("X")` and friends pass the name
@@ -146,6 +174,27 @@ ASSIGN_RE = re.compile(
 NEGATIVE_TEST_RE = re.compile(r"(?:^\s*!|!\s*[A-Za-z_(]|==\s*(?:nullptr|NULL|0)\b|<=\s*0\b|"
                               r"==\s*0\b|\.empty\(\)|!\*)")
 
+# A comparison that follows an env read and INVERTS it. `getenv("X") == nullptr` is this tree's
+# opt-OUT idiom -- it is TRUE when X is unset -- and `<= 0` is the same thing for a numeric read.
+INVERTING_TAIL_RE = re.compile(r"^\s*(?:==\s*(?:nullptr|NULL|0)\b|<=\s*0\b|<\s*1\b)")
+
+# A lambda introducer at the head of an initialiser: `[&](args) {`, `[] {`, `[=]() -> bool {`.
+LAMBDA_INTRO_RE = re.compile(r"^\s*\[[^\]\[]*\]\s*(?:\(|\{|mutable\b|constexpr\b|noexcept\b|->)")
+
+# `name =` with the compound and comparison forms excluded: `+=`/`!=`/`<=`/`==` all fail to match
+# because the character before `=` is then not part of the identifier and not whitespace.
+ASSIGN_TO_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
+
+# A COMPILED-IN CONSTANT -- the thing a "supply a default" statement assigns. Deliberately narrower
+# than "any value not derived from the environment": a computed RHS (`resdump = strtoull(fa, ...) ==
+# code_addr;`, gpu_executor.cpp:6417) sits under a braceless `if` whose condition this scanner does
+# not scope, so treating it as a default would retire the alias on a path that is not actually
+# reachable by default -- and that row is a live two-gate finding. A literal cannot be conditional
+# on anything the scanner missed. (`""` is what strip_comments() leaves of any non-PROSPER_ string.)
+LITERAL_RHS_RE = re.compile(
+    r"^\s*-?(?:\d+(?:\.\d*)?[uUlLfF]*|0[xX][0-9a-fA-F]+[uUlL]*"
+    r"|true|false|nullptr|NULL|\"\"|''|\{\s*\})\s*$")
+
 
 # --------------------------------------------------------------------------------------------
 # Lexing
@@ -202,6 +251,124 @@ def strip_comments(text: str) -> list[str]:
 
 def env_literals(expr: str) -> set[str]:
     return set(ENV_LITERAL_RE.findall(expr))
+
+
+# --------------------------------------------------------------------------------------------
+# Polarity
+#
+# A gate is "X must be SET". An env test that is NEGATED says the opposite, and this tree writes
+# far more of the negated form than the plain one -- `PROSPER_NO_*` is the standard opt-OUT idiom,
+# so `getenv("PROSPER_NO_RESOLVE") == nullptr` is TRUE on a default run and imposes nothing.
+# Reading those as requirements was the single commonest reason a finding was not a real coupling
+# (#2572 measured 47 of 79 reviewed rows, with this as the largest cluster; #2628).
+#
+# The negation was ALREADY pushed through for the early-return form (guard_gates()), so before this
+# the two spellings of one idea disagreed with each other:
+#
+#     if (!getenv("X")) return;        -- the remainder requires X    (correct)
+#     if (!getenv("X")) { ... }        -- the block required X        (backwards)
+#
+# It is done per LITERAL rather than per operand on purpose. A whole-operand test (the shape
+# NEGATIVE_TEST_RE encodes for guard_gates) is applied to text that is sometimes an entire function
+# body -- collect_predicates() calls clauses_of() on one -- where a single `.empty()` or `== 0`
+# anywhere would retire every gate in it. Per-literal, `getenv("A") && !getenv("B")` correctly
+# yields just {A}.
+# --------------------------------------------------------------------------------------------
+def _matching_close(expr: str, open_pos: int) -> int:
+    depth = 0
+    for pos in range(open_pos, len(expr)):
+        if expr[pos] == "(":
+            depth += 1
+        elif expr[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                return pos
+    return -1
+
+
+def _enclosing_open(expr: str, idx: int) -> int:
+    """Position of the nearest `(` to the left of idx that is still open at idx, or -1."""
+    depth, j = 0, idx - 1
+    while j >= 0:
+        ch = expr[j]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            if depth == 0:
+                return j
+            depth -= 1
+        j -= 1
+    return -1
+
+
+_MAX_PAREN_LEVELS = 8
+
+
+def _is_negated(expr: str, idx: int) -> bool:
+    """Does an ODD number of inversions apply to the env literal at `idx`?
+
+    Walks outward through the paren groups that enclose the literal. At each level two inversions
+    are recognised, and both must be, because expand() rewrites an alias into a nested paren group:
+    `!profile_fold` becomes `!((getenv("PROSPER_STAGE_FOLD_PROFILE")))`, where the `!` is three
+    levels out from the literal.
+
+      - a `!` before the callee that opens the group -- `!getenv(`, `!*getenv(`, `!(`;
+      - an inverting comparison after the group closes -- `getenv("X") == nullptr`.
+    """
+    negated, i, levels = False, idx, 0
+    while levels < _MAX_PAREN_LEVELS:
+        open_pos = _enclosing_open(expr, i)
+        if open_pos < 0:
+            break
+        levels += 1
+        k = open_pos - 1
+        while k >= 0 and expr[k].isspace():
+            k -= 1
+        while k >= 0 and (expr[k].isalnum() or expr[k] in "_:"):   # the callee name
+            k -= 1
+        while k >= 0 and (expr[k].isspace() or expr[k] == "*"):    # `!*getenv(...)`
+            k -= 1
+        # `expr[k-1] not in "!=<>"` keeps `a != getenv(...)` and `!!x` from reading as one negation.
+        if k >= 0 and expr[k] == "!" and (k == 0 or expr[k - 1] not in "!=<>"):
+            negated = not negated
+        close = _matching_close(expr, open_pos)
+        if close >= 0 and INVERTING_TAIL_RE.match(expr[close + 1:]):
+            negated = not negated
+        i = open_pos
+    return negated
+
+
+def positive_env_literals(expr: str) -> set[str]:
+    """The PROSPER_* names this expression requires to be SET for it to be true."""
+    return {m.group(1) for m in ENV_LITERAL_RE.finditer(expr)
+            if not _is_negated(expr, m.start())}
+
+
+def split_ternary(expr: str) -> tuple[str, str, str] | None:
+    """`cond ? then : else` split at nesting depth 0, or None.
+
+    Brackets and braces count as well as parens, so the `return e ? atol(e) : 0;` inside an
+    immediately-invoked lambda is NOT seen as the initialiser's own ternary.
+    """
+    expr = unwrap(expr)
+    depth, q = 0, -1
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and ch == "?":
+            if q < 0:
+                q = i
+        elif depth == 0 and ch == ":" and q >= 0:
+            if expr[i:i + 2] == "::" or (i and expr[i - 1] == ":"):
+                i += 2
+                continue
+            return expr[:q], expr[q + 1:i], expr[i + 1:]
+        i += 1
+    return None
 
 
 def unwrap(expr: str) -> str:
@@ -271,17 +438,23 @@ def clauses_of(expr: str) -> frozenset:
         getenv(A) && getenv(B)   -- BOTH needed          -> two clauses {A}, {B}
         getenv(A) || getenv(B)   -- EITHER suffices      -> one clause {A, B}
         getenv(A) || flag        -- neither is required  -> no clause
+        getenv(A) && !getenv(B)  -- only A is required   -> one clause {A}
+        getenv(A) || !getenv(B)  -- neither is required  -> no clause
 
     Read flat, the second reads as "both required" and manufactures a two-gate finding that does
     not exist -- 133 of the first tree run's findings came from that, including one predicate the
     scanner claimed required all sixteen of its alternatives.
+
+    The last two lines are polarity (#2628): a negated env test is satisfied by the DEFAULT run, so
+    it constrains nothing, and a disjunct that is satisfiable with nothing set leaves the whole
+    disjunction unconstrained. See positive_env_literals().
     """
     disjuncts = split_top_level(expr, "||")
-    per: list[set[str]] = [env_literals(d) for d in disjuncts]
+    per: list[set[str]] = [positive_env_literals(d) for d in disjuncts]
     if len(disjuncts) == 1:
         out = set()
         for operand in split_top_level(disjuncts[0], "&&"):
-            names = env_literals(operand)
+            names = positive_env_literals(operand)
             if names:
                 out.add(frozenset(names))
         return frozenset(out)
@@ -310,6 +483,154 @@ def simplify(ctx) -> frozenset:
             continue
         out.append(c)
     return frozenset(out)
+
+
+def expand_with(aliases: dict[str, frozenset], expr: str) -> str:
+    """Splice each alias back in as an explicit `(A || B) && (C)` so clauses_of() can read it."""
+    def sub(m):
+        ctx = aliases.get(m.group(0))
+        if not ctx:
+            return m.group(0)
+        return "(" + " && ".join(
+            "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
+            for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
+    return re.sub(r"\b[A-Za-z_]\w*\b", sub, expr)
+
+
+def guard_clauses(cond: str, expand) -> frozenset:
+    """For `if (COND) return;` -- what the REST requires, i.e. the gates of !COND.
+
+    The negation has to be pushed through, and getting that backwards inverts the answer:
+
+        if (!a || !b) return;      remainder needs a AND b   -> two clauses
+        if (a <= 0 && !b) return;  remainder needs a OR b    -> one any-of clause
+
+    The second form is the one that mattered: reading it as "both" made the scanner keep reporting
+    the very instance #2149's fix had just repaired, because the repaired function opens with
+    exactly `if (interval <= 0 && !dump_unimpl) return;`. A checker that cannot see its own fix
+    land is worse than none -- it teaches people to regenerate past it.
+
+    Only NEGATIVE tests contribute. The negation of a positive test (`if (GATE) return;`) says the
+    remainder needs GATE unset, which is not a gate; and any operand whose negation is not an env
+    fact leaves its whole disjunct unconstrained.
+    """
+    out: set = set()
+    for disjunct in split_top_level(cond, "||"):
+        clause: set = set()
+        unconstrained = False
+        for operand in split_top_level(disjunct, "&&"):
+            if not NEGATIVE_TEST_RE.search(operand):
+                unconstrained = True
+                break
+            names = env_literals(expand(operand))
+            if not names:
+                unconstrained = True
+                break
+            clause |= names
+        if not unconstrained and clause:
+            out.add(frozenset(clause))
+    return frozenset(out)
+
+
+def split_statements(text: str) -> list[str]:
+    """Split on `;` at nesting depth 0."""
+    out, buf, depth = [], [], 0
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth <= 0:
+            out.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if "".join(buf).strip():
+        out.append("".join(buf))
+    return out
+
+
+IF_RETURN_RE = re.compile(r"^\s*if\s*\((.*)\)\s*\{?\s*return\b(.*)$", re.S)
+RETURN_RE = re.compile(r"^\s*return\b(.*)$", re.S)
+
+
+def predicate_clauses(body_text: str) -> frozenset:
+    """The requirement that calling a short bool/int predicate imposes.
+
+    This used to be `clauses_of()` over the whole joined body, which happened to work only because
+    polarity was ignored: every `PROSPER_*` literal anywhere in the body became an alternative of
+    one any-of clause. Once negation is modelled (#2628) that reading is actively wrong in BOTH
+    directions at once, and `dyntrace_failed_shader_enabled` (gpu_executor.cpp:401) shows both:
+
+        if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;   // a GUARD -- FAIL is required
+        const char* filter = std::getenv("PROSPER_DYNTRACE_FAIL_ADDR");
+        if (!filter) return true;                                  // early SUCCESS -- optional
+
+    A flat any-of read said `FAIL|FAIL_ADDR`; a flat polarity read would have said `FAIL_ADDR` and
+    dropped the one variable that IS required, silently weakening a `defect` row's key. A predicate
+    body is a function body, so it is read as one: guards impose their negation (the same rule
+    guard_clauses() already applied to early returns in ordinary code), an early truthy return ends
+    the accumulation, and a declaration is an alias rather than a requirement of its own.
+
+    A body in which NO statement is recognised falls back to the flat reading, so a `static int v =
+    -1; if (v < 0) { ... }` memo (`audiolog_level`, hle_audio.cpp:327) keeps its gate instead of
+    quietly resolving to nothing -- the direction that disables a rule.
+
+    Statements this does not recognise contribute nothing -- the understating direction, which is
+    the one that makes no false accusation.
+    """
+    body = body_text[body_text.find("{") + 1:] if "{" in body_text else body_text
+    aliases: dict[str, frozenset] = {}
+    ctx: set = set()            # required on every path that can return true
+    alts: list[frozenset] = []  # one per `if (COND) return <truthy>;` early exit
+    tail: set = set()           # what the path falling through all of them requires
+    recognised = False
+
+    def exp(expr: str) -> str:
+        return expand_with(aliases, expr)
+
+    for stmt in split_statements(body):
+        m = IF_RETURN_RE.match(stmt)
+        if m:
+            recognised = True
+            cond = unwrap(m.group(1))
+            value = m.group(2).strip().split(";")[0].strip()
+            if value and not DEFAULT_RHS_RE.match(value):
+                alt = clauses_of(exp(cond))
+                if not alt:
+                    # `if (!filter) return true;` -- true with nothing further armed, so the guards
+                    # already collected are the whole necessary condition.
+                    return simplify(ctx)
+                alts.append(alt)
+            else:
+                (tail if alts else ctx).update(guard_clauses(cond, exp))
+            continue
+        m = RETURN_RE.match(stmt)
+        if m:
+            recognised = True
+            (tail if alts else ctx).update(clauses_of(exp(m.group(1))))
+            continue
+        dm = DECL_RE.match(stmt.strip())
+        if dm:
+            got = clauses_of(exp(dm.group(2)))
+            if got:
+                aliases[dm.group(1)] = got
+
+    if not recognised:
+        return simplify(set(clauses_of(body)))
+    if alts:
+        # Several exits can return true, so what is NECESSARY is the disjunction of their
+        # requirements -- `report_selected_sbuffer_reject` (rdna2_gta5_compute_contracts.cpp:39)
+        # returns early under PROSPER_DBG and otherwise needs PROSPER_GTA5_SBUFFER_REJECT, so
+        # either one alone reaches the report. Expressible only when every branch is a single
+        # clause; otherwise the disjunction is dropped, which understates.
+        branches = alts + [frozenset(tail)]
+        if all(len(b) == 1 for b in branches):
+            names: set[str] = set()
+            for b in branches:
+                names |= set(next(iter(b)))
+            ctx.add(frozenset(names))
+    return simplify(ctx)
 
 
 def collect_predicates(files: dict[Path, list[str]]) -> dict[str, frozenset]:
@@ -345,7 +666,7 @@ def collect_predicates(files: dict[Path, list[str]]) -> dict[str, frozenset]:
             text = " ".join(body)
             if not env_literals(text):
                 continue
-            seen.setdefault(m.group(1), []).append(clauses_of(text))
+            seen.setdefault(m.group(1), []).append(predicate_clauses(text))
     return {name: variants[0] for name, variants in seen.items()
             if variants[0] and all(v == variants[0] for v in variants)}
 
@@ -483,43 +804,45 @@ class FileScanner:
                 for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
         return re.sub(r"\b[A-Za-z_]\w*\b", sub, expr)
 
+    @staticmethod
+    def alias_is_a_gate(rhs: str) -> bool:
+        """Is this initialiser's VALUE the thing an env switch decides? Two shapes say no. #2628.
+
+        1. A STORED LAMBDA. `auto readable = [&](uint64_t a, uint32_t n) { ... }` holds a callable,
+           not a value, so the `PROSPER_*` names in its body belong to the branch inside it -- but
+           the block-scope alias path resolved them anyway and exported the requirement to every
+           later `readable(...)` CALL, invisibly at the call site. `readable`
+           (gpu_executor.cpp:2854) and `build_bds` (live_renderer.cpp:5602) are the measured
+           instances; collect_predicates() already declines to alias a whole function for exactly
+           this reason and the lambda path applied no such restriction.
+           An IMMEDIATELY-INVOKED lambda is the opposite case and stays: `static const long
+           interval = [] { ... getenv("PROSPER_PROGRESS") ...; }();` really does hold a value the
+           environment decides, and #2149's fourth measured instance depends on it resolving.
+           The two are told apart by the trailing `()`.
+
+        2. A TERNARY WITH A LIVE DEFAULT. `X ? atoi(X) : 60` yields 60 when X is unset, so the
+           value exists either way and testing it later is not an env gate. `X ? atol(X) : 0` is
+           NOT that: DEFAULT_RHS_RE is the tool's existing statement of which literals mean
+           "unset", and a falsy default keeps the alias -- which is what makes `if (interval <= 0)
+           return;` still impose PROSPER_PROGRESS.
+        """
+        body = rhs.strip().rstrip(";").strip()
+        if LAMBDA_INTRO_RE.match(body):
+            return body.endswith(")")          # invoked -> a value; stored -> a callable
+        parts = split_ternary(body)
+        if parts is not None:
+            fallback = parts[2].strip()
+            if fallback and not DEFAULT_RHS_RE.match(fallback) and "PROSPER_" not in fallback:
+                return False
+        return True
+
     def required(self, cond: str) -> frozenset:
         """The gate context a condition imposes on the block it opens."""
         return clauses_of(self.expand(cond))
 
     def guard_gates(self, cond: str) -> frozenset:
-        """For `if (COND) return;` -- what the REST of the block requires, i.e. the gates of !COND.
-
-        The negation has to be pushed through, and getting that backwards inverts the answer:
-
-            if (!a || !b) return;    remainder needs a AND b   -> two clauses
-            if (a <= 0 && !b) return;  remainder needs a OR b  -> one any-of clause
-
-        The second form is the one that mattered: reading it as "both" made the scanner keep
-        reporting the very instance this issue's fix had just repaired, because the repaired
-        function opens with exactly `if (interval <= 0 && !dump_unimpl) return;`. A checker that
-        cannot see its own fix land is worse than none -- it teaches people to regenerate past it.
-
-        Only NEGATIVE tests contribute. The negation of a positive test (`if (GATE) return;`)
-        says the remainder needs GATE unset, which is not a gate; and any operand whose negation
-        is not an env fact leaves its whole disjunct unconstrained.
-        """
-        out: set = set()
-        for disjunct in split_top_level(cond, "||"):
-            clause: set = set()
-            unconstrained = False
-            for operand in split_top_level(disjunct, "&&"):
-                if not NEGATIVE_TEST_RE.search(operand):
-                    unconstrained = True
-                    break
-                names = env_literals(self.expand(operand))
-                if not names:
-                    unconstrained = True
-                    break
-                clause |= names
-            if not unconstrained and clause:
-                out.add(frozenset(clause))
-        return frozenset(out)
+        """For `if (COND) return;` -- what the REST of the block requires. See guard_clauses()."""
+        return guard_clauses(cond, self.expand)
 
     # -- the walk ----------------------------------------------------------------------------
     def note_local(self, var: str, line_no: int, gates: frozenset, is_write: bool):
@@ -663,6 +986,38 @@ class FileScanner:
                     for ident in IDENT_RE.findall(args):
                         self.note_local(ident, i + 1, here, False)
 
+            # ---- a DEFAULTED alias stops being (only) its own gate -------------------------
+            # `const char* out = getenv("X"); if (!out || !*out) out = "shader0.bin";` leaves `out`
+            # holding a compiled-in default on exactly the path where X is unset, so every later
+            # `if (...out...)` is not gated on X at all (hle_graphics.cpp:1249). The repair sits
+            # inside an `if`, so the SPLIT-LOCAL write path never saw it. #2628.
+            #
+            # The alias is WIDENED rather than dropped, because the second value may itself be
+            # reachable only under a different switch -- `if (g_dyntrace_force) resdump = true;`
+            # (gpu_executor.cpp:6418) means `resdump` is true under PROSPER_RESDUMP *or* under the
+            # dyntrace-failure replay, which is a real any-of requirement and not "no requirement".
+            # Dropping it there would have retired a live coupling; widening keeps it and still
+            # collapses the `out` case, because the default is assigned inside the alias's own gate
+            # so simplify() absorbs the widened clause into it.
+            for am2 in ASSIGN_TO_NAME_RE.finditer(line):
+                name = am2.group(1)
+                value = line[am2.end():].split(";")[0]
+                if not LITERAL_RHS_RE.match(value):
+                    continue
+                for s in reversed(self.stack):
+                    if name not in s.aliases:
+                        continue
+                    at = simplify(set(here) | set(cond_gates))
+                    have = s.aliases[name]
+                    if len(at) == 1 and len(have) == 1:
+                        s.aliases[name] = frozenset(
+                            {frozenset(next(iter(have)) | next(iter(at)))})
+                    else:
+                        # Reachable with nothing armed, or a requirement no single clause can
+                        # express: the alias no longer stands for an env switch.
+                        del s.aliases[name]
+                    break
+
             # ---- scoped alias declaration --------------------------------------------------
             if cond is None:
                 dm2 = DECL_RE.match(line)
@@ -671,7 +1026,7 @@ class FileScanner:
                     rhs, used = self.gather_statement(i, eq + 1) if eq >= 0 else (dm2.group(2), 1)
                     consumed = max(consumed, used)
                     ctx = clauses_of(self.expand(rhs))
-                    if ctx:
+                    if ctx and self.alias_is_a_gate(rhs):
                         self.stack[-1].aliases[dm2.group(1)] = ctx
 
             # ---- brace bookkeeping ---------------------------------------------------------
@@ -708,6 +1063,18 @@ class FileScanner:
         return self.findings
 
 
+def implies(a: frozenset, b: frozenset) -> bool:
+    """Does satisfying gate context `a` also satisfy `b`? (CNF absorption, one direction.)
+
+    `{A}` implies `{A|B}`: arming A satisfies both. simplify() already collapses that pair inside a
+    single context; two SEPARATE contexts were compared by clause-set IDENTITY, so an implication
+    read as a disagreement -- `hle_audio.cpp` `audio2log`, called under {AUDIO2LOG} at :1698 and
+    under {AUDIO2LOG|AUDIO2_PROBE} at :1901, where the first site's arming satisfies the second.
+    #2628.
+    """
+    return all(any(ca <= cb for ca in a) for cb in b)
+
+
 def split_call_findings(call_sites: dict[str, list[tuple[str, frozenset]]],
                         defined: set[str]) -> list[Finding]:
     """SPLIT-CALL: a callee reached only under gates whose call sites do not agree.
@@ -728,7 +1095,7 @@ def split_call_findings(call_sites: dict[str, list[tuple[str, frozenset]]],
         pair = None
         for a in distinct:
             for b in distinct:
-                if a != b and not (a & b):
+                if a != b and not (a & b) and not implies(a, b) and not implies(b, a):
                     pair = (a, b)
                     break
             if pair:
@@ -861,9 +1228,98 @@ def inventory(files: dict[Path, list[str]]) -> dict[str, list[str]]:
 
 
 # --------------------------------------------------------------------------------------------
+# Paired arms for the four lexical limits closed in #2628.
+#
+# Every one of those fixes makes the scanner report FEWER findings, which is the direction that can
+# silently disable a rule -- this scanner has already done it once (`SPLIT-LOCAL` reporting 0 across
+# `src/` while structurally blind, in the audit's `## Ruled out`). So each is written as a PAIR that
+# differs only in the property under test, and the must-match half is what stops "fewer findings"
+# from becoming "no findings":
+#
+#   1 polarity        `== nullptr` vs `!= nullptr` -- ONE character apart
+#                     `if (!getenv(X)) { ... }` vs `if (!getenv(X)) return;` -- the two spellings
+#                     that used to disagree with each other
+#   2 defaulted alias the same function with and without its `if (!out) out = "...";` repair line
+#                     `? atoi(e) : 60` vs `? atoi(e) : 0` -- one character, and the difference
+#                     between an optional parameter and an off-by-default switch
+#   3 lambda alias    the same body STORED (`auto g = [&]{...};`, called later) vs IMMEDIATELY
+#                     INVOKED (`const bool g = [&]{...}();`). The use site differs -- `g(...)` vs
+#                     `g` -- because it must: that IS the property under test, and no C++ spells
+#                     both the same way. The assertion is on the exact rendered requirement, which
+#                     only the alias branch can produce.
+#   4 split-call      a second call site whose gate is IMPLIED by the first (`{A}` vs `{A|B}`)
+#                     versus one that is DISJOINT from it (`{A}` vs `{B}`)
+#
+# Each must-not-match half was checked to be a FINDING on the pre-#2628 scanner, so none of them is
+# passing because it was never in the rule's reach.
+#
+# Two further arms cover predicate_clauses(), which polarity forced to be rewritten: a predicate
+# whose body is `guard; optional filter; early success` must impose the GUARD's variable and not
+# the filter's, and one with two truthy exits must impose their disjunction. Both assert the exact
+# requirement string, so dropping a variable and adding one fail differently.
+# --------------------------------------------------------------------------------------------
+_OPT_OUT = """
+void report(const State& st) {
+    static const bool resolve_on = std::getenv("PROSPER_ZZ_NO_RESOLVE") %s nullptr;
+    if (resolve_on) {
+        if (getenv("PROSPER_ZZ_RESOLVE_LOG")) fprintf(stderr, "[zz] %%u\\n", st.id);
+    }
+}
+"""
+
+_DEFAULTED_ALIAS = """
+void dump_shader(const char* nid) {
+    if (getenv("PROSPER_ZZ_AGCSHADER")) {
+        const char* out = getenv("PROSPER_ZZ_AGCSHADER_OUT");
+%s        if (FILE* f = fopen(out, "wb")) { fprintf(stderr, "  [wrote %%s]\\n", out); }
+    }
+}
+"""
+
+_TERNARY_DEFAULT = """
+void dump_pass(uint64_t frame) {
+    if (getenv("PROSPER_ZZ_DUMP_PASS")) {
+        const char* e = getenv("PROSPER_ZZ_DUMP_PASS_EVERY");
+        const int every = e ? atoi(e) : %s;
+        if (every) { fprintf(stderr, "  [pass every=%%d]\\n", every); }
+    }
+}
+"""
+
+_LAMBDA_ALIAS = """
+void fold(const Stage& s) {
+    %s
+    if (getenv("PROSPER_ZZ_DYNTRACE")) {
+        if (%s) fprintf(stderr, "[zz] %%llu\\n", s.addr);
+    }
+}
+"""
+
+_SPLIT_CALL_GATES = """
+bool audio2log() {
+    static const bool on = std::getenv("PROSPER_ZZ_AUDIO2LOG") != nullptr;
+    return on;
+}
+void probe_dump(uint64_t p) {
+    g_history.insert(p);
+}
+void trace_call(uint64_t p) {
+    if (audio2log()) {
+        probe_dump(p);
+    }
+}
+void trace_probe(uint64_t p) {
+    if (%s) {
+        probe_dump(p);
+    }
+}
+"""
+
+
+# --------------------------------------------------------------------------------------------
 # Self-test. Every case is a shape MEASURED in this tree, reduced to the smallest form that keeps
-# the signature. Five of the nine assert on what must NOT match: a checker that fires on sound
-# code gets skipped, not heeded.
+# the signature. More than half assert on what must NOT match: a checker that fires on sound code
+# gets skipped, not heeded.
 #
 # This is also the positive control the charter demands, and it is deliberately NOT drawn from the
 # tree scan: a control built by the same machinery as the null inherits the null's blind spots and
@@ -1019,6 +1475,101 @@ void diagnose_resource_provenance(const State& st) {
     }
 }
 """, []),
+
+    # ---- #2628 limit 1: polarity ------------------------------------------------------------
+    # The opt-OUT idiom is this tree's standard default-ON switch, so PROSPER_ZZ_NO_RESOLVE being
+    # in the requirement was backwards: the block runs when it is UNSET. Its partner differs by
+    # one character and must still be a two-gate report.
+    ("opt-out (`== nullptr`) is satisfied by a DEFAULT run, so it gates nothing",
+     _OPT_OUT % "==", []),
+    ("opt-in (`!= nullptr`) is a real gate -- one character from the arm above",
+     _OPT_OUT % "!=", ["TWO-GATE:PROSPER_ZZ_NO_RESOLVE+PROSPER_ZZ_RESOLVE_LOG"]),
+    # These two spellings of one idea used to DISAGREE: the negation was pushed through for the
+    # early-return form and not for the block form, so the same code flagged or not depending on
+    # how the author wrote it. Now the block imposes nothing and the remainder still imposes ALPHA.
+    ("`if (!getenv(X)) { ... }` runs when X is UNSET -- the block requires nothing", """
+void report(const State& st) {
+    if (!getenv("PROSPER_ZZ_ALPHA")) {
+        if (getenv("PROSPER_ZZ_BETA")) fprintf(stderr, "[zz] %u\\n", st.id);
+    }
+}
+""", []),
+    ("`if (!getenv(X)) return;` still makes the REMAINDER require X", """
+void report(const State& st) {
+    if (!getenv("PROSPER_ZZ_ALPHA")) return;
+    if (getenv("PROSPER_ZZ_BETA")) fprintf(stderr, "[zz] %u\\n", st.id);
+}
+""", ["TWO-GATE:PROSPER_ZZ_ALPHA+PROSPER_ZZ_BETA"]),
+
+    # ---- #2628 limit 2: a defaulted alias -----------------------------------------------------
+    # hle_graphics.cpp:1249 reduced. The mutation arm is the SAME function with the one repair line
+    # deleted, so nothing else in the fixture can account for the difference.
+    ("a defaulted alias is not a gate (`if (!out) out = \"shader0.bin\";`)",
+     _DEFAULTED_ALIAS % '        if (!out || !*out) out = "shader0.bin";\n', []),
+    ("...and WITHOUT that one repair line the coupling is real",
+     _DEFAULTED_ALIAS % "", ["TWO-GATE:PROSPER_ZZ_AGCSHADER+PROSPER_ZZ_AGCSHADER_OUT"]),
+    # `: 60` is an optional parameter; `: 0` is a switch that is off by default. One character, and
+    # DEFAULT_RHS_RE -- the tool's existing statement of which literals mean "unset" -- decides.
+    ("a ternary with a LIVE default (`: 60`) is a parameter, not a gate",
+     _TERNARY_DEFAULT % "60", []),
+    ("a ternary with a FALSY default (`: 0`) is a gate",
+     _TERNARY_DEFAULT % "0", ["TWO-GATE:PROSPER_ZZ_DUMP_PASS+PROSPER_ZZ_DUMP_PASS_EVERY"]),
+
+    # ---- #2628 limit 3: a lambda is not an alias for its body ---------------------------------
+    # `readable` (gpu_executor.cpp:2854) reduced: a helper whose body carries an env branch used to
+    # export that requirement to every CALL of it, invisibly at the call site. An immediately
+    # invoked lambda is the opposite case -- it yields a value the environment decides -- and
+    # #2149's fourth measured instance depends on that one still resolving.
+    ("a STORED lambda does not export its body's switches to its call sites",
+     _LAMBDA_ALIAS % ('auto readable = [&](uint64_t a) { const bool gfxlog = '
+                      'getenv("PROSPER_ZZ_GFXLOG") != nullptr; return gfxlog && guest_readable(a); };',
+                      "readable(s.addr)"), []),
+    ("an IMMEDIATELY INVOKED lambda holds a value the environment decides, and still aliases",
+     _LAMBDA_ALIAS % ('const bool readable = [&] { const bool gfxlog = '
+                      'getenv("PROSPER_ZZ_GFXLOG") != nullptr; return gfxlog && guest_readable(0); }();',
+                      "readable"), ["TWO-GATE:PROSPER_ZZ_DYNTRACE+PROSPER_ZZ_GFXLOG"]),
+
+    # ---- #2628 limit 4: SPLIT-CALL compared clause sets by identity ---------------------------
+    # hle_audio.cpp reduced: {AUDIO2LOG} at one site and {AUDIO2LOG|AUDIO2_PROBE} at another are
+    # not a disagreement -- arming the first satisfies both. A DISJOINT second gate still is.
+    ("call sites whose gates IMPLY one another do not disagree",
+     _SPLIT_CALL_GATES % 'audio2log() || getenv("PROSPER_ZZ_AUDIO2_PROBE")', []),
+    ("call sites whose gates are DISJOINT still disagree",
+     _SPLIT_CALL_GATES % 'getenv("PROSPER_ZZ_AUDIO2_PROBE")', ["SPLIT-CALL:probe_dump"]),
+
+    # ---- predicate bodies, which polarity forced to be modelled ------------------------------
+    # dyntrace_failed_shader_enabled (gpu_executor.cpp:401) reduced. The flat reading joined both
+    # variables into one any-of clause; a flat POLARITY reading would have kept only the optional
+    # one and dropped the required one, quietly weakening a `defect` row's key. The assertion is
+    # the exact requirement, so either error fails it.
+    ("a predicate's guard is required and its optional filter is not", """
+bool dynfail_enabled(uint64_t code_addr) {
+    if (!std::getenv("PROSPER_ZZ_DYNFAIL")) return false;
+    const char* filter = std::getenv("PROSPER_ZZ_DYNFAIL_ADDR");
+    if (!filter) return true;
+    return strtoull(filter, nullptr, 16) == code_addr;
+}
+void replay(const Draw& d) {
+    if (dynfail_enabled(d.vs)) {
+        if (getenv("PROSPER_ZZ_DYNFAIL_LOG")) fprintf(stderr, "[zz] 0x%llx\\n", d.vs);
+    }
+}
+""", ["TWO-GATE:PROSPER_ZZ_DYNFAIL+PROSPER_ZZ_DYNFAIL_LOG"]),
+    # Two exits can return true, so EITHER variable reaches the report -- one any-of clause, not
+    # two requirements and not nothing. report_selected_sbuffer_reject
+    # (rdna2_gta5_compute_contracts.cpp:39) reduced.
+    ("a predicate with two truthy exits requires their DISJUNCTION", """
+bool report_reject(const uint32_t* code) {
+    if (std::getenv("PROSPER_ZZ_DBG")) return true;
+    if (!std::getenv("PROSPER_ZZ_REJECT")) return false;
+    return code != nullptr;
+}
+void reject(const uint32_t* code, const State& st) {
+    if (report_reject(code)) {
+        if (getenv("PROSPER_ZZ_REJECT_LOG")) fprintf(stderr, "[zz] %u\\n", st.id);
+    }
+}
+""", ["TWO-GATE:PROSPER_ZZ_DBG|PROSPER_ZZ_REJECT+PROSPER_ZZ_REJECT_LOG"]),
 ]
 
 
@@ -1154,6 +1705,140 @@ def load_baseline(path: Path) -> dict[str, str]:
     return entries
 
 
+def _header_class_counts(text: str) -> dict[str, int]:
+    """The `#   benign: 2` block. Only the four known class names are read, so a typo in the header
+    surfaces as "no count declared for <class>" rather than as a silently accepted new class."""
+    declared: dict[str, int] = {}
+    for line in text.split("\n"):
+        m = re.match(r"^#\s+([a-z][a-z-]*):\s*(\d+)\s*$", line)
+        if m and m.group(1) in BASELINE_CLASSES:
+            declared[m.group(1)] = int(m.group(2))
+    return declared
+
+
+def baseline_integrity(text: str, budget: int = UNREVIEWED_BUDGET) -> list[str]:
+    """Check the baseline against ITSELF. Returns one message per failure; empty means sound.
+
+    The gate above this one gets half the job. It fails on a stale KEY and on a missing KEY, and it
+    is completely indifferent to a NOTE -- so a row can keep its key and lose the judgement that is
+    the only reason the row is worth having, with nothing in CI able to tell. That asymmetry is not
+    hypothetical: two branches rewrote this file at once (#2628 and #2572), and the resolution
+    everyone reaches for -- "keep my side of the conflict" -- passes every check while discarding
+    the other lane's 79 notes, with no conflict left over and a diff that reads as your own edit
+    (the trap-41 / #1701 shape).
+
+    Three rules, each cheap and each falsifiable:
+
+      1. every row carries a class from BASELINE_CLASSES;
+      2. the header's own class counts match the rows, for all four classes -- a summary nobody
+         checks is the same silent-drift door one level up, and this file's header is quoted
+         verbatim in docs/DIAGNOSTIC_GATE_AUDIT.md;
+      3. the `unreviewed` count equals UNREVIEWED_BUDGET exactly (see that constant).
+
+    Rule 3 is the one with teeth, because `unreviewed` is what a regeneration turns every judgement
+    into. What none of the three can see, stated so nobody quotes this as more than it is: a
+    baseline copied WHOLE from one branch over another is internally consistent by construction and
+    passes all three. Only merge ORDER protects against that -- land the branch that rebuilds the
+    keys first, so the second merger's "keep mine" resolution is the one that fails loudly.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _sep, note = line.partition("  #")
+        rows.append((key.strip(), note.strip()))
+
+    failures: list[str] = []
+    counts = {cls: 0 for cls in BASELINE_CLASSES}
+    for key, note in rows:
+        cls = note.split(":", 1)[0].strip()
+        if cls in counts:
+            counts[cls] += 1
+        else:
+            failures.append(
+                f"row carries no recognised classification (want one of "
+                f"{', '.join(BASELINE_CLASSES)}): {key}")
+
+    declared = _header_class_counts(text)
+    for cls in BASELINE_CLASSES:
+        if cls not in declared:
+            failures.append(f"the header declares no count for `{cls}` -- add `#   {cls}: "
+                            f"{counts[cls]}` to the class-count block")
+        elif declared[cls] != counts[cls]:
+            failures.append(f"the header says `{cls}: {declared[cls]}` and the rows say "
+                            f"{counts[cls]} -- one of the two was edited without the other")
+
+    if counts["unreviewed"] > budget:
+        failures.append(
+            f"{counts['unreviewed']} `unreviewed` row(s) against a budget of {budget} -- unjudged "
+            f"debt was ADDED. If this came from `--emit-baseline`, it has overwritten judgements: "
+            f"that command classifies every row `unreviewed`, so a `defect` row is laundered into "
+            f"an unjudged one by a command that looks like housekeeping. Re-apply the notes.")
+    elif counts["unreviewed"] < budget:
+        failures.append(
+            f"{counts['unreviewed']} `unreviewed` row(s) against a budget of {budget} -- debt was "
+            f"PAID. Tighten UNREVIEWED_BUDGET in check_diag_gates.py to {counts['unreviewed']} so "
+            f"the ratchet holds; leaving it slack lets the same number of rows silently return.")
+    return failures
+
+
+# Arms for baseline_integrity(). Each pair differs ONLY in the property under test, and every
+# must-fail half is a mutation of the must-pass one -- a rule that cannot be shown to fire is not a
+# rule, and this file's own `## Ruled out` records a check of exactly that kind sitting inert.
+_SOUND_BASELINE = """\
+# A baseline.
+#   defect: 1
+#   config-echo: 0
+#   benign: 1
+#   unreviewed: 2
+#
+TWO-GATE|src/a.cpp|report|PROSPER_A+PROSPER_B  # defect: the printer needs both. #2149
+SPLIT-LOCAL|src/b.cpp|hits|PROSPER_C  # benign: structural, not a count of things observed. #2572
+TWO-GATE|src/c.cpp|report|PROSPER_D+PROSPER_E  # unreviewed: not judged
+TWO-GATE|src/d.cpp|report|PROSPER_F+PROSPER_G  # unreviewed: not judged
+"""
+
+BASELINE_INTEGRITY_TESTS = (
+    ("a sound baseline passes", _SOUND_BASELINE, 2, ""),
+    ("an unclassified row is caught",
+     _SOUND_BASELINE.replace("# defect: the printer needs both. #2149", "# ok, looks fine"),
+     2, "no recognised classification"),
+    ("a header count that disagrees with the rows is caught",
+     _SOUND_BASELINE.replace("#   benign: 1", "#   benign: 2"), 2, "was edited without the other"),
+    ("a class missing from the header is caught",
+     _SOUND_BASELINE.replace("#   config-echo: 0\n", ""), 2, "declares no count for `config-echo`"),
+    # The two rule-3 arms. Both mutate the SAME file in the same place; only the direction differs,
+    # and the messages have to differ too -- "debt was added" and "debt was paid" call for opposite
+    # actions from whoever reads them.
+    ("a judgement downgraded to `unreviewed` is caught",
+     _SOUND_BASELINE.replace("# benign: structural, not a count of things observed. #2572",
+                             "# unreviewed: not judged").replace("#   benign: 1", "#   benign: 0")
+                    .replace("#   unreviewed: 2", "#   unreviewed: 3"),
+     2, "debt was ADDED"),
+    ("debt paid without tightening the ratchet is caught", _SOUND_BASELINE, 3, "debt was PAID"),
+)
+
+
+def run_baseline_integrity_test(verbose: bool = False) -> int:
+    bad = 0
+    for label, text, budget, want in BASELINE_INTEGRITY_TESTS:
+        got = baseline_integrity(text, budget)
+        ok = (not got) if not want else any(want in g for g in got)
+        if not ok:
+            bad += 1
+            print(f"  [FAIL] baseline-integrity: {label}")
+            print(f"         want={want or '<no failures>'}")
+            print(f"         got ={got or '<no failures>'}")
+        elif verbose:
+            print(f"  [ok]   baseline-integrity: {label}")
+    if not bad:
+        print(f"  [ok]   baseline integrity: {len(BASELINE_INTEGRITY_TESTS)} arms "
+              f"({sum(1 for _l, _t, _b, w in BASELINE_INTEGRITY_TESTS if not w)} positive, "
+              f"{sum(1 for _l, _t, _b, w in BASELINE_INTEGRITY_TESTS if w)} must-fail)")
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", nargs="?", help="checkout root containing src/ frontends/ tools/ tests/")
@@ -1166,7 +1851,8 @@ def main() -> int:
     args = ap.parse_args()
 
     print("== check_diag_gates ==")
-    if run_self_test(args.verbose) or run_key_stability_test(args.verbose):
+    if (run_self_test(args.verbose) or run_key_stability_test(args.verbose)
+            or run_baseline_integrity_test(args.verbose)):
         return 1
     if args.selftest:
         print("== all checks passed ==")
@@ -1198,7 +1884,10 @@ def main() -> int:
             print(f"{key}  # unreviewed")
         return 0
 
-    baseline = load_baseline(here.parent / "diag_gate_baseline.txt")
+    baseline_path = here.parent / "diag_gate_baseline.txt"
+    baseline = load_baseline(baseline_path)
+    integrity = (baseline_integrity(baseline_path.read_text(encoding="utf-8"))
+                 if baseline_path.is_file() else [])
     by_key = {f.key(): f for f in findings}
     new = [f for k, f in sorted(by_key.items()) if k not in baseline]
     stale = [k for k in sorted(baseline) if k not in by_key]
@@ -1215,10 +1904,19 @@ def main() -> int:
             if k in baseline and baseline[k]:
                 print(f"      {baseline[k]}")
 
-    if not new and not stale:
+    if not integrity:
+        print(f"  [ok]   baseline notes: {len(baseline)} row(s) classified, header counts agree, "
+              f"{UNREVIEWED_BUDGET} unreviewed as budgeted")
+
+    if not new and not stale and not integrity:
         print("== all checks passed ==")
         return 0
 
+    if integrity:
+        print(f"  [FAIL] {len(integrity)} baseline integrity problem(s) -- the KEYS may be current "
+              f"while the JUDGEMENTS are not:")
+        for msg in integrity:
+            print(f"    {msg}")
     if new:
         print(f"  [FAIL] {len(new)} finding(s) not in the baseline:")
         for f in new:
@@ -1229,7 +1927,7 @@ def main() -> int:
         print(f"  [FAIL] {len(stale)} baseline entry(ies) no longer reproduce -- delete the row:")
         for k in stale:
             print(f"    {k}")
-    print(f"== {len(new) + len(stale)} failure(s) ==")
+    print(f"== {len(new) + len(stale) + len(integrity)} failure(s) ==")
     return 1
 
 

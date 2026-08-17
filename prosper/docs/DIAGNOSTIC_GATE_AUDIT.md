@@ -57,25 +57,54 @@ each derived from a **measured** instance rather than invented:
 | `TWO-GATE` | one report statement requiring **two** distinct `PROSPER_*` variables | `[udtail]` (#2146); the unimplemented-NID table (#2149) |
 | `SPLIT-CALL` | a callee reached only under env gates whose call sites **disagree** on which gate | `record_guest_write(ColorTarget, …)` (#2111) |
 
-### Headline numbers (master, 2026-08-17)
+### Headline numbers (master, 2026-08-17, after #2628)
 
 | | count |
 | --- | --- |
-| `PROSPER_*` variables read anywhere in the tree | **651** |
-| read sites for them | **1,055** |
-| variables read at more than one site | **155** |
-| env predicate functions resolved (`udprov_enabled()` and friends) | **61** |
-| **findings** (`SPLIT-CALL` 4, `SPLIT-LOCAL` 22, `TWO-GATE` 151) | **177** |
-| distinct baseline keys for those findings | **93** |
+| `PROSPER_*` variables read anywhere in the tree | **658** |
+| read sites for them | **1,067** |
+| variables read at more than one site | **158** |
+| env predicate functions resolved (`udprov_enabled()` and friends) | **43** |
+| **findings** (`SPLIT-CALL` 3, `SPLIT-LOCAL` 19, `TWO-GATE` 81) | **103** |
+| distinct baseline keys for those findings | **54** |
 
-Classification of the 93 keys, from `tools/env/diag_gate_baseline.txt`:
+Classification of the 54 keys, from `tools/env/diag_gate_baseline.txt`:
 
 | class | keys | meaning |
 | --- | --- | --- |
 | `defect` | 2 | a confirmed instance; the note names the issue |
 | `config-echo` | 10 | the field echoes **configuration**, so `0` truthfully means "unconstrained" — the shape rule 1 recommends |
-| `benign` | 2 | read and judged sound, with the reason in the note: two deliberate entry points into one arming helper, and a behaviour predicate that prints nothing |
-| `unreviewed` | 79 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
+| `benign` | 2 | read and judged sound, with the reason in the note: two deliberate entry points into one arming helper, and a pure clock read whose call sites disagree |
+| `unreviewed` | 40 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
+
+Before #2628 the same tree read **177 findings / 93 keys** against **61** predicates. The drop is the
+scanner getting *narrower*, not the tree getting cleaner — nothing in `src/` changed.
+
+**18 predicates stopped resolving, and "they were `PROSPER_NO_*` opt-outs" covers only 13 of them.**
+The other five are worth naming, because a predicate that resolves to nothing is invisible
+afterwards and the summary is where anyone would look for it:
+
+- **13** are `PROSPER_NO_*` / `PROSPER_TEST_DISABLE_*` opt-outs (`compute_memory_pool_enabled`,
+  `descriptor_pool_reuse_enabled`, `native_2d_transfer_enabled`, `udprov_collection_enabled`, …),
+  which were being recorded as requirements exactly backwards. Dropping them is the fix.
+- **`time_compute_address_matches`** (`live_compute.cpp:2983`) returns `true` when
+  `PROSPER_COMPUTE_TIMING_CODE` is unset. Dropping it is also a fix — `master` recorded a
+  requirement that does not exist.
+- **`sclog_condition` / `sclog_semaphore` / `sclog`** (`hle_kernel.cpp:117`, `:122`, `:127`) is the
+  one case where the *understating* direction bites. What they lost was inverted and wrong — `master`
+  recorded `sclog_condition` as requiring `{PROSPER_SYNCLOG_SEMA_ONLY}` when the body is
+  `thread_enabled && !semaphore_only` — but their real requirement is `PROSPER_SYNCLOG`, and that is
+  now recorded nowhere. It arrives transitively through `sclog_thread_enabled()` →
+  `sclog_time_enabled()` (`:102`, `getenv("PROSPER_SYNCLOG") != nullptr; if (!enabled) return
+  false;`), and `predicate_clauses()` does not expand *other* predicates. Measured rather than
+  inferred: `sclog_thread_enabled` resolves on **neither** scanner, so the chain was already broken
+  one level below this change — no baseline row depended on it and nothing regressed, but "the
+  predicate count fell because of opt-outs" is not the whole story.
+- **`software_decode_allowed`** stopped resolving because its two definitions now genuinely
+  **disagree**: `vaapi_backend.cpp:52` defaults to *true* and reads `=0` as "hardware only", while
+  `media_foundation_backend.cpp:43` defaults to *false* and reads `=0` as *enabling*. Same switch,
+  opposite meaning per platform. Filed as **#2648**; the scanner found it, which is the tool paying
+  for itself in a direction it was not built for.
 
 **There is deliberately no class meaning "the variables share a name family, so it is probably
 fine".** An earlier revision had one, and it was the single most misreadable thing in this document:
@@ -84,6 +113,102 @@ recorded in the **note** of an `unreviewed` row and is triage only — because #
 was `PROSPER_PROGRESS` + `PROSPER_PROGRESS_UNIMPL`, which **is** a name family, and the family is
 exactly what made the coupling invisible: the name promised what only the pair delivered. A shared
 family cannot be the end of an argument, so it does not get to be a class.
+
+### What #2628 sharpened, and how the shrink was kept honest
+
+Four lexical limits accounted for most of the difference between "the scanner's second clause" and
+"a requirement a run has to satisfy". Each is now modelled:
+
+| limit | before | after |
+| --- | --- | --- |
+| **polarity inside an `if`** | `if (!getenv("X"))` and `getenv("PROSPER_NO_X") == nullptr` both recorded `X` as *required* — while the same negation *was* pushed through for `if (!getenv("X")) return;`, so the two spellings of one idea disagreed | a negated env test imposes nothing; a disjunct satisfiable with nothing set leaves the whole disjunction unconstrained (`positive_env_literals`) |
+| **a defaulted alias** | `const char* out = getenv("X"); if (!out) out = "…";` left `out` standing for `X`, so every later use read as gated | assigning a **literal** to an alias widens it to "the declaration's gate **or** the assignment site's" — which collapses to nothing when the assignment is reachable by default |
+| **a stored lambda** | a helper lambda aliased every `PROSPER_*` in its body and exported it to each *call*, invisibly at the call site | only an **immediately invoked** lambda aliases; `[&]{…}` held in a variable does not (`alias_is_a_gate`) |
+| **`SPLIT-CALL` by identity** | `{A}` versus `{A\|B}` — an *implication* — read as a disagreement | neither-implies-the-other, alongside the existing disjointness test (`implies`) |
+
+Polarity forced a fifth change: `collect_predicates()` used to read a predicate body as a flat bag
+of literals, which was survivable only *because* negation was ignored. With polarity that reading is
+wrong in both directions at once, and `dyntrace_failed_shader_enabled` shows both — a guard
+(`if (!getenv("PROSPER_DYNTRACE_FAIL")) return false;`) that **is** required and a filter
+(`if (!filter) return true;`) that is not. A flat polarity read would have kept the optional one and
+dropped the required one, silently weakening a `defect` row's key. A predicate body is now read as a
+function body: guards impose their negation, an early truthy return ends the accumulation, and a
+predicate with two truthy exits requires their **disjunction**.
+
+**That fifth limit was invisible to every total, and that is the most useful thing in this
+section.** Both readings — the flat one and the structured one — produce the identical **103
+findings / 54 keys**. Only the *content* of one key differs:
+
+```
+structured   TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN
+flat         TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL_ADDR|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN
+```
+
+`gpu_executor.cpp:402` is `if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;` — required —
+and `:403-404` reads `PROSPER_DYNTRACE_FAIL_ADDR` into an optional filter. The flat read keeps
+exactly the wrong one, so a reader following that `defect` row would arm the filter and get silence:
+the defect this document is about, committed by the tool that detects it. **No count could have
+caught it** — not the finding total, not the key total, not a diff of "the numbers went down as
+expected". Only reading the key did. Treat "the totals moved the way I predicted" as evidence about
+volume and never about content.
+
+**Every one of those changes reports fewer findings, which is the direction that silently disables a
+rule** — the `SPLIT-LOCAL` row in [Ruled out](#ruled-out) is this scanner having already done it
+once. So:
+
+- each fix ships as a **pair of self-test arms** differing only in the property under test — `==`
+  against `!=`, `: 60` against `: 0`, one repair line present against absent, a stored lambda
+  against an invoked one, an implied second gate against a disjoint one. 24 arms, 12 of them
+  must-match;
+- **every must-not-match half was checked to be a finding on the pre-#2628 scanner**, so none of
+  them passes by having been outside the rule's reach all along;
+- **both `defect` rows still reproduce.** `[udtail]`'s key moved — `PROSPER_DYNTRACE_FAIL_ADDR` left
+  the alternation, correctly, because it is an optional address filter — and the row was carried
+  across by hand rather than regenerated;
+- the baseline was rebuilt by matching each surviving finding to its predecessor at the same
+  `file:line`, not by `--emit-baseline`. 53 of the 54 rows resolve to a predecessor; **14** re-keyed
+  and say so in the note.
+
+The counts, and the convention they are counted under — stated because the obvious alternative gives
+different numbers, and an earlier revision of this section mixed the two:
+
+| | rows in the new baseline | keys in the old one |
+| --- | --- | --- |
+| unchanged | 39 | 39 |
+| re-keyed (carry `[#2628 re-keyed; was …]`) | 14 | 14 named as a predecessor |
+| new | 1 | — |
+| no successor recorded | — | 40 |
+| **total** | **54** | **93** |
+
+Count **rows** in the new file, and account for the old file's keys by whether a marker names them.
+Both are then reproducible with `grep`, which is the only property that matters here: these counts
+tell whoever merges the sibling branch how many rows to expect, so a count they cannot re-derive
+sends them hunting for a row nobody lost. Two footnotes, both of which have already misled a reader:
+
+- `grep -c '\[#2628 re-keyed; was'` over the baseline returns **15**. The fifteenth hit is the
+  header prose that names the marker. Filter comments first.
+- The rejected alternative counts the *old* keys by which surviving row absorbed them, and gives
+  39 + 16 + 38 **or** 39 + 17 + 37 depending on whether a `SPLIT-LOCAL` and a `TWO-GATE` sharing one
+  source line count as the same absorption. Having two defensible answers is precisely why it is not
+  the convention. It is not wrong, though, and it is what explains the apparent gap between 14
+  markers and 54 departed keys: one surviving row absorbs **three** old keys
+  (`…|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MIN_SUBMIT`), and its note records the one predecessor
+  whose argument still applies while naming the other two.
+
+**One row is new, and it is the rule working rather than decaying.** `diagnostic_elapsed_ms`
+(`live_renderer.cpp:534`) is called under `PROSPER_PASS_LOG` and under `PROSPER_DUMP_PERSISTENT`.
+Those two sites always disagreed; the spurious `PROSPER_RTT_PERTARGET|…` clause they used to share
+was hiding it. So sharpening a rule can *add* findings as well as remove them.
+
+**What was deliberately not silenced:** the convention's own **rule 1**. An armed-state banner is
+conditioned on both switches by construction — `command_processor.cpp:1572` prints *"INIT-TRIP NOT A
+CONTROL — `PROSPER_MB3_FREELIST_GUARD` is on"* — and both `command_processor.cpp` rows are still in
+the baseline. A rule that recognised the shape would have to distinguish "this banner explains the
+other switch" from "this report silently needs it", and no lexical test does; a plausible one ("the
+report's own text names a variable from its other clause") would silence any diagnostic that happens
+to print a variable name. Rule **2**'s shapes did go, but for the polarity reason rather than by
+recognising them: `guest_write_watch.cpp:1372` and `gpu_timeline.cpp:2288`/`:2742` all test a
+*negated* env read.
 
 ### Confirmed instances
 
@@ -140,6 +265,32 @@ classification and an issue link. A baseline row that no longer reproduces **als
 landed, so delete the row. The second half matters as much as the first — a baseline nobody is
 forced to update stops describing the tree, which is this document's whole subject.
 
+### The baseline's own integrity — what guards the NOTES
+
+Both halves above are about **keys**. Until #2628 nothing in the tool looked at a **note**:
+`load_baseline()` kept it only so `--list` could echo it, and the header's class counts were skipped
+as comments. So a row could keep a current key and lose the judgement that is the only reason the
+row is worth having, and every check stayed green. `baseline_integrity()` closes that, with three
+rules:
+
+1. every row carries a class from `BASELINE_CLASSES`;
+2. the header's class counts match the rows, for all four classes;
+3. the `unreviewed` count equals `UNREVIEWED_BUDGET` **exactly** — asserted, not bounded, so that
+   *paying* debt also demands an edit and the ratchet tightens instead of drifting.
+
+Rule 3 is the one with teeth. `--emit-baseline` classifies **every** row `unreviewed`, so "just
+regenerate the baseline" — the repair everyone reaches for, and the one the header has warned
+against in prose since #2149 — now fails loudly instead of laundering a `defect` row into an
+unjudged one. Measured: with the three rules neutered in `main()` and nothing else changed, a
+baseline holding the current 54 keys with all 14 judgements replaced by `unreviewed` reports
+`== all checks passed ==`, exit 0.
+
+**What it cannot see, stated so nobody quotes it as more:** a baseline copied *whole* from one
+branch over another is internally consistent by construction and passes all three rules. Nothing
+inside one file can detect that. Only merge **order** protects against it — land the branch that
+rebuilds the keys first, so the second merger's "keep mine" resolution is the one that fails loudly
+rather than the one that passes silently.
+
 ## What the scanner cannot see
 
 Stated here rather than left implied, because a clean run of an instrument that cannot observe the
@@ -154,6 +305,23 @@ thing is the exact failure this document exists to prevent.
 - A **disjunction imposes no requirement**: `if (getenv("A") || flag)` and
   `if (getenv("A") || getenv("B"))` both yield nothing. That understates deliberately — the
   direction that makes no false accusation.
+- A **negated env test imposes nothing**, for the same reason: `if (!getenv("X"))` and the opt-out
+  `getenv("PROSPER_NO_X") == nullptr` both run on a default boot. The corollary is a real gap:
+  `if (getenv("X")) return;` genuinely makes the remainder require `X` to be *unset*, and this tool
+  has no way to express that, so it does not report it.
+- An **argument list is one conjunct**, so `f(getenv("A") != nullptr, limit_derived_from_B)` yields
+  the any-of clause `{A|B}` rather than two independent parameters. That widens a clause, which
+  understates `TWO-GATE`. The `live_renderer.cpp` texture-cache rows carry a clause of this shape.
+- A **braceless `if` body is not scoped**: in `if (a) if (b) x = c;` the write to `x` is attributed
+  to the enclosing block. This is why the defaulted-alias rule only fires on a *literal* right-hand
+  side — a computed one may sit under a condition the scanner never saw.
+- **`-1` counts as a falsy default**, because `DEFAULT_RHS_RE` lists it. So `X ? atoi(X) : -1` keeps
+  its alias and stays a gate although `-1` is truthy in C. That over-reports rather than
+  under-reports, and it is consistent with the one place the tool states which literals mean
+  "unset", so it is left alone — but a finding resting on such a ternary is a candidate to re-read.
+- A **statement split across lines after its `if`** is outside that `if`'s gate: the scanner handles
+  one condition per line, so `if (getenv("A"))\n    fprintf(...)` is read as ungated. Braces avoid
+  it.
 - `#if`-gated code is scanned as if it were live.
 - A diagnostic gated by something that is **not an environment variable** — a build flag, a member
   field, a runtime setting — is out of scope by construction. The most consequential example is in
@@ -184,6 +352,24 @@ this tree can print an unmeasured field"*.
 - **"`PROSPER_UD_TAIL_ALIGN=off` gives you the `[udtail]` report without the mutation."** It does
   not: the gate is `getenv() != nullptr`, so `0`, `off` and the empty string all enter the block and
   apply `range_start = prefix`. #2146.
+- **"A `TWO-GATE` finding means arming the obviously-named switch leaves you in silence."** Not on
+  its own, and #2628 removed 40 baseline keys — 35 of them `TWO-GATE` — where it was false by
+  construction: the second clause was a negated test, an opt-out that is on by default, an alias
+  holding a compiled-in default, or a lambda's body leaking into its call sites. The finding is a
+  *candidate*; the check is to open each name's declaration and read its polarity and its default.
+  #2572 / #2628.
+- **"A rising `TWO-GATE` count means the convention is decaying."** Rules 1 and 2 both *create*
+  findings — an armed-state banner (`command_processor.cpp:1572`) and a refusal that names the
+  missing switch (`guest_write_watch.cpp:1372`) are each conditioned on two variables by
+  construction. Read the notes, not the total. #2572.
+- **"Sharpening a rule can only remove findings."** `SPLIT-CALL` gained one at
+  `live_renderer.cpp:534` when the spurious clause its three call sites shared went away: the
+  disagreement had been there all along and the extra clause was masking it. #2628.
+- **"A flat bag of literals is good enough for a predicate body."** It was, only because negation
+  was ignored — the two errors cancelled. `dyntrace_failed_shader_enabled` (`gpu_executor.cpp:401`)
+  has a guard on `PROSPER_DYNTRACE_FAIL` that *is* required and a filter on
+  `PROSPER_DYNTRACE_FAIL_ADDR` that is not; a flat polarity read keeps the wrong one of the two.
+  Predicate bodies are read as function bodies (`predicate_clauses`). #2628.
 
 ## See also
 
