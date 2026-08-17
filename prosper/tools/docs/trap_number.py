@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -71,7 +72,31 @@ class ScanError(RuntimeError):
 
 
 def run(cmd: list[str]) -> str:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    """Run `cmd`, or raise ScanError. Never lets an exception escape as a traceback.
+
+    Resolves the executable with `shutil.which` FIRST, for two reasons that turn out to be the same
+    reason:
+
+      * The tool promises to fail closed with a message. Without this it did not: a missing `gh`
+        escaped as an uncaught FileNotFoundError and printed a traceback -- on every platform --
+        instead of the ScanError the docstring advertises. A traceback is not a refusal to answer,
+        it is a crash that happens to also not answer, and the two read very differently to whoever
+        is holding a number they are about to write.
+      * On Windows it is also load-bearing for CORRECTNESS. Python resolves a bare command name
+        through CreateProcess, which appends only `.EXE` and does NOT walk PATHEXT -- that is
+        cmd.exe's job. `shutil.which` does walk PATHEXT, and CreateProcess can execute a `.cmd`
+        given its full path. Without this, anything named `gh.cmd` on PATH is invisible.
+    """
+    exe = shutil.which(cmd[0])
+    if exe is None:
+        raise ScanError(
+            f"{cmd[0]!r} is not on PATH, so `{' '.join(cmd[:3])}...` cannot run. This tool answers "
+            f"from `git` and `gh` and refuses to guess without them."
+        )
+    try:
+        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True)
+    except OSError as exc:  # pragma: no cover - permissions, exec format, a full disk
+        raise ScanError(f"{' '.join(cmd[:3])}... could not be run: {exc}") from exc
     if proc.returncode != 0:
         raise ScanError(f"{' '.join(cmd[:3])}... failed (rc={proc.returncode}): {proc.stderr.strip()}")
     return proc.stdout
@@ -157,7 +182,10 @@ def added_rows_from_diff(repo: str, number: int, path: str) -> list[int]:
     silently restored the defect while the run looked successful: B4's shape, one function over
     (#2610 review).
     """
-    proc = subprocess.run(["gh", "pr", "diff", str(number), "--repo", repo],
+    exe = shutil.which("gh")
+    if exe is None:
+        raise ScanError("'gh' is not on PATH, so this PR's patch cannot be read.")
+    proc = subprocess.run([exe, "pr", "diff", str(number), "--repo", repo],
                           capture_output=True, text=True)
     if proc.returncode != 0:
         raise ScanError(

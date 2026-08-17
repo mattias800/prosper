@@ -41,6 +41,7 @@ Run directly, or via ctest as trap_number.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -213,7 +214,7 @@ SEED = ("| # | Instrument | How it lied |\n|---|---|---|\n"
 
 def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str | None = None,
              exact: str | None = None, extra: list[str] | None = None,
-             stub_env: dict[str, str] | None = None) -> None:
+             stub_env: dict[str, str] | None = None, no_gh: bool = False) -> None:
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         bin_dir = root / "bin"
@@ -246,7 +247,24 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
                     ["config", "user.name", "t"], ["add", "-A"], ["commit", "-qm", "base"]):
             subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True)
 
-        env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+        if no_gh:
+            # PATH with NO gh at all -- not even the stub. `git` still has to resolve, so keep the
+            # real PATH and simply do not prepend the stub directory... except the point is that gh
+            # must be absent, and the runner has a real one. So: prepend a directory holding a git
+            # launcher only, and drop the rest of PATH.
+            git_only = root / "gitonly"
+            git_only.mkdir()
+            real_git = shutil.which("git")
+            assert real_git, "git must be on PATH for these tests"
+            if os.name == "nt":
+                (git_only / "git.cmd").write_text(f'@"{real_git}" %*\n', encoding="utf-8")
+            else:
+                g = git_only / "git"
+                g.write_text(f'#!/bin/sh\nexec "{real_git}" "$@"\n', encoding="utf-8")
+                g.chmod(g.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+            env = dict(os.environ, PATH=str(git_only))
+        else:
+            env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
         env.update(stub_env or {})
         proc = subprocess.run(
             [sys.executable, str(HERE / "trap_number.py"), "--no-fetch", "--base", "master",
@@ -339,6 +357,19 @@ run_main("a claim far above the base is reported as a typo, not an allocation",
 # number itself is what discriminates -- the IGNORING line above prints either way.
 run_main("...and is excluded from the next free number, not merely mentioned",
          want_rc=0, expect="next free number: 3", stub_env={"STUB_MODE": "wild"})
+
+# `gh` ABSENT ENTIRELY -- not failing, not unauthenticated, simply not installed. The tool promises
+# to refuse rather than guess, and it did not: the missing executable escaped as an uncaught
+# FileNotFoundError and printed a traceback on EVERY platform. A traceback is not a refusal to
+# answer; it is a crash that also happens not to answer, and those read very differently to whoever
+# is holding a number they are about to write.
+#
+# This is also the arm that closes the Windows failure. Python resolves a bare command name through
+# CreateProcess, which appends only .EXE and does not walk PATHEXT, so the `gh.cmd` launcher these
+# tests put on PATH was invisible to the tool. Resolving with shutil.which fixes both, and asserting
+# "no traceback" is what pins it -- rc=1 alone is satisfied by the crash too.
+run_main("an absent gh is a refusal with a message, not a traceback",
+         want_rc=1, expect="is not on PATH", absent="Traceback", no_gh=True)
 
 # The truncation guard, executed rather than reasoned about: the stub returns 2 PRs, so --limit 2
 # cannot distinguish "there are 2" from "we stopped at 2".
