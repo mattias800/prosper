@@ -128,6 +128,23 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # worktree_reclaim deletes directories, so its tests are mutation arms first: each builds a tree
+  # that MUST NOT be removed (dirty, untracked-only, unmerged, held by a live process, recently
+  # touched, locked, nested) and asserts both the refusal and which guard produced it. It also
+  # pins the instrument bug found while writing it -- examining a worktree used to make it look
+  # freshly touched, which reported all 278 real trees as busy (#1735).
+  #
+  # Linux only, and that is a statement about the tool rather than about the test. Its in-use
+  # guard reads /proc, so on macOS and Windows it cannot prove nobody is inside a tree and fails
+  # closed: it classifies, and removes nothing, there. Testing removal guards where removal never
+  # happens would assert on a configuration nobody runs. The fail-closed behaviour itself is
+  # covered by a platform-independent arm, so the property that protects those platforms is still
+  # verified everywhere this suite runs.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME worktree_reclaim_tool
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/test_worktree_reclaim.py")
+  endif()
   add_test(NAME re_edis_mapping
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_edis.py")
   # nid_gate_scan answers "does this title BRANCH on an imported function's return value?", and a
