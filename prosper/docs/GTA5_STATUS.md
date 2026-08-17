@@ -886,7 +886,7 @@ Three 4K DCC-compressed **sampled** images remain unsupported (fmt 1/4/9). That 
 resource from the storage image above — the storage image is not compressed. Whether the composite
 depends on those three has not been established.
 
-### The instrument that would answer this — TWO sequential gates, both now identified (2026-08-16)
+### The instrument that would answer this — THREE sequential gates, each masking the next (2026-08-16)
 
 `PROSPER_GRAB_BUNDLE_AFTER_MS` on `prosper-app` is the documented fastest loop for "why does this
 frame look wrong", and on this title it fails **twice, for unrelated reasons**. Each failure reads as
@@ -3463,54 +3463,54 @@ exec_pristine=1 cfg_known=1` at pcs 16/18/21/25, so the mip level is proven and 
 descriptor, not the mip analysis. Then re-run this census and see whether the write-class binding
 becomes `outcome=executed`.
 
-### What invalidates the retained depth, now that the diagnostic can say (2026-08-17)
+### What invalidates the retained depth — 100% of it is prosper's own writeback (2026-08-17)
 
-`[ds] invalidate`'s `origin=` field was **structurally incapable of attribution** until the write
-origin was carried through the queue. It read a thread-local set around `notify_guest_gpu_write`, while
-DS/RTT invalidation runs at **drain** time on the draining thread — long after that thread-local is
-reset. So it printed `origin=gpu` for **30,458 of 30,458** invalidations, including ones made by
-writers that already tag themselves.
+**Read the retraction first.** An earlier revision of this section reported "~81% self-inflicted" and
+"1,678 **genuine guest** HTILE writes" for the main depth, and named the frontier as the semantics of
+those guest writes. **Both numbers were wrong and the frontier was misdirected.** The instrument had a
+second hole: `notify_guest_gpu_write_preserving_bytes` knew its own classification, printed it to the
+immediate watch, and then called the observer with only `(addr, size)` — so all four byte-preserving
+compute writeback paths arrived at the queue as the **default**, and the default was named `gpu`. A
+bucket that means "nobody said" was therefore reported as "genuinely the guest".
 
-**How that was found is worth keeping, because tagging looked like it should have been enough.** The
-remaining untagged writers were tagged first — the compute image writeback, its metadata reset, the
-renderer RTT writeback — and the re-run produced **30,458 × `origin=gpu` again, unchanged**. That null
-is what exposed the seam; the tags were correct and were being discarded between queue and drain. The
-queued record now captures the origin on the writing thread, and drain restores it around each range's
-invalidation.
-
-With attribution working, across every DS invalidation on a routed boot:
+With the origin carried as data across the notification/observer boundary, and the default renamed to
+`unknown` so it can never again be mistaken for a producer:
 
 | origin | count |
 | --- | --- |
-| `compute-writeback(image-guest-bytes)` | 15,777 |
-| `compute-writeback(cpu-fill)` | 11,267 |
-| `gpu` (genuinely the guest) | 6,316 |
+| `compute-writeback(image-guest-bytes)` | 15,017 |
+| `compute-writeback(cpu-fill)` | 10,234 |
+| `gpu-preserving` | 5,590 |
+| `unknown` (unattributed) | **0** |
 
-**About 81% of DS invalidation traffic is prosper invalidating its own caches from its own
-writebacks** (27,044 of 33,360). Recorded as a **measurement, not a verdict** — a writeback into guest
-memory can legitimately stale a detached cache — but it was invisible before and it is worth a
-decision.
+**30,841 of 30,841 DS invalidations are prosper invalidating its own caches from its own writebacks.
+Not 81% — all of them. There are no genuinely-guest DS invalidations on this route at all.**
 
-For the main depth `dr=0x2052ac0000`, which the failing 4K producer samples:
+For the main depth `dr=0x2052ac0000`, 2,276 invalidations, every one ours:
 
 | aspect hit | origin | count |
 | --- | --- | --- |
-| `htile_hit=1` | `gpu` | 1,678 |
-| `htile_hit=1` | `compute-writeback(cpu-fill)` | 407 |
-| `htile_hit=0` | `compute-writeback(cpu-fill)` | 407 |
+| `htile_hit=1` | `gpu-preserving` | 1,542 |
+| `htile_hit=1` | `compute-writeback(cpu-fill)` | 367 |
+| `htile_hit=0` | `compute-writeback(cpu-fill)` | 367 |
 
-**Its depth range is never directly written.** Every loss of the depth plane arrives through the
-conservative "an HTILE overlap may describe both aspects, so invalidate both" rule, and 1,678 of the
-2,492 are genuine guest HTILE writes of a repeated identical 640 KB at the HTILE base
-`0x2055310000`. The bridge consequence: `hit(depth=69965)` against
-`declined addr=0x2052ac0000 reason=depth-invalid x37751`, with the retained surface reporting
-`dvalid=0 svalid=1`.
+Its depth range is still never directly written — every loss of the plane arrives through the
+conservative "an HTILE overlap may describe both aspects" rule. But the writer is **us**, and 1,542 of
+those come from a path whose whole contract is that *the guest bytes were not modified*.
 
-**An aggregate over the wrong population reads as an answer.** A first pass over *all* surfaces showed
-24,922 depth invalidations with `htile_hit=0`, which says "HTILE is not involved at all". That
-population is dominated by **cube shadow maps** (`0x2094ec0000`, `0x20948c0000`, …). Filtering to the
-one surface under investigation inverts the conclusion completely. Filter to the subject before
-believing a count.
+**So the frontier is not the guest's HTILE semantics.** It is: why does prosper's own byte-preserving
+writeback overlap this depth surface's HTILE range at all, and should a write that provably preserves
+guest bytes invalidate a detached Vulkan depth image? The second half already has an answer on record
+and it is **yes, it must** — byte equality with guest memory says nothing about equality with a
+renderer-owned image the renderer has since drawn into, and *Dead Cells* #611 is the counterexample
+where sparing it makes gameplay geometry disappear. That is why no preservation policy is proposed
+here. The open question is the first half.
+
+**A default is not a measurement.** This is the third time on this title that a default or
+unattributed value was read as a positive finding — the others being a black frame compared against a
+mismatched trigger, and an `htile_hit=0` aggregate dominated by cube shadow maps. In all three the
+number was real and the population behind it was not what the label said. Name unattributed buckets
+`unknown`, and check what a "no origin" case actually means before counting it as evidence.
 
 ### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 

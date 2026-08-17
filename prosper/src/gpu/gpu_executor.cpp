@@ -11042,9 +11042,12 @@ void report_guest_write_watch(uint64_t addr, uint64_t size, const char* origin) 
 // packet that produced it. "a guest write covers this surface" and "a DMA_DATA fill of 512 KiB
 // covers this surface" are different facts, and only the second says whether the depth contents
 // were actually replaced.
-thread_local const char* g_guest_write_origin = "gpu";
+// "unknown", not "gpu". A default is not a measurement: naming it after a producer made an
+// unattributed bucket read as "genuinely the guest", and a published census then reported
+// prosper's own byte-preserving writebacks as guest HTILE writes.
+thread_local const char* g_guest_write_origin = "unknown";
 void set_guest_gpu_write_origin(const char* origin) {
-    g_guest_write_origin = origin ? origin : "gpu";
+    g_guest_write_origin = origin ? origin : "unknown";
 }
 const char* guest_gpu_write_origin() { return g_guest_write_origin; }
 
@@ -11063,7 +11066,7 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
         else
             g_guest_gpu_writes.overflowed = true;
     }
-    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size, g_guest_write_origin);
 }
 void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
@@ -11072,7 +11075,14 @@ void notify_guest_gpu_write_preserving_bytes(uint64_t addr, uint64_t size) {
     // which may differ from the exact guest bytes even when a compute result does not. Guest-memory
     // caches, page watches, and the submit journal remain valid because the caller proved that those
     // bytes were not modified.
-    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+    //
+    // Forward the classification this function already knows. Dropping it here is what made every
+    // byte-preserving compute writeback arrive at the queue as the unattributed default, so a census
+    // could not separate prosper's own writes from the guest's -- the exact distinction the origin
+    // field exists to draw. A caller-set origin wins, since it is more specific than this one.
+    const char* preserving_origin =
+        std::strcmp(g_guest_write_origin, "unknown") == 0 ? "gpu-preserving" : g_guest_write_origin;
+    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size, preserving_origin);
 }
 GuestGpuWriteSnapshot guest_gpu_write_snapshot() {
     if (!g_guest_gpu_writes.active || g_guest_gpu_writes.overflowed) return {};

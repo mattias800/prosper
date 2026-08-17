@@ -154,7 +154,7 @@ using RttCache = std::unordered_map<uint64_t, RttSurf>;
 struct PendingGuestGpuWrite {
     uint64_t addr = 0;
     uint64_t size = 0;
-    const char* origin = "gpu";   // string literal or static storage; never an owned buffer
+    const char* origin = "unknown";   // string literal or static storage; never an owned buffer
 };
 
 struct PendingGuestGpuWrites {
@@ -168,10 +168,12 @@ PendingGuestGpuWrites& pending_guest_gpu_writes() {
     return pending;
 }
 
-void queue_guest_gpu_write(uint64_t addr, uint64_t size) {
+void queue_guest_gpu_write(uint64_t addr, uint64_t size, const char* origin) {
     auto& pending = pending_guest_gpu_writes();
-    // Read the origin HERE, on the writing thread, while it is still the writer's.
-    const char* origin = prosper::gpu::guest_gpu_write_origin();
+    // The origin arrives AS DATA from the notifier. Reading the thread-local here instead would be
+    // correct for the plain notifier and wrong for the byte-preserving one, which knows a
+    // classification the thread-local never carried.
+    if (!origin) origin = "unknown";
     std::lock_guard<std::mutex> lock(pending.mutex);
     constexpr size_t kMaxPendingRanges = 65536;
     if (pending.ranges.size() < kMaxPendingRanges)
@@ -911,7 +913,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     const char* ds_invalidate = PROSPER_ENV_VALUE("PROSPER_DS_GUEST_WRITE_INVALIDATE");
     const bool invalidate_ds = !ds_invalidate || strcmp(ds_invalidate, "0");
     prosper::gpu::set_guest_gpu_write_observer(
-        [](uint64_t addr, uint64_t size) { queue_guest_gpu_write(addr, size); });
+        [](uint64_t addr, uint64_t size, const char* origin) {
+            queue_guest_gpu_write(addr, size, origin);
+        });
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
     // Outside a registered renderer, resource decoding retains its strict unknown-format policy.
