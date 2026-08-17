@@ -334,7 +334,7 @@ int main() {
     {
         std::atomic<int> refused_after_write{0};
         std::atomic<int> strays_accepted{0}, strays_refused{0}, rounds{0};
-        std::atomic<int> strays_attempted{0}, strays_while_contended{0};
+        std::atomic<int> strays_attempted{0}, strays_while_workers_ran{0};
         // The stray floor has to be reached BY CONSTRUCTION rather than by winning a race against
         // the workers -- see the attacker loop below for why, and #2427 for what it cost.
         constexpr int kMinStrayAttempts = 1200;
@@ -373,9 +373,22 @@ int main() {
                 // Sampled BEFORE the attempt, so it names the state the attempt was made against.
                 // Reported, never asserted: how much of the floor lands under real contention is
                 // exactly the scheduler-controlled quantity that must not gate the job.
+                //
+                // Name the residual precisely, because "1200 strays ran" is easy to over-read. This
+                // counts "the workers had not finished yet", NOT "the lock was held" -- a worker
+                // between its unlock and its next wrlock counts here. And on a host so starved that
+                // this reads 0, every attempt hit the `COUNT == 0` arm of the refusal; the
+                // WRITE-set/owner-check arm, which is the one the single-word-CAS argument is
+                // actually about, is then not exercised at all. That is a real loss, and it is
+                // still strictly better than the old behaviour, which on the same host produced a
+                // red job AND left `strays_accepted == 0` vacuous at ~0 trials. Making contention
+                // structural too would mean holding the workers until the prefix completes; it is
+                // doable (keep them issuing balanced pairs into a separate counter, leaving
+                // `rounds` at exactly 6000) and is deliberately not done here, because it adds a
+                // second cross-thread dependency to a block whose whole defect was one.
                 const bool contended = rounds.load(std::memory_order_relaxed) < 6000;
                 strays_attempted.fetch_add(1);
-                if (contended) strays_while_contended.fetch_add(1);
+                if (contended) strays_while_workers_ran.fetch_add(1);
                 if (call1(RWun, (uint64_t)(uintptr_t)&h) != 0) strays_refused.fetch_add(1);
                 else strays_accepted.fetch_add(1);
             }
@@ -388,7 +401,7 @@ int main() {
               " unlocks attempted)");
         printf("  [info] stray unlocks: %d attempted, %d of them while the workers still ran,"
                " %d refused, %d accepted\n",
-               strays_attempted.load(), strays_while_contended.load(),
+               strays_attempted.load(), strays_while_workers_ran.load(),
                strays_refused.load(), strays_accepted.load());
         // If this ever fires, it is NOT flakiness — it is the signature of a residual ordering
         // window between the write flag and the hold count, and it is the only assertion here that
