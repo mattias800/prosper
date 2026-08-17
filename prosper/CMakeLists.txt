@@ -1508,6 +1508,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_agc_submit PRIVATE prosper_core)
   add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
 
+  # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
+  # display-buffer registry records the game's registered framebuffers.
+  #
+  # CROSS-PLATFORM on purpose (#1765). This sat inside the if(UNIX) block below, so the one platform
+  # whose display pacing is at risk was the one platform that did not build it: sceVideoOutWaitVblank
+  # waits on a deadline, and on Windows that wait is quantized by the process timer period. Nothing
+  # here is POSIX-specific -- it drives the HLE registry and asserts returned values -- so the gate
+  # was incidental rather than a statement about the test.
+  add_executable(test_videoout tests/test_videoout.cpp)
+  target_link_libraries(test_videoout PRIVATE prosper_core)
+  add_test(NAME videoout_queries COMMAND test_videoout)
+
   # Windows guest-execution substrate (exec_image_win.cpp): build boot_trace so the whole boot path
   # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
   # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
@@ -1697,12 +1709,6 @@ if(TARGET prosper_core)
     add_executable(test_agc_epilogue_window tests/test_agc_epilogue_window.cpp)
     target_link_libraries(test_agc_epilogue_window PRIVATE prosper_core)
     add_test(NAME agc_epilogue_window COMMAND test_agc_epilogue_window)
-
-    # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
-    # display-buffer registry records the game's registered framebuffers.
-    add_executable(test_videoout tests/test_videoout.cpp)
-    target_link_libraries(test_videoout PRIVATE prosper_core)
-    add_test(NAME videoout_queries COMMAND test_videoout)
 
     # libSceVideoOut flip->present: SubmitFlip scans out the registered buffer; present_readback
     # returns the presented frame's real pixels. The surface the renderer presents frames to.

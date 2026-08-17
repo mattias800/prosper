@@ -18,6 +18,7 @@
 #include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
 #include "gpu/tile.hpp"             // de-swizzle a TILE-mode scanout into a linear image
 #include "host/guest_memory_map.hpp" // guest_readable_mapping_containing (real over-read proof)
+#include "host/precise_sleep.hpp"   // #1765: a vblank wait whose resolution is not the Win32 tick
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -755,9 +756,11 @@ void vblank_sleep_until_ns(uint64_t deadline_ns) {
         g_vblank_test_now_ns.store(deadline_ns, std::memory_order_relaxed);
         return;
     }
-    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::nanoseconds(deadline_ns))));
+    // NOT std::this_thread::sleep_until: on Windows that is one ::Sleep(ms), which the system timer
+    // period quantizes to ~15.6 ms steps, so this ~16.68 ms wait cost ~31 ms and paced a title's
+    // display thread at ~32 Hz (#1765). host::sleep_until_steady_ns keeps the deadline semantics and
+    // picks a primitive that does not inherit that period; on POSIX it still is sleep_until.
+    host::sleep_until_steady_ns(deadline_ns);
 }
 }  // namespace
 
@@ -827,9 +830,9 @@ HLE(g_vo_wait_vblank) {
     // Next strictly-future boundary: a caller that is already exactly on one still waits a full
     // period, which is what "wait for the NEXT vblank" means.
     const uint64_t next = t0 + ((now - t0) / kVblankNs + 1) * kVblankNs;
-    // F5: vblank_sleep_until_ns uses duration_cast rather than a nanoseconds->time_point
-    // construction, which only compiles because steady_clock::duration happens to be nanoseconds
-    // on every toolchain we build with.
+    // F5: the deadline crosses into host::sleep_until_steady_ns as a plain nanosecond count, and the
+    // duration_cast back to a steady_clock::time_point happens there — see precise_sleep.cpp, which
+    // also records why this is not a bare std::this_thread::sleep_until on Windows (#1765).
     vblank_sleep_until_ns(next);
     return 0;
 }

@@ -6,6 +6,7 @@
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/gpu/tile.hpp"              // tile/detile round trip for the flipped-buffer image
 #include "../src/host/guest_memory_map.hpp" // the registered-mapping proof for the padded read
+#include "../src/host/precise_sleep.hpp"    // #1765: which primitive WaitVblank actually waited on
 #include <algorithm>
 #include <vector>
 #include <cstdio>
@@ -267,6 +268,12 @@ int main() {
     if (waitvbl) {
         CHECK((uint32_t)waitvbl(invalid_handle, 0, 0, 0, 0, 0) == kInvalidHandle,
               "WaitVblank rejects an invalid handle");
+        // #1765: the wait PRIMITIVE, asserted before and after so the report tracks real use.
+        // "none" here proves the accessor is not a compiled-in constant that would satisfy the
+        // post-wait arm no matter what the sleeper did.
+        CHECK(strcmp(host::sleep_backend_name(), "none") == 0,
+              "no vblank wait has been performed yet on this thread");
+
         // Five waits must consume at least four full vblank periods of real time. A stub that
         // returns immediately finishes in microseconds and fails this outright.
         vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
@@ -283,6 +290,34 @@ int main() {
               "five WaitVblank calls block for at least four vblank periods");
         CHECK(wait_c1 >= wait_c0 + 4,
               "WaitVblank advances GetVblankStatus's counter by one tick per wait");
+        // Reported, deliberately NOT asserted. The upper half of this measurement is what #1765 is
+        // about, and a wall-clock ceiling is exactly the assertion this file has already been burned
+        // by twice: #1770's minimum-residue sampler wrapped after long overshoots and #1793 found
+        // its replacement's admission rule invalid, both because host scheduling is in the number.
+        // A machine running several builds at once will overshoot five 16.68 ms waits by more than
+        // any threshold that could still catch a 2x pacing regression. So the ceiling is asserted
+        // deterministically further down, and the mechanism -- which is not a statistic -- here.
+        // Reported in PERIODS, not ms/wait: the first of the five starts at an arbitrary phase, so
+        // the healthy total is 4..5 periods and a per-wait mean reads misleadingly below one.
+        // ~15.6 ms Sleep quantization would put this near 9.2.
+        printf("  [note] five WaitVblank calls took %lld us = %.2f vblank periods "
+               "(healthy 4..5), backend '%s'\n",
+               (long long)elapsed_us, (double)elapsed_us * 1000.0 / 16683350.0,
+               host::sleep_backend_name());
+
+        // The mechanism. On Windows std::this_thread::sleep_until compiles to a single ::Sleep(ms),
+        // whose resolution is the process timer period -- ~15.6 ms by default, measured on a Windows
+        // host in test_win_exception_delivery.cpp -- so a 16.68 ms wait could only complete on the
+        // second tick, ~31 ms, pacing a title's display thread at ~32 Hz. This arm goes red exactly
+        // when that quantizing path is back in force, which a lower bound on elapsed time cannot
+        // see: oversleeping by 2x passes every assertion above.
+#ifdef _WIN32
+        CHECK(strcmp(host::sleep_backend_name(), "win32-high-resolution-timer") == 0,
+              "WaitVblank waited on a high-resolution timer, not ::Sleep's ~15.6 ms tick");
+#else
+        CHECK(strcmp(host::sleep_backend_name(), "posix-sleep-until") == 0,
+              "WaitVblank waited on sleep_until (glibc: a nanosleep loop honouring the deadline)");
+#endif
 
         // PHASE, which the counter assertion above does NOT test. A WaitVblank with its own epoch
         // shifted half a period — same period, different phase — advances the counter by exactly
@@ -330,6 +365,29 @@ int main() {
         CHECK(phase_distance_ns < 1000,
               "WaitVblank shares GetVblankStatus's PHASE, not just its period "
               "(wakes land on a boundary of the same grid)");
+
+        // The UPPER bound #1765 asks for, taken where it costs nothing to be exact. Every arm on
+        // the live clock above is one-sided, and a one-sided assertion cannot tell "paced at 59.94
+        // Hz" from "paced at half that" -- the second is longer, and longer passes a lower bound.
+        // Deterministic time removes the host scheduler from the measurement entirely, so the
+        // ceiling can be the exact value rather than a tolerance somebody has to tune: the previous
+        // wait landed ON a boundary, so N further waits must advance the clock by EXACTLY N periods
+        // and the status counter by EXACTLY N. This does not see the host sleep quantization -- no
+        // deterministic arm can, which is why the backend arm above exists -- but it does pin
+        // prosper's own boundary arithmetic from both sides.
+        constexpr int kRepeatedWaits = 5;
+        const uint64_t repeat_start_ns = fake_end_ns;
+        const uint64_t repeat_c0 = *(uint64_t*)vb;
+        bool repeat_ok = true;
+        for (int i = 0; i < kRepeatedWaits; ++i)
+            repeat_ok &= waitvbl(handle, 0, 0, 0, 0, 0) == 0;
+        vbl(handle, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0);
+        CHECK(repeat_ok && *(uint64_t*)(vb + 0x10) ==
+                  repeat_start_ns + (uint64_t)kRepeatedWaits * kPeriodNs &&
+                  *(uint64_t*)vb == repeat_c0 + kRepeatedWaits,
+              "consecutive WaitVblanks from a boundary advance by exactly one period each, "
+              "neither short nor double");
+
         prosper_vo_set_vblank_now_for_test(0);
     }
 
