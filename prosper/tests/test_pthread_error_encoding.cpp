@@ -22,6 +22,10 @@
 //   M3  return the host errno instead of the FreeBSD one (#1612)         -> the EAGAIN row fails on both
 //   M4  apply the encoding to a non-error return                         -> the barrier serial-thread arm fails
 //
+//   M5  make a fallible body report 0 again (discard its result)          -> the CondWait row and
+//                                                                             its positive control
+//                                                                             fail together (#1983)
+//
 // The M3 and M4 arms matter most. M1/M2 are provoked with a null object, which yields EINVAL — and
 // EINVAL is 22 on FreeBSD, on Linux, on Darwin and on MinGW, so a null-slot arm alone cannot tell a
 // FreeBSD number from a host number. The EAGAIN row can: FreeBSD EAGAIN is 35 while the host's is
@@ -32,9 +36,11 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/sce_errno.hpp"
+#include <cerrno>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 
 using namespace prosper;
 
@@ -101,6 +107,12 @@ const Row kRows[] = {
     // --- condition variables ---
     {"scePthreadCondInit",           "pthread_cond_init",           "#2178"},
     {"scePthreadCondTimedwait",      nullptr,                       "#2178, in place"},
+    // Moved OUT of kInfallible by #1983. It was correctly listed there when this file was written:
+    // the body discarded its wait result and returned 0 on every path, including the path where a
+    // null slot meant no wait was attempted at all. That is a silent success, strictly worse than
+    // the bare-errno defect this file sweeps for, because a guest testing `rc == 0` is misled too.
+    // Now the body reports the wait and refuses an unusable pair, so the alias rule applies to it.
+    {"scePthreadCondWait",           "pthread_cond_wait",           "#1983, was infallible"},
     // --- read/write locks (already correct: #1984 / #2158 — these are regression guards) ---
     {"scePthreadRwlockInit",         "pthread_rwlock_init",         "#1984"},
     {"scePthreadRwlockRdlock",       "pthread_rwlock_rdlock",       "#2158"},
@@ -134,7 +146,7 @@ const Row kRows[] = {
 const char* const kInfallible[] = {
     "scePthreadMutexattrSetprotocol", "scePthreadMutexattrSetpshared", "scePthreadMutexattrDestroy",
     "scePthreadMutexDestroy", "scePthreadCondattrDestroy", "scePthreadCondDestroy",
-    "scePthreadCondSignal", "scePthreadCondBroadcast", "scePthreadCondWait",
+    "scePthreadCondSignal", "scePthreadCondBroadcast",
     "scePthreadRwlockDestroy", "scePthreadSemDestroy", "scePthreadBarrierDestroy",
     "scePthreadBarrierattrInit", "scePthreadBarrierattrDestroy", "scePthreadBarrierattrSetpshared",
 };
@@ -304,7 +316,129 @@ int main() {
         }
     }
 
-    // ===== 6. the other side of "iff": handlers that correctly have no alias ==================
+    // ===== 6. #1983: the TLS-key pair, which cannot use the null-object row convention ==========
+    // kRows provokes EINVAL with an all-zero call. That is unsafe here: a key argument of 0 is a
+    // plausible LIVE key in this process (the C++ runtime allocates keys before main), so a null-arg
+    // row could delete somebody else's key and pass by accident. Use an index far above any
+    // implementation's table instead — every host range-checks before touching anything, so the
+    // refusal is defined behaviour rather than a lucky read.
+    //
+    // These two were #2178's "raw host errno first" rows: the body returned the HOST number through
+    // BOTH spellings, so aliasing alone would have produced `0x80020000 | wrong_errno`. The
+    // fbsd_errno mapping and the alias therefore land together, as #2189 did for k_mutexattr_init.
+    //
+    // The C11 layer is what makes the pairing concrete rather than merely symmetric: in the shipped
+    // guest libc.prx (PPSA24651), `_Tss_create`, `_Tss_delete` and `_Tss_set` are three-instruction
+    // tail-call forwarders onto scePthreadKeyCreate / KeyDelete / Setspecific (resolved through the
+    // PLT relocations, NIDs geDaqgH9lTg / PrdHuuDekhY / +BzXYkqYeLE). KeyCreate already encoded, so
+    // one C11 family forwarded an encoded value from one member and a bare errno from the other two.
+    // CONFIDENCE: MED on the encoded form itself — the forwarders do not COMPARE, so no guest has
+    // been observed testing an encoded result from any of the three.
+    printf("-- TLS keys: encoded on the Sony spelling, bare on the POSIX one (#1983) --\n");
+    {
+        HleFn sce_kcreate = Hle::lookup(nid_hash("scePthreadKeyCreate"));
+        HleFn sce_kdelete = Hle::lookup(nid_hash("scePthreadKeyDelete"));
+        HleFn pos_kdelete = Hle::lookup(nid_hash("pthread_key_delete"));
+        HleFn sce_setspec = Hle::lookup(nid_hash("scePthreadSetspecific"));
+        HleFn pos_setspec = Hle::lookup(nid_hash("pthread_setspecific"));
+        HleFn pos_getspec = Hle::lookup(nid_hash("pthread_getspecific"));
+        HleFn sce_getspec = Hle::lookup(nid_hash("scePthreadGetspecific"));
+        CHECK(sce_kcreate && sce_kdelete && pos_kdelete && sce_setspec && pos_setspec &&
+                  pos_getspec && sce_getspec,
+              "the TLS-key entry points are registered under both spellings");
+        if (sce_kcreate && sce_kdelete && pos_kdelete && sce_setspec && pos_setspec &&
+            pos_getspec && sce_getspec) {
+            const uint64_t bogus = 0x7ffffffful;
+            const uint64_t posix_del = pos_kdelete(bogus, 0, 0, 0, 0, 0);
+            // Stated as a precondition rather than assumed: if a host ever accepted this, both arms
+            // below would be vacuously satisfied and would read as coverage.
+            CHECK(posix_del != 0,
+                  "precondition: this host refuses an out-of-range TLS key at all");
+            CHECK(posix_del == kBareEINVAL,
+                  "pthread_key_delete on a bogus key keeps the bare FreeBSD EINVAL (22)");
+            CHECK(sce_kdelete(bogus, 0, 0, 0, 0, 0) == kEncodedEINVAL,
+                  "scePthreadKeyDelete on a bogus key reports encoded EINVAL (0x80020016)");
+            CHECK(pos_setspec(bogus, 0x1234, 0, 0, 0, 0) == kBareEINVAL,
+                  "pthread_setspecific on a bogus key keeps the bare EINVAL (22)");
+            CHECK(sce_setspec(bogus, 0x1234, 0, 0, 0, 0) == kEncodedEINVAL,
+                  "scePthreadSetspecific on a bogus key reports encoded EINVAL");
+
+            // POSITIVE CONTROL. Without it, a body broken into "refuse everything" satisfies all
+            // four arms above.
+            //
+            // The stored value is deliberately 0x2a, BELOW 256. sce_pthread_rc passes anything with
+            // bits outside the low byte through untouched, so a large value would be identical
+            // whether or not Getspecific were aliased — and section 5's arms cannot see this either,
+            // because they never store a value. 0x2a is the only shape that discriminates: aliasing
+            // scePthreadGetspecific turns it into 0x8002002a, i.e. a guest's TLS pointer delivered
+            // as an errno. Read through BOTH spellings, since only the Sony one can be aliased.
+            uint32_t key = 0xffffffffu;
+            CHECK(sce_kcreate((uint64_t)(uintptr_t)&key, 0, 0, 0, 0, 0) == 0 && key != 0xffffffffu,
+                  "control: scePthreadKeyCreate produces a key");
+            CHECK(sce_setspec(key, 0x2a, 0, 0, 0, 0) == 0,
+                  "control: scePthreadSetspecific stores a value and reports 0");
+            CHECK(pos_getspec(key, 0, 0, 0, 0, 0) == 0x2a,
+                  "control: pthread_getspecific reads the small value back unencoded");
+            CHECK(sce_getspec && sce_getspec(key, 0, 0, 0, 0, 0) == 0x2a,
+                  "control: scePthreadGetspecific reads back 0x2a, NOT 0x8002002a — the arm that "
+                  "catches a mechanical sweep reaching a value-returning handler");
+            CHECK(sce_kdelete(key, 0, 0, 0, 0, 0) == 0,
+                  "control: scePthreadKeyDelete of a real key reports 0");
+        }
+    }
+
+    // ===== 7. #1983: scePthreadCondWait must still report SUCCESS for a real signalled wait =====
+    // The kRows row above provokes the refusal; this is its positive control, and it is the arm that
+    // separates "the handler reports its wait" from "the handler was broken into rejecting". It also
+    // covers the second defect the row cannot see: before #1983 the body returned 0 for a wait that
+    // FAILED as well as for one that succeeded, so only a success arm plus a failure arm together
+    // establish that the result is now the wait's own.
+    //
+    // No lost-wakeup race: the signaller can only take the mutex once the wait has released it.
+    printf("-- a real signalled condition wait still reports 0 through both spellings --\n");
+    {
+        HleFn sce_wait   = Hle::lookup(nid_hash("scePthreadCondWait"));
+        HleFn posix_wait = Hle::lookup(nid_hash("pthread_cond_wait"));
+        HleFn cond_init  = Hle::lookup(nid_hash("scePthreadCondInit"));
+        HleFn cond_sig   = Hle::lookup(nid_hash("scePthreadCondSignal"));
+        HleFn cond_del   = Hle::lookup(nid_hash("scePthreadCondDestroy"));
+        HleFn mtx_init   = Hle::lookup(nid_hash("scePthreadMutexInit"));
+        HleFn mtx_lock   = Hle::lookup(nid_hash("scePthreadMutexLock"));
+        HleFn mtx_unlock = Hle::lookup(nid_hash("scePthreadMutexUnlock"));
+        HleFn mtx_del    = Hle::lookup(nid_hash("scePthreadMutexDestroy"));
+        CHECK(sce_wait && posix_wait && cond_init && cond_sig && cond_del && mtx_init && mtx_lock &&
+                  mtx_unlock && mtx_del,
+              "the condition-variable family is registered under both spellings");
+        if (sce_wait && posix_wait && cond_init && cond_sig && cond_del && mtx_init && mtx_lock &&
+            mtx_unlock && mtx_del) {
+            void* cond = nullptr;
+            void* mutex = nullptr;
+            const uint64_t c = (uint64_t)(uintptr_t)&cond;
+            const uint64_t m = (uint64_t)(uintptr_t)&mutex;
+            CHECK(cond_init(c, 0, 0, 0, 0, 0) == 0 && cond, "control: a condition variable initializes");
+            CHECK(mtx_init(m, 0, 0, 0, 0, 0) == 0 && mutex, "control: a mutex initializes");
+            for (int arm = 0; arm < 2; ++arm) {
+                HleFn wait_fn = arm == 0 ? sce_wait : posix_wait;
+                CHECK(mtx_lock(m, 0, 0, 0, 0, 0) == 0, "control: the waiter takes the mutex first");
+                std::thread signaller([&] {
+                    mtx_lock(m, 0, 0, 0, 0, 0);
+                    cond_sig(c, 0, 0, 0, 0, 0);
+                    mtx_unlock(m, 0, 0, 0, 0, 0);
+                });
+                const uint64_t rc = wait_fn(c, m, 0, 0, 0, 0);
+                signaller.join();
+                CHECK(rc == 0, arm == 0
+                          ? "scePthreadCondWait reports 0 for a wait that was really signalled"
+                          : "pthread_cond_wait reports 0 for a wait that was really signalled");
+                CHECK(mtx_unlock(m, 0, 0, 0, 0, 0) == 0,
+                      "control: the wait reacquired the mutex before returning");
+            }
+            cond_del(c, 0, 0, 0, 0, 0);
+            mtx_del(m, 0, 0, 0, 0, 0);
+        }
+    }
+
+    // ===== 8. the other side of "iff": handlers that correctly have no alias ==================
     // HONEST LABEL: these arms document the contract, they do NOT discriminate. Each body returns 0
     // on every path, and `sce_pthread_rc(0)` is 0, so a speculatively added alias would be
     // invisible here. They are kept because they pin the *observable* half — that these entry

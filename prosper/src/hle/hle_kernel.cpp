@@ -1011,10 +1011,11 @@ HLE(k_cond_init) {
     *(void**)a0 = cond;
     return 0;
 }
-// The Sony spellings of the fallible condition-variable entry points (#2178). Destroy, Signal,
-// Broadcast and Wait are deliberately absent: each returns 0 unconditionally, so an alias would
-// change nothing today and misstate the contract tomorrow. scePthreadCondTimedwait encodes in
-// place instead — it has no POSIX spelling registered on its body.
+// The Sony spellings of the fallible condition-variable entry points (#2178). Signal and Broadcast
+// are deliberately absent: each returns 0 unconditionally, so an alias would change nothing today
+// and misstate the contract tomorrow. Destroy joined them when #2168 made it EBUSY-capable, and
+// Wait when #1983 made it report its wait; both aliases are below their own bodies.
+// scePthreadCondTimedwait encodes in place instead — it has no POSIX spelling on its body.
 SCE_PTHREAD_ALIAS(k_sce_cond_init,             k_cond_init)
 SCE_PTHREAD_ALIAS(k_sce_condattr_init,         k_condattr_init)
 SCE_PTHREAD_ALIAS(k_sce_condattr_setclock,     k_condattr_setclock)
@@ -1047,14 +1048,49 @@ HLE(k_cond_destroy) {
 SCE_PTHREAD_ALIAS(k_sce_cond_destroy, k_cond_destroy)
 HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
 HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_broadcast(c); } return 0; }
+// #1983: this reported SUCCESS for a wait that failed, and for a wait that never happened, through
+// two separate paths:
+//   1. the result was DISCARDED -- `(void)interruptible_cond_wait(...)` followed by an
+//      unconditional `return 0`, so a failed wait was reported to the guest as "signalled";
+//   2. a null cond or mutex slot skipped the `if (c && m)` body entirely, so NO wait was attempted
+//      at all -- and it still returned 0. That is the worse of the two: a predicate loop is told a
+//      condition fired when nothing was ever waited on, and either spins or proceeds on unsatisfied
+//      state. Path 1 at least performed the wait.
+// This is strictly worse than the bare-errno defect #1983 tracks, because a guest that only tests
+// `rc == 0` is misled too, not just one comparing against a named constant.
+// The k_cond_timedwait sibling just below already captured both -- same helper, same argument
+// shape, adjacent handler, opposite treatment of the return value. It is the model followed here,
+// down to the bare EINVAL(22) for an unusable pair.
+//
+// NOT changed, and deliberately: the C11 `_Cnd_wait` (hle_kernel_time.cpp `m_cnd_wait`) still
+// returns 0 unconditionally, because the SHIPPED guest libc.prx does exactly that -- its `_Cnd_wait`
+// is `call <scePthreadCondWait>; xor eax,eax; ret`. There the unconditional 0 is the contract
+// rather than a defect, and prosper reimplementing it faithfully is the point.
 HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
+    uint64_t result;
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
-      if (c && m) {
+      if (!c || !m) {
+          result = 22;   // EINVAL — not a condition variable, or not a mutex. Bare; see the alias.
+      } else {
           GuestCondWaiterScope waiting(c);   // #2168 -- covers every wait path in this body
-          (void)interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
-                                        nullptr, kGuestMutexCondWaitBookkeeping);
+          result = fbsd_errno(interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,
+                                                      nullptr, kGuestMutexCondWaitBookkeeping));
       } }
-    if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
+    if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return result; }
+// The body above is registered under BOTH spellings, which is exactly why the fix could not live in
+// it alone: `pthread_cond_wait` must report the bare errno and `scePthreadCondWait` the encoded one,
+// so the two consumers of this one body want opposite answers (#1983, the shape #2296 also hit).
+//
+// CONFIDENCE: MED on the encoded form for THIS entry point, and the evidence is worth stating
+// precisely because it is weaker here than for its siblings. The shipped guest libc.prx's C11
+// `_Cnd_timedwait` compares `scePthreadCondTimedwait`'s result against 0x8002003c and 0x80020001,
+// and `_Mtx_lock` compares `scePthreadMutexLock`'s against 0x8002000b -- both were re-read for
+// #1983 and both reproduce. But `_Cnd_wait` (the C11 wrapper that calls scePthreadCondWait) is
+// `push rbp; mov rbp,rsp; call <plt>; xor eax,eax; pop rbp; ret`: it DISCARDS the result. So the
+// C11 layer neither confirms nor contradicts the encoding for this one, and the encoded form is an
+// extrapolation from the libkernel-wide convention (#2178), not a measurement. Do not raise this
+// label without a direct caller that compares.
+SCE_PTHREAD_ALIAS(k_sce_cond_wait, k_cond_wait)
 // POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
 // absolute deadline in the condition attribute's selected clock ({i64 sec, i64 nsec}, FreeBSD ==
 // Linux x86-64 layout), and the
@@ -1796,6 +1832,13 @@ HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam*
     return 0;
 }
 
+// DELIBERATELY NOT ALIASED, and this is a recorded decision rather than an omission (#2178, #2365).
+// `scePthreadGetname` is dual-registered with `pthread_getname_np` and IS fallible, so the family
+// rule would sweep it — but the only guest call site found (PPSA17942 `0x5fac7c3`) does `test eax,
+// eax`, where 3 and 0x80020003 are indistinguishable, so nothing observed can settle it. Its Set
+// counterpart WAS swept in #2382 because a caller there does discriminate. #1983 re-examined this
+// and found no new evidence either way, so the bare form stands until a caller that branches on the
+// value turns up; `tests/test_pthread_names.cpp` pins it with the same reasoning.
 HLE(k_pthread_getname) {
     if (!a0) return 3;    // ESRCH
     if (!a1) return 14;   // EFAULT
@@ -2422,8 +2465,17 @@ HLE(k_key_delete)    {
 #else
     const int result = pthread_key_delete(key);
 #endif
-    return (uint64_t)(int64_t)result;
+    // fbsd_errno, not the raw host number: k_key_create above already routes its EAGAIN through the
+    // table (#1612) and this half did not, so one of the pair could hand the guest a host errno.
+    // Bare on purpose -- `pthread_key_delete` keeps it; `scePthreadKeyDelete` encodes below (#1983).
+    return fbsd_errno(result);
 }
+// The C11 layer makes this concrete: in the shipped guest libc.prx, `_Tss_create`, `_Tss_delete` and
+// `_Tss_set` are three-instruction forwarders onto scePthreadKeyCreate / KeyDelete / Setspecific
+// respectively (verified by PLT relocation for PPSA24651). KeyCreate already encoded via
+// k_sce_key_create, so one C11 family was forwarding an encoded value from one member and a bare
+// errno from the other two -- the #1873 shape, inside a single guest header's worth of API.
+SCE_PTHREAD_ALIAS(k_sce_key_delete, k_key_delete)
 HLE(k_getspecific)   {
     uint64_t rv = (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0);
     // #312: learn the non-trapping MB3 pool-array address even when the hardware-watch diagnostic
@@ -2441,8 +2493,9 @@ HLE(k_setspecific)   {
     if (g_mb3_arm_hook && a1) g_mb3_arm_hook(a1);
     int r = pthread_setspecific((pthread_key_t)a0, (void*)(uintptr_t)a1);
     if (!r && gpu::mb3_tls_tracking_enabled()) gpu::mb3_note_tls_pool_candidate(a1);
-    return (uint64_t)(int64_t)r;
+    return fbsd_errno(r);   // #1612: never a raw host errno. Bare here; the Sony spelling encodes.
 }
+SCE_PTHREAD_ALIAS(k_sce_setspecific, k_setspecific)
 
 // --- event flags (SceKernelEventFlag): a bit pattern with wait/set/clear ---
 namespace {
@@ -4478,7 +4531,7 @@ void register_kernel_hle() {
     R("scePthreadCondDestroy", k_sce_cond_destroy);                 // EBUSY-capable since #2168
     R("scePthreadCondSignal", k_cond_signal);
     R("scePthreadCondBroadcast", k_cond_broadcast);
-    R("scePthreadCondWait", k_cond_wait);
+    R("scePthreadCondWait", k_sce_cond_wait);   // reports its wait since #1983 (was always 0)
     R("scePthreadCondTimedwait", k_cond_timedwait_sce);   // Sony: relative µs, NOT the POSIX abstime form
     // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
     R("scePthreadRwlockInit", k_sce_rwlock_init);    R("pthread_rwlock_init", k_rwlock_init);
@@ -4541,7 +4594,7 @@ void register_kernel_hle() {
     R("scePthreadGetschedparam", k_getschedparam);  R("pthread_getschedparam", k_getschedparam);
     R("scePthreadSetschedparam", k_log_setschedparam);  R("scePthreadSetprio", k_log_setprio);
     R("scePthreadGetprio", k_getprio);
-    R("scePthreadGetname", k_pthread_getname);
+    R("scePthreadGetname", k_pthread_getname);   // bare ON PURPOSE — see the block above the body
     R("scePthreadRename", k_sce_pthread_rename);
     R("scePthreadSetName", k_sce_pthread_rename);
     R("pthread_getname_np", k_pthread_getname);
@@ -4550,9 +4603,11 @@ void register_kernel_hle() {
     R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
     R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_sce_key_create);
-    R("pthread_key_delete", k_key_delete);   R("scePthreadKeyDelete", k_key_delete);
+    R("pthread_key_delete", k_key_delete);   R("scePthreadKeyDelete", k_sce_key_delete);   // #1983
+    // Getspecific returns the stored VALUE, not an error code, so it must NEVER be aliased —
+    // sce_pthread_rc would rewrite a small guest pointer into 0x800200xx.
     R("pthread_getspecific", k_getspecific); R("scePthreadGetspecific", k_getspecific);
-    R("pthread_setspecific", k_setspecific); R("scePthreadSetspecific", k_setspecific);
+    R("pthread_setspecific", k_setspecific); R("scePthreadSetspecific", k_sce_setspecific); // #1983
     R("pthread_self", k_pthread_self);
     // POSIX pthread_equal — the GC compares thread ids with this while searching its
     // thread table; unimplemented (always "not equal") made every thread look unknown.
