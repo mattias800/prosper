@@ -226,10 +226,49 @@ bool wait_for(const std::atomic<int>& counter, int target) {
 // established that its absence is the right answer rather than an oversight.
 const char* const kInfallible[] = {
     "scePthreadMutexattrSetprotocol", "scePthreadMutexattrSetpshared", "scePthreadMutexattrDestroy",
-    "scePthreadMutexDestroy", "scePthreadCondattrDestroy", "scePthreadCondDestroy",
+    "scePthreadMutexDestroy", "scePthreadCondattrDestroy",
     "scePthreadCondSignal", "scePthreadCondBroadcast",
-    "scePthreadRwlockDestroy", "scePthreadSemDestroy", "scePthreadBarrierDestroy",
+    "scePthreadRwlockDestroy", "scePthreadSemDestroy",
     "scePthreadBarrierattrInit", "scePthreadBarrierattrDestroy", "scePthreadBarrierattrSetpshared",
+};
+
+// Bodies that CAN fail, but answer 0 for a NULL slot — so the sweep's null probe cannot reach their
+// failure path and they do not belong in either list above.
+//
+// They were listed as infallible when this file was written, and that was true then. #2359 (condvar)
+// and #2379 (barrier) landed #2168's busy-destroy contract: each now refuses an object that still
+// has waiters, and the guest sees `SCE_KERNEL_ERROR_EBUSY` (0x80020010) from BOTH Sony spellings.
+// They get there by opposite routes, and the difference is the axis #2182 polices, so do not
+// collapse it:
+//   * `k_barrier_destroy` encodes IN PLACE (hle_kernel.cpp:3045). It is Sony-only — nothing
+//     registers `pthread_barrier_destroy` onto that body — so there is no POSIX caller to mislead.
+//   * `k_cond_destroy` returns the BARE FreeBSD errno (hle_kernel.cpp:1033-1034) precisely BECAUSE
+//     the POSIX spelling is registered onto the same body -- grep
+//     `R("pthread_cond_destroy", k_cond_destroy)`, hle_kernel.cpp:4825 at the time of writing. The
+//     Sony spelling gets its 0x8002xxxx from the `SCE_PTHREAD_ALIAS` at :1049. Making this one
+//     encode in place would hand every POSIX caller a Sony-encoded value -- #1984's shape -- and
+//     `test_cond_destroy_busy.cpp` asserts the bare 16 for exactly that reason.
+//     (The line number is given with the symbol on purpose. This citation was already wrong once:
+//     it read :4810, correct when the reviewer wrote it and stale one rebase later, because a line
+//     number is a fact about a revision and a comment outlives revisions. That is #2665's class,
+//     and it bites hardest exactly here -- a reader who opens the cited line, finds an unrelated
+//     registration and concludes the claim is unsupported ends up believing the opposite of it.)
+// The `kInfallible` ARM still passed unchanged after both landings, because a null slot never
+// reaches the busy check -- so nothing failed, and the list's stated rationale ("returns 0 on every
+// path") silently went false while the assertion stayed green. That is the failure this split
+// exists to prevent: a passing arm is not evidence that the sentence justifying it is still true.
+//
+// The busy path itself is covered where it can actually be constructed — a thread must really be
+// parked in the object — by `test_cond_destroy_busy.cpp` and `test_barrier_destroy_busy.cpp`. What
+// is pinned HERE is only the null-slot half: these report success for an absent object rather than
+// inventing a failure. That is all this arm can see: `sce_pthread_rc(0)` is 0, so it reads the same
+// through the condvar's existing alias as it would through the barrier's direct registration, and
+// it would not notice an alias being added to or removed from either.
+// #2168's remaining third, `scePthreadMutexDestroy`, is still genuinely infallible above: it needs
+// owner tracking that deliberately does not exist on POSIX hosts (#719/#793).
+const char* const kFallibleButNullSucceeds[] = {
+    "scePthreadCondDestroy",      // #2359: EBUSY with waiters -- bare from the body, encoded by the alias
+    "scePthreadBarrierDestroy",   // #2379: EBUSY with threads parked -- encoded in the body itself
 };
 
 }  // namespace
@@ -540,6 +579,22 @@ int main() {
         if (!f) { snprintf(msg, sizeof msg, "%s is registered", name); CHECK(false, msg); continue; }
         const uint64_t got = call0(f);
         snprintf(msg, sizeof msg, "%-32s -> 0 (no failure path, so no alias)  got 0x%llx",
+                 name, (unsigned long long)got);
+        CHECK(got == 0, msg);
+    }
+
+    // The #2168 busy-destroy pair. Same observable assertion, deliberately a separate group and a
+    // separate label: these bodies DO have a failure path, it is simply unreachable through a null
+    // slot. Keeping them in kInfallible would keep asserting the right thing for a reason that
+    // stopped being true when #2359 and #2379 landed. See kFallibleButNullSucceeds.
+    printf("-- #2168 busy-destroy bodies: a NULL slot still reports success (the busy path is in "
+           "test_cond_destroy_busy / test_barrier_destroy_busy) --\n");
+    for (const char* name : kFallibleButNullSucceeds) {
+        char msg[192];
+        HleFn f = Hle::lookup(nid_hash(name));
+        if (!f) { snprintf(msg, sizeof msg, "%s is registered", name); CHECK(false, msg); continue; }
+        const uint64_t got = call0(f);
+        snprintf(msg, sizeof msg, "%-32s -> 0 for a null slot (fallible, but not here)  got 0x%llx",
                  name, (unsigned long long)got);
         CHECK(got == 0, msg);
     }

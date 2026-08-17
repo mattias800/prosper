@@ -538,7 +538,23 @@ HLE(k_ok)              { return 0; }                       // generic success no
 // the COMPARE, not the branch target, so it says which titles *can* change behaviour under a
 // different answer, not which ones do, and "441 sites" is a lower bound on reach (it follows one
 // stub level and one call deep). The `test eax,eax` half matters as much as the errno half — it is
-// the plain defensive form of the same gate and never mentions 0x805A1001.
+// the plain defensive form of the same gate. It was recorded here as one that "never mentions
+// 0x805A1001"; that is FALSE for 70 of those sites, which name the constant inside their error arm
+// where the scan of the day could not see it. The claim is quoted rather than deleted so this stays
+// a dated record of what was believed, and the re-measure directly below is what corrects it.
+// RE-MEASURED 2026-08-17 (PR #2637), and it moved in the direction that strengthens this: the scan
+// used to stop at the first branch, so a site that tested generically and compared the errno inside
+// its ERROR ARM was counted in the `test eax,eax` half. Reading the arms, the same 445 sites across
+// the same 66 modules split const=307 / nonzero=78 / gate-open=47 / undecodable=13, against
+// const=237 / nonzero=208 with `--no-follow-arms`. So **70 more sites name 0x805A1001 than this
+// paragraph could see**, and the 47 `gate-open` + 13 `undecodable` are honestly unresolved rather
+// than counted as insensitive.
+// The 441 -> 445 drift against the older reading is resolved, and it is apparatus rather than
+// corpus: PPSA08804-app0 carries a second copy of its eboot at `_DUPLEX_/Original eboot/eboot.bin`
+// (a release-group leftover, and NOT byte-identical to the shipped one -- a different build). The
+// scanner walks it as its own module, and it contributes exactly 4 sites and 1 module: 445 - 4 =
+// 441 and 66 - 1 = 65, reproducing the historical figures. Any sweep quoting a site total over the
+// local dumps double-counts that one title's eboot.
 //
 // What prosper can honestly answer is which ids the guest asked it to load. The sysmodule id space
 // is the set of *optional* modules an application must request; the always-resident libraries

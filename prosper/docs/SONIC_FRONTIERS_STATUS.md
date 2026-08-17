@@ -89,8 +89,10 @@ it. But the corpus says something about the *precise* code that nobody should ha
 **Two independent titles have a dedicated arm for `0x809F000F` and none for `0x809F0008`.** Of the
 five local titles that call `sceSaveDataTransferringMountPs4`, three const-compare the result —
 PPSA03839 against `0x809F0003` (a retry loop), and **PPSA07809 and PPSA08804 against `0x809F000F`**.
-PPSA08804's compare is inside its error arm *past* the branch, which is why a `nid_gate_scan` bucket
-reports it as a plain non-zero test.
+PPSA08804's compare is inside its error arm *past* the branch, at `+0x4e41a32`. When this was
+written that made it invisible to `nid_gate_scan`, which stopped at the first branch and bucketed the
+site as a plain non-zero test; the scan now follows both arms and reports it as `const` (PR #2637),
+so it no longer has to be taken on the hand-read. `--no-follow-arms` reproduces the older reading.
 
 `0x809F000F` appears nowhere in prosper, and the PS5 3.20 library dump carries names and NIDs only —
 no constants — so what it means is unresolved. Start from this rather than from
