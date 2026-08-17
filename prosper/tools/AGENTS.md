@@ -427,6 +427,26 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   the file `unbroken` (#2108). What it does **not** cover, stated so silence is not read as
   coverage: HTML tables, delimiter-less pipe blocks (no header to measure against), whether an
   escaped pipe was what the author meant, and fenced regions, which are skipped deliberately.
+- **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
+  reference in the repository must name a row that exists. `check_numbered_table.py` validates the
+  TABLE and has no idea anything cites it, so until this existed a reference to a row that never
+  existed read as perfectly correct — a plausible number in a plausible sentence, findable only by
+  opening the table and counting, which nobody does for a number in a code comment. **That is the
+  more expensive half:** a duplicate row is visible the moment you look at the table, while a stale
+  by-number reference quietly sends the next agent to an unrelated entry. Roughly half the references
+  are `.cpp`/`.hpp`/`.py` comments rather than prose, so this is a contract compiled files depend on;
+  the tool prints the live counts on every run, so no figure is quoted here to go stale. Deliberately
+  narrow about what counts as a reference, because it scans every tracked file and one that fires on
+  ordinary prose gets disabled — `trap 41`, `traps 55 and 56`, `instrument-trap 43` and `trap #13`
+  count, while `s_trap 1` (an RDNA2 mnemonic), `WRITE-TRAP #1` (a pasted log line), `trap 0x40`,
+  `traps 1234` and `entry 99` do not. Each exclusion is measured: removing the leading boundary
+  admits 4 extra matches, **3 of which cite row 0** and would turn this repo-wide gate red on correct
+  code; removing the trailing boundary makes `\|d{1,3}` bite a prefix out of `0x40` and `1234`, the
+  second resolving **silently** to an unrelated row. That boundary is `(?!\|w\|\|.\|d)` and **not** the
+  obvious `(?![\|w.])`, which rejects a full stop — so `See instrument trap 41.` stopped being a
+  citation at all, losing 22 of 118 references (5 of them in `.cpp`/`.hpp`/test comments) **with the
+  gate still green and the success line still saying "all resolving"**. Run by the CI `Docs` job;
+  `ctest -R trap_citation_checker` covers it.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the
