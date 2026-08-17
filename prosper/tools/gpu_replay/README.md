@@ -60,6 +60,22 @@ tested. The same report covers an unreached `PROSPER_CAPTURE_BUNDLE_AT_PRESENT` 
 count the run reached), an unobserved `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE`, a gate configured without
 `PROSPER_CAPTURE_BUNDLE`, and a conflicting multi-gate configuration.
 
+`PROSPER_CAPTURE_BUNDLE` **set on its own arms nothing** — it names only a destination — and since
+#2565 that too is reported at exit rather than leaving a missing file as the whole story.
+
+The capture tunables parse strictly, and a rejected value is never substituted in silence (#2565).
+The entire value must be a number, with nothing around it: `PROSPER_CAPTURE_MAX_SUBMITS=40 ` (trailing
+space) and `=4O` (letter O) are rejections, not forties.
+
+* **`PROSPER_CAPTURE_MAX_SUBMITS`** is the one that **refuses**: a bad value ends the process at load
+  with exit status 3 and a `[grab]` explanation. It cannot fall back, because its fallback is
+  *uncapped* — the inverse of the request, on exactly the run the cap exists for. Leave the variable
+  unset for an uncapped capture; `0` is refused because it would mean both things at once.
+* **`PROSPER_CAPTURE_BUNDLE_MAX_MB`** (64..3072) and **`PROSPER_CAPTURE_FRAMES`** (1..240) keep their
+  existing fallbacks and now print one `[grab]` line naming the variable, the rejected value with
+  invisible bytes escaped, and the value actually in force. Reading "the budget default is in force"
+  is how you learn that a raise you made after an aborted capture was discarded.
+
 When neither a fixed present nor guest stdout is phase-stable, set
 `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` with
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`. Keep the trigger path absent at startup, watch

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -240,6 +241,24 @@ RuntimeRecorder& runtime_recorder() {
     return recorder;
 }
 
+// Mirrors of the detailed-capture selector's state, at namespace scope (#2564).
+//
+// The exit report may NOT read RuntimeDetailRequest itself. It is a function-local static built
+// lazily on the first submit that reaches the recorder, so a run that never submits — or one whose
+// timeline was never requested — has no such object at all; and an atexit handler registered at load
+// runs AFTER every static destructor, so even a constructed one has ended its lifetime by then.
+// #1684 hit exactly this and leaked its singleton for the same reason. These cost one relaxed store
+// each on paths that already build a whole submit record.
+std::atomic<bool> g_timeline_request_built{false};
+std::atomic<bool> g_timeline_request_valid{false};
+std::atomic<bool> g_timeline_selector_semantic{false};
+std::atomic<uint64_t> g_timeline_submit_hook_reached{0};
+std::atomic<uint64_t> g_timeline_selector_submits_examined{0};
+std::atomic<uint64_t> g_timeline_selector_last_submit_examined{0};
+std::atomic<uint64_t> g_timeline_detail_submits_captured{0};
+std::atomic<bool> g_timeline_after_compute_armed{false};
+std::atomic<uint64_t> g_timeline_phase_submits_observed{0};
+
 struct RuntimeDetailRequest {
     std::string path;
     std::string predecessor_path;
@@ -291,6 +310,10 @@ struct RuntimeDetailRequest {
     std::atomic<bool> history_phase_bounded{false};
 
     RuntimeDetailRequest() {
+        // Latched before the first early return: "the request was never built at all" and "it was
+        // built and rejected" are different faults with different fixes, and the exit report has to
+        // tell them apart without being able to look at this object (#2564).
+        g_timeline_request_built.store(true, std::memory_order_release);
         const char* path_env = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE");
         const char* submit_env = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT");
         if ((!path_env || !*path_env) && (!submit_env || !*submit_env)) return;
@@ -524,6 +547,8 @@ struct RuntimeDetailRequest {
             exit_after_capture = *value && std::strcmp(value, "0") && std::strcmp(value, "off");
         submit_no = parsed;
         valid = true;
+        g_timeline_request_valid.store(true, std::memory_order_release);
+        g_timeline_selector_semantic.store(semantic_selector, std::memory_order_release);
         if (semantic_selector)
             std::fprintf(stderr, "[timeline] semantic capture endpoint submit>=%llu "
                                  "target=%ux%u target-index=%u..%u draws=%u..%u "
@@ -791,12 +816,14 @@ RuntimeCapturePhaseObservation observe_runtime_capture_phase(RuntimeDetailReques
         request.after_compute_seen.load(std::memory_order_acquire))
         return RuntimeCapturePhaseObservation::Ready;
     request.phase_observation_submits.fetch_add(1, std::memory_order_relaxed);
+    g_timeline_phase_submits_observed.fetch_add(1, std::memory_order_relaxed);
     for (const auto& dispatch : state.dispatches) {
         request.phase_dispatches_scanned.fetch_add(1, std::memory_order_relaxed);
         if (compute_dispatch_code_addr(state, dispatch) != request.select_after_compute_program)
             continue;
         request.after_compute_submit_no = submit_no;
         request.after_compute_seen.store(true, std::memory_order_release);
+        g_timeline_after_compute_armed.store(true, std::memory_order_release);
         std::fprintf(stderr,
                      "[timeline] capture after-compute gate armed submit=%llu program=0x%llx "
                      "observed-submits=%llu dispatches-scanned=%llu history-submits-skipped=%llu "
@@ -1854,6 +1881,232 @@ bool begin_gpu_timeline_submit(uint64_t submit_no) {
     return requested;
 }
 
+namespace {
+// Renders a log line or an environment value unambiguously. An exact-match failure — or a rejected
+// tunable — is very often caused by a byte the operator cannot see: a trailing tab, a stray CR, a
+// BOM, a trailing space. Printing raw would reproduce the very invisibility these reports exist to
+// remove. Shared by the guest-log miss report (#1684) and the tunable notices (#2565).
+std::string escape_log_line(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (const unsigned char ch : text) {
+        if (ch == '\\') {
+            out += "\\\\";
+        } else if (ch >= 0x20 && ch < 0x7f) {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            char buf[5];
+            std::snprintf(buf, sizeof(buf), "\\x%02x", ch);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+// A tunable's value is a number, never prose, so a SPACE inside one is always a typo — and
+// `PROSPER_CAPTURE_MAX_SUBMITS=40 ` is one of the two typos this whole change exists for.
+// escape_log_line deliberately leaves 0x20 alone (correct for a guest log line, which is mostly
+// spaces; wrong here, where the invisible byte IS the bug), so spaces are escaped on top of it.
+std::string escape_tunable_value(const std::string& raw) {
+    std::string out = escape_log_line(raw);
+    std::string escaped;
+    escaped.reserve(out.size());
+    for (const char ch : out) {
+        if (ch == ' ') escaped += "\\x20";
+        else escaped.push_back(ch);
+    }
+    return escaped;
+}
+}  // namespace
+
+// ---- Capture tunables: strict parse, and never a silent substitution (#2565) -----------------
+// Four capture tunables accepted a malformed or out-of-range value and quietly substituted a
+// different policy. None printed anything, so the run still completed and still produced *a* result
+// — just not the one that was asked for. The fallbacks are unchanged here; only the silence is.
+CaptureTunableParse parse_capture_tunable(const char* raw, uint64_t lo, uint64_t hi) {
+    CaptureTunableParse out;
+    if (!raw || !*raw) return out;   // Unset
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(raw, &end, 0);
+    // Every one of these is deliberate. `end == raw` rejects a value with no digits at all; `*end`
+    // rejects trailing bytes, which is what makes `40 ` a rejection rather than a 40; `errno`
+    // rejects an overflow that strtoull would otherwise saturate to ULLONG_MAX; a leading '-' is
+    // rejected explicitly because strtoull silently NEGATES it into a huge positive number, turning
+    // `-1` into an accepted 18446744073709551615; and LEADING whitespace is rejected because
+    // strtoull skips it, so ` 40` would otherwise be accepted while `40 ` is not — an asymmetry with
+    // no defensible meaning in a value that is supposed to be a number and nothing else.
+    if (errno || end == raw || !end || *end || *raw == '-' ||
+        std::isspace(static_cast<unsigned char>(*raw))) {
+        out.status = CaptureTunableStatus::Malformed;
+        return out;
+    }
+    out.value = static_cast<uint64_t>(parsed);
+    out.status = out.value < lo   ? CaptureTunableStatus::BelowRange
+                 : out.value > hi ? CaptureTunableStatus::AboveRange
+                                  : CaptureTunableStatus::Accepted;
+    return out;
+}
+
+namespace {
+// The shared body of a substitution notice. `in_force` is the load-bearing half: a message that only
+// says "rejected" still leaves the operator to guess what the run is actually doing.
+std::string capture_tunable_notice(const char* name, const char* raw,
+                                   const CaptureTunableParse& parse, uint64_t lo, uint64_t hi,
+                                   const std::string& in_force) {
+    if (parse.status == CaptureTunableStatus::Unset ||
+        parse.status == CaptureTunableStatus::Accepted)
+        return {};
+    std::string out = "[grab] ";
+    out += name;
+    out += "=\"" + escape_tunable_value(raw ? raw : "") + "\" ";
+    out += parse.status == CaptureTunableStatus::Malformed
+               ? "is not a whole number (the entire value must be one, with no trailing bytes — "
+                 "not even a space)"
+               : "is outside " + std::to_string(lo) + ".." + std::to_string(hi);
+    out += "; " + in_force + "\n";
+    return out;
+}
+}  // namespace
+
+std::string format_capture_bundle_max_mb_notice(const char* raw) {
+    const CaptureTunableParse parse =
+        parse_capture_tunable(raw, kInteractiveBundleMinMb, kInteractiveBundleMaxMb);
+    // 0 is this variable's existing sentinel for "keep the built-in default" — every call site has
+    // always encoded it that way, and prosper-app's own parse says so in a comment. Honouring it is
+    // not a substitution, so it draws no notice.
+    if (parse.status == CaptureTunableStatus::BelowRange && parse.value == 0) return {};
+    std::string in_force;
+    switch (parse.status) {
+        case CaptureTunableStatus::BelowRange:
+            in_force = "the budget is raised to the " + std::to_string(kInteractiveBundleMinMb) +
+                       " MiB minimum";
+            break;
+        case CaptureTunableStatus::AboveRange:
+            in_force = "the budget is capped at the " + std::to_string(kInteractiveBundleMaxMb) +
+                       " MiB maximum";
+            break;
+        default:
+            in_force = "the built-in default of " + std::to_string(kInteractiveBundleDefaultMb) +
+                       " MiB is in force, so a raise asked for here was DISCARDED and a capture "
+                       "that aborted on the budget will abort again";
+            break;
+    }
+    return capture_tunable_notice("PROSPER_CAPTURE_BUNDLE_MAX_MB", raw, parse,
+                                  kInteractiveBundleMinMb, kInteractiveBundleMaxMb, in_force);
+}
+
+std::string format_capture_frames_notice(const char* raw) {
+    const CaptureTunableParse parse =
+        parse_capture_tunable(raw, kCaptureFramesMin, kCaptureFramesMax);
+    std::string in_force;
+    switch (parse.status) {
+        case CaptureTunableStatus::BelowRange:
+            in_force = "the window is " + std::to_string(kCaptureFramesMin) + " present";
+            break;
+        case CaptureTunableStatus::AboveRange:
+            in_force = "the window is clamped to " + std::to_string(kCaptureFramesMax) +
+                       " presents";
+            break;
+        default:
+            in_force = "the window is the default " + std::to_string(kCaptureFramesDefault) +
+                       " present — which is the very width the 'window had no submits' message "
+                       "tells you to widen, so a mistyped remedy reproduces the original failure "
+                       "exactly";
+            break;
+    }
+    return capture_tunable_notice("PROSPER_CAPTURE_FRAMES", raw, parse, kCaptureFramesMin,
+                                  kCaptureFramesMax, in_force);
+}
+
+std::string format_capture_max_submits_refusal(const char* raw) {
+    // 1 is the minimum: a cap of zero submits captures nothing, and "uncapped" is expressible only
+    // by leaving the variable unset. Accepting `=0` as "uncapped" would preserve exactly the
+    // ambiguity this refusal exists to remove.
+    const CaptureTunableParse parse = parse_capture_tunable(raw, 1, UINT64_MAX);
+    if (parse.status == CaptureTunableStatus::Unset ||
+        parse.status == CaptureTunableStatus::Accepted)
+        return {};
+    std::string out = "[grab] PROSPER_CAPTURE_MAX_SUBMITS=\"" + escape_tunable_value(raw ? raw : "") +
+                      "\" is not a submit count; REFUSING TO RUN.\n";
+    out += "[grab]   This variable does not fall back to a default: its fallback is UNCAPPED, which "
+           "is the opposite of what a cap is for.\n";
+    out += "[grab]   The cap exists because one flip burst appended 3.3 GB in a single window and "
+           "blew even the " + std::to_string(kInteractiveBundleMaxMb) +
+           " MiB maximum, so proceeding with a typo would remove the only content bound on exactly "
+           "the run that needs it.\n";
+    out += "[grab]   Give a whole number of submits (1 or more), or unset the variable for an "
+           "uncapped capture. The entire value must be a number — `40 ` with a trailing space and "
+           "`4O` with a letter O are both rejected here.\n";
+    return out;
+}
+
+namespace {
+// Reported at most once per process. The environment does not change during a run, so a second
+// notice would only be noise in a log the first one is competing for attention in.
+// Atomic rather than a plain bool: the three gate constructors that resolve the budget are built
+// lazily and can be reached from the guest-log, present and render threads.
+void report_tunable_once(std::atomic<bool>& reported, const std::string& text) {
+    if (text.empty() || reported.exchange(true, std::memory_order_acq_rel)) return;
+    std::fputs(text.c_str(), stderr);
+}
+}  // namespace
+
+uint32_t resolve_capture_bundle_max_mb() {
+    const char* raw = std::getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB");
+    static std::atomic<bool> reported{false};
+    report_tunable_once(reported, format_capture_bundle_max_mb_notice(raw));
+    const CaptureTunableParse parse =
+        parse_capture_tunable(raw, kInteractiveBundleMinMb, kInteractiveBundleMaxMb);
+    switch (parse.status) {
+        // 0 has always meant "keep the built-in default" at every call site, and a malformed value
+        // has always landed there. That fallback is deliberately unchanged: the defect was silence.
+        case CaptureTunableStatus::Unset:
+        case CaptureTunableStatus::Malformed: return 0;
+        // 0 keeps the built-in default, exactly as it always has; anything else under the minimum is
+        // raised to it, exactly as request_interactive_capture_bundle's clamp always has.
+        case CaptureTunableStatus::BelowRange:
+            return parse.value ? kInteractiveBundleMinMb : 0;
+        case CaptureTunableStatus::AboveRange: return kInteractiveBundleMaxMb;
+        case CaptureTunableStatus::Accepted: return static_cast<uint32_t>(parse.value);
+    }
+    return 0;
+}
+
+uint32_t resolve_capture_frames() {
+    const char* raw = std::getenv("PROSPER_CAPTURE_FRAMES");
+    static std::atomic<bool> reported{false};
+    report_tunable_once(reported, format_capture_frames_notice(raw));
+    const CaptureTunableParse parse =
+        parse_capture_tunable(raw, kCaptureFramesMin, kCaptureFramesMax);
+    switch (parse.status) {
+        case CaptureTunableStatus::Unset:
+        case CaptureTunableStatus::Malformed: return kCaptureFramesDefault;
+        case CaptureTunableStatus::BelowRange: return kCaptureFramesMin;
+        case CaptureTunableStatus::AboveRange: return kCaptureFramesMax;
+        case CaptureTunableStatus::Accepted: return static_cast<uint32_t>(parse.value);
+    }
+    return kCaptureFramesDefault;
+}
+
+uint64_t capture_max_submits() {
+    // Resolved once, and the resolution can END THE PROCESS. This is the one tunable that refuses
+    // rather than substituting, and it refuses at LOAD (the initializer below calls this), so the
+    // operator learns before the route runs rather than after a multi-gigabyte capture is underway.
+    static const uint64_t value = [] {
+        const char* raw = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
+        const std::string refusal = format_capture_max_submits_refusal(raw);
+        if (!refusal.empty()) {
+            std::fputs(refusal.c_str(), stderr);
+            std::fflush(nullptr);
+            std::exit(3);
+        }
+        const CaptureTunableParse parse = parse_capture_tunable(raw, 1, UINT64_MAX);
+        return parse.status == CaptureTunableStatus::Accepted ? parse.value : uint64_t{0};
+    }();
+    return value;
+}
+
 // ---- Interactive frame-bundle capture (prosper-app F9) ---------------------------------------------
 // Capture ONE complete displayed frame — every submit between two presents — on demand, so the produced
 // .prgbundle replays faithfully (the producer submits re-run and regenerate renderer-owned RTTs a single
@@ -1869,7 +2122,7 @@ struct InteractiveFrameBundle {
     std::string current_path;    // path for the window currently being captured
     bool capturing = false;
     bool failed = false;
-    uint64_t max_unique_bytes = 2048ull << 20;
+    uint64_t max_unique_bytes = static_cast<uint64_t>(kInteractiveBundleDefaultMb) << 20;
     // Why the CURRENT grab aborted, recorded as it happens. Distinct from the published outcome
     // below: sharing one field let a completed grab's {ok, path} be collected next to a LATER grab's
     // error string, because this one is written while that one is still awaiting collection.
@@ -1890,6 +2143,10 @@ struct InteractiveFrameBundle {
 };
 InteractiveFrameBundle& interactive_frame_bundle() { static InteractiveFrameBundle b; return b; }
 std::atomic<bool> g_interactive_frame_active{false};   // armed OR capturing
+// Latched, never cleared. `g_interactive_frame_active` goes back to false when a window closes, so
+// it cannot answer "did anything ever arm?" — which is exactly the question the exit report needs in
+// order to say that PROSPER_CAPTURE_BUNDLE was set and nothing ever used it (#2565).
+std::atomic<bool> g_interactive_capture_ever_armed{false};
 
 // Append one capture to `bundle` with content dedup, rolling back if it would exceed the byte budget.
 bool append_capture_to_frame_bundle(GpuCaptureBundle& bundle, const GpuCaptureFile& capture,
@@ -1924,10 +2181,17 @@ std::string request_interactive_capture_bundle(const std::string& path, uint32_t
     std::string replaced = std::move(b.armed_path);
     b.armed_path = path;
     b.arm_delay_presents = delay_presents;
-    if (max_mb) b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(max_mb, 64u, 3072u)) << 20;
-    if (const char* frames = std::getenv("PROSPER_CAPTURE_FRAMES"))
-        b.frames_wanted = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(frames, nullptr, 0)), 1u, 240u);
+    if (max_mb)
+        b.max_unique_bytes = static_cast<uint64_t>(std::clamp<uint32_t>(
+                                 max_mb, kInteractiveBundleMinMb, kInteractiveBundleMaxMb))
+                             << 20;
+    // Strict, and it says what it did (#2565). An unparseable value used to become 0 and then be
+    // clamped straight back to the 1-present default, which is precisely the width the empty-window
+    // message tells the operator to widen — so a mistyped remedy reproduced the original failure and
+    // read as the remedy not working. The value in force is unchanged; the silence is not.
+    if (std::getenv("PROSPER_CAPTURE_FRAMES")) b.frames_wanted = resolve_capture_frames();
     g_interactive_frame_active.store(true, std::memory_order_release);
+    g_interactive_capture_ever_armed.store(true, std::memory_order_release);
     return replaced;
 }
 bool interactive_capture_bundle_active() {
@@ -1970,26 +2234,6 @@ size_t common_prefix_bytes(const std::string& a, const std::string& b) {
     size_t i = 0;
     while (i < n && a[i] == b[i]) ++i;
     return i;
-}
-
-// Renders a guest log line unambiguously. An exact-match failure is very often caused by a byte the
-// operator cannot see — a trailing tab, a stray CR, a BOM — so printing the line raw would reproduce
-// the very invisibility this report exists to remove.
-std::string escape_log_line(const std::string& text) {
-    std::string out;
-    out.reserve(text.size() + 8);
-    for (const unsigned char ch : text) {
-        if (ch == '\\') {
-            out += "\\\\";
-        } else if (ch >= 0x20 && ch < 0x7f) {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            char buf[5];
-            std::snprintf(buf, sizeof(buf), "\\x%02x", ch);
-            out += buf;
-        }
-    }
-    return out;
 }
 
 bool automatic_capture_bundle_gate_conflicts(const char* selected_gate) {
@@ -2056,13 +2300,7 @@ struct GuestLogCaptureBundleState {
                          kGuestLogCaptureMaxLineBytes);
             return;
         }
-        if (const char* limit = std::getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
-            char* end = nullptr;
-            errno = 0;
-            const unsigned long parsed = std::strtoul(limit, &end, 0);
-            if (!errno && end != limit && end && !*end && parsed <= UINT32_MAX)
-                max_mb = static_cast<uint32_t>(parsed);
-        }
+        max_mb = resolve_capture_bundle_max_mb();
         line.reserve(std::min<size_t>(marker.size() + 16, kGuestLogCaptureMaxLineBytes));
         enabled = true;
     }
@@ -2247,7 +2485,28 @@ void report_unfired_automatic_capture_gates() {
             only_value = value;
         }
     }
-    if (!configured) return;   // nothing was asked for; silence is the correct answer
+    if (!configured) {
+        // PROSPER_CAPTURE_BUNDLE alone is a COMPLETE no-op (#2565): it is only ever read as the
+        // destination of one of the three gates above, and F9 derives its own path from
+        // PROSPER_CAPTURE_DIR. "I set the capture path, why is there no bundle?" is a plausible
+        // first attempt, and until now it produced no message anywhere. Say nothing when something
+        // did arm — an interactive or scheduled grab that used the path is not a misconfiguration.
+        const char* only_path = std::getenv("PROSPER_CAPTURE_BUNDLE");
+        if (only_path && *only_path &&
+            !g_interactive_capture_ever_armed.load(std::memory_order_acquire))
+            std::fprintf(stderr,
+                         "[grab] PROSPER_CAPTURE_BUNDLE=\"%s\" was set but nothing ever armed a "
+                         "capture, and NO BUNDLE WAS WRITTEN. On its own this variable only names a "
+                         "DESTINATION; it arms nothing. Add one gate: "
+                         "PROSPER_CAPTURE_BUNDLE_AT_PRESENT=N, "
+                         "PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG=<exact guest line>, or "
+                         "PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=<path>; or press F9 in prosper-app "
+                         "(or schedule it with PROSPER_GRAB_BUNDLE_AT_FRAME / "
+                         "PROSPER_GRAB_BUNDLE_AFTER_MS), which name their output through "
+                         "PROSPER_CAPTURE_DIR rather than through this variable\n",
+                         only_path);
+        return;   // nothing else was asked for; silence is the correct answer
+    }
 
     // Reported here as well as at arm time, because a configuration rejected at startup is easy to
     // miss in a route's log and its only other symptom is the same missing file.
@@ -2314,13 +2573,154 @@ void report_unfired_automatic_capture_gates() {
 }
 
 namespace {
+// The semantic selectors, in the order the request parses them. Read at exit purely to quote back
+// what was configured: every one of these is RUN-LOCAL (extents and program addresses both), which
+// is exactly why a selector carried over from an earlier run silently matches nothing.
+constexpr const char* kTimelineSemanticSelectors[] = {
+    "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM",
+    "PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX",
+    "PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS",
+    "PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS",
+    "PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES",
+    "PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES",
+    "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_VERTEX_PROGRAM",
+    "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_FRAGMENT_PROGRAM",
+    "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM",
+    "PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM",
+    "PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM",
+};
+}  // namespace
+
+std::string format_timeline_capture_selector_miss(const TimelineCaptureSelectorMiss& miss) {
+    std::string out =
+        "[timeline] the detailed capture selector never matched a submit; NO .prgcap WAS WRITTEN.\n";
+    out += "[timeline]   PROSPER_GPU_TIMELINE_CAPTURE=\"" + escape_log_line(miss.capture_path) +
+           "\" PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=\"" + escape_log_line(miss.submit_spec) + "\"\n";
+    for (const auto& [name, value] : miss.semantic)
+        out += "[timeline]   " + name + "=\"" + escape_log_line(value) + "\"\n";
+
+    // Ordered by which fault makes the others unobservable: a timeline that was never recording
+    // means no submit was judged no matter what else is set, and no submits at all means the same.
+    if (!miss.timeline_requested) {
+        out += "[timeline]   PROSPER_GPU_TIMELINE is NOT set, so the recorder never ran and NO "
+               "submit was ever judged against this selector. The detailed capture requires it: "
+               "record_gpu_timeline_submit returns before reaching the selector when it is absent. "
+               "The submit hook itself was reached " +
+               std::to_string(miss.submit_hook_reached) + " time(s).\n";
+        return out;
+    }
+    if (!miss.submit_hook_reached) {
+        out += "[timeline]   the run produced no GPU submits at all, so the selector was never "
+               "tested. That is a routing or boot fault, not a selector fault.\n";
+        return out;
+    }
+    if (!miss.request_built) {
+        out += "[timeline]   the capture request was never built: " +
+               std::to_string(miss.submit_hook_reached) +
+               " submit(s) reached the hook but none reached the recorder, so the timeline writer "
+               "was never opened (an unwritable PROSPER_GPU_TIMELINE path reports its own error "
+               "above).\n";
+        return out;
+    }
+    if (!miss.request_valid) {
+        out += "[timeline]   the capture request was REJECTED when it was built; the [timeline] "
+               "line naming the rejected value appears earlier in this log. Nothing was ever armed, "
+               "so no submit could match.\n";
+        return out;
+    }
+    if (miss.after_compute_gated && !miss.after_compute_armed) {
+        out += "[timeline]   the AFTER_COMPUTE_PROGRAM phase gate never armed, so the endpoint "
+               "predicate was never reached: " +
+               std::to_string(miss.phase_submits_observed) +
+               " submit(s) were scanned for that compute program and none contained it. Program "
+               "addresses are RUN-LOCAL — re-derive this one from THIS run before re-using it.\n";
+        return out;
+    }
+    out += "[timeline]   " + std::to_string(miss.submits_examined) +
+           " submit(s) were judged against the selector; the last one judged was submit " +
+           std::to_string(miss.last_submit_examined) + ".\n";
+    if (!miss.submits_examined) {
+        out += "[timeline]   none was judged at all, so the selector was never exercised.\n";
+        return out;
+    }
+    if (!miss.semantic_selector) {
+        // A bare ordinal selector: the only way to miss is to stop short of it. Note that some of
+        // the variables quoted above do NOT make the selector semantic on their own (a program
+        // address of 0, or a draw-index range with no target extent), which is why this reads the
+        // request's own verdict rather than inferring it from the environment.
+        out += "[timeline]   this is an ORDINAL selector, and the run never reached that submit "
+               "number. Run the route longer, or pick an ordinal at or below " +
+               std::to_string(miss.last_submit_examined) +
+               ". Submit ordinals are RUN-LOCAL: re-derive it from this run's own timeline with "
+               "`gpu_timeline <file> --records`.\n";
+        return out;
+    }
+    out += "[timeline]   every judged submit satisfied the ordinal floor and none satisfied every "
+           "semantic predicate above. Extents, draw indices and program addresses are all "
+           "RUN-LOCAL: re-derive the selector against THIS run's timeline with "
+           "`gpu_timeline <file> --signatures` / `--select` rather than re-using one from an "
+           "earlier run. `--select` exits nonzero when nothing matches, so it answers this "
+           "offline in seconds.\n";
+    return out;
+}
+
+bool timeline_capture_selector_miss_snapshot(TimelineCaptureSelectorMiss& out) {
+    const char* path = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE");
+    const char* submit = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT");
+    // Either variable alone is already a configuration the operator meant; the request rejects that
+    // pairing and this report has to cover it too, not only the complete one.
+    if ((!path || !*path) && (!submit || !*submit)) return false;
+    if (g_timeline_detail_submits_captured.load(std::memory_order_acquire)) return false;
+    out.capture_path = path ? path : "";
+    out.submit_spec = submit ? submit : "";
+    out.semantic.clear();
+    for (const char* name : kTimelineSemanticSelectors)
+        if (const char* value = std::getenv(name))
+            if (*value) out.semantic.emplace_back(name, value);
+    const char* timeline = std::getenv("PROSPER_GPU_TIMELINE");
+    out.timeline_requested = timeline && *timeline;
+    out.request_built = g_timeline_request_built.load(std::memory_order_acquire);
+    out.request_valid = g_timeline_request_valid.load(std::memory_order_acquire);
+    out.semantic_selector = g_timeline_selector_semantic.load(std::memory_order_acquire);
+    const char* after_compute = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM");
+    // "0" is the documented way to spell "no phase gate", and the request treats it as such.
+    out.after_compute_gated = after_compute && *after_compute &&
+                              std::strcmp(after_compute, "0") && std::strcmp(after_compute, "0x0");
+    out.after_compute_armed = g_timeline_after_compute_armed.load(std::memory_order_acquire);
+    out.submit_hook_reached = g_timeline_submit_hook_reached.load(std::memory_order_relaxed);
+    out.phase_submits_observed = g_timeline_phase_submits_observed.load(std::memory_order_relaxed);
+    out.submits_examined = g_timeline_selector_submits_examined.load(std::memory_order_relaxed);
+    out.last_submit_examined =
+        g_timeline_selector_last_submit_examined.load(std::memory_order_relaxed);
+    out.detail_submits_captured =
+        g_timeline_detail_submits_captured.load(std::memory_order_relaxed);
+    return true;
+}
+
+void report_unfired_timeline_capture_selector() {
+    TimelineCaptureSelectorMiss miss;
+    if (!timeline_capture_selector_miss_snapshot(miss)) return;
+    std::fputs(format_timeline_capture_selector_miss(miss).c_str(), stderr);
+}
+
+namespace {
 // Registered at load rather than from a gate's constructor: two of the three gate states are built
 // lazily on the first present, so a run that never presents would register nothing — and that is
 // exactly the run whose silence is hardest to explain. The handler reads only the environment,
 // namespace-scope atomics, and the deliberately leaked guest-log state, so it stays valid after
 // every static destructor has run.
 [[maybe_unused]] const int g_automatic_capture_gate_exit_report = [] {
+    // FIRST, and before anything is registered: a malformed PROSPER_CAPTURE_MAX_SUBMITS ends the
+    // process here (#2565). Its fallback is "uncapped", so continuing would remove the only content
+    // bound on the run, and doing it at load means the operator learns before the route starts
+    // rather than after a multi-gigabyte capture is already underway.
+    capture_max_submits();
     std::atexit(&report_unfired_automatic_capture_gates);
+    // The detailed timeline selector is a separate family with its own state, so it gets its own
+    // handler rather than being folded into the gate report (#2564). Registered at load for the
+    // same reason: its request object is built lazily on the first recorded submit, and a run that
+    // never records one is exactly the run whose silence is hardest to explain.
+    std::atexit(&report_unfired_timeline_capture_selector);
     return 0;
 }();
 
@@ -2346,13 +2746,7 @@ struct CaptureBundleTriggerFileState {
         }
         trigger_path = trigger_env;
         bundle_path = bundle_env;
-        if (const char* limit = std::getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
-            char* end = nullptr;
-            errno = 0;
-            const unsigned long parsed = std::strtoul(limit, &end, 0);
-            if (!errno && end != limit && end && !*end && parsed <= UINT32_MAX)
-                max_mb = static_cast<uint32_t>(parsed);
-        }
+        max_mb = resolve_capture_bundle_max_mb();
         enabled = true;
     }
 };
@@ -2466,13 +2860,13 @@ void interactive_frame_bundle_on_submit(const GpuState& state, uint64_t submit_n
     // full cost of every post-cap submit, and — worse — a post-cap capture FAILURE set `b.failed`
     // and threw away the already-valid capped bundle, which is precisely the outcome the cap exists
     // to prevent.
-    static const uint64_t max_submits = [] {
-        const char* spec = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
-        if (!spec || !*spec) return uint64_t{0};
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(spec, &end, 0);
-        return (end && !*end && parsed) ? static_cast<uint64_t>(parsed) : uint64_t{0};
-    }();
+    //
+    // The parse is strict and REFUSES rather than substituting (#2565): `4O` (letter O) and `40 `
+    // (trailing space) used to yield 0, and 0 means UNCAPPED — so a typo silently removed the cap on
+    // exactly the run the cap exists for, and the symptom was an aborted multi-gigabyte capture
+    // rather than a message. capture_max_submits() has already ended the process at load if the
+    // value was not a submit count, so by here it is either a real cap or genuinely unset.
+    const uint64_t max_submits = capture_max_submits();
     // The whole append policy runs through frame_bundle_append_submit(), with everything below
     // supplied as the injected capture step. That is what makes the ORDERING regressable: a test
     // hands in a step that records whether it ran, so moving the cap check below the capture inside
@@ -2683,6 +3077,13 @@ bool take_interactive_grab_outcome(InteractiveGrabOutcome& out) {
 }
 
 void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
+    // Latched before every early return, so the exit report can separate "the run produced no GPU
+    // submits at all" from "it submitted plenty and the timeline was never recording" (#2564). Those
+    // have opposite fixes and used to produce the identical observation: a missing .prgcap.
+    // Unconditional on purpose: gating it on the selector's environment would make the count itself
+    // depend on the thing being diagnosed. The very next line already pays an identical relaxed
+    // increment for the grab hook, so the marginal cost of this one is not measurable.
+    g_timeline_submit_hook_reached.fetch_add(1, std::memory_order_relaxed);
     interactive_frame_bundle_on_submit(state, submit_no);
     if (!gpu_timeline_requested()) return;
     GpuTimelineWriter* writer = runtime_recorder().get();
@@ -2866,6 +3267,13 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                      request.bundle_start_target_min_index,
                      request.bundle_start_target_max_index);
     }
+    // Counted here rather than at the top of the function: this is the submit set the endpoint
+    // predicate actually judged, which is what separates "nothing matched" from "the predicate was
+    // never reached" — the after-compute phase gate returns above without ever getting here (#2564).
+    if (request.valid) {
+        g_timeline_selector_submits_examined.fetch_add(1, std::memory_order_relaxed);
+        g_timeline_selector_last_submit_examined.store(submit_no, std::memory_order_relaxed);
+    }
     const bool capture_endpoint = request.valid &&
         runtime_capture_endpoint_matches(request, submit, state);
     const uint64_t bundle_first = request.bundle_depth > request.submit_no
@@ -2985,6 +3393,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     GpuCaptureFile capture;
     if (!request.bundle_path.empty()) begin_runtime_capture_bundle();
     request.detail_submits_captured.fetch_add(1, std::memory_order_relaxed);
+    g_timeline_detail_submits_captured.fetch_add(1, std::memory_order_relaxed);
     const auto capture_started = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[timeline] submit %llu detailed capture starting: semantic-draws=%zu "
                          "semantic-dispatches=%zu metadata-only=%s\n",
@@ -3301,14 +3710,7 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
                 config.path = path;
                 config.present = wanted;
                 config.valid = true;
-                if (const char* limit = std::getenv("PROSPER_CAPTURE_BUNDLE_MAX_MB")) {
-                    char* limit_end = nullptr;
-                    errno = 0;
-                    const unsigned long parsed = std::strtoul(limit, &limit_end, 0);
-                    if (!errno && limit_end != limit && limit_end && !*limit_end &&
-                        parsed <= UINT32_MAX)
-                        config.max_mb = static_cast<uint32_t>(parsed);
-                }
+                config.max_mb = resolve_capture_bundle_max_mb();
             }
         }
         return config;

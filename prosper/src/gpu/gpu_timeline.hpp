@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace prosper::gpu {
@@ -354,6 +355,96 @@ bool guest_log_capture_miss_snapshot(GuestLogCaptureMiss& out);
 // capture. Registered with std::atexit at load time, so a run that silently produced no bundle now
 // says so; exported so the same text can be asserted by a test.
 void report_unfired_automatic_capture_gates();
+
+// ---- capture tunables (#2565) ----------------------------------------------------------------
+// A malformed capture tunable used to substitute a DIFFERENT policy in silence. That is the milder
+// relative of #1684 — not "armed and never fired" but "configured and quietly ignored" — and it is
+// invisible the same way, because the run still completes and still produces *a* result.
+//
+// The parse is STRICT: the whole value must be a number with nothing around it, not even a space.
+// `PROSPER_CAPTURE_MAX_SUBMITS=40 ` and `=4O` (letter O) are rejected rather than accepted-as-zero.
+enum class CaptureTunableStatus {
+    Unset,        // absent or empty: the variable was not asked for at all
+    Accepted,     // a whole number inside the accepted range
+    Malformed,    // not a whole number, or trailing bytes (including whitespace)
+    BelowRange,   // parsed, below the minimum this tunable accepts
+    AboveRange,   // parsed, above the maximum this tunable accepts
+};
+struct CaptureTunableParse {
+    CaptureTunableStatus status = CaptureTunableStatus::Unset;
+    uint64_t value = 0;   // what parsed; meaningful for Accepted, BelowRange and AboveRange
+};
+CaptureTunableParse parse_capture_tunable(const char* raw, uint64_t lo, uint64_t hi);
+
+// The interactive/automatic whole-frame bundle budget, in MiB. `request_interactive_capture_bundle`
+// reads 0 as "keep the built-in default" and clamps anything else into [min, max]; both constants
+// live here so a message can never claim a bound the code does not enforce.
+inline constexpr uint32_t kInteractiveBundleDefaultMb = 2048;
+inline constexpr uint32_t kInteractiveBundleMinMb = 64;
+inline constexpr uint32_t kInteractiveBundleMaxMb = 3072;
+// The capture window width, in presents.
+inline constexpr uint32_t kCaptureFramesDefault = 1;
+inline constexpr uint32_t kCaptureFramesMin = 1;
+inline constexpr uint32_t kCaptureFramesMax = 240;
+
+// Pure: the exact `[grab]` text for a rejected value of each substituting tunable, empty when the
+// value is acceptable or unset. Each one names the variable, the rejected value with non-printable
+// bytes escaped (a trailing space is precisely the typo nobody can see), the accepted range, and —
+// the part that matters — the value ACTUALLY IN FORCE, so the run can never be described as
+// "configured" when it is not.
+std::string format_capture_bundle_max_mb_notice(const char* raw);
+std::string format_capture_frames_notice(const char* raw);
+// PROSPER_CAPTURE_MAX_SUBMITS REFUSES instead of substituting, because its fallback inverts the
+// caller's intent: 0 means UNCAPPED, so a typo removes the only content bound on a capture that has
+// reached multiple gigabytes — on exactly the runs the cap exists for. Empty when acceptable.
+std::string format_capture_max_submits_refusal(const char* raw);
+
+// The values actually in force. Both report their substitution on stderr the first time they are
+// resolved, and are otherwise silent. `resolve_capture_bundle_max_mb` returns 0 for "keep the
+// built-in default", exactly as the three gate constructors previously encoded it.
+uint32_t resolve_capture_bundle_max_mb();
+uint32_t resolve_capture_frames();
+// The submit cap in force; 0 means uncapped, which is expressible ONLY by leaving the variable
+// unset. A malformed or zero value has already ended the process at load with a nonzero status.
+uint64_t capture_max_submits();
+
+// ---- detailed timeline capture selector (#2564) -----------------------------------------------
+// `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT` and the semantic selectors around it had the same silent
+// shape #1684 fixed for the bundle gates, one selector family over: if the run never reached the
+// ordinal, or no submit ever satisfied the semantic predicates, nothing was printed. The run exited
+// 0 and the only evidence was a missing `.prgcap`. The `detail_submits_captured` counter that does
+// exist reaches the timeline FILE and never stderr.
+//
+// Every field is either read from the environment at exit or mirrored into a namespace-scope atomic,
+// never taken from the lazily built request object: two of the paths that build it may never run,
+// and an atexit handler registered first runs after every static destructor.
+struct TimelineCaptureSelectorMiss {
+    std::string capture_path;      // PROSPER_GPU_TIMELINE_CAPTURE, as configured
+    std::string submit_spec;       // PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT, as configured
+    // Semantic selectors in force, as name -> raw value. Printed verbatim so the operator sees the
+    // extents and addresses they actually asked for; both are RUN-LOCAL and must be re-derived.
+    std::vector<std::pair<std::string, std::string>> semantic;
+    bool timeline_requested = false;   // PROSPER_GPU_TIMELINE — without it no submit is ever judged
+    bool request_built = false;        // the request object was constructed at least once
+    bool request_valid = false;        // ... and its configuration parsed
+    bool semantic_selector = false;    // matching is by CONTENT, not by the submit ordinal alone
+    bool after_compute_gated = false;  // an AFTER_COMPUTE_PROGRAM phase gate stands in front
+    bool after_compute_armed = false;  // ... and it armed
+    uint64_t submit_hook_reached = 0;  // record_gpu_timeline_submit entries, before any early return
+    uint64_t phase_submits_observed = 0;  // submits examined for the phase program while unarmed
+    uint64_t submits_examined = 0;     // submits the endpoint predicate actually judged
+    uint64_t last_submit_examined = 0; // the ordinal of the last one it judged
+    uint64_t detail_submits_captured = 0;  // >0 means the selector matched; no report is then due
+};
+// Pure: the exact stderr text for a selector that never captured. Reports "the ordinal was never
+// reached" and "nothing matched the semantic predicates" DISTINCTLY, because the fixes differ — run
+// longer versus re-derive the selector against this run's own timeline.
+std::string format_timeline_capture_selector_miss(const TimelineCaptureSelectorMiss& miss);
+// Snapshot of the live selector. True when a report is due: a selector was configured and no
+// detailed capture was ever taken.
+bool timeline_capture_selector_miss_snapshot(TimelineCaptureSelectorMiss& out);
+// Registered with std::atexit at load, next to report_unfired_automatic_capture_gates().
+void report_unfired_timeline_capture_selector();
 // Marks bytes omitted by a bounded stdout adapter. It deliberately discards through the next observed
 // line ending so an unobserved suffix can cause only a missed match, never a false exact-line match.
 void observe_guest_log_capture_gap();
