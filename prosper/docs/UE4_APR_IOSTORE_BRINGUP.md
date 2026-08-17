@@ -18,6 +18,22 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   #1895 to treat registration warnings as read failures is corrected and regression-tested by
   [#1901](https://github.com/mattias800/prosper/issues/1901).
 
+- **A generation/identity stamp on the APR completion binding would close the reused-address
+  aliasing window — false, and it cannot work at the seam that needs it.**
+  [#1674](https://github.com/mattias800/prosper/issues/1674) suggested one, by analogy with the
+  `eq_identity` equeue-lifetime guard. The analogy does not carry: `eq_identity` works because the
+  *producer* retains the value it must later re-present. Here the only key the submit path has is
+  the command buffer's guest **address** — `apr_cb_submit_state(cb, …)` receives nothing else — so
+  a generation stamped on the entry has nothing to be compared against and can never reject a
+  stale match. Making it work would require pruning at **construct** time instead, and
+  `ampr_cb_construct` is explicitly documented as also serving as a *refresh* of a live object
+  ("several SDK flows refresh a live object through a constructor-shaped call whose size slots are
+  all zero/pointers"), so pruning there would drop bindings that are still awaiting a completion —
+  reintroducing the #180/#2139 class of stall to fix a leak. The destructor is the only call that
+  states the object is gone, so pruning there (both flavors, both platform halves) is the whole
+  fix. Bounding the binding vector by capacity was rejected for the same reason: evicting the
+  oldest entry drops a live completion.
+
 ## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
 
 DOLL now boots fully and runs a **stable frame loop**. Two blockers cleared this session:
