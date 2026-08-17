@@ -1749,29 +1749,55 @@ namespace {
 // without PROSPER_GFXLOG's per-packet firehose (GBs over a 10-minute run). Called under
 // g_agc_state_mu. Additive, default-off. CONFIDENCE: HIGH (diagnostic only, no behavior change).
 uint64_t g_presents_cum = 0;   // frames handed to the present path (bumped at each render call site)
+// PROSPER_PROGRESS_UNIMPL=1: periodically dump the unimplemented-NID call-count table. Purpose:
+// the first-seen unimpl log is deduped, so a guest POLLING an unimplemented call (the classic
+// "waits on a wrong stub answer" stall) is invisible without the per-call counts — and a
+// `timeout`-killed diagnostic run never reaches the exit dump.
+//
+// It has its OWN cadence, and that separation is the fix for #2149's fourth instance. The dump used
+// to live after this function's `PROSPER_PROGRESS` early return, so a run armed with only
+// PROSPER_PROGRESS_UNIMPL — the variable whose name matches the question "show me unimplemented
+// call activity" — printed the deduped first-seen lines and no table at all. Read naively that is
+// "8 unimplemented calls in 214 s, no spin": the right conclusion reached by a route that cannot
+// establish it, because the deduped log says nothing about frequency and the table that does was
+// never printed. The coupling was even documented in the comment above; what failed is that the
+// NAME promised what only the pair delivered.
+//
+// When both are armed the cadence is unchanged (every twelfth heartbeat); alone it uses
+// kUnimplStandaloneSecs. CONFIDENCE: HIGH (diagnostic only, no behavior change).
+constexpr long kUnimplHeartbeatsPerDump = 12;
+constexpr long kUnimplStandaloneSecs = 60;
+
 void progress_heartbeat(size_t draws_last, uint64_t submits, uint64_t dispatches) {
     static const long interval = [] {
         const char* e = getenv("PROSPER_PROGRESS"); return e ? atol(e) : 0; }();
-    if (interval <= 0) return;
+    static const bool dump_unimpl = getenv("PROSPER_PROGRESS_UNIMPL") != nullptr;
+    if (interval <= 0 && !dump_unimpl) return;
     static uint64_t draws_cum = 0;
     draws_cum += draws_last;
-    static const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-    static std::chrono::steady_clock::time_point next = t0;
-    auto now = std::chrono::steady_clock::now();
-    if (now < next) return;
-    next = now + std::chrono::seconds(interval);
-    double t = std::chrono::duration<double>(now - t0).count();
-    fprintf(stderr, "[progress] t=%.1fs submits=%llu draws_last=%zu draws_cum=%llu dispatches=%llu flips=%llu presents=%llu\n",
-            t, (unsigned long long)submits, draws_last, (unsigned long long)draws_cum,
-            (unsigned long long)dispatches, (unsigned long long)prosper_vo_flip_count(),
-            (unsigned long long)g_presents_cum);
-    // PROSPER_PROGRESS_UNIMPL=1: with the heartbeat on, also dump the unimplemented-NID call-count
-    // table every ~12 heartbeats. Purpose: the first-seen unimpl log is deduped, so a guest POLLING
-    // an unimplemented call (the classic "waits on a wrong stub answer" stall) is invisible without
-    // the per-call counts — and a `timeout`-killed diagnostic run never reaches the exit dump.
-    static const bool dump_unimpl = getenv("PROSPER_PROGRESS_UNIMPL") != nullptr;
-    static unsigned hb = 0;
-    if (dump_unimpl && (hb++ % 12) == 0) dump_call_log(stderr);
+    const auto now = std::chrono::steady_clock::now();
+    static const std::chrono::steady_clock::time_point t0 = now;
+
+    if (interval > 0) {
+        static std::chrono::steady_clock::time_point next = t0;
+        if (now >= next) {
+            next = now + std::chrono::seconds(interval);
+            double t = std::chrono::duration<double>(now - t0).count();
+            fprintf(stderr, "[progress] t=%.1fs submits=%llu draws_last=%zu draws_cum=%llu dispatches=%llu flips=%llu presents=%llu\n",
+                    t, (unsigned long long)submits, draws_last, (unsigned long long)draws_cum,
+                    (unsigned long long)dispatches, (unsigned long long)prosper_vo_flip_count(),
+                    (unsigned long long)g_presents_cum);
+        }
+    }
+    if (dump_unimpl) {
+        const long period = interval > 0 ? interval * kUnimplHeartbeatsPerDump
+                                         : kUnimplStandaloneSecs;
+        static std::chrono::steady_clock::time_point next_unimpl = t0;
+        if (now >= next_unimpl) {
+            next_unimpl = now + std::chrono::seconds(period);
+            dump_call_log(stderr);
+        }
+    }
 }
 }
 
