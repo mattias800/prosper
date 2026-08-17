@@ -83,11 +83,42 @@ public:
     // say so; #2270 exists because sceVideodec2Decode instead reported SCE_OK with no picture,
     // forever, which a title cannot distinguish from "no frame ready yet".
     virtual int  open_decoder(uint32_t /*codec*/) { return -1; }
-    // True when a picture was produced. `out` is NV12 and stays valid until the next decode_au on
-    // this id. False means "no picture yet" (a decoder legitimately needs several access units
-    // before its first frame) and is NOT an error.
-    virtual bool decode_au(int /*id*/, const uint8_t* /*au*/, size_t /*bytes*/,
-                           VideoFrame& /*out*/) { return false; }
+
+    // What one access-unit submission produced. THREE outcomes, not a bool, because the caller must
+    // answer each of them differently and two of them are indistinguishable once collapsed:
+    // "the decoder needs more input" is correct and benign, while "a picture exists and your buffer
+    // is too small" means the size derivation everything rests on is wrong. #2270 is the issue that
+    // exists because those two were reported identically.
+    enum class AuResult {
+        NoPicture,      // needs more input -- correct, and NOT an error
+        FrameTooSmall,  // a picture exists; `dst_bytes` cannot hold it. `out` says how much it needs
+        Decoded,        // `dst` now holds the packed NV12 picture
+    };
+
+    // Geometry of the picture decode_au produced or refused. Deliberately carries NO plane pointers.
+    //
+    // The earlier shape returned a VideoFrame whose `y`/`uv` pointed into the decoder's own staging
+    // buffer and stayed valid only "until the next decode_au on this id" -- which made the caller's
+    // copy race a concurrent close_decoder that frees exactly that buffer. Handing the DESTINATION
+    // to the decoder instead of handing decoder-owned pointers to the caller removes the lifetime
+    // question rather than documenting it: the copy happens inside the backend's own lock, so there
+    // is nothing a caller can hold that another thread can free. (#2571 review N5.)
+    struct AuPicture {
+        uint32_t width = 0, height = 0, y_stride = 0, uv_stride = 0;
+        // Exact packed NV12 size: w*h + 2*ceil(w/2)*ceil(h/2). NOT the `w*h*3/2` shorthand, which is
+        // short whenever a dimension is odd -- see s_videodec2_query_decoder_memory's note on why
+        // this project writes the exact form. The guest sizes its frame buffer from that same
+        // expression, so any other one here disagrees with the buffer it is copying into.
+        uint64_t nv12_bytes = 0;
+    };
+
+    // Submit one access unit and, if it completes a picture, write the packed NV12 into `dst`.
+    // Defaulted to NoPicture so a backend without the access-unit path keeps compiling AND answers
+    // honestly -- the same reason seek() and open_memory() are defaulted.
+    virtual AuResult decode_au(int /*id*/, const uint8_t* /*au*/, size_t /*bytes*/,
+                               uint8_t* /*dst*/, uint64_t /*dst_bytes*/, AuPicture& /*out*/) {
+        return AuResult::NoPicture;
+    }
     virtual void close_decoder(int /*id*/) {}
 };
 

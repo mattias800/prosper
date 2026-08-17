@@ -305,7 +305,11 @@ std::unordered_map<uint64_t, uint32_t> g_vdec_codecs;
 // picture from a decoder that DID open: a real decoder needs a handful of units before its first
 // frame, so a long run of them is a decoder that is never going to produce one, and that is the
 // exact shape #2270 was filed about -- indistinguishable, without this, from "no frame ready yet".
-struct VdecAu { int id = -1; bool opened = false; unsigned no_picture_run = 0; };
+// `announced` survives Reset while `opened` does not, and that difference is the finding it fixes:
+// Reset re-arms the open so a supported codec gets a fresh decoder, but a REFUSED codec would then
+// re-print its two-line NO DECODER banner on every reset cycle. A title that resets in a retry loop
+// turns the fail-visible path into a flood, which is how fail-visible paths get muted (#2571 N3).
+struct VdecAu { int id = -1; bool opened = false; bool announced = false; unsigned no_picture_run = 0; };
 std::unordered_map<uint64_t, VdecAu> g_vdec_au;
 
 // A rejected decoder config is a hard stop for a title's movie playback, and the guest only prints the
@@ -732,20 +736,24 @@ HLE(s_videodec2_decode) {
     auto* vb = vdec2_no_decode ? nullptr : prosper::video::backend();
     if (vb) {
         int au_id;
-        bool first_open = false;
+        bool announce = false;
         {
             // open_decoder runs UNDER g_vdec_mx, unlike close_decoder below, and the asymmetry is
-            // deliberate rather than an oversight. "Open at most once per guest handle" is the
-            // invariant the whole fail-visible path rests on -- a refusal announced once, and not a
-            // fresh AVCodecContext per access unit -- and holding the lock across the call is what
+            // deliberate rather than an oversight. "Open at most once per open attempt, and never
+            // once per access unit" is what the fail-visible path rests on -- one refusal, and not a
+            // fresh AVCodecContext for every unit -- and holding the lock across the call is what
             // makes it one. Doing it outside would need a published "opening" state that a
             // concurrent decode on the same handle would read as a refusal. It is safe because the
             // backend's access-unit registry is a LEAF lock: nothing inside the backend re-enters
             // the HLE, so no path acquires the two in the opposite order.
+            //
+            // Note the invariant is per OPEN ATTEMPT, not per handle for all time: Reset deliberately
+            // re-arms it. The BANNER is per handle -- see VdecAu::announced.
             std::lock_guard<std::mutex> lk(g_vdec_mx);
             VdecAu& st = g_vdec_au[a0];
-            if (!st.opened) { st.opened = true; st.id = vb->open_decoder(codec); first_open = true; }
+            if (!st.opened) { st.opened = true; st.id = vb->open_decoder(codec); }
             au_id = st.id;
+            if (au_id < 0 && !st.announced) { st.announced = true; announce = true; }
         }
         if (au_id < 0) {
             // FAIL-VISIBLE, and this is the whole point of #2270. Announce the refusal once per
@@ -754,58 +762,74 @@ HLE(s_videodec2_decode) {
             // first bytes do -- 00 00 00 01 is Annex-B H.264/HEVC, and a VP9 key frame carries the
             // sync code 49 83 42. Whoever reads this log can tell "implement this codec" apart from
             // "we read the wrong field" without another run.
-            if (first_open) vdec_no_decoder_warning(codec, input, "the backend refused the codec");
+            if (announce) vdec_no_decoder_warning(codec, input, "the backend refused the codec");
         } else {
             vdec_dump_au((const uint8_t*)PW(input->data), input->data_size);
-            prosper::video::VideoFrame pic;
-            if (vb->decode_au(au_id, (const uint8_t*)PW(input->data), (size_t)input->data_size,
-                              pic)) {
-                const uint64_t need = (uint64_t)pic.width * pic.height * 3 / 2;
-                auto* dst = (uint8_t*)PW(frame->data);
-                // A decoded picture that does not fit is the shape a WRONG LAYOUT takes, so it must
-                // not be silent. `need` is the 1.5-bytes-per-pixel NV12 derivation the whole output
-                // rests on; if that derivation is wrong, what you observe is exactly this -- a
-                // buffer the guest sized correctly and we think is too small. Falling through to
-                // vdec_no_picture without a word makes it indistinguishable from a decoder that
-                // merely needs more input, which is the benign case it looks like. Rate-limited, and
-                // it names both numbers so the ratio is checkable on sight (#2270).
-                if (dst && frame->data_size < need) {
-                    static std::atomic<unsigned> warned{0};
-                    if (warned.fetch_add(1) < 8)
-                        fprintf(stderr,
-                                "[vdec2] frame buffer too small: need=%llu (%ux%u NV12) but "
-                                "frame->data_size=%llu -- reporting NO PICTURE. If this fires, "
-                                "suspect the bytes-per-pixel derivation before the decoder (#2270)\n",
-                                (unsigned long long)need, pic.width, pic.height,
-                                (unsigned long long)frame->data_size);
-                }
-                if (dst && frame->data_size >= need) {
-                    const size_t y_bytes = (size_t)pic.width * pic.height;
-                    std::memcpy(dst, pic.y, y_bytes);
-                    std::memcpy(dst + y_bytes, pic.uv, y_bytes / 2);
-                    // Dump what the GUEST receives, not what the backend produced: the copy above is
-                    // part of what a reference comparison has to cover.
-                    vdec_dump_picture(dst, y_bytes + y_bytes / 2, pic.width, pic.height);
-                    { std::lock_guard<std::mutex> lk(g_vdec_mx); g_vdec_au[a0].no_picture_run = 0; }
-                    frame->accepted = 1;
-                    out->valid = 1; out->error = 0; out->pictures = 1; out->discarded = 0;
-                    out->codec = codec;
-                    out->width = pic.width; out->height = pic.height;
-                    out->pitch = pic.y_stride; out->pitch_bytes = pic.y_stride;
-                    out->frame = frame->data; out->frame_size = frame->data_size;
-                    // The one field still unestablished (#2270). Left 0 rather than filled with a
-                    // plausible constant, because a wrong value here is a correctly-decoded picture
-                    // the guest misreads, which is silent. PROSPER_VDEC2_FORMAT exists so the first
-                    // title observed misreading a picture can be swept over candidate values in one
-                    // sitting instead of one rebuild per candidate; it is a diagnostic, and a value
-                    // discovered through it belongs in code with the title evidence that found it.
-                    static const uint32_t format_override = [] {
-                        const char* v = getenv("PROSPER_VDEC2_FORMAT");
-                        return v ? (uint32_t)strtoul(v, nullptr, 0) : 0u;
-                    }();
-                    out->format = format_override;
-                    return 0;
-                }
+            // The decoder writes STRAIGHT INTO the guest's frame buffer, under its own lock. It used
+            // to hand back pointers into its staging buffer for this function to copy from with no
+            // lock held, which raced a concurrent Reset/DeleteDecoder freeing exactly that buffer
+            // (#2571 review N5). Passing the destination down removes the lifetime question instead
+            // of documenting it, and drops a 3.1 MB per-frame copy on the way.
+            prosper::video::VideoBackend::AuPicture pic;
+            auto* dst = (uint8_t*)PW(frame->data);
+            const auto decoded = vb->decode_au(au_id, (const uint8_t*)PW(input->data),
+                                               (size_t)input->data_size, dst, frame->data_size, pic);
+            using AuResult = prosper::video::VideoBackend::AuResult;
+            // A decoded picture that does not fit is the shape a WRONG LAYOUT takes, so it must not
+            // be silent. `pic.nv12_bytes` is the exact NV12 derivation the whole output rests on; if
+            // that derivation is wrong, what you observe is exactly this -- a buffer the guest sized
+            // correctly and we think is too small. Reporting it as "no picture" without a word makes
+            // it indistinguishable from a decoder that merely needs more input, which is the benign
+            // case it looks like. Rate-limited, and it names both numbers so the ratio is checkable
+            // on sight (#2270).
+            if (decoded == AuResult::FrameTooSmall) {
+                static std::atomic<unsigned> warned{0};
+                if (warned.fetch_add(1) < 8)
+                    fprintf(stderr,
+                            "[vdec2] frame buffer too small: need=%llu (%ux%u NV12) but "
+                            "frame->data_size=%llu -- reporting NO PICTURE. If this fires, "
+                            "suspect the bytes-per-pixel derivation before the decoder (#2270)\n",
+                            (unsigned long long)pic.nv12_bytes, pic.width, pic.height,
+                            (unsigned long long)frame->data_size);
+            }
+            // THE GUARD. A zero-size picture must never become a reported one: `w*h*3/2` is 0 for a
+            // 0x0 frame, so the old size check passed it, copied nothing, and answered valid=1 /
+            // pictures=1 -- a confident, well-formed "here is your picture" over nothing, which is
+            // precisely the false-success shape this whole change exists to remove, re-created one
+            // layer down in its own new code. Only reachable through a backend bug; the backend
+            // guards it too, and this one covers EVERY backend rather than the one that has it
+            // today. (#2571 review N8.)
+            if (decoded == AuResult::Decoded && (!pic.width || !pic.height || !pic.nv12_bytes)) {
+                static std::atomic<unsigned> warned{0};
+                if (warned.fetch_add(1) < 8)
+                    fprintf(stderr,
+                            "[vdec2] backend reported a DECODED %ux%u picture (%llu bytes) -- that "
+                            "is not a picture, and reporting it as one would be #2270 again. "
+                            "Answering NO PICTURE.\n",
+                            pic.width, pic.height, (unsigned long long)pic.nv12_bytes);
+            } else if (decoded == AuResult::Decoded) {
+                // Dump what the GUEST receives, not what the backend produced: the copy is part of
+                // what a reference comparison has to cover.
+                vdec_dump_picture(dst, (size_t)pic.nv12_bytes, pic.width, pic.height);
+                { std::lock_guard<std::mutex> lk(g_vdec_mx); g_vdec_au[a0].no_picture_run = 0; }
+                frame->accepted = 1;
+                out->valid = 1; out->error = 0; out->pictures = 1; out->discarded = 0;
+                out->codec = codec;
+                out->width = pic.width; out->height = pic.height;
+                out->pitch = pic.y_stride; out->pitch_bytes = pic.y_stride;
+                out->frame = frame->data; out->frame_size = frame->data_size;
+                // The one field still unestablished (#2270). Left 0 rather than filled with a
+                // plausible constant, because a wrong value here is a correctly-decoded picture
+                // the guest misreads, which is silent. PROSPER_VDEC2_FORMAT exists so the first
+                // title observed misreading a picture can be swept over candidate values in one
+                // sitting instead of one rebuild per candidate; it is a diagnostic, and a value
+                // discovered through it belongs in code with the title evidence that found it.
+                static const uint32_t format_override = [] {
+                    const char* v = getenv("PROSPER_VDEC2_FORMAT");
+                    return v ? (uint32_t)strtoul(v, nullptr, 0) : 0u;
+                }();
+                out->format = format_override;
+                return 0;
             }
             // The decoder opened and is consuming units without ever producing a picture. A few of
             // those are correct (a decoder builds reference state before its first frame); an
@@ -862,12 +886,30 @@ HLE(s_videodec2_reset) {
     // yields a corrupt picture rather than an error -- silent, and exactly the failure class this
     // path was filed for. Dropping the backend decoder makes the next Decode open a fresh one, which
     // is the same forgetting expressed through the lifecycle we already have.
+    //
+    // CONFIDENCE: MED, and the uncertainty is in the MECHANISM, not the meaning. Close-and-reopen is
+    // strictly stronger than a reset needs to be: `avcodec_flush_buffers` drops the DPB and KEEPS the
+    // parsed SPS/PPS, while a fresh AVCodecContext drops both. Videodec2's caller demuxes itself, so
+    // whether parameter sets are repeated in-band is title-dependent -- PPSA19991's first access unit
+    // carries an SPS and nothing establishes that its later ones do. A title that sends them once and
+    // resets mid-stream would get a decoder that cannot decode until the next in-band SPS: #2270's
+    // own hang shape in a new place. Two things bound that today -- no title in this repository's
+    // history is recorded calling sceVideodec2Reset at all, and the 64-unit alarm above makes the
+    // failure loud rather than silent. The clean fix is a reset_decoder(id) backend entry point over
+    // avcodec_flush_buffers: #2585. (#2571 review N4.)
     int au_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_vdec_mx);
         if (!g_vdec_codecs.count(a0)) return VDEC_ERR_DECODER;
         auto it = g_vdec_au.find(a0);
-        if (it != g_vdec_au.end()) { au_id = it->second.id; g_vdec_au.erase(it); }
+        if (it != g_vdec_au.end()) {
+            au_id = it->second.id;
+            // Re-arm the OPEN but keep `announced`: a refused codec must not re-print its banner on
+            // every reset cycle. Mutating rather than erasing is what preserves that (#2571 N3).
+            it->second.id = -1;
+            it->second.opened = false;
+            it->second.no_picture_run = 0;
+        }
     }
     // Outside the lock: close_decoder calls into the backend, and holding an HLE lock across a
     // backend call is how lock-order problems get built (same rule as DeleteDecoder above).

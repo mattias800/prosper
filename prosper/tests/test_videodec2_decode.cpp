@@ -35,6 +35,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <unistd.h>     // dup/dup2/close — the stderr capture in the banner-count arm
+#endif
 
 using namespace prosper;
 
@@ -85,29 +88,34 @@ public:
         // A DISTINCT id per open, so "the decoder was re-opened" is observable rather than assumed.
         return next_id++;
     }
-    bool decode_au(int id, const uint8_t* au, size_t bytes, video::VideoFrame& out) override {
+    AuResult decode_au(int id, const uint8_t* au, size_t bytes,
+                       uint8_t* dst, uint64_t dst_bytes, AuPicture& out) override {
         ++decodes; last_id = id; last_au_bytes = bytes;
         last_au_first = (au && bytes) ? au[0] : 0;
-        if (starve) return false;   // "no picture yet" — a legitimate, non-error answer
+        if (starve) return AuResult::NoPicture;   // "no picture yet" — legitimate, not an error
+        // ZERO-SIZE arm (#2571 N8). A backend that claims a decode over a 0x0 picture must not be
+        // able to mint a reported picture out of it. Only a fake backend can produce this, which is
+        // exactly why the guard needs a fake backend to test it.
+        if (zero_size) { out = AuPicture{}; return AuResult::Decoded; }
+        out.width = kWidth; out.height = kHeight;
+        out.y_stride = kWidth; out.uv_stride = kWidth;
+        const uint64_t y_bytes = static_cast<uint64_t>(kWidth) * kHeight;
+        out.nv12_bytes = y_bytes + y_bytes / 2;
+        if (!dst || dst_bytes < out.nv12_bytes) return AuResult::FrameTooSmall;
         // A synthetic picture whose bytes are a function of the SUBMITTED access unit, not a
         // constant: a handler that copied the wrong buffer, or copied nothing, still produces a
         // plausible-looking frame if the pattern is fixed, and this test would not notice.
-        const size_t y_bytes = static_cast<size_t>(kWidth) * kHeight;
-        nv12.assign(y_bytes + y_bytes / 2, 0);
-        for (size_t i = 0; i < y_bytes; ++i)
-            nv12[i] = static_cast<uint8_t>((last_au_first + i) & 0xFF);
-        for (size_t i = 0; i < y_bytes / 2; ++i)
-            nv12[y_bytes + i] = static_cast<uint8_t>((last_au_first * 3u + i * 7u) & 0xFF);
-        out.y = nv12.data();
-        out.uv = nv12.data() + y_bytes;
-        out.width = kWidth; out.height = kHeight;
-        out.y_stride = kWidth; out.uv_stride = kWidth;
-        return true;
+        for (uint64_t i = 0; i < y_bytes; ++i)
+            dst[i] = static_cast<uint8_t>((last_au_first + i) & 0xFF);
+        for (uint64_t i = 0; i < y_bytes / 2; ++i)
+            dst[y_bytes + i] = static_cast<uint8_t>((last_au_first * 3u + i * 7u) & 0xFF);
+        return AuResult::Decoded;
     }
     void close_decoder(int id) override { ++closes; last_closed = id; }
 
     bool refuse_open = false;
     bool starve = false;
+    bool zero_size = false;
     int  next_id = 7;
     int  opens = 0, decodes = 0, closes = 0;
     int  last_id = -1, last_closed = -1;
@@ -120,7 +128,6 @@ private:
         printf("  [FAIL] Videodec2 must not use the AvPlayer stream path (%s)\n", what);
         ++fails;
     }
-    std::vector<uint8_t> nv12;
 };
 
 }  // namespace
@@ -279,6 +286,28 @@ int main(int argc, char** argv) {
         for (uint8_t b : tiny) if (b != 0xEE) { untouched = false; break; }
         CHECK(untouched, "the too-small buffer is left entirely unwritten");
 
+        // A ZERO-SIZE picture must not become a reported one (#2571 review N8). `w*h*3/2` is 0 for a
+        // 0x0 frame, so a size check alone passes it, copies nothing, and answers valid=1 —
+        // a confident "here is your picture" over nothing, which is #2270's own shape re-created
+        // inside the success path this PR adds. Only a backend bug can produce it, so only a fake
+        // backend can test it.
+        {
+            fake.zero_size = true;
+            std::vector<uint8_t> buf(nv12_bytes, 0x11);
+            VdecFrame zf{sizeof(VdecFrame), (uint64_t)(uintptr_t)buf.data(), nv12_bytes, 1, {}};
+            VdecOutput zo{}; zo.size = sizeof zo;
+            const uint64_t zrc = decode(handle, (uint64_t)(uintptr_t)&input,
+                                        (uint64_t)(uintptr_t)&zf, (uint64_t)(uintptr_t)&zo, 0, 0);
+            CHECK(zrc == 0 && zo.valid == 0 && zo.pictures == 0 && zf.accepted == 0,
+                  "a 0x0 'decoded' picture is REFUSED, not reported as a picture (#2571 N8)");
+            CHECK(zo.width == 0 && zo.height == 0,
+                  "the refused zero-size picture publishes no dimensions");
+            bool zero_untouched = true;
+            for (uint8_t b : buf) if (b != 0x11) { zero_untouched = false; break; }
+            CHECK(zero_untouched, "the guest frame buffer is untouched by a refused zero-size picture");
+            fake.zero_size = false;
+        }
+
         // Reset means "forget every decoded reference". Continuing to feed the same libavcodec
         // context would decode the guest's next access units against references it just discarded,
         // which yields a corrupt picture rather than an error.
@@ -319,6 +348,55 @@ int main(int argc, char** argv) {
         }
         CHECK(fake.opens == opens_before + (no_decode ? 0 : 1),
               "a refused codec is opened ONCE, so the refusal is announced once and not per unit");
+
+        // THE BANNER ITSELF, counted (#2571 review N3). Everything above measures `open_decoder`
+        // calls, and Reset deliberately re-arms those — so a refused codec in a guest retry loop
+        // re-enters the open and could re-print the two-line NO DECODER banner on every cycle,
+        // turning the fail-visible path into a flood. A flooded diagnostic is a muted one. Nothing
+        // observable through the HLE distinguishes "announced once" from "announced every cycle", so
+        // this arm reads the log: it captures stderr across three reset cycles and counts banners.
+        //
+        // POSIX only — it needs fd redirection, and the assertion is about a log line rather than
+        // about behaviour a Windows build could differ on.
+#if !defined(_WIN32)
+        if (!no_decode) {
+            const std::string log_path =
+                std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+                "/prosper-vdec2-banner-" + std::to_string((unsigned long)getpid()) + ".log";
+            std::fflush(stderr);
+            const int saved = dup(fileno(stderr));
+            bool captured = false;
+            if (saved >= 0 && std::freopen(log_path.c_str(), "w", stderr)) {
+                captured = true;
+                for (int cycle = 0; cycle < 3; ++cycle) {
+                    reset(refused, 0, 0, 0, 0, 0);
+                    f2.accepted = 1;
+                    decode(refused, (uint64_t)(uintptr_t)&input, (uint64_t)(uintptr_t)&f2,
+                           (uint64_t)(uintptr_t)&o2, 0, 0);
+                }
+                std::fflush(stderr);
+                dup2(saved, fileno(stderr));
+                clearerr(stderr);
+            }
+            if (saved >= 0) close(saved);
+            if (captured) {
+                int banners = 0;
+                if (std::FILE* f = std::fopen(log_path.c_str(), "rb")) {
+                    char line[512];
+                    while (std::fgets(line, sizeof line, f))
+                        if (std::strstr(line, "NO DECODER")) ++banners;
+                    std::fclose(f);
+                }
+                std::remove(log_path.c_str());
+                // Three resets re-open three times; the banner must still have been printed zero
+                // more times, because it already fired before this block.
+                CHECK(banners == 0,
+                      "Reset re-arms the open but does NOT re-print the NO DECODER banner (#2571 N3)");
+                CHECK(fake.opens == opens_before + 4,
+                      "each Reset does re-open, so the banner suppression is not just a dead path");
+            }
+        }
+#endif
         CHECK(destroy(refused, 0, 0, 0, 0, 0) == 0, "the refused decoder tears down cleanly");
     }
 

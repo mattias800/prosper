@@ -270,20 +270,26 @@ int main(int argc, char** argv) {
                                     : "AVC access-unit decoder opens (codec=1)");
                 if (dec < 0) continue;
 
+                // The decoder writes into OUR buffer, so what is hashed below is exactly what a
+                // caller receives — including the copy. Deliberately oversized by a guard region so
+                // a decoder writing past the picture is caught rather than tolerated.
+                constexpr size_t kNv12 = static_cast<size_t>(kW) * kH * 3 / 2;
+                std::vector<uint8_t> dst(kNv12 + 256, 0xC3);
                 std::vector<uint64_t> got;
-                bool geometry_ok = true;
+                bool geometry_ok = true, guard_ok = true;
                 for (const auto& u : units) {
-                    VideoFrame pic{};
-                    if (!backend()->decode_au(dec, stream.data() + u.first, u.second, pic)) continue;
-                    if (pic.width != kW || pic.height != kH || !pic.y || !pic.uv ||
-                        pic.y_stride < kW)
+                    VideoBackend::AuPicture pic{};
+                    std::fill(dst.begin(), dst.end(), 0xC3);
+                    if (backend()->decode_au(dec, stream.data() + u.first, u.second, dst.data(),
+                                             kNv12, pic) != VideoBackend::AuResult::Decoded)
+                        continue;
+                    if (pic.width != kW || pic.height != kH || pic.y_stride < kW ||
+                        pic.nv12_bytes != kNv12)
                         geometry_ok = false;
+                    for (size_t i = kNv12; i < dst.size(); ++i)
+                        if (dst[i] != 0xC3) { guard_ok = false; break; }
                     uint64_t hv = 0xcbf29ce484222325ull;
-                    auto absorb = [&hv](const uint8_t* p, size_t n) {
-                        for (size_t i = 0; i < n; ++i) { hv ^= p[i]; hv *= 0x100000001b3ull; }
-                    };
-                    absorb(pic.y, static_cast<size_t>(kW) * kH);
-                    absorb(pic.uv, static_cast<size_t>(kW) * kH / 2);
+                    for (size_t i = 0; i < kNv12; ++i) { hv ^= dst[i]; hv *= 0x100000001b3ull; }
                     got.push_back(hv);
                 }
                 std::printf("  [info] %s pass: %zu pictures from %zu access units\n", what,
@@ -292,6 +298,7 @@ int main(int argc, char** argv) {
                       force_software ? "12 access units yield 12 pictures (software)"
                                      : "12 access units yield 12 pictures");
                 CHECK(geometry_ok, "every decoded picture reports the stream's 128x96 NV12 geometry");
+                CHECK(guard_ok, "no decoded picture writes past the buffer size it was given");
                 size_t matched = 0;
                 for (size_t i = 0; i < got.size() && i < 12; ++i) {
                     if (got[i] == kExpected[i]) { ++matched; continue; }
@@ -307,6 +314,31 @@ int main(int argc, char** argv) {
                 backend()->close_decoder(dec);
             }
             unsetenv("PROSPER_AVP_VAAPI_DEVICE");
+
+            // A frame buffer smaller than the picture reports its OWN outcome, distinct from "no
+            // picture yet". Collapsed into one bool these are indistinguishable, and the benign one
+            // is what a reader would assume — the exact confusion #2270 is about.
+            {
+                const int dec = backend()->open_decoder(1);
+                if (dec >= 0) {
+                    constexpr size_t kNv12 = static_cast<size_t>(128) * 96 * 3 / 2;
+                    std::vector<uint8_t> small(kNv12 - 1, 0x5A);
+                    VideoBackend::AuPicture pic{};
+                    bool saw_too_small = false, small_untouched = true;
+                    for (const auto& u : units) {
+                        const auto r = backend()->decode_au(dec, stream.data() + u.first, u.second,
+                                                            small.data(), small.size(), pic);
+                        if (r == VideoBackend::AuResult::FrameTooSmall) { saw_too_small = true; break; }
+                    }
+                    for (uint8_t b : small) if (b != 0x5A) { small_untouched = false; break; }
+                    CHECK(saw_too_small,
+                          "a too-small destination reports FrameTooSmall, not NoPicture");
+                    CHECK(pic.nv12_bytes == kNv12,
+                          "FrameTooSmall still reports the exact size the picture needs");
+                    CHECK(small_untouched, "a refused-for-size picture writes nothing at all");
+                    backend()->close_decoder(dec);
+                }
+            }
 
             // A codec prosper has not identified must be REFUSED, not opened on a guess. #2270's
             // whole subject is an entry point that answered successfully when it could not deliver.
