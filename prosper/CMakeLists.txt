@@ -216,6 +216,13 @@ if(Python3_Interpreter_FOUND)
   # divergence would hand out a number the gate then rejects, on somebody else's PR, hours later.
   add_test(NAME trap_number
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/docs/test_trap_number.py")
+  # The pre-merge merge-result check (#2211). Its cases build real throwaway git repositories and
+  # run real merges: the git plumbing IS the tool, so a mocked merge would test nothing. The case
+  # that earns its keep is the clean merge whose RESULT holds a duplicate -- the state no head-time
+  # check can observe, because at head time the other branch's row did not exist.
+  add_test(NAME doc_merge_result_checker
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/docs/test_check_merge_result.py")
   # Parsing/gating logic of the Vulkan validation guard (#1704). Pure — it does not create a Vulkan
   # instance, so it runs everywhere. A parser that stops matching the layer's message framing would
   # report a clean suite forever, which is the one way this guard can fail silently.
