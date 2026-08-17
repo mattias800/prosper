@@ -71,10 +71,15 @@ int main() {
     CHECK(c2b == 0, "setcancelstate with NULL old_state -> OK (no write)");
     uint64_t c3 = setcancel(7 /*invalid*/, 0, 0, 0, 0, 0);
     // Plain errno 22, not the 0x80020016 SCE encoding (#1612). This handler is registered ONLY as the
-    // POSIX `pthread_setcancelstate`, whose contract returns an errno directly — and every other
-    // pthread entry point in the emulator (mutex, rwlock, key, cond, sem) already returns a bare
-    // FreeBSD errno from the same shared handlers. A guest comparing the result against EINVAL could
-    // never match the encoded form.
+    // POSIX `pthread_setcancelstate`, whose contract returns an errno directly. A guest comparing
+    // the result against EINVAL could never match the encoded form.
+    //
+    // This comment used to add "and every other pthread entry point in the emulator (mutex, rwlock,
+    // key, cond, sem) already returns a bare FreeBSD errno from the same shared handlers". That was
+    // true when written and is now false: #1984, #2015, #2158, #2189 and #1983 gave every FALLIBLE
+    // Sony spelling an SCE_PTHREAD_ALIAS, so the shared handlers are reached bare through the POSIX
+    // name and encoded through the Sony one. What still holds — and is the only part this assertion
+    // depends on — is that a POSIX-only spelling reports the bare errno. (#2178)
     CHECK(c3 == 22ull, "setcancelstate(invalid) -> EINVAL (POSIX contract: a plain errno)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
