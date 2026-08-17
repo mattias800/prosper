@@ -2360,9 +2360,14 @@ HLE(k_pthread_detach) { return fbsd_errno(pthread_detach((pthread_t)a0)); }
 // TWO SEPARATE READINGS COME OUT OF THAT, and they land at different strengths:
 //
 //   * The guest DOES consume these results — unlike `_Cnd_wait`, which discards
-//     scePthreadCondWait's (#1983). `std::thread::join()` on a failed join therefore reported
-//     _Thrd_success under the old always-0 body, and then copied a stack slot prosper had just
-//     zeroed into the caller's `res`. CONFIDENCE: HIGH that the result must be reported at all.
+//     scePthreadCondWait's (#1983). Under the old always-0 body a FAILED join was reported to the
+//     C11 layer as `_Thrd_success`, so `std::thread::join()` returned normally from a join that
+//     never happened. TWO DIFFERENT CALLERS, and an earlier wording here ran them together: a
+//     caller that passes a `res` pointer (C11 `thrd_join(thr, &res)`) additionally read the slot
+//     prosper had just zeroed, whereas `std::thread::join()` passes `res == nullptr`, so
+//     `4d92: test rbx,rbx` / `4d95: je` skips the copy for it. Both are wrong; only the first
+//     involves the value. Caught in review of #2575.
+//     CONFIDENCE: HIGH that the result must be reported at all.
 //     The listing also shows the value_ptr rule above is safe for this consumer: it reads its own
 //     slot ONLY after the `test` says success, so leaving it untouched on a refusal is never read.
 //   * It does NOT settle the ENCODING. `test eax,eax` is nonzero in both spaces, exactly like the
@@ -2378,6 +2383,13 @@ HLE(k_pthread_detach) { return fbsd_errno(pthread_detach((pthread_t)a0)); }
 // FreeBSD numbering. EDEADLK is the case that proves the mapping runs — 11 on FreeBSD, 35 on Linux —
 // and 35 is FreeBSD's EAGAIN, i.e. a retry hint. A guest told "retry" instead of "you just tried to
 // join yourself" loops on a condition that will never change (#1612).
+//
+// ONE CASE IS NOT CHECKED AND IS NOT CLAIMED: what a join reports when ANOTHER thread is already
+// joining the target. `fbsd_errno` forwards whatever the host decides, which is EINVAL on glibc; a
+// reviewer raised that FreeBSD's libthr may answer ENOTSUP(45) there instead, and neither of us has
+// read that source. If it does, the mapping needs a case of its own, because no host produces 45 for
+// this. Recorded as an open question rather than as a mapping — do not restate either answer as
+// settled without opening libthr's join_common.
 SCE_PTHREAD_ALIAS(k_sce_pthread_join,   k_pthread_join)
 SCE_PTHREAD_ALIAS(k_sce_pthread_detach, k_pthread_detach)
 HLE(k_pthread_exit)   {

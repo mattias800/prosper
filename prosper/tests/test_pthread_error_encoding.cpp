@@ -31,12 +31,21 @@
 //   M8  alias `pthread_join` as well                                     -> §9's POSIX self-join arm
 //   M9  make k_pthread_join report 0 again (discard its result)          -> §9's self-join arms, both
 //   M10 write value_ptr on `if (a1)` rather than `if (rc == 0 && a1)`    -> §9's untouched arm ONLY
-//   M11 return the raw HOST errno from k_pthread_join instead of mapping -> §9's POSIX self-join arm
+//   M11 return the raw HOST errno from k_pthread_join instead of mapping -> §9's self-join arms, BOTH
 //   M12 drop the value_ptr write entirely                                -> §9's exit-value control ONLY
 //   M13 drop SCE_PTHREAD_ALIAS(k_sce_pthread_detach, …)                  -> §9's Sony detach arm
 //   M14 make k_pthread_detach report 0 again                             -> §9's detach arms
+//   M15 make k_pthread_detach report 0 WITHOUT calling through           -> §9's "it REALLY detached"
+//                                                                           control, plus both detach
+//                                                                           arms
 //
-// M7-M14 are the #2575 set and they are NOT interchangeable, for the same reason M5 and M6 are not.
+// M11 kills BOTH self-join arms, not just the POSIX one, and an earlier revision of this table said
+// otherwise while the PR body's measured row said `FAIL (2)`. The reason it must: an unmapped host
+// EDEADLK is 35, and `sce_pthread_rc(35)` is 0x80020023 — encoded FreeBSD EAGAIN — so the Sony arm
+// sees a wrong-but-encoded value and fails too. Caught in review; the same class this file corrects
+// five lines above for M5/M6, which is why it is stated rather than quietly fixed.
+//
+// M7-M15 are the #2575 set and they are NOT interchangeable, for the same reason M5 and M6 are not.
 // M10 and M12 are invisible to every return-value arm in the file — a body that reports EDEADLK
 // correctly and still nulls (or never writes) the guest's `value_ptr` satisfies all of them — and
 // conversely the value_ptr arms cannot see M7/M8/M11/M13, which are all about the number. M11 is the
