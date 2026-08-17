@@ -990,6 +990,7 @@ int main() {
                   fallback.opened_path == "C:/prosper-test-app0/movie.mp4",
               "a failing guest reader falls back to the host path instead of failing the source");
         close(fallback_handle, 0, 0, 0, 0, 0);
+        prosper::video::set_backend(nullptr);   // do not leave a stack backend installed
     }
 
     // ---- the read LOOP, which nothing above has ever run twice (#1955) -------------------------
@@ -1127,7 +1128,31 @@ int main() {
         CHECK(says(partial_log, "INCOMPLETE") && says(partial_log, "#1955"),
               "an incomplete table is reported rather than silently treated as absent");
         close(ph, 0, 0, 0, 0, 0);
+
+        // ---- and the SILENCE, which is the claim protecting every other title -------------------
+        // "A title with no table behaves exactly as before" is the one guarantee here that is a
+        // negative, and a negative is the direction that fails quietly: an over-broad report would
+        // add default-run noise to every title in the corpus and no existing check would notice.
+        // avp_has_partial_file_replacement must be FALSE for an all-null table, so assert it through
+        // the same instrument that proves the positive cases are loud.
+        AvpInitData no_table{};
+        no_table.event.event_callback = (void*)&on_avplayer_event;   // memory + file left all-null
+        uint64_t nh = init((uint64_t)(uintptr_t)&no_table, 0, 0, 0, 0, 0);
+        StderrCapture silent_captured;
+        add(nh, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool silent_armed = silent_captured.armed();
+        const std::string silent_log = silent_captured.finish();
+        CHECK(silent_armed, "the stderr capture armed for the no-table arm");
+        CHECK(!says(silent_log, "INCOMPLETE") && !says(silent_log, "file-replacement"),
+              "a title with NO table says nothing new on a default run");
+        CHECK(guest_file_open_calls == 0 && guest_file_read_calls == 0,
+              "a title with NO table calls no guest reader");
+        CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 3,
+              "a title with NO table takes the host path, exactly as before");
+        close(nh, 0, 0, 0, 0, 0);
+
         prosper::video::set_backend(nullptr);
+        guest_file_expected_object = nullptr;
     }
 #endif
     prosper::video::set_backend(nullptr);
