@@ -47,11 +47,11 @@ from pathlib import Path
 DEFAULT_FILE = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
 DEFAULT_HEADER = "Instrument"
 # `gh pr list --json files` caps the array at 100 entries and gives NO "there is more" signal.
-# MEASURED, not assumed (#2610 review asked and could not settle it here, since this repository's
-# largest PR has 57 changed files):
+# CONFIRMED, and stated as fact rather than as a caveat (#2610 review). This repository's largest PR
+# has 57 changed files, so the cap is unreachable here and had to be established elsewhere:
 #   * server side -- `files(first: 101)` is refused outright: "Requesting 101 records on the `files`
-#     connection exceeds the `first` limit of 100 records" (EXCESSIVE_PAGINATION).
-#   * in the wild -- `cli/cli#14082` truly has 1,161 changed files, and `gh pr view --json files`
+#     connection exceeds the `first` limit of 100 records" (EXCESSIVE_PAGINATION), verbatim.
+#   * in the wild -- `cli/cli#14082` reports changedFiles=1161, while `gh pr view --json files`
 #     returns exactly 100 of them, silently, with no error and no indicator.
 # So a PR at the cap that does NOT list our path proves nothing, and skipping it would make its claim
 # invisible -- the same silent direction as the --limit truncation above. Scan it instead: one extra
@@ -112,6 +112,50 @@ def highest(text: str, header_text: str) -> int | None:
     return max(nums) if nums else None
 
 
+# Mirrors check_numbered_table.MAX_JUMP. Without it a typo'd number in an OPEN PR (`1189` for `189`)
+# propagates straight into the advice, and the allocator hands out a number the gate then rejects --
+# the tool and its own backstop disagreeing, which is worse than either being wrong alone (#2610
+# review). Kept as a literal rather than imported so this stays a standalone script.
+MAX_JUMP = 50
+
+
+def added_rows_from_patch(patch: str, path: str) -> list[int]:
+    """Row numbers a unified patch ADDS to `path`. Pure, so it is testable without the network.
+
+    Deliberately the patch and not a set difference over file contents. "Present here, present in the
+    base, different text" is not a duplicate -- it is also what an AMENDED row looks like, and trap
+    rows are amended routinely as evidence accrues. A first draft used the text comparison and would
+    have reported an extended row as a duplicate. Only a line the patch introduces is a new claim,
+    and a number appearing on BOTH sides of the patch is an amendment rather than an allocation.
+    """
+    added: set[int] = set()
+    removed: set[int] = set()
+    in_file = False
+    for line in patch.split("\n"):
+        if line.startswith("+++ b/"):
+            in_file = line[6:].strip() == path
+            continue
+        if line.startswith("diff --git"):
+            in_file = False
+            continue
+        if not in_file:
+            continue
+        if m := re.match(r"^\+\s*\|\s*(\d+)\s*\|", line):
+            added.add(int(m.group(1)))
+        elif m := re.match(r"^-\s*\|\s*(\d+)\s*\|", line):
+            removed.add(int(m.group(1)))
+    return sorted(added - removed)
+
+
+def added_rows_from_diff(repo: str, number: int, path: str) -> list[int] | None:
+    """`added_rows_from_patch` over this PR's patch. None if the diff cannot be read."""
+    proc = subprocess.run(["gh", "pr", "diff", str(number), "--repo", repo],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return added_rows_from_patch(proc.stdout, path)
+
+
 def added_numbers(text: str, base_text: str, header_text: str) -> list[int]:
     """The row numbers this version has that the base does not -- the PR's actual claim.
 
@@ -163,13 +207,14 @@ def main() -> int:
         repo = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).strip()
         base_text = run(["git", "show", f"{args.base}:{args.file}"])
         base_max = highest(base_text, args.table_header)
+        base_numbers = set(table_numbers(base_text, args.table_header))
         if base_max is None:
             raise ScanError(
                 f"no numbered table whose header contains {args.table_header!r} in "
                 f"{args.base}:{args.file} -- wrong path, or the table format changed"
             )
 
-        claims: list[tuple[int, str, int | None, bool, list[int]]] = []
+        claims: list[tuple[int, str, int | None, bool, list[int], list[int]]] = []
         prs = open_prs(args.limit)
         if len(prs) >= args.limit:
             # The one failure this tool must not have. `gh pr list --limit N` returns AT MOST N and
@@ -194,7 +239,8 @@ def main() -> int:
         for pr in touching:
             text = file_at(repo, args.file, pr["headRefOid"])
             claims.append((pr["number"], pr["title"], highest(text, args.table_header),
-                           pr["isDraft"], added_numbers(text, base_text, args.table_header)))
+                           pr["isDraft"], added_numbers(text, base_text, args.table_header),
+                           added_rows_from_diff(repo, pr["number"], args.file)))
     except ScanError as exc:
         # Hard error. A fallback to "master alone" would answer the question this tool exists to
         # refuse to answer that way, and the caller could not tell the two apart.
@@ -202,17 +248,25 @@ def main() -> int:
         print("The answer would be a guess, so none is given. Fix the above and re-run.", file=sys.stderr)
         return 1
 
-    overall = max([base_max] + [c[2] for c in claims if c[2] is not None])
-    claimed: set[int] = {n for c in claims for n in c[4]}
+    # A claim more than MAX_JUMP above the base is a typo, not an allocation -- check_numbered_table
+    # will reject it -- so it must not drag the advice up with it. Without this the allocator and its
+    # own backstop disagree: the tool hands out 1190 and the gate then refuses the row (#2610 review).
+    sane = [c[2] for c in claims if c[2] is not None and c[2] <= base_max + MAX_JUMP]
+    wild = [(c[0], c[2]) for c in claims if c[2] is not None and c[2] > base_max + MAX_JUMP]
+    overall = max([base_max] + sane)
+    claimed: set[int] = {n for c in claims for n in c[4] if n <= base_max + MAX_JUMP}
     if args.quiet:
         print(overall + 1)
         return 0
 
     print(f"{args.file}  (table header contains {args.table_header!r})")
     print(f"  {args.base:<28} highest row {base_max}")
-    for number, title, pr_max, draft, added in sorted(claims, key=lambda c: -(c[2] or 0)):
+    for number, title, pr_max, draft, added, dup in sorted(claims, key=lambda c: -(c[2] or 0)):
         if pr_max is None:
             note = "no numbered table in its copy"
+        elif dup and (clash := [n for n in dup if n in base_numbers]):
+            note = (f"DUPLICATES {', '.join(str(n) for n in clash)} ALREADY ON {args.base} "
+                    f"-- its patch ADDS a row with that number")
         elif added:
             note = f"CLAIMS {', '.join(str(n) for n in added)}"
         else:
@@ -220,6 +274,10 @@ def main() -> int:
         flag = " [draft]" if draft else ""
         print(f"  PR #{number:<25} highest row {pr_max}   {note}{flag}")
     print(f"  scanned {len(prs)} open PR(s), {len(touching)} touching this file (--limit {args.limit})")
+    for number, pr_max in wild:
+        print(f"  IGNORING PR #{number}'s {pr_max}: more than {MAX_JUMP} above {args.base}'s "
+              f"{base_max}, so it is a typo rather than an allocation -- check_numbered_table "
+              f"--baseline rejects it. Not counted toward the next free number.")
     print()
     # How many lanes already hold the number a naive "master max + 1" would take. When more than one
     # does, "next free" is a trap: every loser steps to it simultaneously and collides again one

@@ -139,8 +139,10 @@ Gaplessness was kept because it catches a DELETED row -- a row that simply vanis
 a wholesale `git checkout` of the file, or a careless rebase leaves a file that is perfectly well
 formed, and uniqueness and structure both pass it. That reasoning is right about the danger and
 wrong about the coverage. MEASURED on master (`0c268362`, whose Instrument table is 186 rows, 1..186
--- the "192" an earlier draft of this comment carried was a whole-FILE `grep` that counted the
-numbered rows of all 14 tables in the document, 248 of them, rather than this one's):
+-- the "192" an earlier draft carried is the whole-FILE numbered-row count,
+`grep -cE '^\s*\|\s*[0-9]+\s*\|'` over all 14 tables in the document, rather than this table's
+186. Both figures here are re-derived; the first correction of this sentence attached 248 to that
+grep, which is the document's total BODY-row count and a third wrong number in the same place):
 
   * delete an INTERIOR row (100)                      -> caught, rc=1
   * delete the HIGHEST row (186)                      -> GREEN, rc=0

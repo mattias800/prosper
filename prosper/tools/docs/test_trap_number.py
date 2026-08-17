@@ -26,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from check_numbered_table import Table, parse_tables  # noqa: E402
-from trap_number import highest, table_numbers  # noqa: E402
+from trap_number import added_rows_from_patch, highest, table_numbers  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -75,6 +75,32 @@ case("a blank line ends the table",
 
 case("no matching table yields None", highest(HEADER + "| 1 | a | b |\n", "Nonexistent"), None)
 case("an empty document yields None", highest("", "Instrument"), None)
+
+print("reading a PR's claim out of its patch:")
+
+D = "diff --git a/doc.md b/doc.md\n--- a/doc.md\n+++ b/doc.md\n"
+
+case("a patch that appends a row claims it",
+     added_rows_from_patch(D + "@@\n | 5 | old |\n+| 6 | new |\n", "doc.md"), [6])
+
+# THE discriminating case. A row EDITED in place is a -/+ pair on one number, and trap rows are
+# amended routinely as evidence accrues. Reading only the `+` side reports it as a fresh claim on a
+# number the base already holds -- i.e. as a collision that does not exist, which would send a lane
+# to renumber for nothing.
+case("an amended row is not a new claim",
+     added_rows_from_patch(D + "@@\n-| 6 | old text |\n+| 6 | extended text |\n", "doc.md"), [])
+
+case("an amendment and an append together yield only the append",
+     added_rows_from_patch(D + "@@\n-| 6 | old |\n+| 6 | new |\n+| 7 | appended |\n", "doc.md"), [7])
+
+# Rows added to a DIFFERENT file in the same patch are not claims on this table.
+case("another file's rows are not counted",
+     added_rows_from_patch(D + "@@\n+| 6 | mine |\n"
+                           "diff --git a/other.md b/other.md\n--- a/other.md\n+++ b/other.md\n"
+                           "@@\n+| 99 | theirs |\n", "doc.md"), [6])
+
+case("a patch touching nothing relevant claims nothing",
+     added_rows_from_patch(D + "@@\n+some prose\n", "doc.md"), [])
 
 print("agreement with the gate, on the repository's real table:")
 
