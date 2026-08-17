@@ -97,10 +97,10 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 Several cost hours; one cost two sessions. This is the single highest-value page in this document.
 
 *Maintenance:* **append, never renumber** — an existing number may already be cited from an issue, a
-commit message, another document or a source comment — **95 lines across 50 files do**, naming 91
-distinct rows, and roughly half of those are `.cpp`/`.hpp`/test comments rather than prose
-(measured on `origin/master`, 2026-08-17; re-derive with `git grep -nE '(instrument[- ])?traps? [0-9]{1,3}'`
-rather than trusting a restated figure). Deliberately
+commit message, another document or a source comment — **118 references on 110 lines in 46 files
+do**, naming 63 distinct rows, and **50 of those references are `.cpp`/`.hpp`/`.py` comments**
+rather than prose (measured on `origin/master` `7413647a`, 2026-08-17; re-derive rather than
+trusting a restated figure). Deliberately
 no total is stated here: a restated count goes stale the moment a lane appends, and it already had
 (the header read "Fourteen" against a 17-row table). The last row's number is the **high-water
 mark**, which is what you want for allocating; it is not the row count, because **gaps are legal**.

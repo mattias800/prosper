@@ -111,15 +111,19 @@ classes: **a violation of uniqueness or of ascent is repairable by the author al
 number by one character, or move the line -- **while a violation of gaplessness is not repairable at
 all.** The missing number belongs to somebody else's unmerged branch. The only local "repair" is to
 renumber into the gap, which is exactly the forbidden operation ("append, never renumber") and which
-reproduces the duplicate the checker warns about. That prohibition is not ceremonial: measured on
-`origin/master` on 2026-08-17, **95 lines across 50 files cite these rows by number**, naming 91
-distinct rows, and every one resolves -- roughly half in `.md` and half in `.cpp`/`.hpp`/tests, so a
-renumber breaks source comments as well as prose. Re-derive rather than trusting this figure, which
-goes stale on every append:
+reproduces the duplicate the checker warns about. That prohibition is not ceremonial. Measured on
+`origin/master` (`7413647a`) on 2026-08-17, excluding the table's self-references:
+
+    118 references on 110 lines in 46 files, naming 63 distinct rows, every one resolving
+    -- 66 of them in .md prose, 50 in .cpp/.hpp/.py COMMENTS
+
+so a renumber breaks compiled files as well as documentation. Re-derive rather than trusting this
+figure, which goes stale on every append:
 
     git grep -nE '(instrument[- ])?traps? [0-9]{1,3}' -- ':!prosper/docs/GAME_COMPAT_ORCHESTRATION.md'
 
-(counting `s_trap`/`v_trap` in the shader tests as the false positives they are). So the gapless rule could only be satisfied by waiting, and the cost was real:
+(counting `s_trap`/`v_trap` in the shader tests as the false positives they are -- they are RDNA2
+mnemonics, not citations). So the gapless rule could only be satisfied by waiting, and the cost was real:
 #2089 records four lanes blocked in one session, two of them writing push-window guard scripts
 rather than working on titles, and three sets of rows nearly lost because a row that has to wait
 gets parked on whatever branch is at hand.
