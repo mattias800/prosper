@@ -34,7 +34,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--min-distinct-frames N] [--max-stale-seconds S]
            [--min-pixel-distinct-frames N] [--max-pixel-stale-seconds S]
            [--require-composited-frame] [--min-present-count N]
-           [--min-frame-seq N] [--require-crc32 N]
+           [--min-frame-seq N] [--require-crc32 N] [--allow-guest-fault]
 ```
 
 | Option | Default | Meaning |
@@ -59,6 +59,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--min-present-count N` | 0 | Fail unless a captured sample reaches guest flip N |
 | `--min-frame-seq N` | 0 | Fail unless a captured sample reaches rendered-frame N |
 | `--require-crc32 N` | unset | Fail unless a sample has this RGBA CRC32 (decimal or `0xHEX`) |
+| `--allow-guest-fault` | off | Do not fail the run when the guest's primary thread dies (deliberate fault-reproduction routes) |
 
 Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
@@ -83,6 +84,27 @@ progress. Use the pixel assertions for loading screens, frozen cinematics, and o
 Assertions preserve every PNG and the manifest, print the concrete failed condition, and exit nonzero.
 This lets an automated progression run distinguish "120 files written" from "120 advancing frames" or
 "the requested checkpoint was reached." A timeout or incomplete screenshot count is also a failure.
+
+## The guest dying is a failure of the run
+
+If the guest's **primary thread** dies during capture, the run reports `status=GUEST-FAULT` and exits
+nonzero even when every capture assertion passed. Every PNG the tool managed to sample is still
+written — frames from a crashing boot are real evidence — but the verdict says so, because after the
+fault the sampler is re-photographing one stale frame and nothing in an exit status used to reveal
+that (#2007: a title that crashed 0.4 s into boot produced 25 identical PNGs and `status=ok`).
+
+- The summary line carries `guest=running|returned|faulted`, and the manifest summary carries
+  `guest_state`, `guest_kind`, `guest_detail`, `guest_fault_rip`, `guest_fault_addr` and `status`,
+  so a batch consumer can filter without re-reading the run log.
+- `--allow-guest-fault` is for routes that *intend* to sample a crashing title. It restores exit 0
+  and reports `status=GUEST-FAULT-ALLOWED` — never `ok` — so the fault stays visible in the record,
+  and it does not disarm the `--min-*` / `--require-*` assertions.
+- A guest whose entry **returns** (a title exiting normally) is reported as `guest=returned` and is
+  not a failure on its own; a run cut short by it still trips the saved/requested assertion.
+
+Scope: this observes the thread `run_entry` entered. A *worker* thread's fatal fault already
+`_exit(90)`s the whole process on Linux, which every caller that checks an exit status can see; the
+primary thread was the one that could die silently.
 
 Warmup is useful when llvmpipe makes a frame-counted startup take minutes. The guest and GPU command
 decoder continue at native speed while Vulkan work is skipped; normal screenshots begin once warmup

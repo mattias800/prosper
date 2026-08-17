@@ -3,12 +3,64 @@
 #include "build_revision.hpp"   // revision this binary was compiled from
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <unordered_set>
 
 namespace prosper::screenshot {
+
+namespace {
+// One publisher (the guest thread), one reader (the sampling thread). `g_guest_state` is stored
+// last with release ordering and loaded first with acquire ordering, which is what makes the fault
+// fields and the detail buffer safe to read without a lock.
+std::atomic<uint32_t> g_guest_state{0};   // 0 running, 1 returned, 2 faulted
+std::atomic<int> g_guest_kind{0};
+std::atomic<uint64_t> g_guest_fault_rip{0};
+std::atomic<uint64_t> g_guest_fault_addr{0};
+// `trap_detail()` builds its text in a 256-byte buffer, so this holds every detail prosper can
+// currently produce; snprintf truncates rather than overruns if that ever grows.
+char g_guest_detail[256]{};
+} // namespace
+
+const char* guest_run_state_name(GuestRunState state) {
+    switch (state) {
+        case GuestRunState::Returned: return "returned";
+        case GuestRunState::Faulted:  return "faulted";
+        case GuestRunState::Running:  break;
+    }
+    return "running";
+}
+
+void publish_guest_outcome(int kind, uint64_t fault_rip, uint64_t fault_addr, const char* detail) {
+    std::snprintf(g_guest_detail, sizeof g_guest_detail, "%s", detail ? detail : "");
+    g_guest_kind.store(kind, std::memory_order_relaxed);
+    g_guest_fault_rip.store(fault_rip, std::memory_order_relaxed);
+    g_guest_fault_addr.store(fault_addr, std::memory_order_relaxed);
+    g_guest_state.store(kind == 0 ? 1u : 2u, std::memory_order_release);
+}
+
+GuestOutcome read_guest_outcome() {
+    GuestOutcome outcome;
+    const uint32_t state = g_guest_state.load(std::memory_order_acquire);
+    if (state == 0) return outcome;
+    outcome.state = state == 1 ? GuestRunState::Returned : GuestRunState::Faulted;
+    outcome.kind = g_guest_kind.load(std::memory_order_relaxed);
+    outcome.fault_rip = g_guest_fault_rip.load(std::memory_order_relaxed);
+    outcome.fault_addr = g_guest_fault_addr.load(std::memory_order_relaxed);
+    outcome.detail.assign(g_guest_detail, strnlen(g_guest_detail, sizeof g_guest_detail));
+    return outcome;
+}
+
+RunVerdict decide_run_verdict(bool assertions_failed, const GuestOutcome& guest,
+                              bool allow_guest_fault) {
+    if (guest.state == GuestRunState::Faulted && !allow_guest_fault) return {"GUEST-FAULT", 1};
+    if (assertions_failed) return {"FAILED", 1};
+    if (guest.state == GuestRunState::Faulted) return {"GUEST-FAULT-ALLOWED", 0};
+    return {"ok", 0};
+}
 
 void normalize_capture_rgba(CaptureSource source, std::vector<uint8_t>& pixels) {
     // A republished guest scanout is normalized like a composited frame and for the same reason:
@@ -206,6 +258,7 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
          << ",\"require_composited_frame\":" << (c.require_composited_frame ? "true" : "false")
          << ",\"min_present_count\":" << c.min_present_count
          << ",\"min_frame_seq\":" << c.min_frame_seq
+         << ",\"allow_guest_fault\":" << (c.allow_guest_fault ? "true" : "false")
          << ",\"required_crc32\":";
     if (c.required_crc32_set)
         line << "\"" << std::hex << std::setw(8) << std::setfill('0') << c.required_crc32
@@ -251,7 +304,8 @@ std::string manifest_sample_json(int index, const std::string& png_path,
 }
 
 std::string manifest_summary_json(int saved, int requested, bool timed_out,
-                                  const CaptureTracker& tracker, int exit_code) {
+                                  const CaptureTracker& tracker, const RunVerdict& verdict,
+                                  const GuestOutcome& guest, bool allow_guest_fault) {
     std::ostringstream line;
     line << "{\"type\":\"summary\",\"schema\":1,\"saved\":" << saved
          << ",\"requested\":" << requested
@@ -266,7 +320,26 @@ std::string manifest_summary_json(int saved, int requested, bool timed_out,
          << tracker.max_pixel_stale_seconds()
          << ",\"max_frame_seq\":" << tracker.max_frame_seq()
          << ",\"max_present_count\":" << tracker.max_present_count()
-         << ",\"exit_code\":" << exit_code << "}";
+         // The guest's own terminal state, so a batch consumer can filter runs whose guest died
+         // without re-reading the run log. Addresses are hex strings, not JSON numbers: a 64-bit
+         // guest address does not survive a double-typed JSON parser.
+         << ",\"guest_state\":\"" << guest_run_state_name(guest.state) << "\""
+         << ",\"guest_kind\":" << guest.kind
+         << ",\"guest_detail\":\"" << json_escape(guest.detail) << "\"";
+    if (guest.state == GuestRunState::Faulted) {
+        char address[32];
+        std::snprintf(address, sizeof address, "0x%llx",
+                      static_cast<unsigned long long>(guest.fault_rip));
+        line << ",\"guest_fault_rip\":\"" << address << "\"";
+        std::snprintf(address, sizeof address, "0x%llx",
+                      static_cast<unsigned long long>(guest.fault_addr));
+        line << ",\"guest_fault_addr\":\"" << address << "\"";
+    } else {
+        line << ",\"guest_fault_rip\":null,\"guest_fault_addr\":null";
+    }
+    line << ",\"allow_guest_fault\":" << (allow_guest_fault ? "true" : "false")
+         << ",\"status\":\"" << verdict.status << "\""
+         << ",\"exit_code\":" << verdict.exit_code << "}";
     return line.str();
 }
 
