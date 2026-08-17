@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""xref.py — cross-reference finder for an (unsymbolicated) PS5 module.
+
+Answers "who references address X" over direct calls, rip-relative loads/stores/leas, and Sony
+(DT_SCE_*) relocations — none of which objdump or readelf can decode on a PS5 module.
+
+usage:
+    xref.py <module.elf> to    <hexaddr>    who references this address
+    xref.py <module.elf> from  <hexaddr>    what the function at this address references
+    xref.py <module.elf> reloc <hexaddr>    data-pointer relocations targeting this address only
+    xref.py <module.elf> imm   <string>     who BUILDS this string from inline immediates
+    xref.py --help
+
+The arguments are POSITIONAL. There are no option flags, and a mode that is not one of the four
+above is refused rather than answered (#2399).
+
+Three things a caller must know before believing an answer:
+
+  * The input is a FLATTENED ELF (p_offset == p_vaddr), not the SELF as it ships. Flatten first:
+        python3 tools/il2cpp/prx_to_elf.py <DUMP>/eboot.bin <out.elf>
+    Handing this tool an `eboot.bin` is refused, not answered (#2346).
+  * Addresses are IMAGE-RELATIVE. A runtime address is module_load_base + VA (the eboot base is
+    0x410000000 — see prosper/src/host/boot_program.hpp for the authoritative set), so subtract the
+    base before querying an address taken from a live backtrace or a diagnostic (#1659).
+  * `to` returning 0 for a string of 22 bytes or fewer is VOID until `imm` has been run: clang
+    materialises a short std::string from immediates, leaving the .rodata copy with no reference of
+    any kind (#1905).
+
+exit status is a contract, because the failure this tool must never have is a zero that means
+"I did not run":
+    0   the query ran; the printed counts ARE the answer, including when they are zero
+    2   refused — nothing was searched, and no count below is a result
+"""
+#
 # xref.py — cross-reference finder for an (unsymbolicated) PS5 module.
 #
 # PS5 eboot/PRX code is position-independent: internal references appear as
@@ -42,11 +75,14 @@
 # `ui/ui_startup` has zero references AND is requested on every boot -- #1905). `imm` closes that hole
 # by searching the executable segments for the string's own bytes appearing as instruction operands.
 #
-# Usage:
-#   xref.py <module.elf> to   <hexaddr>     # who references this address
-#   xref.py <module.elf> from <hexaddr>     # what this function references (rip-lea/call, ~2KB window)
-#   xref.py <module.elf> reloc <hexaddr>    # data-pointer relocations targeting this address only
-#   xref.py <module.elf> imm  <string>      # who BUILDS this string from inline immediates
+# The usage block lives in the module DOCSTRING above and nowhere else, deliberately. It used to be
+# here, as a comment, while `main()` printed `__doc__` on a bad invocation -- and a module whose
+# header is all `#` comments has `__doc__ == None`, so `xref.py --help` printed the literal string
+# `None` (#2399). The comment was correct and unreachable at the same time, which is the worst
+# arrangement available: the tool could not tell a caller how to invoke it, so the caller guessed
+# `--addr`, and the guess produced an empty result they read as "no references".
+#
+# `from` scans a ~2KB window forward from the given address.
 
 import struct, sys
 from collections import defaultdict
@@ -117,12 +153,19 @@ class Module:
         if not phnum or e_phoff + phnum * phentsize > len(raw):
             raise BadModule(f"{path}: program header table (phoff=0x{e_phoff:x}, phnum={phnum}) "
                             f"does not fit in {len(raw)} bytes")
-        self.segs = []          # (va, foff, filesz, flags)
+        self.segs = []          # (va, foff, filesz, flags) -- FILE-backed bytes, what we can decode
+        # p_memsz, separately, because it is a different question. `segs` bounds what can be READ;
+        # `va_ranges` bounds what the module OCCUPIES, and the .bss tail (memsz > filesz) is in the
+        # second and not the first. Guest flag bytes live there: on PPSA24651 the `storeb` target
+        # 0x1f4f3f0 is 0x13288 past the last segment's filesz and is written by real code, so a
+        # "not in this module" check built on filesz calls a correct answer suspect.
+        self.va_ranges = []     # (va, memsz)
         self.dyn_va = 0
         for i in range(phnum):
             t, fl, off, va, pa, fs, ms, al = struct.unpack_from('<IIQQQQQQ', raw, e_phoff + i * phentsize)
             if t == 1:
                 self.segs.append((va, off, fs, fl))
+                self.va_ranges.append((va, max(fs, ms)))
             elif t == 2:
                 self.dyn_va = va
         if not self.segs:
@@ -387,26 +430,123 @@ def find_immediate_builds(m, needle, span=0x60):
     return out
 
 
+MODES = ('to', 'from', 'reloc', 'imm')
+HELP_FLAGS = ('-h', '--help', 'help')
+
+# The exit codes are a contract, not a formality. This tool's characteristic failure is a zero that
+# means "I did not run", so REFUSED and ANSWERED must never share a status.
+EXIT_OK = 0        # the query ran; the printed counts are the answer, zero included
+EXIT_REFUSED = 2   # nothing was searched
+
+
+def usage(stream=sys.stdout):
+    print(__doc__.rstrip(), file=stream)
+
+
+def refuse(message):
+    """Print usage plus a specific reason on stderr, and hand back the refusal status."""
+    usage(sys.stderr)
+    print(f"\nxref.py: refused: {message}", file=sys.stderr)
+    return EXIT_REFUSED
+
+
+def describe_module(path, m):
+    """Print what was decoded, before any answer.
+
+    A count of what the decoder found ACROSS THE MODULE is the number that separates "this address
+    has no references" from "this run found nothing at all" — the two readings of a bare zero that
+    #2399 and #2346 are both about. It is printed on every query, not only on empty ones, so that a
+    zero and a hit are framed identically and a saved transcript carries its own validity check.
+    """
+    exec_bytes = sum(fs for _, _, fs, fl in m.segs if fl & 1)
+    code_sites = sum(len(v) for v in m.code_xref.values())
+    data_sites = sum(len(v) for v in m.data_xref.values())
+    print(f"module {path}: {len(m.segs)} PT_LOAD, 0x{exec_bytes:x} bytes executable; decoded "
+          f"{code_sites} code reference sites to {len(m.code_xref)} distinct addresses, and "
+          f"{data_sites} data-pointer relocations to {len(m.data_xref)} distinct addresses")
+    return code_sites + data_sites
+
+
+def warn_unmapped(m, addr):
+    """Warn when the queried address lies outside the module's address space entirely.
+
+    This is the commonest cause of an honest-looking 0: a runtime address that was never rebased to
+    an image-relative one (#1659) is not in this module at all, so of course nothing references it.
+
+    Measured against p_memsz, NOT p_filesz. `foff()` is filesz-based because it maps to file bytes,
+    but a module occupies its .bss tail too, and that tail is where guest flag bytes live — on
+    PPSA24651 the address 0x1f4f3f0 is past every segment's filesz and has two real references. A
+    filesz test would flag that correct answer as suspect, which is worse than not warning at all.
+
+    A warning and never a refusal, and only when the answer is empty: a non-empty result proves the
+    address is meaningful, and an alarm printed over a correct answer is noise that teaches readers
+    to ignore the alarm.  CONFIDENCE: HIGH
+    """
+    if any(va <= addr < va + size for va, size in m.va_ranges):
+        return
+    print(f"   WARNING: 0x{addr:x} is outside every PT_LOAD segment of this module (checked against "
+          f"p_memsz, so the .bss tail is included). If this address came from a live backtrace or a "
+          f"diagnostic, subtract the module load base first (#1659) — as it stands the 0 above is an "
+          f"answer about an address this module does not have.")
+
+
+def show_truncated(shown, total, what):
+    """Say so when a listing was cut short, instead of letting it read as the whole answer."""
+    if total > shown:
+        print(f"   ... {total - shown} more {what} not shown (listing is capped at {shown})")
+
+
 def main():
-    if len(sys.argv) < 4:
-        print(__doc__)
-        return 1
+    argv = sys.argv[1:]
+    # A help flag counts only in the module or mode slot. `imm` takes an arbitrary needle, so
+    # `xref.py f.elf imm --help` must search for the string "--help", not print this text.
+    if any(a in HELP_FLAGS for a in argv[:2]):
+        usage()
+        return EXIT_OK
+    if len(argv) < 3:
+        return refuse(f"expected 3 arguments (module, mode, argument), got {len(argv)}")
+
+    # Validate the mode BEFORE parsing the module: it is the argv-level mistake, it costs nothing to
+    # check, and leaving it until after the if/elif chain is exactly how #2399 happened. There was no
+    # `else` at the bottom of that chain, so an unrecognised mode fell through to `return 0` having
+    # printed nothing -- and `xref.py <elf> --addr 0x…` is four argv entries, so it cleared the arity
+    # check, parsed a real module, decoded half a million reference sites, and then reported none of
+    # them. Zero bytes of output and exit 0, for an address that provably had two references.
+    mode = argv[1]
+    if mode not in MODES:
+        hint = ""
+        if mode.startswith('-'):
+            hint = (" This CLI is positional and has no option flags — there is no `--addr`; the "
+                    "query is written `to 0x…`.")
+        return refuse(f"{mode!r} is not a mode. Expected one of: {', '.join(MODES)}.{hint}")
+
+    # Likewise the address: argv-level, free to check, and doing it here keeps a typo from costing a
+    # 27 MB module parse and from interleaving its stderr with buffered stdout.
+    addr = None
+    if mode != 'imm':
+        try:
+            addr = int(argv[2], 0)
+        except ValueError:
+            return refuse(f"{argv[2]!r} is not an address. `{mode}` takes a number (0x… or "
+                          f"decimal); only `imm` takes text.")
+
+    path = argv[0]
     try:
-        m = Module(sys.argv[1])
+        m = Module(path)
     except BadModule as exc:
         # Non-zero exit as well as the message: a caller that pipes this into a report must not be
         # able to mistake a refusal for an empty result set (#2346).
         print(f"refused: {exc}", file=sys.stderr)
-        return 2
-    mode = sys.argv[2]
+        return EXIT_REFUSED
+    decoded = describe_module(path, m)
     if mode == 'imm':
-        text = sys.argv[3]
+        text = argv[2]
         needle = text.encode('utf-8')
+        print(f"query: imm {text!r}")
         try:
             builds = find_immediate_builds(m, needle)
         except ValueError as exc:
-            print(f"refused: {exc}")
-            return 1
+            return refuse(str(exc))
         print(f"inline-immediate constructions of {text!r} ({len(needle)} bytes): {len(builds)}")
         for first, last, parts in builds:
             where = ", ".join(f"0x{va:x}[{lo}:{hi}]" for va, lo, hi in parts)
@@ -429,13 +569,19 @@ def main():
         for va in lits[:16]:
             print(f"   0x{va:x}: {len(m.code_xref.get(va, []))} code refs, "
                   f"{len(m.data_xref.get(va, []))} data relocations")
-        return 0
-    addr = int(sys.argv[3], 0)
+        show_truncated(16, len(lits), "literal copies")
+        if not builds and not lits:
+            print(f"   0 constructions and 0 literal copies — a real answer, not a failed run: this "
+                  f"module decoded {decoded} references in total. {text!r} is not in this image.")
+        return EXIT_OK
+    print(f"query: {mode} 0x{addr:x}")
     if mode in ('to', 'reloc'):
         drefs = m.data_xref.get(addr, [])
         print(f"data-pointer relocations targeting 0x{addr:x}: {len(drefs)}")
         for s in drefs[:32]:
             print(f"   ptr stored at 0x{s:x}")
+        show_truncated(32, len(drefs), "relocations")
+        crefs = []
         if mode == 'to':
             crefs = m.code_xref.get(addr, [])
             # Summarise by access class first. "who WRITES this" is the usual question, and an
@@ -451,17 +597,37 @@ def main():
                       "decoder does not know, or it is genuinely read-only (#2025).")
             for s, k in crefs[:32]:
                 print(f"   [{access(k):2s}] {k:7s} at 0x{s:x}  (in func 0x{m.func_start(s):x})")
+            show_truncated(32, len(crefs), "code references")
+        # The line this whole change exists for. A zero must state that it IS the answer and name
+        # the evidence that the run happened, because the alternative reading -- "the tool did not
+        # run" -- is the one that has twice sent an investigation somewhere worse (#2346, #2399).
+        if not drefs and not crefs:
+            ran = (f"This is a real answer, not a failed run: the decoder found {decoded} "
+                   f"references elsewhere in this module.")
+            if mode == 'to':
+                print(f"   0 references of any decoded kind. {ran} If 0x{addr:x} is a string of 22 "
+                      f"bytes or fewer, this zero is void until `imm` has been run (#1905).")
+            else:
+                print(f"   0 data-pointer relocations. {ran} Note that `reloc` does not consult "
+                      f"code references at all — run `to 0x{addr:x}` for those.")
+            warn_unmapped(m, addr)
     elif mode == 'from':
         start = m.func_start(addr)
         print(f"references made by func 0x{start:x} (window from 0x{addr:x}):")
-        fo = m.foff(addr)
         seen = set()
         for tgt, sites in m.code_xref.items():
             for s, k in sites:
                 if addr <= s < addr + 0x800 and tgt not in seen:
                     seen.add(tgt)
                     print(f"   [{access(k):2s}] {k:7s} -> 0x{tgt:x}")
-    return 0
+        # `from` printed a header and then nothing at all on an empty result, which reads as a
+        # truncated run rather than as a function that references nothing.
+        print(f"   {len(seen)} distinct targets in the 0x800-byte window from 0x{addr:x}"
+              + ("" if seen else f" — a real answer: the decoder found {decoded} references "
+                                 f"elsewhere in this module."))
+        if not seen:
+            warn_unmapped(m, addr)
+    return EXIT_OK
 
 
 if __name__ == '__main__':
