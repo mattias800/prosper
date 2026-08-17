@@ -4,13 +4,16 @@ Validated on Linux on 2026-07-25, with GRIS opening gameplay and Cobra tutorial 
 on 2026-07-31. This note records the reproducible evidence for issue #1356. Raw PCM, verbose logs,
 and GPU captures are local diagnostics and are intentionally not committed.
 
+Result-matrix rungs reconciled 2026-08-17 against the three trackers and `tools/snapshot/snapshots.json`;
+no new run was made for that pass. The rest of the document is unchanged.
+
 ## Result matrix
 
 | Title | Revision | Visual milestone | Audio evidence |
 | --- | --- | --- | --- |
-| GRIS (`PPSA09804`) | 01.001.000 | Native 1920×1080 opening gameplay with scripted movement | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
-| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | **rung 1** — 3840x2160 SEGA logo, then a white hold before any title screen. The black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id) | Not re-measured since the boot advanced; the earlier silent-port figure no longer describes this state |
-| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | Native 1920×1080 tutorial combat with scripted progression | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
+| GRIS (`PPSA09804`) | 01.001.000 | **rung 6** — native 1920×1080 opening gameplay with scripted movement, guarded by the reviewed `gris-gameplay` snapshot (tracker #1869) | CLEAN on current master over the first 35 seconds: `rms=0.0082`, `peak=0.1173`, duplicated grains 0.0% |
+| Sonic Origins (`PPSA05325`) | Complete Sonic Origins Plus 02.002.000 base+update, four DLC payloads with mount records | **rung 1** — 3840x2160 SEGA logo, then decoded 4K movie frames; **no title screen observed**. The black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id). The "holds on white to the end" clause this row used to carry is **falsified on current master**: since #2571 (merged `687d2b70`) made `sceVideodec2Decode` decode by default, the pure-white frame at 80 s is passed *through* and the run continues (100-180 s: 14,871 / 8,978 / 13,351 / 9,294 / 9,372 distinct colours) — evidence in [#2267](https://github.com/mattias800/prosper/issues/2267)'s 2026-08-17 comment. That run did not look for a title screen, and prosper still authors nothing here: 68 of 68 guest scanouts report no present source and no renderer target, so only the flipped buffer's contents changed | Not re-measured since the boot advanced; the earlier silent-port figure no longer describes this state |
+| Space Adventure Cobra — The Awakening (`PPSA17337`) | 01.004.000 | **rung 6** — native 1920×1080 tutorial combat with scripted progression, guarded by the reviewed `cobra-gameplay` snapshot (tracker #1870) | CLEAN, `rms=0.0436`, `peak=0.1880`, duplicated grains 0.0% |
 
 ## Visual evidence
 
