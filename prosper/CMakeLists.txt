@@ -509,6 +509,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
 
+  # APR completion delivery on a shared equeue (#1673): the constant-tag (CRI) dialect must not be
+  # coalesced away, while the counter dialect (#208) and genuine level sources must still coalesce.
+  add_executable(test_apr_equeue_completion tests/test_apr_equeue_completion.cpp)
+  target_link_libraries(test_apr_equeue_completion PRIVATE prosper_core)
+  add_test(NAME apr_equeue_completion COMMAND test_apr_equeue_completion)
+
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
   add_executable(test_printf tests/test_printf.cpp)

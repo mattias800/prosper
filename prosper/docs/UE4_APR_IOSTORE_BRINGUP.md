@@ -11,6 +11,32 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
+- **The shared-equeue completion coalescing is what blocks Tales of Graces f's opening movie —
+  false, and the tempting inference to avoid is "the bug is real, therefore it is THIS title's
+  blocker".** The drop itself *is* real and is fixed by
+  [#1673](https://github.com/mattias800/prosper/issues/1673): CRI ADX2 binds through the `id != 0`
+  branch with a literal zero tag, so its high-water mark never advances, every completion posted an
+  identical `(ident, filter, data=0)` event, and `eq_post`'s level coalescing collapsed N discrete
+  completions into one delivery. A by-hand instance in `tests/test_apr_equeue_completion.cpp`
+  reproduces it on the pre-fix code. **But it never fires on the measured PPSA19991 route.** Two
+  independent 150–180 s headless `boot_trace` runs with `PROSPER_EVLOG=1`: **0** coalesce-replace
+  events on the APR filter (`-24`), and the CRI equeue's waits and deliveries balance exactly
+  (480 ↔ 480 pre-fix, 452 ↔ 452 post-fix), each wait preceded by `WAIT.empty (infinite)` — i.e. the
+  CRI waiter is strictly serialized, one request in flight at a time, so two completions are never
+  pending together. The zero is trustworthy rather than an unarmed instrument: the *same* counter
+  reports 5 APR-filter replacements on PPSA17942 and ~170k on the vblank filter in the same runs.
+  So this is a latent hazard of the same character as #2560's binding-aliasing window — reachable,
+  worth closing, and **not** the movie blocker. Do not close the movie investigation on it.
+
+- **The fix perturbs the #208 / #180 UE4 listener channel — false, and the token census is the
+  proof.** The predicate is `cnt != 0`, and the two dialects partition across it with no overlap:
+  PPSA17942 posts **198** completions on this branch with **0** zero-counter tokens (rings 3/4, ids
+  29953/29954 — exactly the documented `0x74fe+ring` listener channel), so every one of them takes
+  the pre-existing `coalesce=true` path with bit-identical behaviour, including the 5 genuine
+  coalesces observed. PPSA19991 posts **32** with **0** nonzero tokens. A zero counter cannot be
+  legitimate in the counter dialect anyway: the guest's listener ctor seeds the per-ring counters at
+  `0x3e8` (1000) with last-processed `0x3e7`, and #180 already forbids posting `cnt < 1000` there.
+
 - **Two registered containers sharing a total byte size makes either normal APR read ambiguous —
   false after #78.** `sceAmprAprCommandBufferReadFile` resolves the real `a3` file id first; total
   byte size is only a legacy fallback when that id is unknown. A collision can therefore refuse
