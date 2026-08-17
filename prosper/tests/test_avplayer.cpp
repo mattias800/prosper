@@ -341,8 +341,14 @@ public:
         fflush(stderr);
         saved_fd_ = dup(2);
         tmp_ = tmpfile();
-        if (tmp_ && saved_fd_ >= 0) dup2(fileno(tmp_), 2);
+        if (tmp_ && saved_fd_ >= 0) { dup2(fileno(tmp_), 2); armed_ = true; }
     }
+    // The instrument must say when it did not run. A dup/tmpfile failure yields an EMPTY capture,
+    // which every "is this path loud?" check below would read as "the message was not printed" --
+    // a confident verdict about the subject produced entirely by the apparatus. Assert this.
+    bool armed() const { return armed_; }
+    StderrCapture(const StderrCapture&) = delete;             // owns an fd and a FILE*
+    StderrCapture& operator=(const StderrCapture&) = delete;
     std::string finish() {
         if (!active_) return text_;
         active_ = false;
@@ -362,7 +368,7 @@ public:
 private:
     int saved_fd_ = -1;
     FILE* tmp_ = nullptr;
-    bool active_ = true;
+    bool active_ = true, armed_ = false;
     std::string text_;
 };
 static bool says(const std::string& haystack, const char* needle) {
@@ -1048,7 +1054,9 @@ int main() {
         const char container_source[] = "/app0/Media/resources.resource";
         StderrCapture captured;
         const uint64_t rc = add(h, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool armed = captured.armed();
         const std::string log = captured.finish();
+        CHECK(armed, "the stderr capture armed (an empty capture would be the apparatus, not a finding)");
         CHECK(rc == 0, "an over-reporting reader still leaves the source in a graceful state");
         // THE ARM. Reverting the over-count refusal makes this exact check fail: memory_open_calls
         // becomes 1 and the backend receives a truncated buffer.
@@ -1086,7 +1094,9 @@ int main() {
         const char container_source[] = "/app0/Media/resources.resource";
         StderrCapture captured;
         add(h, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool armed = captured.armed();
         const std::string log = captured.finish();
+        CHECK(armed, "the stderr capture armed for the refused-open arm");
         CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 1,
               "a reader whose open() refuses falls back to the host path");
         CHECK(guest_file_close_calls == 0,
@@ -1106,7 +1116,9 @@ int main() {
         uint64_t ph = init((uint64_t)(uintptr_t)&partial, 0, 0, 0, 0, 0);
         StderrCapture partial_captured;
         add(ph, (uint64_t)(uintptr_t)container_source, 0, 0, 0, 0);
+        const bool partial_armed = partial_captured.armed();
         const std::string partial_log = partial_captured.finish();
+        CHECK(partial_armed, "the stderr capture armed for the incomplete-table arm");
         CHECK(guest_file_open_calls == 0 && guest_file_read_calls == 0,
               "an incomplete table is never called through (a null member would fault)");
         CHECK(memory_backend.memory_open_calls == 0 && memory_backend.host_open_calls == 2,
