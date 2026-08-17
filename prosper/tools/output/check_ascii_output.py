@@ -82,6 +82,32 @@ class Literal:
         return self.at[idx] if 0 <= idx < len(self.at) else self.line
 
 
+CHAR_PREFIXES = ("", "L", "u", "U", "u8")
+
+
+def opens_char_literal(src: str, i: int) -> bool:
+    """Does the quote at src[i] open a char literal, or is it a digit separator / stray prose?
+
+    Decided by the maximal run of identifier characters immediately before it, which is the whole
+    of the ambiguity:
+
+        '  x = 'a'   -> run ""    -> yes        '  L'"'      -> run "L"    -> yes (prefix)
+        '  5'000     -> run "5"   -> no         '  u8'"'     -> run "u8"   -> yes (prefix)
+        '  menu'0    -> run "menu"-> no         '  kL'0      -> run "kL"   -> no
+
+    Both directions have bitten. Treating every `'` as an opener let `5'000` pair with an apostrophe
+    inside a later string, swallowing that string's opening quote and hiding its contents -- a false
+    clean. Rejecting every `'` preceded by an alphanumeric then broke the ENCODING PREFIXES, since
+    L/u/U/u8 are alphanumeric too, so `L'"'` stopped being a char literal and its inner quote opened
+    a string instead -- the same false clean, one case narrower, and against a docstring that
+    asserts the opposite. Both were found by review, the second in the fix for the first.
+    """
+    j = i
+    while j > 0 and (src[j - 1].isalnum() or src[j - 1] == "_"):
+        j -= 1
+    return src[j:i] in CHAR_PREFIXES
+
+
 def extract_literals(src: str):
     """Every string literal in `src`, with comments and char literals removed.
 
@@ -127,8 +153,7 @@ def extract_literals(src: str):
         # So a quote only opens a char literal when the character before it cannot end an
         # identifier or a number, which is exactly what distinguishes `5'000` and `x'` from `= '` or
         # `('`. Reported by review; no instance existed in the tree, and the tree is not the point.
-        prev = src[i - 1] if i else ""
-        if c == "'" and not (prev.isalnum() or prev == "_"):
+        if c == "'" and opens_char_literal(src, i):
             j = i + 1
             closed = False
             while j < n and src[j] != "\n":
@@ -345,6 +370,19 @@ SELF_TESTS = [
     # MUST fire: a digit separator must not swallow a later string. If the ' in 1'000 pairs with the
     # one in "it's", the whole of that string -- and this dash -- goes invisible. A FALSE CLEAN.
     ('int n = 1\'000; puts("it\'s %s");' % DASH, 1),
+    # MUST fire: the four ENCODING PREFIXES still open a char literal. The first version of the
+    # guard above rejected them (L/u/U/u8 are alphanumeric), so the quote inside L'"' opened a
+    # STRING and everything after it on the line went invisible -- the same false clean the guard
+    # was added to remove, one case narrower, and against a docstring asserting the opposite.
+    ('wchar_t c = L\'"\'; puts("%s");' % DASH, 1),
+    ('char8_t c = u8\'"\'; puts("%s");' % DASH, 1),
+    ('char16_t c = u\'"\'; puts("%s");' % DASH, 1),
+    ('char32_t c = U\'"\'; puts("%s");' % DASH, 1),
+    ('char c = \'"\'; puts("%s");' % DASH, 1),           # control: unprefixed, always worked
+    # MUST fire: an identifier that merely ENDS in a prefix letter is not a prefix, so these stay
+    # digit-separator-like and must not open a char literal and swallow the string.
+    ('int kL = 0; int n = kL\'0; puts("it\'s %s");' % DASH, 1),
+    ('int menu = 0; int n = menu\'0; puts("it\'s %s");' % DASH, 1),
     # #include and preprocessor lines are ordinary text to the scanner; must stay clean.
     ('#include "header.h"', 0),
 ]
@@ -408,12 +446,18 @@ def self_test() -> int:
             print("  [FAIL] line self-test: %r -> %s, want %s"
                   % (snippet, sorted(got.items()), want))
             bad += 1
+    for rel, kind, want_bucket in CLASSIFY_TESTS:
+        got_bucket = classify(rel, kind)
+        if got_bucket != want_bucket:
+            print("  [FAIL] classify self-test: (%s, %s) -> %s, want %s"
+                  % (rel, kind, got_bucket, want_bucket))
+            bad += 1
     if bad:
         print("  the scanner's own patterns are broken -- a tree scan would report a false CLEAN")
         print("  or point at the wrong line, and either way the gate stops being worth reading")
     else:
-        print("  [ok]   scanner self-test: %d shape case(s), %d line-number case(s)"
-              % (len(SELF_TESTS), len(LINE_TESTS)))
+        print("  [ok]   scanner self-test: %d shape case(s), %d line-number case(s), "
+              "%d bucket case(s)" % (len(SELF_TESTS), len(LINE_TESTS), len(CLASSIFY_TESTS)))
     return bad
 
 
@@ -444,6 +488,39 @@ QUARANTINE = {
     "tests/test_descriptor_array_render.cpp": 1,
     "tests/test_rdna2_to_spirv.cpp": 2,
 }
+
+
+def classify(rel: str, kind: str) -> str:
+    """Which bucket one finding lands in: "note", "ledger" or "fail".
+
+    KIND is decided before FILE, and the order is the whole content of this function. The other way
+    round, a \\x byte escape inside a quarantined file counted into the ledger -- so the identical
+    "\\xe2\\x80\\x94" fixture was a silent note anywhere else and a CI failure in a quarantined one,
+    reported as "3 ADDED since #2588": the three-tier rule suspended exactly where it would
+    misdiagnose legitimate binary test data as the defect class. Two of the thirteen quarantined
+    entries are test files, which is where a hex fixture lands.
+
+    It lives out here, rather than inline in main(), only so CLASSIFY_TESTS can pin that order --
+    review's point that this was the one fix in the PR whose removal nothing would detect. The tree
+    cannot catch it (no quarantined file holds a byte escape) and the literal-level arms never reach
+    main(), so without these two assertions it is verified by hand exactly once, in a session that
+    ends.
+    """
+    if kind == "byte":
+        return "note"
+    if rel in QUARANTINE:
+        return "ledger"
+    return "fail"
+
+
+# The two that pin the order above, plus the two that keep them honest.
+CLASSIFY_TESTS = [
+    # (relpath, kind, expected bucket)
+    ("src/gpu/render_state.cpp", "byte", "note"),    # quarantined AND a byte escape -> still a note
+    ("src/hle/other.cpp",        "byte", "note"),    # ... identical outcome anywhere else
+    ("src/gpu/render_state.cpp", "char", "ledger"),  # quarantined and a real character -> ledger
+    ("src/hle/other.cpp",        "char", "fail"),    # the ordinary case
+]
 
 
 def main() -> int:
@@ -478,14 +555,10 @@ def main() -> int:
     fails, notes = [], []
     for f in findings:
         rel, _line, kind, _detail, _ex = f
-        # KIND first, then file. The other order made a byte escape count into the ledger, so the
-        # identical "\xe2\x80\x94" fixture was a silent note anywhere else and a CI failure inside a
-        # quarantined file, reported as "3 ADDED since #2588" -- the gate's own three-tier rule
-        # suspended exactly where it would misdiagnose legitimate binary test data as the defect.
-        # Two of the thirteen quarantined entries are test files. Reported by review.
-        if kind == "byte":
+        bucket = classify(rel, kind)
+        if bucket == "note":
             notes.append(f)
-        elif rel in QUARANTINE:
+        elif bucket == "ledger":
             quarantined[rel] = quarantined.get(rel, 0) + 1
         else:
             fails.append(f)
