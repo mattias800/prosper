@@ -4332,7 +4332,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // can address each face's own bytes. This is the only authority this
                             // title offers: it never programs DB_DEPTH_SLICE.
                             if (r.layer_stride_bytes)
-                                prosper::test::note_ds_layer_stride(r.gpu_addr,
+                                prosper::test::note_ds_layer_stride(r.gpu_addr, tw, th,
                                                                     r.layer_stride_bytes);
                             uint32_t present_mask = 0, known_mask = 0;
                             const bool complete = prosper::test::read_persistent_ds_cube_depth(

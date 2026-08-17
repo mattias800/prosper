@@ -934,24 +934,31 @@ int main() {
     }
 
     {
-        // Layer-stride registry lifetime. The registry is keyed by guest BASE and lives for the
-        // process, so a base is not a stable identity -- the guest frees an allocation and maps
-        // another at the same address. It used to keep the FIRST value forever, which made a stale
-        // stride permanent under reuse; the stride sizes the range an invalidation covers, so a
-        // wrong one leaves stale pixels resident or evicts a neighbouring slice.
+        // Layer-stride registry lifetime, checked in situ alongside a real render. The registry is
+        // keyed by the surface IDENTITY (base, width, height) and lives for the process, because a
+        // guest base alone is not a stable identity -- the guest frees an allocation and maps
+        // another at the same address. The stride sizes the range an invalidation covers, so a
+        // stride carried across a reuse leaves stale pixels resident or evicts a neighbouring slice.
+        // The exhaustive arms are in test_ds_layer_stride; this pins the contract where the renderer
+        // actually publishes it.
         const uint64_t base = 0x5ad0000000ull;   // not used by any render above
-        prosper::test::note_ds_layer_stride(base, 4096);
-        CHECK(prosper::test::ds_layer_stride_for(base) == 4096,
+        prosper::test::note_ds_layer_stride(base, 1024, 1024, 4096);
+        CHECK(prosper::test::ds_layer_stride_for(base, 1024, 1024) == 4096,
               "layer stride registry records a first observation");
-        prosper::test::note_ds_layer_stride(base, 8192);
-        CHECK(prosper::test::ds_layer_stride_for(base) == 8192,
-              "a later layer-stride observation replaces the earlier one (base reuse)");
+        // A DIFFERENT surface mapped at the same base gets its own entry rather than overwriting.
+        prosper::test::note_ds_layer_stride(base, 512, 512, 8192);
+        CHECK(prosper::test::ds_layer_stride_for(base, 512, 512) == 8192 &&
+                  prosper::test::ds_layer_stride_for(base, 1024, 1024) == 4096,
+              "a recycled base yields a separate entry, leaving the first surface's stride intact");
+        // A surface that never published a stride reads as unknown, never as its predecessor's.
+        CHECK(prosper::test::ds_layer_stride_for(base, 256, 256) == 0,
+              "an unpublished identity at a reused base is unknown, not inherited");
         // Zero means "unknown" and must never overwrite a known stride with it.
-        prosper::test::note_ds_layer_stride(base, 0);
-        CHECK(prosper::test::ds_layer_stride_for(base) == 8192,
+        prosper::test::note_ds_layer_stride(base, 1024, 1024, 0);
+        CHECK(prosper::test::ds_layer_stride_for(base, 1024, 1024) == 4096,
               "an unknown (zero) stride does not erase a known one");
         // An unrelated base is unaffected -- the registry is per-surface, not global state.
-        CHECK(prosper::test::ds_layer_stride_for(base + 0x100000ull) == 0,
+        CHECK(prosper::test::ds_layer_stride_for(base + 0x100000ull, 1024, 1024) == 0,
               "layer stride registry does not leak across bases");
     }
 

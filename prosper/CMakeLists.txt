@@ -1835,6 +1835,12 @@ if(TARGET prosper_core)
       add_test(NAME descriptor_array_emit COMMAND test_descriptor_array_emit)
 
 
+      # The DS layer-stride registry's identity (base+width+height, not base alone) and
+      # PersistentDsKey's field membership.
+      add_executable(test_ds_layer_stride tests/test_ds_layer_stride.cpp)
+      target_link_libraries(test_ds_layer_stride PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME ds_layer_stride COMMAND test_ds_layer_stride)
+
       # The per-draw internal-GDS scan memo (#2334). Two registrations of ONE binary: the second
       # sets the opt-out, so the pair proves the memo both fires and can be turned off, on a single
       # build. Both must PASS -- the binary flips its own expectation from the environment.

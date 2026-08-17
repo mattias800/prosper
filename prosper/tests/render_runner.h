@@ -2490,11 +2490,17 @@ inline RenderHostBufferPoolStats render_host_buffer_pool_stats() {
 struct PersistentDsKey {
     uint64_t dr = 0, dw = 0, sr = 0, sw = 0, htile = 0;
     uint32_t w = 0, h = 0, fmt = 0, slice = 0;
-    // Bytes between consecutive slices of a layered allocation, from the producer's own
-    // DB_DEPTH_SLICE. Deliberately NOT part of identity: two views of one allocation that disagree
-    // about the stride are a decode error, not two surfaces, and making it part of the key would
-    // silently split them into two images instead of surfacing that.
-    uint64_t slice_bytes = 0;
+    // NOTE: the layer stride is deliberately NOT here. It used to be, as a `slice_bytes` member
+    // excluded from operator== and from the hash -- which made this struct two things at once: an
+    // identity, and a carrier for a value that identity ignored. That is not a style objection, it
+    // is where a bug lived. The cache is keyed by this struct, so the key STORED in the map is the
+    // one from whichever attachment created the entry, and the invalidation loop iterates those
+    // stored keys. A producer that programmed DB_DEPTH_SLICE only after the entry existed therefore
+    // never reached the invalidation at all, and one that reprogrammed it was ignored in favour of
+    // the frozen first value -- silently, because an excluded field cannot cause a lookup to miss.
+    //
+    // The stride now lives in `ds_layer_stride_registry()`, keyed by the surface identity and
+    // refreshed on every attachment, so the invalidation always reads the latest observation.
     bool operator==(const PersistentDsKey& o) const {
         return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw && htile == o.htile &&
                w == o.w && h == o.h && fmt == o.fmt && slice == o.slice;
@@ -2516,48 +2522,146 @@ struct PersistentDsKey {
 // invalidations that need it. Publishing it here lets the invalidation become slice-exact from the
 // first cube sample onward; before that it falls back to whole-allocation behaviour, which is the
 // safe direction (over-invalidation costs a re-render, under-invalidation shows stale pixels).
-inline std::unordered_map<uint64_t, uint64_t>& ds_layer_stride_registry() {
-    static std::unordered_map<uint64_t, uint64_t> strides;
+// The IDENTITY of a layer-stride observation: (base, width, height), never `base` alone.
+//
+// A guest base is not a stable identity. The guest frees an allocation and maps another at the same
+// address, and an entry keyed by base alone then answers for a surface that no longer exists. That
+// is not bookkeeping pedantry: the stride sizes the range an invalidation covers, so a stride
+// carried across a reuse either leaves stale pixels resident (under-invalidation) or evicts a
+// neighbouring slice that was still good (over-invalidation). The previous version handled reuse by
+// taking whichever observation came LAST -- a heuristic in the place an identity belongs, which
+// cannot tell "the allocation was recycled" from "two live views disagree", and so reported the
+// first as loudly as the second while silently absorbing neither correctly.
+//
+// Both sides derive width/height from the same numbers. The consumer publishes the dimensions it
+// reads the surface with -- exactly the `tw`/`th` it passes to `read_persistent_ds_cube_depth` --
+// and the lookup asks with the attachment's own `key.w`/`key.h`. Format is deliberately NOT part of
+// the identity: the producer's DS format enum and a consumer T#'s format are different value
+// spaces, so including it would make every lookup miss and silently disable per-slice invalidation
+// rather than sharpen it. Width and height are enough to separate a recycled allocation from a
+// genuine disagreement, which is the whole job here.
+struct DsLayerStrideKey {
+    uint64_t base = 0;
+    uint32_t width = 0, height = 0;
+    bool operator==(const DsLayerStrideKey& o) const {
+        return base == o.base && width == o.width && height == o.height;
+    }
+};
+struct DsLayerStrideKeyHash {
+    size_t operator()(const DsLayerStrideKey& k) const {
+        size_t hash = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { hash ^= static_cast<size_t>(v); hash *= 1099511628211ull; };
+        mix(k.base); mix(k.width); mix(k.height);
+        return hash;
+    }
+};
+
+// One entry per identity, carrying BOTH authorities separately because they are separate claims that
+// can each be wrong on their own: the producer's own DB_DEPTH_SLICE, and the layer stride a consumer
+// descriptor carries. Keeping them apart is what lets the lookup state the precedence once, and lets
+// each report its own disagreement without the other's noise.
+struct DsLayerStrideEntry {
+    uint64_t consumer_stride = 0;
+    uint64_t producer_stride = 0;
+    bool consumer_conflict_reported = false;
+    bool producer_conflict_reported = false;
+};
+
+inline std::unordered_map<DsLayerStrideKey, DsLayerStrideEntry, DsLayerStrideKeyHash>&
+ds_layer_stride_registry() {
+    static std::unordered_map<DsLayerStrideKey, DsLayerStrideEntry, DsLayerStrideKeyHash> strides;
     return strides;
 }
 inline std::mutex& ds_layer_stride_mutex() {
     static std::mutex mutex;
     return mutex;
 }
-// Records a stride, and reports a DISAGREEMENT rather than silently taking the newer one: two views
-// of one allocation that differ about the stride mean a decode error somewhere, and quietly
-// overwriting would turn that into wrong invalidation ranges instead of a visible complaint.
-// A LATER observation replaces an earlier one. The registry is keyed by guest base and lives for the
-// process, so a base is not a stable identity: the guest frees an allocation and maps another at the
-// same address, and the entry then describes memory that no longer exists. Keeping the first value
-// made that stale stride permanent, and the consequence is not the safe direction -- the stride sizes
-// the range an invalidation covers, so a wrong one either leaves stale pixels resident
-// (under-invalidation) or evicts a neighbouring slice that was still good (over-invalidation).
-//
-// A stride observed NOW describes the allocation that exists now, which is the best available claim
-// about the surface being invalidated. The conflict is still reported once per base, because a
-// genuine disagreement between two live views is a decode error worth seeing; what changed is which
-// value survives it.
-inline void note_ds_layer_stride(uint64_t base, uint64_t stride) {
+
+// Records a stride learned from a CONSUMER descriptor. With a complete identity, allocation reuse no
+// longer collides here at all -- a new surface at a recycled base has its own entry. A disagreement
+// that survives the identity is therefore a genuine decode error, not reuse, and is reported once.
+// The later value is taken, but that choice is arbitrary between two claims we cannot adjudicate:
+// the REPORT is the mitigation, not the pick.
+inline void note_ds_layer_stride(uint64_t base, uint32_t width, uint32_t height, uint64_t stride) {
     if (!base || !stride) return;
+    const DsLayerStrideKey key{base, width, height};
     std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
-    auto [it, inserted] = ds_layer_stride_registry().try_emplace(base, stride);
-    if (!inserted && it->second != stride) {
-        static std::set<uint64_t> complained;
-        if (complained.insert(base).second)
+    DsLayerStrideEntry& entry = ds_layer_stride_registry()[key];
+    if (entry.consumer_stride && entry.consumer_stride != stride) {
+        if (!entry.consumer_conflict_reported) {
+            entry.consumer_conflict_reported = true;
             std::fprintf(stderr,
-                         "[ds-stride] base=0x%llx had %llu, now told %llu; taking the later value "
-                         "(a base is reused, so the newer observation describes the live surface)\n",
-                         (unsigned long long)base, (unsigned long long)it->second,
-                         (unsigned long long)stride);
-        it->second = stride;
+                         "[ds-stride] consumer disagreement at base=0x%llx %ux%u: had %llu, now told "
+                         "%llu; taking the later value (identity already separates allocation reuse, "
+                         "so this is a decode error)\n",
+                         (unsigned long long)base, width, height,
+                         (unsigned long long)entry.consumer_stride, (unsigned long long)stride);
+        }
     }
+    entry.consumer_stride = stride;
 }
-inline uint64_t ds_layer_stride_for(uint64_t base) {
-    if (!base) return 0;
+
+// Records the PRODUCER's own DB_DEPTH_SLICE-derived stride. Called on every attachment, which is the
+// point: the value it replaces was frozen on the cache key at entry creation, so a producer that
+// programmed or reprogrammed DB_DEPTH_SLICE later never reached the invalidation path.
+//
+// Cost: this is per grouped PASS, not per draw, and the zero check below returns before the lock --
+// so a title that never programs DB_DEPTH_SLICE (GTA V reads 0x00000000 on every depth surface in a
+// routed boot) pays two compares and never contends.
+//
+// A zero is "never programmed", not "a stride of zero", so it is dropped rather than recorded --
+// unknown must not erase known. A disagreement is reported once per identity: with a complete
+// identity this is not allocation reuse, so it is either a genuine reprogramming or a decode error,
+// and the newer value describes the attachment in front of us either way.
+inline void note_ds_producer_slice_bytes(uint64_t base, uint32_t width, uint32_t height,
+                                         uint64_t slice_bytes) {
+    if (!base || !slice_bytes) return;
+    const DsLayerStrideKey key{base, width, height};
     std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
-    const auto found = ds_layer_stride_registry().find(base);
-    return found == ds_layer_stride_registry().end() ? 0 : found->second;
+    DsLayerStrideEntry& entry = ds_layer_stride_registry()[key];
+    if (entry.producer_stride && entry.producer_stride != slice_bytes) {
+        if (!entry.producer_conflict_reported) {
+            entry.producer_conflict_reported = true;
+            std::fprintf(stderr,
+                         "[ds-stride] producer disagreement at base=0x%llx %ux%u: DB_DEPTH_SLICE gave "
+                         "%llu, now gives %llu for the same surface identity\n",
+                         (unsigned long long)base, width, height,
+                         (unsigned long long)entry.producer_stride,
+                         (unsigned long long)slice_bytes);
+        }
+    }
+    entry.producer_stride = slice_bytes;
+}
+
+// Which of a DS surface's two depth bases identifies it in the stride registry. Both the recorder
+// and the lookup MUST use this one expression: a surface that is written but never read has
+// depth_read_base == 0, so a recorder keyed on the read base and a lookup keyed on the write base
+// would never meet, and per-slice invalidation would silently never engage for exactly those
+// surfaces. That divergence cannot be spotted by reading either site alone, which is why it is a
+// function and not a convention.
+inline uint64_t ds_stride_identity_base(uint64_t depth_read_base, uint64_t depth_write_base) {
+    return depth_read_base ? depth_read_base : depth_write_base;
+}
+
+// The layer stride for a surface identity, or 0 when neither authority has published one -- which
+// callers must read as "unknown" and fall back to whole-allocation behaviour, never as a stride of
+// zero. A guessed stride would silently retain faces a real write had invalidated, which is the one
+// error direction that shows as stale pixels rather than as a missing surface.
+//
+// PRECEDENCE, stated once here rather than at the call site: the producer's own DB_DEPTH_SLICE
+// first, then a stride learned from a consumer descriptor. The producer's register is the surface's
+// own declaration of its layout; a consumer's layer_stride is exact too but arrives with a SAMPLE,
+// which is after the invalidation that needs it. GTA V only ever reaches the second -- it never
+// programs DB_DEPTH_SLICE, reading 0x00000000 on every depth surface in a routed boot, including the
+// six-layer cubes.
+inline uint64_t ds_layer_stride_for(uint64_t base, uint32_t width, uint32_t height) {
+    if (!base) return 0;
+    const DsLayerStrideKey key{base, width, height};
+    std::lock_guard<std::mutex> lock(ds_layer_stride_mutex());
+    const auto found = ds_layer_stride_registry().find(key);
+    if (found == ds_layer_stride_registry().end()) return 0;
+    return found->second.producer_stride ? found->second.producer_stride
+                                         : found->second.consumer_stride;
 }
 
 inline uint64_t ds_slice_bytes_from_db_depth_slice(uint32_t db_depth_slice) {
@@ -2654,13 +2758,21 @@ inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelin
                                              uint64_t htile, uint32_t width, uint32_t height,
                                              uint32_t format) {
     const uint64_t slice_bytes = ds_slice_bytes_from_db_depth_slice(ps.db_depth_slice);
+    // Publish the producer's stride on EVERY attachment, not once when the cache entry is created.
+    // This is what makes a later or reprogrammed DB_DEPTH_SLICE reach the invalidation path; storing
+    // it on the key froze it at entry creation (see PersistentDsKey).
+    note_ds_producer_slice_bytes(ds_stride_identity_base(ps.depth_read_base, ps.depth_write_base),
+                                 width, height, slice_bytes);
     if (getenv("PROSPER_DS_SLICE_CENSUS")) {
         static std::mutex mutex;
-        static std::set<std::tuple<uint64_t, uint32_t, uint64_t>> seen;
+        // (base, width, HEIGHT, slice_bytes) -- height was missing, so two surfaces sharing a base
+        // and width but differing in height collapsed to one census line and the second never
+        // printed. A census that silently under-reports is the instrument lying about the subject.
+        static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint64_t>> seen;
         bool first = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            first = seen.emplace(ps.depth_read_base, width, slice_bytes).second;
+            first = seen.emplace(ps.depth_read_base, width, height, slice_bytes).second;
         }
         if (first)
             fprintf(stderr,
@@ -2671,7 +2783,7 @@ inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelin
                     (unsigned long long)(static_cast<uint64_t>(width) * height * 4ull));
     }
     return {ps.depth_read_base, ps.depth_write_base, ps.stencil_read_base, ps.stencil_write_base,
-            htile, width, height, format, ds_depth_view_slice_start(ps.db_depth_view), slice_bytes};
+            htile, width, height, format, ds_depth_view_slice_start(ps.db_depth_view)};
 }
 
 inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
@@ -2895,14 +3007,13 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         // was attributed to face 0. GTA V's cube shadows lost faces this way faster than they were
         // re-rendered, leaving one or two of six resident whenever the cube was sampled.
         //
-        // The offset needs the layer stride. Where the producer never programmed DB_DEPTH_SLICE the
-        // stride is unknown, and the honest fallback is the old whole-allocation behaviour: a
-        // guessed stride would silently retain faces a real write had invalidated, which is the one
-        // error direction that shows up as stale pixels rather than as a missing surface.
-        // Producer register first, then a stride learned from a consumer descriptor, then the old
-        // whole-allocation behaviour. GTA V only ever reaches the second.
-        const uint64_t learned = key.slice_bytes ? key.slice_bytes
-                                                 : ds_layer_stride_for(key.dr ? key.dr : key.dw);
+        // The offset needs the layer stride, which the registry answers for this surface identity --
+        // producer register first, then a consumer descriptor, then 0 for "unknown" and the old
+        // whole-allocation behaviour. Reading it here rather than off `key` is what keeps it fresh:
+        // the keys iterated by this loop are the ones stored at entry creation, so a stride carried
+        // on the key was whatever the FIRST attachment saw, forever.
+        const uint64_t learned =
+            ds_layer_stride_for(ds_stride_identity_base(key.dr, key.dw), key.w, key.h);
         const uint64_t slice_offset = learned ? static_cast<uint64_t>(key.slice) * learned : 0;
         const uint64_t slice_depth_bytes = learned ? learned : depth_size;
         const bool depth_overlap =
