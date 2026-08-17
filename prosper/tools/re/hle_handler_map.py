@@ -330,6 +330,10 @@ class Wrapper:
         self.api, self.fwd_args = api, fwd_args
         self.file, self.line, self.body_span = file, line, body_span
         self.scope = (body_span[1], 1 << 62)      # where calls to it expand; narrowed by #undef
+        # The exact span of the forwarded registration call inside this wrapper. Only THAT is the
+        # wrapper's template; skipping the whole body would also swallow any second, non-forwarded
+        # registration written beside it, which would vanish with nothing in the residual.
+        self.fwd_span = body_span
 
     def signature(self):
         return (self.name, tuple(self.params), self.api, tuple(a.strip() for a in self.fwd_args))
@@ -374,16 +378,16 @@ def _matching_brace(text, open_idx):
 
 
 def _forwards_to(bodytxt, targets):
-    """(target name, forwarded argument expressions) for the first call in `bodytxt` to any of
-    `targets`, or None. `targets` maps a callee name to the expected parameter count (None = any)."""
+    """(target name, forwarded args, span of the call within `bodytxt`) for the first call in
+    `bodytxt` to any of `targets`, or None. `targets` maps a callee name to its parameter count."""
     for m in re.finditer(r"\b(?:Hle\s*::\s*)?(\w+)\s*\(", bodytxt):
         name = m.group(1)
         if name not in targets:
             continue
-        args, _ = split_args(bodytxt, m.end() - 1)
+        args, end = split_args(bodytxt, m.end() - 1)
         if args is None:
             continue
-        return name, args
+        return name, args, (m.start(), end)
     return None
 
 
@@ -414,7 +418,7 @@ def discover_wrappers(text, apis, path):
         for m in re.finditer(r"#\s*define\s+(\w+)\s*\(([^)]*)\)[ \t]*(.*(?:\\\n.*)*)", text):
             params = [p.strip() for p in m.group(2).split(",") if p.strip()]
             cands.append((m.group(1), "macro", params, m.group(3).replace("\\\n", " "),
-                          (m.start(), m.start() + len(m.group(0))), m.start()))
+                          (m.start(), m.start() + len(m.group(0))), m.start(), m.start(3)))
         # --- `auto NAME = [](params) { ... };`
         for m in re.finditer(r"\bauto\s+(\w+)\s*=\s*\[[^\]]*\]\s*\(([^)]*)\)[^{;]*\{", text):
             close = _matching_brace(text, m.end() - 1)
@@ -423,7 +427,7 @@ def discover_wrappers(text, apis, path):
             params = [re.sub(r".*?(\w+)$", r"\1", p.strip())
                       for p in m.group(2).split(",") if p.strip()]
             cands.append((m.group(1), "lambda", params, text[m.end() - 1:close + 1],
-                          (m.start(), close + 1), m.start()))
+                          (m.start(), close + 1), m.start(), m.end() - 1))
         # --- free functions `<ret> NAME(<typed params>) { ... }`
         for m in re.finditer(r"\b(\w+)\s*\(([^;{)]*)\)\s*\{", text):
             if m.group(1) in C_KEYWORDS or not m.group(2).strip():
@@ -440,19 +444,19 @@ def discover_wrappers(text, apis, path):
             if not params:
                 continue
             cands.append((m.group(1), "function", params, text[m.end() - 1:close + 1],
-                          (m.start(), close + 1), m.start()))
+                          (m.start(), close + 1), m.start(), m.end() - 1))
 
         # Dedupe by SPAN, not by name. One file legitimately re-`#define`s `R` after `#undef`-ing it
         # — `hle_kernel_mem.cpp` does exactly that, once per `#if` arm — and a name-keyed skip drops
         # the second block's wrapper, silently losing every registration it makes.
         known_spans = {w.body_span for w in found}
-        for name, kind, params, bodytxt, span, startpos in cands:
+        for name, kind, params, bodytxt, span, startpos, body_off in cands:
             if span in known_spans:
                 continue
             fwd = _forwards_to(bodytxt, targets)
             if fwd is None:
                 continue
-            callee, args = fwd
+            callee, args, fwd_span = fwd
             if len(args) < 1:
                 continue
             # The discriminator: the NID slot must be built from one of this candidate's own
@@ -460,6 +464,7 @@ def discover_wrappers(text, apis, path):
             if not any(re.search(r"\b%s\b" % re.escape(p), args[0]) for p in params):
                 continue
             w = Wrapper(name, kind, params, callee, args, path, line_of(text, startpos), span)
+            w.fwd_span = (body_off + fwd_span[0], body_off + fwd_span[1])
             if kind == "macro":
                 u = re.search(r"#\s*undef\s+%s\b" % re.escape(name), text[span[1]:])
                 if u:
@@ -593,11 +598,33 @@ def scan_tree(src_hle, platform):
                                      "(also at line %d)" % (w.name, clash.line), w.name))
         wrappers = kept
         sc.wrappers += wrappers
-        by_name = {w.name: w for w in wrappers}
-        wrapper_spans = [w.body_span for w in wrappers]
+        # Two different spans, and conflating them loses registrations either way:
+        #   def_spans  — the whole `#define` / lambda / function definition. A wrapper NAME match
+        #                inside one of these is the definition, not a call to it.
+        #   fwd_spans  — ONLY the forwarded registration call. A registration API match inside one
+        #                of these is the wrapper's template. Anything else in the same body is an
+        #                ordinary registration site and must still be counted.
+        def_spans = [w.body_span for w in wrappers]
+        fwd_spans = [w.fwd_span for w in wrappers]
+        by_name = {}
+        for w in wrappers:
+            by_name.setdefault(w.name, []).append(w)
 
-        def in_wrapper_body(idx):
-            return any(a <= idx < b for a, b in wrapper_spans)
+        def in_definition(idx):
+            return any(a <= idx < b for a, b in def_spans)
+
+        def is_wrapper_template(idx):
+            return any(a <= idx < b for a, b in fwd_spans)
+
+        def wrapper_named(name, at):
+            """The wrapper `name` that is in scope AT a call site — one file may define the same
+            macro twice with disjoint `#define`..`#undef` spans, and picking the wrong one would
+            expand a call through the wrong body."""
+            cands = by_name.get(name) or []
+            for w in cands:
+                if w.scope[0] <= at < w.scope[1]:
+                    return w
+            return cands[0] if len(cands) == 1 else None
 
         # ---- direct `Hle::register_*(...)` calls
         for m in re.finditer(r"\bHle\s*::\s*(register_\w+)\s*\(", text):
@@ -606,7 +633,7 @@ def scan_tree(src_hle, platform):
                 sc.unclaimed.append((fn, line_of(text, m.start()), "unknown registration API",
                                      "Hle::%s" % api))
                 continue
-            if in_wrapper_body(m.start()):
+            if is_wrapper_template(m.start()):
                 continue                                # this is a wrapper's template, not a site
             args, end = split_args(text, m.end() - 1)
             if args is None:
@@ -621,7 +648,7 @@ def scan_tree(src_hle, platform):
         # ---- calls through a discovered wrapper, inside that wrapper's own scope
         for w in wrappers:
             for m in re.finditer(r"\b%s\s*\(" % re.escape(w.name), text):
-                if in_wrapper_body(m.start()):
+                if in_definition(m.start()):
                     continue                            # the #define / lambda itself
                 actuals, end = split_args(text, m.end() - 1)
                 ln = line_of(text, m.start())
@@ -646,7 +673,7 @@ def scan_tree(src_hle, platform):
                         break
                     if cur.api in sc.apis:
                         break
-                    nxt = by_name.get(cur.api)
+                    nxt = wrapper_named(cur.api, m.start())
                     if nxt is None:
                         failure = "forwards to '%s', which is neither an API nor a wrapper" % cur.api
                         break
@@ -665,7 +692,7 @@ def scan_tree(src_hle, platform):
                 before = text[max(0, m.start() - 12):m.start()]
                 if "::" in before or "static" in before:
                     continue
-                if in_wrapper_body(m.start()):
+                if in_definition(m.start()) or is_wrapper_template(m.start()):
                     continue
                 sc.unclaimed.append((fn, line_of(text, m.start()),
                                      "unqualified registration call", api))

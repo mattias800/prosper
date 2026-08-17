@@ -331,6 +331,43 @@ void register_demo_hle() {
 """
 
 
+EXTRA_IN_WRAPPER = r"""
+namespace prosper {
+uint64_t h_a(uint64_t) { return 0; }
+uint64_t h_b(uint64_t) { return 0; }
+// A forwarder that ALSO makes one fixed registration of its own. Only the forwarded call is the
+// wrapper's template; the fixed one beside it is an ordinary registration site.
+static void reg_and_seed(const char* nid, HleFn fn, const char* name) {
+    Hle::register_fn(nid, fn, name);
+    Hle::register_fn("ZZZZZZZZZZZ", (HleFn)h_b, "sceDemoSeed");
+}
+void register_demo_hle() {
+    reg_and_seed("AAAAAAAAAAA", (HleFn)h_a, "sceDemoAlpha");
+    reg_and_seed("BBBBBBBBBBB", (HleFn)h_a, "sceDemoBeta");
+}
+}
+"""
+
+
+def test_registration_beside_a_forward_is_not_swallowed():
+    """A second registration inside a wrapper body must still be counted.
+
+    Skipping a wrapper's WHOLE body as "the template" also discards any fixed registration written
+    beside the forwarded one — and it vanishes with nothing in the residual, because a mention
+    inside a wrapper body is exactly what the residual is told to ignore. Only the forwarded call's
+    own span is the template.
+    """
+    print("a fixed registration beside a forward is still counted:")
+    sc = scan_fixture({"demo.cpp": EXTRA_IN_WRAPPER})
+    check("no unclaimed", sc.unclaimed, [])
+    check("the forwarder is discovered",
+          {w.name for w in sc.wrappers}, {"reg_and_seed"})
+    check("h_a serves the two forwarded NIDs", serves(sc).get("h_a"), 2)
+    check("the fixed registration beside it survives", serves(sc).get("h_b"), 1)
+    check("and it is the right NID",
+          {r.nid for r in sc.regs if r.handler == "h_b"}, {"ZZZZZZZZZZZ"})
+
+
 def test_shapes_are_discovered():
     """A registration API, a chained macro and a free-function forwarder that nobody hardcoded.
 
@@ -437,6 +474,7 @@ def main():
     test_distinct_names_not_sites()
     test_platform_arms()
     test_undef_scope()
+    test_registration_beside_a_forward_is_not_swallowed()
     test_shapes_are_discovered()
     test_unparsable_shape_is_reported()
     test_empty_tree_refuses()
