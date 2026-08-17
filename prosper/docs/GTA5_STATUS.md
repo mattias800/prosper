@@ -3389,17 +3389,20 @@ question, not a GPU one. It shares the frontier with one unfinished measurement:
 the failing compute kernels that no instrument has resolved (see the section below for exactly which,
 and why their null does not count yet).
 
-### The composite's tap is renderer-owned, written by ONE draw, and never invalidated (2026-08-17)
+### The composite's tap is renderer-owned, bound by ONE observed draw, and never refreshed (2026-08-17)
 
 Three measurements on the same routed boot, each with its denominator, narrow the tap
 `0x2063380000` (`Float10_11_11`, 4K) to a single remaining question.
 
-**One draw ever binds it as a colour target.** `PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled,
-all eight MRT slots, no dimension filter — reports `draws=1` at every power-of-two checkpoint from
-4,096 through **262,144**. One draw, slot 0, and the count never grows.
+**One observed draw BINDS it as a colour target — binding is not writing.**
+`PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled, all eight MRT slots, no dimension filter —
+reports `draws=1` at every power-of-two checkpoint from 4,096 through **262,144**. One draw, slot 0, and
+the count never grows. Whether that draw wrote useful pixels is **not** established here — the open
+question below is exactly that, and "bound by one draw" and "written by one draw" are different claims.
 
-**No guest write ever touches it.** The new `PROSPER_RTT_INVALIDATE_WATCH` reports **131,072 queued
-guest writes examined, 0 touching either the tap or the f16 source `0x20471e0000`.** The snapshot is
+**No OBSERVED queued write touches it.** The new `PROSPER_RTT_INVALIDATE_WATCH` reports **131,072
+queued guest writes examined, 0 touching either the tap or the f16 source `0x20471e0000`.** That counts
+writes reaching `notify_guest_gpu_write`, so it is a statement about notified writes, not about the guest. The snapshot is
 therefore never invalidated by a guest write — and this is a measurement rather than a silence, because
 the instrument prints its own denominator. It also reports that `0x2063380000` is at some drains **not
 in the RTT cache at all**, which is a different state from "cached and never refreshed" and is stated
@@ -3408,7 +3411,8 @@ separately so the two are not conflated.
 **It is served from the renderer's own snapshot.** Every one of its 11 `PROSPER_RTT_GUESTPEEK` samples
 resolves `HIT-CPU`.
 
-So the composite reads a renderer-owned snapshot that one draw established and nothing ever refreshes.
+So the composite reads a renderer-owned snapshot associated with one observed binding draw, which no
+observed notified write ever refreshes.
 **The remaining question is what that single draw does** — whether it is the intended producer rendering
 nothing (culled, zero-area, colour writes masked, shader rejected), or merely an initial clear whose
 per-frame counterpart is absent. That is one draw out of 262,144, which is a small enough target to
@@ -3437,9 +3441,15 @@ distinguishes them because it prints each sampled surface's FORMAT:
 
 `0x204da00000` is a different address AND a different format from the tap. `0x2042f49a00` reads main
 depth and stencil and writes two **Float32** images — a depth-derived pass, not the f16 → f11f11f10
-conversion the composite is missing. **So the compute source-authority work does not lead to the
-composite's missing input.** It is worth having on its own terms (it closed real paths that read
-compressed bytes as plain texels, in both backends), but it is not the route to the world.
+conversion the composite is missing. **So this failing kernel is not the DIRECT producer of the tap, nor
+of the f16 → f11f11f10 conversion.** That is exactly what the format mismatch establishes and no more:
+it does not rule out compute as an *upstream* input to the one graphics draw that binds the tap, so
+"the compute path is not the route" would overstate it.
+
+The source-authority work is worth having on its own terms — it **defines** the decision that must be
+made before compressed bytes are read as plain texels. But note what is not yet true: **neither runtime
+consumer is wired.** The compute adapter is parked and the graphics adapter is unwritten, so the policy
+exists and no path is closed by it yet.
 
 **And the tap resolves `HIT-CPU` on every sample**, which changes the question entirely. The composite
 does not read empty *guest* memory — the renderer owns that surface and serves its own CPU snapshot. So

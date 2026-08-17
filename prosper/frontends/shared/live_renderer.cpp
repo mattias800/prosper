@@ -2,6 +2,8 @@
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
 #include "hle/dispatch.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
+#include "gpu/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
+#include "gpu/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "rtt_authority.hpp"
 #include "rtt_injection.hpp"
 #include "rtt_scale.hpp"
@@ -231,12 +233,14 @@ std::vector<uint64_t> parse_rtt_invalidate_watch_addrs() {
     std::vector<uint64_t> addrs;
     const char* spec = getenv("PROSPER_RTT_INVALIDATE_WATCH");
     if (!spec || !*spec) return addrs;
-    for (const char* p = spec; *p;) {
-        char* end = nullptr;
-        const uint64_t v = strtoull(p, &end, 0);
-        if (end == p) break;
-        addrs.push_back(v);
-        p = (*end == ',') ? end + 1 : end;
+    // Strict: an explicit 0x prefix, full consumption, no overflow, no zero address. A rejected spec
+    // arms NOTHING and says so, rather than watching a decimal-parsed address and reporting success.
+    if (!prosper::gpu::parse_hex_watch_list(spec, addrs)) {
+        fprintf(stderr,
+                "[rtt-inval] ignoring malformed PROSPER_RTT_INVALIDATE_WATCH=\"%s\" "
+                "(expected 0x-prefixed hex addresses, comma separated) -- NOT armed\n", spec);
+        addrs.clear();
+        return addrs;
     }
     fprintf(stderr, "[rtt-inval] watching %zu address(es)\n", addrs.size());
     return addrs;
@@ -265,6 +269,7 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
     auto& watch = rtt_invalidate_watch();
     if (!watch.addrs.empty()) {
         watch.writes_examined.fetch_add(1, std::memory_order_relaxed);
+        bool write_touched_a_watched_surface = false;
         for (const uint64_t wanted : watch.addrs) {
             const auto entry = cache.find(wanted);
             if (entry == cache.end()) {
@@ -288,7 +293,13 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
             const auto effect = prosper::frontend::live_rtt_guest_write_effect(
                 wanted, bytes, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, addr, size);
             if (effect == prosper::frontend::LiveRttGuestWriteEffect::none) continue;
-            watch.writes_hitting.fetch_add(1, std::memory_order_relaxed);
+            // Counted ONCE per queued write, not once per matching address: with several watched
+            // addresses a per-address counter can exceed writes_examined, which makes the ratio
+            // nonsense in exactly the summary line that exists to make a zero trustworthy.
+            if (!write_touched_a_watched_surface) {
+                write_touched_a_watched_surface = true;
+                watch.writes_hitting.fetch_add(1, std::memory_order_relaxed);
+            }
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 64)
                 fprintf(stderr,
@@ -1133,31 +1144,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // The compute backend must not sample a surface whose CURRENT pixels live in this renderer's
     // RTT cache (raw guest memory is then empty/stale — the Dead Cells 642x362 lesson): publish the
     // exact-match identity and immutable CPU snapshot used by live compute (#590).
-    // Establish WHICH kind of compression metadata an address is, by correlation with retained state.
-    // The descriptor cannot say: WORD6[21] is set for depth and colour alike and shares one metadata
-    // address field, and a Float32x1 view is not necessarily depth. Only the renderer holds the retained
-    // depth surfaces, so the correlation lives here.
+    // Establish WHICH kind of compression metadata an address is. The decision is a pure function over
+    // retained state (metadata_kind_correlation.hpp); this lambda only GATHERS that state, so the rule
+    // itself is mutation-testable at the site that ships rather than through this registration.
+    //
+    // Both answers are positive correlations over metadata AND resource identity. An earlier version
+    // answered DCC by elimination -- "not Float32x1, therefore colour" -- which classified an
+    // uncorrelated Uint32x1 raw alias as DCC and let its all-0xff bytes authorize reading the base.
     prosper::gpu::set_metadata_kind_query(
         [](const prosper::gpu::MetadataKindRequest& request) {
-            // HTILE is POSITIVELY identified: some retained depth/stencil surface names this exact
-            // address as its HTILE base. That is the evidence the review asked for, rather than
-            // inferring depth from the T# format.
+            std::vector<prosper::gpu::RetainedDepthCorrelation> depth;
             for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
                 (void)image;
-                if (key.htile && key.htile == request.metadata_addr)
-                    return prosper::gpu::CompressionMetadataKind::Htile;
+                depth.push_back({key.dr, key.dw, key.sr, key.sw, key.htile});
             }
-            // No HTILE correlation. A DEPTH-SHAPED view then stays Unknown rather than being assumed to
-            // be colour DCC: single-component Float32 is exactly the shape whose metadata was previously
-            // read with colour-DCC sizing, and guessing here is how that happened. Unknown authorizes
-            // nothing, so this is a safe answer rather than a missing one.
-            const bool depth_shaped = request.format == prosper::gpu::DataFormat::Float32 &&
-                                      (request.num_components ? request.num_components : 1u) == 1u;
-            if (depth_shaped) return prosper::gpu::CompressionMetadataKind::Unknown;
-            // An ordinary multi-component colour view with compression declared is DCC by elimination:
-            // the depth registry did not claim it, and colour is the only other kind GFX10 puts in this
-            // field.
-            return prosper::gpu::CompressionMetadataKind::Dcc;
+            std::vector<prosper::gpu::RetainedColorCorrelation> color;
+            for (const auto& [addr, surface] : g_rtt)
+                color.push_back({addr, surface.dcc_metadata_addr});
+            return prosper::gpu::correlate_compression_metadata_kind(request, depth, color);
         });
 
     prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
