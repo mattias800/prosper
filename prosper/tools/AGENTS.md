@@ -265,6 +265,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   for slow software rendering,
   and the pixel-distinct/pixel-stale assertions when visible progression matters. Source publication
   counts alone do not prove that the image changed; see `screenshot/README.md`.
+  A run whose **primary guest thread dies** now reports `guest=faulted status=GUEST-FAULT` and exits
+  non-zero instead of `status=ok` (#2007), and the manifest summary carries `guest_state` and the
+  fault address. Pass `--allow-guest-fault` only when the route deliberately samples a crashing
+  title; it yields `status=GUEST-FAULT-ALLOWED`, never `ok`.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query.
 - **`guest_bt/`** — symbolicated **guest**-thread backtraces for a live or frozen prosper process:
