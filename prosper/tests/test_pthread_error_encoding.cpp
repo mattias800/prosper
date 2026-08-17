@@ -328,9 +328,10 @@ int main() {
     // fbsd_errno mapping and the alias therefore land together, as #2189 did for k_mutexattr_init.
     //
     // The C11 layer is what makes the pairing concrete rather than merely symmetric: in the shipped
-    // guest libc.prx (PPSA24651), `_Tss_create`, `_Tss_delete` and `_Tss_set` are three-instruction
-    // tail-call forwarders onto scePthreadKeyCreate / KeyDelete / Setspecific (resolved through the
-    // PLT relocations, NIDs geDaqgH9lTg / PrdHuuDekhY / +BzXYkqYeLE). KeyCreate already encoded, so
+    // guest libc.prx (PPSA24651), `_Tss_create`, `_Tss_delete` and `_Tss_set` are 11-byte,
+    // five-instruction forwarders onto scePthreadKeyCreate / KeyDelete / Setspecific --
+    // `push rbp; mov rbp,rsp; call <plt>; pop rbp; ret`, returning eax unexamined (resolved through
+    // the PLT relocations, NIDs geDaqgH9lTg / PrdHuuDekhY / +BzXYkqYeLE). KeyCreate already encoded, so
     // one C11 family forwarded an encoded value from one member and a bare errno from the other two.
     // CONFIDENCE: MED on the encoded form itself — the forwarders do not COMPARE, so no guest has
     // been observed testing an encoded result from any of the three.
@@ -426,12 +427,19 @@ int main() {
                     mtx_unlock(m, 0, 0, 0, 0, 0);
                 });
                 const uint64_t rc = wait_fn(c, m, 0, 0, 0, 0);
+                // Release BEFORE joining, and the order is load-bearing rather than stylistic. The
+                // wait returns holding the mutex. On a SPURIOUS wake it can re-acquire before the
+                // signaller's blocked lock is ever granted, so joining first would strand the
+                // signaller inside mtx_lock while this thread holds the mutex it is waiting for --
+                // the test would HANG rather than fail. Under ctest that burns the timeout and
+                // reports as an infrastructure problem, so a real regression would be attributed to
+                // machine load instead of to this assertion.
+                CHECK(mtx_unlock(m, 0, 0, 0, 0, 0) == 0,
+                      "control: the wait reacquired the mutex before returning");
                 signaller.join();
                 CHECK(rc == 0, arm == 0
                           ? "scePthreadCondWait reports 0 for a wait that was really signalled"
                           : "pthread_cond_wait reports 0 for a wait that was really signalled");
-                CHECK(mtx_unlock(m, 0, 0, 0, 0, 0) == 0,
-                      "control: the wait reacquired the mutex before returning");
             }
             cond_del(c, 0, 0, 0, 0, 0);
             mtx_del(m, 0, 0, 0, 0, 0);

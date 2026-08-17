@@ -1832,13 +1832,45 @@ HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam*
     return 0;
 }
 
-// DELIBERATELY NOT ALIASED, and this is a recorded decision rather than an omission (#2178, #2365).
+// DELIBERATELY NOT ALIASED — a DEFERRED decision (#2595), not an evidentially settled one. The
+// distinction is the whole point of this block: an earlier draft of it claimed "nothing observed can
+// settle it" and cited `0x5fac7c3` for the claim, which is not a Getname address at all — it is the
+// `lea rsi` inside the *Rename* caller, quoted 950 lines below above SCE_PTHREAD_ALIAS(
+// k_sce_pthread_rename). Anyone opening it would have landed in the wrong listing and drawn the
+// opposite conclusion. Caught in review of #2573.
+//
 // `scePthreadGetname` is dual-registered with `pthread_getname_np` and IS fallible, so the family
-// rule would sweep it — but the only guest call site found (PPSA17942 `0x5fac7c3`) does `test eax,
-// eax`, where 3 and 0x80020003 are indistinguishable, so nothing observed can settle it. Its Set
-// counterpart WAS swept in #2382 because a caller there does discriminate. #1983 re-examined this
-// and found no new evidence either way, so the bare form stands until a caller that branches on the
-// value turns up; `tests/test_pthread_names.cpp` pins it with the same reasoning.
+// rule that swept the rest of #2178 would take it. Re-derived from PPSA17942 for #2573 rather than
+// inherited: How7B8Oet6k -> JMPREL[1984] -> GOT 0x94909f0 -> PLT thunk 0x669b580, whose single
+// caller is the function at 0x5fac7e0:
+//
+//   5fac7e7:  call   0x669b580              ; scePthreadGetname
+//   5fac7ec:  test   eax,eax
+//   5fac7ee:  je     0x5fac802              ; success early-out
+//   5fac7f0:  movsxd rdx,eax
+//   5fac7f3:  lea    rsi,[rip+0x223d9d1]    ; "…Failed in scePthreadGetname(), 0x%08x"
+//   5fac7fd:  jmp    0x5fa9670              ; shared log helper
+//
+// WHAT THIS DOES NOT ESTABLISH, and the trap is live because the listing looks like evidence: `%08x`
+// ZERO-PADS, so a bare 3 prints as 0x00000003 and an encoded one as 0x80020003 — both render, and
+// the `test eax,eax` is nonzero in either space. That exact reading was made once, about the Rename
+// caller, and FALSIFIED in review; the correction is recorded in the Rename block below. Do not
+// re-derive it as support for encoding. Rename was swept on the FAMILY RULE at CONFIDENCE: MED, not
+// on its call site, and any sweep of Getname stands on identical footing.
+//
+// WHAT IT DOES ESTABLISH is narrower and cuts the other way from the older rationale: this caller is
+// a byte-for-byte structural twin of the Rename caller 0x30 bytes above it — same prologue, same
+// test/je, same movsxd, same tail-jump into the same helper, same format specifier. So #2365's
+// reason for holding Getname back ("its contract is different: lookup failures on a call whose
+// success path writes through a buffer") is NOT VISIBLE at the only call site anyone has found. That
+// is not proof the contracts match; it is the removal of the one asymmetry that was cited for them
+// differing.
+//
+// So the bare form here is the older default surviving, at CONFIDENCE: MED — not a measurement, and
+// not "unsettleable". It is not swept in #2573 because doing so moves `tests/test_pthread_names.cpp`'s
+// `== 3` / `== 14` pins, and editing a passing test so it agrees with a change is exactly what #2365
+// declined to do; that edit needs a reviewer looking at it as the primary artefact. #2595 carries it,
+// with the disassembly above and what would actually settle it.
 HLE(k_pthread_getname) {
     if (!a0) return 3;    // ESRCH
     if (!a1) return 14;   // EFAULT
@@ -2477,8 +2509,11 @@ HLE(k_key_delete)    {
     return fbsd_errno(result);
 }
 // The C11 layer makes this concrete: in the shipped guest libc.prx, `_Tss_create`, `_Tss_delete` and
-// `_Tss_set` are three-instruction forwarders onto scePthreadKeyCreate / KeyDelete / Setspecific
-// respectively (verified by PLT relocation for PPSA24651). KeyCreate already encoded via
+// `_Tss_set` are 11-byte, five-instruction forwarders onto scePthreadKeyCreate / KeyDelete /
+// Setspecific respectively -- `push rbp; mov rbp,rsp; call <plt>; pop rbp; ret`, so a CALL and a
+// RET rather than a tail-jump, returning eax unexamined (verified by PLT relocation for PPSA24651;
+// an earlier wording said "three-instruction tail-call", which was wrong on both counts and is
+// corrected here because the number was checkable). KeyCreate already encoded via
 // k_sce_key_create, so one C11 family was forwarding an encoded value from one member and a bare
 // errno from the other two -- the #1873 shape, inside a single guest header's worth of API.
 SCE_PTHREAD_ALIAS(k_sce_key_delete, k_key_delete)
