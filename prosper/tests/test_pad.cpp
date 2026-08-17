@@ -331,6 +331,78 @@ int main() {
         set_test_env("PROSPER_PAD_SCRIPT", "");
     }
 
+    // (6b) scePadGetHandle must be DETERMINISTIC when several open handles share one
+    // (userId, portType, index) triple (#1624). Nothing stops a guest from opening the same triple
+    // twice — prosper mints a fresh handle for every scePadOpen — and each of those handles matches
+    // the lookup equally. Resolving by iterating the handle map answered with whichever entry the
+    // container happened to reach first, and std::unordered_map leaves that order unspecified: it
+    // moves with insertion history, with rehashes, and with the standard-library version. A guest
+    // that closes the handle it was handed and keeps reading the other then loses input for the
+    // rest of the run, intermittently. The contract asserted here is the LOWEST matching handle —
+    // the oldest still-open pad for the triple, since scePadOpen mints from a monotonic counter.
+    //
+    // The arms are built so a "first match in iteration order" implementation cannot satisfy them
+    // by luck: 24 duplicates make one specific handle the answer out of 24 candidates, the query is
+    // repeated after enough unrelated opens to rehash the container several times, and again after
+    // the current answer is closed.
+    {
+        HleFn open       = Hle::lookup(nid_hash("scePadOpen"));
+        HleFn close      = Hle::lookup(nid_hash("scePadClose"));
+        HleFn get_handle = Hle::lookup(nid_hash("scePadGetHandle"));
+        constexpr uint64_t invalid_handle = 0xffffffff80920003ull;
+        CHECK(open && close && get_handle, "duplicate-triple arm: scePadOpen/Close/GetHandle found");
+        if (open && close && get_handle) {
+            constexpr int kDup = 24;
+            uint64_t dup[kDup];
+            for (int i = 0; i < kDup; ++i) dup[i] = open(7, 0, 3, 0, 0, 0);
+            uint64_t lowest = dup[0];
+            uint64_t highest = dup[0];
+            bool ascending = true;
+            bool all_distinct = true;
+            for (int i = 1; i < kDup; ++i) {
+                if (dup[i] < lowest)  lowest = dup[i];
+                if (dup[i] > highest) highest = dup[i];
+                ascending &= dup[i] > dup[i - 1];
+            }
+            for (int i = 0; i < kDup && all_distinct; ++i)
+                for (int j = i + 1; j < kDup; ++j)
+                    if (dup[i] == dup[j]) { all_distinct = false; break; }
+            // The ambiguity has to EXIST before any assertion about resolving it means anything: if
+            // a repeated triple handed back one shared handle there would be nothing to choose
+            // between and every arm below would pass vacuously.
+            CHECK(all_distinct && ascending && highest != lowest,
+                  "duplicate triple: 24 opens of (user 7, type 0, index 3) mint 24 distinct "
+                  "ascending handles, so 23 of the matches are NOT the lowest");
+
+            CHECK(get_handle(7, 0, 3, 0, 0, 0) == lowest,
+                  "scePadGetHandle names the LOWEST handle sharing a triple, not whichever the "
+                  "handle map iterates first");
+
+            // Unrelated opens grow the container past several rehash points — the exact event that
+            // reorders unordered_map iteration — so the same query must still answer the same way.
+            constexpr int kNoise = 96;
+            uint64_t noise[kNoise];
+            for (int i = 0; i < kNoise; ++i) noise[i] = open(100 + i, 0, 0, 0, 0, 0);
+            CHECK(get_handle(7, 0, 3, 0, 0, 0) == lowest,
+                  "the named handle does not move when unrelated opens rehash the handle map");
+
+            // Closing the named handle promotes the next-lowest still-open one: a guest that closes
+            // what it was handed must be given another live pad, never a retired handle.
+            uint64_t second = 0;
+            for (int i = 0; i < kDup; ++i)
+                if (dup[i] != lowest && (second == 0 || dup[i] < second)) second = dup[i];
+            CHECK(close(lowest, 0, 0, 0, 0, 0) == 0, "scePadClose retires the named duplicate");
+            CHECK(get_handle(7, 0, 3, 0, 0, 0) == second,
+                  "after the lowest duplicate is closed the next-lowest open handle is named");
+
+            for (int i = 0; i < kDup; ++i)
+                if (dup[i] != lowest) close(dup[i], 0, 0, 0, 0, 0);
+            for (int i = 0; i < kNoise; ++i) close(noise[i], 0, 0, 0, 0, 0);
+            CHECK(get_handle(7, 0, 3, 0, 0, 0) == invalid_handle,
+                  "closing every duplicate leaves the triple with no handle");
+        }
+    }
+
     // (7) PROSPER_PAD_SCRIPT pure helpers — parse + time-eval (drives menus headless, issue #163).
     {
         CHECK(pad_button_by_name("start")   == SCE_PAD_BUTTON_OPTIONS, "name: start -> OPTIONS");
