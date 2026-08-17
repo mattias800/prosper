@@ -489,6 +489,15 @@ int main(int argc, char** argv) {
     // which name table (if any) was read, and — when the answer is zero — WHY it is zero. A tool
     // that prints "nothing" when it means "I did not parse anything" is worse than one that
     // refuses, so an empty result here always names its own cause and exits 3.
+    //
+    // EVERY BYTE PRINTED BELOW MUST BE ASCII. This output is designed to be grepped, and stdout
+    // carries bytes, not text: a UTF-8 punctuation mark leaves this process as its UTF-8 bytes and
+    // is then decoded by whatever reads it. On Windows that is the console/locale code page
+    // (cp1252/cp437), so a single em dash renders as mojibake in cmd.exe AND makes a `grep` for the
+    // line the tool itself printed fail to match. Five em dashes shipped here and cost a red
+    // `Windows MinGW` CI job on exactly the one check that matched across one. Comments in this
+    // file may use whatever punctuation reads best; printed literals may not.
+    // test_import_slots.py asserts this property directly, on every message path.
     int slots_rc = 0;
     if (import_slots) {
         printf("\n[IMPORT SLOTS] file=%s\n", argv[1]);
@@ -504,7 +513,7 @@ int main(int argc, char** argv) {
             // and parse the ELF header as relocations — a silent wrong answer rather than a gap.
             if (!va) {
                 printf("[IMPORT SLOTS] %-6s absent (no %s)%s\n", label, tag,
-                       sz ? "  [but a size is declared for it — malformed dynamic table]" : "");
+                       sz ? "  [but a size is declared for it -- malformed dynamic table]" : "");
                 return;
             }
             int64_t fo = va2foff(va);
@@ -554,14 +563,14 @@ int main(int argc, char** argv) {
         if (!names_dir.empty()) {
             names = prosper_tools::load_stub_names(names_dir);
             if (!names.dir_ok)
-                printf("[IMPORT SLOTS] names: '%s' is not a readable directory%s — the name column "
+                printf("[IMPORT SLOTS] names: '%s' is not a readable directory%s -- the name column "
                        "will be '-'\n", names_dir.c_str(),
                        names_dir_explicit ? "" : " (from $PROSPER_PS5_LIBS)");
             else
                 printf("[IMPORT SLOTS] names: %s (%zu files, %zu pairs, %zu distinct NIDs)\n",
                        names_dir.c_str(), names.files, names.pairs, names.by_nid.size());
         } else {
-            printf("[IMPORT SLOTS] names: none — pass --names <PS5-3.20_Libs dir> or set "
+            printf("[IMPORT SLOTS] names: none -- pass --names <PS5-3.20_Libs dir> or set "
                    "$PROSPER_PS5_LIBS to fill the name column; the NID column is authoritative\n");
         }
         auto name_of = [&](const std::string& nid) -> const char* {
@@ -587,7 +596,7 @@ int main(int argc, char** argv) {
                 reloc_total == 0                   ? "the relocation tables are declared but empty" :
                                                      "no relocation of type 64/GLOB_DAT/JUMP_SLOT "
                                                      "references an imported symbol";
-            printf("[IMPORT SLOTS] 0 import slots — %s\n", why);
+            printf("[IMPORT SLOTS] 0 import slots -- %s\n", why);
             slots_rc = 3;
         } else {
             printf("#%-12s %-11s  %-32s %-40s %s\n", "slot", "NID", "library", "name", "reloc");
@@ -609,7 +618,7 @@ int main(int argc, char** argv) {
         // An import with no relocation slot is listed rather than omitted: a `grep <name>` that
         // returns nothing must mean "this module does not import it", never "it has no slot".
         if (n_import > with_slot.size()) {
-            printf("[IMPORTS WITHOUT A SLOT] (%zu — imported but no address relocation targets "
+            printf("[IMPORTS WITHOUT A SLOT] (%zu -- imported but no address relocation targets "
                    "them in this module)\n", n_import - with_slot.size());
             for (size_t i = 0; i < symbol_recs.size(); i++) {
                 const auto& s = symbol_recs[i];

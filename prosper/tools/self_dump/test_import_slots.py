@@ -152,15 +152,25 @@ def build_fixture(*, jmprel=True, rela_table=True, unmapped_jmprel=False,
     return bytes(buf)
 
 
+ALL_OUTPUT = []   # every stdout this test has seen, for the ASCII invariant below
+
+
 def run(binary: str, blob: bytes, extra=(), names_dir=None):
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "fixture.elf"
-        path.write_bytes(blob)
+        path.write_bytes(blob)          # binary mode: the fixture must reach the tool byte-exact
         cmd = [binary, str(path), "--import-slots"] + list(extra)
         if names_dir:
             cmd += ["--names", names_dir]
-        done = subprocess.run(cmd, capture_output=True, text=True)
-        return done.returncode, done.stdout
+        # Decode explicitly, NOT with text=True. text=True uses
+        # locale.getpreferredencoding(), which is UTF-8 on Linux and cp1252 on Windows — so the
+        # same bytes would compare differently per platform and a Linux-green run could not see
+        # it. errors="replace" keeps a mis-decode visible (U+FFFD is non-ASCII, so the invariant
+        # check below fails) rather than raising something that reads as a crash.
+        done = subprocess.run(cmd, capture_output=True)
+        out = done.stdout.decode("utf-8", errors="replace")
+        ALL_OUTPUT.append((" ".join(cmd[1:]), out))
+        return done.returncode, out
 
 
 def slot_rows(out: str):
@@ -226,9 +236,13 @@ def main() -> int:
 
     # --- Case 6: no relocation tables at all --------------------------------------------------
     code, out = run(binary, build_fixture(jmprel=False, rela_table=False))
-    check("a module with no relocation tables says so explicitly",
-          "0 import slots — the dynamic table declares neither DT_JMPREL nor DT_RELA" in out,
-          "\n" + out)
+    # Asserted as two ASCII substrings rather than one quoted sentence: the zero, and the reason
+    # for it. Matching the whole sentence made this the only check in the file that spanned a
+    # non-ASCII character, and it was the only one that failed on Windows.
+    check("a module with no relocation tables reports zero slots",
+          "0 import slots" in out, "\n" + out)
+    check("a module with no relocation tables says WHY it is zero",
+          "the dynamic table declares neither DT_JMPREL nor DT_RELA" in out, "\n" + out)
     check("a zero result exits 3 rather than 0", code == 3, "got exit %d" % code)
     check("a zero result still reports what was parsed",
           "imports=3" in out and "jmprel absent" in out, "\n" + out)
@@ -281,6 +295,22 @@ def main() -> int:
         check("without --import-slots nothing is printed and the exit code stays 0",
               done.returncode == 0 and "[IMPORT SLOTS]" not in done.stdout,
               "exit %d\n%s" % (done.returncode, done.stdout))
+
+    # --- the output is ASCII on every message path -------------------------------------------
+    # The property, not a re-spelling of one message: stdout carries BYTES, and whoever reads them
+    # decodes by platform (UTF-8 on Linux, the cp1252/cp437 console code page on Windows). Any
+    # non-ASCII byte therefore renders as mojibake in cmd.exe and breaks a `grep` for the very
+    # line the tool printed. Checked over every run above — including the zero-result and
+    # name-table paths, which is where the five em dashes actually were.
+    offenders = []
+    for cmd, out in ALL_OUTPUT:
+        for lineno, line in enumerate(out.splitlines(), 1):
+            bad = {c for c in line if ord(c) > 127}
+            if bad:
+                offenders.append("%s: line %d: %s in %r"
+                                 % (cmd, lineno, sorted(hex(ord(c)) for c in bad), line[:90]))
+    check("every byte the tool prints is ASCII, on all %d runs" % len(ALL_OUTPUT),
+          not offenders, "\n" + "\n".join(offenders[:10]))
 
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0
