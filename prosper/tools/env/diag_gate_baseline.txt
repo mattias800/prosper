@@ -40,7 +40,7 @@
 SPLIT-CALL|src/gpu/command_processor.cpp|generation_guard|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # benign: the callee is a BEHAVIOUR predicate, not a producer of printed state -- there is no field it could leave unmeasured. The rule's shape matches; its subject does not.
 SPLIT-CALL|src/gpu/gpu_timeline.cpp|automatic_capture_bundle_gate_conflicts|PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 SPLIT-CALL|src/hle/hle_audio.cpp|audio2log|PROSPER_AUDIO2LOG+PROSPER_AUDIO2LOG|PROSPER_AUDIO2_PROBE  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-SPLIT-CALL|src/host/exec_image_linux.cpp|arm_hwwatch|PROSPER_HWBP+PROSPER_HWWATCH_ABS  # benign: two DELIBERATE entry points into one arming helper (absolute watch vs register-relative on the first exec-bp hit). Neither switch is a producer for the other's printer, and nothing prints a field either could have measured.
+SPLIT-CALL|src/host/exec_image_linux.cpp|arm_hwwatch|PROSPER_HWBP|PROSPER_HWWATCH+PROSPER_HWWATCH_ABS  # benign: two DELIBERATE entry points into one arming helper (absolute watch vs register-relative on the first exec-bp hit). Neither switch is a producer for the other's printer, and nothing prints a field either could have measured.
 SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_compute_image_hit|(any)  # unreviewed: not judged
 SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_submit_query|(any)  # unreviewed: not judged
 SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validated_bytes|(any)  # unreviewed: not judged
