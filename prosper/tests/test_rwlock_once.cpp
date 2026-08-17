@@ -334,6 +334,10 @@ int main() {
     {
         std::atomic<int> refused_after_write{0};
         std::atomic<int> strays_accepted{0}, strays_refused{0}, rounds{0};
+        std::atomic<int> strays_attempted{0}, strays_while_workers_ran{0};
+        // The stray floor has to be reached BY CONSTRUCTION rather than by winning a race against
+        // the workers -- see the attacker loop below for why, and #2427 for what it cost.
+        constexpr int kMinStrayAttempts = 1200;
         std::vector<std::thread> workers;
         for (int t = 0; t < 3; t++) {
             workers.emplace_back([&]{
@@ -349,14 +353,56 @@ int main() {
             // workers are done, and never spins more than this many times, because an unbounded
             // "while the workers run" loop reaches half a billion attempts on a fast host and buys
             // no additional interleavings.
-            for (int i = 0; i < 200000 && rounds.load(std::memory_order_relaxed) < 6000; i++) {
+            //
+            // `i < kMinStrayAttempts` is an UNCONDITIONAL PREFIX and that is the whole point. The
+            // condition used to be `rounds < 6000` alone, which stops this loop the instant the
+            // three workers finish — so on a host that schedules this thread late, or preempts it,
+            // the attacker made almost no attempts and the coverage floor below failed while every
+            // correctness assertion in this block passed. That is #2427's `rwlock_once_semantics`
+            // half: 2 of 502 macOS/Rosetta job attempts (2026-08-08..17) died on that one line and
+            // nothing else, both times with `strays_accepted == 0`, `refused_after_write == 0` and
+            // the post-arm re-acquire all green. A coverage floor that the scheduler can veto is a
+            // gate that fails good changes, so the floor is now met by construction: the loop runs
+            // the prefix out whatever the workers are doing, and only then defers to them.
+            //
+            // The prefix cannot hang and costs microseconds: a stray never enters the host lock. It
+            // sees WRITE set (owner check) or COUNT == 0, and the single-word CAS refuses it and
+            // returns — the same reason this workload can assert `strays_accepted == 0` at all.
+            for (int i = 0; i < 200000 && (i < kMinStrayAttempts ||
+                                           rounds.load(std::memory_order_relaxed) < 6000); i++) {
+                // Sampled BEFORE the attempt, so it names the state the attempt was made against.
+                // Reported, never asserted: how much of the floor lands under real contention is
+                // exactly the scheduler-controlled quantity that must not gate the job.
+                //
+                // Name the residual precisely, because "1200 strays ran" is easy to over-read. This
+                // counts "the workers had not finished yet", NOT "the lock was held" -- a worker
+                // between its unlock and its next wrlock counts here. And on a host so starved that
+                // this reads 0, every attempt hit the `COUNT == 0` arm of the refusal; the
+                // WRITE-set/owner-check arm, which is the one the single-word-CAS argument is
+                // actually about, is then not exercised at all. That is a real loss, and it is
+                // still strictly better than the old behaviour, which on the same host produced a
+                // red job AND left `strays_accepted == 0` vacuous at ~0 trials. Making contention
+                // structural too would mean holding the workers until the prefix completes; it is
+                // doable (keep them issuing balanced pairs into a separate counter, leaving
+                // `rounds` at exactly 6000) and is deliberately not done here, because it adds a
+                // second cross-thread dependency to a block whose whole defect was one.
+                const bool contended = rounds.load(std::memory_order_relaxed) < 6000;
+                strays_attempted.fetch_add(1);
+                if (contended) strays_while_workers_ran.fetch_add(1);
                 if (call1(RWun, (uint64_t)(uintptr_t)&h) != 0) strays_refused.fetch_add(1);
                 else strays_accepted.fetch_add(1);
             }
         });
         for (auto& w : workers) w.join();
-        CHECK(rounds.load() == 6000 && strays_refused.load() > 1000,
-              "the concurrency arm actually ran (6000 balanced write rounds; strays were refused)");
+        // Both halves are deterministic now: `rounds` is 3 x 2000 with every worker joined, and
+        // `strays_attempted` is the prefix. Nothing here depends on how the host scheduled them.
+        CHECK(rounds.load() == 6000 && strays_attempted.load() >= kMinStrayAttempts,
+              "the concurrency arm actually ran (6000 balanced write rounds; at least 1200 stray"
+              " unlocks attempted)");
+        printf("  [info] stray unlocks: %d attempted, %d of them while the workers still ran,"
+               " %d refused, %d accepted\n",
+               strays_attempted.load(), strays_while_workers_ran.load(),
+               strays_refused.load(), strays_accepted.load());
         // If this ever fires, it is NOT flakiness — it is the signature of a residual ordering
         // window between the write flag and the hold count, and it is the only assertion here that
         // can see one (`refused_after_write` cannot: a stray that steals the hold returns 0 to
