@@ -317,6 +317,25 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   Every `--values` run prints a `positive-control=` verdict on its own value capture — read it first,
   because `VOID` and `unchecked` mean the run cannot support an inference from an ABSENT value, and
   they look nothing like a failure. See `hle_calls/README.md`.
+- **`re/hle_handler_map.py`** — **which Sony NIDs collapse onto ONE prosper handler?** This is the
+  blind spot `hle_calls --values` structurally cannot see: the histogram keys on the handler symbol,
+  so when one handler answers several Sony entry points they all become a single row (usually `0x0`),
+  and a mismodelled answer for one is indistinguishable from a correct answer for all of them. By the
+  time a call is counted the collapse has already happened, so it has to be read out of prosper's own
+  registration tables. Crossed against `nid_gate_scan.py --all-nids` it names the exact rows a
+  `--values` measurement cannot support an inference from: on *Sonic Origins* (`PPSA05325`), **36 of
+  247** gated rows. The biggest collapses in the tree are `k_attr_noop` (20 Sony names), `s_ok` (14)
+  and `font_ok` (12).
+  Registration shapes are **discovered, not hardcoded** — the API list is read out of `class Hle` in
+  `dispatch.hpp`, and the wrapper list is every macro/lambda/free function forwarding a parameter
+  into a registration call — and the parse is **reconciled against the registry the binary actually
+  builds** (`re/hle_registry_dump.cpp`, ctest `re_hle_handler_map_reconcile`), so a shape it cannot
+  read fails loudly instead of quietly shrinking the census. Exit `3` means the table is a lower
+  bound; exit `2` means nothing was parsed. **Pass `--platform`**: `hle_kernel_mem.cpp` defines
+  `register_kernel_mem_hle()` twice in two arms of one `#if`, and counting both promotes five
+  single-name handlers to "shared" — that plus per-site (rather than per-distinct-name) counting is
+  the whole difference between the 41 this measurement was first published with and the 36 that is
+  correct (#2070). See `re/README.md`.
 - **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
   `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
   "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,

@@ -331,6 +331,122 @@ six-step trophy-init chain of anonymous addresses. Mapping the stubs named step 
 site under investigation is unreachable, and a boot A/B that would otherwise have reported a
 misleading null could be turned into a positive control that fires.
 
+## `hle_handler_map.py` — which Sony NIDs share ONE prosper handler?
+
+`--all-nids` above says which Sony answers a title *depends* on. This is the other axis of the same
+cross, and without it the first one cannot be acted on.
+
+A runtime return-value histogram (`tools/hle_calls --values`) keys on the **prosper handler symbol**,
+not on the Sony function. When one handler is registered for several Sony entry points, all of them
+collapse into a single row — typically reading `0x0` — and **a mismodelled answer for one is
+indistinguishable from a correct answer for all of them.** No runtime instrument can recover that:
+by the time a call is counted, the collapse has already happened. It has to be read out of the
+registration tables.
+
+```bash
+# 1. which imports does the title branch on?
+python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA05325-app0/eboot.bin \
+    --all-nids --names ../PS5-3.20_Libs > gated.txt
+
+# 2. which of those are answered by a handler that also answers something else?
+python3 tools/re/hle_handler_map.py --names ../PS5-3.20_Libs --gated gated.txt
+```
+
+Measured on *Sonic Origins* (`PPSA05325`) at the time of writing: of 247 gated rows, **36** sit on a
+handler that answers more than one Sony entry point — so 36 `--values` rows cannot be trusted on
+their own, while the other 135 registered rows have a handler to themselves. The largest collapses
+in the tree are `k_attr_noop` (**20** Sony names), `s_ok` (**14**) and `font_ok` (**12**).
+
+### Reading a zero from it
+
+Every run prints a coverage block *before* any table, because "no collapses" and "I parsed nothing"
+must never be the same output:
+
+```text
+#   registration APIs (from dispatch.hpp class Hle): register_fn, register_placeholder
+#   wrappers discovered:  4 macro (R RN RN_SUBMIT RN_SUBMIT_NAMED)
+#                         2 lambda (R reg)
+#   registration sites claimed:                      1156  [direct=237 macro(R)=692 …]
+#   distinct NIDs registered:                        1153
+#   sites claimed but NID not a literal:             17  (listed below; not a coverage gap)
+#   sites UNCLAIMED (a missed shape):                0
+```
+
+| exit | meaning |
+| --- | --- |
+| `0` | the scan ran; the printed counts **are** the answer, zero included |
+| `2` | refused — nothing was parsed, and no number printed is a result |
+| `3` | the scan ran but is **incomplete**: a registration site was unclaimed, or the reconciliation below disagreed. Every table is a lower bound |
+
+`sites UNCLAIMED` is the load-bearing line. It is produced by a deliberately over-broad detector that
+is independent of the shape list — it counts *mentions* of a registration API or of a discovered
+wrapper, while the shape list *consumes* them — so a shape the parser does not know surfaces as a
+non-zero residual instead of vanishing.
+
+### The shapes are discovered, not hardcoded
+
+prosper almost never calls `Hle::register_fn` directly: there are file-local `#define R(...)` /
+`RN(...)` / `RN_SUBMIT(...)` / `RN_SUBMIT_NAMED(...)` macros and file-local lambdas. A fixed pattern
+list is exactly what made the first version of this measurement a scratch script, so:
+
+* the **API list** is read out of the `class Hle` declaration in `dispatch.hpp` — a third
+  registration API is picked up the day it is declared;
+* the **wrapper list** is every macro, lambda **or free function** whose body forwards one of its own
+  parameters into a registration call, found by a fixpoint so a macro wrapping another macro is
+  caught too;
+* the discriminator that keeps `register_service_hle()` — a zero-parameter function whose body is 300
+  registration calls — from being mistaken for a forwarder is that a wrapper must forward a
+  **parameter** into the NID slot. Without it the census comes back empty.
+
+### It is reconciled against the binary, not trusted
+
+A parser is the wrong kind of authority here, so `hle_registry_dump` (built from
+`tools/re/hle_registry_dump.cpp`) runs the real `register_builtin_hle()` and prints the registry
+prosper actually builds — no boot, no game dump, no GPU, because registration is pure setup:
+
+```bash
+./build-linux/hle_registry_dump registry.tsv
+python3 tools/re/hle_handler_map.py --registry registry.tsv --names ../PS5-3.20_Libs
+```
+
+A NID the binary registers that the parser never produced is, by definition, a registration shape the
+parser cannot read. `ctest -R re_hle_handler_map` runs both this and the parser's own unit tests.
+
+The handler-address column is an **upper** bound on collapse only: an identical-code-folding linker
+can give two distinct `{ return 0; }` handlers one address, so equal addresses do not prove a shared
+handler — unequal addresses do prove a distinct one.
+
+### Two things that moved the number, both of which look like nothing
+
+* **`--platform` matters.** `hle_kernel_mem.cpp` defines `register_kernel_mem_hle()` **twice**,
+  ~3,200 lines apart, in the two arms of one `#if defined(__linux__) || defined(__APPLE__)`. A
+  line-based extraction counts both arms, so every kernel-memory handler looks registered for two
+  Sony names and gets promoted to "shared". Five handlers that answer exactly one Sony function each
+  — `k_dmem_size`, `k_virtual_query`, `k_alloc_dmem`, `k_mtypeprotect`, `k_mprotect` — were counted
+  as collapses this way. The tool evaluates the conditionals for one platform and prints how many
+  lines it skipped.
+* **Distinct Sony NAMES, not registration SITES.** `scePthreadAttrSetaffinity` is registered to
+  `k_attr_noop` at both `hle_kernel.cpp:4539` and `:4588`. That is one Sony entry point; counting the
+  lines inflates every handler with a duplicate.
+
+Together those two are the whole difference between the **41** rows this measurement was first
+published with (#2070) and the **36** the tool reports: platform-blind, per-site counting reproduces
+41 exactly, and the 5 extra rows are the `hle_kernel_mem.cpp` handlers listed above. `s_ok` is
+likewise **14**, not 15 — the 15th, `sceNpCheckCallback`, is registered to `s_ok` only in the
+`#else` (Windows) arm at `hle_service.cpp:4596`; on Linux that NID goes to a real handler, and the
+two arms *swap* a name rather than adding one, so the total is 14 on every platform.
+
+### Library attribution is a definition, and it is printed as one
+
+The by-library table uses the PS5 3.20 firmware file names **verbatim** and never rolls up a
+"libc"/"non-libc" subtotal, because that rollup is the one place this measurement has been misread:
+two extractions that appeared to disagree (13 vs 37) were the same rows, differing only over whether
+`libkernel` counted as "libc". Attribution comes from the same `--names` loader `nid_gate_scan.py`
+uses — the first `libSceXxx.c` in sorted order that exports the NID — so the two tools cannot
+disagree about a library. Note this is a *Sony* attribution, not a prosper-file one:
+`sceSysmoduleIsLoaded` is `libSceSysmodule` even though prosper registers it in
+`src/hle/hle_kernel_time.cpp`.
+
 ## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
 
 A UE4 title on PS5 streams content through the Ampr/APR async-read path, and `PROSPER_FILELOG=1`
