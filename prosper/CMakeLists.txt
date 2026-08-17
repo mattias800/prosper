@@ -1207,6 +1207,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_compressed_source_authority PRIVATE prosper_core)
   add_test(NAME compressed_source_authority COMMAND test_compressed_source_authority)
 
+  add_executable(test_metadata_kind_correlation tests/test_metadata_kind_correlation.cpp)
+  target_link_libraries(test_metadata_kind_correlation PRIVATE prosper_core)
+  add_test(NAME metadata_kind_correlation COMMAND test_metadata_kind_correlation)
+
+  add_executable(test_watch_list tests/test_watch_list.cpp)
+  target_link_libraries(test_watch_list PRIVATE prosper_core)
+  add_test(NAME watch_list COMMAND test_watch_list)
+
   add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
