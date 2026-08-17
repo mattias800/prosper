@@ -218,9 +218,25 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
         root = Path(d)
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        gh = bin_dir / "gh"
-        gh.write_text(GH_STUB, encoding="utf-8")
-        gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        # The stub logic lives in a .py; what goes on PATH is a per-platform LAUNCHER.
+        #
+        # Windows resolves an executable through PATHEXT (.COM;.EXE;.BAT;.CMD;...), so a stub file
+        # named `gh` with no extension matches nothing and `subprocess` reports the tool's first
+        # `gh` call as a failure -- which is how eleven of these twelve arms went red on Windows
+        # MinGW while passing on Linux and macOS. The arms written to close the "nothing executes
+        # main()" gap were themselves POSIX-only (#2610 CI). Shipping a `.cmd` on Windows keeps
+        # every arm running on all three platforms, which is the point: a skip here would leave the
+        # tool's primary path untested on exactly the platform where PATHEXT and the path separator
+        # differ.
+        stub_py = bin_dir / "gh_stub.py"
+        stub_py.write_text(GH_STUB, encoding="utf-8")
+        if os.name == "nt":
+            gh = bin_dir / "gh.cmd"
+            gh.write_text(f'@"{sys.executable}" "{stub_py}" %*\n', encoding="utf-8")
+        else:
+            gh = bin_dir / "gh"
+            gh.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub_py}" "$@"\n', encoding="utf-8")
+            gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
         repo = root / "repo"
         (repo / DOC_REL.parent).mkdir(parents=True)
