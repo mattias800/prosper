@@ -165,6 +165,25 @@ command-line path keeps working.
 Selection movement lives in `library_nav.hpp`, which is pure and unit-tested, so the grid's behaviour is
 covered in ordinary CI rather than only by someone pressing arrow keys.
 
+#### Descriptor capacity
+
+Covers and background art are Dear ImGui textures, and every one of them costs a descriptor set out of
+the library's single pool. The pool is sized from the library — one set per title, plus an allowance for
+the background cache and ImGui's own font atlas — and is **grown** when a rescan finds more titles than
+it holds, so pointing the app at a bigger folder does not cost the extra titles their art. The sizing and
+the accounting are pure and unit-tested in `library_descriptor_budget.hpp`.
+
+When the pool genuinely cannot fit everything, the shortfall costs one image per title and nothing more:
+prosper checks the budget *before* asking ImGui for a set, because `ImGui_ImplVulkan_AddTexture` writes to
+whatever `vkAllocateDescriptorSets` returned without checking it, and on a full pool that is
+`VK_NULL_HANDLE`. Titles past the limit fall back to the same labelled button a title with an undecodable
+`icon0.png` gets, and one line is logged.
+
+`PROSPER_LIBRARY_POOL_SETS=<n>` caps the pool at `n` sets and stops it from growing. It exists to make
+that exhaustion path reachable without owning hundreds of games — set it below your library's title count
+and the titles past the cap should lose their covers, and nothing else. It is a reproduction knob, not a
+tuning one; leave it unset for normal use.
+
 ## Options
 
 - `--dump <app0>` — boot and display the PS5 title at this app0 directory (positional path also works).
