@@ -285,6 +285,11 @@ bool convert_video_frame(Pipeline& pipeline, HardwareSelection& selection, Sessi
     packet.height = static_cast<uint32_t>(source->height);
     packet.stride = packet.width;
     packet.pts_us = frame_timestamp_us(decoded, time_base);
+    // `*3/2` is EXACT here, unlike on the Videodec2 access-unit path, and the asymmetry is a
+    // guarantee rather than an oversight: the check a few lines above REFUSES an odd width or
+    // height outright ("decoded video dimensions are not valid for NV12"), so both are even by the
+    // time this runs and the shorthand and the exact form agree. Videodec2 cannot refuse the same
+    // way -- its VP9 branch may legitimately carry odd dimensions -- so it uses nv12_bytes().
     packet.nv12.resize(static_cast<size_t>(packet.stride) * packet.height * 3 / 2);
     uint8_t* destination[4] = {
         packet.nv12.data(),
@@ -888,29 +893,43 @@ struct AuDecoder {
     // hardware while decoding in software, which is exactly what the first version of this did.
     std::shared_ptr<HardwareSelection> selection;
     AVPacket* packet = nullptr;
-    std::vector<uint8_t> nv12;      // interleaved UV staging; owned so `out` stays valid to next call
-    uint32_t width = 0, height = 0;
 };
 
 std::mutex g_au_mutex;
 std::map<int, AuDecoder> g_au_decoders;
 int g_next_au_id = 1;
 
-// libavcodec's H.264 decoder yields planar YUV420P; the guest wants semi-planar NV12. Interleaving
-// is the whole conversion -- the Y plane is byte-identical, so only chroma is touched.
-void yuv420p_to_nv12(const AVFrame* src, std::vector<uint8_t>& dst,
-                     uint32_t w, uint32_t h) {
-    const size_t y_bytes = static_cast<size_t>(w) * h;
-    dst.resize(y_bytes + y_bytes / 2);
+// Copy a decoded picture into the CALLER's buffer as packed NV12. Runs with g_au_mutex held, which
+// is the whole point: the decoder's frame memory is never handed out, so nothing a caller holds can
+// be freed by a concurrent close_decoder (#2571 review N5).
+//
+// The chroma plane is `ceil(h/2)` rows of `2*ceil(w/2)` bytes -- for odd dimensions that is WIDER
+// than the luma row, which the `y_bytes/2` shorthand silently gets wrong.
+void copy_nv12(const AVFrame* src, uint8_t* dst, uint32_t w, uint32_t h) {
+    const uint64_t y_bytes = static_cast<uint64_t>(w) * h;
+    const uint32_t crows = (h + 1) / 2, cbytes = 2 * ((w + 1) / 2);
     for (uint32_t row = 0; row < h; ++row)
-        std::memcpy(dst.data() + static_cast<size_t>(row) * w,
+        std::memcpy(dst + static_cast<uint64_t>(row) * w,
                     src->data[0] + static_cast<size_t>(row) * src->linesize[0], w);
-    uint8_t* uv = dst.data() + y_bytes;
-    const uint32_t cw = w / 2, ch = h / 2;
+    for (uint32_t row = 0; row < crows; ++row)
+        std::memcpy(dst + y_bytes + static_cast<uint64_t>(row) * cbytes,
+                    src->data[1] + static_cast<size_t>(row) * src->linesize[1], cbytes);
+}
+
+// libavcodec's software H.264 decoder yields planar YUV420P; the guest wants semi-planar NV12.
+// Interleaving is the whole conversion -- the Y plane is byte-identical, so only chroma is touched.
+// Same destination discipline as copy_nv12: straight into the caller's buffer, under the lock.
+void copy_yuv420p_as_nv12(const AVFrame* src, uint8_t* dst, uint32_t w, uint32_t h) {
+    const uint64_t y_bytes = static_cast<uint64_t>(w) * h;
+    for (uint32_t row = 0; row < h; ++row)
+        std::memcpy(dst + static_cast<uint64_t>(row) * w,
+                    src->data[0] + static_cast<size_t>(row) * src->linesize[0], w);
+    uint8_t* uv = dst + y_bytes;
+    const uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
     for (uint32_t row = 0; row < ch; ++row) {
         const uint8_t* u = src->data[1] + static_cast<size_t>(row) * src->linesize[1];
         const uint8_t* v = src->data[2] + static_cast<size_t>(row) * src->linesize[2];
-        uint8_t* o = uv + static_cast<size_t>(row) * w;
+        uint8_t* o = uv + static_cast<uint64_t>(row) * (2 * cw);
         for (uint32_t col = 0; col < cw; ++col) { o[col * 2] = u[col]; o[col * 2 + 1] = v[col]; }
     }
 }
@@ -1007,15 +1026,22 @@ int VaapiBackend::open_decoder(uint32_t codec) {
     // Deliberately says REQUESTED, not "using". Whether hardware is actually negotiated is only
     // known when a frame comes back in the hardware pixel format, and the first version of this
     // line claimed hardware while every frame decoded in software.
-    fprintf(stderr, "[vdec2] access-unit H.264 decoder opened (id=%d, VA-API %s)\n", id,
+    // Name the codec that was actually opened. This line used to say "H.264" unconditionally while
+    // `want_name` two dozen lines above already held "VP9" -- harmless while the path was opt-in,
+    // and not harmless once it prints on every Videodec2 title by default, because the one title
+    // known to take the VP9 branch would be debugged against a log naming the wrong bitstream. In a
+    // subsystem whose entire diagnostic story is "the head bytes name the format", a line that
+    // misnames it is worse than no line. (#2571 review N10.)
+    fprintf(stderr, "[vdec2] access-unit %s decoder opened (id=%d, VA-API %s)\n", want_name, id,
             d.hw_device ? "requested" : "unavailable -- software");
     return id;
 }
 
-bool VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame& out) {
+VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes,
+                                               uint8_t* dst, uint64_t dst_bytes, AuPicture& out) {
     std::lock_guard<std::mutex> lk(g_au_mutex);
     auto it = g_au_decoders.find(id);
-    if (it == g_au_decoders.end() || !au || !bytes) return false;
+    if (it == g_au_decoders.end() || !au || !bytes) return AuResult::NoPicture;
     AuDecoder& d = it->second;
 
     // Make a WRONG codec mapping loud on the very first access unit, instead of letting libavcodec
@@ -1063,33 +1089,44 @@ bool VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame
                     got, pics.load(), send_fail.load());
         }
     }
-    if (sent < 0 || got < 0) return false;   // needs more input: NOT an error
+    if (sent < 0 || got < 0) return AuResult::NoPicture;   // needs more input: NOT an error
 
-    // HARDWARE: the decoded surface is already NV12. Transfer it to CPU-visible memory and hand
-    // the planes over as they are -- no colour conversion, no chroma interleave, nothing per-pixel
-    // on the CPU beyond the transfer the guest's own buffer requires anyway.
+    // HARDWARE: the decoded surface is already NV12. Transfer it to CPU-visible memory and copy the
+    // planes as they are -- no colour conversion, no chroma interleave, nothing per-pixel on the CPU
+    // beyond the transfer the guest's own buffer requires anyway.
     const AVFrame* pic = d.frame;
     if (d.hw_pix_fmt != AV_PIX_FMT_NONE && d.frame->format == d.hw_pix_fmt) {
         av_frame_unref(d.sw_frame);
         d.sw_frame->format = AV_PIX_FMT_NV12;          // ask for NV12 directly from the surface
-        if (av_hwframe_transfer_data(d.sw_frame, d.frame, 0) < 0) return false;
+        if (av_hwframe_transfer_data(d.sw_frame, d.frame, 0) < 0) return AuResult::NoPicture;
         pic = d.sw_frame;
     }
 
-    d.width = static_cast<uint32_t>(pic->width);
-    d.height = static_cast<uint32_t>(pic->height);
+    // A decoder that reports a zero-size picture has produced no picture, whatever it says. Refuse
+    // it here rather than let it become a well-formed "here is your frame" over nothing -- the exact
+    // shape #2270 exists to remove, and it costs a line to keep out of the new success path.
+    // (#2571 review N8; the HLE guards it independently, because this one only covers this backend.)
+    if (pic->width <= 0 || pic->height <= 0) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            fprintf(stderr, "[vdec2] decoder returned a %dx%d picture -- refusing it rather than "
+                            "reporting an empty frame as a decode (#2270)\n",
+                    pic->width, pic->height);
+        return AuResult::NoPicture;
+    }
+
+    out.width = static_cast<uint32_t>(pic->width);
+    out.height = static_cast<uint32_t>(pic->height);
+    out.y_stride = out.width;
+    out.uv_stride = out.width;
+    out.nv12_bytes = nv12_bytes(out.width, out.height);
+
+    // Report the size mismatch as its OWN outcome. Collapsed into "no picture" it would read as a
+    // decoder warming up, which is the benign case it most resembles and the one that hides it.
+    if (!dst || dst_bytes < out.nv12_bytes) return AuResult::FrameTooSmall;
 
     if (pic->format == AV_PIX_FMT_NV12) {
-        // Already the guest's layout. Copy plane-wise only because the strides may exceed the
-        // width; when they do not this is two straight memcpys.
-        const size_t y_bytes = static_cast<size_t>(d.width) * d.height;
-        d.nv12.resize(y_bytes + y_bytes / 2);
-        for (uint32_t row = 0; row < d.height; ++row)
-            std::memcpy(d.nv12.data() + static_cast<size_t>(row) * d.width,
-                        pic->data[0] + static_cast<size_t>(row) * pic->linesize[0], d.width);
-        for (uint32_t row = 0; row < d.height / 2; ++row)
-            std::memcpy(d.nv12.data() + y_bytes + static_cast<size_t>(row) * d.width,
-                        pic->data[1] + static_cast<size_t>(row) * pic->linesize[1], d.width);
+        copy_nv12(pic, dst, out.width, out.height);
     } else if (pic->format == AV_PIX_FMT_YUV420P) {
         // SOFTWARE fallback only. This is the per-frame CPU chroma interleave the hardware path
         // exists to avoid -- 12.4 MB per frame at 3840x2160 -- so it is a correctness net, not a
@@ -1098,23 +1135,15 @@ bool VaapiBackend::decode_au(int id, const uint8_t* au, size_t bytes, VideoFrame
         if (warned.fetch_add(1) == 0)
             fprintf(stderr, "[vdec2] software decode path: paying a per-frame YUV420P->NV12 CPU "
                             "interleave; VA-API was unavailable (#2270)\n");
-        yuv420p_to_nv12(pic, d.nv12, d.width, d.height);
+        copy_yuv420p_as_nv12(pic, dst, out.width, out.height);
     } else {
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 8)
             fprintf(stderr, "[vdec2] unexpected decoded pixel format %d; no picture\n",
                     pic->format);
-        return false;
+        return AuResult::NoPicture;
     }
-
-    out.y = d.nv12.data();
-    out.uv = d.nv12.data() + static_cast<size_t>(d.width) * d.height;
-    out.width = d.width;
-    out.height = d.height;
-    out.y_stride = d.width;
-    out.uv_stride = d.width;
-    out.pts_us = 0;
-    return true;
+    return AuResult::Decoded;
 }
 
 void VaapiBackend::close_decoder(int id) {

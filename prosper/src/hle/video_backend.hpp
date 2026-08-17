@@ -39,6 +39,28 @@ struct AudioFrame {
     uint64_t pts_us = 0;
 };
 
+// The exact packed NV12 size: a full-resolution luma plane plus a half-resolution interleaved chroma
+// plane, each chroma dimension rounded UP.
+//
+// ONE function with three callers -- the Videodec2 sizing query that tells the guest how big a frame
+// buffer to allocate, the backend's own "does the caller's buffer fit" check, and the copy that
+// fills it. They must agree by construction; a divergence would be a guest buffer sized by one rule
+// and written by another, which is a heap overflow presenting as a decoder bug.
+//
+// `w*h*3/2` is NOT used, and neither is `wh + (wh+1)/2`. Both are exact only when BOTH dimensions
+// are even, and that rule is unusually easy to state wrongly: "even product" is the seductive wrong
+// version, and 1920x1081 has an even product while both shorthands are 960 bytes short there. It
+// never bit because H.264 codes in 16x16 macroblocks so its dimensions are always even -- but VP9
+// frame dimensions are arbitrary, and VP9 is the branch Sonic Racing: CrossWorlds takes. Only ONE
+// dimension needs to be odd for the shorthand to be short (65x32 is short by 16).
+//
+// WIDEN BEFORE ARITHMETIC. Written as `2*((w+1)/2)*...` on `int32_t` inputs the `+1` overflows at
+// INT32_MAX before any cast; taking uint32_t and widening here makes every operation 64-bit.
+inline uint64_t nv12_bytes(uint32_t w, uint32_t h) {
+    const uint64_t uw = w, uh = h;
+    return uw * uh + 2 * ((uw + 1) / 2) * ((uh + 1) / 2);
+}
+
 class VideoBackend {
 public:
     virtual ~VideoBackend() = default;
@@ -83,11 +105,47 @@ public:
     // say so; #2270 exists because sceVideodec2Decode instead reported SCE_OK with no picture,
     // forever, which a title cannot distinguish from "no frame ready yet".
     virtual int  open_decoder(uint32_t /*codec*/) { return -1; }
-    // True when a picture was produced. `out` is NV12 and stays valid until the next decode_au on
-    // this id. False means "no picture yet" (a decoder legitimately needs several access units
-    // before its first frame) and is NOT an error.
-    virtual bool decode_au(int /*id*/, const uint8_t* /*au*/, size_t /*bytes*/,
-                           VideoFrame& /*out*/) { return false; }
+
+    // What one access-unit submission produced. THREE outcomes, not a bool, because collapsing them
+    // destroys information the caller needs even where its guest-facing answer is the same.
+    //
+    // Stated as what the HLE actually does with them, rather than as a rule it does not follow:
+    // `sceVideodec2Decode` answers the GUEST identically for NoPicture and FrameTooSmall — SCE_OK
+    // with no picture, which is the honest answer in both cases — and differs only in the LOG. That
+    // difference is the whole point: "the decoder needs more input" is benign and expected, while
+    // "a picture exists and your buffer cannot hold it" means the size derivation the guest
+    // allocated from is wrong, and the two are indistinguishable to a reader once merged. #2270 is
+    // the issue that exists because outcomes were reported identically. (#2571 review D6.)
+    enum class AuResult {
+        NoPicture,      // needs more input -- correct, and NOT an error
+        FrameTooSmall,  // a picture exists; `dst_bytes` cannot hold it. `out` says how much it needs
+        Decoded,        // `dst` now holds the packed NV12 picture
+    };
+
+    // Geometry of the picture decode_au produced or refused. Deliberately carries NO plane pointers.
+    //
+    // The earlier shape returned a VideoFrame whose `y`/`uv` pointed into the decoder's own staging
+    // buffer and stayed valid only "until the next decode_au on this id" -- which made the caller's
+    // copy race a concurrent close_decoder that frees exactly that buffer. Handing the DESTINATION
+    // to the decoder instead of handing decoder-owned pointers to the caller removes the lifetime
+    // question rather than documenting it: the copy happens inside the backend's own lock, so there
+    // is nothing a caller can hold that another thread can free. (#2571 review N5.)
+    struct AuPicture {
+        uint32_t width = 0, height = 0, y_stride = 0, uv_stride = 0;
+        // Exact packed NV12 size: w*h + 2*ceil(w/2)*ceil(h/2). NOT the `w*h*3/2` shorthand, which is
+        // short whenever a dimension is odd -- see s_videodec2_query_decoder_memory's note on why
+        // this project writes the exact form. The guest sizes its frame buffer from that same
+        // expression, so any other one here disagrees with the buffer it is copying into.
+        uint64_t nv12_bytes = 0;
+    };
+
+    // Submit one access unit and, if it completes a picture, write the packed NV12 into `dst`.
+    // Defaulted to NoPicture so a backend without the access-unit path keeps compiling AND answers
+    // honestly -- the same reason seek() and open_memory() are defaulted.
+    virtual AuResult decode_au(int /*id*/, const uint8_t* /*au*/, size_t /*bytes*/,
+                               uint8_t* /*dst*/, uint64_t /*dst_bytes*/, AuPicture& /*out*/) {
+        return AuResult::NoPicture;
+    }
     virtual void close_decoder(int /*id*/) {}
 };
 
