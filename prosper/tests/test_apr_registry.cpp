@@ -480,7 +480,75 @@ int main() {
                 fs::path(prosper_apr_path_for_id(awb_id)), awb, awb_path_error);
             CHECK(!awb_path_error && same_awb,
                   "APR content-root fallback registers the real raw-content path");
+
+            // #1993 — THE NEGATIVE ARM, and it is the load-bearing one. Sonic Origins Plus
+            // (PPSA05325) mounts four add-contents and then probes every CRI streamed asset under
+            // an add-content mount point BEFORE the base content root:
+            //     resolve MISS /app0/dlc3/sound/Foo.awb        <- the overlay probe: correctly ENOENT
+            //     content-root fallback /app0/sound/Foo.awb -> /app0/raw/sound/Foo.awb   <- the hit
+            // Measured on a live boot: no DLC-prefixed probe occurs before the four mounts, every
+            // one occurs after them, and each is followed by the base-root retry that resolves and
+            // is then actually read. So the two spellings are two DIFFERENT questions the engine
+            // asks in sequence — "does the DLC override this asset?" then "where is the base one?".
+            //
+            // The tempting fix was to strip the mount prefix and retry, which would make the four
+            // reported misses disappear. It must never be done: it answers the override question
+            // with the base file, so the guest can no longer distinguish an overridden asset from a
+            // plain one, and prosper would be resolving a request to a file the guest did not ask
+            // for. Mount points are namespaces; /app0/dlc3/sound/X and /app0/sound/X are different
+            // paths by contract even when only one of them exists.
+            //
+            // Kills: any "also try without the /app0/dlcN/ segment" rewrite in apr_resolve_impl.
+            // Positive control for this arm: `awb_rc` immediately above proves the content-root
+            // fallback machinery IS armed on this fixture, so the ENOENT below is a refusal rather
+            // than a fallback that was never reachable.
+            const fs::path dlc_mount = app0 / "dlc3";
+            fs::create_directories(dlc_mount);
+            prosper_apr_reset_for_test();
+            const char* overlay_paths[1] = { "/app0/dlc3/sound/fallback.awb" };
+            uint32_t overlay_id = 0x5a5a5a5au, overlay_error = 0xdead;
+            uint64_t overlay_rc = resolve_ids((uint64_t)(uintptr_t)overlay_paths, 1,
+                                              (uint64_t)(uintptr_t)&overlay_id,
+                                              (uint64_t)(uintptr_t)&overlay_error, 0, 0);
+            CHECK((uint32_t)overlay_rc == 0x80020002u && overlay_id == 0xffffffffu &&
+                      overlay_error == 0,
+                  "an absent asset under a DLC mount point is ENOENT, never the base-root file");
+
+            // And the discriminating half: when the overlay DOES exist, the two spellings must
+            // resolve to two DIFFERENT containers. Without this, a resolver that answered every
+            // /app0/dlc3/... with the base file would still pass the arm above whenever the base
+            // file was absent — this proves the paths are kept apart rather than merely refused.
+            const fs::path overlay_dir = dlc_mount / "sound";
+            fs::create_directories(overlay_dir);
+            const fs::path overlay_awb = overlay_dir / "fallback.awb";
+            if (FILE* of = std::fopen(overlay_awb.string().c_str(), "wb")) {
+                // Deliberately a different byte count from the base file, so "same size" cannot be
+                // mistaken for "same container" by any size-based path in the registry.
+                std::fwrite(wp_bytes.data(), 1, wp_bytes.size() / 2, of);
+                std::fclose(of);
+            }
+            prosper_apr_reset_for_test();
+            const char* both_paths[2] = { "/app0/dlc3/sound/fallback.awb",
+                                          "/app0/sound/fallback.awb" };
+            uint32_t both_ids[2] = { 0, 0 }; uint32_t both_error = 0xdead;
+            uint64_t both_rc = resolve_ids((uint64_t)(uintptr_t)both_paths, 2,
+                                           (uint64_t)(uintptr_t)both_ids,
+                                           (uint64_t)(uintptr_t)&both_error, 0, 0);
+            CHECK(both_rc == 0 && both_ids[0] >= 1 && both_ids[1] >= 1 &&
+                      both_ids[0] != both_ids[1] && both_error == 0,
+                  "an existing DLC overlay and its base twin resolve to distinct containers");
+            std::error_code overlay_error_code;
+            const bool overlay_is_overlay = fs::equivalent(
+                fs::path(prosper_apr_path_for_id(both_ids[0])), overlay_awb, overlay_error_code);
+            const bool base_is_base = fs::equivalent(
+                fs::path(prosper_apr_path_for_id(both_ids[1])), awb, overlay_error_code);
+            CHECK(overlay_is_overlay && base_is_base,
+                  "each spelling registers its own file: the mount path is never served the base one");
+
             set_app0_root(".");
+            fs::remove(overlay_awb);
+            fs::remove(overlay_dir);
+            fs::remove(dlc_mount);
             fs::remove(awb);
             fs::remove(raw_sound);
             fs::remove(app0 / "raw");

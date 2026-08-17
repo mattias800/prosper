@@ -436,6 +436,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_addcontent_unmount PRIVATE prosper_core)
   add_test(NAME addcontent_unmount COMMAND test_addcontent_unmount)
 
+  add_executable(test_addcontent_mount_report tests/test_addcontent_mount_report.cpp)
+  target_link_libraries(test_addcontent_mount_report PRIVATE prosper_core)
+  add_test(NAME addcontent_mount_report COMMAND test_addcontent_mount_report)
+
   # libSceSysmodule state query (#2002): IsLoaded answers from prosper's own load history, so a
   # title that gates its initialization on UNLOADED stops skipping that initialization.
   add_executable(test_sysmodule_state tests/test_sysmodule_state.cpp)
