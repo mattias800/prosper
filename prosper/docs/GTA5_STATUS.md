@@ -3389,7 +3389,53 @@ question, not a GPU one. It shares the frontier with one unfinished measurement:
 the failing compute kernels that no instrument has resolved (see the section below for exactly which,
 and why their null does not count yet).
 
-### The failing kernels bind 4K WRITE-capable storage images (2026-08-17)
+### THE FAILING KERNEL'S 4K WRITE IS NOT THE COMPOSITE'S TAP — measured, same run (2026-08-17)
+
+**Read this before the section below it.** That section reports that two failing compute programs bind
+4K write-capable storage images, and that the only write-class binding of `0x204da00000` came from a
+dispatch that never ran. Both facts hold. The *inference* everyone then drew from them — that unblocking
+that program feeds the composite — is **false**, and a single run with `PROSPER_RTT_GUESTPEEK`
+distinguishes them because it prints each sampled surface's FORMAT:
+
+| surface | format | role | resolved |
+| --- | --- | --- | --- |
+| `0x2063380000` | **`Float10_11_11`** (fmt 20) | the composite's base tap, sampled 11x | **`HIT-CPU`**, all 11 |
+| `0x20471e0000` | **`Float16`** (fmt 4) | the presumed HDR source | `HIT-CPU` |
+| `0x204da00000` | **`Float32`** (fmt 1) | what `0x2042f49a00` writes, sampled **once** at pc=75 | `miss` |
+
+`0x204da00000` is a different address AND a different format from the tap. `0x2042f49a00` reads main
+depth and stencil and writes two **Float32** images — a depth-derived pass, not the f16 → f11f11f10
+conversion the composite is missing. **So the compute source-authority work does not lead to the
+composite's missing input.** It is worth having on its own terms (it closed real paths that read
+compressed bytes as plain texels, in both backends), but it is not the route to the world.
+
+**And the tap resolves `HIT-CPU` on every sample**, which changes the question entirely. The composite
+does not read empty *guest* memory — the renderer owns that surface and serves its own CPU snapshot. So
+a compute dispatch writing guest bytes is not even the mechanism that would fill it. What is empty is
+the **renderer's snapshot**, and what fills that is a renderer/draw question.
+
+**`PROSPER_RTT_GUESTPEEK`'s 0% distinguishes nothing here, and this is an instrument trap worth naming.**
+All **twenty** distinct `Float10_11_11` surfaces in the run report 0% non-zero guest bytes, and most
+resolve `HIT-CPU` — including `0x205f1a0000`, the bloom source this document elsewhere credits with 44%
+content. Empty guest memory is the *normal* state of a renderer-owned surface, so "guest bytes are zero"
+is not evidence that a surface is unproduced. The claim that the tap is effectively empty stands on the
+**aliasing A/B** (SCANOUT 13.5% → 55.6% with real geometry), which is a rendering measurement; it does
+not stand on guestpeek.
+
+**One assumption corrected in the other direction:** these addresses are **stable across runs**.
+`0x2063380000`, `0x20471e0000`, `0x2052ac0000`, `0x204da00000` and `0x205f1a0000` all appear at the
+addresses this document recorded hours earlier, in a fresh boot. Earlier notes here cautioned that
+addresses are run-local and re-derivation is required. That is true of *some* allocations — the storage
+image `0x205b557e00` binds did move between runs — but not of these, so a cross-run comparison of the
+named surfaces is legitimate.
+
+**Where the work actually goes next.** The tap is renderer-owned and its snapshot is empty, and the
+earlier colour-target census found **1 draw in 65,536** ever binding `0x2063380000` as a colour target.
+So either that single draw is the producer and it renders nothing, or the producer writes it by some
+path the resolved-table census cannot see. That is the next thing to establish, and it is a graphics
+question rather than a compute one.
+
+### The failing kernels bind 4K write-capable storage images (2026-08-17)
 
 The section below draws the census boundary at "the unresolved operations inside the failing compute
 kernels remain outside the census". This looks *inside* that boundary for the first time, using a
