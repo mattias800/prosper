@@ -27,6 +27,30 @@
 //   M6  make the CondWait body REFUSE unconditionally                    -> §7's signalled-wait
 //                                                                           control fails (#1983)
 //
+//   M7  drop SCE_PTHREAD_ALIAS(k_sce_pthread_join, …)                    -> §9's Sony self-join arm
+//   M8  alias `pthread_join` as well                                     -> §9's POSIX self-join arm
+//   M9  make k_pthread_join report 0 again (discard its result)          -> §9's self-join arms, both
+//   M10 write value_ptr on `if (a1)` rather than `if (rc == 0 && a1)`    -> §9's untouched arm ONLY
+//   M11 return the raw HOST errno from k_pthread_join instead of mapping -> §9's POSIX self-join arm
+//   M12 drop the value_ptr write entirely                                -> §9's exit-value control ONLY
+//   M13 drop SCE_PTHREAD_ALIAS(k_sce_pthread_detach, …)                  -> §9's Sony detach arm
+//   M14 make k_pthread_detach report 0 again                             -> §9's detach arms
+//
+// M7-M14 are the #2575 set and they are NOT interchangeable, for the same reason M5 and M6 are not.
+// M10 and M12 are invisible to every return-value arm in the file — a body that reports EDEADLK
+// correctly and still nulls (or never writes) the guest's `value_ptr` satisfies all of them — and
+// conversely the value_ptr arms cannot see M7/M8/M11/M13, which are all about the number. M11 is the
+// only one that can tell a FreeBSD errno from a host one, because EDEADLK is the ONLY errno reachable
+// in §9 where the two numberings disagree (11 on FreeBSD, 35 on Linux, and 35 is FreeBSD's EAGAIN).
+//
+// M9 AND M14 ARE THE ARMS THAT REVERT THE DEFECT ITSELF, and the first draft of §9 could not see
+// either. Its skip guards asked the HANDLER whether the host refuses a self-join / a second detach;
+// under M9 and M14 the handler answers 0, the guard read that as "this host permits it" and skipped,
+// and the section passed under the exact bug it exists to catch. Both guards now come from a direct
+// host call on a thread the handler never touches. Recorded because the failure was silent and
+// green: the same "a positive control drawn from the same source as the null tests the
+// DISCRIMINATOR, never the DOMAIN" shape the charter records, inside a mutation harness.
+//
 // M5 and M6 are COMPLEMENTARY, and an earlier revision of this header got it wrong in the way that
 // matters most here: it claimed M5 kills §7's positive control too. It cannot. M5 makes the body
 // return 0 and §7 asserts 0, so §7 passes under M5 — the measured `FAIL (2)` is the kRows row's two
@@ -45,10 +69,13 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/sce_errno.hpp"
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <pthread.h>
 #include <thread>
 
 using namespace prosper;
@@ -148,7 +175,43 @@ const Row kRows[] = {
     // --- barriers (no POSIX spelling registered on either body) ---
     {"scePthreadBarrierInit",        nullptr,                       "#2178, in place"},
     {"scePthreadBarrierWait",        nullptr,                       "#2178, in place"},
+    // scePthreadJoin / scePthreadDetach became fallible in #2575 and so now need the alias, but they
+    // deliberately have NO row here and that is not an oversight: kRows provokes its refusal with an
+    // all-zero call, and `pthread_join(0, …)` is not a defined refusal. A `pthread_t` is an opaque
+    // descriptor POINTER on both hosts prosper builds for, so a null one is dereferenced before any
+    // validity check — the sweep would segfault rather than report EINVAL. Their arms are §9, where
+    // the failure comes from a real thread.
 };
+
+// --- §9 thread bodies. Plain HOST pthreads on purpose: these arms are about what k_pthread_join and
+// k_pthread_detach do with the host result, so nothing about prosper's own create trampoline is
+// under test and routing through it would only add failure modes the arms cannot attribute.
+void* join_worker(void* arg) { return arg; }        // hands its own argument back as the exit value
+
+// The park gate and its counters are FILE-SCOPE STATICS, not locals of main, and that is a
+// correctness requirement rather than a style choice. §9's workers are detached, so nothing joins
+// them; a gate living in main's frame would be touched by a worker still inside pthread_mutex_lock
+// after that frame had gone away. It reproduced: the first mutation run aborted with SIGABRT in one
+// arm out of eight, which is exactly how this presents — intermittently, in whichever arm happens to
+// lose the race, and attributable to anything. §9 also waits for every worker to finish below, so
+// the statics are belt and braces.
+pthread_mutex_t g_park_gate = PTHREAD_MUTEX_INITIALIZER;
+std::atomic<int> g_park_running{0};
+std::atomic<int> g_park_done{0};
+void* park_worker(void*) {
+    g_park_running.fetch_add(1, std::memory_order_release);
+    pthread_mutex_lock(&g_park_gate);      // main holds this for the whole of §9's detach block
+    pthread_mutex_unlock(&g_park_gate);
+    g_park_done.fetch_add(1, std::memory_order_release);
+    return nullptr;
+}
+// Bounded spin so a lost wake fails the run instead of burning ctest's timeout, which reports as an
+// infrastructure problem and gets blamed on machine load (the hazard #1983's review caught in §7).
+bool wait_for(const std::atomic<int>& counter, int target) {
+    for (int i = 0; i < 20000 && counter.load(std::memory_order_acquire) < target; ++i)
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    return counter.load(std::memory_order_acquire) >= target;
+}
 
 // Entry points whose body returns 0 on every path. They correctly have NO alias, and #2158
 // established that its absence is the right answer rather than an oversight.
@@ -470,6 +533,133 @@ int main() {
         snprintf(msg, sizeof msg, "%-32s -> 0 (no failure path, so no alias)  got 0x%llx",
                  name, (unsigned long long)got);
         CHECK(got == 0, msg);
+    }
+
+    // ===== 9. #2575: join and detach must report their result, and only a real join writes back ===
+    // Both bodies DISCARDED the host result and returned 0 on every path, so ESRCH, EINVAL and
+    // EDEADLK all reached the guest as "the thread was joined, and here is its result" — with
+    // `*value_ptr` overwritten by the `nullptr` the discarded call left behind. That second half is
+    // what makes this worse than an ignored return code: "the worker returned NULL" and "there was
+    // no such thread" became the same observation, and a SELF-join read as a worker that finished.
+    //
+    // The self-join arm carries the #1612 half as well, and it is the only join failure in this file
+    // that can: EDEADLK is 11 on FreeBSD and 35 on Linux, and 35 is FreeBSD's EAGAIN — so a
+    // passed-through host number would tell the guest "would block, retry" where the truth is "you
+    // just tried to join yourself", which is a loop that never ends. Every other errno these two
+    // produce is EINVAL(22), which every platform agrees on and proves nothing about the mapping.
+    //
+    // EVERY SKIP BELOW IS DECIDED BY A DIRECT HOST CALL, NEVER BY THE HANDLER UNDER TEST, and that
+    // is the whole design of this section rather than a detail. The first draft asked the handler
+    // itself whether the host refuses a self-join — and the mutation that reverts the fix (make the
+    // body report 0 again) then produced `0`, which the draft read as "this host permits a
+    // self-join" and SKIPPED. The arm passed under the exact defect it exists to catch, in both the
+    // join and the detach block. A guard drawn from the same source as the null it is validating
+    // tests nothing; the host probes here are the "construct a positive instance BY HAND, outside
+    // whatever produced the null" rule applied literally.
+    printf("-- join/detach report their result; only a real join writes value_ptr (#2575) --\n");
+    {
+        HleFn sce_join     = Hle::lookup(nid_hash("scePthreadJoin"));     // onNY9Byn-W8
+        HleFn posix_join   = Hle::lookup(nid_hash("pthread_join"));
+        HleFn sce_detach   = Hle::lookup(nid_hash("scePthreadDetach"));   // 4qGrR6eoP9Y
+        HleFn posix_detach = Hle::lookup(nid_hash("pthread_detach"));
+        CHECK(sce_join && posix_join && sce_detach && posix_detach,
+              "scePthreadJoin/Detach and pthread_join/detach are registered under both spellings");
+        if (sce_join && posix_join && sce_detach && posix_detach) {
+            // --- POSITIVE CONTROL. Without it, a body broken into "refuse everything" satisfies
+            // every failure arm below, and a body that never joins at all satisfies the rc == 0 half.
+            // The exit-value readback separates them: 0x5eed can only reach `out` through a join
+            // that really completed and really read the worker's return.
+            pthread_t worker{};
+            const int created = pthread_create(&worker, nullptr, join_worker, (void*)0x5eed);
+            CHECK(created == 0, "control: a worker thread starts");
+            if (created == 0) {
+                void* out = (void*)0xC0FFEE;   // a sentinel a real join MUST overwrite
+                const uint64_t rc = sce_join((uint64_t)worker, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
+                CHECK(rc == 0, "control: scePthreadJoin of a real worker reports 0");
+                CHECK(out == (void*)0x5eed,
+                      "control: the worker's own exit value (0x5eed) reaches value_ptr — an arm that "
+                      "only checked rc == 0 would pass under the old always-0 body too");
+            }
+
+            // --- the join failure arm: a self-join, through both spellings.
+            // POSIX specifies EDEADLK here ("a deadlock was detected, or the value of thread
+            // specifies the calling thread"), so the host probe is a precondition rather than a
+            // capability test — but it is still taken from the host, for the reason in the header.
+            char msg[224];
+            const int host_self_join = pthread_join(pthread_self(), nullptr);
+            if (host_self_join == 0) {
+                printf("  [SKIP] this host's own pthread_join permits a thread to join itself — the "
+                       "#2575 EDEADLK arms cannot run here\n");
+            } else {
+                snprintf(msg, sizeof msg,
+                         "precondition: this HOST refuses a self-join with EDEADLK (host EDEADLK is "
+                         "%d here; got %d) — established by a direct host call, so no handler can "
+                         "manufacture the skip", EDEADLK, host_self_join);
+                CHECK(host_self_join == EDEADLK, msg);
+
+                void* untouched = (void*)0xC0FFEE;
+                const uint64_t sony_rc =
+                    sce_join((uint64_t)pthread_self(), (uint64_t)(uintptr_t)&untouched, 0, 0, 0, 0);
+                const uint64_t posix_rc = posix_join((uint64_t)pthread_self(), 0, 0, 0, 0, 0);
+                snprintf(msg, sizeof msg,
+                         "pthread_join(self) reports bare FreeBSD EDEADLK (11), not this host's %d "
+                         "— %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
+                         EDEADLK, EDEADLK, (unsigned long long)posix_rc);
+                CHECK(posix_rc == 11, msg);
+                snprintf(msg, sizeof msg,
+                         "scePthreadJoin(self) reports encoded FreeBSD EDEADLK 0x8002000b (got 0x%llx)",
+                         (unsigned long long)sony_rc);
+                CHECK(sony_rc == 0x8002000bull, msg);
+                CHECK(untouched == (void*)0xC0FFEE,
+                      "a REFUSED join leaves value_ptr untouched — it used to be overwritten with "
+                      "NULL, which a guest reads as a legitimate NULL exit value");
+            }
+
+            // --- detach. Its only reachable refusal is EINVAL, so it cannot carry the mapping half;
+            // what it carries is the alias split, which is the defect it actually had.
+            //
+            // Both workers park on g_park_gate, which main holds for this whole block, so their
+            // descriptors stay valid throughout — a detached thread that had already exited would be
+            // a wild pointer, not a defined EINVAL. The PROBE thread is detached by direct host
+            // calls only, so the host's answer to a second detach is ground truth; the SUBJECT
+            // thread is the handler's.
+            pthread_mutex_lock(&g_park_gate);
+            pthread_t probe{}, subject{};
+            const int probe_created   = pthread_create(&probe, nullptr, park_worker, nullptr);
+            const int subject_created = pthread_create(&subject, nullptr, park_worker, nullptr);
+            CHECK(probe_created == 0 && subject_created == 0, "control: two parked workers start");
+            if (probe_created == 0 && subject_created == 0) {
+                CHECK(wait_for(g_park_running, 2), "control: both parked workers reached the gate");
+                CHECK(pthread_detach(probe) == 0, "control: the HOST detaches a live joinable thread");
+                const int host_double = pthread_detach(probe);
+                if (host_double == 0) {
+                    printf("  [SKIP] this host's own pthread_detach accepts a second detach of the "
+                           "same thread — the #2575 detach refusal arms cannot run here\n");
+                } else {
+                    snprintf(msg, sizeof msg,
+                             "precondition: this HOST refuses a second detach with EINVAL (got %d)",
+                             host_double);
+                    CHECK(host_double == EINVAL, msg);
+
+                    CHECK(sce_detach((uint64_t)subject, 0, 0, 0, 0, 0) == 0,
+                          "control: scePthreadDetach of a live joinable thread reports 0");
+                    CHECK(pthread_detach(subject) == EINVAL,
+                          "control: …and it REALLY detached — the host now refuses a second detach. "
+                          "A body that reported 0 without calling through passes the line above and "
+                          "fails this one");
+                    CHECK(sce_detach((uint64_t)subject, 0, 0, 0, 0, 0) == kEncodedEINVAL,
+                          "scePthreadDetach of an already-detached thread reports encoded EINVAL "
+                          "(0x80020016)");
+                    CHECK(posix_detach((uint64_t)subject, 0, 0, 0, 0, 0) == kBareEINVAL,
+                          "pthread_detach of the same thread keeps the bare FreeBSD EINVAL (22)");
+                }
+            }
+            pthread_mutex_unlock(&g_park_gate);
+            // Both workers are detached, so nothing joins them; wait for them to leave the gate
+            // before returning from main rather than racing process teardown against a live thread.
+            if (probe_created == 0 && subject_created == 0)
+                CHECK(wait_for(g_park_done, 2), "control: both parked workers finished");
+        }
     }
 
     if (fails) printf("== FAIL (%d) ==\n", fails);
