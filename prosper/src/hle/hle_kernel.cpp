@@ -3188,10 +3188,20 @@ HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
 // the tool declines to clear, and both were read BY HAND:
 //   * PPSA04263+0x2b1e081, `gate-open`. Its ERROR arm — `test eax,eax; je`, not taken — never reads
 //     eax at all, and `call 0x33911f0` at +0x2b1e09b clobbers it. The site is unresolved only
-//     because the SUCCESS arm spills eax at +0x2b1e0e4, where the value is provably zero.
+//     because the SUCCESS arm spills eax at +0x2b1e0e4, where the value is zero. Do not look for a
+//     zeroing instruction — there is none, and the proof is BRANCH DOMINANCE: the only route to
+//     that spill still carrying the poll result runs through the `je` at +0x2b1e088, and the `je`
+//     being taken IS `eax == 0`. Every other route overwrites eax first (`mov eax,ecx` at
+//     +0x2b1e0ca, `mov eax,[rbx+rdx*4+0x80c]` at +0x2b1e0d3, and the error arm's `call`). Note the
+//     claim is about the tracked value, not the stack slot: [rbp-0x5c] does receive non-zero values
+//     on the routes where eax was overwritten.
 //   * PPSA04263+0x310cd21, `undecodable`. Both consumers reduce the result to one bit — `sete sil`
 //     at +0x310cd30 and `test ebx,ebx; jne` at +0x310cd48 — and no decodable path reaches a compare
-//     against any constant. The bucket comes from one path running into inter-function NOP padding.
+//     against any constant. The bucket comes from one path reaching the 14-byte alignment pad at
+//     +0x310cc92 (`66 66 66 66 66 2e 0f 1f 84 00 …`), which the classifier rejects on its `data16`
+//     prefix (#2653). That pad is INTRA-function — it aligns +0x310cca0, the target of the `jne` at
+//     +0x310cc73 in the same code stream — so this is padding before a branch target, not a walk
+//     that ran off the end of a function.
 //
 // READING THE ERROR ARM IS THE WHOLE POINT, and an earlier version of this comment claimed a bound
 // it had not earned. `nid_gate_scan` used to stop at the first branch, so a site that gates

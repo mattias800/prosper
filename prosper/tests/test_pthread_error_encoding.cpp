@@ -243,10 +243,16 @@ const char* const kInfallible[] = {
 //   * `k_barrier_destroy` encodes IN PLACE (hle_kernel.cpp:3045). It is Sony-only — nothing
 //     registers `pthread_barrier_destroy` onto that body — so there is no POSIX caller to mislead.
 //   * `k_cond_destroy` returns the BARE FreeBSD errno (hle_kernel.cpp:1033-1034) precisely BECAUSE
-//     `pthread_cond_destroy` is registered onto the same body (:4810). The Sony spelling gets its
-//     0x8002xxxx from the `SCE_PTHREAD_ALIAS` at :1049. Making this one encode in place would hand
-//     every `pthread_cond_destroy` caller a Sony-encoded value — #1984's shape — and
+//     the POSIX spelling is registered onto the same body -- grep
+//     `R("pthread_cond_destroy", k_cond_destroy)`, hle_kernel.cpp:4825 at the time of writing. The
+//     Sony spelling gets its 0x8002xxxx from the `SCE_PTHREAD_ALIAS` at :1049. Making this one
+//     encode in place would hand every POSIX caller a Sony-encoded value -- #1984's shape -- and
 //     `test_cond_destroy_busy.cpp` asserts the bare 16 for exactly that reason.
+//     (The line number is given with the symbol on purpose. This citation was already wrong once:
+//     it read :4810, correct when the reviewer wrote it and stale one rebase later, because a line
+//     number is a fact about a revision and a comment outlives revisions. That is #2665's class,
+//     and it bites hardest exactly here -- a reader who opens the cited line, finds an unrelated
+//     registration and concludes the claim is unsupported ends up believing the opposite of it.)
 // The `kInfallible` ARM still passed unchanged after both landings, because a null slot never
 // reaches the busy check -- so nothing failed, and the list's stated rationale ("returns 0 on every
 // path") silently went false while the assertion stayed green. That is the failure this split
