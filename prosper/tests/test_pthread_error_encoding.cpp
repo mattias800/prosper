@@ -586,7 +586,7 @@ int main() {
                 const uint64_t rc = sce_join((uint64_t)worker, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
                 CHECK(rc == 0, "control: scePthreadJoin of a real worker reports 0");
                 CHECK(out == (void*)0x5eed,
-                      "control: the worker's own exit value (0x5eed) reaches value_ptr — an arm that "
+                      "control: the worker's own exit value (0x5eed) reaches value_ptr -- an arm that "
                       "only checked rc == 0 would pass under the old always-0 body too");
             }
 
@@ -597,12 +597,12 @@ int main() {
             char msg[224];
             const int host_self_join = pthread_join(pthread_self(), nullptr);
             if (host_self_join == 0) {
-                printf("  [SKIP] this host's own pthread_join permits a thread to join itself — the "
+                printf("  [SKIP] this host's own pthread_join permits a thread to join itself -- the "
                        "#2575 EDEADLK arms cannot run here\n");
             } else {
                 snprintf(msg, sizeof msg,
                          "precondition: this HOST refuses a self-join with EDEADLK (host EDEADLK is "
-                         "%d here; got %d) — established by a direct host call, so no handler can "
+                         "%d here; got %d) -- established by a direct host call, so no handler can "
                          "manufacture the skip", EDEADLK, host_self_join);
                 CHECK(host_self_join == EDEADLK, msg);
 
@@ -612,7 +612,7 @@ int main() {
                 const uint64_t posix_rc = posix_join((uint64_t)pthread_self(), 0, 0, 0, 0, 0);
                 snprintf(msg, sizeof msg,
                          "pthread_join(self) reports bare FreeBSD EDEADLK (11), not this host's %d "
-                         "— %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
+                         "-- %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
                          EDEADLK, EDEADLK, (unsigned long long)posix_rc);
                 CHECK(posix_rc == 11, msg);
                 snprintf(msg, sizeof msg,
@@ -620,7 +620,7 @@ int main() {
                          (unsigned long long)sony_rc);
                 CHECK(sony_rc == 0x8002000bull, msg);
                 CHECK(untouched == (void*)0xC0FFEE,
-                      "a REFUSED join leaves value_ptr untouched — it used to be overwritten with "
+                      "a REFUSED join leaves value_ptr untouched -- it used to be overwritten with "
                       "NULL, which a guest reads as a legitimate NULL exit value");
             }
 
@@ -643,7 +643,7 @@ int main() {
                 const int host_double = pthread_detach(probe);
                 if (host_double == 0) {
                     printf("  [SKIP] this host's own pthread_detach accepts a second detach of the "
-                           "same thread — the #2575 detach refusal arms cannot run here\n");
+                           "same thread -- the #2575 detach refusal arms cannot run here\n");
                 } else {
                     snprintf(msg, sizeof msg,
                              "precondition: this HOST refuses a second detach with EINVAL (got %d)",
@@ -653,7 +653,7 @@ int main() {
                     CHECK(sce_detach((uint64_t)subject, 0, 0, 0, 0, 0) == 0,
                           "control: scePthreadDetach of a live joinable thread reports 0");
                     CHECK(pthread_detach(subject) == EINVAL,
-                          "control: …and it REALLY detached — the host now refuses a second detach. "
+                          "control: ...and it REALLY detached -- the host now refuses a second detach. "
                           "A body that reported 0 without calling through passes the line above and "
                           "fails this one");
                     CHECK(sce_detach((uint64_t)subject, 0, 0, 0, 0, 0) == kEncodedEINVAL,
