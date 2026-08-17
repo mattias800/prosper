@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace prosper::frontend {
@@ -59,29 +60,68 @@ void imgui_vk_result(VkResult r) {
 
 LibraryUi::~LibraryUi() { shutdown(); }
 
+// One combined-image-sampler set per texture, and FREE_DESCRIPTOR_SET because covers and backgrounds are
+// individually released (ImGui_ImplVulkan_RemoveTexture calls vkFreeDescriptorSets).
+VkDescriptorPool LibraryUi::create_descriptor_pool(uint32_t sets) const {
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sets};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpi.maxSets = sets;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &size;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (vkCreateDescriptorPool(device_, &dpi, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return pool;
+}
+
+bool LibraryUi::init_imgui_vulkan() {
+    ImGui_ImplVulkan_InitInfo vi{};
+    vi.Instance = instance_;
+    vi.PhysicalDevice = phys_;
+    vi.Device = device_;
+    vi.QueueFamily = qfamily_;
+    vi.Queue = queue_;
+    vi.DescriptorPool = pool_;
+    vi.RenderPass = renderPass_;
+    vi.MinImageCount = imageCount_;
+    vi.ImageCount = imageCount_;
+    vi.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    vi.CheckVkResultFn = imgui_vk_result;
+    return ImGui_ImplVulkan_Init(&vi);
+}
+
 bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice phys, VkDevice device,
                      uint32_t queue_family, VkQueue queue, VkSwapchainKHR swapchain,
                      VkFormat swapchain_format, const std::vector<VkImage>& swapchain_images,
                      VkExtent2D extent) {
-    window_ = window; device_ = device; phys_ = phys; queue_ = queue; qfamily_ = queue_family;
+    window_ = window; instance_ = instance; device_ = device; phys_ = phys; queue_ = queue;
+    qfamily_ = queue_family;
     swapchain_ = swapchain;
+    imageCount_ = static_cast<uint32_t>(swapchain_images.size());
 
-    // A pool large enough for ImGui's font atlas plus one descriptor per cover. Sized from the grid,
-    // not guessed: exceeding it would silently drop covers.
-    const uint32_t kMaxTextures = 256;
-    VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxTextures },
-    };
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = kMaxTextures;
-    dpi.poolSizeCount = 1;
-    dpi.pPoolSizes = sizes;
-    if (vkCreateDescriptorPool(device_, &dpi, nullptr, &pool_) != VK_SUCCESS) {
+    // PROSPER_LIBRARY_POOL_SETS forces a small pool so #1649's exhaustion can be reproduced without
+    // owning 250 games. Deliberately a HARD cap that a grow cannot lift: the point of the knob is to
+    // reach the path where a cover has no descriptor left, and see that it costs that cover and nothing
+    // else. Unset (the normal case) leaves the sizing entirely to the library's title count.
+    if (const char* cap = SDL_getenv("PROSPER_LIBRARY_POOL_SETS")) {
+        const long v = std::strtol(cap, nullptr, 10);
+        if (v > 0) {
+            poolCap_ = static_cast<uint32_t>(v);
+            fprintf(stderr, "[library] PROSPER_LIBRARY_POOL_SETS=%u: descriptor pool capped\n", poolCap_);
+        }
+    }
+
+    // Sized from the library, not fixed (#1649). The games are not scanned yet at this point, so this is
+    // the floor; the first set_games() grows it to fit the real title count.
+    poolSets_ = library_descriptor_pool_sets(0);
+    if (poolCap_ && poolSets_ > poolCap_) poolSets_ = poolCap_;
+    pool_ = create_descriptor_pool(poolSets_);
+    if (pool_ == VK_NULL_HANDLE) {
         fprintf(stderr, "[library] descriptor pool creation failed\n");
         shutdown();
         return false;
     }
+    budget_.reset(library_texture_budget(poolSets_));
 
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -130,19 +170,7 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
 
     if (!ImGui_ImplSDL3_InitForVulkan(window_)) { fprintf(stderr, "[library] SDL3 backend init failed\n"); shutdown(); return false; }
     sdlInit_ = true;
-    ImGui_ImplVulkan_InitInfo vi{};
-    vi.Instance = instance;
-    vi.PhysicalDevice = phys_;
-    vi.Device = device_;
-    vi.QueueFamily = qfamily_;
-    vi.Queue = queue_;
-    vi.DescriptorPool = pool_;
-    vi.RenderPass = renderPass_;
-    vi.MinImageCount = static_cast<uint32_t>(swapchain_images.size());
-    vi.ImageCount = static_cast<uint32_t>(swapchain_images.size());
-    vi.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-    vi.CheckVkResultFn = imgui_vk_result;
-    if (!ImGui_ImplVulkan_Init(&vi)) { fprintf(stderr, "[library] Vulkan backend init failed\n"); shutdown(); return false; }
+    if (!init_imgui_vulkan()) { fprintf(stderr, "[library] Vulkan backend init failed\n"); shutdown(); return false; }
     vulkanInit_ = true;
     ready_ = true;
 
@@ -159,7 +187,7 @@ bool LibraryUi::init(SDL_Window* window, VkInstance instance, VkPhysicalDevice p
     const char* musicEnv = SDL_getenv("PROSPER_LAUNCHER_MUSIC");
     musicToggle_ = resolve_launcher_music(musicEnv, musicToggle_, /*automated=*/stats_);
     const float gain = resolve_launcher_music_gain(SDL_getenv("PROSPER_LAUNCHER_MUSIC_VOLUME"));
-    if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, musicToggle_, gain))
+    if (!media_.init(phys_, device_, queue_, qfamily_, sampler_, &budget_, musicToggle_, gain))
         fprintf(stderr, "[library] background art and music unavailable\n");
     // Mirror the EFFECTIVE state, not the request: if the audio device could not be opened the checkbox
     // must show unticked, or set_music_enabled() sees no change on the first click and swallows it.
@@ -233,6 +261,7 @@ bool LibraryUi::recreate_swapchain(VkSwapchainKHR swapchain, VkFormat format,
     vkDeviceWaitIdle(device_);
     destroy_render_target();
     swapchain_ = swapchain;
+    imageCount_ = static_cast<uint32_t>(images.size());
     if (!create_render_target(format, images, extent)) { ready_ = false; return false; }
     return true;
 }
@@ -274,17 +303,67 @@ void LibraryUi::shutdown() {
     if (renderSem_)  { vkDestroySemaphore(device_, renderSem_, nullptr);   renderSem_ = VK_NULL_HANDLE; }
     if (cmdPool_)    { vkDestroyCommandPool(device_, cmdPool_, nullptr);   cmdPool_ = VK_NULL_HANDLE; cmd_ = VK_NULL_HANDLE; }
     if (pool_)       { vkDestroyDescriptorPool(device_, pool_, nullptr);   pool_ = VK_NULL_HANDLE; }
+    poolSets_ = 0;
+    budget_.reset(0);   // nothing may be allocated until a later init() creates a pool again
     ready_ = false;
 }
 
 void LibraryUi::destroy_covers() {
     for (Cover& c : covers_) {
-        if (c.set)    ImGui_ImplVulkan_RemoveTexture(c.set);
+        release_texture_set(budget_, c.set, VkDescriptorSet(VK_NULL_HANDLE),
+                            [](VkDescriptorSet s) { ImGui_ImplVulkan_RemoveTexture(s); });
         if (c.view)   vkDestroyImageView(device_, c.view, nullptr);
         if (c.image)  vkDestroyImage(device_, c.image, nullptr);
         if (c.memory) vkFreeMemory(device_, c.memory, nullptr);
     }
     covers_.clear();
+}
+
+// Grow the descriptor pool to fit `title_count` covers. The pool handle is baked into ImGui's Vulkan
+// backend at init time and the vendored backend offers no way to swap it, so growing means creating the
+// new pool, releasing every set prosper holds out of the old one, and re-running
+// ImGui_ImplVulkan_Init — which rebuilds the font atlas and the UI pipeline against the new pool. That
+// is affordable here because this only runs when the library actually got bigger: once at startup for a
+// library above the floor, and again if the user points the app at a larger folder.
+//
+// Never shrinks. A rescan that finds FEWER games would otherwise churn the backend for nothing, and the
+// spare sets cost a few hundred bytes.
+bool LibraryUi::ensure_descriptor_capacity(size_t title_count) {
+    if (!ready_ || device_ == VK_NULL_HANDLE) return false;
+    uint32_t want = library_descriptor_pool_sets(title_count);
+    if (poolCap_ && want > poolCap_) want = poolCap_;
+    if (want <= poolSets_) return true;
+
+    // Create first, swap second: if the driver refuses the bigger pool we still have a working one, and
+    // the budget below simply keeps costing an image per title past capacity.
+    VkDescriptorPool fresh = create_descriptor_pool(want);
+    if (fresh == VK_NULL_HANDLE) {
+        fprintf(stderr, "[library] could not grow the descriptor pool to %u sets; %zu titles share %u\n",
+                want, title_count, poolSets_);
+        return false;
+    }
+
+    // Both holders of sets from the old pool must let go before it is destroyed. The caller already
+    // destroyed the covers; the backgrounds are released here, and are reloaded on the next focus change.
+    media_.release_backgrounds();
+    if (vulkanInit_) { ImGui_ImplVulkan_Shutdown(); vulkanInit_ = false; }
+    vkDestroyDescriptorPool(device_, pool_, nullptr);
+    pool_ = fresh;
+    poolSets_ = want;
+    poolFullWarned_ = false;   // a bigger pool may well hold everything; let it say so again if not
+    budget_.reset(library_texture_budget(poolSets_));
+    if (!init_imgui_vulkan()) {
+        // Nothing can draw without the backend, and the pool it would have used is already gone. Same
+        // outcome as a failed init(): the app falls back to the flat idle colour.
+        fprintf(stderr, "[library] Vulkan backend re-init failed after growing the descriptor pool\n");
+        ready_ = false;
+        return false;
+    }
+    vulkanInit_ = true;
+    // Worth a line: it is the only place the pool changes size, and it says out loud how many covers the
+    // run can actually hold — which is exactly the number #1649 was silently wrong about.
+    fprintf(stderr, "[library] descriptor pool grown to %u sets for %zu titles\n", poolSets_, title_count);
+    return true;
 }
 
 void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games_dir) {
@@ -296,6 +375,9 @@ void LibraryUi::set_games(std::vector<GameEntry> games, const std::string& games
 
     if (device_) vkDeviceWaitIdle(device_);   // covers may still be referenced by an in-flight frame
     destroy_covers();
+    // After destroy_covers() and the device wait, so the grow finds the old pool free of cover sets and
+    // no frame in flight that could still be sampling one.
+    ensure_descriptor_capacity(games.size());
     games_ = std::move(games);
     gamesDir_ = games_dir;
     covers_.resize(games_.size());
@@ -441,13 +523,31 @@ VkDescriptorSet LibraryUi::cover_for(const GameEntry& game) {
         ivi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         ok = vkCreateImageView(device_, &ivi, nullptr, &cover.view) == VK_SUCCESS;
     }
+    bool poolFull = false;
     if (ok) {
-        cover.set = ImGui_ImplVulkan_AddTexture(sampler_, cover.view,
-                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        // Through the budget, NOT straight to AddTexture: on a full pool that helper hands the
+        // VK_NULL_HANDLE from vkAllocateDescriptorSets to vkUpdateDescriptorSets, so checking its return
+        // value would be checking after the undefined behaviour (#1649).
+        poolFull = budget_.available() == 0;
+        cover.set = acquire_texture_set(budget_, VkDescriptorSet(VK_NULL_HANDLE), [&] {
+            return ImGui_ImplVulkan_AddTexture(sampler_, cover.view,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
     }
     if (!ok || !cover.set) {
         // Leave the entry usable without art rather than dropping a bootable title from the list.
-        fprintf(stderr, "[library] could not upload cover for %s\n", game.title_name.c_str());
+        // Said once for an exhausted pool: every remaining title would repeat it, and the cause is a
+        // property of the pool rather than of this icon.
+        if (poolFull) {
+            if (!poolFullWarned_) {
+                poolFullWarned_ = true;
+                fprintf(stderr,
+                        "[library] descriptor pool full at %u sets; titles past this show no cover art\n",
+                        poolSets_);
+            }
+        } else {
+            fprintf(stderr, "[library] could not upload cover for %s\n", game.title_name.c_str());
+        }
         if (cover.view)   { vkDestroyImageView(device_, cover.view, nullptr); cover.view = VK_NULL_HANDLE; }
         if (cover.image)  { vkDestroyImage(device_, cover.image, nullptr);    cover.image = VK_NULL_HANDLE; }
         if (cover.memory) { vkFreeMemory(device_, cover.memory, nullptr);     cover.memory = VK_NULL_HANDLE; }
