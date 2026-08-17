@@ -196,7 +196,35 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   Never `cd` back to the main repo root to run git or builds. If you MUST touch the main checkout,
   assume another agent is actively working there — check `git status` first and don't reset/stash/
   switch branches under them (the stash stack is shared too — see the worktree note in the environment
-  preamble). Your worktree is auto-cleaned when its branch merges.
+  preamble).
+  - **Nothing cleans your worktree up. This line used to claim "your worktree is auto-cleaned when
+    its branch merges", and that mechanism never existed** — no git hook, no `core.hooksPath`, no
+    `hooks` key in any settings.json, no `.claude/hooks/`, no workflow, no timer, and — until the
+    sweeper below — no script in the repo that called `git worktree remove` or `prune` at all. The
+    claim entered as prose in #332 with no code beside it, and by the time #1735 measured the damage
+    there were 121 stale trees / 111 GB; a fortnight later, **278**. The likely origin is a real
+    harness feature — subagents launched with `isolation: "worktree"` are cleaned up **if
+    unchanged** — generalized into a promise about hand-made `git worktree add` trees, which the
+    harness knows nothing about, and stripped of the one condition that made it true. A charter that
+    promises a safety net nobody has is worse than one that admits the manual step: everybody skips
+    the cleanup *and* nobody files the bug.
+  - **So remove your own worktree when your branch merges**, and run the sweeper periodically:
+    ```bash
+    python3 prosper/tools/worktree_reclaim.py              # census; touches nothing
+    python3 prosper/tools/worktree_reclaim.py --remove --yes
+    ```
+    It refuses any tree that is unmerged, dirty (untracked counts), locked, nested, recently touched,
+    or held by a live process — checked against `/proc/*/cwd`, `exe`, open fds and mappings, matched
+    by inode so a container's `/home` spelling of a `/var/home` path still counts, and re-checked
+    immediately before each individual removal. That last guard is not paranoia: **removing a
+    worktree a live shell is `cd`'d into wedges that shell irrecoverably**, and it has happened here.
+    It never deletes a branch.
+    **What it does NOT protect: gitignored files.** `git status` does not list them, so a tree whose
+    only content is an ignored `build-linux/` or a run log reads as clean and is removed with it —
+    which is mostly the point, but this charter also tells you to put run artifacts in "a gitignored
+    worktree-local directory". Move anything you want to keep out of the tree, or `git worktree lock`
+    it. On macOS and Windows the tool classifies but never removes: the in-use guard needs `/proc`,
+    and without it the tool cannot prove nobody is inside, so it fails closed.
 - **On a Windows host, run git through PowerShell (Windows git), not WSL.** The repo lives on the
   Windows filesystem (`C:\...` = `/mnt/c/...`), and worktrees created from Windows store a
   Windows-path gitdir link (`gitdir: C:/Users/.../.git/worktrees/<name>`). WSL's git can't resolve
