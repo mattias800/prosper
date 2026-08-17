@@ -549,9 +549,14 @@ int main() {
     // PROSPER_DENY_SUBSTR case-insensitivity (#1237): the fixture EXISTS on disk, but its name
     // contains a CASE VARIANT of the armed ".tmpdeny" substring — the deny must still fire.
     {
-        const std::string deny_fixture_storage =
-            prosper_test::test_scratch_file("prosper-deny-fixture.TmpDeny");
-        const char* deny_fixture = deny_fixture_storage.c_str();
+        // Deliberately NOT tests/test_scratch.h, and measured rather than assumed. Converting this
+        // one made the assertion below FAIL on Windows/MinGW while passing on Linux: `translate()`
+        // composes the deny redirect as `"/prosper-denied" + path`, which for a host-absolute
+        // Windows path yields `/prosper-deniedC:\...` — a spelling whose CRT error is not the ENOENT
+        // this asserts. The knob is documented for GUEST paths, so an absolute host path with a
+        // drive letter is a shape it was never given; what is under test here is the case-insensitive
+        // MATCH, not the location. Left relative so the assertion keeps its meaning (#1621, #2599).
+        const char* deny_fixture = "prosper-deny-fixture.TmpDeny";
         FILE* deny_out = std::fopen(deny_fixture, "wb");
         CHECK(deny_out != nullptr, "create deny fixture");
         if (deny_out) { std::fputs("x", deny_out); std::fclose(deny_out); }
