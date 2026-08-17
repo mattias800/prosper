@@ -115,14 +115,43 @@ carries no debug info, and that is precisely the configuration on which this
 feature used to record nothing at all (#2075). When both answer they must agree,
 and a disagreement prints a loud `value-source-MISMATCH:` line.
 
-Two limits to know before believing a number: `--values` records the return
-**register**, never an out-struct, so a handler that returns 0 while writing
-wrong bytes through a pointer is invisible; and on a handler that longjmps back
+One limit to know before believing a number: on a handler that longjmps back
 into its own caller, gdb's finish breakpoint can capture the *landing* value as
 if it were a return (measured on gdb 17.2), so a `(captured N/M)` row's other
 values are suspect rather than merely fewer.
 
 `--values` costs a second trap per call, so pair it with `--filter`.
+
+Out-structs — the half a return value cannot reach
+--------------------------------------------------
+`--values` records the return **register**. The recurring defect on this codebase
+is the one that register cannot see: *success returned, out-struct never
+written*. `sceSystemServiceGetStatus` aliased to the wrong handler,
+`sceSystemServiceGetDisplaySafeAreaInfo` leaving `ratio` at 0,
+`sceNpEntitlementAccessGetSkuFlag` unregistered with its out pointer untouched,
+`sceNpTrophy2GetTrophyInfoArray` handing back a garbage count — every one of them
+returns `0`, and every one is invisible in a value census.
+
+`--out-bytes N` snapshots N bytes at whichever of a0/a1 is a readable pointer,
+**before and after** each call, and reports what changed:
+
+    5  s_syss_getstatus   ret 0x0 x5
+            out a0[12] calls=5 read=5 changed=5 same-zero=0 same-nonzero=0 \\
+                null=0 small=0 unreadable=0 lost=0
+              @5 00->01 @6 00->01  x5
+
+The before/after form is what makes it self-validating, and every counter is
+printed including the zeros: `changed=0 same-zero=12` (the handler wrote nothing
+into a buffer that was zero) and `read=0 unreadable=12` (this tool never saw the
+bytes) are the two readings that must never be confused, and a field that
+disappeared when zero would let the second read as the first.
+
+`same-nonzero` is the one genuinely ambiguous state: the bytes already held a
+value, so a handler that wrote exactly that is indistinguishable from one that
+wrote nothing — a guest polling into a buffer it does not clear produces it.
+`lost` means the entry snapshot had no second half (the frame left without
+returning, or the memory went away): neither reading, and counted apart from
+both.
 
 The launched process's own output
 --------------------------------
@@ -156,6 +185,9 @@ import tempfile
 
 HLE_SIGNATURE = ("(unsigned long, unsigned long, unsigned long, "
                  "unsigned long, unsigned long, unsigned long)")
+# --out-bytes ceiling. Two reads of this width per call per argument, and the whole snapshot is held
+# per in-flight call; a struct worth inspecting here is tens of bytes, not kilobytes.
+OUT_BYTES_MAX = 256
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -199,6 +231,47 @@ def enumerate_handlers(binary, name_filter):
         seen.add(short)
         out.append((addr, short))
     return out
+
+
+def refuse_if_pie(binary):
+    """Stop with a reason on a position-independent executable, rather than letting gdb spew.
+
+    This tool arms breakpoints at the RAW addresses `nm` reports, which are link-time addresses. In a
+    non-PIE executable (`ET_EXEC`) they are the runtime addresses too, which is why this works at all
+    -- prosper's own binaries are `ET_EXEC` as built by the toolchains this project uses. Under a
+    toolchain that defaults to `-pie` (Ubuntu's gcc does; Fedora's does not) the same addresses are
+    offsets from a load base chosen at run time, so every breakpoint lands in unmapped memory:
+
+        Cannot insert breakpoint 3.
+        Cannot access memory at address 0x1149
+
+    gdb prints that per breakpoint and the run yields no result block -- loud, but three steps away
+    from naming its own cause. Measured on a GitHub `ubuntu-24.04` runner, where the same fixture
+    that passes here failed exactly this way.
+
+    Refusing rather than guessing a base is deliberate: in `--launch` mode the whole point is that
+    breakpoints are armed BEFORE the process exists, so there is no bias to read yet, and inferring
+    one from gdb's disabled-randomization default would produce a number that is right until it
+    silently is not. Making this work on a PIE build is a real feature (attach mode could read the
+    bias from `/proc/<pid>/maps`) and is tracked separately.
+    """
+    try:
+        with open(binary, "rb") as handle:
+            header = handle.read(18)
+    except OSError as exc:
+        sys.exit("hle_calls: cannot read %s: %s" % (binary, exc))
+    if len(header) < 18 or header[:4] != b"\x7fELF":
+        return                      # not an ELF; let the later steps produce their own message
+    little = header[5] == 1
+    e_type = int.from_bytes(header[16:18], "little" if little else "big")
+    if e_type == 3:                 # ET_DYN -- a PIE (or a shared object)
+        sys.exit(
+            "hle_calls: %s is a position-independent executable (ET_DYN), and this tool arms the "
+            "raw link-time addresses `nm` reports, so every breakpoint would land in unmapped "
+            "memory (gdb: 'Cannot insert breakpoint N / Cannot access memory at address 0x...'). "
+            "Build the target non-PIE -- e.g. cmake -DCMAKE_EXE_LINKER_FLAGS=-no-pie -- which is "
+            "what prosper's binaries already are under the toolchains this project uses. Refusing "
+            "here rather than reporting a window that armed nothing." % binary)
 
 
 def _prepare_inferior_log(path):
@@ -248,6 +321,12 @@ def main():
     ap.add_argument("--values", action="store_true",
                     help="also record each handler's return values (costs a second trap per "
                          "call — pair it with --filter)")
+    ap.add_argument("--out-bytes", type=int, default=0, metavar="N",
+                    help="also snapshot N bytes at whichever of a0/a1 is a readable pointer, "
+                         "before and after each call, and report what CHANGED. This is the half a "
+                         "return-value census cannot reach: the recurring bug shape here is "
+                         "'success returned, out-struct never written', which returns 0 every time. "
+                         "Costs two memory reads per call per argument — pair it with --filter.")
     ap.add_argument("--order", type=int, default=24,
                     help="how many leading calls to report in call order (default 24); this is "
                          "what shows whether the window covered init")
@@ -276,6 +355,11 @@ def main():
         sys.exit("hle_calls: pass exactly one of --pid <pid> or --launch <program> [args...]")
     # Refuse rather than silently ignore: in --pid mode the emulator is not this tool's child,
     # it already owns its stdout/stderr, and accepting the flag would imply we redirected them.
+    # A refusal rather than a clamp: a run that quietly sampled a different width than the one asked
+    # for would put an unfalsifiable number in front of a reader.
+    if args.out_bytes < 0 or args.out_bytes > OUT_BYTES_MAX:
+        sys.exit("hle_calls: --out-bytes must be between 0 (off) and %d; got %d"
+                 % (OUT_BYTES_MAX, args.out_bytes))
     if not args.launch and args.inferior_log is not None:
         sys.exit("hle_calls: --inferior-log applies to --launch only — a --pid target owns its "
                  "own output and this tool cannot redirect it")
@@ -286,6 +370,9 @@ def main():
         binary = args.binary or os.path.realpath("/proc/%d/exe" % args.pid)
     if not os.path.exists(binary):
         sys.exit("hle_calls: no such binary: %s" % binary)
+    # Before anything expensive: a PIE would arm hundreds of breakpoints at unmapped addresses and
+    # report a window that measured nothing. See refuse_if_pie().
+    refuse_if_pie(binary)
 
     handlers = enumerate_handlers(binary, args.filter)
     if not handlers:
@@ -311,6 +398,7 @@ def main():
     env["HLE_CALLS_MODE"] = "launch" if args.launch else "attach"
     env["HLE_CALLS_VALUES"] = "1" if args.values else "0"
     env["HLE_CALLS_ORDER"] = str(args.order)
+    env["HLE_CALLS_OUT_BYTES"] = str(args.out_bytes)
     script = os.path.join(HERE, "hle_calls_gdb.py")
     if args.launch:
         # `--args` must come last; the gdb script issues the `run` itself, after

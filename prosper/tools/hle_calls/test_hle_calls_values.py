@@ -90,36 +90,68 @@ def gdb_can_launch(gdb):
     return None
 
 
-def compile_fixture(cxx, out, debug):
-    cmd = [cxx, "-O0", "-g" if debug else "-g0", "-o", out, FIXTURE]
+def compile_fixture(cxx, out, debug, pie=False, optional=False):
+    """Build the fixture. `-no-pie` is load-bearing, not tidiness.
+
+    hle_calls arms breakpoints at the raw link-time addresses `nm` reports, so the target must be
+    `ET_EXEC` -- as prosper's own binaries are. Ubuntu's gcc defaults to `-pie` while Fedora's does
+    not, so a fixture built without this flag is a different program on the two, and the CI arm of
+    this very test failed that way (`Cannot access memory at address 0x1149`, no result block) while
+    passing locally. The `pie=True` arm below exists to pin the REFUSAL that now replaces that spew.
+    """
+    cmd = [cxx, "-O0", "-g" if debug else "-g0",
+           "-fPIE" if pie else "-fno-pie", "-pie" if pie else "-no-pie",
+           "-o", out, FIXTURE]
     done = subprocess.run(cmd, capture_output=True, text=True)
     if done.returncode != 0:
-        print("  [FAIL] could not compile the fixture (%s):\n%s" % (" ".join(cmd), done.stderr))
+        # A toolchain that cannot produce the requested linkage says nothing about the tool, so the
+        # PIE arm reports that as a skip. The two main arms still fail: without them there is no
+        # test at all.
+        prefix = "  [skip] " if optional else "  [FAIL] "
+        print("%scould not compile the fixture (%s):\n%s" % (prefix, " ".join(cmd), done.stderr))
         return False
     return True
 
 
-def run_arm(binary, ticks=12):
-    """Run the real driver over one fixture build; return (header_fields, rows, raw)."""
+def run_arm(binary, ticks=12, out_bytes=0):
+    """Run the real driver over one fixture build; return (header_fields, rows, outs, raw)."""
     cmd = [sys.executable, DRIVER, "--ticks", str(ticks), "--values", "--order", "8",
-           "--filter", "^s_", "--timeout", "180", "--launch", binary]
+           "--filter", "^s_", "--timeout", "180"]
+    if out_bytes:
+        cmd += ["--out-bytes", str(out_bytes)]
+    cmd += ["--launch", binary]
     done = subprocess.run(cmd, capture_output=True, text=True)
     raw = done.stdout + done.stderr
-    fields, rows = {}, {}
+    fields, rows, outs = {}, {}, {}
+    current, current_out = None, None
     for line in done.stdout.splitlines():
         if line.startswith("clock="):
             for token in line.split():
                 if "=" in token:
                     key, _, value = token.partition("=")
                     fields[key] = value
+            continue
+        out = re.match(r"\s+out (a\d)\[(\d+)\] (.*)$", line)
+        if out and current:
+            current_out = (current, out.group(1))
+            stats = {"width": int(out.group(2)), "shapes": {}}
+            for key, value in re.findall(r"([a-z-]+)=(\d+)", out.group(3)):
+                stats[key] = int(value)
+            outs[current_out] = stats
+            continue
+        shape = re.match(r"\s+(@\d+ .*?)\s+x(\d+)$", line)
+        if shape and current_out:
+            outs[current_out]["shapes"][shape.group(1)] = int(shape.group(2))
+            continue
         m = re.match(r"\s*(\d+)\s+(\S+)(.*)$", line)
-        if m and not line.startswith("clock="):
+        if m:
             name, tail = m.group(2), m.group(3)
             seen = {}
             for value, count in re.findall(r"(0x[0-9a-f]+) x(\d+)", tail):
                 seen[int(value, 16)] = int(count)
             rows[name] = {"calls": int(m.group(1)), "values": seen, "tail": tail}
-    return fields, rows, raw
+            current, current_out = name, None
+    return fields, rows, outs, raw
 
 
 def check_arm(label, fields, rows, raw, expect_source):
@@ -178,6 +210,76 @@ def check_arm(label, fields, rows, raw, expect_source):
           % (label, WIDE, [hex(v) for v in wide["values"]]))
 
 
+def check_out_arm(fields, rows, outs, raw):
+    """The --out-bytes arm (#2045): what the handler WROTE, which the return register cannot say.
+
+    Every expected value here comes from `test_values_fixture.cpp`, which in turn mirrors the real
+    handlers named in the issue — `s_syss_getstatus` writes 12 bytes with `st[6] = 1`, and
+    `s_user_getevent` writes `{0, 1}` on the one call that delivers the LOGIN. Both are known from
+    source before the run, which is the only kind of check worth having on an instrument.
+    """
+    label = "out-bytes"
+    check(fields.get("out-bytes") == "12", "%s: the header states the sampled width (out-bytes=%s)"
+          % (label, fields.get("out-bytes")))
+
+    wrote = outs.get(("s_fixture_writes12", "a0"), {})
+    check(wrote.get("read", 0) > 0 and wrote.get("read") == wrote.get("calls"),
+          "%s: the writer's out-pointer was sampled on every call (%s)" % (label, wrote))
+    check(wrote.get("changed", 0) == wrote.get("read", -1),
+          "%s: every sampled call showed a write (changed=%s read=%s)"
+          % (label, wrote.get("changed"), wrote.get("read")))
+    check(list(wrote.get("shapes", {})) == ["@6 00->01"],
+          "%s: the diff is exactly the byte the source writes, st[6]=1 (%s)"
+          % (label, list(wrote.get("shapes", {}))))
+
+    # THE distinction the feature exists for. Same width, same call count, both readable — one
+    # handler wrote and the other did not, and the counters say which without ambiguity.
+    quiet = outs.get(("s_fixture_nowrite", "a0"), {})
+    check(quiet.get("read", 0) > 0 and quiet.get("changed", -1) == 0,
+          "%s: a handler that writes nothing reads as changed=0, not as a failure (%s)"
+          % (label, quiet))
+    check(quiet.get("same-zero", 0) == quiet.get("read", -1),
+          "%s: its unwritten buffer is same-zero, the unambiguous 'nothing was written' (%s)"
+          % (label, quiet))
+
+    # ... and "nothing was READ" must never look like either of those.
+    bad = outs.get(("s_fixture_badptr", "a0"), {})
+    check(bad.get("unreadable", 0) > 0 and bad.get("read", -1) == 0 and bad.get("changed", -1) == 0,
+          "%s: an unmapped out-pointer is unreadable=N read=0 — nothing was READ (%s)" % (label, bad))
+    small = outs.get(("s_fixture_handlearg", "a0"), {})
+    check(small.get("small", 0) > 0 and small.get("read", -1) == 0,
+          "%s: a small handle argument is counted as small, not as unreadable (%s)" % (label, small))
+    check(("s_fixture_nullarg", "a0") not in outs
+          and "were NULL on every call" in raw,
+          "%s: an always-null argument gets the explicit null line, not a silent absence" % label)
+
+    # The out-struct positive control, from the same source contract as the value control: the LOGIN
+    # call is the only one that writes, so exactly one sample may differ.
+    control = outs.get((CONTROL, "a0"), {})
+    check(control.get("changed", -1) == 1,
+          "%s: %s wrote its event struct on exactly one call (%s)" % (label, CONTROL, control))
+    check(list(control.get("shapes", {})) == ["@4 00->01"],
+          "%s: and the write is userId=1 at offset 4 (%s)" % (label, list(control.get("shapes", {}))))
+    check(control.get("same-zero", 0) == control.get("read", 0) - 1,
+          "%s: every other %s call left the struct untouched (%s)" % (label, CONTROL, control))
+
+    # The ambiguous state, asserted rather than merely documented: a buffer the guest does not clear,
+    # rewritten with the same bytes every call. Exactly one call can show a diff; the rest ARE writes
+    # and are indistinguishable from silence, which is what `same-nonzero` says and `same-zero` must
+    # not. Collapsing the two would make this instrument claim more than it can see.
+    rewrite = outs.get(("s_fixture_rewrite", "a0"), {})
+    check(rewrite.get("changed", -1) == 1 and rewrite.get("same-nonzero", 0) == rewrite.get("read", 0) - 1,
+          "%s: a repeated identical write reads as same-nonzero, not as a write (%s)"
+          % (label, rewrite))
+    check(rewrite.get("same-zero", -1) == 0,
+          "%s: and never as same-zero, which would claim nothing was written (%s)" % (label, rewrite))
+    check(rows.get(CONTROL, {}).get("values", {}).get(LOGIN, 0) == 1,
+          "%s: the value capture still works alongside the out-byte sampling" % label)
+    check(fields.get("finish-failures") == "0" and "(captured " not in raw,
+          "%s: sampling out-bytes cost no return-value capture (finish-failures=%s)"
+          % (label, fields.get("finish-failures")))
+
+
 def main():
     print("== test_hle_calls_values ==")
     if sys.platform != "linux":
@@ -201,13 +303,47 @@ def main():
         # the configuration on which every value capture failed.
         arms = (("no-debug-info", os.path.join(work, "fixture_nodbg"), False, "rax"),
                 ("debug-info", os.path.join(work, "fixture_dbg"), True, "dwarf"))
+        built = {}
         for label, path, debug, expect in arms:
             if not compile_fixture(cxx, path, debug):
                 global fails
                 fails += 1
                 continue
-            fields, rows, raw = run_arm(path)
+            built[label] = path
+            fields, rows, outs, raw = run_arm(path)
             check_arm(label, fields, rows, raw, expect)
+        # Third arm: the same no-debug-info binary, now with --out-bytes. Run apart from the two
+        # above so the default path (out-bytes off) stays covered rather than only the new one.
+        if "no-debug-info" in built:
+            fields, rows, outs, raw = run_arm(built["no-debug-info"], out_bytes=12)
+            check_out_arm(fields, rows, outs, raw)
+
+        # Fourth arm: a PIE build must be REFUSED by name, not attempted. Every address this tool
+        # arms is a link-time address, so on a PIE they are offsets and each breakpoint lands in
+        # unmapped memory -- gdb then prints "Cannot insert breakpoint N" per handler and the run
+        # produces no result block, which is three steps from naming its own cause. This arm is here
+        # because that is exactly how the test failed on a GitHub ubuntu-24.04 runner while passing
+        # on Fedora: the two toolchains disagree on the -pie default, so the fixture was a different
+        # program on each.
+        pie_path = os.path.join(work, "fixture_pie")
+        if compile_fixture(cxx, pie_path, debug=False, pie=True, optional=True):
+            done = subprocess.run([sys.executable, DRIVER, "--ticks", "4", "--values",
+                                   "--filter", "^s_", "--timeout", "60", "--launch", pie_path],
+                                  capture_output=True, text=True)
+            message = done.stdout + done.stderr
+            check(done.returncode != 0,
+                  "pie: the driver refuses a PIE target (exit %d)" % done.returncode)
+            check("position-independent" in message and "-no-pie" in message,
+                  "pie: and the refusal names the cause and the fix (%s)"
+                  % message.strip().splitlines()[-1][:160] if message.strip() else "pie: no message")
+            # The refusal must come BEFORE any work, and the tell has to be a string only the
+            # not-taken path can print. Two earlier attempts here were void for exactly the reason
+            # this test exists to catch: "Cannot insert breakpoint" and "armed" both appear in the
+            # refusal itself, which QUOTES the gdb error it is preventing -- so each check would
+            # have passed or failed on the wording of the message rather than on the behaviour.
+            # `hle_calls: N handler symbols in ...` is printed only once enumeration has run.
+            check("handler symbols in" not in message,
+                  "pie: it refuses before enumerating handlers or starting gdb")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
