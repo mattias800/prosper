@@ -231,7 +231,7 @@ int main() {
         const RenderState neg_tl = extract_render_state(negative_tl);
         CHECK(neg_tl.has_scissor && neg_tl.scissor_left == 12 && neg_tl.scissor_top == 19 &&
               neg_tl.scissor_right == 50 && neg_tl.scissor_bottom == 60,
-              "coherent negative-TL screen pair stays binding — no recovery misfire");
+              "coherent negative-TL screen pair stays binding -- no recovery misfire");
 
         GpuState closed_vport = degenerate_screen;
         closed_vport.cx[P::PA_SC_VPORT_SCISSOR_0_TL] = 0x04000000u;     // tile TL=(0,1024)
@@ -240,7 +240,7 @@ int main() {
         CHECK(still_closed.has_scissor &&
               (still_closed.scissor_right <= still_closed.scissor_left ||
                still_closed.scissor_bottom <= still_closed.scissor_top),
-              "a genuine VPORT close stays closed — the screen recovery must not unmask it");
+              "a genuine VPORT close stays closed -- the screen recovery must not unmask it");
 
         // #1349: PA_SU_POLY_OFFSET_* -> Vulkan depth bias (radv inverse: constant=asfloat(OFFSET),
         // slope=asfloat(SCALE)/16, clamp=asfloat(CLAMP)); enable from PA_SU_SC_MODE_CNTL bit 11/12.
@@ -459,7 +459,7 @@ int main() {
         const RenderState none = extract_render_state(unbound);
         CHECK(none.depth_read_base == 0 && none.depth_write_base == 0 &&
               none.stencil_read_base == 0 && none.stencil_write_base == 0,
-              "pair-zero (unbound) DB bases stay zero — no invented identity");
+              "pair-zero (unbound) DB bases stay zero -- no invented identity");
     }
 
     // #371: depth clear value. The sample stream programs no DB_DEPTH_CLEAR, so resolve defaults it by

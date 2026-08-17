@@ -129,7 +129,7 @@ int main() {
     // the first and enter the wrong image. A FAILED boot must therefore relaunch, exactly like a
     // successful one — this is the assertion that pins that.
     CHECK(decide_open_action(kRoot, /*boot_attempted=*/true) == GameOpenAction::relaunch,
-          "once a boot has been attempted — successful OR failed — a title needs a fresh process");
+          "once a boot has been attempted -- successful OR failed -- a title needs a fresh process");
     CHECK(decide_open_action("", /*boot_attempted=*/false) == GameOpenAction::ignore,
           "an unresolved path is ignored, not booted");
     CHECK(decide_open_action("", /*boot_attempted=*/true) == GameOpenAction::ignore,

@@ -583,7 +583,7 @@ HLE(s_videodec2_query_decoder_memory) {
         if (!warned.exchange(true))
             fprintf(stderr,
                     "[vdec] QueryDecoderMemoryInfo: max_width/max_height are auto (%d x %d), so "
-                    "max_frame_size falls back to the 0x%llx FLOOR — this is not a derived size, and "
+                    "max_frame_size falls back to the 0x%llx FLOOR -- this is not a derived size, and "
                     "a real decoder must not write a picture into it unchecked (#1688)\n",
                     config->max_width, config->max_height, (unsigned long long)VDEC_MIN_MEMORY);
     }
@@ -929,7 +929,7 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     bool first = false;
     { std::lock_guard<std::mutex> lk(mx); first = (seen[which]++ == 0); }
     if (first)
-        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 — the "
+        fprintf(stderr, "[vdec] %s FIRST CALL: a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx (#1658 -- the "
                         "AVC layout is unestablished; these arguments are the evidence)\n",
                 which, (unsigned long long)a0, (unsigned long long)a1,
                 (unsigned long long)a2, (unsigned long long)a3);
@@ -940,7 +940,7 @@ static uint64_t vdec_picture_info(const char* which, uint64_t a0, uint64_t a1, u
     bool report = false;
     { std::lock_guard<std::mutex> lk(bad_mx); report = (bad[which]++ < 4); }
     if (report)
-        fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx — rejected. If this "
+        fprintf(stderr, "[vdec] %s: caller struct size 0x%llx != VdecOutput 0x%zx -- rejected. If this "
                         "is the AVC form, that size IS its layout evidence (#1658).\n",
                 which, (unsigned long long)out->size, sizeof(*out));
     return VDEC_ERR_STRUCT;
@@ -1200,7 +1200,7 @@ bool avp_fill_video_ex(AvpVideoEx& out, uint32_t visible_w, uint32_t visible_h, 
     // keeps a future caller's mistake loud instead of silently corrupting its sampling.
     if (pitch < visible_w) {
         fprintf(stderr,
-                "[avp] REFUSING AvPlayerVideoEx: pitch %u < visible width %u — the staged surface and "
+                "[avp] REFUSING AvPlayerVideoEx: pitch %u < visible width %u -- the staged surface and "
                 "the published extent disagree; frame not published\n",
                 pitch, visible_w);
         return false;
@@ -1674,7 +1674,7 @@ HLE(s_avplayer_isactive) {   // bool sceAvPlayerIsActive(AvPlayerHandle)
         // than by delivering its frames is a title consuming nothing, and must never read as an
         // ordinary drain in a default run.
         fprintf(stderr,
-                "[avp] handle=0x%llx: the %llu ms source played out on the media clock — nothing "
+                "[avp] handle=0x%llx: the %llu ms source played out on the media clock -- nothing "
                 "requested a video frame for %llu ms and %llu ms of the media remained (#1973)\n",
                 (unsigned long long)a0, (unsigned long long)clock_duration_ms,
                 (unsigned long long)clock_idle_ms, (unsigned long long)clock_remaining_ms);

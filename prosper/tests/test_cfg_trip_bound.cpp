@@ -165,7 +165,7 @@ int main() {
     const std::vector<uint32_t> bounded = recompile_valu(kExecWalk, kWords, 2, 2);
     CHECK(!bounded.empty(), "the bounded kernel still recompiles");
     CHECK(bounded == unbounded,
-          "a structured loop is NOT bounded — the diagnostic covers only the CFG dispatcher");
+          "a structured loop is NOT bounded -- the diagnostic covers only the CFG dispatcher");
 
     const std::vector<float> still_walked =
         prosper::test::run_compute(bounded, input, kLanes, kLanes);

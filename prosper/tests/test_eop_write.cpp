@@ -1981,7 +1981,7 @@ int main() {
             {0x1000000000ull, 4, 1, 1, 1, "0x1000000000 (DOLL arena) is narrow AND wide"},
             // Exactly one byte above the narrow bound: ArcRunner's terminal `addr=(nil)` fault
             // dereferences 0x2100000001, whose pre is this value.
-            {0x2100000000ull, 4, 1, 0, 1, "0x2100000000 is WIDE-ONLY — the #1226 blind spot"},
+            {0x2100000000ull, 4, 1, 0, 1, "0x2100000000 is WIDE-ONLY -- the #1226 blind spot"},
             {0x9f00000000ull, 4, 1, 0, 1, "0x9f00000000 (arena top) is WIDE-ONLY"},
             // Outside the guest VA window entirely: neither predicate may claim it.
             {0x0000000000ull, 4, 1, 0, 0, "a null pre is neither narrow nor wide"},
@@ -1991,7 +1991,7 @@ int main() {
             // test; the same case with a 0x21… pre would be rejected by the window on the narrow arm
             // and prove nothing about the rule.
             {0x2000000005ull, 4, 1, 0, 0, "a nonzero low dword is not a forge on either window"},
-            {0x2000000000ull, 8, 1, 0, 0, "a full-width write replaces the qword — not a forge"},
+            {0x2000000000ull, 8, 1, 0, 0, "a full-width write replaces the qword -- not a forge"},
             {0x2000000000ull, 4, 0, 0, 0, "a zero value cannot forge a nonzero low dword"},
             // …and once more above the narrow bound, so a shape rule that is accidentally applied
             // only inside the narrow window is still caught.
@@ -2037,7 +2037,7 @@ int main() {
             {0x0000002000000000ull, 4, 1, 0, "the #1245 shape is NOT a stomp on the heap window either"},
             // Remaining shape rules.
             {0x0000000000000001ull, 4, 0, 0, "a small integer (no high dword) is not a pointer"},
-            {0x000000041700f1e8ull, 8, 0, 0, "a full-width write replaces the qword — not a stomp"},
+            {0x000000041700f1e8ull, 8, 0, 0, "a full-width write replaces the qword -- not a stomp"},
             {0x000000041700f1e8ull, 4, 0x1700f1e8ull, 0, "a write that does not change the low dword is not a stomp"},
         };
         for (const auto& c : cases) {

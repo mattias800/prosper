@@ -91,7 +91,7 @@ int main() {
     for (int spin = 0; spin < 1000 && !released.load(std::memory_order_acquire); ++spin)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     if (!released.load(std::memory_order_acquire)) {
-        check(false, "the waiter did not wake within 5 s — the barrier was destroyed out from "
+        check(false, "the waiter did not wake within 5 s -- the barrier was destroyed out from "
                      "under a parked thread, so arriving reached nothing (#2168 regressed)");
         waiter.detach();
         std::fprintf(stderr, "== FAIL ==\n");

@@ -416,7 +416,7 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
                 if (!resolved) {
                     uint64_t& cnt = unhandled[r.type];
                     if (cnt == 0)
-                        fprintf(stderr, "[reloc] WARNING: unresolved TPOFF64 in %s — "
+                        fprintf(stderr, "[reloc] WARNING: unresolved TPOFF64 in %s -- "
                                 "static TLS offset left unapplied (issue #338)\n", m.path.c_str());
                     cnt++;
                     break;
@@ -434,7 +434,7 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
                 // does, it fails visibly instead of silently corrupting TLS. #338.
                 uint64_t& cnt = unhandled[r.type];
                 if (cnt == 0 && r.type >= 16 && r.type <= 23)
-                    fprintf(stderr, "[reloc] WARNING: unhandled TLS relocation type %u in %s — "
+                    fprintf(stderr, "[reloc] WARNING: unhandled TLS relocation type %u in %s -- "
                             "thread-local storage may be corrupted (issue #338)\n", r.type, m.path.c_str());
                 cnt++;
                 break;

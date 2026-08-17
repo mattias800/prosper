@@ -118,7 +118,7 @@ int main() {
 
         munmap(pcm, kBlockBytes);
     } else {
-        std::printf("  [skip] MAP_FIXED @0x%llx unavailable — streaming assertions skipped here\n",
+        std::printf("  [skip] MAP_FIXED @0x%llx unavailable -- streaming assertions skipped here\n",
                     (unsigned long long)kBlockVA);
         if (pcm != MAP_FAILED) munmap(pcm, kBlockBytes);
     }

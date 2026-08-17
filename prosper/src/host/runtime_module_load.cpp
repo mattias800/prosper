@@ -304,7 +304,7 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
         // boot — but if it ever did, every address-derived handle from here on would resolve
         // against a different module than it names. Refuse the load rather than continue with one.
         fprintf(stderr,
-                "[loadmod] '%s': INTERNAL — unwind index %zu != export index %llu; an "
+                "[loadmod] '%s': INTERNAL -- unwind index %zu != export index %llu; an "
                 "address-derived module handle would name a different module (#639) -> ENOEXEC\n",
                 guest_path, unwind_index, (unsigned long long)(rm.handle - kSceModuleHandleBase));
         return abandon(kEnoexec);

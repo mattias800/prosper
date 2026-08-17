@@ -198,9 +198,9 @@ int main() {
                         // unreachable would remove the only thing that could tell a reader the
                         // diagnosis no longer applies.
                         const bool moved = (uintptr_t)small != old_addr;
-                        printf("  [diag] over-copy guard FAILED — the facts, before you conclude anything:\n");
+                        printf("  [diag] over-copy guard FAILED -- the facts, before you conclude anything:\n");
                         printf("  [diag]   block %s (old=0x%llx new=0x%llx)\n",
-                               moved ? "MOVED" : "did NOT move — shrunk in place",
+                               moved ? "MOVED" : "did NOT move -- shrunk in place",
                                (unsigned long long)old_addr, (unsigned long long)(uintptr_t)small);
                         printf("  [diag]   usable=%zu kNew=%zu window=%zu bytes; %zu of the first %zu slack "
                                "bytes match the source pattern positionally (%zu matches in the whole "
@@ -233,7 +233,7 @@ int main() {
                                "  [diag]   Check the cap at :244 first. See #2297.\n");
                     }
                     CHECK(slack_clean,
-                          "the copy is capped by the NEW size — no source bytes past it (over-copy guard)");
+                          "the copy is capped by the NEW size -- no source bytes past it (over-copy guard)");
                 } else {
                     printf("  [skip] over-copy guard did NOT run: this allocator reports usable=%zu "
                            "for a %zu-byte request, so there is no readable slack to inspect\n",

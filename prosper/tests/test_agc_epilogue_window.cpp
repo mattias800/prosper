@@ -95,7 +95,7 @@ int main() {
         CHECK(acq != 0 && rel != 0, "both builders appended a packet (acquire=%s release=%s)",
               acq ? "ok" : "REFUSED", rel ? "ok" : "REFUSED");
         CHECK(g_callback_hits == 0,
-              "buffer-full callback never invoked (hits=%d) — the epilogue fits its 16-dword window",
+              "buffer-full callback never invoked (hits=%d) -- the epilogue fits its 16-dword window",
               g_callback_hits);
         CHECK((uint64_t)(d.cursor_up - g_window) == 16,
               "epilogue consumed %llu of 16 dwords",

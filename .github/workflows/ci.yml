@@ -305,6 +305,23 @@ jobs:
           python3 prosper/tools/env/check_diag_gates.py --selftest
           python3 prosper/tools/env/check_diag_gates.py prosper
 
+      # Same job, same reason again: a repository-wide text scan needing nothing built -- and here
+      # the "needing nothing built" part is the point, because the defect this catches is visible
+      # ONLY on Windows and would otherwise wait for the MinGW job. stdout carries bytes, and the
+      # reader decodes them by platform: UTF-8 on Linux, the cp1252/cp437 console code page on
+      # Windows. One em dash in a printf literal therefore reaches a Windows user as mojibake, so
+      # `grep` for the line the tool itself printed does not match it -- fatal for a tool whose
+      # documented recipe is `--import-slots | grep <name>`. #2579 shipped five that way: Linux CI
+      # green, the Windows MinGW job red on the one assertion whose substring spanned one (#2588).
+      #
+      # It is also registered as the `ascii_output_literals` ctest so a local run catches it before
+      # a push; the duplicate second is worth the seconds this job saves over waiting for a build.
+      # Comments and Markdown keep their punctuation -- the rule is about the bytes the program
+      # emits, and comments are stripped before literals are extracted.
+      - name: Verify every string literal a program can print is ASCII
+        run: |
+          python3 prosper/tools/output/check_ascii_output.py prosper
+
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest

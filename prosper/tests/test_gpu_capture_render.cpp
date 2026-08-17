@@ -1644,7 +1644,7 @@ int main() {
             CHECK(render_host_buffer_pool_limit_bytes("256", 128ull * GiB) == 256ull * MiB,
                   "the pool MiB override takes precedence over host memory");
             CHECK(render_host_buffer_pool_limit_bytes("64", 128ull * GiB) == 64ull * MiB,
-                  "the override may go BELOW the floor — it is the constrained-host escape hatch "
+                  "the override may go BELOW the floor -- it is the constrained-host escape hatch "
                   "and the A/B lever, so it must be exact");
             CHECK(render_host_buffer_pool_limit_bytes("0", 8ull * GiB) == 0,
                   "an explicit zero disables pool retention rather than being clamped up");

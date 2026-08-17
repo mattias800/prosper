@@ -48,7 +48,7 @@ int main() {
     CHECK(prosper::hle::sce_kernel_error(FreeBsdErrno::EInval) == 0x80020016ull,
           "the values Linux and FreeBSD share are unchanged (EINVAL 22)");
     CHECK(prosper::hle::sce_kernel_error(FreeBsdErrno::EOwnerDead) == 0x80020060ull,
-          "0x80020060 is EOWNERDEAD (96) — the value a decimal-60 typo produces, NOT a timeout");
+          "0x80020060 is EOWNERDEAD (96) -- the value a decimal-60 typo produces, NOT a timeout");
 
     // ---- host -> FreeBSD translation -------------------------------------------------------
     CHECK(prosper::hle::freebsd_errno_from_host(EAGAIN) == FreeBsdErrno::EAgain,
@@ -150,7 +150,7 @@ int main() {
             const uint64_t rc = sem_trywait((uint64_t)slot, 0, 0, 0, 0, 0);
             CHECK(rc == sce_kernel_error(FreeBsdErrno::EAgain),
                   "scePthreadSemTrywait on an empty semaphore reports encoded FreeBSD EAGAIN "
-                  "(0x80020023) — not a bare 35, and not host 11");
+                  "(0x80020023) -- not a bare 35, and not host 11");
             // The POSIX spelling shares the body and must NOT encode. Without this line the arm
             // above cannot distinguish a correct alias from both spellings being encoded.
             auto posix_trywait = Hle::lookup(nid_hash("sem_trywait"));
@@ -159,7 +159,7 @@ int main() {
                 posix_trywait ? posix_trywait((uint64_t)slot, 0, 0, 0, 0, 0) : 0;
             CHECK(posix_trywait && posix_rc == (uint64_t)(int64_t)-1 &&
                       errno == static_cast<int>(FreeBsdErrno::EAgain),
-                  "sem_trywait returns -1 and leaves FreeBSD EAGAIN (35) in errno (#2182) — the "
+                  "sem_trywait returns -1 and leaves FreeBSD EAGAIN (35) in errno (#2182) -- the "
                   "POSIX contract, and the FreeBSD numbering the guest compares against");
             sem_destroy((uint64_t)slot, 0, 0, 0, 0, 0);
         } else {

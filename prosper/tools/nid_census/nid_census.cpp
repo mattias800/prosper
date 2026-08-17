@@ -168,7 +168,7 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
     if (self_check)
         printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
     if (modules_failed)
-        printf("%sWARNING: %zu module(s) did not parse — their imports are ABSENT from this "
+        printf("%sWARNING: %zu module(s) did not parse -- their imports are ABSENT from this "
                "census, so a NID missing below may be unmeasured rather than unimported\n",
                prefix, modules_failed);
     // The distinction an absence in this report is most likely to be misread as. Recorded because it
@@ -176,7 +176,7 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
     // #1756 plus sceKernelWaitCommandBufferCompletion — a ready-made explanation for its fault — and
     // calls NONE of them. The runtime unimplemented-call census over a full faulting run was 12 NIDs,
     // none in libSceAgc/libSceAgcDriver/libkernel (#1226).
-    printf("%sNOTE: this is a STATIC import census — what a title MAY call, not what it did. A NID "
+    printf("%sNOTE: this is a STATIC import census -- what a title MAY call, not what it did. A NID "
            "listed here may never execute, and a fault is not explained by its presence. For what a "
            "run actually called, use prosper_on_unimpl's first-seen census from a live boot, or "
            "hle_calls (#1980), and bound it to the window the behaviour occurs in.\n", prefix);

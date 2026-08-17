@@ -387,7 +387,7 @@ UltObject* resolve(uint64_t guest_addr, UltType type, const char* fn) {
     if (magic != magic_for(type)) {
         static std::atomic<uint64_t> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 16)
-            log_line("%s: object 0x%llx is not a live %s (magic 0x%llx) — never created, already "
+            log_line("%s: object 0x%llx is not a live %s (magic 0x%llx) -- never created, already "
                      "destroyed, or the wrong object type",
                      fn, (unsigned long long)guest_addr, type_name(type), (unsigned long long)magic);
         return nullptr;
@@ -584,7 +584,7 @@ void note_uninitialised(const char* fn) {
     if (g_initialized.load(std::memory_order_acquire)) return;
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true))
-        log_line("%s called before sceUltInitialize — prosper needs no global init and continues, "
+        log_line("%s called before sceUltInitialize -- prosper needs no global init and continues, "
                  "but the guest's ordering is unusual and worth knowing", fn);
 }
 
@@ -688,7 +688,7 @@ PROSPER_SYSV_ABI uint64_t ult_runtime_create(uint64_t a0, uint64_t a1, uint64_t 
         return kUltErrInval;
     }
     if (!num_max) {
-        log_line("_sceUltUlthreadRuntimeCreate: numMaxUlthread is 0 — no ulthread could ever be "
+        log_line("_sceUltUlthreadRuntimeCreate: numMaxUlthread is 0 -- no ulthread could ever be "
                  "created in this runtime");
         return kUltErrInval;
     }
@@ -792,7 +792,7 @@ PROSPER_SYSV_ABI uint64_t ult_mutex_create(uint64_t a0, uint64_t a1, uint64_t a2
     // prove it).
     const uint32_t bound = pool->bound_sync_objects.fetch_add(1, std::memory_order_relaxed) + 1;
     if (bound > pool->num_sync_objects && !pool->warned_pool_capacity.exchange(true))
-        log_line("pool \"%s\" now has %u sync objects bound but was created for numSyncObjects=%u — "
+        log_line("pool \"%s\" now has %u sync objects bound but was created for numSyncObjects=%u -- "
                  "prosper does not enforce this cap; reporting it so an undersized pool is visible",
                  pool->name.c_str(), bound, pool->num_sync_objects);
 
@@ -840,7 +840,7 @@ uint64_t mutex_lock_impl(UltObject* o, const char* fn) {
 #endif
         if (rc == ETIMEDOUT || rc == EBUSY) {
             if (!o->warned_block.exchange(true))
-                log_line("BLOCKED >%llums: sceUltMutexLock on \"%s\" (0x%llx) — holder thread 0x%llx, "
+                log_line("BLOCKED >%llums: sceUltMutexLock on \"%s\" (0x%llx) -- holder thread 0x%llx, "
                          "waiter thread token 0x%llx. Still waiting. If the title appears hung, this is "
                          "where. (PROSPER_ULT_BLOCK_WARN_MS)",
                          (unsigned long long)warn_ms, o->name.c_str(),
@@ -884,7 +884,7 @@ PROSPER_SYSV_ABI uint64_t ult_mutex_unlock(uint64_t a0, uint64_t, uint64_t, uint
         static std::atomic<uint64_t> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
             log_line("sceUltMutexUnlock on \"%s\" (0x%llx) by thread 0x%llx, which does not hold it "
-                     "(holder 0x%llx) — refusing so the real owner's exclusion is not broken",
+                     "(holder 0x%llx) -- refusing so the real owner's exclusion is not broken",
                      o->name.c_str(), (unsigned long long)o->guest_addr, (unsigned long long)me,
                      (unsigned long long)o->owner.load(std::memory_order_relaxed));
         return kUltErrPerm;
@@ -977,7 +977,7 @@ void ulthread_on_enter(void* opaque) {
         log_line("CONCURRENCY: %u ulthreads of runtime \"%s\" are running at once, but it was created "
                  "with numWorkerThread=%u. prosper runs ulthreads one-to-one on real guest threads "
                  "instead of multiplexing them onto that many workers, so more can run in parallel "
-                 "than on hardware. Reported, deliberately NOT capped — capping would trade a visible "
+                 "than on hardware. Reported, deliberately NOT capped -- capping would trade a visible "
                  "deviation for a hidden scheduling stall",
                  running, rt->name.c_str(), rt->num_worker_thread);
 }
@@ -1009,7 +1009,7 @@ bool runtime_claim_slot(UltObject* rt, uint64_t ulthread_id, uint64_t context, u
     if (!rt->work_area || !gpu::guest_readable(rt->work_area, sizeof(RuntimeWorkArea))) return false;
     auto* wa = (RuntimeWorkArea*)(uintptr_t)rt->work_area;
     if (wa->magic != kWorkMagicRuntime) {
-        log_line("runtime \"%s\" work area at 0x%llx no longer carries prosper's header (0x%llx) — "
+        log_line("runtime \"%s\" work area at 0x%llx no longer carries prosper's header (0x%llx) -- "
                  "freed or reused by the guest while the runtime is still live",
                  rt->name.c_str(), (unsigned long long)rt->work_area, (unsigned long long)wa->magic);
         return false;
@@ -1067,7 +1067,7 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_create(uint64_t a0, uint64_t a1, uint64_t
     const uint32_t live = rt->live_ulthreads.load(std::memory_order_relaxed);
     if (live >= rt->num_max_ulthread) {
         log_line("_sceUltUlthreadCreate: runtime \"%s\" already holds %u of numMaxUlthread=%u "
-                 "ulthreads — refusing", rt->name.c_str(), live, rt->num_max_ulthread);
+                 "ulthreads -- refusing", rt->name.c_str(), live, rt->num_max_ulthread);
         return kUltErrAgain;
     }
 
@@ -1151,7 +1151,7 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_join(uint64_t a0, uint64_t a1, uint64_t, 
 #if defined(__linux__)
         rc = pthread_timedjoin_np((pthread_t)(uintptr_t)o->host_thread, nullptr, &deadline);
         if (rc == ETIMEDOUT) {
-            log_line("BLOCKED >%llums: sceUltUlthreadJoin on \"%s\" (0x%llx) — the ulthread has not "
+            log_line("BLOCKED >%llums: sceUltUlthreadJoin on \"%s\" (0x%llx) -- the ulthread has not "
                      "returned. Still waiting. (PROSPER_ULT_BLOCK_WARN_MS)",
                      (unsigned long long)warn_ms, o->name.c_str(), (unsigned long long)a0);
             rc = pthread_join((pthread_t)(uintptr_t)o->host_thread, nullptr);
@@ -1171,7 +1171,7 @@ PROSPER_SYSV_ABI uint64_t ult_ulthread_join(uint64_t a0, uint64_t a1, uint64_t, 
     const uint32_t status = o->exit_status.load(std::memory_order_relaxed);
     if (a1) {
         if (!gpu::guest_readable(a1, sizeof(int32_t))) {
-            log_line("sceUltUlthreadJoin: status out-param 0x%llx is unusable — not writing it",
+            log_line("sceUltUlthreadJoin: status out-param 0x%llx is unusable -- not writing it",
                      (unsigned long long)a1);
         } else {
             *(int32_t*)(uintptr_t)a1 = (int32_t)status;
@@ -1282,7 +1282,7 @@ PROSPER_SYSV_ABI uint64_t ult_cond_wait(uint64_t a0, uint64_t, uint64_t, uint64_
     if (!o) return kUltErrSrch;
     UltObject* m = object_from_id(o->mutex_id, UltType::Mutex);
     if (!m) {
-        log_line("sceUltConditionVariableWait: condvar \"%s\" (0x%llx) has no live bound mutex — it "
+        log_line("sceUltConditionVariableWait: condvar \"%s\" (0x%llx) has no live bound mutex -- it "
                  "was destroyed while the condvar still refers to it",
                  o->name.c_str(), (unsigned long long)a0);
         return kUltErrInval;
@@ -1294,7 +1294,7 @@ PROSPER_SYSV_ABI uint64_t ult_cond_wait(uint64_t a0, uint64_t, uint64_t, uint64_
         static std::atomic<uint64_t> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 8)
             log_line("sceUltConditionVariableWait on \"%s\" by thread 0x%llx, which does NOT hold the "
-                     "bound mutex \"%s\" (holder 0x%llx) — refusing rather than entering undefined "
+                     "bound mutex \"%s\" (holder 0x%llx) -- refusing rather than entering undefined "
                      "behaviour", o->name.c_str(), (unsigned long long)me, m->name.c_str(),
                      (unsigned long long)m->owner.load(std::memory_order_relaxed));
         return kUltErrPerm;
@@ -1319,7 +1319,7 @@ PROSPER_SYSV_ABI uint64_t ult_cond_wait(uint64_t a0, uint64_t, uint64_t, uint64_
         if (!noted && waited_ms >= cond_note_ms()) {
             noted = true;
             log_line("WAITING >%llums: sceUltConditionVariableWait on \"%s\" (0x%llx), thread 0x%llx. "
-                     "This is informational — a worker waiting for work is normal — but if the title "
+                     "This is informational -- a worker waiting for work is normal -- but if the title "
                      "appears hung, nothing has signalled this condvar. (PROSPER_ULT_COND_NOTE_MS)",
                      (unsigned long long)cond_note_ms(), o->name.c_str(), (unsigned long long)a0,
                      (unsigned long long)me);
@@ -1361,7 +1361,7 @@ PROSPER_SYSV_ABI uint64_t ult_cond_destroy(uint64_t a0, uint64_t, uint64_t, uint
     const uint64_t woken = o->wake_seq.load(std::memory_order_acquire);
     if (issued > woken)
         log_line("sceUltConditionVariableDestroy on \"%s\" (0x%llx) with %llu waiter(s) still "
-                 "blocked — releasing them with an error rather than leaving them stuck",
+                 "blocked -- releasing them with an error rather than leaving them stuck",
                  o->name.c_str(), (unsigned long long)a0, (unsigned long long)(issued - woken));
     o->destroying.store(true, std::memory_order_release);
     pthread_cond_broadcast(&o->cond);

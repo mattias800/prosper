@@ -294,7 +294,7 @@ bool run_live_arm(bool defect_mode) {
     } else {
         const int e = errno;
         std::fprintf(stderr,
-                     "[hwbp] perf_event_open refused (errno=%d %s) — the hardware arm of the %s is "
+                     "[hwbp] perf_event_open refused (errno=%d %s) -- the hardware arm of the %s is "
                      "not exercised; the routing assertions below still run against a live fd, "
                      "which is exactly the production precondition\n",
                      e, std::strerror(e), arm);
