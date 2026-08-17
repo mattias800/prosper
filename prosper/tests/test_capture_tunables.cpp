@@ -111,23 +111,37 @@ static std::string capture_stderr(const std::filesystem::path& path, Body body) 
 
 // Spawns this same binary in `mode`, redirecting the child's stderr to a BARE filename in the
 // current directory. ctest runs a test in the directory the binary was built into, and neither a
-// CMake target name nor this filename contains a space or a separator, so the whole command line
-// needs no quoting at all — which is the question two Windows CI runs were lost to on #1684.
+// CMake target name nor this filename contains a space or a separator, so the program and the
+// redirect need no quoting at all — which is the question two Windows CI runs were lost to on #1684.
+//
+// `shell_env_*` is a shell-level assignment applied to the child, used ONLY where the child needs
+// the variable before its own `main` could set one. Nothing here relies on the parent's
+// `setenv`/`_putenv_s` reaching the spawned process: whether a CRT environment write lands in the
+// Win32 environment block a child inherits is exactly the kind of platform question that costs a CI
+// cycle, and no existing test in this repository answers it — both cross-process tests here have
+// their children set their own environment from argv, which is what the other modes do too.
 struct ChildRun {
     int rc = -1;
     std::string stderr_text;
     std::string command;
 };
-static ChildRun run_child(const char* argv0, const std::string& mode, const std::string& err_name) {
+static ChildRun run_child(const char* argv0, const std::string& mode, const std::string& err_name,
+                          const std::string& shell_env_name = {},
+                          const std::string& shell_env_value = {}) {
     ChildRun out;
-    const std::string prefix =
-#ifdef _WIN32
-        ".\\";
-#else
-        "./";
-#endif
     const std::string self = std::filesystem::path(argv0).filename().string();
-    out.command = prefix + self + " " + mode + " 2>" + err_name;
+#ifdef _WIN32
+    const std::string prefix = ".\\";
+    const std::string env = shell_env_name.empty()
+                                ? std::string()
+                                : "set \"" + shell_env_name + "=" + shell_env_value + "\" && ";
+#else
+    const std::string prefix = "./";
+    const std::string env = shell_env_name.empty()
+                                ? std::string()
+                                : shell_env_name + "='" + shell_env_value + "' ";
+#endif
+    out.command = env + prefix + self + " " + mode + " 2>" + err_name;
     if (!std::system(nullptr)) std::printf("  [note] no command processor available\n");
     out.rc = std::system(out.command.c_str());
     out.stderr_text = slurp(err_name);
@@ -136,18 +150,33 @@ static ChildRun run_child(const char* argv0, const std::string& mode, const std:
     return out;
 }
 
+// Command-line spelling for a path handed to a child. Quoted, which is the form #1684's Windows CI
+// runs proved works for an ARGUMENT (the program path was the part that could not be quoted).
+static std::string quoted(const std::filesystem::path& p) { return "\"" + p.string() + "\""; }
+
 int main(int argc, char** argv) {
     // ---- child modes ---------------------------------------------------------------------------
     // Neither of these calls a reporter. Anything on the child's stderr can only have come from an
     // exit handler registered at load, or from the load-time refusal — the halves an in-process
     // assertion cannot distinguish from their absence.
-    if (argc > 1 && std::strcmp(argv[1], "--child-submits") == 0) {
+    if (argc > 4 && std::strcmp(argv[1], "--child-submits") == 0) {
         std::printf("  [child] started (submits)\n");
         std::fflush(stdout);
+        // The child sets its own environment from argv rather than inheriting it: see run_child.
+        // It happens before the first submit, which is where the capture request is built.
+        set_test_env("PROSPER_GPU_TIMELINE", argv[2]);
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE", argv[3]);
+        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", argv[4]);
         for (uint64_t n = 1; n <= 12; ++n) {
             begin_gpu_timeline_submit(n);
             record_gpu_timeline_submit(GpuState{}, n);
         }
+        return 0;
+    }
+    if (argc > 2 && std::strcmp(argv[1], "--child-bundle") == 0) {
+        std::printf("  [child] started (bundle)\n");
+        std::fflush(stdout);
+        set_test_env("PROSPER_CAPTURE_BUNDLE", argv[2]);
         return 0;
     }
     if (argc > 1 && std::strcmp(argv[1], "--child-bare") == 0) {
@@ -155,10 +184,14 @@ int main(int argc, char** argv) {
         // lands inline in the ctest log ("did the spawn happen at all?", which a failed spawn and a
         // missing exit report otherwise answer identically), and stderr lands in the captured file,
         // where the PROSPER_CAPTURE_MAX_SUBMITS arm asserts its ABSENCE — the refusal is supposed to
-        // end the process during static initialization, before main runs a single line.
+        // end the process during static initialization, before main runs a single line. The
+        // variable's visibility is reported too, so a shell assignment that failed to reach the
+        // child is separable from a refusal that failed to fire; those produce the same exit status.
+        const char* cap = std::getenv("PROSPER_CAPTURE_MAX_SUBMITS");
         std::printf("  [child] started (bare)\n");
         std::fflush(stdout);
-        std::fprintf(stderr, "[child] reached main\n");
+        std::fprintf(stderr, "[child] reached main; PROSPER_CAPTURE_MAX_SUBMITS=%s\n",
+                     cap ? cap : "<unset>");
         std::fflush(stderr);
         return 0;
     }
@@ -466,10 +499,11 @@ int main(int argc, char** argv) {
             scratch / ("prosper-capture-tunables-child-" + std::to_string(nonce) + ".prgtl");
         const auto capture_path =
             scratch / ("prosper-capture-tunables-child-" + std::to_string(nonce) + ".prgcap");
-        set_test_env("PROSPER_GPU_TIMELINE", timeline_path.string());
-        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE", capture_path.string());
-        set_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "41000");
-        const ChildRun child = run_child(argv[0], "--child-submits", child_err);
+        // Passed as arguments, not inherited: the child sets them itself before its first submit.
+        const ChildRun child = run_child(
+            argv[0],
+            "--child-submits " + quoted(timeline_path) + " " + quoted(capture_path) + " 41000",
+            child_err);
         // A spawn or redirection fault leaves the same empty file the defect does. Name the
         // apparatus so the two can never be confused.
         if (child.rc != 0 || child.stderr_text.empty())
@@ -482,28 +516,24 @@ int main(int argc, char** argv) {
               "the exit report states the submit ordinal the child actually reached");
         CHECK(!std::filesystem::exists(capture_path),
               "no capture was written, which is the outcome the report exists to explain");
-        clear_test_env("PROSPER_GPU_TIMELINE");
-        clear_test_env("PROSPER_GPU_TIMELINE_CAPTURE");
-        clear_test_env("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT");
         std::error_code ec;
         std::filesystem::remove(timeline_path, ec);
     }
     {
-        set_test_env("PROSPER_CAPTURE_BUNDLE", bundle_path.string());
-        const ChildRun child = run_child(argv[0], "--child-bare", child_err);
+        const ChildRun child =
+            run_child(argv[0], "--child-bundle " + quoted(bundle_path), child_err);
         if (child.rc != 0 || child.stderr_text.empty())
             std::printf("  [note] child rc=%d, stderr bytes=%zu, command was: %s\n", child.rc,
                         child.stderr_text.size(), child.command.c_str());
         CHECK(child.rc == 0 && contains(child.stderr_text, "arms nothing"),
               "a process that sets only PROSPER_CAPTURE_BUNDLE explains itself at exit");
-        clear_test_env("PROSPER_CAPTURE_BUNDLE");
     }
     {
         // The load-time refusal. This child never reaches main, so its exit status is the assertion:
-        // without the refusal it would return 0 and run UNCAPPED, which is the defect.
-        set_test_env("PROSPER_CAPTURE_MAX_SUBMITS", "4O");
-        const ChildRun child = run_child(argv[0], "--child-bare", child_err);
-        clear_test_env("PROSPER_CAPTURE_MAX_SUBMITS");
+        // without the refusal it would return 0 and run UNCAPPED, which is the defect. The value has
+        // to exist before main, so it is the one thing set through the shell rather than from argv.
+        const ChildRun child =
+            run_child(argv[0], "--child-bare", child_err, "PROSPER_CAPTURE_MAX_SUBMITS", "4O");
         if (child.rc == 0 || child.stderr_text.empty())
             std::printf("  [note] child rc=%d, stderr bytes=%zu, command was: %s\n", child.rc,
                         child.stderr_text.size(), child.command.c_str());
