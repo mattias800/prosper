@@ -524,6 +524,46 @@ int main() {
                   miss_error_guard[2] == 0x22222222u,
               "APR resolver reports the scalar failure index without an array overrun");
 
+        // #1951: the batch stops at the miss, but every one of the `count` output slots still
+        // belongs to the call. The 2-entry case above cannot see this — its miss IS the last entry,
+        // so there is no tail. Resolve [present, present, MISSING, present] instead and prove the
+        // untouched tail is stamped rather than left holding the caller's own prior contents.
+        //
+        // The poison is deliberately a LIVE 1-based registry id, not an obviously-bogus word: a
+        // decoy container is registered first so that id 1 names a DIFFERENT file than the tail
+        // entry's own path. That reproduces the exact hazard — a stale id resolving to the wrong
+        // container — instead of merely showing that some bytes changed. Entry 3 also names a file
+        // that genuinely EXISTS, so the tail sentinel additionally distinguishes "stamped" from
+        // "resolved anyway" (which would mean the batch did not stop).
+        prosper_apr_reset_for_test();
+        const char* decoy_path = "prosper-test-apr-decoy-container.tmp";   // registry-only, never opened
+        const uint32_t decoy_id = prosper_apr_register(decoy_path, 4096);
+        CHECK(decoy_id == 1 && prosper_apr_path_for_id(1) == decoy_path,
+              "#1951 setup: a live id 1 names the decoy container");
+        const char* tail_paths[4] = { wp_full, wp_full,
+                                      "prosper-test-apr-does-not-exist.tmp", wp_full };
+        uint32_t tail_ids[4] = { decoy_id, decoy_id, decoy_id, decoy_id };
+        uint64_t tail_sizes[4] = { 0x5a5a, 0x5a5a, 0x5a5a, 0x5a5a };
+        uint32_t tail_error_guard[3] = { 0x11111111u, 0xDEADBEEFu, 0x22222222u };
+        uint64_t rt = resolve_plain((uint64_t)(uintptr_t)tail_paths, 4,
+                                    (uint64_t)(uintptr_t)tail_ids,
+                                    (uint64_t)(uintptr_t)tail_sizes,
+                                    (uint64_t)(uintptr_t)&tail_error_guard[1], 0);
+        CHECK((uint32_t)rt == 0x80020002u && tail_error_guard[1] == 2,
+              "#1951: a mid-batch miss still fails the batch at its own scalar index");
+        CHECK(tail_ids[0] >= 1 && tail_ids[0] != decoy_id && tail_sizes[0] == wp_bytes.size() &&
+                  tail_ids[1] == tail_ids[0] && tail_sizes[1] == wp_bytes.size(),
+              "#1951: entries before the miss keep their real resolved ids and sizes");
+        CHECK(tail_ids[2] == 0xffffffffu && tail_sizes[2] == 0,
+              "#1951: the failing entry itself is stamped (unchanged behaviour)");
+        CHECK(tail_ids[3] == 0xffffffffu && tail_sizes[3] == 0,
+              "#1951: the entry AFTER the miss is stamped, not left holding the caller's value");
+        CHECK(prosper_apr_path_for_id(tail_ids[3]).empty(),
+              "#1951: the stamped tail id resolves to no container (no silent wrong-file read)");
+        CHECK(tail_error_guard[0] == 0x11111111u && tail_error_guard[2] == 0x22222222u,
+              "#1951: stamping the tail does not write past the scalar error index");
+        prosper_apr_reset_for_test();
+
         // A null paths pointer / non-positive count is rejected without touching memory.
         CHECK((uint32_t)resolve_prefix((uint64_t)(uintptr_t)"", 0, 1, 0, 0, 0) == 0x80020016u,
               "WithPrefix resolve rejects a null paths array");
