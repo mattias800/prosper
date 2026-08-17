@@ -80,6 +80,7 @@ BLOCKER_ORDER = [
     "missing",
     "locked",
     "in-use",
+    "holder-scan-unavailable",
     "dirty",
     "unmerged",
     "no-merge-evidence",
@@ -192,7 +193,10 @@ def list_worktrees(repo: str) -> list[Worktree]:
     for t in trees:
         if t.is_main:
             continue  # every .claude/worktrees/* sits under main by construction
-        pfx = t.real.rstrip("/") + "/"
+        # os.sep, not "/": on Windows realpath yields backslashes and a "/" prefix never matches,
+        # which silently disables this guard. Appending the separator is also what keeps
+        # `/a/foo` from being read as a parent of `/a/foobar`.
+        pfx = t.real.rstrip(os.sep) + os.sep
         t.nested = sorted(r for r in reals if r != t.real and r.startswith(pfx))
 
     for t in trees:
@@ -228,19 +232,30 @@ def _readlink(path: str) -> str | None:
     return target[: -len(" (deleted)")] if target.endswith(" (deleted)") else target
 
 
-def scan_processes(scan_fds: bool = True, scan_maps: bool = True) -> list[tuple[int, str, str, str]]:
+def scan_processes(
+    scan_fds: bool = True, scan_maps: bool = True
+) -> tuple[list[tuple[int, str, str, str]], bool]:
     """Collect every (pid, kind, comm, path) reference a live process holds.
+
+    Returns (refs, supported). `supported` is False where there is no readable `/proc` -- macOS
+    and Windows, notably. That flag is load-bearing and must never be dropped: without it this
+    function returns an empty list on those platforms, the in-use guard never fires, and a
+    worktree with a live shell sitting in it classifies as REMOVABLE. An absent instrument would
+    read as "nobody is using anything", which is the most dangerous answer this tool can give.
+    Callers must fail closed on `supported == False` rather than treating it as "no holders".
 
     Deliberately scans ALL processes rather than a list of known binary names. The failure this
     guards against is a wedged interactive shell, and a shell is exactly what a name list misses.
-    Unreadable processes (other users, or exited mid-scan) are skipped -- so this is a lower
-    bound on holders, never an upper one, which is the safe direction.
+    Unreadable processes (other users, or exited mid-scan) are skipped -- so within a supported
+    platform this is a lower bound on holders, never an upper one, which is the safe direction.
     """
     refs: list[tuple[int, str, str, str]] = []
     try:
         entries = os.listdir("/proc")
     except OSError:
-        return refs
+        return refs, False
+    if not any(n.isdigit() for n in entries):
+        return refs, False  # something is mounted at /proc, but it is not a Linux procfs
 
     for name in entries:
         if not name.isdigit():
@@ -283,7 +298,7 @@ def scan_processes(scan_fds: bool = True, scan_maps: bool = True) -> list[tuple[
                             refs.append((pid, "map", comm, tgt))
             except OSError:
                 pass
-    return refs
+    return refs, True
 
 
 def attach_holders(trees: list[Worktree], refs: list[tuple[int, str, str, str]]) -> None:
@@ -467,7 +482,8 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
 # --------------------------------------------------------------------------- classification
 
 
-def classify(t: Worktree, min_idle_hours: float, merge_evidence_available: bool) -> None:
+def classify(t: Worktree, min_idle_hours: float, merge_evidence_available: bool,
+             holder_scan_ok: bool = True) -> None:
     t.blockers = []
     if t.is_main:
         t.blockers.append("main")
@@ -477,7 +493,12 @@ def classify(t: Worktree, min_idle_hours: float, merge_evidence_available: bool)
         return
     if t.locked:
         t.blockers.append("locked")
-    if t.holders:
+    if not holder_scan_ok:
+        # Fail closed. Without a readable /proc we cannot tell whether a live shell is sitting in
+        # this tree, and "the instrument is absent" must never be reported as "nobody is here".
+        # This makes the tool classify-only on macOS and Windows, which is the honest outcome.
+        t.blockers.append("holder-scan-unavailable")
+    elif t.holders:
         t.blockers.append("in-use")
     if t.status_error:
         t.blockers.append("status-unavailable")
@@ -514,7 +535,7 @@ def survey(
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             list(pool.map(probe_size, trees))
 
-    refs = scan_processes(scan_fds=scan_fds, scan_maps=scan_maps)
+    refs, holder_scan_ok = scan_processes(scan_fds=scan_fds, scan_maps=scan_maps)
     attach_holders(trees, refs)
 
     probe_ancestor(repo, trees, base)
@@ -531,13 +552,15 @@ def survey(
     evidence_complete = use_github and gh_available
     for t in trees:
         t.merge_evidence_available = evidence_complete
-        classify(t, min_idle_hours, merge_evidence_available=evidence_complete)
+        classify(t, min_idle_hours, merge_evidence_available=evidence_complete,
+                 holder_scan_ok=holder_scan_ok)
 
     meta = {
         "repo": repo,
         "base": base,
         "base_sha": run(["git", "-C", repo, "rev-parse", base])[1].strip(),
         "min_idle_hours": min_idle_hours,
+        "holder_scan_supported": holder_scan_ok,
         "process_refs_scanned": len(refs),
         "pids_seen": len({r[0] for r in refs}),
         "scan_fds": scan_fds,
@@ -579,8 +602,13 @@ def report(trees: list[Worktree], meta: dict, do_redact: bool, verbose: bool) ->
     print(f"repo                 {fmt(meta['repo'])}")
     print(f"base                 {meta['base']} @ {meta['base_sha'][:12]}")
     print(f"worktrees registered {len(trees)}")
-    print(f"process refs scanned {meta['process_refs_scanned']} over {meta['pids_seen']} pids "
-          f"(fds={meta['scan_fds']}, maps={meta['scan_maps']})")
+    if meta["holder_scan_supported"]:
+        print(f"process refs scanned {meta['process_refs_scanned']} over {meta['pids_seen']} pids "
+              f"(fds={meta['scan_fds']}, maps={meta['scan_maps']})")
+    else:
+        print("process refs scanned NONE -- no readable /proc on this platform, so the in-use "
+              "guard cannot run;\n                     every tree is held back (fail closed) "
+              "and this run is classify-only")
     print(f"merge evidence       ancestor-of-{meta['base']} + {meta['github']}")
     print(f"idle threshold       {meta['min_idle_hours']}h")
     print()
@@ -601,6 +629,7 @@ def report(trees: list[Worktree], meta: dict, do_redact: bool, verbose: bool) ->
         "MISSING": "directory gone; `git worktree prune` reclaims the registration",
         "LOCKED": "explicitly locked by a human",
         "IN-USE": "a live process holds cwd/exe/fd/map inside it",
+        "HOLDER-SCAN-UNAVAILABLE": "no readable /proc: cannot prove nobody is inside (fail closed)",
         "DIRTY": "uncommitted or untracked files present",
         "UNMERGED": "work not provably in the base branch",
         "NO-MERGE-EVIDENCE": "could not establish merge state",
@@ -689,12 +718,14 @@ def recheck_and_remove(repo: str, t: Worktree, base: str, min_idle_hours: float,
 
     probe_idle(cur)  # before probe_status, for the reason given in probe_idle
     probe_status(cur)
-    attach_holders(fresh, scan_processes(scan_fds=scan_fds, scan_maps=scan_maps))
+    fresh_refs, holder_scan_ok = scan_processes(scan_fds=scan_fds, scan_maps=scan_maps)
+    attach_holders(fresh, fresh_refs)
     probe_ancestor(repo, fresh, base)
     if use_github and cur.merged_by is None:
         probe_github(repo, fresh, gh_limit)
     cur = next((w for w in fresh if w.real == t.real), cur)
-    classify(cur, min_idle_hours, merge_evidence_available=True)
+    classify(cur, min_idle_hours, merge_evidence_available=True,
+             holder_scan_ok=holder_scan_ok)
 
     if not cur.removable:
         print(f"  REFUSE {fmt(cur.real)}: {', '.join(cur.blockers) or 'no merge evidence'}")

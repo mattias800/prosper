@@ -61,6 +61,15 @@ def age(path: str | Path, admin: str | Path | None, seconds: int = OLD) -> None:
             pass
 
 
+def spawn_holder(cwd: Path) -> subprocess.Popen:
+    """A live process whose cwd is `cwd`, without depending on an external `sleep` binary."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(cwd))
+
+
+def holder_scan_supported() -> bool:
+    return W.scan_processes(scan_fds=False, scan_maps=False)[1]
+
+
 def admin_of(repo: Path, name: str) -> Path:
     return repo / ".git" / "worktrees" / name
 
@@ -126,7 +135,7 @@ def test_positive_and_mutations() -> None:
         for name in ("safe", "dirty", "untracked", "unmerged", "inuse", "locked"):
             age(root / name, admin_of(repo, name))              # `recent` is deliberately not aged
 
-        holder = subprocess.Popen(["sleep", "60"], cwd=str(inuse))  # in-use: a live cwd
+        holder = spawn_holder(inuse)  # in-use: a live cwd
         try:
             time.sleep(0.4)
             trees, _ = survey(repo)
@@ -150,10 +159,19 @@ def test_positive_and_mutations() -> None:
             check("unmerged names guard", "no-merge-evidence" in trees["unmerged"].blockers, True,
                   str(trees["unmerged"].blockers))
             check("in-use refused", trees["inuse"].removable, False)
-            check("in-use names guard", "in-use" in trees["inuse"].blockers, True,
-                  str(trees["inuse"].blockers))
-            check("in-use identifies the pid", holder.pid in [h.pid for h in trees["inuse"].holders],
-                  True)
+            if holder_scan_supported():
+                check("in-use names guard", "in-use" in trees["inuse"].blockers, True,
+                      str(trees["inuse"].blockers))
+                check("in-use identifies the pid",
+                      holder.pid in [h.pid for h in trees["inuse"].holders], True)
+            else:
+                # No /proc here, so the guard cannot fire on its own merits. The tool must still
+                # refuse -- via fail-closed -- and test_fails_closed_without_a_process_scan pins
+                # that. Passing this arm silently would be the exact defect it exists to catch.
+                print("  SKIP in-use guard needs a readable /proc; fail-closed arm covers this")
+                check("in-use refused via fail-closed",
+                      "holder-scan-unavailable" in trees["inuse"].blockers, True,
+                      str(trees["inuse"].blockers))
             check("recent refused", trees["recent"].removable, False)
             check("recent names guard", "recent" in trees["recent"].blockers, True,
                   str(trees["recent"].blockers))
@@ -191,6 +209,33 @@ def test_merge_evidence_labels() -> None:
     check("proven merged is removable", proven.removable, True)
 
 
+def test_fails_closed_without_a_process_scan() -> None:
+    """No readable /proc must mean "cannot tell", never "nobody is here".
+
+    macOS and Windows have no procfs, so `scan_processes` finds nothing there. Read as "no
+    holders", that turns the in-use guard off silently and a worktree with a live shell in it
+    classifies as REMOVABLE -- the single most dangerous answer this tool can give, and one that
+    would only ever be observed on the machine where it deleted someone's session. So the scan
+    reports whether it could run at all, and an absent scan blocks every tree.
+
+    CI caught this: the first revision passed on Linux and failed on the macOS and Windows jobs.
+    """
+    print("\n[fail closed when the process scan cannot run]")
+    ok = W.Worktree(path="/x", real="/x", merged_by="ancestor", idle_hours=999.0)
+    W.classify(ok, 12.0, merge_evidence_available=True, holder_scan_ok=True)
+    check("scan available -> removable", ok.removable, True)
+
+    blind = W.Worktree(path="/x", real="/x", merged_by="ancestor", idle_hours=999.0)
+    W.classify(blind, 12.0, merge_evidence_available=True, holder_scan_ok=False)
+    check("scan unavailable -> refused", blind.removable, False)
+    check("scan unavailable names guard", blind.blockers, ["holder-scan-unavailable"])
+
+    # The flag must reflect reality on THIS platform, not merely be plumbed through.
+    _, supported = W.scan_processes(scan_fds=False, scan_maps=False)
+    check("scan support matches the platform", supported, os.path.isdir("/proc"),
+          f"platform={sys.platform}")
+
+
 def test_nested_worktree_is_refused() -> None:
     """A worktree registered underneath another must not be removed out from under it."""
     print("\n[nested worktree]")
@@ -220,10 +265,13 @@ def test_holder_attributed_to_most_specific_tree() -> None:
         inner = outer / "inner"
         git(repo, "worktree", "add", "-q", "-b", "feat/inner", str(inner), "origin/master")
 
-        holder = subprocess.Popen(["sleep", "60"], cwd=str(inner))
+        holder = spawn_holder(inner)
         try:
             time.sleep(0.4)
             trees, _ = survey(repo)
+            if not holder_scan_supported():
+                print("  SKIP holder attribution needs a readable /proc")
+                return
             check("inner sees the holder", holder.pid in [h.pid for h in trees["inner"].holders],
                   True)
             check("outer does NOT see it", holder.pid in [h.pid for h in trees["outer"].holders],
@@ -353,6 +401,7 @@ def main() -> int:
     for fn in (
         test_positive_and_mutations,
         test_merge_evidence_labels,
+        test_fails_closed_without_a_process_scan,
         test_nested_worktree_is_refused,
         test_holder_attributed_to_most_specific_tree,
         test_idle_is_not_measuring_our_own_footprint,
