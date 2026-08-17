@@ -50,12 +50,19 @@ FOUR CLASSES OF CHECK, deliberately separated:
 
   ORDER (--ordered, opt-in) -- the numbered column is unique and strictly ascending. GAPS ARE
   LEGAL; see WHY GAPLESSNESS WAS REMOVED below. This is a CONVENTION of the trap table ("append,
-  never renumber"), NOT a property of numbered tables in general. Measured over the 77 tracked
-  Markdown files: all 77 satisfy structure, while of the 5 documents holding an
-  all-numeric-first-column table only 2 satisfy order -- the rest lead with frame indices, draw
-  ordinals and submit numbers, where repeats are the correct content. Applying order everywhere
-  would report correct documents as broken, and a check that fires on correct data gets deleted
-  rather than heeded.
+  never renumber"), NOT a property of numbered tables in general. RE-MEASURED under this rule
+  rather than inherited from --sequential's: over the 101 tracked Markdown files, all 101 satisfy
+  structure, while of the 10 documents holding an all-numeric-first-column table only 6 satisfy
+  order -- the rest lead with frame indices, draw ordinals and submit numbers, where repeats are
+  the correct content. Applying order everywhere would report correct documents as broken, and a
+  check that fires on correct data gets deleted rather than heeded.
+
+  The figure had to be re-measured because relaxing gaplessness can only INCREASE it, so
+  --sequential's "3 of 10" could not survive the rewrite unchanged (#2610 review). The three
+  documents that qualify under --ordered and did not under --sequential are
+  ASTROBOT_LINUX_HANDOFF_2026_07_19.md, RENDERER_PERFORMANCE_2026_07.md and
+  SONIC_CROSSWORLDS_STATUS.md. The conclusion is unaffected: 4 of 10 still fail, so "do not apply
+  it broadly" stands on the new rule as it did on the old one.
 
   Two selector details, both from real documents here rather than from theory:
     * The order is checked from its own first value, not from 1, because a genuine numbered
@@ -131,7 +138,9 @@ gets parked on whatever branch is at hand.
 Gaplessness was kept because it catches a DELETED row -- a row that simply vanishes in a bad merge,
 a wholesale `git checkout` of the file, or a careless rebase leaves a file that is perfectly well
 formed, and uniqueness and structure both pass it. That reasoning is right about the danger and
-wrong about the coverage. MEASURED on master (`0c268362`, the Instrument table at 192 rows, max 186):
+wrong about the coverage. MEASURED on master (`0c268362`, whose Instrument table is 186 rows, 1..186
+-- the "192" an earlier draft of this comment carried was a whole-FILE `grep` that counted the
+numbered rows of all 14 tables in the document, 248 of them, rather than this one's):
 
   * delete an INTERIOR row (100)                      -> caught, rc=1
   * delete the HIGHEST row (186)                      -> GREEN, rc=0
@@ -192,11 +201,16 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 FENCE = re.compile(r"^\s*(```|~~~)")
 DELIMITER = re.compile(r"^\s*\|[\s:|-]+\|?\s*$")
 LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
+
+# See N1 in persistence_problems: how far above the baseline's maximum a NEW row number may
+# sit before it is treated as a typo rather than as a deliberate step clear of a collision.
+MAX_JUMP = 50
 
 
 ESCAPED_PIPE = re.compile(r"(?<!\\)\|")
@@ -437,21 +451,25 @@ def select_numbered_table(
     return candidates[0], []
 
 
-def baseline_rows(baseline: Path, table_header: str | None) -> int | None:
-    """How many numbered rows the baseline held, for the success line.
+@lru_cache(maxsize=None)
+def load_baseline(baseline_path: str, table_header: str | None) -> tuple[tuple[int, ...] | None, str]:
+    """The baseline table's row numbers, parsed ONCE. Returns (numbers, error-or-empty).
 
-    A bare "no row has been deleted" is not a falsifiable statement -- it prints identically whether
-    187 rows were compared or the baseline was the subject's own copy compared against itself, which
-    is exactly the mistake `HEAD^1` would make if a merge ref's parent order were the other way
-    round. Quoting the count makes the run self-checking: on a PR that appends one row it must read
-    one LESS than the subject's, and a reader who sees the two agree knows the comparison was void.
+    Cached deliberately, and not merely to save work. The comparison and the count printed on the
+    success line are two reads of the same file, and two reads can disagree: `--baseline <(cat f)`
+    is a process substitution, which is a single-read FIFO, so the second read saw an empty file and
+    the run printed "none of the None rows ... has been deleted" and exited 0 (#2610 review). A
+    falsifiability device that can print `None` is not one. One parse, one answer.
     """
+    baseline = Path(baseline_path)
     lines, err = read_lines(baseline)
     if err:
-        return None
+        return None, f"--baseline {err}"
     tables, _, _ = parse_tables(lines or [])
-    table, _ = select_numbered_table(baseline, tables, table_header)
-    return len(table.numbered_rows()) if table else None
+    table, problems = select_numbered_table(baseline, tables, table_header)
+    if table is None:
+        return None, "; ".join(f"--baseline: {p}" for p in problems)
+    return tuple(n for _, n in table.numbered_rows()), ""
 
 
 def persistence_problems(
@@ -469,21 +487,37 @@ def persistence_problems(
     ERROR rather than a skip: the caller asked for this check, and a silent skip would leave a
     green run meaning nothing.
     """
-    lines, err = read_lines(baseline)
-    if err:
-        return [f"--baseline {err}"]
-    base_tables, _, _ = parse_tables(lines or [])
-    base_table, problems = select_numbered_table(baseline, base_tables, table_header)
-    if base_table is None:
-        return [f"--baseline: {p}" for p in problems]
+    base_numbers, err = load_baseline(str(baseline), table_header)
+    if base_numbers is None:
+        return [err]
 
     now = {num for _, num in table.numbered_rows()}
-    was = {num: line_no for line_no, num in base_table.numbered_rows()}
-    missing = sorted(n for n in was if n not in now)
+    problems: list[str] = []
+
+    # N1 -- a bound on how far a NEW number may sit above everything the base held. Gaps are legal,
+    # but a mistyped digit is not: appending `1189` instead of `189` passes uniqueness and ascent,
+    # reports "1000 unused numbers", and permanently poisons the space, because the allocator then
+    # hands out 1190 and everything after it. The old gapless rule caught this incidentally; nothing
+    # else does. The bound is deliberately local -- it compares against the BASE's own maximum, so
+    # no other lane's merge timing can make it fire -- and generous, since no realistic set of
+    # concurrent lanes opens a gap this wide.
+    if base_numbers:
+        ceiling = max(base_numbers) + MAX_JUMP
+        for line_no, num in table.numbered_rows():
+            if num not in base_numbers and num > ceiling:
+                problems.append(
+                    f"{path}:{line_no}: row number {num} is more than {MAX_JUMP} above the highest "
+                    f"row in the baseline ({max(base_numbers)}). Gaps are legal, but a jump this "
+                    f"large is almost always a mistyped digit -- and it is not self-correcting, "
+                    f"because every later allocation is taken from the new maximum. If the jump is "
+                    f"deliberate, lower it: nothing requires stepping this far clear."
+                )
+
+    missing = sorted(n for n in base_numbers if n not in now)
     if not missing:
-        return []
+        return problems
     listed = ", ".join(str(n) for n in missing[:12]) + (" ..." if len(missing) > 12 else "")
-    return [
+    return problems + [
         f"{path}:{table.start}: {len(missing)} row number(s) present in the baseline are GONE "
         f"from this table: {listed}. A row that vanishes leaves a perfectly well-formed file, so "
         f"nothing else here can see it -- the usual causes are a whole-file `git checkout "
@@ -711,7 +745,8 @@ def main() -> int:
                     f"{len(nums)} rows, unique and ascending{gaps}"
                 )
                 if args.baseline:
-                    n = baseline_rows(args.baseline, args.table_header)
+                    base_numbers, _ = load_baseline(str(args.baseline), args.table_header)
+                    n = len(base_numbers) if base_numbers is not None else 0
                     summary += f"; none of the {n} rows in {args.baseline} has been deleted"
         print(summary)
     return 0

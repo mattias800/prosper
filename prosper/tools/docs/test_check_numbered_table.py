@@ -233,6 +233,33 @@ run("rows orphaned by a table split are reported gone, alongside the structure e
     ordered=True, baseline=BASE, want_problems=True, want_count=2,
     expect_text="GONE from this table: 3, 4")
 
+# N1 (#2610 review) -- a bound on how far a NEW number may sit above the baseline's maximum. Gaps are
+# legal; a mistyped digit is not. `1189` for `189` passes uniqueness and ascent, reports a thousand
+# unused numbers, and permanently poisons the space, because every later allocation comes off the new
+# maximum. The old gapless rule caught this incidentally and nothing else does.
+run("a wildly out-of-range number is a typo, not a gap",
+    BASE + "| 1004 | typo |\n",
+    ordered=True, baseline=BASE, want_problems=True, expect_text="more than 50 above")
+
+# ...and the discriminating counter-arm: a DELIBERATE step clear of a contested band must still pass.
+# Without this case, "reject any gap at all" would satisfy the case above and undo the whole change.
+run("a deliberate step clear of a collision is still legal",
+    BASE + "| 8 | stepped clear of a three-way race on 5 |\n",
+    ordered=True, baseline=BASE, want_problems=False)
+
+# The bound is measured against the BASE's maximum, never against another lane's timing -- so a
+# number just inside it passes no matter what else is in flight.
+run("a number just inside the bound passes",
+    BASE + "| 54 | 50 above the baseline max of 4 |\n",
+    ordered=True, baseline=BASE, want_problems=False)
+
+# ...and a row the baseline ALREADY had is never re-judged by the bound, or every file whose table
+# legitimately contains a historical jump would fail forever.
+run("an existing far-out row is not re-judged",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 900 | historical |\n",
+    ordered=True, baseline="| # | What |\n|---|---|\n| 1 | a |\n| 900 | historical |\n",
+    want_problems=False)
+
 # Fails closed. A baseline that cannot be read must be an ERROR: the caller asked for the check, and
 # a silent skip would make a green run mean nothing -- exactly the "no tests ran and everything
 # passed share an exit code" shape the charter warns about.

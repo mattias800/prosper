@@ -429,12 +429,6 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `--baseline` does that job completely — interior, tail, whole-file revert, and renumber — and
   cannot be made to fire by another lane's timing. **Gaps are now legal**, so a collision is repaired
   by bumping to any higher number and merging.
-- **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/master`
-  **and every open PR** (#1729). Prints each claimant so you can see whether you are in a race, not
-  just a bare number. An **advisor, not a gate**: two lanes running it in the same minute both see the
-  same free number, so it shrinks the collision window and cannot close it — merge order does that,
-  and `--ordered` is the backstop. Reading master alone is what produced the #2574/#2581 collision.
-  `ctest -R trap_number` covers it.
   **On arity, and why it is not optional:** GFM splits a row into cells on `|` *before* it parses
   inline content, so a pipe inside an inline `code span` is a cell boundary, and a row with more
   cells than the header has the excess **silently discarded** on the rendered page. Write `\|`
@@ -463,6 +457,20 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   citation at all, losing 22 of 118 references (5 of them in `.cpp`/`.hpp`/test comments) **with the
   gate still green and the success line still saying "all resolving"**. Run by the CI `Docs` job;
   `ctest -R trap_citation_checker` covers it.
+- **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/master`
+  **and every open PR** (#1729). Prints each claimant so you can see whether you are in a race, not
+  just a bare number. An **advisor, not a gate**: two lanes running it in the same minute both see the
+  same free number, so it shrinks the collision window and cannot close it — merge order does that,
+  and `--ordered` is the backstop. Reading master alone is what produced the #2574/#2581 collision.
+  It **errors rather than answering** when `--limit` truncates the PR list or when `gh` is
+  unauthenticated: a smaller list yields a confidently wrong "next free number", which is the exact
+  defect the tool exists to prevent, wearing the look of a successful run. It also scans (rather than
+  skips) any PR whose `files` array is at GitHub's silent 100-entry cap — measured: `cli/cli#14082`
+  has 1,161 changed files and `gh --json files` returns 100 with no indicator. When more than one open
+  PR claims the same number it says so and suggests stepping *clear* of the contested band rather than
+  to the next free number, since every loser stepping to "next free" collides again one number up.
+  `ctest -R trap_number` covers it.
+>>>>>>> e2a972fe (fix(tools/docs): address review B1-B4 and N1-N5, and renumber the trap row to 188)
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the

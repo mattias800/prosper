@@ -10,8 +10,9 @@ That agreement is the point of the last section, and it is not decoration. The a
 `check_numbered_table.py` parse the same table with DIFFERENT code -- the checker builds table runs
 and requires every body row to be numbered, the allocator scans linearly from a matching header. If
 they ever disagree, the allocator hands out a number the gate rejects, and the failure appears on
-someone else's PR hours later. Pinning them against the repository's real 187-row table is the only
-arm that can see that.
+someone else's PR hours later. Pinning them against the repository's real Instrument table is the
+only arm that can see that. The arm asserts a floor rather than an exact count deliberately: an
+exact one would need editing on every append, which is how prose figures go stale.
 
 Run directly, or via ctest as trap_number.
 """

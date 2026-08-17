@@ -501,13 +501,17 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     it takes a second:
     ```bash
     F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
-    git show "origin/master:$F" > /var/tmp/orch-base.md          # what CI passes as --baseline
+    B=$(mktemp)                    # mktemp, not a fixed name: several agents run this concurrently
+    git fetch origin -q && git show "origin/master:$F" > "$B"
     python3 prosper/tools/docs/check_numbered_table.py --ordered \
-        --table-header Instrument --baseline /var/tmp/orch-base.md "$F"
+        --table-header Instrument --baseline "$B" "$F"
     git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py
     ```
     This matters most for `GAME_COMPAT_ORCHESTRATION.md`'s numbered tables. The gate requires rows to be
     unique and ascending, and requires that **no row present in the base is missing** (`--baseline`).
+    Note the local baseline is `origin/master`, while **CI passes `HEAD^1`** — the base *as of when the
+    event fired*. `origin/master` is the fresher and therefore stricter of the two, which is why it is
+    the right one to check by hand; the gap between them is the subject of instrument trap 188.
     **Gaps are legal** — `--sequential` and its gapless rule were removed on 2026-08-17 (#2089) because a
     gap is usually another lane's unmerged number, which no edit of *your* branch can supply, so the check
     served only to serialize independent lanes; the flag now errors and names its replacement. So if you

@@ -211,19 +211,20 @@ jobs:
       #     and other documents cite these rows BY NUMBER, so a duplicate silently redirects them.
       #
       # --ordered is opt-in and belongs only to this table, whose convention is "append, never
-      # renumber". Measured with this checker over the 77 tracked Markdown files: all 77 pass the
-      # structure check, while of the 5 documents holding an all-numeric-first-column table only 2
-      # satisfy order -- the rest lead with frame indices, draw ordinals and submit numbers, where
-      # repeats are the correct content. Applying order broadly would report correct documents as
-      # broken, and a check that fires on correct data gets deleted.
+      # renumber". RE-MEASURED under this rule rather than inherited from --sequential's, because
+      # relaxing gaplessness can only raise the count: over the 101 tracked Markdown files, all 101
+      # pass the structure check, while of the 10 documents holding an all-numeric-first-column
+      # table only 6 satisfy order -- the rest lead with frame indices, draw ordinals and submit
+      # numbers, where repeats are the correct content. Applying order broadly would report correct
+      # documents as broken, and a check that fires on correct data gets deleted.
       #
       # --ordered replaced --sequential on 2026-08-17 (#2089). GAPS ARE NOW LEGAL. Gaplessness made
       # a lane's job red BY CONSTRUCTION whenever a lower number was still in flight -- a failure
       # its author could not repair, because the missing number belonged to somebody else's branch,
       # and the only local fix was the forbidden renumber. It was kept because it catches a DELETED
-      # row, but it only ever caught an INTERIOR deletion: measured on master, dropping the highest
-      # row passed green, and restoring the file wholesale from an old revision (instrument trap 41
-      # / #1701) lost 61 rows and reported "contiguous and unbroken".
+      # row, but it only ever caught an INTERIOR deletion: measured on master's 186-row Instrument
+      # table, dropping the highest row passed green, and restoring the file wholesale from an old
+      # revision (instrument trap 41 / #1701) lost 61 rows and reported "contiguous and unbroken".
       #
       # --baseline is what took that job over, and it is the whole detector: every row number in
       # the base's copy of the table must still be present, so an interior deletion, a truncated

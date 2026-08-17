@@ -46,6 +46,17 @@ from pathlib import Path
 
 DEFAULT_FILE = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
 DEFAULT_HEADER = "Instrument"
+# `gh pr list --json files` caps the array at 100 entries and gives NO "there is more" signal.
+# MEASURED, not assumed (#2610 review asked and could not settle it here, since this repository's
+# largest PR has 57 changed files):
+#   * server side -- `files(first: 101)` is refused outright: "Requesting 101 records on the `files`
+#     connection exceeds the `first` limit of 100 records" (EXCESSIVE_PAGINATION).
+#   * in the wild -- `cli/cli#14082` truly has 1,161 changed files, and `gh pr view --json files`
+#     returns exactly 100 of them, silently, with no error and no indicator.
+# So a PR at the cap that does NOT list our path proves nothing, and skipping it would make its claim
+# invisible -- the same silent direction as the --limit truncation above. Scan it instead: one extra
+# request against an invisible collision.
+FILES_CAP = 100
 
 # A leading-pipe row whose first cell is a bare integer. Deliberately the same shape as
 # check_numbered_table.LEADING_NUMBER, so the allocator and the gate agree on what a numbered row
@@ -101,6 +112,17 @@ def highest(text: str, header_text: str) -> int | None:
     return max(nums) if nums else None
 
 
+def added_numbers(text: str, base_text: str, header_text: str) -> list[int]:
+    """The row numbers this version has that the base does not -- the PR's actual claim.
+
+    Not `range(base_max + 1, pr_max + 1)`. Since gaps became legal (#2089) a branch's maximum says
+    nothing about which numbers between it and the base are taken: this branch itself holds 191 and
+    leaves 188-190 free. Printing the range would report three claims that do not exist and push the
+    next lane needlessly high.
+    """
+    return sorted(set(table_numbers(text, header_text)) - set(table_numbers(base_text, header_text)))
+
+
 def open_prs(limit: int) -> list[dict]:
     out = run([
         "gh", "pr", "list", "--state", "open", "--limit", str(limit),
@@ -147,15 +169,32 @@ def main() -> int:
                 f"{args.base}:{args.file} -- wrong path, or the table format changed"
             )
 
-        claims: list[tuple[int, str, int | None, bool]] = []
+        claims: list[tuple[int, str, int | None, bool, list[int]]] = []
         prs = open_prs(args.limit)
-        touching = [
-            pr for pr in prs
-            if any(f.get("path") == args.file for f in pr.get("files") or [])
-        ]
+        if len(prs) >= args.limit:
+            # The one failure this tool must not have. `gh pr list --limit N` returns AT MOST N and
+            # says nothing about what it dropped, so a truncated list yields a smaller maximum and a
+            # confidently wrong "next free number" -- the exact defect this exists to prevent, wearing
+            # the look of a successful run. Reproduced at --limit 3 while three open PRs held 188.
+            raise ScanError(
+                f"--limit {args.limit} returned {len(prs)} open PR(s), so the list is (or may be) "
+                f"TRUNCATED and any answer would silently omit whatever was dropped. Re-run with a "
+                f"higher --limit."
+            )
+        touching = []
+        for pr in prs:
+            paths = [f.get("path") for f in pr.get("files") or []]
+            if args.file in paths:
+                touching.append(pr)
+            elif len(paths) >= FILES_CAP:
+                # `gh pr list --json files` pages at 100 entries, so on a PR at the cap the absence
+                # of our path proves nothing. Scan it rather than skip it: the cost is one request
+                # and the alternative is an invisible claim.
+                touching.append(pr)
         for pr in touching:
             text = file_at(repo, args.file, pr["headRefOid"])
-            claims.append((pr["number"], pr["title"], highest(text, args.table_header), pr["isDraft"]))
+            claims.append((pr["number"], pr["title"], highest(text, args.table_header),
+                           pr["isDraft"], added_numbers(text, base_text, args.table_header)))
     except ScanError as exc:
         # Hard error. A fallback to "master alone" would answer the question this tool exists to
         # refuse to answer that way, and the caller could not tell the two apart.
@@ -164,24 +203,38 @@ def main() -> int:
         return 1
 
     overall = max([base_max] + [c[2] for c in claims if c[2] is not None])
+    claimed: set[int] = {n for c in claims for n in c[4]}
     if args.quiet:
         print(overall + 1)
         return 0
 
     print(f"{args.file}  (table header contains {args.table_header!r})")
     print(f"  {args.base:<28} highest row {base_max}")
-    for number, title, pr_max, draft in sorted(claims, key=lambda c: -(c[2] or 0)):
+    for number, title, pr_max, draft, added in sorted(claims, key=lambda c: -(c[2] or 0)):
         if pr_max is None:
             note = "no numbered table in its copy"
-        elif pr_max > base_max:
-            note = f"CLAIMS {', '.join(str(n) for n in range(base_max + 1, pr_max + 1))}"
+        elif added:
+            note = f"CLAIMS {', '.join(str(n) for n in added)}"
         else:
             note = "no claim (older base, adds no row)"
         flag = " [draft]" if draft else ""
         print(f"  PR #{number:<25} highest row {pr_max}   {note}{flag}")
     print(f"  scanned {len(prs)} open PR(s), {len(touching)} touching this file (--limit {args.limit})")
     print()
-    print(f"next free number: {overall + 1}")
+    # How many lanes already hold the number a naive "master max + 1" would take. When more than one
+    # does, "next free" is a trap: every loser steps to it simultaneously and collides again one
+    # number up. Stepping CLEAR of the whole contested band is the cheap fix, and it is only safe
+    # because gaps stopped being defects (#2089).
+    contested = sorted(n for n in claimed if sum(1 for c in claims if n in c[4]) > 1)
+    if contested:
+        racing = [f"#{n}" for n, _, _, _, added in claims if set(added) & set(contested)]
+        band = ", ".join(str(n) for n in contested)
+        print(f"COLLISION: {band} claimed by more than one open PR ({', '.join(racing)}).")
+        print(f"next free number: {overall + 1}   --   CONSIDER {overall + 4} INSTEAD: if every")
+        print("loser steps to the next free number they collide again one number up. Stepping clear")
+        print("of the contested band costs a gap, legal since #2089, and takes you out of the race.")
+    else:
+        print(f"next free number: {overall + 1}")
     print("Advisory only -- another lane can take it in the same minute. Push and merge promptly;")
     print("if you collide, renumber to any HIGHER number and merge (gaps are legal since #2089).")
     return 0
