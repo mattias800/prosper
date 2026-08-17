@@ -266,7 +266,29 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   and the pixel-distinct/pixel-stale assertions when visible progression matters. Source publication
   counts alone do not prove that the image changed; see `screenshot/README.md`.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
-  export RVAs. Use `--find-symbol NID` for a focused import/export query.
+  export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
+  to print the GOT/PLT relocation slot each import lands in — the step that starts every
+  "who calls this Sony function, and what does the guest do with the result?" investigation:
+
+  ```bash
+  ./build-linux/self_dump <DUMP_ROOT>/<TITLE>-app0/eboot.bin \
+      --import-slots --names ../PS5-3.20_Libs | grep scePadGetHandle
+  # 0x000007f9b18 u1GRHp+oWoY  libScePad   scePadGetHandle   JUMP_SLOT
+  ```
+
+  Then hand that slot to `re/xref.py` (see `re/README.md` for the full recipe, including the PLT
+  hop the slot's only direct reference is). `--names` points at the PS5 3.20 firmware stub dump
+  (`$PROSPER_PS5_LIBS` is the fallback); **the NID is printed either way**, so an import the dump
+  does not name is still actionable.
+
+  The output is deliberately self-describing rather than terse. Each run prints which relocation
+  tables it read and how many entries each held, how many symbols and imports it parsed, which name
+  table it used, and — when there are **no** rows — the reason, exiting **3** rather than 0. Imports
+  with no relocation are listed under `[IMPORTS WITHOUT A SLOT]` instead of being dropped, so a
+  `grep` that finds nothing means the module does not import that function, never "it has no slot".
+  A `JUMP_SLOT` row is the call path; `GLOB_DAT`/`64` rows are the same address stored elsewhere
+  (vtables, static initialisers), which is why a busy title reports several times more slots than
+  imports — filter with `grep JUMP_SLOT` when you want only the call site.
 - **`guest_bt/`** — symbolicated **guest**-thread backtraces for a live or frozen prosper process:
   "what is this thread doing / waiting for?". Answers it for **any** title, not just IL2CPP/Unity —
   the managed-symbol step is optional, and on a stripped native C++ UE4 title it still walks every

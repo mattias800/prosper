@@ -15,6 +15,55 @@ PS5 dynamic symbols use NIDs rather than plaintext names. Once a name has been h
 The result distinguishes imports from exports and prints the export RVA. `--symbols` prints every import
 NID and every defined export with its RVA, size, module, and library context.
 
+## Find who calls an IMPORTED Sony function
+
+This is the question that starts most HLE contract work — "who calls this, and what does the guest do
+with the result?" — and it is how #1592 was root-caused: the guest's own `test eax,eax` / `jns` around
+`scePadGetHandle` proved the contract prosper was violating.
+
+A PS5 module never calls an import directly. The call goes to a PLT stub, the stub jumps through a GOT
+slot, and the loader fills that slot at bind time. `self_dump --import-slots` prints the slot
+(`DT_JMPREL`/`DT_RELA` `r_offset`), which used to be hand-parsed out of the relocation table:
+
+```bash
+./build-linux/self_dump <DUMP_ROOT>/PPSA20052-app0/eboot.bin \
+    --import-slots --names ../PS5-3.20_Libs | grep scePadGetHandle
+```
+
+```text
+0x000007f9b18 u1GRHp+oWoY  libScePad    scePadGetHandle    JUMP_SLOT
+```
+
+Then flatten the module and walk the two references out from that slot. **The slot's only direct
+reference is the PLT stub** — the callers reference the *stub*, so it is two `xref` queries, not one:
+
+```bash
+python3 tools/il2cpp/prx_to_elf.py <DUMP_ROOT>/PPSA20052-app0/eboot.bin ~/work/eboot.elf
+python3 tools/re/xref.py ~/work/eboot.elf to 0x7f9b18      # slot  -> PLT stub
+python3 tools/re/xref.py ~/work/eboot.elf to 0x60c8e0      # stub  -> the call sites
+```
+
+```text
+code references to 0x7f9b18: 1 (0 write, 0 read, 0 address-taken)
+   [x ] jmp*    at 0x60c8e0  (in func 0x60c3e0)            # the PLT stub
+
+code references to 0x60c8e0: 9 (0 write, 0 read, 0 address-taken)
+   [x ] call    at 0x7fc74  (in func 0x7fa30)
+   [x ] call    at 0x7fd5c  (in func 0x7fa30)              # the #1592 site
+   [x ] call    at 0x800d9  (in func 0x7fa30)
+   ...
+```
+
+`tools/re/edis.py` then disassembles a call site to read the guest's own test of the return value.
+This is the worked known answer for `--import-slots`: `0x7fd5c`, `0x800d9` and the containing function
+`0x7fa30` are exactly what #1592 recorded by hand.
+
+Two things to know before believing an answer here. **`--import-slots` reports `GLOB_DAT` and `64`
+relocations as well as `JUMP_SLOT`** — those are the same function address stored in a vtable or a
+static initialiser rather than the call path, so a busy title lists several times more slots than it has
+imports; `grep JUMP_SLOT` when you want the call site. And a **zero from `--import-slots` always states
+its own cause and exits 3**, so "no output" is never ambiguous between "no slots" and "nothing parsed".
+
 ## Find readers and writers of a slot
 
 Flatten the SELF/PRX first, then query the address with `xref.py`:
