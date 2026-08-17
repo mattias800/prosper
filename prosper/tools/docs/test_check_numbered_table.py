@@ -222,6 +222,17 @@ run("a gap both files share is not a deletion",
     ordered=True, baseline="| # | What |\n|---|---|\n| 1 | a |\n| 4 | d |\n",
     want_problems=False)
 
+# A row that leaves the table by being STRUCTURALLY orphaned -- a blank line splitting the table
+# above it -- is reported as gone, on top of the structure error naming the real cause. That is a
+# decision, not an accident: rows below a break drop out of every numbered check, so suppressing
+# persistence whenever structure complains would let a deletion hide behind a stray blank line,
+# which is the shape "a duplicate hidden below an interruption cannot pass green" already guards.
+# Two problems, and the structure one is listed first because it is the repair.
+run("rows orphaned by a table split are reported gone, alongside the structure error",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n\n| 3 | c |\n| 4 | d |\n",
+    ordered=True, baseline=BASE, want_problems=True, want_count=2,
+    expect_text="GONE from this table: 3, 4")
+
 # Fails closed. A baseline that cannot be read must be an ERROR: the caller asked for the check, and
 # a silent skip would make a green run mean nothing -- exactly the "no tests ran and everything
 # passed share an exit code" shape the charter warns about.
