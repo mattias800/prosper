@@ -3492,6 +3492,46 @@ early/transition moment, while the HUD-visible baseline comes from the 380 s gra
 ~4137. Different sample point, not different behaviour. **Compare frames only against a control taken
 with the identical trigger** — on this route an unmatched pair looks exactly like a regression.
 
+#### What actually invalidates that depth, now that the diagnostic can say (2026-08-17)
+
+`[ds] invalidate`'s `origin=` field was **structurally incapable of attribution** until `1818b996`.
+It reads a thread-local set around `notify_guest_gpu_write`, while DS/RTT invalidation runs at
+**drain** time on the draining thread, long after that thread-local is reset — so it printed
+`origin=gpu` for **30,458 of 30,458** invalidations, including ones from writers that tag themselves.
+The queued record now carries the origin, captured on the writing thread.
+
+**Read the aggregate and the per-surface breakdown as two different questions**, because taking the
+aggregate for an answer inverted this one. Across every DS invalidation:
+
+| origin | count |
+| --- | --- |
+| `compute-writeback(image-guest-bytes)` | 15,777 |
+| `compute-writeback(cpu-fill)` | 11,267 |
+| `gpu` (genuinely the guest) | 6,316 |
+
+About **81%** of DS invalidation traffic is prosper invalidating its own caches from its own
+writebacks. That is a measurement, not a verdict — a writeback into guest memory can legitimately
+stale a detached cache — but it was invisible before and it is worth a decision.
+
+For the surface `0x2042f49a00` actually samples, `dr=0x2052ac0000`:
+
+| aspect hit | origin | count |
+| --- | --- | --- |
+| `htile_hit=1` | `gpu` | 1,678 |
+| `htile_hit=1` | `compute-writeback(cpu-fill)` | 407 |
+| `htile_hit=0` | `compute-writeback(cpu-fill)` | 407 |
+
+**Its depth range is never directly written.** Every loss of the depth plane comes through the
+conservative "an HTILE overlap may describe both aspects, so invalidate both" rule, and 1,678 of the
+2,492 are genuine guest HTILE writes of a repeated identical 640 KB at the HTILE base
+`0x2055310000`. So the frontier is the HTILE semantics, exactly as framed — not a writeback bug.
+
+**An aggregate over the wrong population reads as an answer.** A first pass over *all* surfaces showed
+24,922 depth invalidations with `htile_hit=0`, which says "HTILE is not involved at all". That
+population is dominated by **cube shadow maps** (`0x2094ec0000`, `0x20948c0000`, …). Isolating the one
+surface under investigation inverts the conclusion completely. Same shape as the matched-trigger
+screenshot trap above: filter to the subject before believing a count.
+
 **The frontier is now depth validity, not the recompiler.** This dispatch reads the main depth and
 needs the retained image to be *valid* when it runs; `dvalid=0` says it frequently is not, and one
 address accounts for 37,751 of the run's 40,826 `depth-invalid` declines. That is HTILE
