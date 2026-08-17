@@ -17,10 +17,28 @@
 //     --warmup-seconds S  skip Vulkan rendering for S seconds before capture
 //     --warmup-submits N  skip Vulkan rendering before submit N
 //     --allow-guest-fault the guest's primary thread dying is not a failure (fault-repro routes)
+//     --no-stop-after-guest-fault  keep sampling the full request after the guest dies
+//     --guest-fault-settle-seconds S  quiescence required before that early stop (default 1)
 //
 // A run whose guest died still writes every PNG it managed to sample — frames from a crashing boot
 // are real evidence — but it reports `status=GUEST-FAULT` and exits non-zero, because every sample
 // after the fault is the same stale frame and no exit status used to say so (#2007).
+//
+// It also stops sampling once that is established: the primary thread is dead AND the present layer
+// has published nothing for the settle window, so nothing new can arrive (#2584). Samples already
+// taken are kept and the run finishes normally, without the redundant tail. The summary line reports
+// `saved/requested` with `stop=guest-fault` beside it so a short artifact set explains itself
+// instead of reading as a truncated harness.
+//
+// What the stop can and cannot change, stated exactly, because "same assertions" is NOT true and
+// used to be claimed here (#2639 review B1):
+//   - the saved/requested assertion is EXCUSED, and only in wall-clock mode with a sample taken;
+//   - `--max-stale-seconds` / `--max-pixel-stale-seconds` DISARM the stop, because they are maxima
+//     over the samples taken and a shortened run would report a smaller one (`early_stop_armed`);
+//   - every other FLAG assertion is a floor (`--min-*`, `--require-*`) that fewer samples can only
+//     push further from being met, and the one non-flag assertion (an unwritable manifest) is still
+//     caught by the summary write and the fclose below. So the stop cannot make a run pass.
+// The verdict, the manifest and the exit status are otherwise the ones the full-length run produces.
 //
 // Reaching a rendering frame loop needs the guest switches the render frontier documents; this tool
 // defaults PROSPER_GUEST_ARGS=-force-gfx-direct (Unity/Messenger recipe) if it isn't already set,
@@ -277,6 +295,12 @@ int main(int argc, char** argv) {
     uint64_t min_present_count = 0, min_frame_seq = 0, required_crc32 = 0;
     bool manifest_disabled = false, require_composited_frame = false, required_crc32_set = false;
     bool warmup_seconds_set = false, warmup_submits_set = false, allow_guest_fault = false;
+    // Once the guest's primary thread is dead AND the present layer has been quiet this long, no
+    // further sample can carry new information, so sampling stops (#2584). One second is long
+    // enough for a renderer backlog or a surviving guest thread to publish one more frame at any
+    // rate the tool has ever sampled, and short enough that the redundant tail disappears.
+    double guest_fault_settle_seconds = 1.0;
+    bool stop_after_guest_fault = true;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--every"   && i + 1 < argc) every = atoi(argv[++i]);
@@ -345,6 +369,14 @@ int main(int argc, char** argv) {
         }
         else if (a == "--require-composited-frame") require_composited_frame = true;
         else if (a == "--allow-guest-fault") allow_guest_fault = true;
+        else if (a == "--no-stop-after-guest-fault") stop_after_guest_fault = false;
+        else if (a == "--guest-fault-settle-seconds" && i + 1 < argc) {
+            if (!parse_nonnegative_double(argv[++i], guest_fault_settle_seconds)) {
+                fprintf(stderr,
+                        "screenshot: --guest-fault-settle-seconds requires a non-negative number\n");
+                return 2;
+            }
+        }
         else if (a == "--warmup-seconds" && i + 1 < argc) {
             warmup_seconds_set = true;
             if (!parse_nonnegative_double(argv[++i], warmup_seconds)) {
@@ -370,11 +402,29 @@ int main(int argc, char** argv) {
                         "[--max-stale-seconds S] [--min-pixel-distinct-frames N] "
                         "[--max-pixel-stale-seconds S] [--require-composited-frame] "
                         "[--min-present-count N] [--min-frame-seq N] [--require-crc32 N] "
-                        "[--allow-guest-fault]\n");
+                        "[--allow-guest-fault] [--no-stop-after-guest-fault] "
+                        "[--guest-fault-settle-seconds S]\n");
         return 2;
     }
     if (every < 1) every = 1;
     if (count < 1) count = 1;
+
+    // A staleness bound disarms the early stop, because both bounds are maxima over the samples that
+    // were TAKEN and the stop deletes the very interval they exist to catch (#2639 review B1; the
+    // reasoning is on `early_stop_armed`). From here on this variable is the EFFECTIVE policy: it is
+    // what the loop obeys and what the manifest run header records, so an archived artifact set
+    // states the policy it ran under rather than the one that was asked for.
+    {
+        const bool requested_stop = stop_after_guest_fault;
+        stop_after_guest_fault = screenshot::early_stop_armed(stop_after_guest_fault,
+                                                             max_stale_seconds,
+                                                             max_pixel_stale_seconds);
+        if (requested_stop && !stop_after_guest_fault)
+            fprintf(stderr, "[shot] early stop after a guest fault is DISARMED for this run: "
+                            "--max-stale-seconds / --max-pixel-stale-seconds measure the maximum "
+                            "gap across the samples taken, so stopping early would delete the "
+                            "interval they exist to catch. Sampling runs the full request.\n");
+    }
 
     // Title code = dump basename with a trailing "-app0" removed (e.g. PPSA24651-app0 -> PPSA24651).
     std::string code = dump;
@@ -499,6 +549,8 @@ int main(int argc, char** argv) {
         run_config.required_crc32_set = required_crc32_set;
         run_config.required_crc32 = static_cast<uint32_t>(required_crc32);
         run_config.allow_guest_fault = allow_guest_fault;
+        run_config.stop_after_guest_fault = stop_after_guest_fault;
+        run_config.guest_fault_settle_seconds = guest_fault_settle_seconds;
         const std::string run_line = screenshot::manifest_run_json(run_config);
         if (fprintf(manifest, "%s\n", run_line.c_str()) < 0 || fflush(manifest) != 0) {
             fprintf(stderr, "screenshot: cannot write manifest header '%s': %s\n",
@@ -573,18 +625,67 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[shot] manifest: %s\n", manifest_path.c_str());
 
     int saved = 0;
-    bool timed_out = false, manifest_failed = false, required_crc32_seen = false;
+    bool manifest_failed = false, required_crc32_seen = false;
+    screenshot::SamplingStop stop = screenshot::SamplingStop::RequestSatisfied;
     screenshot::CaptureTracker tracker;
     uint64_t next = (uint64_t)every;   // frame-mode: rendered-frame # for the next shot
     auto t0 = std::chrono::steady_clock::now();
     auto last_cap = t0;                // time-mode: wall-clock of the previous shot
+    // Early-stop state. `sampling_guest` is the terminal state observed WHILE sampling, which is a
+    // different observation from the one the verdict is folded from after the loop: this one has to
+    // be polled, that one has to be read exactly once.
+    screenshot::GuestOutcome sampling_guest;
+    auto guest_fault_at = t0;          // when the fault was first observed
+    auto present_advanced_at = t0;     // when the present layer last published anything
+    uint64_t seen_frame_seq = gpu::present_frame_seq();
+    uint64_t seen_present_count = gpu::present_count();
     while (saved < count) {
         auto now = std::chrono::steady_clock::now();
         double el = std::chrono::duration<double>(now - t0).count();
         if (timeout > 0 && el > timeout) {
             fprintf(stderr, "[shot] timeout after %.0fs with %d/%d saved — game not rendering enough "
                             "(wrong guest env for this title? see the README)\n", el, saved, count);
-            timed_out = true;
+            stop = screenshot::SamplingStop::Timeout;
+            break;
+        }
+        // Present-layer liveness, polled every iteration rather than at capture time: the quiescence
+        // window has to be measured from the last real publication, not from the last thing this
+        // tool happened to photograph. Either counter advancing is new content — renderer frames and
+        // guest flips are independent, and a title can advance one without the other.
+        {
+            const uint64_t frame_seq_now = gpu::present_frame_seq();
+            const uint64_t present_count_now = gpu::present_count();
+            if (frame_seq_now != seen_frame_seq || present_count_now != seen_present_count) {
+                seen_frame_seq = frame_seq_now;
+                seen_present_count = present_count_now;
+                present_advanced_at = now;
+            }
+        }
+        if (stop_after_guest_fault &&
+            sampling_guest.state != screenshot::GuestRunState::Faulted) {
+            const screenshot::GuestOutcome polled = screenshot::read_guest_outcome();
+            if (polled.state == screenshot::GuestRunState::Faulted) {
+                sampling_guest = polled;
+                guest_fault_at = now;
+                fprintf(stderr, "[shot] guest fault observed at %.1fs with %d/%d saved; sampling "
+                                "continues while the present layer is still publishing\n",
+                        el, saved, count);
+            }
+        }
+        if (screenshot::should_stop_after_guest_fault(
+                sampling_guest, stop_after_guest_fault,
+                std::chrono::duration<double>(now - guest_fault_at).count(),
+                std::chrono::duration<double>(now - present_advanced_at).count(),
+                guest_fault_settle_seconds)) {
+            fprintf(stderr,
+                    "[shot] stopping early at %.1fs: the guest's primary thread is dead and the "
+                    "present layer has published nothing for %.1fs, so every further sample would "
+                    "copy the same frame. %d of %d requested samples were taken and ALL are kept; "
+                    "the run finishes normally. Use --no-stop-after-guest-fault to sample the full "
+                    "request anyway.\n",
+                    el, std::chrono::duration<double>(now - present_advanced_at).count(),
+                    saved, count);
+            stop = screenshot::SamplingStop::GuestFault;
             break;
         }
         bool due = time_mode ? (std::chrono::duration<double>(now - last_cap).count() >= seconds)
@@ -677,8 +778,29 @@ int main(int argc, char** argv) {
         fputc('\n', stderr);
         exit_code = 1;
     };
-    if (saved != count)
+    // A short run is EXCUSED only where the samples it skipped would otherwise have been written.
+    //
+    // In wall-clock mode the sampler is due again every `--seconds` no matter what the guest is
+    // doing, and the present layer keeps handing back its last frame, so once one sample exists the
+    // remainder are guaranteed duplicates: their absence is this stop's doing, not the route's, and
+    // failing on it would flip an `--allow-guest-fault` run that passes today into FAILED.
+    //
+    // In frame mode `due` needs a NEW rendered frame, which a dead and quiet guest will never
+    // produce. The sampler would have written nothing more and would have failed on the timeout, so
+    // the shortfall is real and still fails — the contract README.md states for a run cut short by
+    // the guest. Excusing it there would turn a failing run into a passing one.
+    const bool short_run_explained =
+        stop == screenshot::SamplingStop::GuestFault && time_mode && saved > 0;
+    if (saved != count && !short_run_explained)
         assertion_failed("saved %d/%d requested screenshots", saved, count);
+    else if (saved != count)
+        // ASCII only: this is program output, and a UTF-8 punctuation mark in a printf literal is
+        // cp1252/cp437 mojibake on Windows and stops matching the grep a reader types (#2588).
+        fprintf(stderr, "[shot] note: %d of %d requested samples were taken. The %d not taken were "
+                        "skipped because sampling stopped at the guest's death (each would have "
+                        "been a byte-for-byte copy of sample %d), not because the run was cut "
+                        "short. This is not counted as a failure.\n",
+                saved, count, count - saved, saved - 1);
     if (manifest_failed)
         assertion_failed("%s", "manifest could not be written completely");
     if (tracker.distinct_source_frames() < static_cast<uint64_t>(min_distinct_frames))
@@ -734,7 +856,7 @@ int main(int argc, char** argv) {
         screenshot::decide_run_verdict(exit_code != 0, guest_outcome, allow_guest_fault);
     if (manifest) {
         const std::string summary = screenshot::manifest_summary_json(
-            saved, count, timed_out, tracker, verdict, guest_outcome, allow_guest_fault);
+            saved, count, stop, tracker, verdict, guest_outcome, allow_guest_fault);
         if (fprintf(manifest, "%s\n", summary.c_str()) < 0 || fclose(manifest) != 0) {
             fprintf(stderr, "[shot] manifest close failed: %s: %s\n",
                     manifest_path.c_str(), strerror(errno));
@@ -743,10 +865,14 @@ int main(int argc, char** argv) {
             verdict = screenshot::decide_run_verdict(true, guest_outcome, allow_guest_fault);
         }
     }
-    fprintf(stderr, "[shot] done: %d screenshot(s) in %s; source-distinct=%llu "
+    // `saved/requested` and `stop=` travel together: a reader who sees fewer PNGs than requested
+    // must be able to tell a truncated harness from a run that stopped because nothing new could
+    // arrive, on this one line, without opening the manifest.
+    fprintf(stderr, "[shot] done: %d/%d screenshot(s) in %s; stop=%s source-distinct=%llu "
                     "pixel-distinct=%llu max-source-stale=%.1fs max-pixel-stale=%.1fs guest=%s "
                     "status=%s\n",
-            saved, out.c_str(), (unsigned long long)tracker.distinct_source_frames(),
+            saved, count, out.c_str(), screenshot::sampling_stop_name(stop),
+            (unsigned long long)tracker.distinct_source_frames(),
             (unsigned long long)tracker.pixel_distinct_frames(), tracker.max_stale_seconds(),
             tracker.max_pixel_stale_seconds(),
             screenshot::guest_run_state_name(guest_outcome.state), verdict.status);

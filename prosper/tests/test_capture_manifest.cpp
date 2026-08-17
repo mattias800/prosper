@@ -188,8 +188,10 @@ int main() {
     GuestOutcome running_guest;
     const RunVerdict failed_verdict = decide_run_verdict(true, running_guest, false);
     const std::string summary =
-        manifest_summary_json(3, 5, true, tracker, failed_verdict, running_guest, false);
+        manifest_summary_json(3, 5, SamplingStop::Timeout, tracker, failed_verdict, running_guest,
+                              false);
     CHECK(summary.find("\"timed_out\":true") != std::string::npos &&
+          summary.find("\"stop_reason\":\"timeout\"") != std::string::npos &&
           summary.find("\"pixel_distinct_frames\":2") != std::string::npos &&
           summary.find("\"max_pixel_stale_seconds\":2.500000") != std::string::npos &&
           summary.find("\"exit_code\":1") != std::string::npos,
@@ -234,7 +236,8 @@ int main() {
               "--allow-guest-fault does not disarm the capture assertions");
 
         const std::string fault_summary =
-            manifest_summary_json(25, 25, false, tracker, fault_verdict, faulted, false);
+            manifest_summary_json(25, 25, SamplingStop::RequestSatisfied, tracker, fault_verdict,
+                                  faulted, false);
         CHECK(fault_summary.find("\"guest_state\":\"faulted\"") != std::string::npos &&
               fault_summary.find("\"guest_kind\":2") != std::string::npos &&
               fault_summary.find("\"guest_fault_rip\":\"0x410024055\"") != std::string::npos &&
@@ -251,10 +254,128 @@ int main() {
               std::string(returned_verdict.status) == "ok" && returned_verdict.exit_code == 0,
               "a guest that exits normally is recorded but does not fail the run");
         const std::string returned_summary =
-            manifest_summary_json(5, 5, false, tracker, returned_verdict, returned, false);
+            manifest_summary_json(5, 5, SamplingStop::RequestSatisfied, tracker, returned_verdict,
+                                  returned, false);
         CHECK(returned_summary.find("\"guest_state\":\"returned\"") != std::string::npos &&
               returned_summary.find("\"guest_fault_rip\":null") != std::string::npos,
               "a normal guest exit is still visible in the manifest, with no fault address");
+    }
+
+    // #2584: the verdict was right and the LOOP was not — a run whose guest died at 0.4 s went on
+    // sampling for 24 more seconds and wrote 24 byte-identical PNGs. The stop condition is the unit
+    // under test here; the live arm (a routed PPSA26414 boot with and without
+    // --no-stop-after-guest-fault) is what proves the sampler is actually wired to it.
+    {
+        GuestOutcome running;
+        GuestOutcome returned;  returned.state = GuestRunState::Returned;
+        GuestOutcome faulted;   faulted.state = GuestRunState::Faulted; faulted.kind = 2;
+        const double settle = 1.0;
+
+        CHECK(should_stop_after_guest_fault(faulted, true, 2.0, 2.0, settle),
+              "a dead guest and a present layer that has gone quiet stops the sampler");
+
+        // The two arms that separate this from "stop as soon as the guest thread dies". A primary
+        // thread's death says nothing about other guest threads or a renderer backlog, so a stop
+        // keyed on the fault alone would silently truncate a run that is still producing frames —
+        // and the truncation would be indistinguishable from a satisfied request.
+        CHECK(!should_stop_after_guest_fault(faulted, true, 2.0, 0.2, settle),
+              "a present layer still publishing keeps the sampler running after the fault");
+        CHECK(!should_stop_after_guest_fault(faulted, true, 0.2, 2.0, settle),
+              "work already in flight gets the settle window before the sampler gives up");
+
+        // Neither non-terminal nor voluntary exit is a stop. `Returned` is the load-bearing one: a
+        // title exiting normally must keep tripping the saved/requested assertion (#2007), which
+        // stopping here would silence.
+        CHECK(!should_stop_after_guest_fault(running, true, 2.0, 2.0, settle),
+              "a live guest never stops the sampler, however quiet the present layer is");
+        CHECK(!should_stop_after_guest_fault(returned, true, 2.0, 2.0, settle),
+              "a guest that exits on its own is not a fault and does not stop the sampler");
+
+        CHECK(!should_stop_after_guest_fault(faulted, /*enabled=*/false, 30.0, 30.0, settle),
+              "--no-stop-after-guest-fault samples the full request even from a dead guest");
+
+        // Boundary: the windows are inclusive, so a zero settle stops on the first poll after the
+        // fault. Nothing in the tool sets that, but the comparison must not be strict.
+        CHECK(should_stop_after_guest_fault(faulted, true, 0.0, 0.0, 0.0),
+              "a zero settle window stops as soon as the fault is observed");
+
+        // The stop must be legible in the artifact, or a 3-PNG run reads as a crashed harness.
+        const RunVerdict fault_verdict = decide_run_verdict(false, faulted, false);
+        const std::string early =
+            manifest_summary_json(3, 25, SamplingStop::GuestFault, tracker, fault_verdict, faulted,
+                                  false);
+        CHECK(early.find("\"saved\":3") != std::string::npos &&
+              early.find("\"requested\":25") != std::string::npos &&
+              early.find("\"stop_reason\":\"guest-fault\"") != std::string::npos &&
+              early.find("\"timed_out\":false") != std::string::npos,
+              "a short run states saved, requested and why it is short, and is not a timeout");
+
+        CHECK(std::string(sampling_stop_name(SamplingStop::RequestSatisfied)) ==
+                  "request-satisfied" &&
+              std::string(sampling_stop_name(SamplingStop::Timeout)) == "timeout" &&
+              std::string(sampling_stop_name(SamplingStop::GuestFault)) == "guest-fault",
+              "every stop reason has its own name, so the three are distinguishable");
+
+        // The run header records the policy, so an archived manifest says whether the tail was
+        // dropped by this stop or was never produced.
+        CaptureRunConfig stopped_config;
+        stopped_config.stop_after_guest_fault = false;
+        stopped_config.guest_fault_settle_seconds = 2.5;
+        const std::string stopped_run = manifest_run_json(stopped_config);
+        CHECK(stopped_run.find("\"stop_after_guest_fault\":false") != std::string::npos &&
+              stopped_run.find("\"guest_fault_settle_seconds\":2.500000") != std::string::npos,
+              "the run header records the early-stop policy that produced the artifact set");
+
+        // #2639 review B1. The finding was not the wording: ONE assertion family moves in the
+        // PASSING direction under a shortened run, and the live A/B could not have seen it, because
+        // neither arm set a `--max-*` flag and both therefore had the assertion off. So construct
+        // the hazard by hand, outside whatever produced that null -- the same route, sampled to the
+        // end of the request versus cut at the stop.
+        {
+            std::vector<uint8_t> frame(16 * 8 * 4, 0x44);
+            const CaptureObservation shot{CaptureSource::Rendered, 7, 7, 70, 0, 16, 8,
+                                          0xdeadbeef, 1.0};
+            CaptureTracker full, cut;
+            full.observe(shot, frame);
+            cut.observe(shot, frame);   // the single sample an early-stopped run takes
+            // The 24 byte-identical samples a full-length run goes on to take, one per second, from
+            // a guest that died at 0.4 s: same source identity, same pixels, advancing clock.
+            for (int second = 2; second <= 25; ++second) {
+                CaptureObservation later = shot;
+                later.elapsed_seconds = static_cast<double>(second);
+                full.observe(later, frame);
+            }
+            CHECK(full.max_stale_seconds() == 24.0 && full.max_pixel_stale_seconds() == 24.0,
+                  "a full-length run measures the whole quiet interval after the guest dies");
+            CHECK(cut.max_stale_seconds() == 0.0 && cut.max_pixel_stale_seconds() == 0.0,
+                  "an early-stopped run measures NO staleness: the tail it drops IS the evidence "
+                  "the staleness bounds are computed from");
+            // Which is the flip in full: one bound, two verdicts, same route.
+            const double bound = 5.0;
+            CHECK(full.max_pixel_stale_seconds() > bound &&
+                  !(cut.max_pixel_stale_seconds() > bound),
+                  "--max-pixel-stale-seconds 5 FAILS the full run and PASSES the shortened one");
+        }
+
+        // So the bound disarms the stop rather than being documented around it.
+        CHECK(early_stop_armed(true, -1.0, -1.0),
+              "with no staleness bound armed, the early stop is armed");
+        CHECK(!early_stop_armed(true, 5.0, -1.0),
+              "--max-stale-seconds disarms the early stop");
+        CHECK(!early_stop_armed(true, -1.0, 5.0),
+              "--max-pixel-stale-seconds disarms the early stop");
+        CHECK(!early_stop_armed(true, 0.0, -1.0),
+              "a ZERO staleness bound counts as armed: the assertions guard on >= 0, so reading "
+              "zero as absent would silently drop the strictest bound of all");
+        CHECK(!early_stop_armed(false, -1.0, -1.0),
+              "--no-stop-after-guest-fault stays off whatever the assertions ask for");
+
+        // The struct's own default is the policy an archived manifest reports for a producer that
+        // does not set it, so it must be the tool's default and not the "stop on the first poll
+        // after the fault" that zero means (#2639 review N1).
+        CHECK(CaptureRunConfig{}.guest_fault_settle_seconds == 1.0,
+              "the settle-window default matches the tool's, so a direct producer gets the same "
+              "policy the command line gives");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

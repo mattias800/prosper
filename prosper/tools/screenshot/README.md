@@ -35,6 +35,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--min-pixel-distinct-frames N] [--max-pixel-stale-seconds S]
            [--require-composited-frame] [--min-present-count N]
            [--min-frame-seq N] [--require-crc32 N] [--allow-guest-fault]
+           [--no-stop-after-guest-fault] [--guest-fault-settle-seconds S]
 ```
 
 | Option | Default | Meaning |
@@ -60,6 +61,8 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--min-frame-seq N` | 0 | Fail unless a captured sample reaches rendered-frame N |
 | `--require-crc32 N` | unset | Fail unless a sample has this RGBA CRC32 (decimal or `0xHEX`) |
 | `--allow-guest-fault` | off | Do not fail the run when the guest's primary thread dies (deliberate fault-reproduction routes) |
+| `--no-stop-after-guest-fault` | off | Keep sampling the full request after the guest's primary thread dies |
+| `--guest-fault-settle-seconds S` | 1 | Quiescence required before that early stop: the guest must be dead **and** the present layer silent this long |
 
 Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
@@ -98,13 +101,62 @@ that (#2007: a title that crashed 0.4 s into boot produced 25 identical PNGs and
   so a batch consumer can filter without re-reading the run log.
 - `--allow-guest-fault` is for routes that *intend* to sample a crashing title. It restores exit 0
   and reports `status=GUEST-FAULT-ALLOWED` — never `ok` — so the fault stays visible in the record,
-  and it does not disarm the `--min-*` / `--require-*` assertions.
+  and it does not disarm the `--min-*` / `--require-*` / `--max-*` assertions. (It is the flag that
+  makes the early stop below observable at all: without it a fault is exit 1 either way.)
 - A guest whose entry **returns** (a title exiting normally) is reported as `guest=returned` and is
   not a failure on its own; a run cut short by it still trips the saved/requested assertion.
 
 Scope: this observes the thread `run_entry` entered. A *worker* thread's fatal fault already
 `_exit(90)`s the whole process on Linux, which every caller that checks an exit status can see; the
 primary thread was the one that could die silently.
+
+### Sampling stops once nothing new can arrive
+
+The verdict was only half of it: the loop used to keep running to the full `--seconds`/`--count`/
+`--timeout` after the guest had died, writing one identical PNG per interval. On the `PPSA26414`
+reproduction that was 24 byte-identical PNGs over 24 s (#2584).
+
+Sampling now stops when **both** hold: the guest's primary thread is dead, *and* the present layer
+has published nothing for `--guest-fault-settle-seconds` (1 s by default). The second condition is
+not redundant — `GuestOutcome` covers only the thread `run_entry` entered, so other guest threads and
+a renderer backlog can still publish frames after it dies. A run that keeps producing frames keeps
+sampling them, so the stop cannot silently truncate evidence; it can only remove a tail that is
+already known-identical.
+
+- **Every sample already taken is kept**, and the run finishes normally: same verdict, same
+  manifest, same exit status. The assertions are *not* untouched, and three bullets below state
+  exactly which: one assertion is excused, two disarm the stop outright, and the rest cannot be
+  affected in either direction.
+- **The short artifact set explains itself.** The summary line reads
+  `done: 3/25 screenshot(s) … stop=guest-fault … status=GUEST-FAULT`, and the manifest summary
+  carries `stop_reason` (`request-satisfied` | `timeout` | `guest-fault`) beside the `saved` and
+  `requested` it already had. Three PNGs where 25 were asked for must never read as a crashed
+  harness.
+- **The saved/requested assertion is excused only where the skipped samples would otherwise have
+  been written** — wall-clock (`--seconds`) mode with at least one sample taken, where the sampler
+  is due again regardless of the guest and the remainder are guaranteed duplicates. In frame
+  (`--every`) mode a dead, quiet guest produces no new frame for `due` to fire on, so nothing more
+  would have been written and the shortfall still fails.
+- **`--max-stale-seconds` and `--max-pixel-stale-seconds` disarm the stop entirely.** Both are
+  *maxima over the samples that were taken* — `CaptureTracker::observe` accumulates them, and only at
+  a sample — so cutting the tail deletes precisely the quiet interval they exist to catch. A run with
+  `--allow-guest-fault --max-pixel-stale-seconds 5` that fails over the full window (25 samples,
+  ~24 s stale, exit 1 `FAILED`) would, if the stop were left armed, take one sample, report 0 s and
+  exit 0. So arming either bound keeps the full-length loop, and the manifest run header records
+  `"stop_after_guest_fault": false` — the policy the run actually used, not the one requested — with
+  the bounds themselves in the same `assertions` object next to it. The run log says so too.
+- **Nothing else the tool asserts can be affected.** Every remaining flag assertion is a floor —
+  `--min-distinct-frames`, `--min-pixel-distinct-frames`, `--min-present-count`, `--min-frame-seq`,
+  `--require-composited-frame`, `--require-crc32` — and fewer samples can only push a floor further
+  from being satisfied. The one assertion that is not a flag, *manifest could not be written
+  completely*, is an I/O check on the tool itself: a shortened run makes fewer sample writes, but the
+  summary write and the `fclose` still happen, so an unwritable manifest is still caught. The stop
+  can shorten a run; it cannot turn a failing run into a passing one.
+- **A guest that *returns* does not trigger this.** A title exiting on its own is not a dead guest,
+  and a run cut short by it must keep tripping the saved/requested assertion, as above.
+- `--no-stop-after-guest-fault` restores the old full-length sampling, and both the flag and the
+  settle window are recorded in the manifest's run header, so an archived artifact set says whether
+  its tail was dropped or never produced.
 
 Warmup is useful when llvmpipe makes a frame-counted startup take minutes. The guest and GPU command
 decoder continue at native speed while Vulkan work is skipped; normal screenshots begin once warmup

@@ -541,6 +541,12 @@ Two apparatus notes for whoever picks that up:
   race**: on `20153833` with a warm page cache and `PROSPER_RENDER=1`, three attempts split two
   boots to one fault, so retry the launch to get either arm. A route that *intends* to sample this
   crash passes `--allow-guest-fault`.
+  A follow-up (#2584) also stops the run at the fault: the sampler used to keep going for the
+  remaining ~24 s and write 24 more byte-identical PNGs. Measured here on the same route, same
+  binary, `rip=0x410024055` on both arms — default **1.5 s / 1 PNG**, `--no-stop-after-guest-fault`
+  **25.3 s / 25 PNGs**, all 26 files one md5 (`c65064cd…`), identical `status=GUEST-FAULT` and
+  exit 1. So a fault-arm boot of this title now costs seconds rather than the whole route, and the
+  short PNG set says why: `stop=guest-fault` on the summary line, `stop_reason` in the manifest.
 - The flat post-movie colour is *not* the same value as the pre-fault black (`crc=064567f8`); the two
   are distinguishable by CRC, which makes them separable in a route manifest.
 
