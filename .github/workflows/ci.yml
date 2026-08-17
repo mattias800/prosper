@@ -186,7 +186,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
+        # fetch-depth: 2 is LOAD-BEARING, not tidiness. The numbering gate's deleted-row check
+        # needs the base's copy of the file, and reads it as `HEAD^1` -- which is the base commit
+        # on a `pull_request` merge ref and the previous master on a push. At the default depth 1
+        # the parent is not fetched, `git show HEAD^1:<file>` fails, and the step below fails with
+        # it (deliberately: a baseline that cannot be produced must not degrade to a green run).
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       # Its own job rather than a step of Linux: a false positive here must not cost the build and
       # test signal from an unrelated job. It needs nothing built and finishes in seconds.
@@ -203,16 +210,35 @@ jobs:
       #     every job green. Conflict detection is line-local and has no idea the column is a key,
       #     and other documents cite these rows BY NUMBER, so a duplicate silently redirects them.
       #
-      # --sequential is opt-in and belongs only to this table, whose convention is "append, never
-      # renumber". Measured with this checker over the 77 tracked Markdown files: all 77 pass the
-      # structure check, while of the 5 documents holding an all-numeric-first-column table only 2
-      # satisfy sequence -- the rest lead with frame indices, draw ordinals and submit numbers,
-      # where gaps and repeats are the correct content. Applying sequence broadly would report
-      # correct documents as broken, and a check that fires on correct data gets deleted.
+      # --ordered is opt-in and belongs only to this table, whose convention is "append, never
+      # renumber". RE-MEASURED under this rule rather than inherited from --sequential's, because
+      # relaxing gaplessness can only raise the count: over the 101 tracked Markdown files, all 101
+      # pass the structure check, while of the 10 documents holding an all-numeric-first-column
+      # table only 6 satisfy order -- the rest lead with frame indices, draw ordinals and submit
+      # numbers, where repeats are the correct content. Applying order broadly would report correct
+      # documents as broken, and a check that fires on correct data gets deleted.
+      #
+      # --ordered replaced --sequential on 2026-08-17 (#2089). GAPS ARE NOW LEGAL. Gaplessness made
+      # a lane's job red BY CONSTRUCTION whenever a lower number was still in flight -- a failure
+      # its author could not repair, because the missing number belonged to somebody else's branch,
+      # and the only local fix was the forbidden renumber. It was kept because it catches a DELETED
+      # row, but it only ever caught an INTERIOR deletion: measured on master's 186-row Instrument
+      # table, dropping the highest row passed green, and restoring the file wholesale from an old
+      # revision (instrument trap 41 / #1701) lost 61 rows and reported "contiguous and unbroken".
+      #
+      # --baseline is what took that job over, and it is the whole detector: every row number in
+      # the base's copy of the table must still be present, so an interior deletion, a truncated
+      # tail, a whole-file revert and a renumber are all reported -- and nothing another lane does
+      # can make it fire. HEAD^1 is the base commit on a pull_request merge ref (checkout with no
+      # `ref:` checks out refs/pull/N/merge, whose first parent is the base) and the previous master
+      # on a push, so the same expression is right for both the pre-merge and the post-merge run.
       - name: Verify the numbered doc tables are intact
         run: |
-          python3 prosper/tools/docs/check_numbered_table.py --github --sequential \
-            --table-header Instrument prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+          set -o pipefail
+          F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+          git show "HEAD^1:$F" > "$RUNNER_TEMP/orchestration-base.md"
+          python3 prosper/tools/docs/check_numbered_table.py --github --ordered \
+            --table-header Instrument --baseline "$RUNNER_TEMP/orchestration-base.md" "$F"
 
       # Structure and cell ARITY, across every tracked Markdown file: catches the same
       # table-splitting defect anywhere it appears, plus a third class no gate here could see

@@ -12,6 +12,7 @@ Run directly, or via ctest as doc_table_checker.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -20,10 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_numbered_table import check  # noqa: E402
 
+CHECKER = Path(__file__).resolve().parent / "check_numbered_table.py"
+
 FAILURES: list[str] = []
 
 
-def run(name: str, body: str, *, sequential: bool = False, header: str | None = None,
+def run(name: str, body: str, *, ordered: bool = False, header: str | None = None,
+        baseline: str | None = None,
         want_problems: bool, expect_text: str | None = None, want_count: int | None = None,
         want_lines: list[int] | None = None) -> None:
     """Check one document.
@@ -33,11 +37,21 @@ def run(name: str, body: str, *, sequential: bool = False, header: str | None = 
     against the previous element) that single-instance fixtures are blind to. An earlier draft of
     this checker had exactly that bug, and a truthiness-only version of this suite stayed green
     when it was reintroduced. Any case covering more than one defect must pin the count.
+
+    `baseline` is the PRIOR text of the same document (--baseline), so a case can assert what the
+    checker sees about a row that used to exist. `baseline="<missing>"` names a path that is not
+    there, which is how the fail-closed behaviour is pinned.
     """
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "case.md"
         path.write_text(body, encoding="utf-8")
-        problems = check(path, sequential, header)
+        base_path: Path | None = None
+        if baseline == "<missing>":
+            base_path = Path(d) / "no-such-baseline.md"
+        elif baseline is not None:
+            base_path = Path(d) / "baseline.md"
+            base_path.write_text(baseline, encoding="utf-8")
+        problems = check(path, ordered, header, base_path)
     if bool(problems) != want_problems:
         FAILURES.append(
             f"{name}: expected {'problems' if want_problems else 'clean'}, got "
@@ -116,21 +130,150 @@ run("a row that lost its leading pipe ends the table",
 # duplicate.
 run("a duplicate hidden below an interruption cannot pass green",
     "| # | What |\n|---|---|\n| 1 | a |\n2 | b |\n| 5 | c |\n| 5 | d |\n",
-    sequential=True, want_problems=True, want_count=1, want_lines=[4],
+    ordered=True, want_problems=True, want_count=1, want_lines=[4],
     expect_text="drops out of any sequence check")
 
-# The #1696 collision: two branches append the same number; the merge is textually clean.
+# The #1696 collision: two branches append the same number; the merge is textually clean. This is
+# the check that survives the removal of gaplessness, and it is the one that protects the citation
+# contract -- a duplicate makes every by-number reference ambiguous.
 run("duplicate row number",
     "| # | What |\n|---|---|\n| 32 | a |\n| 33 | b |\n| 34 | c |\n| 35 | d |\n| 32 | e |\n",
-    sequential=True, want_problems=True, expect_text="duplicate row number 32")
+    ordered=True, want_problems=True, expect_text="duplicate row number 32")
 
-run("gap in the sequence",
-    "| # | What |\n|---|---|\n| 1 | a |\n| 4 | b |\n",
-    sequential=True, want_problems=True, expect_text="skip 2, 3")
+# Every duplicate is reported, not just the first: a detector that compares only against the
+# previous element -- the shape this suite has already caught twice -- would find the second 32 and
+# miss the second 33, and a single-duplicate fixture cannot tell the two implementations apart.
+run("every duplicate is reported, not just the first",
+    "| # | What |\n|---|---|\n| 32 | a |\n| 33 | b |\n| 32 | c |\n| 34 | d |\n| 33 | e |\n",
+    ordered=True, want_problems=True, want_count=2, want_lines=[5, 7])
 
 run("out of ascending order",
     "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
-    sequential=True, want_problems=True)
+    ordered=True, want_problems=True, expect_text="out of ascending order")
+
+# The message must forbid the repair that breaks the citation contract. An author whose row is out
+# of order because another lane's higher number landed first can fix it by MOVING the line; the one
+# thing they must not do is renumber: 118 references on 110 lines in 46 files cite these rows by
+# number (origin/master 7413647a, 2026-08-17), naming 63 distinct rows -- and 50 of those
+# references are .cpp/.hpp/.py COMMENTS, not prose.
+run("the out-of-order message forbids renumbering",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
+    ordered=True, want_problems=True, expect_text="NOT renumber")
+run("...and names the repair that is allowed",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
+    ordered=True, want_problems=True, expect_text="MOVE the row")
+
+# ---------------------------------------------------------------------------------------------
+# GAPS ARE LEGAL (#2089). This case asserted the OPPOSITE until 2026-08-17, and flipping it is the
+# whole behavioural change -- so it is the arm to read first if this suite ever disagrees with what
+# CI does. Gaplessness made a lane's `Docs` job red BY CONSTRUCTION whenever a lower number was
+# still in flight, which no edit of that lane's own branch could repair; the deleted-row job it was
+# kept for now belongs to --baseline, which does it strictly better (see the two cases below that
+# gaplessness could not see at all).
+run("a gap is legal: the number belongs to a branch that has not landed",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 4 | b |\n",
+    ordered=True, want_problems=False)
+
+run("a permanent gap from an abandoned claim is legal",
+    "| # | What |\n|---|---|\n| 184 | a |\n| 185 | b |\n| 186 | c |\n| 188 | d |\n| 189 | e |\n",
+    ordered=True, want_problems=False)
+
+# ---------------------------------------------------------------------------------------------
+# PERSISTENCE (--baseline). A row that VANISHES leaves a perfectly well-formed file: uniqueness
+# passes, ascent passes, structure passes, and every citation to it silently resolves to nothing.
+BASE = "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n| 3 | c |\n| 4 | d |\n"
+
+run("a deleted INTERIOR row is caught",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n| 4 | d |\n",
+    ordered=True, baseline=BASE, want_problems=True, want_count=1, expect_text="GONE from this table: 3")
+
+# THE discriminating case, and the reason gaplessness was not merely relaxed but replaced. Deleting
+# the HIGHEST row leaves 1,2,3 -- still gapless, still ascending, still unique. The old --sequential
+# gate passed this green, measured on master's real Instrument table (186 rows at 0c268362;
+# deleting row 186 -> rc=0).
+run("a deleted TAIL row is caught -- gaplessness could not see this",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n| 3 | c |\n",
+    ordered=True, baseline=BASE, want_problems=True, want_count=1, expect_text="GONE from this table: 4")
+
+# The instrument-trap-41 / #1701 shape at full size: `git checkout <old-branch> -- <file>` restores
+# the file whole and silently drops every row added since. On master's real table that is 61 rows,
+# and the old gate reported "contiguous and unbroken", rc=0.
+run("a whole-file revert that truncates the tail is caught, with every lost row named",
+    "| # | What |\n|---|---|\n| 1 | a |\n",
+    ordered=True, baseline=BASE, want_problems=True, want_count=1,
+    expect_text="3 row number(s) present in the baseline are GONE from this table: 2, 3, 4")
+
+# A renumber is a deletion of the old key. Nothing before --baseline could see this at all, and it
+# is the operation the table's maintenance note forbids outright.
+run("a renumbered row is caught -- the old number is gone",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n| 3 | c |\n| 9 | d |\n",
+    ordered=True, baseline=BASE, want_problems=True, expect_text="GONE from this table: 4")
+
+# The false-positive guard that keeps the check alive: appending is the ordinary operation and must
+# never fire. Without this case, a rule as broken as "the row sets must be EQUAL" would pass the
+# four cases above.
+run("appending rows is not a deletion",
+    BASE + "| 5 | e |\n| 6 | f |\n",
+    ordered=True, baseline=BASE, want_problems=False)
+
+# A gap in the SUBJECT that the baseline also had is not a deletion either -- the two rules are
+# independent, and conflating them would reintroduce gaplessness through the back door.
+run("a gap both files share is not a deletion",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 4 | d |\n| 7 | g |\n",
+    ordered=True, baseline="| # | What |\n|---|---|\n| 1 | a |\n| 4 | d |\n",
+    want_problems=False)
+
+# A row that leaves the table by being STRUCTURALLY orphaned -- a blank line splitting the table
+# above it -- is reported as gone, on top of the structure error naming the real cause. That is a
+# decision, not an accident: rows below a break drop out of every numbered check, so suppressing
+# persistence whenever structure complains would let a deletion hide behind a stray blank line,
+# which is the shape "a duplicate hidden below an interruption cannot pass green" already guards.
+# Two problems, and the structure one is listed first because it is the repair.
+run("rows orphaned by a table split are reported gone, alongside the structure error",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n\n| 3 | c |\n| 4 | d |\n",
+    ordered=True, baseline=BASE, want_problems=True, want_count=2,
+    expect_text="GONE from this table: 3, 4")
+
+# N1 (#2610 review) -- a bound on how far a NEW number may sit above the baseline's maximum. Gaps are
+# legal; a mistyped digit is not. `1189` for `189` passes uniqueness and ascent, reports a thousand
+# unused numbers, and permanently poisons the space, because every later allocation comes off the new
+# maximum. The old gapless rule caught this incidentally and nothing else does.
+run("a wildly out-of-range number is a typo, not a gap",
+    BASE + "| 1004 | typo |\n",
+    ordered=True, baseline=BASE, want_problems=True, expect_text="more than 50 above")
+
+# ...and the discriminating counter-arm: a DELIBERATE step clear of a contested band must still pass.
+# Without this case, "reject any gap at all" would satisfy the case above and undo the whole change.
+run("a deliberate step clear of a collision is still legal",
+    BASE + "| 8 | stepped clear of a three-way race on 5 |\n",
+    ordered=True, baseline=BASE, want_problems=False)
+
+# The bound is measured against the BASE's maximum, never against another lane's timing -- so a
+# number just inside it passes no matter what else is in flight.
+run("a number just inside the bound passes",
+    BASE + "| 54 | 50 above the baseline max of 4 |\n",
+    ordered=True, baseline=BASE, want_problems=False)
+
+# ...and a row the baseline ALREADY had is never re-judged by the bound, or every file whose table
+# legitimately contains a historical jump would fail forever.
+run("an existing far-out row is not re-judged",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 900 | historical |\n",
+    ordered=True, baseline="| # | What |\n|---|---|\n| 1 | a |\n| 900 | historical |\n",
+    want_problems=False)
+
+# Fails closed. A baseline that cannot be read must be an ERROR: the caller asked for the check, and
+# a silent skip would make a green run mean nothing -- exactly the "no tests ran and everything
+# passed share an exit code" shape the charter warns about.
+run("an unreadable baseline is an error, not a silent skip",
+    BASE, ordered=True, baseline="<missing>", want_problems=True, expect_text="--baseline")
+
+# ...and a baseline whose matching table cannot be found is an error too. This is the one that a
+# same-source positive control cannot reach: if selection silently returned a DIFFERENT table, every
+# deletion would read as intact and all six cases above would still pass.
+run("a baseline with no matching numbered table is an error",
+    "| # | Instrument | x |\n|---|---|---|\n| 1 | a | b |\n",
+    ordered=True, header="Instrument", baseline="| # | Other | x |\n|---|---|---|\n| 1 | a | b |\n",
+    want_problems=True, expect_text="--baseline")
 
 # ---------------------------------------------------------------------------------------------
 # ARITY (#2108). GFM splits a row into cells on `|` BEFORE parsing inline content, so a pipe
@@ -190,6 +333,59 @@ run("a row that dropped a cell",
 run("a delimiter that disagrees with the header",
     "| # | Instrument | How it lied |\n|---|---|\n| 1 | x | y |\n",
     want_problems=True, expect_text="does NOT render as a table at all")
+
+# A stray conflict marker AFTER the last row. This is the shape that escaped every other class and
+# reached a pushed branch: the marker is not a table row, so it merely ends the table, and with no
+# orphaned rows below it there is no fragment to report. Without this arm the file below is reported
+# "unique and ascending" -- over a line that is a merge artifact.
+run("a conflict marker after the last row is caught",
+    TABLE + ">>>>>>> 8f124852 (some commit subject)\n",
+    ordered=True, want_problems=True, expect_text="unresolved merge conflict marker")
+
+run("a conflict marker inside the table is caught",
+    "| # | What |\n|---|---|\n| 1 | a |\n<<<<<<< HEAD\n| 2 | b |\n",
+    want_problems=True, expect_text="unresolved merge conflict marker")
+
+# THE ARM THE FENCE FIX NEEDED. The first draft of the conflict scan ran before parse_tables, with
+# no fence tracking and always on -- so it rejected any document that PASTES an example conflict
+# inside a ``` block, which is how this defect gets documented. This file's own header settled that
+# question for every other class ("this file's own defect example would otherwise fail the check
+# that documents it"); the scan had to make the same trade (#2610 review).
+run("a conflict marker inside a fence is an example, not a defect",
+    "```\n>>>>>>> 8f124852 (some commit)\n```\n\n" + TABLE,
+    ordered=True, want_problems=False)
+
+run("...and one inside a fence does not fire on the plain sweep either",
+    "```\n<<<<<<< HEAD\n| 5 | a |\n>>>>>>> other\n```\n\n" + TABLE,
+    want_problems=False)
+
+# The counter-arm that keeps the fix honest: a marker AFTER the fence closes is still a defect, so
+# "skip fenced" cannot decay into "skip everything once a fence is seen".
+run("a marker after a closed fence is still caught",
+    "```\nexample output\n```\n\n" + TABLE + ">>>>>>> 8f124852 (real leftover)\n",
+    ordered=True, want_problems=True, expect_text="unresolved merge conflict marker")
+
+# An UNCLOSED fence silences every check from that point on, so a real marker after it reads clean.
+# That is the fenced-region skip decaying from a trade into a blind spot, and unlike the
+# fenced-example case it has no legitimate shape (#2610 review). Measured safe: 0 of 101 tracked
+# Markdown files end unbalanced.
+run("an unclosed fence hiding a real marker is caught",
+    TABLE + "```\nsome output\n>>>>>>> 8f124852 (real leftover)\n",
+    ordered=True, want_problems=True, expect_text="opened and never closed")
+
+run("an unclosed fence is caught on the plain sweep too",
+    "| # | a |\n|---|---|\n| 1 | x |\n\n```\nunterminated\n",
+    want_problems=True, expect_text="opened and never closed")
+
+# ...and a BALANCED fence must not fire, or every document that quotes output would be rejected.
+run("a balanced fence is not an unterminated one",
+    TABLE + "```\nsome output\n```\n",
+    ordered=True, want_problems=False)
+
+# `=======` is a legal setext heading underline, so it must NOT be treated as a marker -- a checker
+# that fires on correct Markdown gets deleted rather than heeded.
+run("a setext heading underline is not a conflict marker",
+    "Heading\n=======\n\n" + TABLE, ordered=True, want_problems=False)
 
 print("correct shapes the arity check must not reject:")
 
@@ -256,22 +452,22 @@ run("a delimiter-less pipe block is not arity-checked",
 
 print("fails closed (never vacuously green):")
 
-# Absence of a table is an error only when we were pointed at ONE specific table (--sequential):
+# Absence of a table is an error only when we were pointed at ONE specific table (--ordered):
 # then it means the path is wrong or the format changed, and passing would let the check go green
 # forever on a file it can no longer see. In a plain structure sweep it is ordinary -- 35 of this
 # repo's 77 Markdown files contain no table at all, and failing on those makes the tool unusable
 # for the sweep it is meant to support.
-run("no table at all, --sequential", "just prose, no table\n",
-    sequential=True, want_problems=True, expect_text="no Markdown tables found")
-run("empty file, --sequential", "", sequential=True, want_problems=True)
+run("no table at all, --ordered", "just prose, no table\n",
+    ordered=True, want_problems=True, expect_text="no Markdown tables found")
+run("empty file, --ordered", "", ordered=True, want_problems=True)
 run("no table at all, structure sweep", "just prose, no table\n", want_problems=False)
 run("empty file, structure sweep", "", want_problems=False)
-run("--sequential with no numbered table",
+run("--ordered with no numbered table",
     "| name | value |\n|---|---|\n| a | 1 |\n",
-    sequential=True, want_problems=True, expect_text="no numbered table")
-run("--sequential ambiguous between two numbered tables",
+    ordered=True, want_problems=True, expect_text="no numbered table")
+run("--ordered ambiguous between two numbered tables",
     "| # | a |\n|---|---|\n| 1 | x |\n\ntext\n\n| # | b |\n|---|---|\n| 1 | y |\n",
-    sequential=True, want_problems=True, expect_text="ambiguous")
+    ordered=True, want_problems=True, expect_text="ambiguous")
 
 print("correct shapes an earlier revision wrongly rejected:")
 
@@ -336,15 +532,97 @@ run("non-sequential numbers pass structure",
 # A genuine numbered work list in this repo starts at 0, so "gapless from 1" is wrong.
 run("sequence starting at zero",
     "| # | What |\n|---|---|\n| 0 | a |\n| 1 | b |\n| 2 | c |\n",
-    sequential=True, want_problems=False)
+    ordered=True, want_problems=False)
 
 run("--table-header selects among several numbered tables",
     "| # | Instrument |\n|---|---|\n| 1 | x |\n| 2 | y |\n\ntext\n\n| # | Other |\n|---|---|\n| 7 | z |\n",
-    sequential=True, header="Instrument", want_problems=False)
+    ordered=True, header="Instrument", want_problems=False)
 
-run("clean sequential table", TABLE, sequential=True, want_problems=False)
+run("clean ordered table", TABLE, ordered=True, want_problems=False)
 run("indented table rows", "  | # | What |\n  |---|---|\n  | 1 | a |\n  | 2 | b |\n",
-    sequential=True, want_problems=False)
+    ordered=True, want_problems=False)
+
+print("command line (subprocess -- these live in main(), not in check()):")
+
+
+def cli(name: str, args: list[str], *, want_rc: int, expect_text: str | None = None) -> None:
+    """Run the checker as a process. main()'s argument handling has its own failure modes."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "case.md"
+        path.write_text(TABLE, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(CHECKER)] + [a.replace("<FILE>", str(path)) for a in args],
+            capture_output=True, text=True,
+        )
+    if proc.returncode != want_rc:
+        FAILURES.append(
+            f"{name}: expected rc={want_rc}, got {proc.returncode}. "
+            f"stdout={proc.stdout[:200]!r} stderr={proc.stderr[:300]!r}"
+        )
+        return
+    if expect_text and expect_text not in proc.stdout + proc.stderr:
+        FAILURES.append(f"{name}: expected {expect_text!r} in output, got {proc.stderr[:300]!r}")
+        return
+    print(f"  ok  {name}")
+
+
+# --sequential must FAIL, not be quietly accepted as an alias for --ordered. The distinction is the
+# whole point: a caller who still passes it believes gaplessness is being enforced, and silently
+# giving them the weaker check is exactly the "a gate's silence is not evidence about the class it
+# no longer inspects" failure this file's own KNOWN LIMIT section is about. argparse.error exits 2.
+cli("--sequential is an error naming its replacement",
+    ["--sequential", "--table-header", "What", "<FILE>"],
+    want_rc=2, expect_text="--ordered")
+
+# ...and the message must be actionable rather than merely "unrecognized arguments".
+cli("--sequential names the issue that removed it",
+    ["--sequential", "<FILE>"], want_rc=2, expect_text="#2089")
+
+cli("--ordered on a clean table exits 0", ["--ordered", "<FILE>"], want_rc=0)
+
+# The success line reports the numbered range and any unused numbers, so an allocator can read the
+# high-water mark from the gate's own output instead of grepping the file.
+cli("the success line reports the numbered range",
+    ["--ordered", "<FILE>"], want_rc=0, expect_text="numbered column 1..3")
+
+# --baseline without --ordered is rejected rather than ignored: silently accepting it would mean a
+# CI step could ask for the deletion check, get no check, and stay green.
+cli("--baseline without --ordered is rejected",
+    ["--baseline", "<FILE>", "<FILE>"], want_rc=2, expect_text="--baseline only applies")
+
+
+# The success line must quote the BASELINE's row count, and this is not cosmetic. "no row has been
+# deleted" prints identically whether 187 rows were compared or the subject was compared against
+# ITSELF -- which is precisely what CI would do if a merge ref's parent order were the other way
+# round and `HEAD^1` resolved to the head. Quoting the count makes the green run falsifiable: on a
+# PR appending one row it must read one LESS than the subject's, and a reader who sees the two agree
+# knows the comparison was void. Verified on the real CI run for this change: 188 rows in the
+# subject, 187 in the baseline.
+def cli_baseline(name: str, subject: str, baseline: str, *, expect_text: str) -> None:
+    with tempfile.TemporaryDirectory() as d:
+        s, b = Path(d) / "case.md", Path(d) / "base.md"
+        s.write_text(subject, encoding="utf-8")
+        b.write_text(baseline, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(CHECKER), "--ordered", "--baseline", str(b), str(s)],
+            capture_output=True, text=True,
+        )
+    if proc.returncode != 0:
+        FAILURES.append(f"{name}: expected rc=0, got {proc.returncode}: {proc.stderr[:200]!r}")
+    elif expect_text not in proc.stdout:
+        FAILURES.append(f"{name}: expected {expect_text!r}, got {proc.stdout[:300]!r}")
+    else:
+        print(f"  ok  {name}")
+
+
+cli_baseline("the success line quotes the BASELINE's row count, not the subject's",
+             TABLE + "| 4 | d |\n", TABLE,
+             expect_text="none of the 3 rows in")
+
+# One baseline cannot describe several subjects.
+cli("--baseline with several subjects is rejected",
+    ["--ordered", "--baseline", "<FILE>", "<FILE>", "<FILE>"],
+    want_rc=2, expect_text="exactly one subject")
 
 print()
 if FAILURES:

@@ -29,7 +29,7 @@ the first data row, which orphans the entire body.
 Fenced code blocks are skipped: this repository's docs paste tool output containing pipe
 characters, and this file's own defect example would otherwise fail the check that documents it.
 
-THREE CLASSES OF CHECK, deliberately separated:
+FOUR CLASSES OF CHECK, deliberately separated:
 
   STRUCTURE (always on) -- no blank line may split a table. A fact about Markdown, true of
   every table in the repository.
@@ -48,19 +48,33 @@ THREE CLASSES OF CHECK, deliberately separated:
   The delimiter row is checked against the header too, because GFM requires those to agree or the
   block is not a table at all and renders as a paragraph of literal pipes.
 
-  SEQUENCE (--sequential, opt-in) -- the numbered column is unique, strictly ascending and
-  gapless. This is a CONVENTION of the trap table ("append, never renumber"), NOT a property of
-  numbered tables in general. Measured over the 77 tracked Markdown files: all 77 satisfy
-  structure, while of the 5 documents holding an all-numeric-first-column table only 2 satisfy
-  sequence -- the rest lead with frame indices, draw ordinals and submit numbers, where gaps and
-  repeats are the correct content. Applying sequence everywhere would report correct documents
-  as broken, and a check that fires on correct data gets deleted rather than heeded.
+  ORDER (--ordered, opt-in) -- the numbered column is unique and strictly ascending. GAPS ARE
+  LEGAL; see WHY GAPLESSNESS WAS REMOVED below. This is a CONVENTION of the trap table ("append,
+  never renumber"), NOT a property of numbered tables in general. RE-MEASURED under this rule
+  rather than inherited from --sequential's: over the 101 tracked Markdown files, all 101 satisfy
+  structure, while of the 10 documents holding an all-numeric-first-column table only 6 satisfy
+  order -- the rest lead with frame indices, draw ordinals and submit numbers, where repeats are
+  the correct content. Applying order everywhere would report correct documents as broken, and a
+  check that fires on correct data gets deleted rather than heeded.
+
+  The figure had to be re-measured because relaxing gaplessness can only INCREASE it, so
+  --sequential's "3 of 10" could not survive the rewrite unchanged (#2610 review). The three
+  documents that qualify under --ordered and did not under --sequential are
+  ASTROBOT_LINUX_HANDOFF_2026_07_19.md, RENDERER_PERFORMANCE_2026_07.md and
+  SONIC_CROSSWORLDS_STATUS.md. The conclusion is unaffected: 4 of 10 still fail, so "do not apply
+  it broadly" stands on the new rule as it did on the old one.
 
   Two selector details, both from real documents here rather than from theory:
-    * The sequence is checked from its own first value, not from 1, because a genuine numbered
+    * The order is checked from its own first value, not from 1, because a genuine numbered
       work list in this repo starts at 0 (EVERGATE_PERFORMANCE_HANDOFF_2026_07.md).
     * A table qualifies only if EVERY body row is numbered. That same work list ends with a
-      `| Separate | ...` row, which is legitimate content and must not be read as a gap.
+      `| Separate | ...` row, which is legitimate content and must not be read as an unnumbered
+      row to be silently ignored.
+
+  PERSISTENCE (--baseline PATH, opt-in, requires --ordered) -- every row number present in the
+  BASELINE copy of the same table is still present here. This is the check that catches a row
+  which was DELETED or RENUMBERED, and it is what replaced gaplessness. It needs a second file
+  because "was this row here before?" is not a question one file can answer.
 
 Validates structure, never content, so no class can rot as a table grows.
 
@@ -68,7 +82,7 @@ WHAT THIS CANNOT SEE, and a real incident. It validates STRUCTURE. It does not r
 cannot tell that a row still says what its author meant. On 2026-08-01 a rebase silently reverted an
 entry's TEXT to a version asserting a conclusion its author had already retracted, while the
 numbering stayed perfectly contiguous -- this check would have passed it without a word. The
-boundary is sharp and worth knowing: numbering catches a row that VANISHED (the sequence gaps), and
+boundary is sharp and worth knowing: numbering catches a row that VANISHED (--baseline), and
 nothing here catches a row that CHANGED ITS MIND. A green run means the table is well formed, never
 that it is true. Diff the region for content too.
 
@@ -89,24 +103,93 @@ What ARITY specifically cannot see, stated so silence is not read as coverage:
     nothing about the cells being in the right ORDER or the right columns.
   * Fenced regions, deliberately: a ``` block of shell pipes is not a table, and a checker that
     fires on pasted tool output gets disabled. Nested/mismatched fences (``` inside ~~~) are
-    tracked as a single toggle, so a document mixing the two markers could desynchronise.
+    tracked as a single toggle, so a document mixing the two markers could desynchronise. This
+    applies to the conflict-marker scan too, and it is a real blind spot rather than a free choice:
+    a genuine unresolved conflict that happens to land inside a fenced block is invisible here. The
+    alternative -- rejecting every document that quotes a marker as an example -- would reject the
+    documentation of this very defect, so the trade is made the same way it is made for tables.
+    `git diff --check` has no such blind spot and remains the backstop the charter runs separately.
 
-A RED `Docs` JOB THAT IS THE GATE WORKING, not a defect -- read this before "fixing" it. Two
-concurrent PRs appending to a gapless table create a MERGE-ORDER DEPENDENCY. Master ends at 42;
-both branches append; the earlier claimant keeps 43 and the later one renumbers to 44. The later
-branch's table then reads `42, 44`, and --sequential correctly rejects the gap, so ITS `Docs` job is
-red BY CONSTRUCTION until the earlier PR lands -- and merging it first would put that gap on master.
-Neither PR is broken. Rebase after the earlier one merges: the gap closes itself, and nothing else
-about either change is involved.
+WHY GAPLESSNESS WAS REMOVED (#2089), and what took over its job. Until 2026-08-17 the opt-in class
+was `--sequential`: unique, ascending AND gapless. Gaplessness is the reason this file used to carry
+a section headed "a red Docs job that is the gate working" -- two concurrent PRs appending to a
+gapless table create a MERGE-ORDER DEPENDENCY. Master ends at 42, both branches append, the earlier
+claimant keeps 43 and the later renumbers to 44; the later branch then reads `42, 44` and its `Docs`
+job is red BY CONSTRUCTION until the earlier PR lands. Neither PR is broken, and there is nothing
+its author can do about it.
 
-The temptation at that point is to weaken the gapless rule, and that would cost the one thing
-numbering can see which content checking cannot. Gaplessness is what catches a DELETED row.
-Uniqueness catches a duplicate and structure catches a split, but a row that simply vanishes -- in a
-bad merge, a wholesale `git checkout` of the file, a careless rebase -- leaves a file that is
-perfectly well formed and silently redirects nothing, because the citations to it still resolve to
-"no such row". The sequence is the only signal. So the correct response to `42, 44` is to wait, not
-to relax the check. First hit on 2026-08-02 (#1711/#1722, the fourth row-number collision that day);
-#1729 tracks pre-empting the collision at claim time, which is what would remove the wait.
+That is the property worth naming, because it is what separates gaplessness from the other two
+classes: **a violation of uniqueness or of ascent is repairable by the author alone** -- bump the
+number by one character, or move the line -- **while a violation of gaplessness is not repairable at
+all.** The missing number belongs to somebody else's unmerged branch. The only local "repair" is to
+renumber into the gap, which is exactly the forbidden operation ("append, never renumber") and which
+reproduces the duplicate the checker warns about. That prohibition is not ceremonial. Measured on
+`origin/master` (`7413647a`) on 2026-08-17, excluding the table's self-references:
+
+    118 references on 110 lines in 46 files, naming 63 distinct rows, every one resolving
+    -- 66 of them in .md prose, 50 in .cpp/.hpp/.py COMMENTS
+
+so a renumber breaks compiled files as well as documentation. Re-derive rather than trusting this
+figure, which goes stale on every append:
+
+    git grep -nE '(instrument[- ])?traps? [0-9]{1,3}' -- ':!prosper/docs/GAME_COMPAT_ORCHESTRATION.md'
+
+(counting `s_trap`/`v_trap` in the shader tests as the false positives they are -- they are RDNA2
+mnemonics, not citations). So the gapless rule could only be satisfied by waiting, and the cost was real:
+#2089 records four lanes blocked in one session, two of them writing push-window guard scripts
+rather than working on titles, and three sets of rows nearly lost because a row that has to wait
+gets parked on whatever branch is at hand.
+
+Gaplessness was kept because it catches a DELETED row -- a row that simply vanishes in a bad merge,
+a wholesale `git checkout` of the file, or a careless rebase leaves a file that is perfectly well
+formed, and uniqueness and structure both pass it. That reasoning is right about the danger and
+wrong about the coverage. MEASURED on master (`0c268362`, whose Instrument table is 186 rows, 1..186
+-- the "192" an earlier draft carried is the whole-FILE numbered-row count,
+`grep -cE '^\s*\|\s*[0-9]+\s*\|'` over all 14 tables in the document, rather than this table's
+186. Both figures here are re-derived; the first correction of this sentence attached 248 to that
+grep, which is the document's total BODY-row count and a third wrong number in the same place):
+
+  * delete an INTERIOR row (100)                      -> caught, rc=1
+  * delete the HIGHEST row (186)                      -> GREEN, rc=0
+  * restore the file wholesale from a 40-commit-old
+    revision, losing 61 rows                          -> GREEN, rc=0, "contiguous and unbroken"
+
+The last of those is the shape this repository has actually suffered: `git checkout <old-branch> --
+<file>` while rebuilding a branch, which cost #1701 ten lines of documentation and is instrument
+trap 41. It truncates the TAIL, and a truncated tail is still gapless. So gaplessness was a partial
+deleted-row detector, blind to the dominant real-world case, bought at the price of serializing
+every lane that appends.
+
+--baseline is the whole detector, and it is free of the coupling: it compares this file's row
+numbers against the same table in the PR's own base, so a row that vanished is reported whether it
+came from the middle, the end, or a whole-file revert -- and a RENUMBER is reported too, which
+nothing here could see before. Nothing another lane does can make it fire. CI passes `HEAD^1`'s copy
+of the file, which is the base commit on a `pull_request` merge ref and the previous master on a
+push, so both the pre-merge and the post-merge run are covered.
+
+TWO ALTERNATIVES WERE REJECTED, recorded here because the next person to find this painful will
+propose one of them, and both are more expensive than they look:
+
+  * BATCHING (#2089's own proposal) -- lanes write rows unnumbered into a staging area, and one
+    periodic PR assigns a contiguous block. It does remove the serialization. It also destroys the
+    property #2089 correctly insists on keeping: a row staged and never promoted is INVISIBLE, since
+    there is no gap to notice, because it never had a number. That trades a check which fires for one
+    which cannot, and adds a mandatory orchestrator step to every lane. --baseline gets the lane
+    independence without the staging area.
+
+  * STABLE NON-SEQUENTIAL IDS (date- or hash-prefixed) plus a generated index (#1664). Rejected for
+    the reason its own filer conceded when they read #1729: the identifier was never the problem, and
+    changing it breaks every existing citation to buy a property that a claim-time check gets for
+    free.
+
+Both were declined in favour of removing the one requirement that could not be satisfied locally.
+
+WHAT THE GATE CAN NO LONGER CATCH, stated plainly so silence is not read as coverage. A number that
+is allocated and then never used -- an abandoned PR, a row dropped in review -- leaves a permanent
+gap, and nothing reports it. That is deliberate: such a gap is not a defect, and treating it as one
+is what produced the serialization. The success line prints the unused numbers so a reader can see
+them, but they are informational. If a lane writes a row, never opens a PR, and tells nobody, no
+check here will notice -- the same as today, since that row never reached a numbered table at all.
 
 KNOWN LIMIT, recorded as a decision rather than a defect. The abutment rule keeps the
 `blank line, prose, orphaned rows` shape -- a real table split -- and that shape is structurally
@@ -125,11 +208,22 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 FENCE = re.compile(r"^\s*(```|~~~)")
 DELIMITER = re.compile(r"^\s*\|[\s:|-]+\|?\s*$")
 LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
+
+# See N1 in persistence_problems: how far above the baseline's maximum a NEW row number may
+# sit before it is treated as a typo rather than as a deliberate step clear of a collision.
+MAX_JUMP = 50
+
+# Unresolved merge markers. `=======` is deliberately NOT included: it is a legal setext heading
+# underline in Markdown, and a checker that fires on correct documents gets deleted rather than
+# heeded. The other two are unambiguous -- measured across the tracked corpus, zero instances of
+# either, which is what makes this safe to gate on.
+CONFLICT = re.compile(r"^(<<<<<<<|>>>>>>>)")
 
 
 ESCAPED_PIPE = re.compile(r"(?<!\\)\|")
@@ -332,24 +426,184 @@ def arity_problems(path: Path, table: Table) -> list[str]:
     return problems
 
 
-def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
-    """Return a list of problems; empty means the tables are sound."""
+def read_lines(path: Path) -> tuple[list[str] | None, str | None]:
+    """(lines, error). Split out so --baseline reports its own file rather than the subject's."""
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8").split("\n"), None
     except OSError as exc:
-        return [f"{path}: cannot read: {exc}"]
+        return None, f"{path}: cannot read: {exc}"
     except UnicodeDecodeError as exc:
-        return [f"{path}: is not valid UTF-8: {exc}"]
+        return None, f"{path}: is not valid UTF-8: {exc}"
 
-    lines = text.split("\n")
+
+def select_numbered_table(
+    path: Path, tables: list[Table], table_header: str | None
+) -> tuple[Table | None, list[str]]:
+    """The one fully-numbered table --ordered was pointed at, or the reason there isn't one.
+
+    Shared with --baseline so the two files are never measured against DIFFERENT tables: a
+    baseline whose header text no longer matches would otherwise silently compare nothing and
+    report every row as intact.
+    """
+    candidates = [t for t in tables if t.proper and t.all_rows_numbered]
+    if table_header:
+        candidates = [t for t in candidates if table_header in t.header]
+    if not candidates:
+        return None, [
+            f"{path}: --ordered found no numbered table"
+            + (f" whose header contains {table_header!r}" if table_header else "")
+        ]
+    if len(candidates) > 1:
+        # Ambiguous rather than guessed: checking the wrong table would report correct data as
+        # broken, and a check that fires on correct data gets deleted rather than heeded.
+        where = ", ".join(f"line {t.start}" for t in candidates)
+        return None, [
+            f"{path}: --ordered is ambiguous -- {len(candidates)} numbered tables ({where}). "
+            f"Select one with --table-header."
+        ]
+    return candidates[0], []
+
+
+@lru_cache(maxsize=None)
+def load_baseline(baseline_path: str, table_header: str | None) -> tuple[tuple[int, ...] | None, str]:
+    """The baseline table's row numbers, parsed ONCE. Returns (numbers, error-or-empty).
+
+    Cached deliberately, and not merely to save work. The comparison and the count printed on the
+    success line are two reads of the same file, and two reads can disagree: `--baseline <(cat f)`
+    is a process substitution, which is a single-read FIFO, so the second read saw an empty file and
+    the run printed "none of the None rows ... has been deleted" and exited 0 (#2610 review). A
+    falsifiability device that can print `None` is not one. One parse, one answer.
+    """
+    baseline = Path(baseline_path)
+    lines, err = read_lines(baseline)
+    if err:
+        return None, f"--baseline {err}"
+    tables, _, _ = parse_tables(lines or [])
+    table, problems = select_numbered_table(baseline, tables, table_header)
+    if table is None:
+        return None, "; ".join(f"--baseline: {p}" for p in problems)
+    return tuple(n for _, n in table.numbered_rows()), ""
+
+
+def persistence_problems(
+    path: Path, table: Table, baseline: Path, table_header: str | None
+) -> list[str]:
+    """Every row number the BASELINE had must still be here. See PERSISTENCE above.
+
+    This is what replaced gaplessness, and it is strictly stronger at the job gaplessness was kept
+    for: a gap could only see an INTERIOR deletion, so a truncated tail -- which is what
+    `git checkout <old-branch> -- <file>` produces, instrument trap 41 / #1701 -- passed it green.
+    Comparing against the base sees all three shapes, plus a renumber, which no single-file rule
+    can distinguish from an append plus a deletion.
+
+    Fails closed. A baseline that cannot be read, or whose matching table cannot be found, is an
+    ERROR rather than a skip: the caller asked for this check, and a silent skip would leave a
+    green run meaning nothing.
+    """
+    base_numbers, err = load_baseline(str(baseline), table_header)
+    if base_numbers is None:
+        return [err]
+
+    now = {num for _, num in table.numbered_rows()}
+    problems: list[str] = []
+
+    # N1 -- a bound on how far a NEW number may sit above everything the base held. Gaps are legal,
+    # but a mistyped digit is not: appending `1189` instead of `189` passes uniqueness and ascent,
+    # reports "1000 unused numbers", and permanently poisons the space, because the allocator then
+    # hands out 1190 and everything after it. The old gapless rule caught this incidentally; nothing
+    # else does. The bound is deliberately local -- it compares against the BASE's own maximum, so
+    # no other lane's merge timing can make it fire -- and generous, since no realistic set of
+    # concurrent lanes opens a gap this wide.
+    if base_numbers:
+        ceiling = max(base_numbers) + MAX_JUMP
+        for line_no, num in table.numbered_rows():
+            if num not in base_numbers and num > ceiling:
+                problems.append(
+                    f"{path}:{line_no}: row number {num} is more than {MAX_JUMP} above the highest "
+                    f"row in the baseline ({max(base_numbers)}). Gaps are legal, but a jump this "
+                    f"large is almost always a mistyped digit -- and it is not self-correcting, "
+                    f"because every later allocation is taken from the new maximum. If the jump is "
+                    f"deliberate, lower it: nothing requires stepping this far clear."
+                )
+
+    missing = sorted(n for n in base_numbers if n not in now)
+    if not missing:
+        return problems
+    listed = ", ".join(str(n) for n in missing[:12]) + (" ..." if len(missing) > 12 else "")
+    return problems + [
+        f"{path}:{table.start}: {len(missing)} row number(s) present in the baseline are GONE "
+        f"from this table: {listed}. A row that vanishes leaves a perfectly well-formed file, so "
+        f"nothing else here can see it -- the usual causes are a whole-file `git checkout "
+        f"<branch> -- <file>` while rebuilding a branch (instrument trap 41), a bad merge "
+        f"resolution, or a renumber. Numbers are cited BY NUMBER from other documents, so restore "
+        f"the rows rather than closing the hole -- and if a renumber was intended, it is not "
+        f"allowed: append, never renumber."
+    ]
+
+
+def check(
+    path: Path,
+    ordered: bool,
+    table_header: str | None,
+    baseline: Path | None = None,
+) -> list[str]:
+    """Return a list of problems; empty means the tables are sound."""
+    lines, err = read_lines(path)
+    if err:
+        return [err]
+    assert lines is not None
+
+    # ALWAYS ON, and it caught nothing here until it caught this file's own author. A stray
+    # `>>>>>>> <sha>` left by a conflict resolution landed immediately after the LAST row of the
+    # instrument table, and every check in this file passed it: the marker is not a table row, so it
+    # simply ENDED the table, and with no orphaned rows below it there was no fragment to report.
+    # `git diff --check` found it instead -- which is why the charter runs that as a separate gate --
+    # but nothing stops a marker reaching a branch where nobody runs it, and the numbering was
+    # meanwhile reported "unique and ascending" over a line that was a merge artifact.
+    #
+    # FENCED REGIONS ARE SKIPPED, like every other class here, and the first draft of this scan
+    # forgot it -- running before parse_tables, with no fence tracking, always on, including the
+    # repo-wide *.md sweep. It therefore rejected any document that PASTES an example conflict
+    # inside a ``` block, which is exactly how this defect gets documented. This file's own header
+    # settled that question long ago: "this file's own defect example would otherwise fail the check
+    # that documents it." Same self-referential shape as the marker that got past it in the first
+    # place (#2610 review).
+    conflicts: list[str] = []
+    fenced = False
+    for i, line in enumerate(lines, start=1):
+        if FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced or not CONFLICT.match(line):
+            continue
+        conflicts.append(
+            f"{path}:{i}: unresolved merge conflict marker: {line.strip()[:60]!r}. A marker directly "
+            f"after a table's last row ENDS the table rather than splitting it, so no other check "
+            f"here can see it."
+        )
+    if fenced:
+        # An UNCLOSED fence makes every check here go quiet from that point on -- the marker scan
+        # above, the table scan below -- so a real conflict marker after it reads CLEAN. That is the
+        # skip turning into a blind spot rather than a trade, and unlike the fenced-example case it
+        # has no legitimate shape: a document that opens a fence and never closes it is malformed.
+        # Safe to gate on by the same measurement that made the marker scan safe: 0 of 101 tracked
+        # Markdown files end with an unbalanced fence count (#2610 review).
+        conflicts.append(
+            f"{path}: a fenced block is opened and never closed, so every check in this file goes "
+            f"silent from that point on -- including the conflict-marker scan. Close the fence."
+        )
+    if conflicts:
+        # Return immediately: every other class would be measuring a file that is half two files.
+        return conflicts
+
     tables, blanks, fences = parse_tables(lines)
     if not tables:
-        # Under --sequential we were pointed at ONE specific table, so its absence means the path
+        # Under --ordered we were pointed at ONE specific table, so its absence means the path
         # is wrong or the format changed, and failing here is what stops this check passing
         # forever on a file it can no longer see. In a plain structure sweep across many
         # documents, a file with no table is ordinary and must not be an error -- 35 of this
         # repo's 77 Markdown files have none.
-        if sequential:
+        if ordered:
             return [f"{path}: no Markdown tables found -- wrong path, or the table format changed"]
         return []
 
@@ -417,49 +671,45 @@ def check(path: Path, sequential: bool, table_header: str | None) -> list[str]:
         if table.proper:
             problems.extend(arity_problems(path, table))
 
-    if not sequential:
+    if not ordered:
         return problems
 
-    candidates = [t for t in tables if t.proper and t.all_rows_numbered]
-    if table_header:
-        candidates = [t for t in candidates if table_header in t.header]
-    if not candidates:
-        return problems + [
-            f"{path}: --sequential found no numbered table"
-            + (f" whose header contains {table_header!r}" if table_header else "")
-        ]
-    if len(candidates) > 1:
-        # Ambiguous rather than guessed: checking the wrong table would report correct data as
-        # broken, and a check that fires on correct data gets deleted rather than heeded.
-        where = ", ".join(f"line {t.start}" for t in candidates)
-        return problems + [
-            f"{path}: --sequential is ambiguous -- {len(candidates)} numbered tables ({where}). "
-            f"Select one with --table-header."
-        ]
+    table, selection_problems = select_numbered_table(path, tables, table_header)
+    if table is None:
+        return problems + selection_problems
 
-    rows = candidates[0].numbered_rows()
+    rows = table.numbered_rows()
     seen: dict[int, int] = {}
-    expected = rows[0][1]
+    highest = rows[0][1]
     for line_no, num in rows:
         if num in seen:
+            # Repairable by this author alone, and that is the point: bump the LATER row. Under the
+            # gapless rule the bump had to be re-derived against whatever master looked like at that
+            # moment, and re-derived again if a lane landed in between (#2581). It no longer does --
+            # any number above the current highest is valid, so overshooting is safe.
             problems.append(
                 f"{path}:{line_no}: duplicate row number {num} (first used at line {seen[num]}). "
                 f"Two branches almost certainly appended the same number concurrently -- such a "
-                f"merge is textually clean. Renumber the LATER row to {max(seen) + 1} or higher, "
-                f"and re-check every by-number citation of it elsewhere in the docs."
+                f"merge is textually clean. Renumber the LATER row to {max(seen) + 1} or higher "
+                f"(any higher number is fine; gaps are legal), and re-check every by-number "
+                f"citation of it elsewhere in the docs."
             )
             continue
         seen[num] = line_no
-        if num > expected:
-            missing = ", ".join(str(n) for n in range(expected, num))
-            problems.append(f"{path}:{line_no}: row numbers skip {missing} before reaching {num}")
-        elif num < expected:
+        if num < highest:
+            # Deliberately does not say which row to move: either this one earlier or the higher one
+            # later restores the order, and which is correct depends on whose row arrived by a merge.
+            # What it must say is that renumbering is NOT the repair -- that is the reflex, and it is
+            # the one operation the citation contract forbids.
             problems.append(
-                f"{path}:{line_no}: row number {num} is out of ascending order "
-                f"(previous row was {expected - 1})"
+                f"{path}:{line_no}: row number {num} is out of ascending order (an earlier row "
+                f"already reached {highest}). The table is sorted by this column, so MOVE the row "
+                f"to its numeric position. Do NOT renumber it -- other documents cite it by number."
             )
-        expected = max(expected, num + 1)
+        highest = max(highest, num)
 
+    if baseline:
+        problems.extend(persistence_problems(path, table, baseline, table_header))
     return problems
 
 
@@ -467,15 +717,28 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("paths", nargs="+", type=Path, help="Markdown files to check")
     ap.add_argument(
+        "--ordered",
+        action="store_true",
+        help="also require the numbered column to be unique and strictly ascending (a convention "
+        "of the instrument-trap table, not of numbered tables generally). GAPS ARE LEGAL -- pair "
+        "with --baseline to catch a deleted row",
+    )
+    ap.add_argument(
         "--sequential",
         action="store_true",
-        help="also require the numbered column to be unique, ascending and gapless (a convention "
-        "of the instrument-trap table, not of numbered tables generally)",
+        help=argparse.SUPPRESS,  # removed 2026-08-17; kept only to fail loudly. See below.
+    )
+    ap.add_argument(
+        "--baseline",
+        metavar="PATH",
+        type=Path,
+        help="with --ordered, require every row number in PATH's copy of the same table to still "
+        "be present (catches a deleted or renumbered row). CI passes `git show HEAD^1:<file>`",
     )
     ap.add_argument(
         "--table-header",
         metavar="TEXT",
-        help="with --sequential, select the table whose header row contains TEXT",
+        help="with --ordered, select the table whose header row contains TEXT",
     )
     ap.add_argument(
         "--github",
@@ -483,12 +746,28 @@ def main() -> int:
         help="emit ::error:: annotations so failures surface on the GitHub Actions summary",
     )
     args = ap.parse_args()
-    if args.table_header and not args.sequential:
-        ap.error("--table-header only applies with --sequential")
+    # An error rather than an alias. --sequential meant unique + ascending + GAPLESS, and silently
+    # accepting it under the new semantics would leave every caller believing a check is running
+    # that was deliberately removed (#2089). A caller that is told gets to decide.
+    if args.sequential:
+        ap.error(
+            "--sequential was removed on 2026-08-17: gaplessness serialized every lane appending "
+            "to the table and could not see a truncated tail anyway (#2089). Use --ordered "
+            "(unique + ascending), and --baseline <base copy> for the deleted-row check that "
+            "replaced it. See this file's WHY GAPLESSNESS WAS REMOVED."
+        )
+    if args.table_header and not args.ordered:
+        ap.error("--table-header only applies with --ordered")
+    if args.baseline and not args.ordered:
+        ap.error("--baseline only applies with --ordered")
+    if args.baseline and len(args.paths) > 1:
+        # One baseline cannot describe several subjects, and picking one silently would compare
+        # the wrong pair.
+        ap.error("--baseline takes exactly one subject path")
 
     problems: list[str] = []
     for path in args.paths:
-        problems.extend(check(path, args.sequential, args.table_header))
+        problems.extend(check(path, args.ordered, args.table_header, args.baseline))
 
     for problem in problems:
         if args.github:
@@ -506,8 +785,27 @@ def main() -> int:
         tables, _, _ = parse_tables(path.read_text(encoding="utf-8").split("\n"))
         proper = [t for t in tables if t.proper]
         rows = sum(len(t.body) for t in proper)
-        detail = "contiguous and unbroken" if args.sequential else "unbroken"
-        print(f"{path}: {len(proper)} table(s), {rows} rows, {detail}, every row matching its header")
+        summary = f"{path}: {len(proper)} table(s), {rows} rows, unbroken, every row matching its header"
+        if args.ordered:
+            # Report the unused numbers rather than staying silent about them. They are LEGAL --
+            # an abandoned PR or a row dropped in review retires its number -- but a reader
+            # allocating the next one wants to see the shape of the space, and a sudden jump of
+            # fifty is worth a glance even though no rule forbids it.
+            table, _ = select_numbered_table(path, tables, args.table_header)
+            if table is not None:
+                nums = sorted(n for _, n in table.numbered_rows())
+                unused = sorted(set(range(nums[0], nums[-1] + 1)) - set(nums))
+                listed = ", ".join(str(n) for n in unused[:12]) + (" ..." if len(unused) > 12 else "")
+                gaps = f", {len(unused)} unused number(s): {listed}" if unused else ", no unused numbers"
+                summary += (
+                    f"\n{path}: numbered column {nums[0]}..{nums[-1]}, "
+                    f"{len(nums)} rows, unique and ascending{gaps}"
+                )
+                if args.baseline:
+                    base_numbers, _ = load_baseline(str(args.baseline), args.table_header)
+                    n = len(base_numbers) if base_numbers is not None else 0
+                    summary += f"; none of the {n} rows in {args.baseline} has been deleted"
+        print(summary)
     return 0
 
 
