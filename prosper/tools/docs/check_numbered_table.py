@@ -409,6 +409,23 @@ def select_numbered_table(
     return candidates[0], []
 
 
+def baseline_rows(baseline: Path, table_header: str | None) -> int | None:
+    """How many numbered rows the baseline held, for the success line.
+
+    A bare "no row has been deleted" is not a falsifiable statement -- it prints identically whether
+    187 rows were compared or the baseline was the subject's own copy compared against itself, which
+    is exactly the mistake `HEAD^1` would make if a merge ref's parent order were the other way
+    round. Quoting the count makes the run self-checking: on a PR that appends one row it must read
+    one LESS than the subject's, and a reader who sees the two agree knows the comparison was void.
+    """
+    lines, err = read_lines(baseline)
+    if err:
+        return None
+    tables, _, _ = parse_tables(lines or [])
+    table, _ = select_numbered_table(baseline, tables, table_header)
+    return len(table.numbered_rows()) if table else None
+
+
 def persistence_problems(
     path: Path, table: Table, baseline: Path, table_header: str | None
 ) -> list[str]:
@@ -661,7 +678,8 @@ def main() -> int:
                     f"{len(nums)} rows, unique and ascending{gaps}"
                 )
                 if args.baseline:
-                    summary += f"; no row present in {args.baseline} has been deleted"
+                    n = baseline_rows(args.baseline, args.table_header)
+                    summary += f"; none of the {n} rows in {args.baseline} has been deleted"
         print(summary)
     return 0
 

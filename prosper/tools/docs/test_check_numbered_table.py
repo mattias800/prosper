@@ -493,6 +493,35 @@ cli("the success line reports the numbered range",
 cli("--baseline without --ordered is rejected",
     ["--baseline", "<FILE>", "<FILE>"], want_rc=2, expect_text="--baseline only applies")
 
+
+# The success line must quote the BASELINE's row count, and this is not cosmetic. "no row has been
+# deleted" prints identically whether 187 rows were compared or the subject was compared against
+# ITSELF -- which is precisely what CI would do if a merge ref's parent order were the other way
+# round and `HEAD^1` resolved to the head. Quoting the count makes the green run falsifiable: on a
+# PR appending one row it must read one LESS than the subject's, and a reader who sees the two agree
+# knows the comparison was void. Verified on the real CI run for this change: 188 rows in the
+# subject, 187 in the baseline.
+def cli_baseline(name: str, subject: str, baseline: str, *, expect_text: str) -> None:
+    with tempfile.TemporaryDirectory() as d:
+        s, b = Path(d) / "case.md", Path(d) / "base.md"
+        s.write_text(subject, encoding="utf-8")
+        b.write_text(baseline, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(CHECKER), "--ordered", "--baseline", str(b), str(s)],
+            capture_output=True, text=True,
+        )
+    if proc.returncode != 0:
+        FAILURES.append(f"{name}: expected rc=0, got {proc.returncode}: {proc.stderr[:200]!r}")
+    elif expect_text not in proc.stdout:
+        FAILURES.append(f"{name}: expected {expect_text!r}, got {proc.stdout[:300]!r}")
+    else:
+        print(f"  ok  {name}")
+
+
+cli_baseline("the success line quotes the BASELINE's row count, not the subject's",
+             TABLE + "| 4 | d |\n", TABLE,
+             expect_text="none of the 3 rows in")
+
 # One baseline cannot describe several subjects.
 cli("--baseline with several subjects is rejected",
     ["--ordered", "--baseline", "<FILE>", "<FILE>", "<FILE>"],
