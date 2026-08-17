@@ -39,7 +39,7 @@ The header line reports the window actually observed:
 
     clock=prosper::k_usleep entries=400/400 window=complete \\
         positive-control=absent(attach:login-consumed-pre-window) armed=750 mode=attach \\
-        calls=21362 finish-failures=0 exited=0
+        calls=21362 finish-failures=0 exited=0 elf=ET_EXEC load-bias=0x0 symbol-check=8/8
 
 An **empty histogram with a non-zero `entries`** is a real measurement: the
 guest entered no HLE handler while the clock advanced 400 times. An empty
@@ -169,6 +169,26 @@ redirected too, so a launched program that reads stdin sees EOF. `--inferior-log
 applies to `--launch` only; passing it with `--pid` is an error, because there is
 no inferior whose output this tool controls.
 
+PIE targets, and where the breakpoints went
+-------------------------------------------
+`nm` reports link-time addresses. On an `ET_EXEC` binary those are the runtime
+addresses; on a PIE they are offsets from a base the kernel picks per run, so the
+tool reads that base out of the live process and adds it before arming — under
+`--pid` from the attached process, and under `--launch` after a `starti` that
+stops at the first instruction, before anything of the program has run, so no
+init coverage is lost. Ubuntu's gcc defaults to `-pie` and Fedora's does not, so
+both shapes occur for the same source (#2605).
+
+The header reports the outcome — `elf=ET_DYN load-bias=0x555555554000
+symbol-check=8/8`. The bias is `running entry - link-time entry`, read from
+`/proc/<pid>/auxv` and cross-checked against gdb's own `info files`; it is never
+assumed, because gdb disables randomization and its `0x555555554000` is right
+until a plain `--pid` attach (measured: `0x5634df2d1000`) makes it silently
+wrong. `symbol-check` is the observation behind it: gdb was asked what lives at a
+sample of the addresses about to be armed, and each named a function *start*. A
+wrong bias — or a `--binary` that is not the image the process is running —
+fails that and the run is refused by name rather than measuring nothing.
+
 Requirements: Linux, `gdb` with Python, `nm`, and ptrace attach permitted
 (`kernel.yama.ptrace_scope=0`, for `--pid`; `--launch` runs its own child). The
 prosper binary must not be stripped — the handler enumeration below reads the
@@ -188,6 +208,10 @@ HLE_SIGNATURE = ("(unsigned long, unsigned long, unsigned long, "
 # --out-bytes ceiling. Two reads of this width per call per argument, and the whole snapshot is held
 # per in-flight call; a struct worth inspecting here is tens of bytes, not kilobytes.
 OUT_BYTES_MAX = 256
+# ELF `e_type`. ET_EXEC's link-time addresses are its runtime addresses; ET_DYN's are offsets from a
+# base the kernel picks per run, which is the whole of #2605.
+ET_EXEC = 2
+ET_DYN = 3
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -233,45 +257,44 @@ def enumerate_handlers(binary, name_filter):
     return out
 
 
-def refuse_if_pie(binary):
-    """Stop with a reason on a position-independent executable, rather than letting gdb spew.
+def read_elf_geometry(binary):
+    """`(e_type, e_entry)` -- what decides whether a link-time address is a runtime address (#2605).
 
     This tool arms breakpoints at the RAW addresses `nm` reports, which are link-time addresses. In a
-    non-PIE executable (`ET_EXEC`) they are the runtime addresses too, which is why this works at all
-    -- prosper's own binaries are `ET_EXEC` as built by the toolchains this project uses. Under a
-    toolchain that defaults to `-pie` (Ubuntu's gcc does; Fedora's does not) the same addresses are
-    offsets from a load base chosen at run time, so every breakpoint lands in unmapped memory:
+    non-PIE executable (`ET_EXEC`) they are the runtime addresses too. Under a toolchain that
+    defaults to `-pie` (Ubuntu's gcc does; Fedora's does not) the same addresses are offsets from a
+    load base chosen at run time, and arming them unrelocated puts every breakpoint in unmapped
+    memory:
 
         Cannot insert breakpoint 3.
         Cannot access memory at address 0x1149
 
-    gdb prints that per breakpoint and the run yields no result block -- loud, but three steps away
-    from naming its own cause. Measured on a GitHub `ubuntu-24.04` runner, where the same fixture
-    that passes here failed exactly this way.
+    That is what a GitHub `ubuntu-24.04` runner produced from the same fixture that passes on Fedora.
+    #2593 replaced the spew with a refusal; this function replaces the refusal with the load bias,
+    which the gdb side derives from the LIVE process (`hle_calls_gdb.py`, `_resolve_load_bias`) --
+    `e_entry` here is one of the two halves of that subtraction, the other being the kernel's own
+    `AT_ENTRY`. Nothing is guessed: in particular the base gdb picks with randomization disabled is
+    never assumed, because it is right until it silently is not (a real attach measured
+    `0x5634df2d1000`, nowhere near gdb's `0x555555554000`).
 
-    Refusing rather than guessing a base is deliberate: in `--launch` mode the whole point is that
-    breakpoints are armed BEFORE the process exists, so there is no bias to read yet, and inferring
-    one from gdb's disabled-randomization default would produce a number that is right until it
-    silently is not. Making this work on a PIE build is a real feature (attach mode could read the
-    bias from `/proc/<pid>/maps`) and is tracked separately.
+    Returns `(None, None)` for anything that is not an ELF, and lets the later steps produce their
+    own message -- `nm` is next and says so plainly.
     """
     try:
         with open(binary, "rb") as handle:
-            header = handle.read(18)
+            header = handle.read(64)
     except OSError as exc:
         sys.exit("hle_calls: cannot read %s: %s" % (binary, exc))
-    if len(header) < 18 or header[:4] != b"\x7fELF":
-        return                      # not an ELF; let the later steps produce their own message
-    little = header[5] == 1
-    e_type = int.from_bytes(header[16:18], "little" if little else "big")
-    if e_type == 3:                 # ET_DYN -- a PIE (or a shared object)
-        sys.exit(
-            "hle_calls: %s is a position-independent executable (ET_DYN), and this tool arms the "
-            "raw link-time addresses `nm` reports, so every breakpoint would land in unmapped "
-            "memory (gdb: 'Cannot insert breakpoint N / Cannot access memory at address 0x...'). "
-            "Build the target non-PIE -- e.g. cmake -DCMAKE_EXE_LINKER_FLAGS=-no-pie -- which is "
-            "what prosper's binaries already are under the toolchains this project uses. Refusing "
-            "here rather than reporting a window that armed nothing." % binary)
+    if len(header) < 32 or header[:4] != b"\x7fELF":
+        return (None, None)
+    order = "little" if header[5] == 1 else "big"
+    e_type = int.from_bytes(header[16:18], order)
+    # e_entry sits at 0x18 in both classes; only its width differs (ELF32 4 bytes, ELF64 8).
+    width = 8 if header[4] == 2 else 4
+    if len(header) < 0x18 + width:
+        return (e_type, None)
+    e_entry = int.from_bytes(header[0x18:0x18 + width], order)
+    return (e_type, e_entry)
 
 
 def _prepare_inferior_log(path):
@@ -370,15 +393,25 @@ def main():
         binary = args.binary or os.path.realpath("/proc/%d/exe" % args.pid)
     if not os.path.exists(binary):
         sys.exit("hle_calls: no such binary: %s" % binary)
-    # Before anything expensive: a PIE would arm hundreds of breakpoints at unmapped addresses and
-    # report a window that measured nothing. See refuse_if_pie().
-    refuse_if_pie(binary)
+    # Whether `nm`'s addresses are runtime addresses, and what the gdb side needs to find out if they
+    # are not. See read_elf_geometry().
+    elf_type, elf_entry = read_elf_geometry(binary)
+    if elf_type == ET_DYN and elf_entry is None:
+        sys.exit("hle_calls: %s is ET_DYN but its ELF header carries no entry point, so the load "
+                 "bias cannot be derived. Build the target non-PIE "
+                 "(cmake -DCMAKE_EXE_LINKER_FLAGS=-no-pie) and re-run." % binary)
 
     handlers = enumerate_handlers(binary, args.filter)
     if not handlers:
         sys.exit("hle_calls: found no HLE handlers in %s "
                  "(wrong binary, stripped build, or too narrow a --filter)" % binary)
-    print("hle_calls: %d handler symbols in %s" % (len(handlers), binary), file=sys.stderr)
+    print("hle_calls: %d handler symbols in %s (%s)"
+          % (len(handlers), binary,
+             "ET_DYN -- the load bias is read from the live process before arming"
+             if elf_type == ET_DYN else
+             "ET_EXEC -- link-time addresses are runtime addresses" if elf_type == ET_EXEC else
+             "not an ELF header this tool recognises"),
+          file=sys.stderr)
 
     with tempfile.NamedTemporaryFile("w", suffix=".syms", delete=False) as table:
         for addr, name in handlers:
@@ -399,6 +432,10 @@ def main():
     env["HLE_CALLS_VALUES"] = "1" if args.values else "0"
     env["HLE_CALLS_ORDER"] = str(args.order)
     env["HLE_CALLS_OUT_BYTES"] = str(args.out_bytes)
+    # The gdb side needs both halves of the bias subtraction: this file's link-time entry point, and
+    # the running process's real one. It reads the second itself; only the first is knowable here.
+    env["HLE_CALLS_ELF_TYPE"] = str(elf_type if elf_type is not None else 0)
+    env["HLE_CALLS_ELF_ENTRY"] = str(elf_entry if elf_entry is not None else 0)
     script = os.path.join(HERE, "hle_calls_gdb.py")
     if args.launch:
         # `--args` must come last; the gdb script issues the `run` itself, after
@@ -449,7 +486,7 @@ def main():
     run = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     os.unlink(syms_path)
 
-    body, keep = [], False
+    body, keep, notes, aborts = [], False, [], []
     for line in run.stdout.splitlines():
         if line == "HLE_CALLS_BEGIN":
             keep = True
@@ -459,7 +496,23 @@ def main():
             continue
         if keep:
             body.append(line)
+        elif line.startswith("HLE_CALLS_ABORT:"):
+            aborts.append(line)
+        elif line.startswith("hle_calls:"):
+            # What the gdb side resolved and armed, forwarded rather than swallowed. Only the
+            # result block reaches stdout, so before this these lines — the load bias it derived,
+            # the symbols it could not arm — were visible ONLY when the run produced nothing at all,
+            # i.e. exactly when it was too late to be diagnostic.
+            notes.append(line)
+    for line in notes:
+        print(line, file=sys.stderr)
     if not body:
+        # An abort names its own cause, so print it INSTEAD of the raw gdb transcript: the transcript
+        # is what a reader had to search before, and "VOID, not a negative" is true but not useful
+        # when the tool already knows precisely what was wrong.
+        if aborts:
+            sys.stderr.write(run.stderr)
+            sys.exit("\n".join(aborts))
         sys.stderr.write(run.stdout)
         sys.stderr.write(run.stderr)
         sys.exit("hle_calls: gdb produced no result block — VOID, not a negative")
