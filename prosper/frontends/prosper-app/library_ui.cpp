@@ -360,6 +360,9 @@ bool LibraryUi::ensure_descriptor_capacity(size_t title_count) {
         return false;
     }
     vulkanInit_ = true;
+    // Worth a line: it is the only place the pool changes size, and it says out loud how many covers the
+    // run can actually hold — which is exactly the number #1649 was silently wrong about.
+    fprintf(stderr, "[library] descriptor pool grown to %u sets for %zu titles\n", poolSets_, title_count);
     return true;
 }
 

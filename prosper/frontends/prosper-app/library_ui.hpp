@@ -144,6 +144,9 @@ private:
     // How many of pool_'s sets prosper itself may allocate — covers here, backgrounds in LibraryMedia.
     // Consulted BEFORE ImGui_ImplVulkan_AddTexture, which would otherwise write to a VK_NULL_HANDLE set
     // when the pool is full (#1649); see library_descriptor_budget.hpp.
+    //
+    // MUST stay declared ABOVE media_: media_ holds a pointer to this and gives its sets back from
+    // ~LibraryMedia, and members are destroyed in reverse declaration order.
     DescriptorBudget budget_;
     // PROSPER_LIBRARY_POOL_SETS caps the pool, so #1649's exhaustion path is reproducible on a small
     // library. 0 = unset. Not a tuning knob: capping it below the library deliberately costs covers.
