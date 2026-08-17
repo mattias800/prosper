@@ -149,9 +149,11 @@ int main(int argc, char** argv) {
         GuestLogCaptureMiss miss;
         miss.marker = std::string(kGuestLogCaptureMaxLineBytes + 1, 'x');
         miss.marker_too_long = true;
-        CHECK(contains(format_guest_log_capture_miss(miss), "never been enabled") ||
-              contains(format_guest_log_capture_miss(miss), "never enabled"),
+        const std::string text = format_guest_log_capture_miss(miss);
+        CHECK(contains(text, "never enabled"),
               "an over-long marker reports that the gate was never enabled");
+        CHECK(!contains(text, "closest observed line"),
+              "a gate that was never enabled makes no claim about what it observed");
     }
 
     // --- the live gate: a prefix marker against the real observer ------------------------------
@@ -249,9 +251,6 @@ int main(int argc, char** argv) {
         const std::string command = "\"" + self + "\" --unfired-child \"" + bundle_path.string() +
                                     "\" 2> \"" + child_err.string() + "\"";
         const int rc = std::system(command.c_str());
-        // Printed on any failure so a spawn or quoting problem is never mistaken for the defect
-        // this arm exists to catch — the two look identical from the assertions alone.
-        if (rc != 0) std::printf("  [note] child command was: %s\n", command.c_str());
         std::string child_text;
         if (FILE* in = std::fopen(child_err.string().c_str(), "rb")) {
             char buf[4096];
@@ -259,6 +258,11 @@ int main(int argc, char** argv) {
             while ((got = std::fread(buf, 1, sizeof(buf), in)) > 0) child_text.append(buf, got);
             std::fclose(in);
         }
+        // A spawn, quoting, or redirection problem is indistinguishable from the missing exit
+        // report itself — both leave this file empty. Name the apparatus so the two never get
+        // confused, which is the failure mode the instrument-trap list keeps recording.
+        if (rc != 0 || child_text.empty())
+            std::printf("  [note] child command was: %s\n", command.c_str());
         CHECK(rc == 0, "the child process exits cleanly, exactly as the lost Astro Bot run did");
         CHECK(contains(child_text, "never matched") && contains(child_text, "PREFIX"),
               "a process that only returns from main still reports its unfired marker at exit");
