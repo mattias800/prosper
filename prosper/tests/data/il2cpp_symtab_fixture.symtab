@@ -1,0 +1,19 @@
+prosper-il2cpp-symtab v1 window=0x8000 count=5
+# Hand-written fixture for test_il2cpp_symbols (#2551). It contains NO Il2CppDumper output: every
+# name and address here is invented (tools/il2cpp/README.md forbids committing dumper output, which
+# is derived from the gitignored game dump). Only the SHAPES are taken from what the dumper really
+# produces, so the parser meets the cases that actually occur:
+#   0x100200 / 0x100310  two adjacent methods 0x110 apart, for the nearest-preceding boundary
+#   0x100310             a name containing ", " -- IL2CPP spells generics `Foo<A, B>$$Bar`, and
+#                        1,326 of PPSA24651's 87,851 method names look like this. A parser that
+#                        tokenises on whitespace truncates them into names that still look
+#                        plausible, which is the failure this shape exists to catch.
+#   0x900000             isolated from both neighbours by far more than window=0x8000
+#   0xa00000 (x2)        two methods sharing a start address, to pin the tie rule: resolve.py
+#                        bisects a list sorted by (address, name) and takes the LAST entry at or
+#                        below the query, so 0xa00000 must resolve to ...MethodZzz.
+100200 Prosper.Fixture.Alpha$$Start
+100310 Prosper.Fixture.Container<Key, Value>$$Insert
+900000 Prosper.Fixture.Isolated$$Run
+a00000 Prosper.Fixture.Tied$$Method
+a00000 Prosper.Fixture.Tied$$MethodZzz

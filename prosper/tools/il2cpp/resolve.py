@@ -8,31 +8,37 @@ usage:
   python3 resolve.py <script.json> il+0x16b981,eb+0xada254    # a btrace chain
   echo '[btrace] ... chain=il+0x1e23b8,il+0xde92e9' | python3 resolve.py <script.json> -
   python3 resolve.py <script.json> --base 0x440000000 0x4402140d0   # absolute runtime addr
+  python3 resolve.py <script.json> --emit-symtab out.symtab   # for RUNTIME symbolication
 
-The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and PPSA02664), so a
-method's runtime address = base + RVA, and script.json's "Address" field == RVA (the flattened ELF
-has p_offset == p_vaddr). A prosper [btrace] chain prints frames as "il+0x<offset>", where <offset>
-is already the RVA — feed those straight in.
+The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and PPSA02664 —
+src/host/boot_program.hpp BOOT_IL2CPP), so a method's runtime address = base + RVA, and
+script.json's "Address" field == RVA (the flattened ELF has p_offset == p_vaddr). A prosper
+[btrace] chain prints frames as "il+0x<offset>", where <offset> is already the RVA — feed those
+straight in.
+
+--emit-symtab writes the flat table prosper reads IN-PROCESS via PROSPER_IL2CPP_SYMBOLS
+(src/host/il2cpp_symbols.{hpp,cpp}, #2551). It is written from this file's own load(), so the
+runtime resolver and this one share the record set; the ordering and window notes below are the
+rest of what makes them agree, and il2cpp_symtab_agreement pins it.
 """
 # The usage block above is the module DOCSTRING, not a comment, because `main()` prints `__doc__` on
 # a bad invocation — and a header made only of `#` comments makes that print the literal string
 # `None` (#2399, where the same arrangement in xref.py sent a caller to invented syntax).
 #
-# resolve.py — map runtime addresses / btrace frames to C# method names using the
-# Il2CppDumper output (script.json). Companion to prx_to_elf.py; see README.md.
-#
-# The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and
-# PPSA02664), so a method's runtime address = base + RVA, and script.json's
-# "Address" field == RVA (the flattened ELF has p_offset == p_vaddr). A prosper
-# [btrace] chain prints frames as "il+0x<offset>", where <offset> is already the
-# RVA — feed those straight in.
-#
-# Usage:
-#   python3 resolve.py <script.json> 0x16b981 0x11e63c ...      # bare RVAs
-#   python3 resolve.py <script.json> il+0x16b981,eb+0xada254    # a btrace chain
-#   echo '[btrace] ... chain=il+0x1e23b8,il+0xde92e9' | python3 resolve.py <script.json> -
-#   python3 resolve.py <script.json> --base 0x440000000 0x4402140d0   # absolute runtime addr
-import json, bisect, re, sys
+# It came back once already: #2642 rewrote this header as `#` comments while adding the
+# --emit-symtab line above, so the very usage text that change existed to publish printed `None`
+# again. The guard is now mechanical rather than advisory — tools/ci/check_usage_text.py
+# (ctest `tools_usage_text`) rejects any module under prosper/ that reads `__doc__` without having
+# one, and test_symtab_agreement.py runs this file with no arguments and reads what comes out.
+import json, bisect, os, re, sys
+
+# Nearest-preceding acceptance window: an offset further than this past a method's start is reported
+# as "no managed method" rather than attributed to that method. script.json gives starts only, never
+# lengths, so some bound is unavoidable. It is written INTO the emitted symtab header so the runtime
+# resolver reads it rather than keeping a second copy that can drift.
+NEAREST_WINDOW = 0x8000
+
+SYMTAB_MAGIC = 'prosper-il2cpp-symtab v1'
 
 def load(path):
     sj = json.load(open(path))
@@ -41,10 +47,31 @@ def load(path):
 
 def resolve_one(addrs, keys, off):
     i = bisect.bisect_right(keys, off) - 1
-    if i >= 0 and off - addrs[i][0] < 0x8000:
+    if i >= 0 and off - addrs[i][0] < NEAREST_WINDOW:
         a, name = addrs[i]
         return f"{name}  (+0x{off - a:x})"
     return "<il2cpp runtime / no managed method at this offset>"
+
+def emit_symtab(addrs, out_path, source):
+    """Write the runtime symbol table. One `<hex-rva> <name>` line per method, in the SAME
+    (address, name) order load() sorted them into — the runtime resolver takes the last entry at or
+    below a query, which reproduces bisect_right()-1 including its tie rule only if that order is
+    preserved. A name is written verbatim to end of line because IL2CPP names contain spaces
+    (`Foo<A, B>$$Bar`); a name containing a newline would break the format, so refuse rather than
+    emit a file that parses into wrong records."""
+    bad = [n for _, n in addrs if '\n' in n or '\r' in n]
+    if bad:
+        raise SystemExit('resolve.py: %d method name(s) contain a newline; refusing to emit '
+                         'an ambiguous symtab (first: %r)' % (len(bad), bad[0]))
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('%s window=0x%x count=%d\n' % (SYMTAB_MAGIC, NEAREST_WINDOW, len(addrs)))
+        f.write('# generated by tools/il2cpp/resolve.py --emit-symtab from %s\n'
+                % os.path.basename(source))
+        f.write('# consumed by prosper at runtime via PROSPER_IL2CPP_SYMBOLS (#2551)\n')
+        for a, n in addrs:
+            f.write('%x %s\n' % (a, n))
+    print('resolve.py: wrote %d symbols to %s (window=0x%x)' % (len(addrs), out_path,
+                                                                NEAREST_WINDOW))
 
 def main(argv):
     if len(argv) < 2:
@@ -54,7 +81,17 @@ def main(argv):
     base = 0
     if '--base' in rest:
         k = rest.index('--base'); base = int(rest[k+1], 0); del rest[k:k+2]
+    emit = None
+    if '--emit-symtab' in rest:
+        k = rest.index('--emit-symtab')
+        if k + 1 >= len(rest):
+            print('resolve.py: --emit-symtab needs an output path'); return 2
+        emit = rest[k+1]; del rest[k:k+2]
     addrs, keys = load(script)
+    if emit:
+        emit_symtab(addrs, emit, script)
+        if not rest:
+            return 0
     tokens = []
     for a in rest:
         if a == '-':
