@@ -8,7 +8,7 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
-Last updated: 2026-08-11
+Last updated: 2026-08-17
 
 ## Summary
 
@@ -20,7 +20,7 @@ Last updated: 2026-08-11
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
-| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo; the boot sequence then holds on a white screen before a title screen | [#1871](https://github.com/mattias800/prosper/issues/1871) |
+| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then decoded 4K movie frames; no title screen observed | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; the menu heading draws the wrong string | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
@@ -53,6 +53,47 @@ Last updated: 2026-08-11
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
 | *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
+
+## At a glance
+
+Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
+ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
+six of the twenty titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
+at two different rungs. Counting markers gives a different — and wrong — answer.
+
+| Where the title stops | Titles |
+| --- | --- |
+| **Gameplay reached** with real GPU draws (rung 3 or better) | 20 |
+| **Title screen or menu** reached, gameplay not yet reached (rung 2) | 18 |
+| **Below a title screen** — logo or splash only (rung 1) | 1 |
+| Total tracked | 39 |
+
+"Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
+It includes *Grand Theft Auto V*, which enters Story Mode with a correct HUD and radar over an absent
+3D world, and *Syberia: Remastered*, whose gameplay composite is degraded.
+
+### Where the titles accumulate
+
+The 18 titles that stop at a title screen or menu, by the engine recorded in the table:
+
+| Engine | Titles |
+| --- | --- |
+| Unreal Engine — 8 × UE4, 1 × UE5, 1 unversioned | 10 |
+| Unity / IL2CPP, including Unity 6 | 4 |
+| Hedgehog Engine 2, Custom, Custom (Ancient), ASOBI — one each | 4 |
+
+**Every Unreal title in the table is in this group.** Ten of the 39 rows are Unreal; all ten reach a
+title screen and none has reached gameplay. The distribution is the mirror image on the other side:
+15 of the 20 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows.
+
+**This is an observation about where titles accumulate, not a claim that the ten Unreal titles share
+one root cause.** A common cause is an untested hypothesis, and the per-title records currently cut
+against it: what bounds *Nikoderiko*, *ArcRunner*, *Crisis Core*, *Little Nightmares III* and
+*The Oregon Trail* is recorded separately for each in the sections below and in their tracker issues,
+and no cross-title experiment has been run. What the grouping does say is that the shared UE
+bring-up surface — [`prosper/docs/UE4_APR_IOSTORE_BRINGUP.md`](prosper/docs/UE4_APR_IOSTORE_BRINGUP.md)
+and [`prosper/docs/CROSS_ENGINE_UE4.md`](prosper/docs/CROSS_ENGINE_UE4.md) — carries the largest
+single block of titles waiting to reach gameplay.
 
 ## Screenshots and short descriptions
 
@@ -111,9 +152,19 @@ live renderer at 3840×2160. The title had previously produced nothing but black
 machine waits for a save-data job that could never finish, because
 `sceSaveDataCreateTransactionResource` returned 0 when it must return the id of the transaction
 resource it creates. With a real id the boot advances,
-the frontend loads its menu resource set and opens its logo movie, and the SEGA logo renders. **No
-title screen is reached:** after the logo fades the composite holds on white. See
-[`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) and the
+the frontend loads its menu resource set and opens its logo movie, and the SEGA logo renders.
+
+**No title screen is reached.** After the logo fades the composite goes to a flat white frame. That
+white state used to be terminal — one colour, static to the end of the run. It no longer is: since
+`sceVideodec2Decode` began decoding by default ([#2571](https://github.com/mattias800/prosper/pull/2571)),
+a default launch still shows the pure-white frame at 80 s and then continues, producing distinct
+multi-thousand-colour 4K frames to the end of a 180 s window. The white is **passed through, not
+eliminated**, and what follows the movie is unmeasured — no title screen has been observed. prosper
+authors none of these frames either way: 68 of 68 guest scanouts report no present source and no
+renderer target, so every presented frame is raw guest memory published directly, and only its
+contents changed. See
+[`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md),
+[#2267](https://github.com/mattias800/prosper/issues/2267) for the measured run, and the
 [tracker](https://github.com/mattias800/prosper/issues/1871).
 
 ## Sonic Frontiers — `PPSA03831`
