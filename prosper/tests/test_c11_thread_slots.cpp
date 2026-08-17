@@ -27,9 +27,10 @@
 //   N2  restore the guard on m_mtx_lock    -> FAIL (2): §2's "self-initialised into a real host
 //                                             mutex" and "a second thread BLOCKS"
 //   N3  make m_cnd_broadcast never broadcast AT ALL (`if (false && a0)`)
-//                                          -> FAIL (2): the wake arm of §1 AND of §3 — nobody is
+//                                          -> FAIL (3): the wake arm of §1 AND of §3 — nobody is
 //                                             ever woken, and the bounded retry reports it as a
-//                                             failure rather than hanging
+//                                             failure rather than hanging — PLUS §4's broadcast arm,
+//                                             because a broadcast that never fires never resolves
 //   N4  make guest_cond_from_slot refuse an ALREADY-INITIALISED slot (sentinels only)
 //                                          -> FAIL (2): §1's wake arm and §3's "an initialised
 //                                             _Cnd_wait waits too". This is the arm §3 exists for:
@@ -41,6 +42,11 @@
 //                                             one. §1, §2 and §3 all pass under it — see §4.
 //   N6  restore the OLD GUARD on m_mtx_unlock
 //                                          -> FAIL (1): §4's `_Mtx_unlock` arm, and only that one.
+//   N7  restore the OLD GUARD on m_cnd_signal
+//                                          -> FAIL (1): §4's `_Cnd_signal` arm, and only that one.
+//                                             `_Cnd_signal` is one of the five handlers this change
+//                                             moves and had NO arm at all until a reviewer pointed
+//                                             out that restoring its guard failed nothing.
 //
 // N3 AND N5 ARE DIFFERENT MUTATIONS, and an earlier revision of this header ran N3 while describing
 // N5. A reviewer caught the mismatch by reading, and measuring the arm they described produced
@@ -78,7 +84,7 @@ static int fails = 0;
 namespace {
 
 HleFn mtx_lock = nullptr, mtx_unlock = nullptr, mtx_init = nullptr;
-HleFn cnd_wait = nullptr, cnd_broadcast = nullptr, cnd_init = nullptr;
+HleFn cnd_wait = nullptr, cnd_broadcast = nullptr, cnd_init = nullptr, cnd_signal = nullptr;
 
 // A statically-initialised guest cnd_t / mtx_t pair: the slot holds NULL, which is exactly what
 // `PTHREAD_MUTEX_INITIALIZER` puts there on the guest's platform. File-scope so a detached worker
@@ -163,9 +169,10 @@ int main() {
     cnd_init      = Hle::lookup(nid_hash("_Cnd_init"));
     cnd_wait      = Hle::lookup(nid_hash("_Cnd_wait"));
     cnd_broadcast = Hle::lookup(nid_hash("_Cnd_broadcast"));
-    CHECK(mtx_init && mtx_lock && mtx_unlock && cnd_init && cnd_wait && cnd_broadcast,
+    cnd_signal    = Hle::lookup(nid_hash("_Cnd_signal"));
+    CHECK(mtx_init && mtx_lock && mtx_unlock && cnd_init && cnd_wait && cnd_broadcast && cnd_signal,
           "the C11 _Mtx_* / _Cnd_* handlers are registered");
-    if (!(mtx_init && mtx_lock && mtx_unlock && cnd_init && cnd_wait && cnd_broadcast)) {
+    if (!(mtx_init && mtx_lock && mtx_unlock && cnd_init && cnd_wait && cnd_broadcast && cnd_signal)) {
         printf("== FAIL (%d) ==\n", ++fails);
         return 1;
     }
@@ -230,30 +237,55 @@ int main() {
     }
 
     // ===== 4. the SIGNAL side, on a slot no wait has resolved yet ==============================
-    // THIS SECTION EXISTS BECAUSE ITS ABSENCE WAS INVISIBLE, and the way that came out is worth
-    // recording. A reviewer questioned the N3 row and derived that restoring the old guard on
-    // `m_cnd_broadcast` should fail only §1's wake arm, not §3's. Measuring it produced something
-    // worse than either reading: restoring the guard made the suite pass **completely**.
+    // THIS SECTION EXISTS BECAUSE ITS ABSENCE WAS INVISIBLE. A reviewer questioned the N3 row and
+    // derived that restoring the old guard on `m_cnd_broadcast` should fail only §1's wake arm.
+    // Measuring it produced something worse than either reading: restoring the guard made the suite
+    // pass COMPLETELY. The reason is structural — §1 and §3 both WAIT before they broadcast, and the
+    // wait self-initialises the slot, so by the time any broadcast runs every slot in this file
+    // already holds a real pointer and the old guard is satisfied. Those sections cannot see the
+    // signal/broadcast half of the change at all, however the mutation is phrased. A positive
+    // control that has already resolved the thing under test is not a control.
     //
-    // The reason is structural, not a fluke. §1 and §3 both WAIT before they broadcast, and the
-    // wait self-initialises the slot — so by the time any broadcast runs, every slot in this file
-    // already holds a real pointer and the old guard is satisfied. Those sections therefore cannot
-    // see the signal/broadcast half of the change AT ALL, however the mutation is phrased. A
-    // positive control that has already resolved the thing under test is not a control.
+    // WHAT THESE TWO ARMS ARE FOR, stated carefully because the first revision of this block gave a
+    // reason that CANNOT HAPPEN. It said a skipped signal "would be signalling an object no waiter
+    // will ever use". There is no such waiter: `ensure_cond` installs the object with a CAS before
+    // returning it, and `m_cnd_wait` can only park on what it returns, so a slot still holding a
+    // sentinel has nobody parked on it by construction. On a NULL sentinel a skipped broadcast
+    // therefore loses NOTHING. A second reviewer caught that, and it is recorded rather than quietly
+    // replaced because a plausible-but-impossible failure mode in a test's rationale is exactly what
+    // stops the next reader questioning the arm.
     //
-    // The only observable that discriminates is the resolution itself, on a slot NOTHING has waited
-    // on: after the call the slot must NAME AN OBJECT. That is not an implementation detail — it is
-    // the whole mechanism, because a later waiter resolves the same slot, so a signal that skipped
-    // it would be signalling an object no waiter will ever use. Nothing weaker works here: a
-    // broadcast to an empty condvar has no other effect to assert.
-    printf("-- _Cnd_broadcast / _Mtx_unlock resolve a slot no wait has touched --\n");
+    // The two things these arms really establish:
+    //   1. CROSS-SPELLING PARITY, which is this PR's whole thesis (#1873). `k_cond_broadcast` and
+    //      `k_mutex_unlock` resolve the identical guest slot for the identical input. §4 is the only
+    //      place in the suite that asserts the C11 spelling agrees, and the only place the resolver
+    //      is exercised on the signal side at all.
+    //   2. THE CRASH PATH. The old guard tested the slot's VALUE, so it was TRUE for every sentinel
+    //      except NULL: sentinel 1 and the destroyed poison kPtDestroyed (0xDEA) were dereferenced
+    //      as object pointers. Routing through the resolver is what turns
+    //      `interruptible_cond_broadcast((pthread_cond_t*)0xDEA)` into a refusal.
+    // The observable is the resolution itself, because a broadcast to a condvar with no waiters has
+    // no other effect to assert.
+    printf("-- _Cnd_signal / _Cnd_broadcast / _Mtx_unlock resolve a slot no wait has touched --\n");
     {
-        static void* untouched_cnd = nullptr;   // a static sentinel, never waited on
+        static void* untouched_signal_cnd = nullptr;   // static sentinels, never waited on
+        static void* untouched_bcast_cnd = nullptr;
         static void* untouched_mtx = nullptr;
-        cnd_broadcast((uint64_t)(uintptr_t)&untouched_cnd, 0, 0, 0, 0, 0);
-        CHECK(untouched_cnd != nullptr,
-              "_Cnd_broadcast RESOLVES a statically-initialised cnd_t rather than skipping it — the "
-              "slot now names the same object a later _Cnd_wait will resolve");
+        // `_Cnd_signal` gets its own slot rather than sharing the broadcast one: it is one of the
+        // five handlers this change moves, and without an arm of its own restoring its old guard
+        // would fail nothing in this file.
+        cnd_signal((uint64_t)(uintptr_t)&untouched_signal_cnd, 0, 0, 0, 0, 0);
+        CHECK(untouched_signal_cnd != nullptr,
+              "_Cnd_signal RESOLVES a statically-initialised cnd_t rather than skipping it — the "
+              "same slot, and the same answer, scePthreadCondSignal gives for this input");
+        cnd_broadcast((uint64_t)(uintptr_t)&untouched_bcast_cnd, 0, 0, 0, 0, 0);
+        CHECK(untouched_bcast_cnd != nullptr,
+              "_Cnd_broadcast likewise resolves rather than skipping");
+        // NOTE for anyone reading this arm as evidence of more than it shows: unlocking a mutex this
+        // thread never locked is UNDEFINED under POSIX for a non-ERRORCHECK mutex. It is benign on
+        // glibc, and it is exactly what k_mutex_unlock already does for the same input, which is why
+        // it is acceptable here — but the arm asserts that the slot was RESOLVED, not that the
+        // unlock is defined.
         mtx_unlock((uint64_t)(uintptr_t)&untouched_mtx, 0, 0, 0, 0, 0);
         CHECK(untouched_mtx != nullptr,
               "_Mtx_unlock likewise resolves rather than skipping, so the C11 family agrees with "
