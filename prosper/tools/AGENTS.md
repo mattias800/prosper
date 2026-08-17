@@ -312,6 +312,12 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **`--values`** additionally records each handler's RETURN value, which is what turns a census into
   evidence about *behaviour* rather than only traffic — the recurring bug shape here is a handler
   answering `SCE_OK` for work it never did, and a call count cannot see that.
+  **`--out-bytes N`** covers the half a return value cannot reach: it snapshots N bytes at whichever
+  of a0/a1 is a readable pointer, before the call and at its return, and reports what CHANGED. The
+  defect this codebase produces most is *success returned, out-struct never written* — every instance
+  returns `0`, so a value census is blind to all of them. Its counters keep "the handler wrote
+  nothing" (`same-zero`) apart from "this tool never read the bytes" (`null`/`small`/`unreadable`)
+  and from the one ambiguous case (`same-nonzero`: the bytes already held what would be written).
   **`--launch`** starts the process under gdb instead of attaching, so the window covers init: the
   handlers a title calls once, before anything could attach, are reachable only this way.
   Every `--values` run prints a `positive-control=` verdict on its own value capture — read it first,
