@@ -2161,6 +2161,10 @@ static std::string apr_miss_callsite() {
 // makes APR proceed on garbage ids and wild-write over the allocator, so every successful entry
 // writes its id and size. `error_index` is one scalar, not an output array; a missing path records
 // its index and fails the batch so callers do not construct a zero-length reader (#1226).
+//
+// The "populate the outputs" half of that reasoning covers the WHOLE array, not just the entries the
+// loop reaches: on a miss the batch stops, but all `count` output slots still belong to this call
+// (#1951). See the miss branch below for why the untouched tail is stamped rather than left.
 static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int count,
                                  uint32_t* out_ids, uint64_t* out_sizes, uint32_t* error_index) {
     if (!paths || count <= 0) return 0x80020016ull;   // EINVAL
@@ -2205,8 +2209,30 @@ static uint64_t apr_resolve_impl(const char* prefix, const char** paths, int cou
         }
         if (found) size = (uint64_t)st.st_size;
         else {
-            if (out_ids) out_ids[i] = 0xffffffffu;
-            if (out_sizes) out_sizes[i] = 0;
+            // Stamp the failing entry AND everything after it (#1951). The batch stops here, so
+            // entries i+1..count-1 are never stat'd — and leaving them untouched hands the guest
+            // back whatever its own array already held. That is the same "APR proceeds on garbage
+            // ids" hazard this function's header comment was written against, displaced one index:
+            // a stale word that happens to be a live 1-based registry index resolves through
+            // prosper_apr_path_for_id() to the WRONG container, so the read path serves the wrong
+            // file's bytes instead of failing. 0xffffffff cannot be a valid APR id (ids are 1-based
+            // indices into g_apr_files), so both f_apr_get_file_stat and the Ampr read path reject
+            // it with ENOENT — a definite, diagnosable error instead of a silent wrong-data read.
+            // The written RANGE is exactly the range an all-success batch already writes, so this
+            // assumes no output-array bound the success path does not already assume.
+            //
+            // The scalar `error_index` and the ENOENT batch-failure return are deliberately
+            // unchanged: that contract was recovered from live ArcRunner evidence (#1226).
+            //
+            // CONFIDENCE: MED — no title has yet been observed making a multi-entry resolve whose
+            // miss is not the final entry (Sonic Origins' two startup misses are each single-entry
+            // calls), so firmware's exact treatment of the tail is unevidenced. The sentinel VALUE
+            // is the one the failing entry already used; stamping can only turn an unspecified read
+            // into a rejected id, and no evidenced behaviour is weakened.
+            for (int j = i; j < count; j++) {
+                if (out_ids)   out_ids[j]   = 0xffffffffu;
+                if (out_sizes) out_sizes[j] = 0;
+            }
             if (error_index) *error_index = (uint32_t)i;
             if (filelog())
                 fprintf(stderr, "[apr] resolve MISS %s%s\n",
