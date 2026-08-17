@@ -1,0 +1,125 @@
+# Baseline for tools/env/check_diag_gates.py -- diagnostics whose PRODUCER and PRINTER are
+# armed by different PROSPER_* switches (#2149).
+#
+# One line per finding: KEY  # CLASS: note. The checker FAILS on a finding missing from this file
+# (a newly introduced split gate) AND on a line here that no longer reproduces (the fix landed --
+# delete the row). Both halves matter: a baseline nobody is forced to update stops describing the
+# tree, which is the failure class this tool exists to catch.
+#
+# The key is KIND|file|subject|requirement, with NO line number, so ordinary code motion does not
+# churn it. `A+B` means both are required; `A|B` means either satisfies that clause.
+#
+# CLASSES
+#   defect       a confirmed instance of #2149's shape; the note names the issue.
+#   config-echo  the field echoes CONFIGURATION, so 0 truthfully means "unconstrained". That is
+#                the shape #2143 recommends, not the defect.
+#   family       TRIAGE, NOT A CLEARANCE. Every variable in the requirement shares a name family
+#                (PROSPER_X with PROSPER_X_DIM), so a reader who arms one can find the other from
+#                the names. It is explicitly not a clean bill of health: #2149's fourth instance
+#                was PROSPER_PROGRESS + PROSPER_PROGRESS_UNIMPL, which IS a name family, and the
+#                family is what made the coupling invisible -- the name promised what only the
+#                pair delivered. Read one of these before quoting its output as a measurement.
+#   unreviewed   found by the sweep and NOT judged. Honest debt, counted in the audit doc.
+#
+# Regenerate the key list with:
+#     python3 tools/env/check_diag_gates.py <root> --emit-baseline
+# then re-apply the classifications. Never let a regeneration silently downgrade a `defect` row to
+# `unreviewed` -- that is the laundering this tool exists to prevent, performed by hand.
+#   config-echo: 10
+#   defect: 2
+#   family: 28
+#   unreviewed: 53
+#
+SPLIT-CALL|src/gpu/command_processor.cpp|generation_guard|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-CALL|src/gpu/gpu_timeline.cpp|automatic_capture_bundle_gate_conflicts|PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE  # family: every gate shares a name family -- the coupling is discoverable from the names
+SPLIT-CALL|src/hle/hle_audio.cpp|audio2log|PROSPER_AUDIO2LOG+PROSPER_AUDIO2LOG|PROSPER_AUDIO2_PROBE  # family: every gate shares a name family -- the coupling is discoverable from the names
+SPLIT-CALL|src/host/exec_image_linux.cpp|arm_hwwatch|PROSPER_HWBP+PROSPER_HWWATCH_ABS  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_compute_image_hit|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..25more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_submit_query|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validated_bytes|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validation_ms|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_active|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_disabled|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_only|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_query|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_stability|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|seed|PROSPER_RTT_NOSEED  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-LOCAL|src/gpu/gpu_executor.cpp|fresh|PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE|PROSPER_UDPROV  # defect: #2149 inst.3 fresh_extent: prints 0, which reads as 'the bind programmed nothing'
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_after_compute_program|PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_compute_program|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_dispatch_threads_x|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_dispatch_threads_y|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_dispatch_threads_z|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_min_dispatches|PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_min_draws|PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_height|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_min_index|PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_width|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
+SPLIT-LOCAL|tests/render_runner.h|cached_color|PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_compute.cpp|report|PROSPER_COMPUTE_PHASE_TIMING+PROSPER_COMPUTE_TIMING_TRACE_ONLY  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|frontends/shared/live_compute.cpp|report|PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION+PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS+PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER|PROSPER_NO_NATIVE_3D_COMPUTE_TRANSFER  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|frontends/shared/live_compute.cpp|report|PROSPER_NO_NORMALIZED_UNORM_RTT_BIND|PROSPER_NO_UNORM_RTT_VALUE_REUSE+PROSPER_RENDER_SCALE  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DETILE+PROSPER_DUMP_RAWTILE+PROSPER_NODETILE  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DETILE_STATS+PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..25more  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DSBRIDGE_LOG+PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DSLOG+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DS_UNBRIDGED_FAR+PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_DRAWSTEPS+PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_DRAWSTEPS|PROSPER_DUMP_RTGROUPS|..12more+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_PASS+PROSPER_DUMP_PASS_EVERY+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_PASS+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_PERSISTENT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RAWTILE+PROSPER_NODETILE  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RTGROUPS+PROSPER_DUMP_RTGROUPS_ADDR+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RTGROUPS_ADDR+PROSPER_DUMP_RTGROUPS_RGBA+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_SAMPLED_RTT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_EAGER_RESOLVE_READBACK+PROSPER_NO_RESOLVE+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_MRT_CENSUS+PROSPER_MRT_SHAPE_FOR+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_MRT_CENSUS+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_NO_RESOLVE+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_PASS_LOG+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_PASS_LOG|PROSPER_PASS_LOG_NODEFER+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_READBACK_WHY+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RENDER_TIMING+PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RESOLVE_CENSUS+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_GUESTPEEK+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_NOSEED+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET+PROSPER_TARGET_STEP_HASH_MIN_DRAWS  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/command_processor.cpp|report|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/command_processor.cpp|report|PROSPER_INIT_TRIP+PROSPER_MB3_FREELIST_GUARD  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/gpu_execute.hpp|report|PROSPER_CAPTION_DIAG+PROSPER_FRAME_DIR  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/gpu_execute.hpp|report|PROSPER_FORCE_COLORWRITE+PROSPER_NO_EARLY_NO_EFFECT  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_COMPUTE_TREE_WATCH_AUX+PROSPER_COMPUTE_TREE_WATCH_DUMP  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROSPER_DYNTRACE_FAIL_ADDR|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN  # defect: #2146 [udtail]: the one report answering #305 also needs PROSPER_UD_TAIL_ALIGN, which the charter requires stay OFF
+TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE|PROSPER_DYNTRACE_FAIL|PROSPER_DYNTRACE_FAIL_ADDR+PROSPER_STAGE_FOLD_PROFILE  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE|PROSPER_UDPROV+PROSPER_RESDUMP  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_CAPTURE_BUNDLE+PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_CAPTURE_BUNDLE+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_DEPTH+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DRAW_INDEX+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/hle/hle_graphics.cpp|report|PROSPER_AGCSHADER+PROSPER_AGCSHADER_OUT  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/hle/hle_pad.cpp|report|PROSPER_PAD_SCRIPT+PROSPER_PAD_SCRIPT_RELOAD  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/host/exec_image_win.cpp|report|PROSPER_NULL_PAGE+PROSPER_NULL_PAGE_LOG  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|src/host/guest_write_watch.cpp|report|PROSPER_DMEM_CALLER+PROSPER_DMEM_WRITE_TRACE  # family: every gate shares a name family -- the coupling is discoverable from the names
+TWO-GATE|tests/render_runner.h|report|PROSPER_BACKEND_TIMING_WINDOWS+PROSPER_RENDER_TIMING  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|tests/render_runner.h|report|PROSPER_DRAW_ISO+PROSPER_ISO_AT  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|tests/render_runner.h|report|PROSPER_NO_BACKEND_PIPELINE_CACHE+PROSPER_PIPEKEY_LOG  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|tools/boot_trace/boot_trace.cpp|report|PROSPER_CRASHPEEK+PROSPER_PEEK_CLASS  # unreviewed: found by the #2149 sweep, not judged
+TWO-GATE|tools/boot_trace/boot_trace.cpp|report|PROSPER_CRASHPEEK+PROSPER_PEEK_CODE  # unreviewed: found by the #2149 sweep, not judged
