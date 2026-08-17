@@ -1325,6 +1325,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_log_capture_miss PRIVATE prosper_core)
   add_test(NAME guest_log_capture_miss COMMAND test_guest_log_capture_miss)
 
+  # The same silence, two selector families over: a malformed capture tunable substituting a
+  # different policy (#2565) and a detailed timeline selector that never matched (#2564). Separate
+  # binary because both the detailed-capture request and the tunable refusal are process-wide
+  # one-shots, and one of its arms deliberately ends a CHILD process during static initialization.
+  add_executable(test_capture_tunables tests/test_capture_tunables.cpp)
+  target_link_libraries(test_capture_tunables PRIVATE prosper_core)
+  add_test(NAME capture_tunables COMMAND test_capture_tunables)
+
   # Remote/headless F9 equivalent: an external regular-file witness arms the existing seeded
   # whole-frame capture on the next present. Pure/cross-platform; no game dump or Vulkan device.
   add_executable(test_capture_trigger_file tests/test_capture_trigger_file.cpp)

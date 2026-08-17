@@ -204,9 +204,16 @@ int main(int argc, char** argv) {
 
     // --- delivery: the report actually reaches stderr, and only when a gate is armed ------------
     clear_test_env("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG");
+    // PROSPER_CAPTURE_BUNDLE has to go with it. Since #2565 that variable ON ITS OWN is itself
+    // reported — it names a destination and arms nothing — so leaving it set would turn this check
+    // into one about that report instead of the gate report it exists to pin. Clearing both makes
+    // the premise ("nothing configured at all") match the claim, and additionally proves the new
+    // report is not spurious.
+    clear_test_env("PROSPER_CAPTURE_BUNDLE");
     const std::string quiet = capture_stderr(stderr_path, &report_unfired_automatic_capture_gates);
-    CHECK(quiet.empty(), "with no gate configured the exit report says nothing at all");
+    CHECK(quiet.empty(), "with nothing configured at all the exit report says nothing at all");
 
+    set_test_env("PROSPER_CAPTURE_BUNDLE", bundle_path.string());
     set_test_env("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG", "phase-ready");
     const std::string loud = capture_stderr(stderr_path, &report_unfired_automatic_capture_gates);
     CHECK(contains(loud, "never matched") && contains(loud, "phase-ready"),

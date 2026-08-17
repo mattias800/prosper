@@ -739,6 +739,20 @@ covers the other two automatic gates: an unreached `PROSPER_CAPTURE_BUNDLE_AT_PR
 count the run actually reached, and an unobserved `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE` states how many
 presents looked for it. **Absence of a bundle is no longer evidence of anything on its own — read the
 exit report.**
+Since #2565 the same exit report also covers **`PROSPER_CAPTURE_BUNDLE` set on its own**, which is a
+complete no-op: the variable only names a DESTINATION, and nothing but one of the three gates above
+(or F9, which uses `PROSPER_CAPTURE_DIR` instead) ever arms a capture into it.
+
+**Malformed capture tunables no longer substitute a policy in silence** (#2565). The parse is strict —
+the whole value must be a number, with nothing around it, not even a space — and every rejection now
+names the variable, quotes the value with invisible bytes escaped, and states what is actually in
+force:
+
+| variable | a bad value used to mean | now |
+| --- | --- | --- |
+| `PROSPER_CAPTURE_MAX_SUBMITS` | **uncapped** — the inverse of the request | **the process refuses to start**, exit status 3. There is no honest default: `0` means uncapped, so a typo removed the only content bound on exactly the run that needed it. Express "uncapped" by leaving the variable unset. |
+| `PROSPER_CAPTURE_BUNDLE_MAX_MB` | the default budget, so a raise was discarded | same value in force, plus one `[grab]` line saying the raise was discarded (or naming the 64/3072 MiB bound it was clamped to) |
+| `PROSPER_CAPTURE_FRAMES` | 1 — the very width the `window had no submits` message tells you to widen | same value in force, plus one `[grab]` line; a mistyped remedy no longer reproduces the original failure in silence |
 If present counts vary and the title emits no honest guest-stdout marker, use the headless F9 control:
 set `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` together with
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`, keep the trigger absent at process start, and create it

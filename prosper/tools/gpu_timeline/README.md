@@ -69,6 +69,28 @@ PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
   --bundle-intermediate-through-target 642x362 /tmp/closure.bmp
 ```
 
+**A selector that never matches now says so at process exit, on stderr** (#2564). Before that fix the
+run simply completed, exited 0 and wrote no `.prgcap` — an outcome indistinguishable from a route that
+crashed early or a mistyped output path, and the `detail_submits_captured` counter that does exist
+reaches only the timeline file. The report quotes what was configured and what the run actually
+reached, and it separates the outcomes because their fixes differ:
+
+* `this is an ORDINAL selector, and the run never reached that submit number` — run the route longer,
+  or pick an ordinal at or below the one named. **Submit ordinals are run-local**; re-derive with
+  `gpu_timeline <file> --records`.
+* `none satisfied every semantic predicate` — the predicates are quoted back verbatim. Extents, draw
+  indices and program addresses are **all run-local**, so re-derive them against *this* run with
+  `--signatures` / `--select` rather than re-using a selector from an earlier one. `--select` exits
+  nonzero when nothing matches, which answers the same question offline in seconds.
+* `PROSPER_GPU_TIMELINE is NOT set` — the detailed capture requires it. Setting only
+  `PROSPER_GPU_TIMELINE_CAPTURE` and `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT` is a complete no-op,
+  because the submit hook returns before reaching the selector when the recorder is not running.
+* `the run produced no GPU submits at all` — a routing or boot fault, not a selector fault.
+* `the AFTER_COMPUTE_PROGRAM phase gate never armed` — the endpoint predicate was never even reached;
+  the compute program address is run-local too.
+
+So **the absence of a `.prgcap` is not evidence on its own**: read the exit report first.
+
 See [`../gpu_replay/README.md`](../gpu_replay/README.md) for graph interpretation, pixel-oracle
 semantics, draw isolation, resource/shader extraction, and the distinction between draw and operation indices.
 
