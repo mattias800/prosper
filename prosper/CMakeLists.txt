@@ -1168,6 +1168,10 @@ if(TARGET prosper_core)
   add_test(NAME shader_recompile_cache COMMAND test_shader_recompile_cache)
 
   # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
+  add_executable(test_compressed_source_authority tests/test_compressed_source_authority.cpp)
+  target_link_libraries(test_compressed_source_authority PRIVATE prosper_core)
+  add_test(NAME compressed_source_authority COMMAND test_compressed_source_authority)
+
   add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
