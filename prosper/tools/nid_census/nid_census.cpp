@@ -43,6 +43,7 @@
 // any disagreement: the name table is the instrument this tool reads the census through, so it
 // gets a control of its own rather than being trusted.
 #include "host/boot_program.hpp"
+#include "../common/nid_stub_names.hpp"
 #include "../../src/hle/dispatch.hpp"
 #include "../../src/hle/nid.hpp"
 #include "../../src/loader/linker.hpp"
@@ -76,53 +77,34 @@ struct Row {
 //     if(sprx_dlsym(__handle, "PI7jIZj4pcE", &__ptr_sceRandomGetRandomNumber)) return;
 // so the pair is read off directly. No hashing is required to build the map, which is what makes
 // --self-check meaningful: the hash is checked AGAINST the dump rather than used to produce it.
+//
+// The reading of the dump itself lives in tools/common/nid_stub_names.hpp so that self_dump
+// --import-slots names its imports from the identical parse; only the --self-check control and its
+// mismatch accounting are this tool's.
 struct NameTable {
     std::map<std::string, std::string> by_nid;   // nid -> function name
     std::map<std::string, std::string> lib_of;   // nid -> library file stem
     size_t pairs = 0, mismatches = 0;
 };
 
-bool parse_stub_line(const std::string& line, std::string* nid, std::string* name) {
-    const size_t call = line.find("sprx_dlsym(");
-    if (call == std::string::npos) return false;
-    const size_t q1 = line.find('"', call);
-    if (q1 == std::string::npos) return false;
-    const size_t q2 = line.find('"', q1 + 1);
-    if (q2 == std::string::npos) return false;
-    const size_t ptr = line.find("&__ptr_", q2);
-    if (ptr == std::string::npos) return false;
-    size_t end = ptr + 7;
-    while (end < line.size() && (isalnum((unsigned char)line[end]) || line[end] == '_')) ++end;
-    *nid = line.substr(q1 + 1, q2 - q1 - 1);
-    *name = line.substr(ptr + 7, end - (ptr + 7));
-    return !nid->empty() && !name->empty();
-}
-
 NameTable load_names(const std::string& dir, bool self_check) {
     NameTable t;
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file() || e.path().extension() != ".c") continue;
-        std::ifstream in(e.path());
-        std::string line, nid, name;
-        while (std::getline(in, line)) {
-            if (!parse_stub_line(line, &nid, &name)) continue;
-            t.pairs++;
-            t.by_nid[nid] = name;
-            t.lib_of[nid] = e.path().stem().string();
+    auto stub = prosper_tools::load_stub_names(
+        dir, [&](const std::string& nid, const std::string& name) {
             // The dump states the NID; prosper computes it. They must agree, and a disagreement
             // means one of the two is wrong for that name — report it rather than silently
             // preferring either. This is the control on the name table itself.
-            if (self_check && nid_hash(name) != nid) {
-                t.mismatches++;
-                // stderr, not stdout: under --tsv these land above the header and corrupt the
-                // stream a consumer parses. The control's result belongs with the diagnostics,
-                // and its COUNT is reported in the scope block below in both modes.
-                fprintf(stderr, "  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
-                        name.c_str(), nid.c_str(), nid_hash(name).c_str());
-            }
-        }
-    }
+            if (!self_check || nid_hash(name) == nid) return;
+            t.mismatches++;
+            // stderr, not stdout: under --tsv these land above the header and corrupt the
+            // stream a consumer parses. The control's result belongs with the diagnostics,
+            // and its COUNT is reported in the scope block below in both modes.
+            fprintf(stderr, "  [name-mismatch] %s: dump says %s, nid_hash() says %s\n",
+                    name.c_str(), nid.c_str(), nid_hash(name).c_str());
+        });
+    t.by_nid = std::move(stub.by_nid);
+    t.lib_of = std::move(stub.lib_of);
+    t.pairs = stub.pairs;
     return t;
 }
 

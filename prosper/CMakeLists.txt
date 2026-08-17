@@ -117,6 +117,15 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
+  # self_dump --import-slots reads DT_JMPREL/DT_RELA to answer "which GOT slot does this Sony import
+  # land in" (#1625). The fixtures are PS5-shaped ELFs written byte by byte in the test, so they are
+  # an independent statement of the relocation layout rather than anything self_dump produced, and
+  # they run in CI with no game dump. Includes the zero-result arms: a tool that answers "nothing"
+  # when it means "I did not parse anything" is the defect class of #2399.
+  add_test(NAME self_dump_import_slots
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/self_dump/test_import_slots.py"
+                   "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
   add_test(NAME re_edis_mapping
