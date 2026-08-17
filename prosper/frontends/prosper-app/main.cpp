@@ -901,7 +901,7 @@ static CaptureTitle capture_title_for(const std::string& dump) {
     return out;
 }
 
-// "prosper — <game name>" for a booted game (name from param.json, falling back to the app0
+// "prosper - <game name>" for a booted game (name from param.json, falling back to the app0
 // basename), else a label that says what the empty window is waiting for.
 static std::string window_title_for(const std::string& dump, bool test_pattern) {
     if (!dump.empty()) {
@@ -1326,7 +1326,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    // Title: "prosper — <game name>" for a booted game, else a label saying what the empty window
+    // Title: "prosper - <game name>" for a booted game, else a label saying what the empty window
     // is waiting for. A title opened later replaces this (#1469).
     std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());

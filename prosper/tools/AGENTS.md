@@ -505,8 +505,12 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   bytes a program emits, never source style. Replacements are `--`, `->`, `...`, `"`, `x`.
   Three tiers, because a gate with standing false positives is one people learn to skip: a raw
   non-ASCII character and a `\u`/`\U` escape above 127 **fail**; a `\x`/octal byte escape above 127
-  is a **note**, since that spelling is binary data by construction (the two in the tree are UTF-8
-  fixtures feeding conversion tests, not messages).
+  is a **note**, since a multi-byte run like `\xe2\x80\x94` is binary data by construction (the two
+  in the tree are UTF-8 fixtures feeding conversion tests, not messages). The note tier is honestly
+  weaker for a *lone* high byte — `printf("caf\xe9")` is the same defect in escape form and is only
+  noted — so the note **count** is printed on every run to keep growth visible. The tier is decided
+  before the quarantine, not after, or a binary fixture added to a quarantined file would be
+  reported as the defect class it is not.
   It prints how many files and literals it examined on **every** run, pass or fail — a verdict alone
   cannot be told apart from a scan that saw nothing — and it self-tests both its parsing and its
   **line numbers**, the second because its first revision drifted its counter across an unterminated
@@ -514,7 +518,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   What it does **not** cover, stated so silence is not read as coverage: **Python, shell and CMake
   literals** (#2609 — 109 characters in 30 files, the same mojibake class, measured); Markdown and
   comments, deliberately; anything assembled at runtime from a data file, `argv`, or the guest's own
-  UTF-8 strings printed through `%s`; and the files in its `QUARANTINE` ledger, which #2588 left to
+  UTF-8 strings printed through `%s`; **char literals** (`L'—'` is invisible — their spans are
+  skipped so a quote inside one cannot open a string, and their contents are never read); **C++23
+  delimited escapes** (`\u{2014}`, `\N{EM DASH}`, which GCC and Clang already accept as extensions);
+  and the files in its `QUARANTINE` ledger, which #2588 left to
   the GPU/compute lane (#2608). That ledger fails on a count that RISES *and* on one that falls,
   so it cannot outlive the defect it records.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.

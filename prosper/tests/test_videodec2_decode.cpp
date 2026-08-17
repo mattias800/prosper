@@ -168,7 +168,7 @@ void check_nv12_sizes() {
     // implementation would agree with any implementation, including a wrong one.
     static const Case cases[] = {
         // w    h     exact                                    shorthand   short by
-        {  64,  32,  64ull * 32 + 2 * 32 * 16,  "even x even -- the shorthand agrees here" },
+        {  64,  32,  64ull * 32 + 2 * 32 * 16,  "even x even, the shorthand agrees"       },
         {  65,  32,  65ull * 32 + 2 * 33 * 16,  "ODD width  (3136 vs 3120, short by 16)"  },
         {  64,  33,  64ull * 33 + 2 * 32 * 17,  "ODD height (3200 vs 3168, short by 32)"  },
         {  65,  33,  65ull * 33 + 2 * 33 * 17,  "BOTH odd   (3267 vs 3217, short by 50)"  },

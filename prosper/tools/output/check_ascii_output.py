@@ -3,12 +3,13 @@
 
 stdout and stderr carry BYTES. A UTF-8 punctuation mark in a printf literal leaves the process as
 its UTF-8 bytes and is decoded by whoever reads them -- UTF-8 on Linux, but the console/locale code
-page (cp1252 / cp437) on Windows. One EM DASH (U+2014 = e2 80 94) therefore reaches a Windows user as
+page (cp1252 / cp437) on Windows. One EM DASH (U+2014 = e2 80 94) therefore reaches a Windows user
+as three mojibake characters -- a-circumflex, euro, right-double-quote under cp1252; capital-gamma,
+C-cedilla, o-umlaut under cp437 -- in place of the dash, so
 
-    cp1252: [IMPORT SLOTS] 0 import slots a=" the dynamic table declares neither DT_JMPREL
-    cp437 : [IMPORT SLOTS] 0 import slots .-o the dynamic table declares neither DT_JMPREL
+    [IMPORT SLOTS] 0 import slots <3 junk chars> the dynamic table declares neither DT_JMPREL
 
-so a `grep` for the line prosper itself printed does not match it, and a test asserting on the
+is what the console shows. A `grep` for the line prosper itself printed does not match it, and a test asserting on the
 rendered string fails on Windows only. That is #2588, found because #2579 shipped five em dashes in
 `self_dump --import-slots` output and the Windows MinGW job failed on the one assertion that spanned
 one of them while Linux CI stayed green.
@@ -30,8 +31,24 @@ Escapes are read too, because they put the same bytes on the wire without a sing
 in the source -- a scanner that looked only at raw bytes could be walked straight around. They split
 by how they are written: a \\u / \\U escape above 127 FAILS (it denotes a character, and is how the
 accident would be spelled to dodge a byte scan), while a \\x / octal escape above 127 is a NOTE, on
-the grounds that nobody types "\\xe2\\x80\\x94" by accident -- the two in this tree are UTF-8
-fixtures feeding conversion tests, and failing them would mean banning binary test data.
+the grounds that a MULTI-BYTE run such as "\\xe2\\x80\\x94" is nobody's accident -- the two in this
+tree are UTF-8 fixtures feeding conversion tests, and failing them would mean banning binary test
+data. That justification is honestly weaker for a LONE high byte: printf("caf\\xe9") is the same
+mojibake defect written in escape form, and this reports it only as a note. The note COUNT is
+printed on every run so growth is visible; discriminating a stray latin-1 byte from deliberate
+binary needs a UTF-8 well-formedness test that is not written here.
+
+WHAT THIS CANNOT SEE, stated so its silence is not read as coverage:
+
+  * Python, shell and CMake literals -- the same defect class, measured and filed as #2609.
+  * Markdown, and comments in any language. Deliberate.
+  * Anything assembled at RUNTIME: a data file, argv, or a title's own UTF-8 name through %s.
+  * CHAR literals. 'x' spans are skipped so a quote inside one cannot open a string, and their
+    contents are never examined -- L'<em dash>' would be invisible. Zero instances today.
+  * C++23 delimited escapes: "\\u{2014}", "\\x{2014}", "\\o{24024}", "\\N{EM DASH}". The project is
+    C++20, but GCC and Clang accept some of these as extensions already.
+  * The files in QUARANTINE, bounded by that ledger rather than unexamined.
+  * Whether ASCII output is CORRECT. This bans a class of bytes, nothing more.
 
 Run standalone against a checkout, or via ctest as ascii_output_literals.
 """
@@ -40,7 +57,10 @@ import sys
 from pathlib import Path
 
 SCAN_DIRS = ("src", "frontends", "tools", "tests")
-SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp", ".inl")
+# .m/.mm are here for a macOS frontend that does not exist yet: adding an extension costs nothing,
+# while a future Objective-C file would otherwise be silently out of scope, and silent scope loss is
+# this checker's whole failure mode.
+SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp", ".inl", ".m", ".mm")
 
 # Escapes that denote a code point without spelling it in bytes. \u/\U are always a code point;
 # \x and octal are byte values, and a byte above 0x7F in a narrow literal is exactly the thing
@@ -97,22 +117,36 @@ def extract_literals(src: str):
                     i += 1
                 i = min(i + 2, n)
                 continue
-        # char literal: skip it, so '"' does not open a string
-        if c == "'":
+        # char literal: skip it, so '"' does not open a string.
+        #
+        # A DIGIT SEPARATOR is the hazard, and it fails in the dangerous direction. `5'000` is not a
+        # char literal, but if a string later on the same line contains an apostrophe -- `puts("it's
+        # here")` -- a scanner that just hunts for the next `'` pairs the separator with that one,
+        # swallows the string's opening quote, and every character of that string becomes INVISIBLE
+        # to the gate. A false clean, which is the one outcome this checker must never produce.
+        # So a quote only opens a char literal when the character before it cannot end an
+        # identifier or a number, which is exactly what distinguishes `5'000` and `x'` from `= '` or
+        # `('`. Reported by review; no instance existed in the tree, and the tree is not the point.
+        prev = src[i - 1] if i else ""
+        if c == "'" and not (prev.isalnum() or prev == "_"):
             j = i + 1
             closed = False
             while j < n and src[j] != "\n":
                 if src[j] == "\\":
+                    # A char literal does not span lines, so a backslash-newline here means this
+                    # quote was never one. Stepping over that newline uncounted drifts every line
+                    # number after it (measured: a one-line drift), which points findings at
+                    # innocent code.
+                    if j + 1 < n and src[j + 1] == "\n":
+                        break
                     j += 2
                     continue
                 if src[j] == "'":
                     closed = True
                     break
                 j += 1
-            # Not closed on this line, so the quote was a digit separator (1'000) or stray prose,
-            # NOT a char literal. Consume just the quote. Skipping to the next ' across newlines is
-            # what drifted every line number after it -- a finding then names an innocent line and
-            # the real one is never looked at, which is worse than missing it.
+            # Not closed on this line: stray prose or an unbalanced quote, not a char literal.
+            # Consume just the quote, so the outer loop counts the newline.
             i = (j + 1) if closed else (i + 1)
             continue
         # raw string: R"delim( ... )delim", optionally prefixed u8/u/U/L
@@ -180,6 +214,19 @@ def offenders_in(lit: Literal):
             bad.append(("char", "U+%04X %r" % (ord(ch), ch), lit.line_of(idx), ch))
     if not lit.raw:
         for m in ESCAPE_RE.finditer(lit.text):
+            # Backslash PARITY: in "\\u2014" the first backslash escapes the second, so the runtime
+            # string is six ASCII characters and nothing non-ASCII is emitted. Counting
+            # the run of backslashes before the match is what separates that from a real escape.
+            # The tree has three live sites (all JSON escapers) that are safe only because none is
+            # followed by four hex digits. Reported by review; false-positive direction, but a gate
+            # that cries wolf on correct code gets deleted rather than heeded.
+            k = m.start() - 1
+            slashes = 0
+            while k >= 0 and lit.text[k] == "\\":
+                slashes += 1
+                k -= 1
+            if slashes % 2:                 # this backslash is itself escaped
+                continue
             u4, u8, hx, oc = m.groups()
             if u4 is not None:
                 val, kind = int(u4, 16), "unicode"
@@ -288,6 +335,16 @@ SELF_TESTS = [
     ('printf("tab\\there\\n");', 0),
     ('printf("\\x41\\x42");', 0),
     ('printf("\\101");', 0),
+    # MUST NOT fire: an ESCAPED backslash. "\\u2014" emits six ASCII characters, and the tree has
+    # three live JSON escapers written this way -- safe today only because none is followed by four
+    # hex digits, which is not a property to rely on.
+    ('printf("\\\\u2014");', 0),
+    ('printf("\\\\\\\\u2014");', 0),          # four backslashes: still escaped pairs
+    # MUST fire: three backslashes is an escaped backslash THEN a real \\u escape.
+    ('printf("\\\\\\u2014");', 1),
+    # MUST fire: a digit separator must not swallow a later string. If the ' in 1'000 pairs with the
+    # one in "it's", the whole of that string -- and this dash -- goes invisible. A FALSE CLEAN.
+    ('int n = 1\'000; puts("it\'s %s");' % DASH, 1),
     # #include and preprocessor lines are ordinary text to the scanner; must stay clean.
     ('#include "header.h"', 0),
 ]
@@ -309,6 +366,29 @@ LINE_TESTS = [
     ('printf("a\\\n%s");' % DASH, [(2, 1)]),                            # backslash-newline
     ('const char* s = R"(one\ntwo %s)";\nprintf("clean");' % DASH, [(2, 1)]),   # inside a raw string
     ('#define X "a" \\\n          "%s"\nprintf("clean");' % DASH, [(2, 1)]),
+    # The three below pin line tracking where the arms above did NOT, each verified to fail on a
+    # one-line revert of the logic it covers. Review measured that reverting the apostrophe guard
+    # left all 34 previous arms green AND a full tree scan green, while drifting every finding on
+    # unswept master by up to 114 lines -- and now that the tree is swept, the runtime misreported
+    # cross-check cannot catch it either, because it needs a finding to check. The tree that
+    # discovered a bug stops being able to detect its return; that is when a self-test has to carry
+    # the weight.
+    #   1. an UNCLOSED code-level apostrophe before a later string holding an apostrophe. Without
+    #      the `!= "\n"` guard the scan runs forward to that second apostrophe across a newline it
+    #      never counts, and every later finding is one line early. NOTE: the digit-separator form
+    #      of this arm, which review supplied, is inert against this particular revert -- the
+    #      opener guard added alongside it means `1'000` is not treated as a char literal at all,
+    #      so the newline guard is never reached. Two guards, two arms; an arm that the OTHER fix
+    #      makes unreachable pins nothing, and this one was measured surviving before it was
+    #      rewritten to the form below.
+    ('x = \' ;\nputs("it\'s fine");\nputs("%s");' % DASH, [(3, 1)]),
+    #   2. `line = cur` after a NORMAL string continued with backslash-newline
+    ('puts("a\\\n b\\\n c");\nputs("x");\nputs("%s");' % DASH, [(5, 1)]),
+    #   3. `line = cur` after a RAW string spanning lines
+    ('const char* s = R"(one\ntwo\nthree)";\nputs("x");\nputs("%s");' % DASH, [(5, 1)]),
+    #   4. a char literal continued with backslash-newline is NOT a char literal (found in author
+    #      testing; it drifted by one line and the misreported check turned it into a hard abort)
+    ('char c = \'\\\n n\';\nputs("%s");' % DASH, [(3, 1)]),
 ]
 
 
@@ -398,10 +478,15 @@ def main() -> int:
     fails, notes = [], []
     for f in findings:
         rel, _line, kind, _detail, _ex = f
-        if rel in QUARANTINE:
-            quarantined[rel] = quarantined.get(rel, 0) + 1
-        elif kind == "byte":
+        # KIND first, then file. The other order made a byte escape count into the ledger, so the
+        # identical "\xe2\x80\x94" fixture was a silent note anywhere else and a CI failure inside a
+        # quarantined file, reported as "3 ADDED since #2588" -- the gate's own three-tier rule
+        # suspended exactly where it would misdiagnose legitimate binary test data as the defect.
+        # Two of the thirteen quarantined entries are test files. Reported by review.
+        if kind == "byte":
             notes.append(f)
+        elif rel in QUARANTINE:
+            quarantined[rel] = quarantined.get(rel, 0) + 1
         else:
             fails.append(f)
 
@@ -437,6 +522,8 @@ def main() -> int:
         print("  an em dash, -> for an arrow, ... for an ellipsis, \" for smart quotes, x for a")
         print("  multiplication sign. Comments and Markdown keep theirs; this is about the bytes")
         print("  the program emits, not about source style.")
+        print("  If you MOVED one of these out of a quarantined file rather than writing it, the")
+        print("  ledger below expects the old file's count to drop -- sweep it while it is in hand.")
     if ledger_bad:
         print("  [FAIL] %d quarantine ledger entr(y/ies) no longer match the tree:" % len(ledger_bad))
         for msg in ledger_bad:
