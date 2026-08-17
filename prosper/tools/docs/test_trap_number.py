@@ -14,6 +14,27 @@ someone else's PR hours later. Pinning them against the repository's real Instru
 only arm that can see that. The arm asserts a floor rather than an exact count deliberately: an
 exact one would need editing on every append, which is how prose figures go stale.
 
+HOW TO TELL A REAL ARM FROM ONE THAT REDDENS NOTHING, without running a mutation:
+
+    Ask "WHAT ELSE IN THIS OUTPUT COULD SATISFY THIS ASSERTION?"
+    An arm discriminates only if it asserts on a string ONLY THE BRANCH UNDER TEST can produce.
+
+Every void arm this suite has shipped failed exactly that question, and each was caught late and
+expensively by a mutation run instead:
+
+  * `expect="#11"` for the collision line -- the per-PR TABLE ROW prints `PR #11` too, so emptying
+    the racing list satisfied it just as well.
+  * `want_rc=1` for "an unauthenticated gh must not fall back" -- a silent fallback makes the NEXT
+    `gh` call fail, so rc=1 either way. Assert WHICH call failed.
+  * `expect="4"` for `--quiet` -- a bare substring any report containing a 4 satisfies. Assert the
+    whole output.
+  * (in the sibling suite) a `// s_trap 1` fixture asserting "not a citation", where 1 is a valid
+    row, so it passed whether the mnemonic was excluded or matched-and-resolved.
+
+The question is cheaper than a mutation run and catches the same class while you are writing, which
+is where it is worth having. It is not a replacement for mutating -- an arm can name a unique string
+and still test the wrong branch -- but nothing that fails this question is worth mutating.
+
 Run directly, or via ctest as trap_number.
 """
 
@@ -132,6 +153,18 @@ if a[:2] == ["repo", "view"]:
     print("o/r")
 elif a[:2] == ["pr", "list"]:
     import os
+    if os.environ.get("STUB_MODE") == "wild":
+        print(json.dumps([
+            {"number": 33, "title": "typo lane", "headRefOid": "ccc", "isDraft": False,
+             "files": [{"path": DOC}]},
+        ]))
+        sys.exit(0)
+    if os.environ.get("STUB_MODE") == "dupmaster":
+        print(json.dumps([
+            {"number": 44, "title": "dup lane", "headRefOid": "ddd", "isDraft": False,
+             "files": [{"path": DOC}]},
+        ]))
+        sys.exit(0)
     if os.environ.get("STUB_MODE") == "capped":
         print(json.dumps([
             {"number": 11, "title": "lane A", "headRefOid": "aaa", "isDraft": False,
@@ -145,10 +178,27 @@ elif a[:2] == ["pr", "list"]:
          "files": [{"path": DOC}]},
     ]))
 elif a[0] == "api":
-    print(table([1, 2, 3]))
+    m = os.environ.get("STUB_MODE")
+    if m == "wild":
+        print(table([1, 2, 900]))
+    elif m == "dupmaster":
+        print(table([1, 2]))
+    else:
+        print(table([1, 2, 3]))
 elif a[:2] == ["pr", "diff"]:
     import os
-    if os.environ.get("STUB_MODE") == "stacked" and a[2] == "22":
+    m = os.environ.get("STUB_MODE")
+    if m == "wild":
+        print("diff --git a/%s b/%s" % (DOC, DOC))
+        print("--- a/%s" % DOC); print("+++ b/%s" % DOC)
+        print("@@"); print("+| 900 | r900 | e |")
+        sys.exit(0)
+    if m == "dupmaster":
+        print("diff --git a/%s b/%s" % (DOC, DOC))
+        print("--- a/%s" % DOC); print("+++ b/%s" % DOC)
+        print("@@"); print("+| 2 | a DIFFERENT row 2 | e |")
+        sys.exit(0)
+    if m == "stacked" and a[2] == "22":
         print("diff --git a/other.txt b/other.txt\\n--- a/other.txt\\n+++ b/other.txt\\n@@\\n+unrelated\\n")
     else:
         print("diff --git a/%s b/%s\\n--- a/%s\\n+++ b/%s\\n@@\\n+| 3 | r3 | e |\\n" % (DOC, DOC, DOC, DOC))
@@ -162,7 +212,8 @@ SEED = ("| # | Instrument | How it lied |\n|---|---|---|\n"
 
 
 def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str | None = None,
-             extra: list[str] | None = None, stub_env: dict[str, str] | None = None) -> None:
+             exact: str | None = None, extra: list[str] | None = None,
+             stub_env: dict[str, str] | None = None) -> None:
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         bin_dir = root / "bin"
@@ -193,6 +244,12 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
         FAILURES.append(f"{name}: expected {expect!r} in output, got {out[:400]!r}")
     elif absent and absent in out:
         FAILURES.append(f"{name}: did not expect {absent!r}, got {out[:400]!r}")
+    elif exact is not None and out.strip() != exact:
+        # `exact` exists because a bare substring is the weak form the whole batch kept tripping on:
+        # "4" is satisfied by any report that happens to contain a 4, including the full table
+        # --quiet is supposed to suppress. Whole-output equality is the only assertion here that
+        # nothing but the intended branch can produce.
+        FAILURES.append(f"{name}: expected the whole output to be {exact!r}, got {out.strip()[:200]!r}")
     else:
         print(f"  ok  {name}")
 
@@ -202,14 +259,21 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
 run_main("a real collision reaches the advice instead of crashing",
          want_rc=0, expect="COLLISION: 3 claimed by more than one open PR")
 
-run_main("...and it names the racing PRs", want_rc=0, expect="#11")
+# ASSERT ON THE COLLISION LINE, NOT ON "#11". The first draft did the latter and reddened nothing,
+# because the per-PR table row above prints "PR #11" too -- so `racing = []` satisfied it just as
+# well. That is the general rule the whole batch converged on: an arm discriminates only if it
+# asserts on a string ONLY THE BRANCH UNDER TEST can produce. Asking "what else in this output could
+# satisfy this assertion?" catches it while writing, with no mutation run (#2610 review).
+run_main("...and the collision line names both racing PRs",
+         want_rc=0, expect="open PR (#11, #22)")
 
 run_main("...and suggests stepping clear rather than to the next free number",
          want_rc=0, expect="CONSIDER")
 
 # --quiet returns before the report, which is exactly why the crash was invisible to a scripted
 # caller. It must still be right, and it must not be the only path that works.
-run_main("--quiet prints just the number", want_rc=0, expect="4", extra=["--quiet"])
+run_main("--quiet prints just the number and nothing else", want_rc=0, exact="4",
+         extra=["--quiet"])
 
 # THE arm that pins WHICH notion of "claim" the collision arithmetic uses. PR 22 here is STACKED:
 # its file holds row 3, inherited from the branch underneath, while its patch adds nothing to this
@@ -240,6 +304,25 @@ run_main("an unauthenticated gh is an error at the FIRST call, not a fallback to
 # from the report.
 run_main("a PR whose files array is at the 100 cap is scanned, not skipped",
          want_rc=0, expect="1 touching this file", stub_env={"STUB_MODE": "capped"})
+
+# THE HEADLINE CAPABILITY, and it had no arm: a PR whose patch adds a number the base ALREADY holds.
+# This is the report that found the live #2602 collision, and disabling the branch changed nothing in
+# the suite. Master here holds rows 1 and 2; PR #44's patch adds a DIFFERENT row 2.
+run_main("a PR adding a number the base already holds is reported as a duplicate",
+         want_rc=0, expect="DUPLICATES 2 ALREADY ON master",
+         stub_env={"STUB_MODE": "dupmaster"})
+
+# The wild-claim report, added two rounds ago as the allocator/gate divergence guard, also had no
+# arm. PR #33 claims 900 against a base whose max is 2 -- a mistyped digit, which
+# check_numbered_table --baseline rejects, so the allocator must not hand out 901.
+run_main("a claim far above the base is reported as a typo, not an allocation",
+         want_rc=0, expect="IGNORING PR #33", stub_env={"STUB_MODE": "wild"})
+
+# ...and the half that matters more: it must be EXCLUDED from the arithmetic. Without the MAX_JUMP
+# filter on `sane` the answer becomes 901 and every later allocation inherits it. Asserting the
+# number itself is what discriminates -- the IGNORING line above prints either way.
+run_main("...and is excluded from the next free number, not merely mentioned",
+         want_rc=0, expect="next free number: 3", stub_env={"STUB_MODE": "wild"})
 
 # The truncation guard, executed rather than reasoned about: the stub returns 2 PRs, so --limit 2
 # cannot distinguish "there are 2" from "we stopped at 2".

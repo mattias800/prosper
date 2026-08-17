@@ -409,6 +409,18 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   gap goes in `kKnownGaps` with its issue — that list is meant to stay empty.
   **`spirv-val` must be on `PATH`** (`spirv-tools`, `mingw-w64-ucrt-x86_64-spirv-tools`, or
   `brew install spirv-tools`); its absence fails the suite rather than skipping the gate.
+- **Writing a test arm in this directory? One question first, and it is cheaper than a mutation run:**
+  **"what else in this output could satisfy this assertion?"** An arm discriminates only if it asserts
+  on a string **only the branch under test can produce**. Five void arms shipped here in one session
+  and every one failed that question: `expect="#11"` for a collision line the per-PR table row also
+  prints; `want_rc=1` for a fail-closed path whose silent fallback exits 1 anyway; `expect="4"` for a
+  `--quiet` output any report containing a 4 satisfies; a `// s_trap 1` fixture whose operand is a
+  valid row. It does not replace mutating the code — an arm can name a unique string and still test
+  the wrong branch — but nothing that fails this question is worth mutating. Related: the defects
+  those arms missed were all in the tool's **advertised** faculty (a citation auditor blind to
+  sentence-final citations while certifying "all resolving"; a conflict scanner that would reject the
+  documentation of its own defect; a collision reporter that could not report a collision), which is
+  the one place nobody points an arm, because reasoning about it hard feels like testing it.
 - **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
   number. Four classes: **structure** (always on) rejects a blank line that splits a table, which
   in Markdown silently renders everything after it as a *separate* table; **arity** (always on)
