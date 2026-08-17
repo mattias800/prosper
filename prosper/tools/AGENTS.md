@@ -409,16 +409,39 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   gap goes in `kKnownGaps` with its issue — that list is meant to stay empty.
   **`spirv-val` must be on `PATH`** (`spirv-tools`, `mingw-w64-ucrt-x86_64-spirv-tools`, or
   `brew install spirv-tools`); its absence fails the suite rather than skipping the gate.
+- **Writing a test arm in this directory? One question first, and it is cheaper than a mutation run:**
+  **"what else in this output could satisfy this assertion?"** An arm discriminates only if it asserts
+  on a string **only the branch under test can produce**. Five void arms shipped here in one session
+  and every one failed that question: `expect="#11"` for a collision line the per-PR table row also
+  prints; `want_rc=1` for a fail-closed path whose silent fallback exits 1 anyway; `expect="4"` for a
+  `--quiet` output any report containing a 4 satisfies; a `// s_trap 1` fixture whose operand is a
+  valid row. It does not replace mutating the code — an arm can name a unique string and still test
+  the wrong branch — but nothing that fails this question is worth mutating. Related: the defects
+  those arms missed were all in the tool's **advertised** faculty (a citation auditor blind to
+  sentence-final citations while certifying "all resolving"; a conflict scanner that would reject the
+  documentation of its own defect; a collision reporter that could not report a collision), which is
+  the one place nobody points an arm, because reasoning about it hard feels like testing it.
 - **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
-  number. Three classes: **structure** (always on) rejects a blank line that splits a table, which
+  number. Four classes: **structure** (always on) rejects a blank line that splits a table, which
   in Markdown silently renders everything after it as a *separate* table; **arity** (always on)
-  requires every row to have its header's cell count; **`--sequential`**
-  (opt-in, plus `--table-header` to select one table) additionally requires the numbered column
-  to be unique, ascending and gapless. Sequence is a convention of the instrument-trap table
+  requires every row to have its header's cell count; **`--ordered`**
+  (opt-in, plus `--table-header` to select one table) requires the numbered column
+  to be unique and strictly ascending; **`--baseline <base copy>`** requires that every row number
+  the base had is still present. Order is a convention of the instrument-trap table
   ("append, never renumber"), not a property of numbered tables — most here lead with frame or
-  draw ordinals where gaps are correct — so do not apply it broadly. Catches the case where two
+  draw ordinals where repeats are correct — so do not apply it broadly. Catches the case where two
   branches append the same row number, which merges textually clean and green. Run by the CI
   `Docs` job; `ctest -R doc_table_checker` covers the checker itself.
+  **`--sequential` was removed on 2026-08-17 and now errors** (#2089). It also required the column to
+  be *gapless*, which made a lane's `Docs` job red purely because a lower number sat in another
+  lane's unmerged branch — unrepairable by its author, since the only local fix is the forbidden
+  renumber. It was kept for catching a **deleted** row, and measurement showed it only ever caught an
+  *interior* deletion: on master's 186-row Instrument table, dropping the highest row passed green,
+  and a
+  whole-file `git checkout` from an old revision lost 61 rows and reported "contiguous and unbroken".
+  `--baseline` does that job completely — interior, tail, whole-file revert, and renumber — and
+  cannot be made to fire by another lane's timing. **Gaps are now legal**, so a collision is repaired
+  by bumping to any higher number and merging.
   **On arity, and why it is not optional:** GFM splits a row into cells on `|` *before* it parses
   inline content, so a pipe inside an inline `code span` is a cell boundary, and a row with more
   cells than the header has the excess **silently discarded** on the rendered page. Write `\|`
@@ -447,6 +470,19 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   citation at all, losing 22 of 118 references (5 of them in `.cpp`/`.hpp`/test comments) **with the
   gate still green and the success line still saying "all resolving"**. Run by the CI `Docs` job;
   `ctest -R trap_citation_checker` covers it.
+- **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/master`
+  **and every open PR** (#1729). Prints each claimant so you can see whether you are in a race, not
+  just a bare number. An **advisor, not a gate**: two lanes running it in the same minute both see the
+  same free number, so it shrinks the collision window and cannot close it — merge order does that,
+  and `--ordered` is the backstop. Reading master alone is what produced the #2574/#2581 collision.
+  It **errors rather than answering** when `--limit` truncates the PR list or when `gh` is
+  unauthenticated: a smaller list yields a confidently wrong "next free number", which is the exact
+  defect the tool exists to prevent, wearing the look of a successful run. It also scans (rather than
+  skips) any PR whose `files` array is at GitHub's silent 100-entry cap — measured: `cli/cli#14082`
+  has 1,161 changed files and `gh --json files` returns 100 with no indicator. When more than one open
+  PR claims the same number it says so and suggests stepping *clear* of the contested band rather than
+  to the next free number, since every loser stepping to "next free" collides again one number up.
+  `ctest -R trap_number` covers it.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the
