@@ -151,6 +151,23 @@ nothing here could see before. Nothing another lane does can make it fire. CI pa
 of the file, which is the base commit on a `pull_request` merge ref and the previous master on a
 push, so both the pre-merge and the post-merge run are covered.
 
+TWO ALTERNATIVES WERE REJECTED, recorded here because the next person to find this painful will
+propose one of them, and both are more expensive than they look:
+
+  * BATCHING (#2089's own proposal) -- lanes write rows unnumbered into a staging area, and one
+    periodic PR assigns a contiguous block. It does remove the serialization. It also destroys the
+    property #2089 correctly insists on keeping: a row staged and never promoted is INVISIBLE, since
+    there is no gap to notice, because it never had a number. That trades a check which fires for one
+    which cannot, and adds a mandatory orchestrator step to every lane. --baseline gets the lane
+    independence without the staging area.
+
+  * STABLE NON-SEQUENTIAL IDS (date- or hash-prefixed) plus a generated index (#1664). Rejected for
+    the reason its own filer conceded when they read #1729: the identifier was never the problem, and
+    changing it breaks every existing citation to buy a property that a claim-time check gets for
+    free.
+
+Both were declined in favour of removing the one requirement that could not be satisfied locally.
+
 WHAT THE GATE CAN NO LONGER CATCH, stated plainly so silence is not read as coverage. A number that
 is allocated and then never used -- an abandoned PR, a row dropped in review -- leaves a permanent
 gap, and nothing reports it. That is deliberate: such a gap is not a defect, and treating it as one
