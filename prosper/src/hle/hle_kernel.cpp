@@ -17,6 +17,7 @@
 #include "sce_errno.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "../host/exec_image.hpp"      // describe_code_address (host frame naming)
+#include "pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
 #include "sync_futex.hpp"
 #include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "../gpu/mb3_freelist.hpp"
@@ -1048,6 +1049,18 @@ HLE(k_cond_destroy) {
 SCE_PTHREAD_ALIAS(k_sce_cond_destroy, k_cond_destroy)
 HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_signal(c); } return 0; }
 HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) { guest_cond_advance(c); interruptible_cond_broadcast(c); } return 0; }
+// The two guest-slot resolvers, published for the C11 `_Mtx_*` / `_Cnd_*` handlers in
+// hle_kernel_time.cpp (#2596). They are thin by design: `ensure_mutex` / `ensure_cond` above hold
+// the whole contract -- FreeBSD's static-initialiser sentinels self-initialise (#793), a destroyed
+// slot is refused loudly instead of manufacturing a fresh unheld object (#2170), and the created
+// object is installed with a compare-exchange so racing first uses share one object (#2176). The
+// C11 spelling had a PRIVATE `if (*slot)` guard that answered none of that, and read a statically
+// initialised object as absent. On hardware it has no such guard: the shipped libc.prx's `_Cnd_wait`
+// is `call <scePthreadCondWait>; xor eax,eax; ret`, so the C11 spelling resolves its slots through
+// exactly this code. See pthread_slot.hpp.
+pthread_mutex_t* guest_mutex_from_slot(uint64_t slot_addr) { return ensure_mutex(slot_addr); }
+pthread_cond_t*  guest_cond_from_slot(uint64_t slot_addr)  { return ensure_cond(slot_addr); }
+
 // #1983: this reported SUCCESS for a wait that failed, and for a wait that never happened, through
 // two separate paths:
 //   1. the result was DISCARDED -- `(void)interruptible_cond_wait(...)` followed by an
