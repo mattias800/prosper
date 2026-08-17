@@ -331,6 +331,50 @@ void register_demo_hle() {
 """
 
 
+UNKNOWN_COND = r"""
+namespace prosper {
+uint64_t h_a(uint64_t) { return 0; }
+uint64_t h_b(uint64_t) { return 0; }
+void register_demo_hle() {
+    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+#ifdef PROSPER_SOME_BUILD_FLAG
+    R("sceDemoAlpha", h_a);
+#else
+    R("sceDemoBeta", h_b);
+#endif
+    #undef R
+}
+}
+"""
+
+
+def test_undecidable_condition_keeps_both_arms_and_says_so():
+    """A `#if` on an identifier the tool does not know must be REPORTED, not silently taken as 0.
+
+    C says an undefined identifier in `#if` is 0, and following C here would be the dangerous
+    choice: a build-system define guarding a registration would be read as off, that arm would
+    vanish, and the census would shrink with nothing looking wrong. So an unknown identifier makes
+    the condition undecidable — both arms are kept and the directive is printed.
+
+    No registration in `src/hle` is guarded this way today, which is exactly why this needs a
+    fixture: the path is unreachable from the real tree, so a run against real source can neither
+    confirm nor deny that it works. Building one case BY HAND is the only way to know the code is
+    live rather than merely unexecuted.
+    """
+    print("an undecidable #if keeps both arms and reports itself:")
+    sc = scan_fixture({"demo.cpp": UNKNOWN_COND})
+    check("the condition is reported as undecided",
+          [d for _fn, _ln, d in sc.uncertain_conds], ["#ifdef PROSPER_SOME_BUILD_FLAG"])
+    check("both arms kept rather than one silently dropped", len(sc.regs), 2)
+    check("neither arm is lost", {r.handler for r in sc.regs}, {"h_a", "h_b"})
+    check("no unclaimed", sc.unclaimed, [])
+    # And the contrast: a condition the tool DOES know is decided, not kept.
+    known = scan_fixture({"demo.cpp": UNKNOWN_COND.replace("PROSPER_SOME_BUILD_FLAG", "_WIN32")})
+    check("a known identifier is decided, not reported", known.uncertain_conds, [])
+    check("linux therefore takes only the #else arm",
+          {r.handler for r in known.regs}, {"h_b"})
+
+
 EXTRA_IN_WRAPPER = r"""
 namespace prosper {
 uint64_t h_a(uint64_t) { return 0; }
@@ -474,6 +518,7 @@ def main():
     test_distinct_names_not_sites()
     test_platform_arms()
     test_undef_scope()
+    test_undecidable_condition_keeps_both_arms_and_says_so()
     test_registration_beside_a_forward_is_not_swallowed()
     test_shapes_are_discovered()
     test_unparsable_shape_is_reported()
