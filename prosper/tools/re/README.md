@@ -293,6 +293,44 @@ three with a synthetic symbol table. Note the rule does **not** separate imports
 exports carry the same shape) — what removes exports is the JMPREL/call-site filter, since an export
 has no jump slot bound to it.
 
+## `stub_nid_map.py` — which import does the stub at address X resolve to?
+
+The inverse of `nid_gate_scan.py`, and the direction you need when **reading a call chain** rather
+than chasing one NID. A disassembled guest function shows `call 0x13d810` and nothing more: the
+target is an unsymbolicated `jmp *[rip+d]` thunk, `objdump`/`readelf` cannot decode the Sony
+relocation binding its slot, and the NID appears nowhere near the call. Without this, going from
+"this function calls four things in sequence" to their names means guessing a NID, scanning for it,
+and checking whether a reported site matches the address you are looking at — once per candidate.
+
+```bash
+# name every stub in the module
+python3 tools/re/stub_nid_map.py <DUMP_ROOT>/PPSA28061-app0/eboot.bin --names ../PS5-3.20_Libs
+
+# or just the ones a call chain targets
+python3 tools/re/stub_nid_map.py <DUMP_ROOT>/PPSA28061-app0/eboot.bin --names ../PS5-3.20_Libs \
+    --addr 0x13d750 --addr 0x13d810 --addr 0x13d820
+0x13d750  Gz1rmUZpROM  sceNpTrophy2CreateHandle        libSceNpTrophy2
+0x13d810  4IzqhhUQ3nk  sceNpTrophy2GetGameInfo         libSceNpTrophy2
+0x13d820  +PDSI6WgPRc  sceNpTrophy2GetGroupInfoArray   libSceNpTrophy2
+```
+
+It walks `nid_gate_scan`'s own resolution (NID → dynsym index → JMPREL jump slot → stub → entry
+points) for *every* import and inverts it, sharing that module's `Image`/`flatten`/`scan_code` so the
+two tools cannot silently disagree about what a module imports.
+
+Two behaviours are deliberate. The map is keyed by **address**, because a CET-prologue stub is
+entered four bytes before its `jmp` and a NID-keyed map would answer "not a stub" for the address the
+caller actually names. And a `--addr` you ask about that has no row is reported as **`NOT A STUB`**
+rather than omitted — silently dropping it makes "this call does not go through an import" and "you
+named the wrong address" the same empty output, and the reader cannot tell which they got.
+`test_stub_nid_map.py` (ctest: `re_stub_nid_map`) pins both, each arm naming the mutation it kills.
+
+Worked example (#2186): *Earthion*'s only `sceNpTrophy2GetGroupInfoArray` call site sits in a
+six-step trophy-init chain of anonymous addresses. Mapping the stubs named step 4 as
+`sceNpTrophy2GetGameInfo`, which already answers an error and short-circuits the chain — so the call
+site under investigation is unreachable, and a boot A/B that would otherwise have reported a
+misleading null could be turned into a positive control that fires.
+
 ## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
 
 A UE4 title on PS5 streams content through the Ampr/APR async-read path, and `PROSPER_FILELOG=1`
