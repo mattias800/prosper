@@ -18,6 +18,7 @@
 #endif
 
 #include "exec_image.hpp"
+#include "immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "guest_write_watch.hpp"
 #include "sse4a.hpp"
 #include "x86_read_decode.hpp"
@@ -148,6 +149,22 @@ __asm__(
 namespace prosper {
 
 namespace {
+// #2613 static-destruction ordering canary. Declared BEFORE every registry in this file, so the
+// reverse-order static destruction pass destroys it AFTER all of them: once this flag reads true,
+// every object in this translation unit that still had a static destructor has already run it.
+// tests/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran after
+// this TU's destruction. Constant-initialized atomic: no dynamic init, no destructor.
+std::atomic<bool> g_exec_image_statics_destroyed{false};
+struct ExecImageDestructionCanary {
+    ExecImageDestructionCanary() noexcept {
+        g_exec_image_statics_destroyed.store(false, std::memory_order_relaxed);
+    }
+    ~ExecImageDestructionCanary() {
+        g_exec_image_statics_destroyed.store(true, std::memory_order_release);
+    }
+};
+ExecImageDestructionCanary g_exec_image_destruction_canary;
+
 std::atomic<GuestExecutionThreadEnterTestHook> g_guest_execution_enter_test_hook{nullptr};
 std::atomic<void*> g_guest_execution_enter_test_opaque{nullptr};
 }
@@ -249,8 +266,14 @@ namespace {
     };
 
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
-    std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
-    std::mutex g_smx;
+    // #2613: immortal — win_thread_trampoline's tail calls unregister_thread_stack() while the
+    // process may already be running its exit handlers. See host/immortal.hpp.
+    Immortal<std::map<uint64_t, std::pair<uint64_t, uint64_t>>> g_stacks;
+    Immortal<std::mutex> g_smx;
+    static_assert(std::is_trivially_destructible_v<decltype(g_stacks)> &&
+                  std::is_trivially_destructible_v<decltype(g_smx)>,
+                  "#2613: the guest thread-stack registry must register no static destructor -- a "
+                  "guest thread reaches it from the trampoline tail while the process is exiting");
 
     // Module initialization may attach a frontend-owned thread to IL2CPP before run_entry switches
     // to its dedicated guest stack. Keep the init thread's native stack registered for that
@@ -259,8 +282,8 @@ namespace {
         uint64_t native_tid = 0;
         ~InitThreadStackRegistration() {
             if (!native_tid) return;
-            std::lock_guard<std::mutex> lk(g_smx);
-            g_stacks.erase(native_tid);
+            std::lock_guard<std::mutex> lk(*g_smx);
+            g_stacks->erase(native_tid);
         }
     };
     thread_local InitThreadStackRegistration t_init_stack_registration;
@@ -1371,17 +1394,21 @@ std::string describe_code_address(uint64_t address) {
     return text;
 }
 
+bool exec_image_statics_destroyed() {   // #2613, see the canary at the top of this file
+    return g_exec_image_statics_destroyed.load(std::memory_order_acquire);
+}
+
 void register_thread_stack(uint64_t tid, void* base, uint64_t size) {
-    std::lock_guard<std::mutex> lk(g_smx); g_stacks[tid] = { (uint64_t)base, size };
+    std::lock_guard<std::mutex> lk(*g_smx); (*g_stacks)[tid] = { (uint64_t)base, size };
 }
 void unregister_thread_stack(uint64_t tid) {
-    std::lock_guard<std::mutex> lk(g_smx); g_stacks.erase(tid);
+    std::lock_guard<std::mutex> lk(*g_smx); g_stacks->erase(tid);
 }
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
     auto lookup = [&](uint64_t key) {
-        std::lock_guard<std::mutex> lk(g_smx);
-        auto it = g_stacks.find(key);
-        if (it == g_stacks.end()) return false;
+        std::lock_guard<std::mutex> lk(*g_smx);
+        auto it = g_stacks->find(key);
+        if (it == g_stacks->end()) return false;
         if (base) *base = (void*)(uintptr_t)it->second.first;
         if (size) *size = (size_t)it->second.second;
         return true;

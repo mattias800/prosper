@@ -1804,6 +1804,17 @@ if(TARGET prosper_core)
     target_link_libraries(test_tls_dtv_purge PRIVATE prosper_core)
     add_test(NAME tls_dtv_purge_on_thread_exit COMMAND test_tls_dtv_purge)
 
+    # #2613: nothing joins guest threads at shutdown, so thread_trampoline's tail runs while the
+    # process is already inside __run_exit_handlers and touches the thread-name / thread-stack / DTV
+    # registries. They must be process-lifetime (src/host/immortal.hpp), i.e. register no static
+    # destructor. The test parks a guest worker and drives the whole tail from an exit-time probe, so
+    # the post-destruction access happens on EVERY run instead of 1-in-300 — and the probe checks the
+    # two library canaries first, so a broken ordering assumption fails instead of passing vacuously.
+    add_executable(test_exit_registry_lifetime tests/test_exit_registry_lifetime.cpp)
+    target_link_libraries(test_exit_registry_lifetime PRIVATE prosper_core)
+    add_test(NAME exit_registry_lifetime COMMAND test_exit_registry_lifetime)
+    set_tests_properties(exit_registry_lifetime PROPERTIES TIMEOUT 120)
+
     add_executable(test_agc_dcb tests/test_agc_dcb.cpp)
     target_link_libraries(test_agc_dcb PRIVATE prosper_core)
     add_test(NAME agc_dcb_pm4 COMMAND test_agc_dcb)
