@@ -248,7 +248,7 @@ const char* const kInfallible[] = {
 //     every `pthread_cond_destroy` caller a Sony-encoded value — #1984's shape — and
 //     `test_cond_destroy_busy.cpp` asserts the bare 16 for exactly that reason.
 // The `kInfallible` ARM still passed unchanged after both landings, because a null slot never
-// reaches the busy check — so nothing failed, and the list's stated rationale ("returns 0 on every
+// reaches the busy check -- so nothing failed, and the list's stated rationale ("returns 0 on every
 // path") silently went false while the assertion stayed green. That is the failure this split
 // exists to prevent: a passing arm is not evidence that the sentence justifying it is still true.
 //
@@ -261,8 +261,8 @@ const char* const kInfallible[] = {
 // #2168's remaining third, `scePthreadMutexDestroy`, is still genuinely infallible above: it needs
 // owner tracking that deliberately does not exist on POSIX hosts (#719/#793).
 const char* const kFallibleButNullSucceeds[] = {
-    "scePthreadCondDestroy",      // #2359: EBUSY with waiters — bare from the body, encoded by the alias
-    "scePthreadBarrierDestroy",   // #2379: EBUSY with threads parked — encoded in the body itself
+    "scePthreadCondDestroy",      // #2359: EBUSY with waiters -- bare from the body, encoded by the alias
+    "scePthreadBarrierDestroy",   // #2379: EBUSY with threads parked -- encoded in the body itself
 };
 
 }  // namespace
