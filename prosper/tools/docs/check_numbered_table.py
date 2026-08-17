@@ -578,14 +578,19 @@ def check(
             continue
         seen[num] = line_no
         if num < highest:
+            # Deliberately does not say which row to move: either this one earlier or the higher one
+            # later restores the order, and which is correct depends on whose row arrived by a merge.
+            # What it must say is that renumbering is NOT the repair -- that is the reflex, and it is
+            # the one operation the citation contract forbids.
             problems.append(
-                f"{path}:{line_no}: row number {num} is out of ascending order (the row above "
-                f"reached {highest}). Move this row down to its numeric position; do NOT renumber "
-                f"it -- other documents cite it by number."
+                f"{path}:{line_no}: row number {num} is out of ascending order (an earlier row "
+                f"already reached {highest}). The table is sorted by this column, so MOVE the row "
+                f"to its numeric position. Do NOT renumber it -- other documents cite it by number."
             )
         highest = max(highest, num)
 
-    problems.extend(persistence_problems(path, table, baseline, table_header) if baseline else [])
+    if baseline:
+        problems.extend(persistence_problems(path, table, baseline, table_header))
     return problems
 
 

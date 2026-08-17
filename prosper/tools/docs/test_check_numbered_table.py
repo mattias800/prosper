@@ -154,9 +154,12 @@ run("out of ascending order",
 # The message must forbid the repair that breaks the citation contract. An author whose row is out
 # of order because another lane's higher number landed first can fix it by MOVING the line; the one
 # thing they must not do is renumber, because 64 places in this repo cite these rows by number.
-run("the out-of-order message says move, not renumber",
+run("the out-of-order message forbids renumbering",
     "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
-    ordered=True, want_problems=True, expect_text="do NOT renumber")
+    ordered=True, want_problems=True, expect_text="NOT renumber")
+run("...and names the repair that is allowed",
+    "| # | What |\n|---|---|\n| 1 | a |\n| 3 | b |\n| 2 | c |\n",
+    ordered=True, want_problems=True, expect_text="MOVE the row")
 
 # ---------------------------------------------------------------------------------------------
 # GAPS ARE LEGAL (#2089). This case asserted the OPPOSITE until 2026-08-17, and flipping it is the
