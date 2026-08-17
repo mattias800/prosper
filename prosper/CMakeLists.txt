@@ -1772,6 +1772,16 @@ if(TARGET prosper_core)
     add_test(NAME c11_thread_slots COMMAND test_c11_thread_slots)
     set_tests_properties(c11_thread_slots PROPERTIES TIMEOUT 120)
 
+    # #2619 / #2623: sharing the slot RESOLUTION was not the same as sharing the per-object
+    # BOOKKEEPING. Guards the claim-and-poison of a destroyed slot, the missed-wakeup generation,
+    # and the cond-destroy waiter count -- through BOTH spellings, since a divergence between them
+    # is the defect. Deliberately separate from c11_thread_slots: every arm there passes with the
+    # bookkeeping absent. Same generous TIMEOUT, same reason -- one arm parks a real thread.
+    add_executable(test_c11_sync_bookkeeping tests/test_c11_sync_bookkeeping.cpp)
+    target_link_libraries(test_c11_sync_bookkeeping PRIVATE prosper_core)
+    add_test(NAME c11_sync_bookkeeping COMMAND test_c11_sync_bookkeeping)
+    set_tests_properties(c11_sync_bookkeeping PROPERTIES TIMEOUT 120)
+
     # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68), and
     # normal return leaves guest %fs before glibc resumes host pthread cleanup (#644).
     add_executable(test_tls_dtv_purge tests/test_tls_dtv_purge.cpp)

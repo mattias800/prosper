@@ -25,7 +25,132 @@
 // sentinel" is answered inside libkernel. A private `if (*slot)` guard in prosper's C11 handler
 // answers a DIFFERENT question: it reads a statically initialised object as absent and skips the
 // operation entirely (#2596).
+//
+// SHARING THE RESOLUTION WAS NOT ENOUGH (#2619, #2623). #2596 gave the C11 handlers the same slot
+// RESOLUTION as their Sony counterparts and left each one keeping its own (absent) per-object
+// BOOKKEEPING: the destroy-busy waiter count (#2168), the missed-wakeup generation, the Windows
+// ownership map, and the claim-and-poison of a destroyed slot (#2176/#2170 -- the half #2619 is
+// about). Every one of those is the #1873 shape, the same question answered differently depending
+// on which spelling the guest happened to use, and the C11 spelling could reach them all the moment
+// its slots started resolving.
+//
+// So the family below publishes WHOLE OPERATIONS rather than resolvers, and both spellings call
+// them. That is not tidiness either: the guest's own wrappers ARE the Sony entry points. Read out
+// of the shipped libc.prx of PPSA24651, each PLT thunk taken to its import through the JMPREL slot
+// (`tools/re/stub_nid_map.py`) rather than by adjacency, and each body decoded with
+// `tools/re/edis.py`:
+//
+//   export         addr    size  forwards to                what it does with the result
+//   _Mtx_init      0x5dc0  0x73  scePthreadMutexattr{Init,Settype,Destroy}, scePthreadMutexInit
+//                                                           maps onto a _Thrd_* code
+//   _Mtx_lock      0x5e80  0x1d  scePthreadMutexLock        maps: 0->0, 0x8002000b->3, else 4
+//   _Mtx_unlock    0x5e70  0x0d  scePthreadMutexUnlock      xor eax,eax -- DISCARDS
+//   _Mtx_destroy   0x5e60  0x0b  scePthreadMutexDestroy     nothing after the call touches eax
+//   _Cnd_init      0x5560  0x9d  scePthreadCondInit         maps onto a _Thrd_* code
+//   _Cnd_signal    0x56d0  0x0d  scePthreadCondSignal       xor eax,eax -- DISCARDS
+//   _Cnd_broadcast 0x56e0  0x0d  scePthreadCondBroadcast    xor eax,eax -- DISCARDS
+//   _Cnd_wait      0x5670  0x0d  scePthreadCondWait         xor eax,eax -- DISCARDS
+//   _Cnd_destroy   0x5660  0x0b  scePthreadCondDestroy      nothing after the call touches eax
+//   _Thrd_yield    0x4ee0  0x0b  scePthreadYield            nothing after the call touches eax
+//                                                           (not a sync primitive -- it is here as
+//                                                            the CONTROL for the block below)
+//
+// Every wrapper is a single call with the guest's slot pointer passed straight through, and not one
+// of them inspects the slot. So a C11 handler whose BODY differs from the Sony handler's body is a
+// divergence by construction, whatever it returns.
+//
+// THE DESTROY PAIR IS THE ROW THAT SETTLES #2619's OPEN QUESTION, and the answer is that their
+// RESULT IS NOT A CONTRACT: prosper answers 0 through both spellings, and nothing in the lifetime
+// behaviour below depends on the question either way.
+//
+// An earlier revision of this block read the eleven bytes as "they FORWARD the libkernel result",
+// reasoning that the missing `xor eax,eax` had to mean the callee's value was being passed on. That
+// inference is VOID, and the counterexample is in the table above: an eleven-byte
+// `push rbp; mov rbp,rsp; call; pop rbp; ret` is exactly what a VOID-RETURNING wrapper compiles
+// to. The compiler emits no `xor eax,eax` for a function with no return value, so the absence --
+// which was the entire argument -- is equally well explained by there being nothing to return.
+// Recorded rather than quietly deleted because the shape is genuinely suggestive and the next
+// reader will re-derive it (#2636).
+//
+// THE ELEVEN-BYTE SHAPE CARRIES NO INFORMATION ABOUT THE RETURN TYPE AT ALL, and this module proves
+// it in BOTH directions with two functions sixteen bytes apart:
+//
+//     _Thrd_yield   @0x4ee0  554889e5 e8f7061100 5dc3  -> 0x1155e0  T72hz6ffq08  scePthreadYield
+//     _Thrd_equal   @0x4ef0  554889e5 e8f7061100 5dc3  -> 0x1155f0  3PtV6p3QNX4  scePthreadEqual
+//
+// BYTE-FOR-BYTE IDENTICAL bodies (the call displacements coincide because both the wrapper pair and
+// the stub pair are 0x10 apart, so both encode disp 0x1106f7). ISO C11 spells one
+// `void thrd_yield(void)` and the other `int thrd_equal(thrd_t, thrd_t)` -- and `_Thrd_equal` has no
+// way to return its value except by leaving `scePthreadEqual`'s result in eax. So one of these
+// eleven-byte bodies has nothing to forward and the other certainly does forward, and nothing in the
+// bytes distinguishes them. That is a complete proof rather than a counterexample, and it is why the
+// inference above is void.
+//
+// THE OBVIOUS COMPETING READING -- "the compiler just emits identical bytes for every eleven-byte
+// forwarder, so the identity means nothing" -- IS FALSIFIED BY THE NEXT PAIR DOWN, and the
+// arithmetic above predicts it. `_Thrd_current` @0x4f10 and `_Thrd_id` @0x4f20 are also 0x10 apart,
+// but they SHARE one stub (both call 0x115600 = `aI+OeCz8xrQ` scePthreadSelf), so their
+// displacements differ by exactly 0x10 and their bodies are NOT identical:
+//
+//     _Thrd_current 0x4f10  554889e5 e8e70611 00 5dc3   disp 0x1106e7  -> 0x115600
+//     _Thrd_id      0x4f20  554889e5 e8d70611 00 5dc3   disp 0x1106d7  -> 0x115600
+//
+// Same prologue, same shape, different bytes. So the yield/equal identity is not a compiler
+// signature that all these bodies share -- it is a consequence of the two wrappers and their two
+// distinct stubs being equally spaced, which is a prediction this module tests and confirms.
+//
+// It is not a lone oddity. Every eleven-byte forwarder in the module's C11 family, with its ISO
+// counterpart's return type -- these are the ones checked, listed so the claim is falsifiable rather
+// than asserted over a set someone assembled:
+//
+//     _Thrd_yield   0x4ee0 -> scePthreadYield         void          (nothing to forward)
+//     _Thrd_equal   0x4ef0 -> scePthreadEqual         int           FORWARDS
+//     _Thrd_current 0x4f10 -> scePthreadSelf          thrd_t        FORWARDS
+//     _Thrd_id      0x4f20 -> scePthreadSelf          (Dinkumware)  forwards
+//     _Mtx_destroy  0x5e60 -> scePthreadMutexDestroy  void
+//     _Cnd_destroy  0x5660 -> scePthreadCondDestroy   void
+//     _Tss_create  0x7f3a0 -> scePthreadKeyCreate     int           FORWARDS
+//     _Tss_delete  0x7f3b0 -> scePthreadKeyDelete     void          (nothing to forward)
+//     _Tss_set     0x7f3c0 -> scePthreadSetspecific   int           FORWARDS
+//     _Tss_get     0x7f3d0 -> scePthreadGetspecific   void*         FORWARDS
+//
+// THE `_Tss_*` HALF WAS ALREADY IN THIS REPOSITORY. `hle_kernel.cpp` (above
+// `SCE_PTHREAD_ALIAS(k_sce_key_delete, ...)`) records that `_Tss_create`, `_Tss_delete` and
+// `_Tss_set` are "11-byte, five-instruction forwarders ... returning eax unexamined", verified by
+// PLT relocation for PPSA24651. Two of those return `int` in ISO C11. The counterexample never
+// required leaving the tree, and an earlier revision of THIS block nevertheless asserted a universal
+// that the same source file contradicts 1,600 lines away (#2636).
+//
+// WHAT DOES SURVIVE, and it is the load-bearing line: NO CALLER READS THE DESTROY PAIR'S RESULT.
+// Over every direct `E8` in `.text` (0..0x115bf0) of the flattened module, `_Cnd_destroy` has 14
+// call sites and `_Mtx_destroy` 16, and NOT ONE of those 30 is followed by `test eax,eax`; the
+// first, at 0x504f, does `mov rax,[rip+0x18d1ad]` and clobbers eax before any use. The wrappers
+// whose result IS a contract are read at most of theirs -- `_Cnd_wait` 7 of 8, `_Mtx_unlock` 12 of
+// 25. That is an absence rather than a proof, and it is labelled as one below.
+//
+// WHAT THE ELEVEN BYTES DO ESTABLISH is the half #2168 needs, and it is not about a return value at
+// all: the wrapper's single call is to `scePthreadCondDestroy`, so whatever that entry point does
+// TO THE OBJECT is what happens on hardware through the C11 spelling. The EBUSY refusal is
+// therefore part of `_Cnd_destroy`'s behaviour too, and a C11 destroy that retires an object a
+// thread is parked in is wrong for the same reason the Sony one was. That is what
+// `guest_cond_destroy_slot` enforces and what the tests assert -- on the OBJECT, not on a number.
+//
+// CONFIDENCE: HIGH that the eleven-byte shape does not establish forwarding. This is now a PROOF,
+// not a counterexample: `_Thrd_yield` and `_Thrd_equal` are byte-identical with opposite ISO return
+// types, so the shape is demonstrably ambiguous in both directions inside one module. Also HIGH on
+// every byte, address, NID and count quoted above -- all re-derived from the shipped `libc.prx` with
+// the tools named at the head of this block.
+// CONFIDENCE: MED that the destroy pair is declared `void`, and the grounds are narrower than an
+// earlier revision claimed. What supports it is exactly two things: the ISO C11 signatures of
+// `mtx_destroy` and `cnd_destroy` themselves, which are `void`; and the call-site census above,
+// which is an ABSENCE over one module rather than a proof. A partition over the module's C11 exports
+// is NOT among the grounds -- that argument was asserted over a set assembled alongside the
+// conclusion and is refuted by the table above. Nothing prosper does needs it settled: both readings
+// permit the 0 both handlers answer, because a void result may be anything and a forwarded one is
+// read by no caller here.
 #pragma once
+
+#include "sync_retire.hpp"   // SyncObjectKind — the destroy pair keeps its own census bucket
 
 #include <cstdint>
 #include <pthread.h>
@@ -38,5 +163,32 @@ namespace prosper {
 // names a host object or is a static initialiser, and both come back as a usable object.
 pthread_mutex_t* guest_mutex_from_slot(uint64_t slot_addr);
 pthread_cond_t*  guest_cond_from_slot(uint64_t slot_addr);
+
+// --- whole operations, shared by the Sony spelling and the C11 spelling (#2619 / #2623) ----------
+// Each is the ENTIRE body of the scePthread* / pthread_* handler of the same name, bookkeeping
+// included, so the two spellings cannot drift again. Results are the BARE FreeBSD errno; the
+// libkernel encoding is applied by SCE_PTHREAD_ALIAS at the Sony spelling, and by the C11 wrapper's
+// own result transform (the table above) at the C11 one.
+uint64_t guest_mutex_lock_slot(uint64_t slot_addr);
+uint64_t guest_mutex_unlock_slot(uint64_t slot_addr);
+// `kind` selects the retirement CENSUS bucket only (`_Mtx` vs `mutex`); the lifetime policy is
+// identical. Keeping the buckets apart is what let #2619 establish that no title on this machine
+// reaches the C11 spelling at all.
+uint64_t guest_mutex_destroy_slot(uint64_t slot_addr, SyncObjectKind kind);
+void     guest_cond_signal_slot(uint64_t slot_addr);
+void     guest_cond_broadcast_slot(uint64_t slot_addr);
+// The ONE body that parks on a condition variable without a deadline, so `GuestCondWaiterScope`
+// (#2168) is taken here rather than remembered by each caller. EINVAL(22) if either slot is unusable.
+uint64_t guest_cond_wait_slot(uint64_t cond_slot, uint64_t mutex_slot);
+// EBUSY(16) when the condvar still has waiters — checked BEFORE the slot is claimed, so a refusal
+// leaves the guest a handle that still works (#2168).
+uint64_t guest_cond_destroy_slot(uint64_t slot_addr, SyncObjectKind kind);
+
+// Test-only. The missed-wakeup generation counter is bumped by exactly one function
+// (`guest_cond_advance`, hle_kernel.cpp) whose only callers are the signal/broadcast bodies, and its
+// only PRODUCTION reader is the retry loop in `interruptible_cond_clock_timedwait` — a
+// slice-boundary race no test can schedule. Reading the counter is therefore the only way to assert
+// that a signal was ACCOUNTED FOR, which is the first divergence #2623 records.
+uint64_t guest_cond_generation_for_test(pthread_cond_t* cond);
 
 }  // namespace prosper

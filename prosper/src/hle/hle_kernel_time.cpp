@@ -785,8 +785,10 @@ HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthre
 //     segfault. Routing through the resolver fixes a use-after-destroy crash on this spelling as
 //     well as the missing operation.
 //
-// The guard is gone in favour of guest_mutex_from_slot / guest_cond_from_slot, which ARE
+// The guard is gone. #2596 replaced it with guest_mutex_from_slot / guest_cond_from_slot, which ARE
 // ensure_mutex / ensure_cond -- the same resolution scePthreadMutexLock and scePthreadCondWait use.
+// (#2619/#2623 then went further and took the whole libkernel BODY, so no handler below names those
+// two resolvers any more; the resolution they describe is still exactly what happens, one level in.)
 // That is where the guest itself answers the question: its C11 wrappers pass the slot pointer
 // STRAIGHT THROUGH to those entry points and inspect nothing (_Cnd_wait @0x5670 and _Mtx_lock
 // @0x5e80 in the shipped libc.prx, both re-derived through their JMPREL slots for #2596 -- see
@@ -797,29 +799,70 @@ HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthre
 // The family moves TOGETHER on purpose. Fixing only the wait would leave `_Mtx_lock` no-opping on a
 // static mutex while `_Cnd_wait` self-initialised and waited on it, i.e. a wait on a mutex nothing
 // had locked -- one spelling of the #1873 shape, where the answer depends on which entry point the
-// guest happened to use. Destroy is NOT in this list: retiring an object the guest never
-// initialised would be a new defect, not a fix.
-HLE(m_mtx_lock)   { if (auto* m = guest_mutex_from_slot(a0)) interruptible_mutex_lock(m); return 0; }
-HLE(m_mtx_unlock) { if (auto* m = guest_mutex_from_slot(a0)) pthread_mutex_unlock(m); return 0; }
+// guest happened to use.
+//
+// SHARING THE RESOLUTION WAS ONLY HALF (#2619, #2623). Each handler below still carried a PRIVATE
+// BODY around the shared resolver, and four pieces of per-object bookkeeping the libkernel bodies
+// keep did not travel with it: the destroy pair never claimed or poisoned the slot (#2619, so a
+// double `_Mtx_destroy` was a double free and a slot already destroyed through the Sony spelling had
+// its 0xDEA poison dereferenced as a pointer); the C11 signal/broadcast never bumped the
+// missed-wakeup generation; the C11 wait was invisible to the cond-destroy busy check (#2168); and
+// the C11 lock/unlock bypassed the Windows guest-mutex ownership map. Each is the same #1873 shape
+// again, one level down. So every handler below is now the libkernel BODY -- `pthread_slot.hpp`'s
+// whole-operation family, which the scePthread* handlers call too -- and there is no private body
+// left to drift.
+//
+// DESTROY IS IN THE LIST NOW, and #2596's note that it is not is superseded rather than contradicted:
+// what that note ruled out was retiring an object the guest never initialised, and
+// `guest_mutex_destroy_slot` does not do that either. `pt_claim_slot` returns nullptr for every
+// sub-page value, so an untouched static slot is still a no-op.
+//
+// WHAT EACH HANDLER RETURNS is the one thing that stays per-spelling, and it is READ OUT of the
+// guest's own wrappers rather than chosen -- see the table in pthread_slot.hpp. `_Mtx_unlock`,
+// `_Cnd_signal`, `_Cnd_broadcast` and `_Cnd_wait` are 13 bytes ending `xor eax,eax; pop rbp; ret`,
+// so 0 is their CONTRACT. The destroy pair is 11 bytes and never touches eax after its call, which
+// does NOT establish that it forwards libkernel's answer -- eleven bytes with no `xor eax,eax` is
+// precisely what a VOID wrapper compiles to, `_Thrd_yield` is the byte-identical control, and 0 of
+// the pair's 30 call sites read the value (the reading is worked through in pthread_slot.hpp,
+// #2636). So both destroys answer 0, and #2168's refusal is expressed where it is actually
+// observable: in the object NOT being retired. `_Mtx_lock` maps its result onto a `_Thrd_*` code
+// (`0 -> 0, 0x8002000b -> 3, else 4`) and prosper still answers 0 unconditionally there -- a separate
+// false-success defect, filed as #2626 rather than folded in, because a `_Thrd_error` reaching
+// Dinkumware TERMINATES the guest (see the note above SCE_PTHREAD_ALIAS in hle_kernel.cpp), so it
+// needs its own evidence about which titles reach it. `guest_mutex_lock_slot` already computes the
+// value; the `(void)` below is where it is dropped, deliberately and visibly.
+HLE(m_mtx_lock)   { (void)guest_mutex_lock_slot(a0); return 0; }
+HLE(m_mtx_unlock) { (void)guest_mutex_unlock_slot(a0); return 0; }
 // _Mtx_destroy / _Cnd_destroy are the guest STL's own spelling of the same objects, so they carry
 // the same lifetime rule as scePthreadMutexDestroy / scePthreadCondDestroy: quarantine the storage
 // instead of freeing it here, and defer the host destroy to reclaim, because a thread may be parked
 // inside the object. See the contract block above k_mutex_destroy in hle_kernel.cpp, and
-// sync_retire.hpp (#2042).
-HLE(m_mtx_destroy){ if (a0 && *(void**)P(a0)) { retire_sync_object(*(void**)P(a0), SyncObjectKind::StlMutex,
-                                                          [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } return 0; }
+// sync_retire.hpp (#2042). The `SyncObjectKind` argument is the ONLY thing that differs from the
+// Sony spelling: it keeps the `_Mtx`/`_Cnd` census buckets #2619 used as its reachability evidence.
+HLE(m_mtx_destroy){ return guest_mutex_destroy_slot(a0, SyncObjectKind::StlMutex); }
 HLE(m_cnd_init)   { if (a0) { auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)P(a0) = c; } return 0; }
-HLE(m_cnd_signal) { if (auto* c = guest_cond_from_slot(a0)) interruptible_cond_signal(c); return 0; }
-HLE(m_cnd_broadcast){ if (auto* c = guest_cond_from_slot(a0)) interruptible_cond_broadcast(c); return 0; }
+HLE(m_cnd_signal) { guest_cond_signal_slot(a0); return 0; }
+HLE(m_cnd_broadcast){ guest_cond_broadcast_slot(a0); return 0; }
 // The `return 0` here is NOT the defect and must stay. The shipped guest libc.prx's own `_Cnd_wait`
 // is `push rbp; mov rbp,rsp; call <plt scePthreadCondWait>; xor eax,eax; pop rbp; ret` -- it
 // discards the result on every path, so an unconditional 0 is the CONTRACT rather than an oversight
 // (#1983, recorded above k_cond_wait, which is where the reading was made). #2596 is only about the
-// wait not happening. Do not "fix" this line.
-HLE(m_cnd_wait)   { auto* c = guest_cond_from_slot(a0); auto* m = guest_mutex_from_slot(a1);
-                    if (c && m) interruptible_cond_wait(c, m); return 0; }
-HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { auto* c = (pthread_cond_t*)*(void**)P(a0); interruptible_cond_forget(c); retire_sync_object(c, SyncObjectKind::StlCond,
-                                                                       [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); }); } return 0; }
+// wait not happening. Do not "fix" this line. What DID change is the body whose result it discards:
+// `guest_cond_wait_slot` takes the #2168 waiter scope, so a thread parked here is visible to every
+// cond-destroy busy check instead of having its condvar retired out from under it (#2623).
+HLE(m_cnd_wait)   { (void)guest_cond_wait_slot(a0, a1); return 0; }
+// Answers 0, exactly like its `_Mtx_destroy` sibling above. The guest's eleven-byte wrapper never
+// touches eax after its call to `scePthreadCondDestroy`, and that shape does NOT establish a
+// forwarded result -- it is what a void wrapper compiles to (pthread_slot.hpp works the reading
+// through against `_Thrd_yield`, its byte-identical void control, and against a call-site census in
+// which 0 of 30 destroy sites read the value; #2636).
+// What #2168 needs from this handler is a REFUSAL, not a number, and the refusal is in the shared
+// body: `guest_cond_destroy_slot` declines to claim or retire a condvar a thread is parked on, so
+// the guest keeps a handle that still works. Publishing `kSceKernelErrorEBUSY` here instead would
+// put a LIBKERNEL-encoded value through a C11-spelled door -- a third convention, neither the bare
+// errno the POSIX spelling answers nor a `_Thrd_*` code, and the one answer no reading of the bytes
+// supports. The `(void)` is where the shared body's result is dropped, deliberately and visibly.
+HLE(m_cnd_destroy){ (void)guest_cond_destroy_slot(a0, SyncObjectKind::StlCond); return 0; }
 
 // --- event queue (sceKernelEqueue): kqueue-like event mechanism the engine uses for vsync/flip
 // and async I/O completion. Headless: give a valid queue object; WaitEqueue yields briefly and
