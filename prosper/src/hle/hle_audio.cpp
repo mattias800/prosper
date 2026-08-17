@@ -1406,8 +1406,15 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
     if (port_index + 1 != want_port) return;
 
     static StampState st;
-    if (st.disabled || st.done >= budget) return;
-    if (st.seen++ < after) {
+    if (st.disabled) return;
+    // The budget gates writing a NEW stamp, never resolving an outstanding one. Returning here on
+    // `done >= budget` alone would leave the last stamp unclassified — costing a verdict, and worse,
+    // leaving the pattern in the guest's buffer in exactly the INTACT case, which is the one where
+    // nothing else ever overwrites it. That would quietly break the byte-identical guarantee at the
+    // one address the probe was pointed at.
+    const bool budget_spent = st.done >= budget;
+    if (budget_spent && !st.pending) return;
+    if (!budget_spent && st.seen++ < after) {
         if (st.seen == 1)
             fprintf(stderr, "[audio-stamp] port%u: armed, waiting %llu pushes before the first "
                             "stamp\n", port_index + 1, (unsigned long long)after);
@@ -1475,6 +1482,9 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
         }
         st.pending = false;
     }
+    // The last stamp has now been classified and, if it survived, rolled back. Stop before writing
+    // another one.
+    if (budget_spent) return;
 
     audio_stamp_fill(st.pattern, want, channels, data_type);
     st.original = now;
@@ -1512,8 +1522,8 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
     st.pending = true;
     ++st.done;
     if (st.done >= budget)
-        fprintf(stderr, "[audio-stamp] port%u: stamp budget (%u) spent; the verdict above is the "
-                        "probe's whole output\n", port_index + 1, budget);
+        fprintf(stderr, "[audio-stamp] port%u: stamp budget (%u) spent; one more verdict follows on "
+                        "the next push, then the probe is done\n", port_index + 1, budget);
 }
 
 } // namespace
