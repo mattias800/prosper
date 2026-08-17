@@ -236,6 +236,23 @@ jobs:
           python3 prosper/tools/ci/check_ctest_gate.py --selftest
           python3 prosper/tools/ci/check_ctest_gate.py --root .
 
+      # Same job, same reason: a repository-wide text scan needing nothing built. A diagnostic
+      # whose PRODUCER is armed by a different switch than its PRINTER reports unarmed state as a
+      # confident, well-formed ZERO, and a zero in these fields is usually what the interesting
+      # hypothesis predicts -- so it lands in a `## Ruled out` row as a MEASUREMENT. #2111's
+      # instrument emitted 183 negatives it had no capacity to falsify; three more instances landed
+      # in one session (#2149). The failure is silent, survives review, and looks like rigour.
+      #
+      # The scan fails on a finding missing from tools/env/diag_gate_baseline.txt (a newly
+      # introduced split gate) and on a baseline row that no longer reproduces (the fix landed --
+      # delete the row). --selftest runs first and separately, not piped: a pipeline's exit status
+      # is its last stage's, and this scanner's own failure mode is a signature that quietly stops
+      # matching and reports a clean tree forever.
+      - name: Verify no diagnostic prints a field a different switch had to measure
+        run: |
+          python3 prosper/tools/env/check_diag_gates.py --selftest
+          python3 prosper/tools/env/check_diag_gates.py prosper
+
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest

@@ -175,6 +175,18 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME cached_env_arming_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_cached_env.py"
                    "${CMAKE_SOURCE_DIR}")
+  # A diagnostic whose PRODUCER is armed by a different switch than its PRINTER reports unarmed
+  # state as a confident, well-formed ZERO -- indistinguishable from a measured negative, and
+  # exactly what the interesting hypothesis usually predicts (#2149; #2111 emitted 183 such
+  # negatives). Two arms: --selftest pins the three signatures against reduced forms of the four
+  # MEASURED instances and runs from any build directory; the repository scan compares the tree
+  # against tools/env/diag_gate_baseline.txt and runs in the Docs CI job, because it needs the
+  # checkout root. Half the selftest cases assert on what must NOT match -- a checker that fires
+  # on sound code gets regenerated past, not heeded -- and its own failure mode is silence: a
+  # signature that stops matching reports a clean tree forever.
+  add_test(NAME diag_gate_selftest
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_diag_gates.py"
+                   --selftest)
   # Most cases here assert on what must NOT appear (negative time, failed dispatches summed in, an
   # image share computed against a filtered denominator, a per-binding mean over aliased folds),
   # because each is a table this tool has already produced once. Note what this gate does NOT do: it
