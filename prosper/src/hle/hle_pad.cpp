@@ -477,6 +477,21 @@ HLE(pad_close) {
 // (its close path at eboot+0x7fc7b takes `jle` -- 0 and below are "nothing to close"), and negative
 // means "no handle".
 //
+// Several open handles can share one triple: nothing stops a guest from calling scePadOpen twice
+// with the same (userId, portType, index), and prosper mints a fresh handle each time, so every one
+// of them matches this lookup.  Answering with the first match the container iterates makes the
+// reply depend on std::unordered_map's unspecified order -- it moves with insertion history, with
+// rehashes, and with the standard-library version -- so one route could answer differently across
+// runs, and a guest that closes what it was handed and keeps reading the other loses input for the
+// rest of the run, intermittently (#1624).  Answer with the LOWEST matching handle instead: since
+// scePadOpen mints from a monotonically increasing counter, that is the oldest still-open pad for
+// the triple, which is the one a caller asking "did I already open this?" is asking about.
+// CONFIDENCE: HIGH that a shared triple must resolve deterministically (a nondeterministic reply is
+// wrong under any semantics).  MED on picking the oldest: prosper has no primary evidence for what
+// hardware does with a repeated open -- rejecting the second open is at least as plausible, and the
+// PS5 3.20 export list names scePadOpen without a body or an error code, so nothing local settles
+// it.  Both are unobserved so far: no local dump double-opens a triple today.
+//
 // CONFIDENCE: HIGH on the lookup semantics and the sign convention (both read directly off the
 // guest's own use above, and Sony pad handles are positive with 0x8092xxxx errors).  MED on the
 // exact errno: prosper cannot establish SCE_PAD_ERROR_NO_HANDLE's value from primary evidence, so
@@ -485,11 +500,16 @@ HLE(pad_close) {
 HLE(pad_get_handle) {
     const PadOpenKey key{(int32_t)a0, (int32_t)a1, (int32_t)a2};
     std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    int32_t found = 0;
+    bool have = false;
     for (const auto& [handle, opened] : g_pad_handles) {
         if (!(opened == key)) continue;
+        if (!have || handle < found) { found = handle; have = true; }
+    }
+    if (have) {
         if (padlog()) fprintf(stderr, "[pad] GETHANDLE userId=%d type=%d index=%d -> handle=%d\n",
-                              key.user_id, key.type, key.index, handle);
-        return (uint64_t)(int64_t)handle;
+                              key.user_id, key.type, key.index, found);
+        return (uint64_t)(int64_t)found;
     }
     if (padlog()) fprintf(stderr, "[pad] GETHANDLE userId=%d type=%d index=%d -> no open handle\n",
                           key.user_id, key.type, key.index);
