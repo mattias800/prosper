@@ -172,8 +172,9 @@ guest's own PCM instead of assuming an enumeration, reporting every five seconds
 
 ```text
 [audio-layout] port1 ctx0 type=0x0 fmt=0xc00 channels=12 grain=256 frames=6856704 \
-               stride=n/a (single grain buffer 0x301e393a88, 26784 publications)
-[audio-layout]   ch0  rms=0.028960 peak=0.389781 nonzero= 89.8% hf=0.1210 corr= +1.00 +0.46 …
+               stride=n/a (single grain buffer 0x301e393a88, 26784 publications) fold=7.1 + 4 UNPLACED
+[audio-layout]   ch0  rms=0.028960 peak=0.389781 nonzero= 89.8% hf=0.1210 fold=L1.000/R0.000 \
+               corr= +1.00 +0.46 …
 ```
 
 - **`rms` / `peak` / `nonzero%`** — which channels carry the bed *at all*. A height channel a title
@@ -192,6 +193,13 @@ guest's own PCM instead of assuming an enumeration, reporting every five seconds
   double-buffering title makes this one grain's byte size, an **independent** measure of the channel
   count rather than a restatement of the `data_format` decode. A single-buffer title reports
   `stride=n/a` with the pointer and publication count, which is a finding, not a missing value.
+- **`fold`** — where prosper actually *sent* that channel: the `{left, right}` gain pair the mix
+  loop applied, or `UNPLACED` for a channel it has no position for. This is the other half of the
+  question and it used to be readable only by opening `hle_audio.cpp` and working the table by hand,
+  which is exactly the step nobody takes while reading a log. A channel that measures as a surround
+  feed and folds to `UNPLACED`, or one that measures centre-like and folds hard to one side, is now
+  visible in two adjacent lines. Non-MAIN ports print `fold=n/a`: they are not mixed to the host
+  bed at all, so claiming a placement for them would be a straight falsehood.
 
 `PROSPER_AUDIO_LAYOUT_DUMP=PATH` additionally appends each measured port's raw interleaved grain to
 `PATH.portN.<channels>ch.f32` as float32 (both sample types converted), so the measurement can be re-derived,
@@ -296,16 +304,129 @@ with this probe; it settles orientation in one run. That is
 the experiment #1720 asks for, and it is why a plausible-sounding wrong order is more dangerous than
 a reported gap.
 
+## Is the grain prosper READS the grain the guest WRITES? — `PROSPER_AUDIO_STAMP`
+
+Everything above is computed from one read of the guest's buffer, so none of it can separate the
+two causes of a port that measures exactly zero:
+
+- **(a)** the guest holds the bus open and mixes silence into it — a non-defect, and
+- **(b)** prosper is reading a buffer the guest never fills: a pointer published once at setup and
+  thereafter stale, one buffer of a pair we never see, or a read taken at the wrong point in the
+  guest's fill cycle. Real audio is being lost, silently.
+
+**A wrong address is exactly as zero as a silent mix.** `nonzero=0/55175168` is a statement about an
+instrument until something outside that instrument says otherwise, and no additional statistic
+derived from the same read can be that something — it would inherit the assumption under test.
+
+`PROSPER_AUDIO_STAMP` settles it by **writing**. After the mix has consumed a grain it stamps the
+guest's own grain buffer with a per-channel-distinct pattern, and on the next push classifies what
+comes back:
+
+| verdict | meaning |
+|---|---|
+| `CLEARED` | the stamp is gone and the grain is exactly zero — the guest **actively writes** this buffer and writes silence into it. Case (a), measured rather than assumed. |
+| `INTACT` | the stamp survived byte-for-byte — the guest never touched this buffer between two pushes. Case (b): prosper is reading dead memory, and this port's zero says nothing about the guest's mix. |
+| `OVERWRITTEN` | the stamp is gone and the grain carries something else — the guest fills this buffer with content the push-time read is not seeing. Case (b), timing rather than address. |
+| `POINTER-MOVED` | the guest republished a different address before the stamp could be read back. Itself a finding: the port is double-buffered, so a zero read of either buffer alone proves nothing. |
+
+```sh
+PROSPER_AUDIO_STAMP=<port>[:<pushes>[:<after>]]
+#   port    1-based, as printed by [audio-flow] / [audio-layout]
+#   pushes  how many pushes to stamp (default 8, max 64)
+#   after   how many of that port's pushes to let past first (default 0)
+```
+
+Three properties make a verdict from it worth quoting:
+
+- **It is self-validating.** The stamp is read back *immediately* after being written, through the
+  same `audio_read_bytes_partial()` the mix loop uses, and the per-channel non-zero counts of that
+  read-back are printed. A probe whose own read-back does not return what it wrote prints
+  `PROBE-INVALID` and draws **no verdict**. That read-back is a positive instance of "this exact
+  port can report a non-zero sample", constructed by hand and **outside** whatever produced the
+  null — a control drawn from the same silent guest could only ever have re-confirmed the silence.
+- **`after` is not a convenience, and skipping it will fake a result.** A title's first pushes are
+  routinely silent while it boots. Measured on *Dragon Quest VII* (150 s route): its 12-channel MAIN
+  port — the one carrying the whole soundtrack — is **exactly zero for the first ~43 seconds**. A
+  probe armed at push 0 therefore classifies the *known-good* port as `CLEARED` and "validates" an
+  instrument that was pointed at silence. Calibrate against a port measured to carry content, at a
+  moment it is measured to be carrying it.
+- **Guest memory is left byte-identical.** An `INTACT` stamp is rolled back to the bytes that were
+  there before it; in the other cases the guest has already replaced them itself.
+
+It is opt-in, names **one** port, and stops after a bounded number of pushes — the pushes it stamps
+do carry the stamp into the *following* push's flow/layout statistics, so an unbounded version would
+corrupt the very totals the investigation is reading. A malformed value disables the probe loudly
+rather than stamping some other port: a typo must cost a measurement, never produce a wrong one.
+
 Related, narrower probes: `PROSPER_AUDIOLOG=1` (legacy `sceAudioOut` path: per-port calls, bytes,
 peak and RMS), `PROSPER_AUDIO_DUMP=PATH` (raw `PATH.portN.raw` PCM for offline inspection),
 `PROSPER_AUDIO2LOG=1` (full AudioOut2 call trace with hexdumps), `PROSPER_AUDIO2_PROBE=1` (per-port
 PCM sampling, signal-bearing ports only) and `PROSPER_AUDIO2_CONTROL_PROBE=1` (control surface).
 Note that the first two fall silent in cases 1 **and** 2, which is why `PROSPER_AUDIO_FLOW` exists.
 
+## Ruled out — do not re-derive these
+
+- **"A silent AudioOut2 port might be pushing its PCM through `sceAudioOut2ContextBedWrite`, which
+  prosper stubs."** The stub is real — `audio2_ctx_bed_write` in `hle_audio.cpp` validates the
+  context handle and returns 0, mixing nothing — so the hypothesis is well formed and would explain
+  a port that reads as zero while the title is audible on hardware. It is nonetheless dead for the
+  whole local corpus: **0 of 44 dumps import the NID `DxGyV8dtOR8`**, scanned across every
+  `eboot.bin` and `.prx` in each dump. *Dragon Quest VII* imports exactly **14** AudioOut2
+  entrypoints, and `PortSetAttributes(id=0) + ContextPush` — the pair prosper reads — is the only
+  PCM path any of them offer. Re-run the scan before assuming it for a *new* dump; do not re-run it
+  for one already in the corpus (#1721).
+- **"The mix loop might not be applying the fold table it documents."** Falsified end to end, not by
+  inspection: `test_audio`'s `test_bed_routing_matrix` pushes one unit impulse per source channel
+  through the real `sceAudioOut2*` entrypoints for **every** width 1..16 and reads the gain that
+  arrives at the host sink. That is **136 channel measurements** across the sixteen widths: the
+  **100** placed ones all match the table's gains, and the **36** unplaced ones — every channel at
+  index ≥ 8, at every width above 8 — measure exactly `{0, 0}`, so the "unplaced contributes
+  nothing" contract is measured rather than asserted. Note precisely what this does and does not establish: it pins the **application** of the
+  table, and the orientation question below is untouched by it (#1720).
+- **Which titles could ever settle the left/right orientation — surveyed, so nobody re-searches.**
+  Only **5 of 44** dumps import `sceAudioOut2GetSpeakerInfo` (`DImz2Ft9E2g`), the one call through
+  which a guest could learn the platform's own speaker positions: `PPSA04263` (GTA V, eboot),
+  `PPSA05143` (Little Nightmares III, eboot), `PPSA09804` (GRIS, via `AkSoundEngine.prx`),
+  `PPSA21564` (Astro Bot, eboot) and `PPSA26414` (R-Type Delta, eboot). GTA V alone additionally
+  imports `SpeakerArrayCreate` and `GetSpeakerArrayAmbisonicsCoefficients`. Every other title in the
+  corpus — *Dragon Quest VII* included — never asks, so for those the bed's order is something
+  prosper must infer and cannot negotiate. Start the orientation experiment from one of those five.
+  Their MAIN port widths, measured with `PROSPER_AUDIO_FLOW=1` on a short default boot:
+
+  | title | MAIN `data_format` | channels | note |
+  |---|---|---|---|
+  | `PPSA26414` R-Type Delta | `0xc00` (two MAIN ports; port38 has `flags=0x2`) | 12 | **the best candidate**: a wide bed AND it queries `GetSpeakerInfo` |
+  | `PPSA21564` Astro Bot | `0x800` | 8 | |
+  | `PPSA05143` Little Nightmares III | `0x880` | 8 | **bit 7 set** — see below |
+  | `PPSA09804` GRIS (Wwise) | `0x880` | 8 | **bit 7 set** |
+
+- **`data_format` bit 7 is set by two titles and prosper drops it. Whether it names the channel
+  order is UNVERIFIED — do not repeat the code comment as fact.** `hle_audio.cpp:630` says the bit
+  "selects the standard 8-channel order", which if true would mean the format word carries ordering
+  information and the order is not purely an inference. Two things are established and one is not:
+  **measured**, two titles set it (`0x880` above) and two do not; **established by reading the
+  code**, nothing in prosper consumes it — it is masked off at `hle_audio.cpp:1023` and `:1999`
+  (`& 0x7fu`) and `audio2_format_channels` uses only bits 8..15. **Not established**: what the bit
+  means. The comment entered in #1347, a GTA V *decode* change, with no evidence recorded for it,
+  and it is exactly the shape of claim this project has been burned by — a plausible sentence with a
+  `file:line` that everyone downstream treats as checked. Treat it as a lead for #1720, not as a
+  premise, and re-derive it from a title's own disassembly or from an A/B before building on it.
+  `CONFIDENCE: LOW`.
+
 ## Tests (`ctest`)
 - **`audio_hle`** (`tests/test_audio.cpp`) — always built. Drives the real HLE entrypoints through the
   dispatch table with a capturing sink: format decode (all 8 formats + unknown), port open/close,
   byte-exact PCM forwarding, `Output`/`Outputs`, volume, port state, exhaustion, and error paths.
+  It also carries **`test_bed_routing_matrix`**, which measures the fold end to end: one unit impulse
+  per source channel, for every width 1..16, pushed through the real `sceAudioOut2*` entrypoints, with
+  the resulting host `{L, R}` gain read back off the sink and printed as a routing matrix. That report
+  is the answer to "which guest channel landed in which host channel, and at what gain", and it is a
+  different claim from `test_stereo_downmix`'s: the latter pins the fold **table** against literals,
+  this pins the mix loop's **application** of it. A correct table applied through a wrong stride, tap
+  list or side produces exactly the output a wrong table would, and no assertion on the pure function
+  can see it. Its bulk oracle is `audio_stereo_downmix` itself, deliberately — so a handful of
+  placements are additionally asserted against literals at widths 3, 5, 6 and 7, the ones no other
+  end-to-end arm exercises.
 - **`audio_sdl3`** (`frontends/audio_sdl3/test_audio_sdl3.cpp`) — built with `-DPROSPER_AUDIO_SDL3=ON`.
   End-to-end through the real SDL3 backend under the SDL **dummy** audio driver, so it runs on
   headless CI with no sound hardware.

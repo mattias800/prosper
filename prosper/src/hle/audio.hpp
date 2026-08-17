@@ -8,6 +8,7 @@
 // itself via audio_set_sink(), keeping prosper_core dependency-free and unit-testable.
 #pragma once
 #include <cmath>
+#include <cstddef>   // std::size_t — a header must carry its own includes, not inherit its includer's
 #include <cstdint>
 
 namespace prosper {
@@ -100,6 +101,31 @@ struct AudioSignalStats {
     bool silent() const { return nonzero == 0; }
     void reset() { peak = 0.0; sumsq = 0.0; samples = 0; nonzero = 0; }
 };
+
+// --- PROSPER_AUDIO_STAMP: does the guest WRITE the grain prosper reads? ------------------------
+// A port measuring exactly zero is either a live bus carrying silence or a buffer prosper reads and
+// the guest never fills, and every statistic derived from that same read is blind to the
+// difference. The probe (hle_audio.cpp) writes a pattern into the guest's grain after consuming it
+// and classifies what comes back on the next push. The decision itself is a pure function so the
+// rule can be unit-tested: getting `Intact` and `Overwritten` the wrong way round inverts the whole
+// conclusion (the stamp is deliberately non-zero, so a surviving stamp looks like guest content),
+// and that mistake is invisible in a live log.
+enum class AudioGrainVerdict {
+    PointerMoved,   // the guest republished a different address; this port is double-buffered
+    Intact,         // the stamp survived -> the guest never wrote this buffer between two pushes
+    Cleared,        // the stamp is gone and the grain is exactly zero -> live bus, silent content
+    Overwritten,    // the stamp is gone and content is in its place -> live bus carrying signal
+};
+AudioGrainVerdict audio_classify_stamped_grain(bool same_address, bool matches_stamp,
+                                               uint64_t nonzero_samples);
+
+// Samples differing from exactly zero, under the SAME rule AudioSignalStats::nonzero uses, so a
+// stamp verdict and a PROSPER_AUDIO_FLOW total can never disagree about what "silent" means.
+// The subtlety that forces a shared helper: **-0.0f is zero here and its bytes are not**. A
+// byte-wise count — the obvious way to ask "is this buffer empty" — reports a buffer the guest
+// legitimately cleared with negative zero as non-zero, and the probe then answers `Overwritten`
+// for exactly the case it exists to identify.
+uint64_t audio_count_nonzero_samples(const void* pcm, std::size_t bytes, bool s16);
 
 // Pluggable audio backend. All calls arrive on the guest's audio thread; output() MAY block to
 // pace it (as real hardware does — sceAudioOutOutput blocks until the ring has room).
