@@ -333,6 +333,23 @@ run("a delimiter that disagrees with the header",
     "| # | Instrument | How it lied |\n|---|---|\n| 1 | x | y |\n",
     want_problems=True, expect_text="does NOT render as a table at all")
 
+# A stray conflict marker AFTER the last row. This is the shape that escaped every other class and
+# reached a pushed branch: the marker is not a table row, so it merely ends the table, and with no
+# orphaned rows below it there is no fragment to report. Without this arm the file below is reported
+# "unique and ascending" -- over a line that is a merge artifact.
+run("a conflict marker after the last row is caught",
+    TABLE + ">>>>>>> 8f124852 (some commit subject)\n",
+    ordered=True, want_problems=True, expect_text="unresolved merge conflict marker")
+
+run("a conflict marker inside the table is caught",
+    "| # | What |\n|---|---|\n| 1 | a |\n<<<<<<< HEAD\n| 2 | b |\n",
+    want_problems=True, expect_text="unresolved merge conflict marker")
+
+# `=======` is a legal setext heading underline, so it must NOT be treated as a marker -- a checker
+# that fires on correct Markdown gets deleted rather than heeded.
+run("a setext heading underline is not a conflict marker",
+    "Heading\n=======\n\n" + TABLE, ordered=True, want_problems=False)
+
 print("correct shapes the arity check must not reject:")
 
 # THE discriminating case for escape handling: remove it and this correct row is reported. It is

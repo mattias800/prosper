@@ -214,6 +214,12 @@ LEADING_NUMBER = re.compile(r"^\s*\|\s*(\d+)\s*\|")
 # sit before it is treated as a typo rather than as a deliberate step clear of a collision.
 MAX_JUMP = 50
 
+# Unresolved merge markers. `=======` is deliberately NOT included: it is a legal setext heading
+# underline in Markdown, and a checker that fires on correct documents gets deleted rather than
+# heeded. The other two are unambiguous -- measured across the tracked corpus, zero instances of
+# either, which is what makes this safe to gate on.
+CONFLICT = re.compile(r"^(<<<<<<<|>>>>>>>)")
+
 
 ESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 
@@ -541,6 +547,24 @@ def check(
     if err:
         return [err]
     assert lines is not None
+
+    # ALWAYS ON, and it caught nothing here until it caught this file's own author. A stray
+    # `>>>>>>> <sha>` left by a conflict resolution landed immediately after the LAST row of the
+    # instrument table, and every check in this file passed it: the marker is not a table row, so it
+    # simply ENDED the table, and with no orphaned rows below it there was no fragment to report.
+    # `git diff --check` found it instead -- which is why the charter runs that as a separate gate --
+    # but nothing stops a marker reaching a branch where nobody runs it, and the numbering was
+    # meanwhile reported "unique and ascending" over a line that was a merge artifact.
+    conflicts = [
+        f"{path}:{i}: unresolved merge conflict marker: {line.strip()[:60]!r}. A marker directly "
+        f"after a table's last row ENDS the table rather than splitting it, so no other check here "
+        f"can see it."
+        for i, line in enumerate(lines, start=1) if CONFLICT.match(line)
+    ]
+    if conflicts:
+        # Return immediately: every other class would be measuring a file that is half two files.
+        return conflicts
+
     tables, blanks, fences = parse_tables(lines)
     if not tables:
         # Under --ordered we were pointed at ONE specific table, so its absence means the path
