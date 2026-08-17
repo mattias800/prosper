@@ -285,6 +285,11 @@ bool convert_video_frame(Pipeline& pipeline, HardwareSelection& selection, Sessi
     packet.height = static_cast<uint32_t>(source->height);
     packet.stride = packet.width;
     packet.pts_us = frame_timestamp_us(decoded, time_base);
+    // `*3/2` is EXACT here, unlike on the Videodec2 access-unit path, and the asymmetry is a
+    // guarantee rather than an oversight: the check a few lines above REFUSES an odd width or
+    // height outright ("decoded video dimensions are not valid for NV12"), so both are even by the
+    // time this runs and the shorthand and the exact form agree. Videodec2 cannot refuse the same
+    // way -- its VP9 branch may legitimately carry odd dimensions -- so it uses nv12_bytes().
     packet.nv12.resize(static_cast<size_t>(packet.stride) * packet.height * 3 / 2);
     uint8_t* destination[4] = {
         packet.nv12.data(),
@@ -894,16 +899,6 @@ std::mutex g_au_mutex;
 std::map<int, AuDecoder> g_au_decoders;
 int g_next_au_id = 1;
 
-// The exact packed NV12 size, matching what the guest's own sizing query allocates. NOT the
-// `w*h*3/2` shorthand: that is correct only when BOTH dimensions are even, and while H.264 codes in
-// 16x16 macroblocks (so it is always even there), VP9 frame dimensions are arbitrary -- and VP9 is
-// the branch the one title known to take it uses. The same rule, and why it is unusually easy to
-// state wrongly, is written out at s_videodec2_query_decoder_memory.
-uint64_t nv12_size(uint32_t w, uint32_t h) {
-    const uint64_t uw = w, uh = h;
-    return uw * uh + 2 * ((uw + 1) / 2) * ((uh + 1) / 2);
-}
-
 // Copy a decoded picture into the CALLER's buffer as packed NV12. Runs with g_au_mutex held, which
 // is the whole point: the decoder's frame memory is never handed out, so nothing a caller holds can
 // be freed by a concurrent close_decoder (#2571 review N5).
@@ -1124,7 +1119,7 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
     out.height = static_cast<uint32_t>(pic->height);
     out.y_stride = out.width;
     out.uv_stride = out.width;
-    out.nv12_bytes = nv12_size(out.width, out.height);
+    out.nv12_bytes = nv12_bytes(out.width, out.height);
 
     // Report the size mismatch as its OWN outcome. Collapsed into "no picture" it would read as a
     // decoder warming up, which is the benign case it most resembles and the one that hides it.

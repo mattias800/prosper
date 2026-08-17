@@ -556,24 +556,14 @@ HLE(s_videodec2_query_decoder_memory) {
     // The cpu/gpu/shared workspace sizes stay at the floor: nothing here is evidence for those, and
     // inflating them has broken a title before (see VDEC_MIN_MEMORY's own note on the 16 MiB
     // placeholder exhausting a CRI pool).
-    // Compute the EXACT NV12 size — luma plus a half-resolution interleaved chroma plane, each
-    // chroma dimension rounded UP: `w*h + 2*ceil(w/2)*ceil(h/2)`.
-    //
-    // The obvious shorthand `w*h*3/2` is deliberately not used, and neither is `wh + (wh+1)/2`. Both
-    // are exact only when BOTH dimensions are even, and that rule is unusually easy to state wrongly:
-    // it was stated wrongly three times on this change, by an author under review, because every size
-    // anyone checked (1920x1088, 1920x1080, 640x480) happens to be both-even and so confirmed the
-    // true rule and the wrong one equally. "Even product" is not sufficient and is the seductive
-    // version — 1920x1081 has an even product and `wh + (wh+1)/2` is 960 bytes short there. The exact
-    // form removes the need to state the rule at all, which is worth more than the two divisions it
-    // costs on a path called 7-8 times per boot. (Instrument-trap 34.)
-    //
-    // WIDEN BEFORE ARITHMETIC — this is the trap in the "simpler" version. Written as
-    // `2*((config->max_width+1)/2)*...` the `+1` is evaluated in `int32_t`, so `max_width ==
-    // INT32_MAX` is signed overflow and undefined behaviour BEFORE any cast. Widening first makes
-    // every operation unsigned 64-bit; peak intermediate is then 37.5% of UINT64_MAX at INT32_MAX
-    // dimensions, so a future factor (a DPB count, a 10-bit bytes-per-sample term) still has room,
-    // though less than it looks — re-check the bound rather than assuming.
+    // The EXACT NV12 size comes from prosper::video::nv12_bytes(), which is the SAME function the
+    // decoder backend uses to check the caller's buffer and to fill it. That shared call is the point:
+    // this query tells the guest how large a frame buffer to allocate, and the backend writes into
+    // the buffer the guest allocated from that answer — two rules would be a guest buffer sized by
+    // one and written by the other, i.e. a heap overflow presenting as a decoder bug. The rule itself,
+    // why `w*h*3/2` is wrong for an odd dimension, and the widen-before-arithmetic trap are all
+    // written out at the function. (Instrument-trap 34; consolidated on #2571 review D1, which
+    // pointed out the property had no test that could see it — `test_videodec2_decode` now has one.)
     constexpr uint32_t VDEC_FRAME_ALIGN = 0x100;
     uint64_t frame_bytes = 0;
     if (config->max_width > 0 && config->max_height > 0) {
@@ -582,9 +572,8 @@ HLE(s_videodec2_query_decoder_memory) {
         // in 16x16 macroblocks, so a 1080-row picture is physically written as 1088 rows and cropped
         // for display via the SPS frame_cropping fields. Sizing from 1080 would be short by 8 rows
         // times the pitch — a real overflow, not conservatism.
-        const uint64_t w = (uint64_t)config->max_width;
-        const uint64_t h = (uint64_t)config->max_height;
-        frame_bytes = w * h + 2 * ((w + 1) / 2) * ((h + 1) / 2);
+        frame_bytes = prosper::video::nv12_bytes((uint32_t)config->max_width,
+                                                 (uint32_t)config->max_height);
     } else {
         // Auto dimensions: the value below is a FLOOR, not a derivation, and the original
         // resolution-independent hazard survives on this path. Nothing in the code distinguishes the

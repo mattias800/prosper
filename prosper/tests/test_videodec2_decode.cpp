@@ -35,6 +35,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include "test_scratch.h"
 #if !defined(_WIN32)
 #include <unistd.h>     // dup/dup2/close — the stderr capture in the banner-count arm
 #endif
@@ -152,6 +154,50 @@ void set_env(const char* name, const char* value) {
 #endif
 }
 
+// THE ODD-DIMENSION ARM (#2571 review D1). The exact NV12 size is the sharpest correction in this
+// change and, until this arm existed, **nothing in the suite could see it**: every dimension anywhere
+// near this code is even (128x96, 1920x1088, 3840x2160), so reinstating the `w*h*3/2` shorthand
+// passed green. A correct change with no test defending it is one a future tidy-up reverts.
+//
+// Only ONE dimension needs to be odd. That is the half of the rule that is easy to state wrongly —
+// "even product" is the seductive wrong version, and 1920x1081 has an even product while the
+// shorthand is 960 bytes short there.
+void check_nv12_sizes() {
+    struct Case { uint32_t w, h; uint64_t exact; const char* what; };
+    // Hand-computed, not produced by the function under test — a table generated from the
+    // implementation would agree with any implementation, including a wrong one.
+    static const Case cases[] = {
+        // w    h     exact                                    shorthand   short by
+        {  64,  32,  64ull * 32 + 2 * 32 * 16,  "even x even — the shorthand agrees here" },
+        {  65,  32,  65ull * 32 + 2 * 33 * 16,  "ODD width  (3136 vs 3120, short by 16)"  },
+        {  64,  33,  64ull * 33 + 2 * 32 * 17,  "ODD height (3200 vs 3168, short by 32)"  },
+        {  65,  33,  65ull * 33 + 2 * 33 * 17,  "BOTH odd   (3267 vs 3217, short by 50)"  },
+        { 1920, 1081, 1920ull * 1081 + 2 * 960 * 541,
+          "1920x1081 — EVEN PRODUCT, and the shorthand is still 960 short" },
+        { 1920, 1088, 1920ull * 1088 + 2 * 960 * 544, "the live PPSA19991 geometry" },
+        { 3840, 2160, 3840ull * 2160 + 2 * 1920 * 1080, "the live PPSA05325 geometry" },
+    };
+    for (const Case& c : cases) {
+        const uint64_t got = video::nv12_bytes(c.w, c.h);
+        char msg[192];
+        std::snprintf(msg, sizeof msg, "nv12_bytes(%u,%u) == %llu — %s", c.w, c.h,
+                      (unsigned long long)c.exact, c.what);
+        CHECK(got == c.exact, msg);
+        // The discriminator, stated as its own assertion so a reader can see WHICH cases the
+        // shorthand would have passed: it must be short exactly when a dimension is odd.
+        const uint64_t shorthand = (uint64_t)c.w * c.h * 3 / 2;
+        const bool any_odd = (c.w & 1u) || (c.h & 1u);
+        std::snprintf(msg, sizeof msg,
+                      "%ux%u: the w*h*3/2 shorthand is %s here (%llu vs %llu)", c.w, c.h,
+                      any_odd ? "SHORT, which is why it is not used" : "equal",
+                      (unsigned long long)shorthand, (unsigned long long)c.exact);
+        CHECK(any_odd ? (shorthand < c.exact) : (shorthand == c.exact), msg);
+    }
+    // Widening: `2*((w+1)/2)` on a 32-bit `w` at UINT32_MAX would wrap to 0 before the multiply.
+    CHECK(video::nv12_bytes(0xFFFFFFFFu, 2) == 0xFFFFFFFFull * 2 + 2 * 0x80000000ull * 1,
+          "nv12_bytes widens before arithmetic — no 32-bit wrap at the top of the range");
+}
+
 int main(int argc, char** argv) {
     const std::string arg = argc > 1 ? argv[1] : "";
     const bool no_decode = arg == "--no-decode";
@@ -160,6 +206,7 @@ int main(int argc, char** argv) {
     if (format_probe) set_env("PROSPER_VDEC2_FORMAT", "42");   // decimal 42 == kFormatProbe
     printf("== test_videodec2_decode (%s) ==\n",
            no_decode ? "opt-out arm" : format_probe ? "format-override arm" : "decode arm");
+    check_nv12_sizes();
     register_builtin_hle();
 
     auto alloc_queue    = Hle::lookup("eD+X2SmxUt4");
@@ -360,14 +407,16 @@ int main(int argc, char** argv) {
         // about behaviour a Windows build could differ on.
 #if !defined(_WIN32)
         if (!no_decode) {
+            // Scratch path, NOT /tmp. On this box /tmp is a RAM-backed tmpfs with a per-user quota
+            // shared by every concurrent agent, and exhausting it takes the tooling down for
+            // everyone — test_scratch.h exists to make that unrepeatable, and it also gives a
+            // per-case, per-pid path so parallel ctest cases cannot collide (#1621).
             const std::string log_path =
-                std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
-                "/prosper-vdec2-banner-" + std::to_string((unsigned long)getpid()) + ".log";
+                prosper_test::test_scratch_file("vdec2-banner-capture.log");
             std::fflush(stderr);
             const int saved = dup(fileno(stderr));
-            bool captured = false;
-            if (saved >= 0 && std::freopen(log_path.c_str(), "w", stderr)) {
-                captured = true;
+            const bool redirected = saved >= 0 && std::freopen(log_path.c_str(), "w", stderr);
+            if (redirected) {
                 for (int cycle = 0; cycle < 3; ++cycle) {
                     reset(refused, 0, 0, 0, 0, 0);
                     f2.accepted = 1;
@@ -379,13 +428,22 @@ int main(int argc, char** argv) {
                 clearerr(stderr);
             }
             if (saved >= 0) close(saved);
-            if (captured) {
+            // A FAILED CAPTURE FAILS THE TEST. This block used to be wrapped in `if (captured)`,
+            // so a failed freopen dropped both assertions below and the case still reported
+            // success — a test whose failure mode is indistinguishable from passing, which is the
+            // whole subject of #2149 and the shape #2566 hit. If the instrument cannot run, that is
+            // a result, not a skip. (#2571 review D2.)
+            CHECK(redirected, "the banner-count arm could capture stderr (a failed capture is a "
+                              "FAILURE, never a silent skip)");
+            if (redirected) {
                 int banners = 0;
                 if (std::FILE* f = std::fopen(log_path.c_str(), "rb")) {
                     char line[512];
                     while (std::fgets(line, sizeof line, f))
                         if (std::strstr(line, "NO DECODER")) ++banners;
                     std::fclose(f);
+                } else {
+                    CHECK(false, "the captured banner log could be re-opened for reading");
                 }
                 std::remove(log_path.c_str());
                 // Three resets re-open three times; the banner must still have been printed zero
