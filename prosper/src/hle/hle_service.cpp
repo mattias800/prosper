@@ -869,23 +869,43 @@ HLE(s_videodec2_flush) {
     return 0;
 }
 HLE(s_videodec2_reset) {
-    // Reset means "forget every decoded reference", and once a real decoder is attached that is no
-    // longer free (#2270). Continuing to feed a libavcodec context that still holds the pre-reset
-    // DPB decodes the guest's new access units against references it has just discarded, which
-    // yields a corrupt picture rather than an error -- silent, and exactly the failure class this
-    // path was filed for. Dropping the backend decoder makes the next Decode open a fresh one, which
-    // is the same forgetting expressed through the lifecycle we already have.
+    // sceVideodec2Reset DISCARDS the decoder's buffered state and leaves the decoder usable. It is
+    // neither of its two neighbours, and #2585 was implementing it as the third:
     //
-    // CONFIDENCE: MED, and the uncertainty is in the MECHANISM, not the meaning. Close-and-reopen is
-    // strictly stronger than a reset needs to be: `avcodec_flush_buffers` drops the DPB and KEEPS the
-    // parsed SPS/PPS, while a fresh AVCodecContext drops both. Videodec2's caller demuxes itself, so
-    // whether parameter sets are repeated in-band is title-dependent -- PPSA19991's first access unit
-    // carries an SPS and nothing establishes that its later ones do. A title that sends them once and
-    // resets mid-stream would get a decoder that cannot decode until the next in-band SPS: #2270's
-    // own hang shape in a new place. Two things bound that today -- no title in this repository's
-    // history is recorded calling sceVideodec2Reset at all, and the 64-unit alarm above makes the
-    // failure loud rather than silent. The clean fix is a reset_decoder(id) backend entry point over
-    // avcodec_flush_buffers: #2585. (#2571 review N4.)
+    //   Flush  -- DRAIN.   Carries a VdecFrame/VdecOutput, so it hands buffered pictures back.
+    //   Reset  -- DISCARD. Carries neither, so it returns nothing; it throws the state away.
+    //   Delete -- DESTROY. The decoder is gone and the handle with it.
+    //
+    // THE WARRANT IS THE DOMINANCE ARGUMENT BELOW, not the confidence label. A weaker supporting
+    // claim -- that Reset must leave the decoder usable, derivable from the export list because
+    // libSceVideodec2 has NO re-initialise entry point between Create and Delete -- is CONFIDENCE:
+    // HIGH but is NOT load-bearing: the pre-fix code already satisfied it in the guest-visible sense,
+    // since the handle stayed valid and the next Decode reopened. Cite the dominance argument.
+    //
+    // THIS USED TO CLOSE THE BACKEND DECODER and let the next Decode open a fresh one. That forgets
+    // the parsed SPS/PPS along with the DPB, and the two are not equally re-suppliable: Videodec2's
+    // caller demuxes itself, so whether parameter sets are repeated in-band is title-dependent, and
+    // a title that sends them once and resets mid-stream got a decoder that could not decode until
+    // the next in-band SPS -- #2270's own hang shape in a new place. Measured on this build's
+    // libavcodec with the committed Annex-B asset: a FLUSHED context fed access units with every
+    // SPS/PPS stripped decodes 6 pictures, a FRESH one decodes 0. See VaapiBackend::reset_decoder.
+    //
+    // Which disposition the Sony contract actually specifies for the sequence headers is NOT
+    // established (CONFIDENCE: MED) -- and it does not have to be, because flushing DOMINATES. If
+    // the contract keeps them, close-and-reopen is broken and flushing is right. If the contract
+    // drops them, flushing is NO WORSE: a stream that repeats its parameter sets replaces the
+    // retained ones in-band by id, and a stream that does not repeat them is one where retaining is
+    // the only thing that decodes at all. (Stated as "no worse" rather than "correct" on purpose --
+    // under that reading, retention can make prosper decode where a faithful implementation would
+    // not. It does not change the decision.) There is no reading under which closing wins.
+    //
+    // LOGGED, and that is not incidental. #2585's own text argued the defect was bounded because
+    // "no title in this repository's history is recorded calling sceVideodec2Reset at all" -- but
+    // this handler had no svc_log call, so no boot could ever have recorded one. That was a fact
+    // about the instrument being used as a fact about the titles. `dump_words = 0`: the only
+    // argument is a decoder handle, and a handle is >= 0x10000, which svc_ptrish would otherwise
+    // mistake for a pointer and try to dump.
+    svc_log("sceVideodec2Reset", a0, a1, a2, a3, a4, a5, 0);
     int au_id = -1;
     {
         std::lock_guard<std::mutex> lk(g_vdec_mx);
@@ -893,17 +913,43 @@ HLE(s_videodec2_reset) {
         auto it = g_vdec_au.find(a0);
         if (it != g_vdec_au.end()) {
             au_id = it->second.id;
-            // Re-arm the OPEN but keep `announced`: a refused codec must not re-print its banner on
-            // every reset cycle. Mutating rather than erasing is what preserves that (#2571 N3).
-            it->second.id = -1;
-            it->second.opened = false;
             it->second.no_picture_run = 0;
+            // A handle with NO live backend decoder re-arms the open so the next Decode retries.
+            // That is the refused-codec path, and `announced` is deliberately kept so the refusal
+            // does not re-print its banner on every reset cycle (#2571 N3). A LIVE decoder must NOT
+            // re-arm: it is about to be flushed in place and never closes, so re-arming would open a
+            // second decoder and strand the first.
+            if (au_id < 0) it->second.opened = false;
         }
     }
-    // Outside the lock: close_decoder calls into the backend, and holding an HLE lock across a
-    // backend call is how lock-order problems get built (same rule as DeleteDecoder above).
-    if (au_id >= 0)
-        if (auto* vb = prosper::video::backend()) vb->close_decoder(au_id);
+    if (au_id < 0) return 0;
+    // Outside the lock: these call into the backend, and holding an HLE lock across a backend call
+    // is how lock-order problems get built (same rule as DeleteDecoder above).
+    auto* vb = prosper::video::backend();
+    if (vb && vb->reset_decoder(au_id)) return 0;   // flushed in place; the decoder stays open
+    // FALLBACK -- a backend with no in-place reset (or none registered any more). Close and re-arm,
+    // which is what this function used to do unconditionally. It forgets too much rather than too
+    // little, which is the right direction to fail: leaving the DPB live would decode the guest's
+    // next access units against references it just asked us to forget, and that is a corrupt picture
+    // rather than an error. Said once, because a fail-visible backstop nobody can see is not one.
+    if (vb) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            fprintf(stderr,
+                    "[vdec2] sceVideodec2Reset: this backend has no in-place reset, so the decoder "
+                    "is being CLOSED and reopened. That discards the parsed sequence headers as well "
+                    "as the DPB, so a title whose stream carries its parameter sets only once cannot "
+                    "decode again until its next in-band SPS (#2585)\n");
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_vdec_mx);
+        auto it = g_vdec_au.find(a0);
+        if (it != g_vdec_au.end() && it->second.id == au_id) {
+            it->second.id = -1;
+            it->second.opened = false;
+        }
+    }
+    if (vb) vb->close_decoder(au_id);
     return 0;
 }
 // sceVideodec2GetPictureInfo / ...GetAvcPictureInfo. `which` names the entry point so a size mismatch
