@@ -504,6 +504,14 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
             _apply_github(trees, by_oid, open_branches)
         return ok, note
 
+    def fail(note: str) -> tuple[bool, str]:
+        # Cache failures too. Caching only the first failure exit meant that a JSON decode error
+        # or a failed open-PR query -- precisely the failures a rate limit produces, and the ones
+        # most likely to recur -- refetched on every candidate, which is the 145-query storm this
+        # cache exists to prevent. A negative result is as worth remembering as a positive one.
+        _GH_CACHE[(repo, limit)] = (False, note, {}, set())
+        return False, note
+
     rc, out, err = run(
         [
             "gh", "pr", "list", "--state", "merged", "--limit", str(limit),
@@ -513,13 +521,11 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
         timeout=300,
     )
     if rc != 0:
-        note = f"gh unavailable ({(err.strip() or 'rc=%d' % rc)[:120]})"
-        _GH_CACHE[(repo, limit)] = (False, note, {}, set())
-        return False, note
+        return fail(f"gh unavailable ({(err.strip() or 'rc=%d' % rc)[:120]})")
     try:
         merged = json.loads(out)
     except json.JSONDecodeError as e:
-        return False, f"gh returned unparseable JSON ({e})"
+        return fail(f"gh returned unparseable JSON ({e})")
 
     rc2, out2, err2 = run(
         ["gh", "pr", "list", "--state", "open", "--limit", str(limit), "--json", "number,headRefName"],
@@ -531,11 +537,11 @@ def probe_github(repo: str, trees: list[Worktree], limit: int) -> tuple[bool, st
     # no open PRs" would otherwise be the same value, and a rate limit right after the paginated
     # merged fetch is a realistic way to get there. Fail closed on the whole cross-check instead.
     if rc2 != 0:
-        return False, f"gh open-PR query failed ({(err2.strip() or 'rc=%d' % rc2)[:120]})"
+        return fail(f"gh open-PR query failed ({(err2.strip() or 'rc=%d' % rc2)[:120]})")
     try:
         open_branches = {pr["headRefName"] for pr in json.loads(out2)}
     except json.JSONDecodeError as e:
-        return False, f"gh open-PR query returned unparseable JSON ({e})"
+        return fail(f"gh open-PR query returned unparseable JSON ({e})")
 
     by_oid: dict[str, int] = {}
     for pr in merged:
@@ -572,7 +578,11 @@ def _apply_github(trees: list[Worktree], by_oid: dict[str, int], open_branches: 
 
 
 def classify(t: Worktree, min_idle_hours: float, merge_evidence_available: bool,
-             holder_scan_ok: bool = True) -> None:
+             holder_scan_ok: bool) -> None:
+    """Assign every blocker that applies. Both booleans are REQUIRED and neither defaults:
+    `holder_scan_ok=True` as a default would hand a fail-closed guard a fail-open fallback, which
+    is the same shape as the bug it was added to fix one layer down -- a caller that forgets the
+    argument would silently get the permissive answer."""
     t.blockers = []
     if t.is_main:
         t.blockers.append("main")

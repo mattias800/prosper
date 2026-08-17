@@ -15,6 +15,7 @@ Run directly, or via ctest as worktree_reclaim_tool.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -196,17 +197,134 @@ def test_merge_evidence_labels() -> None:
     """
     print("\n[merge evidence: unmerged vs could-not-tell]")
     unproven = W.Worktree(path="/x", real="/x", merged_by=None, idle_hours=999.0)
-    W.classify(unproven, 12.0, merge_evidence_available=True)
+    W.classify(unproven, 12.0, merge_evidence_available=True, holder_scan_ok=True)
     check("complete evidence says unmerged", unproven.blockers, ["unmerged"])
 
     unknown = W.Worktree(path="/x", real="/x", merged_by=None, idle_hours=999.0)
-    W.classify(unknown, 12.0, merge_evidence_available=False)
+    W.classify(unknown, 12.0, merge_evidence_available=False, holder_scan_ok=True)
     check("incomplete evidence says no-merge-evidence", unknown.blockers, ["no-merge-evidence"])
 
     proven = W.Worktree(path="/x", real="/x", merged_by="squash-pr#1", idle_hours=999.0)
-    W.classify(proven, 12.0, merge_evidence_available=True)
+    W.classify(proven, 12.0, merge_evidence_available=True, holder_scan_ok=True)
     check("proven merged has no blockers", proven.blockers, [])
     check("proven merged is removable", proven.removable, True)
+
+
+def test_github_merge_evidence() -> None:
+    """The squash-merge cross-check, which is the SOLE merge evidence for most real candidates.
+
+    On the live repo this path qualified 104 of 146 removal candidates while `ancestor` qualified
+    41 -- so the majority of this tool's delete decisions rest here. Every other arm in this file
+    runs with use_github=False, which left `probe_github`, `_apply_github`, the recycled-branch
+    guard and `_GH_CACHE` at zero coverage: reverting the open-PR fail-closed fix kept all 54 arms
+    green. A path that decides deletions cannot be the untested one.
+
+    `W.run` is monkeypatched rather than calling a real `gh`, so these arms are hermetic and
+    exercise the failure branches on demand.
+    """
+    print("\n[github merge evidence]")
+    W._GH_CACHE.clear()
+
+    def wt(name: str, head: str, branch: str | None) -> W.Worktree:
+        t = W.Worktree(path=f"/{name}", real=f"/{name}", head=head, branch=branch,
+                       detached=branch is None)
+        return t
+
+    # --- _apply_github: qualification, the recycled-branch guard, and detached trees -------
+    merged_head = wt("merged", "a" * 40, "feat/landed")
+    recycled = wt("recycled", "b" * 40, "feat/recycled")
+    detached = wt("detached", "c" * 40, None)
+    untouched = wt("other", "d" * 40, "feat/live")
+    trees = [merged_head, recycled, detached, untouched]
+    by_oid = {"a" * 40: 111, "b" * 40: 222, "c" * 40: 333}
+    W._apply_github(trees, by_oid, open_branches={"feat/recycled"})
+
+    check("sha match qualifies", merged_head.merged_by, "squash-pr#111")
+    check("recycled branch name is refused", recycled.merged_by, None)
+    check("detached qualifies on sha alone", detached.merged_by, "squash-pr#333")
+    check("unmatched sha stays unqualified", untouched.merged_by, None)
+
+    # A branch whose tip has MOVED past the merged PR is live work, not a stale tree.
+    moved = wt("moved", "e" * 40, "feat/moved")
+    W._apply_github([moved], {"a" * 40: 111}, open_branches=set())
+    check("advanced branch tip stays unqualified", moved.merged_by, None)
+
+    # --- probe_github: the open-PR query failing must fail the WHOLE cross-check closed ----
+    real_run = W.run
+    merged_json = json.dumps([{"number": 111, "headRefName": "feat/landed",
+                               "headRefOid": "a" * 40, "mergedAt": "x"}])
+
+    def fake_run(cmd, cwd=None, timeout=W.GIT_TIMEOUT):
+        if "--state" in cmd and "merged" in cmd:
+            return 0, merged_json, ""
+        if "--state" in cmd and "open" in cmd:
+            return 1, "", "API rate limit exceeded"
+        return real_run(cmd, cwd=cwd, timeout=timeout)
+
+    try:
+        W.run = fake_run
+        W._GH_CACHE.clear()
+        victim = wt("victim", "a" * 40, "feat/landed")
+        ok, note = W.probe_github("/repo", [victim], 10)
+        check("open-PR failure -> evidence unavailable", ok, False)
+        check("open-PR failure names the cause", "open-PR query failed" in note, True, note)
+        check("and qualifies NOTHING", victim.merged_by, None)
+
+        # --- _GH_CACHE: a failure must be remembered, or 145 candidates refetch it ---------
+        calls = {"n": 0}
+
+        def counting_run(cmd, cwd=None, timeout=W.GIT_TIMEOUT):
+            if "pr" in cmd and "list" in cmd:
+                calls["n"] += 1
+            return fake_run(cmd, cwd=cwd, timeout=timeout)
+
+        W.run = counting_run
+        W._GH_CACHE.clear()
+        W.probe_github("/repo", [wt("v1", "a" * 40, "feat/landed")], 10)
+        after_first = calls["n"]
+        W.probe_github("/repo", [wt("v2", "a" * 40, "feat/landed")], 10)
+        check("failed lookup is cached, not refetched", calls["n"], after_first)
+
+        # --- the success path, end to end through probe_github ----------------------------
+        def ok_run(cmd, cwd=None, timeout=W.GIT_TIMEOUT):
+            if "--state" in cmd and "merged" in cmd:
+                return 0, merged_json, ""
+            if "--state" in cmd and "open" in cmd:
+                return 0, "[]", ""
+            return real_run(cmd, cwd=cwd, timeout=timeout)
+
+        W.run = ok_run
+        W._GH_CACHE.clear()
+        good = wt("good", "a" * 40, "feat/landed")
+        ok, note = W.probe_github("/repo", [good], 10)
+        check("success path reports available", ok, True)
+        check("success path qualifies the tree", good.merged_by, "squash-pr#111")
+        check("note states what it examined", "1 merged PRs" in note, True, note)
+
+        # Truncation must announce itself rather than silently narrowing the evidence.
+        W._GH_CACHE.clear()
+        _, note = W.probe_github("/repo", [wt("t", "a" * 40, "feat/landed")], 1)
+        check("hitting --gh-limit warns", "WARNING" in note, True, note)
+    finally:
+        W.run = real_run
+        W._GH_CACHE.clear()
+
+
+def test_unknown_idle_time_blocks_removal() -> None:
+    """idle_hours=None means every stat failed, and must not be the one guard that permits.
+
+    Unreachable in practice on a healthy tree, which is exactly why it needs an arm: it is the
+    kind of fail-open default nobody notices until the day the stats fail.
+    """
+    print("\n[unknown idle time]")
+    unknown = W.Worktree(path="/x", real="/x", merged_by="ancestor", idle_hours=None)
+    W.classify(unknown, 12.0, merge_evidence_available=True, holder_scan_ok=True)
+    check("unknown idle refuses", unknown.removable, False)
+    check("unknown idle names recent", unknown.blockers, ["recent"])
+
+    known = W.Worktree(path="/x", real="/x", merged_by="ancestor", idle_hours=999.0)
+    W.classify(known, 12.0, merge_evidence_available=True, holder_scan_ok=True)
+    check("known-old idle permits", known.removable, True)
 
 
 def test_fails_closed_without_a_process_scan() -> None:
@@ -496,11 +614,35 @@ def test_fd_and_map_references_are_holders() -> None:
         trees, _ = survey(repo, scan_fds=True, scan_maps=False)
         check("removable once the fd is closed", trees["fdheld"].state, "REMOVABLE")
 
+        # --- the maps parser, which until now this arm's NAME claimed but did not cover -----
+        # A mapping is the holder with no cwd and no fd: a running binary, or a compiler's mmap
+        # of an object file. It also exercises a different parser -- /proc/<pid>/maps is parsed
+        # by hand, unlike the fd and cwd symlinks -- so it can break independently.
+        import mmap
+        with open(target, "rb") as mf:
+            mm = mmap.mmap(mf.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                trees, _ = survey(repo, scan_fds=False, scan_maps=True)
+                held = trees["fdheld"]
+                check("map holder refuses the tree", held.removable, False)
+                check("map holder names in-use", "in-use" in held.blockers, True,
+                      str(held.blockers))
+                check("map holder is seen as a mapping",
+                      os.getpid() in [h.pid for h in held.holders if h.kind == "map"], True,
+                      str([(h.pid, h.kind) for h in held.holders]))
+            finally:
+                mm.close()
+
+        trees, _ = survey(repo, scan_fds=False, scan_maps=True)
+        check("removable once the mapping is gone", trees["fdheld"].state, "REMOVABLE")
+
 
 def main() -> int:
     for fn in (
         test_positive_and_mutations,
         test_merge_evidence_labels,
+        test_github_merge_evidence,
+        test_unknown_idle_time_blocks_removal,
         test_fails_closed_without_a_process_scan,
         test_nested_worktree_is_refused,
         test_holder_attributed_to_most_specific_tree,
