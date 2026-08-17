@@ -227,6 +227,21 @@ jobs:
         run: |
           git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py --github
 
+      # The other half of the numbering contract, and until now nobody checked it. The table's value
+      # is that other files point AT it by number -- 118 references on 110 lines in 46 files as of
+      # 2026-08-17, and 50 of those are .cpp/.hpp/.py COMMENTS, not prose. `check_numbered_table.py`
+      # validates the table and has no idea anything cites it, so a reference to a row that never
+      # existed reads as perfectly correct: a plausible number in a plausible sentence, findable only
+      # by opening the table and counting, which nobody does for a number in a code comment.
+      #
+      # It scans every tracked file, so it is deliberately narrow about what counts as a reference --
+      # `s_trap 1` in the shader tests is an RDNA2 mnemonic and is excluded by an identifier-character
+      # lookbehind, measured rather than assumed (without it the corpus reports 3 spurious hits).
+      - name: Verify every by-number trap reference resolves
+        run: |
+          git ls-files -z | xargs -0 python3 prosper/tools/docs/check_trap_citations.py --github \
+            --table prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+
       # Lives here, in the job that needs nothing built, for the same reason the checks above do:
       # it is a repository-wide text scan that finishes in a second. It gates the flag that keeps
       # the OTHER jobs' ctest steps honest -- plain ctest exits 0 on an empty suite, so a job

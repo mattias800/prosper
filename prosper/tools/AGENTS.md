@@ -427,6 +427,20 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   the file `unbroken` (#2108). What it does **not** cover, stated so silence is not read as
   coverage: HTML tables, delimiter-less pipe blocks (no header to measure against), whether an
   escaped pipe was what the author meant, and fenced regions, which are skipped deliberately.
+- **`docs/check_trap_citations.py`** — the other half of the numbering contract: every `trap NNN`
+  reference in the repository must name a row that exists. `check_numbered_table.py` validates the
+  TABLE and has no idea anything cites it, so until this existed a reference to a row that never
+  existed read as perfectly correct — a plausible number in a plausible sentence, findable only by
+  opening the table and counting, which nobody does for a number in a code comment. **That is the
+  more expensive half:** a duplicate row is visible the moment you look at the table, while a stale
+  by-number reference quietly sends the next agent to an unrelated entry. Measured on `origin/master`
+  2026-08-17: **118 references on 110 lines in 46 files, naming 63 distinct rows, all resolving —
+  and 50 of those references are `.cpp`/`.hpp`/`.py` comments**, so this is a contract compiled files
+  depend on. Deliberately narrow about what counts as a reference, because it scans every tracked
+  file and one that fires on ordinary prose gets disabled: `s_trap 1` in the shader tests is an RDNA2
+  mnemonic, excluded by an identifier-character lookbehind that is measured rather than assumed
+  (without it the corpus reports 3 spurious hits). Run by the CI `Docs` job;
+  `ctest -R trap_citation_checker` covers it.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the
