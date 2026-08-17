@@ -3389,6 +3389,38 @@ question, not a GPU one. It shares the frontier with one unfinished measurement:
 the failing compute kernels that no instrument has resolved (see the section below for exactly which,
 and why their null does not count yet).
 
+### The composite's tap is renderer-owned, written by ONE draw, and never invalidated (2026-08-17)
+
+Three measurements on the same routed boot, each with its denominator, narrow the tap
+`0x2063380000` (`Float10_11_11`, 4K) to a single remaining question.
+
+**One draw ever binds it as a colour target.** `PROSPER_TARGET_WATCH=0x2063380000` — exact, unsampled,
+all eight MRT slots, no dimension filter — reports `draws=1` at every power-of-two checkpoint from
+4,096 through **262,144**. One draw, slot 0, and the count never grows.
+
+**No guest write ever touches it.** The new `PROSPER_RTT_INVALIDATE_WATCH` reports **131,072 queued
+guest writes examined, 0 touching either the tap or the f16 source `0x20471e0000`.** The snapshot is
+therefore never invalidated by a guest write — and this is a measurement rather than a silence, because
+the instrument prints its own denominator. It also reports that `0x2063380000` is at some drains **not
+in the RTT cache at all**, which is a different state from "cached and never refreshed" and is stated
+separately so the two are not conflated.
+
+**It is served from the renderer's own snapshot.** Every one of its 11 `PROSPER_RTT_GUESTPEEK` samples
+resolves `HIT-CPU`.
+
+So the composite reads a renderer-owned snapshot that one draw established and nothing ever refreshes.
+**The remaining question is what that single draw does** — whether it is the intended producer rendering
+nothing (culled, zero-area, colour writes masked, shader rejected), or merely an initial clear whose
+per-frame counterpart is absent. That is one draw out of 262,144, which is a small enough target to
+identify directly, and it is the next step.
+
+**On the boundary this does and does not move.** The write watch observes writes that reach
+`notify_guest_gpu_write`; a producer writing guest memory without notifying would be invisible here too.
+So this remains *no observed path*, not *the guest never issues one* — the same boundary #2542 already
+records, now with a denominator of 131,072 rather than an argument. What is genuinely new is that the
+surface is renderer-owned and served from a snapshot, which means a guest-memory producer is not even
+the mechanism that would fill it.
+
 ### THE FAILING KERNEL'S 4K WRITE IS NOT THE COMPOSITE'S TAP — measured, same run (2026-08-17)
 
 **Read this before the section below it.** That section reports that two failing compute programs bind

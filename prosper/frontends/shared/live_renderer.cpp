@@ -201,8 +201,111 @@ bool draw_binds_color_target(const prosper::gpu::DrawItem& draw, uint64_t addr) 
     return prosper::frontend::mrt_draw_binds_target(draw, addr, mrt_format_defined);
 }
 
+// PROSPER_RTT_INVALIDATE_WATCH=<0xaddr>[,<0xaddr>…] — why a renderer-owned surface's CPU snapshot is,
+// or is not, being invalidated.
+//
+// The question it answers is the one left when a composite input is empty and the renderer serves its
+// own snapshot for it. `PROSPER_RTT_GUESTPEEK` cannot answer it: every renderer-owned surface reports
+// 0% non-zero GUEST bytes whether it renders correctly or not, because the renderer owns the pixels.
+// So "the guest memory is empty" is not evidence about production, and the live question becomes
+// whether the cached copy is ever refreshed.
+//
+// It reports both directions, which is the point. A write that OVERLAPS prints its effect and its
+// origin; a write that misses prints nothing, but the periodic line states how many writes were
+// examined and how many hit — so "never invalidated" is distinguishable from "the instrument never
+// ran", and a watched address absent from the cache says so explicitly rather than looking like a
+// silent zero.
+//
+// `strtoull(..., 0)` is used deliberately, so `0x` is required: a bare `2063380000` would parse as
+// DECIMAL and watch an unrelated address while reporting success. That exact base-0 mistake is
+// recorded as an instrument trap for PROSPER_TARGET_WATCH.
+struct RttInvalidateWatch {
+    std::vector<uint64_t> addrs;
+    std::atomic<uint64_t> writes_examined{0};
+    std::atomic<uint64_t> writes_hitting{0};
+};
+
+// The counters are atomics, so the watch is populated IN PLACE rather than returned from an
+// initializer lambda -- an atomic is neither copyable nor movable.
+std::vector<uint64_t> parse_rtt_invalidate_watch_addrs() {
+    std::vector<uint64_t> addrs;
+    const char* spec = getenv("PROSPER_RTT_INVALIDATE_WATCH");
+    if (!spec || !*spec) return addrs;
+    for (const char* p = spec; *p;) {
+        char* end = nullptr;
+        const uint64_t v = strtoull(p, &end, 0);
+        if (end == p) break;
+        addrs.push_back(v);
+        p = (*end == ',') ? end + 1 : end;
+    }
+    fprintf(stderr, "[rtt-inval] watching %zu address(es)\n", addrs.size());
+    return addrs;
+}
+
+RttInvalidateWatch& rtt_invalidate_watch() {
+    static RttInvalidateWatch watch;
+    static const bool once = [] {
+        watch.addrs = parse_rtt_invalidate_watch_addrs();
+        return true;
+    }();
+    (void)once;
+    return watch;
+}
+
+const char* rtt_guest_write_effect_name(prosper::frontend::LiveRttGuestWriteEffect effect) {
+    switch (effect) {
+        case prosper::frontend::LiveRttGuestWriteEffect::color_plane:   return "color-plane";
+        case prosper::frontend::LiveRttGuestWriteEffect::dcc_metadata:  return "dcc-metadata";
+        default:                                                       return "none";
+    }
+}
+
 void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
+    auto& watch = rtt_invalidate_watch();
+    if (!watch.addrs.empty()) {
+        watch.writes_examined.fetch_add(1, std::memory_order_relaxed);
+        for (const uint64_t wanted : watch.addrs) {
+            const auto entry = cache.find(wanted);
+            if (entry == cache.end()) {
+                // A watched address that is not a cached RTT surface at all. Reported once so an
+                // absence of invalidations is not read as "nothing ever wrote it".
+                static std::mutex absent_mutex;
+                static std::set<uint64_t> absent_reported;
+                bool first = false;
+                { std::lock_guard<std::mutex> lock(absent_mutex);
+                  first = absent_reported.insert(wanted).second; }
+                if (first)
+                    fprintf(stderr,
+                            "[rtt-inval] 0x%llx is NOT in the RTT cache at this drain — no snapshot "
+                            "to invalidate\n", (unsigned long long)wanted);
+                continue;
+            }
+            const RttSurf& surface = entry->second;
+            const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(surface.format);
+            const uint64_t pixels = static_cast<uint64_t>(surface.w) * surface.h;
+            const uint64_t bytes = pixels > UINT64_MAX / bpp ? UINT64_MAX : pixels * bpp;
+            const auto effect = prosper::frontend::live_rtt_guest_write_effect(
+                wanted, bytes, surface.dcc_metadata_addr, surface.dcc_metadata_bytes, addr, size);
+            if (effect == prosper::frontend::LiveRttGuestWriteEffect::none) continue;
+            watch.writes_hitting.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 64)
+                fprintf(stderr,
+                        "[rtt-inval] 0x%llx %ux%u snapshot invalidated: effect=%s by write "
+                        "addr=0x%llx size=%llu origin=%s\n",
+                        (unsigned long long)wanted, surface.w, surface.h,
+                        rtt_guest_write_effect_name(effect),
+                        (unsigned long long)addr, (unsigned long long)size,
+                        prosper::gpu::guest_gpu_write_origin());
+        }
+        // Periodic totals, so a zero is a measurement rather than a silence.
+        const uint64_t examined = watch.writes_examined.load(std::memory_order_relaxed);
+        if (examined && (examined & (examined - 1)) == 0 && examined >= 1024)
+            fprintf(stderr, "[rtt-inval] examined=%llu writes, %llu touched a watched surface\n",
+                    (unsigned long long)examined,
+                    (unsigned long long)watch.writes_hitting.load(std::memory_order_relaxed));
+    }
     for (auto it = cache.begin(); it != cache.end();) {
         const RttSurf& surface = it->second;
         const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(surface.format);
