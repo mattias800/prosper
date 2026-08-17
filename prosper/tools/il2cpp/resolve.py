@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""resolve.py — map runtime addresses / btrace frames to C# method names.
+
+Uses the Il2CppDumper output (script.json). Companion to prx_to_elf.py; see README.md.
+
+usage:
+  python3 resolve.py <script.json> 0x16b981 0x11e63c ...      # bare RVAs
+  python3 resolve.py <script.json> il+0x16b981,eb+0xada254    # a btrace chain
+  echo '[btrace] ... chain=il+0x1e23b8,il+0xde92e9' | python3 resolve.py <script.json> -
+  python3 resolve.py <script.json> --base 0x440000000 0x4402140d0   # absolute runtime addr
+
+The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and PPSA02664), so a
+method's runtime address = base + RVA, and script.json's "Address" field == RVA (the flattened ELF
+has p_offset == p_vaddr). A prosper [btrace] chain prints frames as "il+0x<offset>", where <offset>
+is already the RVA — feed those straight in.
+"""
+# The usage block above is the module DOCSTRING, not a comment, because `main()` prints `__doc__` on
+# a bad invocation — and a header made only of `#` comments makes that print the literal string
+# `None` (#2399, where the same arrangement in xref.py sent a caller to invented syntax).
+#
 # resolve.py — map runtime addresses / btrace frames to C# method names using the
 # Il2CppDumper output (script.json). Companion to prx_to_elf.py; see README.md.
 #
