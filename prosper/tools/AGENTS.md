@@ -442,7 +442,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `traps 1234` and `entry 99` do not. Each exclusion is measured: removing the leading boundary
   admits 4 extra matches, **3 of which cite row 0** and would turn this repo-wide gate red on correct
   code; removing the trailing boundary makes `\|d{1,3}` bite a prefix out of `0x40` and `1234`, the
-  second resolving **silently** to an unrelated row. Run by the CI `Docs` job;
+  second resolving **silently** to an unrelated row. That boundary is `(?!\|w\|\|.\|d)` and **not** the
+  obvious `(?![\|w.])`, which rejects a full stop — so `See instrument trap 41.` stopped being a
+  citation at all, losing 22 of 118 references (5 of them in `.cpp`/`.hpp`/test comments) **with the
+  gate still green and the success line still saying "all resolving"**. Run by the CI `Docs` job;
   `ctest -R trap_citation_checker` covers it.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator

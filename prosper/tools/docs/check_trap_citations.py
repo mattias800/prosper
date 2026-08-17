@@ -67,7 +67,14 @@ from check_numbered_table import parse_tables  # noqa: E402
 #         `trap 0x40`   -> row 0     (turns this repo-wide gate RED on correct code)
 #         `traps 1234`  -> row 123   (silently WRONG -- resolves today, points at an unrelated row)
 #         `trap 41.5ms` -> row 41    (spurious, resolves)
-#     `(?![\w.])` rejects all three: the match fails outright rather than truncating.
+#     The boundary is `(?!\w|\.\d)` and NOT `(?![\w.])`, which is the obvious form and is wrong:
+#     a full stop is also how a sentence ends, so `See instrument trap 41.` stopped being a citation
+#     at all. That cost 22 of 118 references on this corpus, 5 of them in .cpp/.hpp/test comments --
+#     the half this tool exists for -- and it did so SILENTLY, because the gate stays green while the
+#     success line still says "all resolving". A citation auditor that quietly stops seeing
+#     sentence-final citations and then reports full coverage is the exact shape it was built to
+#     police (#2621 review). Excluding only a digit AFTER the stop keeps `41.5` out and `41.` in.
+#     It also restored list members: `See traps 55 and 56.` had been yielding only 55.
 #  3. An optional `#`. `trap #16`, `trap #35` and `instrument trap #13` are live in-repo citation
 #     forms (DRAGON_QUEST_STATUS.md, OREGON_TRAIL_STATUS.md, SYBERIA_STATUS.md); missing them while
 #     the success line says "all resolving" would be a completeness claim the tool does not have.
@@ -77,7 +84,7 @@ CITATION = re.compile(
     r"(?:(?<![A-Za-z0-9_])(?:instrument[- ]|orchestration )|(?<![A-Za-z0-9_-]))"
     r"traps?[- ]#?"
     r"(\d{1,3}(?:\s*,\s*#?\d{1,3})*(?:\s*(?:,\s*)?and\s+#?\d{1,3})?)"
-    r"(?![\w.])",
+    r"(?!\w|\.\d)",
     re.IGNORECASE,
 )
 NUMBER = re.compile(r"\d{1,3}")

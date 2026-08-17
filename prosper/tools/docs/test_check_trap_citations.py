@@ -85,10 +85,34 @@ case("a plain list of resolving numbers passes", "// traps 1, 2 and 3\n", want_r
 # inside each string still matched. Only a citation that must be REPORTED proves it was parsed.
 case("the hyphenated form is recognised (asserted by failing)",
      "// see instrument-trap 99\n", want_rc=1, expect_text="cites row 99")
-case("the spaced instrument form is recognised (asserted by failing)",
+# These two are NOT alternation tests and are named for what they actually establish: deleting the
+# `(?:instrument[- ]|orchestration )` group leaves both green, because the bare `trap 99` inside each
+# string still matches through the other branch. They pin that a prefixed citation is found at all,
+# which is worth having; only the HYPHENATED case above can discriminate the alternation, because a
+# hyphen is the one separator the bare branch refuses (#2621 review).
+case("a prefixed citation is found (does not discriminate the alternation)",
      "// see instrument trap 99\n", want_rc=1, expect_text="cites row 99")
-case("the orchestration form is recognised (asserted by failing)",
+case("an orchestration-prefixed citation is found (does not discriminate the alternation)",
      "// per orchestration trap 99\n", want_rc=1, expect_text="cites row 99")
+
+# THE ARM THAT WOULD HAVE CAUGHT THE REGRESSION. The obvious trailing boundary, `(?![\w.])`, also
+# rejects a full stop -- which is how a sentence ends -- so `See instrument trap 41.` stopped being a
+# citation at all. 22 of 118 references vanished from the corpus, 5 of them in .cpp/.hpp/test
+# comments, and NOTHING went red: the gate stays green while the success line still claims "all
+# resolving". A citation auditor that silently stops seeing sentence-final citations and then reports
+# full coverage is precisely the shape it exists to police.
+case("a sentence-final citation is still a citation",
+     "See instrument trap 99.\n", want_rc=1, expect_text="cites row 99")
+
+# ...and the same at the end of a LIST, which the broken form also truncated: `traps 55 and 56.`
+# was yielding only 55, so the loss was not confined to single references.
+case("the last member of a sentence-final list is still a citation",
+     "See traps 1, 2 and 99.\n", want_rc=1, expect_text="cites row 99")
+
+# The counter-arm that keeps both honest: a DECIMAL must still be rejected, which is the entire
+# reason the boundary exists. `(?!\w|\.\d)` excludes only a digit after the stop.
+case("a decimal is still not a citation, with the looser boundary",
+     "// trap 99.5 ms of overhead\n", want_rc=0)
 
 # `trap #NN` is live in this repository — DRAGON_QUEST_STATUS.md, OREGON_TRAIL_STATUS.md and
 # SYBERIA_STATUS.md all use it. Missing it while the success line says "all resolving" would be a
