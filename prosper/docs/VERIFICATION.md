@@ -168,6 +168,55 @@ If **neither** source yields a title id the three are registered and run exactly
 failure has to stay fail-visible: silently converting three real guards into permanent skips would be
 the same defect this section is about, pointed the other way.
 
+### Dump-gated tests, and the loader assertions that no longer are (#2567)
+
+A visible `(Skipped)` fixes the *legibility* of a dump-gated assertion, not its *coverage*. Six ctest
+cases carry assertions that only run with a dump — `module_loads_eboot`, `nid_hash_matches_imports`,
+`trap_identifies_imports`, `boot_reaches_first_syscall`, `real_shader_render` and `plugin_autolink` —
+so a regression in the paths they cover is caught only by an agent who happens to run the suite
+locally with that title installed, which is not a gate. #2567 carries the measured per-case census.
+
+**Five of the six cannot be synthesized and should not be.** They are pinned to one real title's
+bytes — `PPSA24651`'s import counts, its IL2CPP module layout, the RDNA2 blobs embedded in its
+eboot. A synthetic fixture would be a *different* test wearing the same name, which is worse than an
+honest skip.
+
+**`plugin_autolink`'s dump-gated block was the exception, and is now covered without a dump.** What it
+guards — `link_program`'s export table, the duplicate-export collision guard (#1609) and the alias
+record (#1635) — is structural loader behaviour that depends on the shape of a module's dynamic
+tables, not on any title's content. Two ctest cases now exercise it everywhere:
+
+| case | what it establishes |
+| --- | --- |
+| `loader_synth_link` | the export table, first-wins and its alias record, the collision guard and its skip record, cross-module import binding and stub-slot fallback |
+| `loader_synth_reject` | the corrupted variants the loader must refuse, and the relocations it must decline to apply |
+
+The fixtures are minimal `ET_SCE_DYNAMIC` PRX modules emitted at test time by `tests/synth_prx.h` and
+`tests/handmade_prx.h`. **Every byte is synthesized from the published ELF64 layout; none is carved
+out of a dump**, and none may ever be — this repository is public, and a dump-derived fixture would
+put Sony-built code in it however small it was. Nothing is committed as a binary, so there is no
+opaque asset to regenerate: the generator *is* the provenance record (#2587's convention, applied to
+a generated asset).
+
+The dump-backed `plugin_autolink` block stays exactly as it is. It links real Sony-built modules and
+is not redundant with a synthetic pair.
+
+**Three rules bind on any future fixture-based test here, and the first two are what make it evidence
+rather than decoration:**
+
+1. **Build the negative arms.** A fixture the loader accepts proves only that the generator and the
+   loader agree with each other. Each corrupted variant must differ from a *linking control* in
+   exactly one field, so the arm can show its lever moved.
+2. **Build at least one instance BY HAND, outside the generator.** A generator emits one geometry and
+   every fixture inherits it, so a defect about some *other* legal shape is structurally inexpressible
+   in its output and reads as a clean pass — a positive control drawn from the same source as the null
+   it validates tests the discriminator, never the domain. `handmade_prx.h` is that instance: two
+   `PT_LOAD`s whose file offsets and vaddrs diverge, so every dynamic table is reached through
+   `Module::va2foff`'s translation rather than an identity map.
+3. **Include a mutation arm for every guard that can fire.** `loader_synth_link` links the same
+   flagged module twice, once where its exports collide and once where a single export NID differs; a
+   guard that skipped every flagged module would pass the first arm exactly as well as a correct one.
+
 ## Rule of thumb
 
 Prefer the cheapest layer that can catch a given bug: pure structural asserts for translation logic,
