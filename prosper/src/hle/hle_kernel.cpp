@@ -3173,6 +3173,39 @@ HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
     if (sclog_semaphore() || sclog_focused_semaphore(a0))
         fprintf(stderr, "[sync2] T%" PRIu64 " SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
     interruptible_mutex_lock(&s->m); s->count += n; interruptible_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
+// #1640: PollSema's "not available" value is 0x80020023 (FreeBSD EAGAIN) where its sibling
+// `k_ef_poll` above answers 0x80020010 (EBUSY). EBUSY is the obvious guess by symmetry. IT IS NOT
+// TAKEN, because a static census of the whole 44-dump corpus shows the corpus CANNOT tell the two
+// apart, so changing it would be a guess dressed as a fix:
+//
+//   python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA*-app0 --nid 12wOHk8ywb0 --const 0x80020010 -v
+//
+// Four titles import `sceKernelPollSema` (PPSA02801, PPSA04263, PPSA08576, PPSA13579 — confirmed
+// independently by `nid_census --registered --names`, which agrees on exactly that set). Across
+// their 49 call sites: **0 compare the result against any constant.** 29 are `ignored` (the result
+// is dead before any read), 17 are `test eax,eax`, and the 3 `forward` windows were read by hand
+// with `edis.py` — all three are the same `call PollSema; jmp <back>` into a shared
+// `xor r15d,r15d; test eax,eax; je <success>`, i.e. `nonzero` as well. 0 undecodable windows.
+//
+// That is a BOUND, not merely an absence, and this is the part worth keeping: both candidate values
+// are non-zero AND both are negative as int32 (0x80020010, 0x80020023). So a `test eax,eax` gate —
+// and equally a `js`/`jns` on it — is *structurally* incapable of distinguishing them. Every one of
+// the 49 sites is therefore provably insensitive to the choice, which is why no amount of re-running
+// this scan will settle it.
+//
+// The instrument is not silently broken: the same tool, same corpus, same classifier finds
+// `sceKernelPollEventFlag` (9lvj5DjHZiA) compared against `cmp eax,0x80020010` at **9 sites** in
+// PPSA05325 — independently re-deriving, from static disassembly, the live-trace evidence recorded
+// in `k_ef_poll` above. So the class "a poll import const-compared against a libkernel errno" is
+// expressible and does get found; it simply does not occur for this NID.
+//
+// WHAT WOULD SETTLE IT: a caller that compares the result against a named constant (the way
+// `_Mtx_trylock` compares 0x80020010), or a live `[sync2] SEMA.*` trace of a title branching on the
+// value. Site discovery follows one stub level and one call deep, so the 49 is a lower bound —
+// an indirect call through a function pointer would not appear.
+// CONFIDENCE: LOW on 0x80020023 being what Sony's libkernel reports. It is a legitimate FreeBSD
+// EAGAIN and NOT an instance of #1612 (a host errno leaking into a FreeBSD-numbered field), so it is
+// left as it is rather than swapped on symmetry alone.
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     interruptible_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
 

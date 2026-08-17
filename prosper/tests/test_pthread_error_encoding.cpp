@@ -226,10 +226,33 @@ bool wait_for(const std::atomic<int>& counter, int target) {
 // established that its absence is the right answer rather than an oversight.
 const char* const kInfallible[] = {
     "scePthreadMutexattrSetprotocol", "scePthreadMutexattrSetpshared", "scePthreadMutexattrDestroy",
-    "scePthreadMutexDestroy", "scePthreadCondattrDestroy", "scePthreadCondDestroy",
+    "scePthreadMutexDestroy", "scePthreadCondattrDestroy",
     "scePthreadCondSignal", "scePthreadCondBroadcast",
-    "scePthreadRwlockDestroy", "scePthreadSemDestroy", "scePthreadBarrierDestroy",
+    "scePthreadRwlockDestroy", "scePthreadSemDestroy",
     "scePthreadBarrierattrInit", "scePthreadBarrierattrDestroy", "scePthreadBarrierattrSetpshared",
+};
+
+// Bodies that CAN fail, but answer 0 for a NULL slot — so the sweep's null probe cannot reach their
+// failure path and they do not belong in either list above.
+//
+// They were listed as infallible when this file was written, and that was true then. #2359 (condvar)
+// and #2379 (barrier) landed #2168's busy-destroy contract: each now refuses an object that still
+// has waiters with an ENCODED `SCE_KERNEL_ERROR_EBUSY` (0x80020010), returned in place because
+// neither body has a POSIX spelling registered on it. The `kInfallible` ARM still passed unchanged
+// after both, because a null slot never reaches the busy check — so nothing failed, and the list's
+// stated rationale ("returns 0 on every path") silently went false while the assertion stayed green.
+// That is the failure this split exists to prevent: a passing arm is not evidence that the sentence
+// justifying it is still true.
+//
+// The busy path itself is covered where it can actually be constructed — a thread must really be
+// parked in the object — by `test_cond_destroy_busy.cpp` and `test_barrier_destroy_busy.cpp`. What
+// is pinned HERE is only the null-slot half: these report success for an absent object rather than
+// inventing a failure. Neither arm discriminates an added alias (`sce_pthread_rc(0)` is 0).
+// #2168's remaining third, `scePthreadMutexDestroy`, is still genuinely infallible above: it needs
+// owner tracking that deliberately does not exist on POSIX hosts (#719/#793).
+const char* const kFallibleButNullSucceeds[] = {
+    "scePthreadCondDestroy",      // #2359: encoded EBUSY when the condvar still has waiters
+    "scePthreadBarrierDestroy",   // #2379: encoded EBUSY when threads are parked in the barrier
 };
 
 }  // namespace
@@ -540,6 +563,22 @@ int main() {
         if (!f) { snprintf(msg, sizeof msg, "%s is registered", name); CHECK(false, msg); continue; }
         const uint64_t got = call0(f);
         snprintf(msg, sizeof msg, "%-32s -> 0 (no failure path, so no alias)  got 0x%llx",
+                 name, (unsigned long long)got);
+        CHECK(got == 0, msg);
+    }
+
+    // The #2168 busy-destroy pair. Same observable assertion, deliberately a separate group and a
+    // separate label: these bodies DO have a failure path, it is simply unreachable through a null
+    // slot. Keeping them in kInfallible would keep asserting the right thing for a reason that
+    // stopped being true when #2359 and #2379 landed. See kFallibleButNullSucceeds.
+    printf("-- #2168 busy-destroy bodies: a NULL slot still reports success (the busy path is in "
+           "test_cond_destroy_busy / test_barrier_destroy_busy) --\n");
+    for (const char* name : kFallibleButNullSucceeds) {
+        char msg[192];
+        HleFn f = Hle::lookup(nid_hash(name));
+        if (!f) { snprintf(msg, sizeof msg, "%s is registered", name); CHECK(false, msg); continue; }
+        const uint64_t got = call0(f);
+        snprintf(msg, sizeof msg, "%-32s -> 0 for a null slot (fallible, but not here)  got 0x%llx",
                  name, (unsigned long long)got);
         CHECK(got == 0, msg);
     }
