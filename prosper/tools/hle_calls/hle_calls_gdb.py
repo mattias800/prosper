@@ -10,6 +10,9 @@ environment so the driver can stay a plain subprocess call:
                       BEFORE the guest's entry point runs, so the window covers init
     HLE_CALLS_VALUES  "1" to record each handler's return values, not only its count
     HLE_CALLS_ORDER   how many leading calls to report in call order (default 24)
+    HLE_CALLS_OUT_BYTES  0 = off. Otherwise snapshot this many bytes at a0/a1 before
+                      and after each call, and report what CHANGED -- the half a
+                      return value cannot reach (#2045)
     HLE_CALLS_INFERIOR_TTY  launch mode only: where the INFERIOR's stdin/stdout/stderr
                       go. The driver holds gdb's own stdout on a pipe, and without this
                       the launched emulator's entire run log would inherit that pipe and
@@ -56,7 +59,9 @@ both are printed unconditionally:
 Two limits of `--values` worth knowing before believing a number:
 
   * It records the return **register**, never an out-struct. A handler that
-    returns 0 while writing wrong bytes through a pointer argument is invisible.
+    returns 0 while writing wrong bytes through a pointer argument is invisible
+    to it — that is what `--out-bytes` answers (see `_sample_out_args` below),
+    and it is a separate observation with its own five-state accounting.
   * On a handler that longjmps back into its own caller, gdb's finish breakpoint
     sits at an address the landing pad reuses, so it can capture the *landing*
     value as if it were a return. Measured on gdb 17.2. Non-returning paths are
@@ -102,6 +107,8 @@ TICKS = int(os.environ.get("HLE_CALLS_TICKS", "400"))
 MODE = os.environ.get("HLE_CALLS_MODE", "attach")
 VALUES = os.environ.get("HLE_CALLS_VALUES", "") == "1"
 ORDER_N = int(os.environ.get("HLE_CALLS_ORDER", "24"))
+# 0 = off. When non-zero, snapshot this many bytes at a0/a1 before and after every call (#2045).
+OUT_BYTES = int(os.environ.get("HLE_CALLS_OUT_BYTES", "0"))
 INFERIOR_TTY = os.environ.get("HLE_CALLS_INFERIOR_TTY", "")
 
 # The built-in control for the value-capture mechanism, and the two values it can answer.
@@ -153,15 +160,131 @@ def _note_reason(text):
         finish_failure_reasons[overflow] = finish_failure_reasons.get(overflow, 0) + 1
 
 
+# --- out-struct sampling (--out-bytes, #2045) ---------------------------------------------------
+# The recurring bug shape on this codebase is "success returned, out-struct never written":
+# sceSystemServiceGetStatus aliased to the wrong handler, sceSystemServiceGetDisplaySafeAreaInfo
+# leaving `ratio` 0, sceNpEntitlementAccessGetSkuFlag unregistered with the out pointer untouched,
+# sceNpTrophy2GetTrophyInfoArray handing back a garbage count. EVERY one of them returns 0, so a
+# return-value census cannot see any of them -- the bound a value census puts on a candidate reaches
+# exactly as far as the return register.
+#
+# So: snapshot N bytes at whichever of a0/a1 is a readable pointer, on entry and again at return,
+# and report the difference. The before/after form is what makes the result self-validating, which
+# is the property #2075 showed this tool otherwise lacked: "the handler wrote nothing" and "this
+# tool never looked" are DIFFERENT counters here, and both are printed.
+OUT_ARGS = (("a0", "rdi"), ("a1", "rsi"))       # SysV integer argument registers 0 and 1
+OUT_SHAPE_CAP = 32
+# A pointer is never in page 0. Anything below this is an ordinary small argument -- a handle, a
+# size, an enum -- and saying so is not the same statement as "the pointer could not be read".
+OUT_MIN_POINTER = 0x1000
+out_stats = {}                  # (handler, "a0"|"a1") -> counters + observed diff shapes
+
+
+def _out_stats(name, argname):
+    key = (name, argname)
+    if key not in out_stats:
+        out_stats[key] = {"calls": 0, "noreg": 0, "null": 0, "small": 0, "unreadable": 0,
+                          "read": 0, "changed": 0, "same_zero": 0, "same_nonzero": 0,
+                          "lost": 0, "shapes": {}}
+    return out_stats[key]
+
+
+def _out_shape(before, after):
+    """`@6 00->01` — the changed offsets only, which is what a reader compares against the source."""
+    diffs = [(i, before[i], after[i]) for i in range(len(before)) if before[i] != after[i]]
+    parts = ["@%d %02x->%02x" % d for d in diffs[:8]]
+    if len(diffs) > 8:
+        parts.append("+%d more bytes" % (len(diffs) - 8))
+    return " ".join(parts)
+
+
+def _sample_out_args(name):
+    """Entry half of the diff: returns [(stats, addr, before_bytes)] for each sampled argument."""
+    snaps = []
+    try:
+        frame = gdb.newest_frame()
+        inferior = gdb.selected_inferior()
+    except Exception:
+        return snaps
+    for argname, reg in OUT_ARGS:
+        st = _out_stats(name, argname)
+        st["calls"] += 1
+        try:
+            value = int(frame.read_register(reg)) & RET_MASK
+        except Exception:
+            st["noreg"] += 1
+            continue
+        if value == 0:
+            st["null"] += 1
+            continue
+        if value < OUT_MIN_POINTER:
+            st["small"] += 1
+            continue
+        try:
+            before = bytes(inferior.read_memory(value, OUT_BYTES))
+        except Exception:
+            # The distinction this whole feature turns on: nothing was READ here. It is NOT
+            # evidence that nothing was written.
+            st["unreadable"] += 1
+            continue
+        st["read"] += 1
+        snaps.append((st, value, before))
+    return snaps
+
+
 class _Finish(gdb.FinishBreakpoint):
-    """One-shot: record what the handler returned, then get out of the way."""
+    """One-shot: record what the handler returned and what it wrote, then get out of the way."""
 
     def __init__(self, frame, name):
         super().__init__(frame, internal=True)
         self.hle_name = name
         self.silent = True
+        self.out_snaps = []             # filled by _Counter.stop() right after construction
 
     def stop(self):
+        # Out-bytes first, and unconditionally: the return-value capture has a failure path that
+        # returns early, and an out-struct observation must not be lost to it.
+        self._capture_out_bytes()
+        if VALUES:
+            self._capture_return()
+        return False
+
+    def _capture_out_bytes(self):
+        try:
+            inferior = gdb.selected_inferior()
+        except Exception:
+            for st, _, _ in self.out_snaps:
+                st["lost"] += 1
+            return
+        for st, addr, before in self.out_snaps:
+            try:
+                after = bytes(inferior.read_memory(addr, len(before)))
+            except Exception:
+                # Readable on entry, unreadable now (the guest freed or unmapped it). Neither
+                # "wrote" nor "did not write" -- a third state, and it says so.
+                st["lost"] += 1
+                continue
+            if after != before:
+                st["changed"] += 1
+                shape = _out_shape(before, after)
+                if shape in st["shapes"] or len(st["shapes"]) < OUT_SHAPE_CAP:
+                    st["shapes"][shape] = st["shapes"].get(shape, 0) + 1
+                else:
+                    st["shapes"]["(+shapes beyond the first %d)" % OUT_SHAPE_CAP] = \
+                        st["shapes"].get("(+shapes beyond the first %d)" % OUT_SHAPE_CAP, 0) + 1
+            elif any(before):
+                # Ambiguous, and the ONE case this instrument cannot resolve: the bytes already held
+                # a value, so a handler that wrote exactly that is indistinguishable from one that
+                # wrote nothing. Kept apart from same-zero, where "nothing was written" is the far
+                # likelier reading.
+                st["same_nonzero"] += 1
+            else:
+                st["same_zero"] += 1
+        # Accounted for. Clearing them keeps a later out_of_scope() from counting the same samples
+        # a second time as lost.
+        self.out_snaps = []
+
+    def _capture_return(self):
         """Read the return value from TWO independent sources, because one of them is optional.
 
         `gdb.FinishBreakpoint.return_value` is derived from the function's **DWARF return type**, so
@@ -210,13 +333,12 @@ class _Finish(gdb.FinishBreakpoint):
             state["finish_failures"] += 1
             for text in why:
                 _note_reason(text)
-            return False
+            return
         if dwarf is not None and rax is not None and dwarf != rax:
             state["src_mismatch"] += 1
         state["src_dwarf" if dwarf is not None else "src_rax"] += 1
         values.setdefault(self.hle_name, {})
         values[self.hle_name][result] = values[self.hle_name].get(result, 0) + 1
-        return False
 
     def out_of_scope(self):
         # The handler's frame vanished without a normal return (longjmp, thread
@@ -224,7 +346,14 @@ class _Finish(gdb.FinishBreakpoint):
         # more than once per breakpoint on some versions, so it is not a reliable
         # counter. The per-row `captured N/M` below is what makes such a loss
         # visible, and it needs no cooperation from gdb at all.
-        pass
+        #
+        # An out-struct sample IS counted lost here, and for the opposite reason: nothing else can
+        # see it. `(captured N/M)` derives from the value histogram, so with `--values` off there is
+        # no other trace of a sample that never got its second half. gdb calling this twice would
+        # over-count `lost` -- an over-report of "this run could not tell", never of "it wrote".
+        for st, _, _ in self.out_snaps:
+            st["lost"] += 1
+        self.out_snaps = []
 
 
 class _Counter(gdb.Breakpoint):
@@ -250,15 +379,22 @@ class _Counter(gdb.Breakpoint):
                 pass
         if len(order) < ORDER_N:
             order.append((state["calls"], self.hle_name))
-        if VALUES:
+        # Sample BEFORE arming the finish breakpoint: the entry snapshot is a fact about this call
+        # whether or not the second half can be armed, and a dropped one is then counted as `lost`
+        # rather than silently vanishing.
+        snaps = _sample_out_args(self.hle_name) if OUT_BYTES else []
+        if VALUES or OUT_BYTES:
             try:
-                _Finish(gdb.newest_frame(), self.hle_name)
+                finish = _Finish(gdb.newest_frame(), self.hle_name)
+                finish.out_snaps = snaps
             except Exception as exc:
                 # The other half of #2075's diagnosis problem: this site and the decode site above
                 # increment ONE counter, so "finish-failures == calls" could not distinguish "never
                 # armed" from "armed and could not be decoded". Both now say which they were.
                 _note_reason(_reason("FinishBreakpoint()", exc))
                 state["finish_failures"] += 1
+                for st, _, _ in snaps:
+                    st["lost"] += 1
         return False
 
 
@@ -343,6 +479,8 @@ control, control_note = _positive_control()
 source = ""
 if VALUES:
     source = " value-source=dwarf:%d,rax:%d" % (state["src_dwarf"], state["src_rax"])
+if OUT_BYTES:
+    source += " out-bytes=%d" % OUT_BYTES
 print("clock=%s entries=%d/%d window=%s positive-control=%s armed=%d mode=%s calls=%d "
       "finish-failures=%d exited=%d%s"
       % (CLOCK, state["ticks"], TICKS, "complete" if state["ticks"] >= TICKS else "SHORT",
@@ -388,6 +526,30 @@ for count, name in rows:
         if captured != count:
             line += "   (captured %d/%d)" % (captured, count)
     print(line)
+    if OUT_BYTES:
+        # One line per sampled argument, then the diff shapes under it. Every counter is printed,
+        # including the zeros: "changed=0 same-zero=12" (the handler wrote nothing into a buffer
+        # that was zero) and "read=0 unreadable=12" (this tool never saw the bytes) are the two
+        # readings this feature exists to keep apart, and a field that vanishes when zero would
+        # make the second look like the first.
+        printed = False
+        for argname, _ in OUT_ARGS:
+            st = out_stats.get((name, argname))
+            if not st or (st["read"] + st["unreadable"] + st["small"] + st["noreg"]) == 0:
+                continue        # NULL on every call: reported by the fallback line below instead
+            printed = True
+            print("            out %s[%d] calls=%d read=%d changed=%d same-zero=%d same-nonzero=%d "
+                  "null=%d small=%d unreadable=%d lost=%d%s"
+                  % (argname, OUT_BYTES, st["calls"], st["read"], st["changed"], st["same_zero"],
+                     st["same_nonzero"], st["null"], st["small"], st["unreadable"], st["lost"],
+                     " noreg=%d" % st["noreg"] if st["noreg"] else ""))
+            ranked = sorted(st["shapes"].items(), key=lambda kv: -kv[1])
+            for shape, n in ranked[:3]:
+                print("              %s  x%d" % (shape, n))
+            if len(ranked) > 3:
+                print("              +%d more diff shapes" % (len(ranked) - 3))
+        if not printed and any((name, a) in out_stats for a, _ in OUT_ARGS):
+            print("            out: a0 and a1 were NULL on every call — nothing to sample")
 print("distinct=%d total=%d" % (len(rows), sum(c for c, _ in rows)))
 print("HLE_CALLS_END")
 

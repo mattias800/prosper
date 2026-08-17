@@ -31,12 +31,17 @@ python3 tools/hle_calls/hle_calls.py --pid <pid> --filter '^s_'
 PROSPER_GUEST_ARGS=-force-gfx-direct \
 python3 tools/hle_calls/hle_calls.py --ticks 30 --values --filter '^s_' \
     --launch build-linux/boot_trace <DUMP_ROOT>/PPSA05325-app0
+
+# ... and what each handler WROTE through its out-pointer, which a return value cannot say
+python3 tools/hle_calls/hle_calls.py --ticks 60 --values --out-bytes 16 --filter '^s_' \
+    --launch build-linux/boot_trace <DUMP_ROOT>/PPSA05325-app0
 ```
 
 Flags: `--binary` (defaults to `/proc/<pid>/exe`, or the `--launch` program), `--ticks N` (window
 length), `--clock SYMBOL` (what advances the window, default `prosper::k_usleep` — one or more
 entries per frame on every title observed so far), `--filter REGEX`, `--order N`,
-`--inferior-log PATH` (`--launch` only — see below), `--gdb PATH`, `--timeout SECONDS`.
+`--out-bytes N` (sample the out-struct at a0/a1 — see below), `--inferior-log PATH` (`--launch`
+only — see below), `--gdb PATH`, `--timeout SECONDS`.
 
 Output:
 
@@ -173,8 +178,8 @@ Two independent reads answer "what did it return", and the header says which one
 Three limits before believing a number:
 
 - `--values` records the return **register**, never an out-struct. A handler that returns 0 while
-  writing wrong bytes through a pointer argument is invisible — and on this codebase that is a common
-  bug shape.
+  writing wrong bytes through a pointer argument is invisible to it — and on this codebase that is
+  the common bug shape, which is what [`--out-bytes`](#--out-bytes-what-the-handler-wrote) answers.
 - On a handler that longjmps back into its own caller, gdb's finish breakpoint sits at an address the
   landing pad reuses, so it can capture the *landing* value as if it were a return (measured on
   gdb 17.2). A `(captured N/M)` row's other values are therefore suspect, not merely fewer.
@@ -196,6 +201,62 @@ One behaviour change that also reaches `--pid`: the gdb side now passes SIGSEGV/
 straight through without stopping. prosper uses SIGSEGV as a working mechanism (write watches, the
 fault handler) and gdb's default is to stop, so an attach window previously truncated at the first
 guest fault.
+
+## `--out-bytes`: what the handler wrote
+
+A return value cannot see the defect this codebase produces most: **success returned, out-struct
+never written.** `sceSystemServiceGetStatus` aliased to the wrong handler,
+`sceSystemServiceGetDisplaySafeAreaInfo` leaving `ratio` at 0, `sceNpEntitlementAccessGetSkuFlag`
+unregistered with its out pointer untouched, `sceNpTrophy2GetTrophyInfoArray` handing back a garbage
+count that became a 34 GB allocation. Every one of them returns `0`; every one is invisible in a
+`--values` census. A 49-handler census that comes back with no implausible return value has bounded
+its candidate exactly as far as the return register reaches, and no further.
+
+`--out-bytes N` snapshots N bytes at whichever of a0/a1 is a readable pointer, **before the call and
+again at its return**, and reports what changed. Live on *Sonic Origins* (`PPSA05325`), `--out-bytes 16`:
+
+```
+       5  s_syss_getstatus   ret 0x0 x5
+            out a0[16] calls=5 read=5 changed=5 same-zero=0 same-nonzero=0 null=0 small=0 unreadable=0 lost=0
+              @2 70->00 @3 45->00 @6 07->01 @7 45->00 @10 70->00 @11 45->00  x4
+              @4 3f->00 @6 00->01 @7 80->00  x1
+```
+
+`src/hle/hle_service.cpp` says, before any run: `memset(st, 0, 12)` then `st[6] = 1`. The diff shows
+exactly that — byte 6 becomes 1, the other changed bytes are the memset clearing what was there, and
+**nothing at offsets 12–15 moved even though 16 bytes were sampled**, which re-derives the struct's
+width from the observation.
+
+### The five states, and why none of them collapse
+
+The counters are printed in full, zeros included, because the whole value of a before/after diff is
+that it can tell these apart:
+
+| counter | reading |
+|---|---|
+| `changed` | the handler wrote, and the diff shapes say what |
+| `same-zero` | the bytes were zero before and after: the unambiguous **nothing was written** |
+| `same-nonzero` | the bytes already held a value — a handler that wrote exactly that is indistinguishable from one that wrote nothing. The one state this method cannot resolve, and it is named rather than folded into `same-zero` |
+| `null` / `small` / `unreadable` | **nothing was read.** The argument was 0, or too small to be an address (a handle, a size), or pointed at memory gdb could not read. None of these is evidence about writing |
+| `lost` | sampled on entry, no second half (the frame left without returning, or the memory went away). Neither reading |
+
+A field that vanished when zero would let "nothing was read" pass for "nothing was written", which is
+the exact failure this tool exists to avoid. An argument that was NULL on *every* call gets one
+explicit line rather than silence.
+
+Its positive control is the same handler as `--values`', and derivable from the same source:
+`s_user_getevent` writes `{eventType=0, userId=1}` only on the call that delivers the LOGIN, so a
+`--launch` window must show `changed=1` for it, at `@4 …->01`, on the call that returned `0x0`. The
+run above does. In `--pid` mode, `changed=0` is the correct observation, for the same reason the
+value control shows no `0x0` there.
+
+**Scope: a0 and a1 only.** A handler whose out-pointer is a2 or later is not sampled, and no row
+claims otherwise — the absence of a line for such a handler means *this tool did not look*, never
+*the handler wrote nothing*. Widening it is a matter of adding registers to `OUT_ARGS`; the reason it
+is not already wide is cost, two reads per call per argument.
+
+Cost: two memory reads per call per argument, on top of `--values`' second trap. Pair it with
+`--filter`. Maximum width 256 bytes; a wider request is refused rather than clamped.
 
 ## Reading a zero — and the trap this tool was built around
 
@@ -237,6 +298,15 @@ Linux, `gdb` with Python support, `nm`/`c++filt`, and ptrace attach permitted
 (`kernel.yama.ptrace_scope=0`, `--pid` mode only — `--launch` runs its own child). The prosper
 binary must not be **stripped**: the driver enumerates handlers out of the symbol table with `nm`.
 Debug info is *not* required, including for `--values`.
+
+**The target must be non-PIE (`ET_EXEC`)**, which prosper's binaries are under the toolchains this
+project uses. Every breakpoint is armed at the raw link-time address `nm` reports; in a PIE those are
+offsets from a run-time load base, so each one lands in unmapped memory and gdb answers
+`Cannot insert breakpoint N / Cannot access memory at address 0x…` per handler. **The driver checks
+the ELF type and refuses with that explanation** rather than reporting a window that armed nothing.
+This is not hypothetical: Ubuntu's gcc defaults to `-pie` and Fedora's does not, so the same source
+builds differently on the two — measured when this tool's own test passed on Fedora and failed on a
+GitHub `ubuntu-24.04` runner. Rebuild with `-DCMAKE_EXE_LINKER_FLAGS=-no-pie`; the bias-aware fix is #2605.
 
 ## Cost
 
