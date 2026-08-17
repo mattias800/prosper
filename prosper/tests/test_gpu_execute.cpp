@@ -452,7 +452,7 @@ int main() {
                       watch.query() == prosper::host::GuestWriteWatchQuery::Unchanged,
                   "arm cross-submit watch before GPU notification");
             bool preserving_write_observed = false;
-            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                 preserving_write_observed =
                     addr == reinterpret_cast<uint64_t>(watched) + logical_offset + 8u &&
                     size == 16u;
@@ -630,7 +630,7 @@ int main() {
         auto& image = cache[scene];
         image.depth_valid = true;
         image.stencil_valid = true;
-        set_guest_gpu_write_observer([](uint64_t addr, uint64_t size) {
+        set_guest_gpu_write_observer([](uint64_t addr, uint64_t size, const char*) {
             prosper::test::invalidate_persistent_ds_guest_write(addr, size);
         });
         notify_guest_gpu_write(0x300000, 0x8000);

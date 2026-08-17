@@ -886,15 +886,110 @@ Three 4K DCC-compressed **sampled** images remain unsupported (fmt 1/4/9). That 
 resource from the storage image above — the storage image is not compressed. Whether the composite
 depends on those three has not been established.
 
-### The instrument that would answer this, and why it has not yet
+### The instrument that would answer this — THREE sequential gates, each masking the next (2026-08-16)
 
 `PROSPER_GRAB_BUNDLE_AFTER_MS` on `prosper-app` is the documented fastest loop for "why does this
-frame look wrong". It was tried at 170 s with `PROSPER_CAPTURE_FRAMES=1` and again with 16, and both
-report **"the capture window contained no GPU submits"** while the same run shows 271 `[agc]`, 60
-`[compute]` and 43 `[render]` lines and reaches 191 s of route. So the capture window and the
-submits are not lining up, and **that mismatch is itself the next thing to understand** — without a
-bundle there is no draw-level view of the frame, and every conclusion above is from log statistics
-rather than from the frame's actual contents.
+frame look wrong", and on this title it fails **three times, for unrelated reasons**. Each failure
+reads as "frame capture does not work on GTA V", and because they are **sequential** every fix reveals
+the next one rather than the bundle: clear the empty window and you meet the provenance abort, clear
+provenance and you meet the byte budget. That masking is why this took several runs to walk, and why
+the third gate — which no setting can clear — was the last to be seen.
+
+**Gate 1 — the capture window is a PRESENT COUNT, and a present count is not a unit of time.**
+Earlier attempts at 170 s with `PROSPER_CAPTURE_FRAMES=1` and 16 reported *"the capture window
+contained no GPU submits"*, which read as a window/submit mismatch of unknown kind. The newer
+diagnostic names it exactly:
+
+```
+[grab] frame-bundle: during this window the submit hook was reached=0, 0 while inactive,
+       0 while not capturing; window was open 1 ms for 1 presents      # FRAMES=1
+       ... window was open  6 ms for   8 presents                      # FRAMES=8
+       ... window was open 38 ms for  64 presents                      # FRAMES=64
+```
+
+`reached=0` settles that nothing was mis-classified — the hook never fired. The rate is the finding:
+this title flips in **bursts**, ~0.6 ms per present against a ~23–25/s average, so a window's
+wall-clock duration is effectively random and usually far too short to contain a submit. Widening the
+count does not reliably help, because a burst consumes it: 64 presents elapsed in 38 ms and saw
+nothing.
+
+**The fix is `PROSPER_CAPTURE_WAIT_FOR_SUBMITS=1`** (`gpu_timeline.cpp`, opt-in), which extends the
+window until at least one submit is captured, bounded by the same 240-present ceiling, and never
+shortens a window that already worked. This was already diagnosed on this title under #2549 with the
+same burst measurements — recorded here because three separate frame counts were tried before that
+flag was found, and the failure message points at `PROSPER_CAPTURE_FRAMES` instead.
+
+**Gate 2 — the bundle then aborts on indirect-pointer provenance.**
+
+```
+[grab] frame-bundle: submit 34146 failed (indirect-pointer relocation lacks exact compute
+       provenance); grab aborted
+```
+
+`validate_captured_indirect_pointer_relocations` requires capture format ≥ v53, a captured recompile
+config, an in-range raw shader index, **and exactly one** indirect-pointer carrier. GTA V fails one of
+these, and until 2026-08-16 the message was the same sentence for all four, so the log could not say
+which arm to pursue; it now names the failing precondition and prints the carrier/marker counts.
+
+**`PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1` accepts it and writes the bundle**, with the tool
+stating the limit itself: *"THIS BUNDLE IS FOR INSPECTION, NOT FAITHFUL REPLAY."* That is the right
+trade for the question in this document — the bundle is wanted for its **resource tables and
+descriptors**, not to reproduce the frame — but a replayed frame from such a bundle is not evidence
+about rendering, and must not be used as any.
+
+**Gate 3 — GTA V's working set exceeds the F9 grab's 2 GiB default budget.**
+
+```
+[grab] frame-bundle: submit 42862 failed (frame bundle unique bytes 2155499889
+       exceeded limit 2147483648); grab aborted        # FRAMES=240, died at frame 153
+[grab] frame-bundle: submit 35716 failed (frame bundle unique bytes 2236660079
+       exceeded limit 2147483648); grab aborted        # FRAMES=4 + WAIT_FOR_SUBMITS
+```
+
+**Read those two together, because the pair is the finding:** 153 frames cost 2.155 GB and *four*
+frames cost 2.237 GB. The bytes are therefore **not** per-frame deltas — they are dominated by the
+resident working set the first captured frame pulls in, so shrinking the window does not shrink the
+bundle and there is no frame count that fits under 2 GiB. (An earlier revision of this section
+divided 42,861 submits by 153 frames and published "≈ 14 MB per frame" as a sizing rule. That
+arithmetic is right and the inference from it is wrong: the 4-frame run falsifies it outright.)
+
+The lever is the budget, not the window — **`PROSPER_CAPTURE_BUNDLE_MAX_MB`**, 64..3072 MiB against a
+2048 MiB default — **and on this title it is not enough at its maximum:**
+
+```
+FRAMES=240, limit 2048 MiB -> 2,155,499,889 bytes   (died at frame 153)
+FRAMES=4,   limit 2048 MiB -> 2,236,660,079 bytes
+FRAMES=4,   limit 3072 MiB -> 3,351,980,610 bytes
+FRAMES=1,   limit 3072 MiB -> 3,269,369,026 bytes   <- ONE frame, over the ceiling
+```
+
+A single frame costs 3.27 GB against a 3072 MiB (3.22 GB) hard clamp, so **there is currently no
+setting under which an F9 bundle of GTA V completes.** The last row is the one that matters: it is not
+a window-size problem and cannot be tuned away. (These are overshoot values at the point of abort,
+not totals, and they vary run to run, so the true working-set size is unknown and above 3.35 GB.)
+
+The fix worth building is not a bigger number. The question a bundle is wanted for here — *which
+compute program binds the empty composite tap* — needs **resource tables and descriptors, not pixel
+payloads**; a metadata-only capture would fit inside any budget and answer it directly. Tracked as
+#2554.
+
+The three gates are **sequential and each masks the next**, which is why this took several runs to
+walk: widen the window and you meet provenance; clear provenance and you meet the size limit; and
+widening the window is the wrong lever for gate 1 anyway. The combination that gets through is a
+**small** window that waits for submits, plus the override:
+
+```bash
+PROSPER_CAPTURE_FRAMES=1 PROSPER_CAPTURE_WAIT_FOR_SUBMITS=1 \
+PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT=1 PROSPER_CAPTURE_BUNDLE_MAX_MB=3072 \
+PROSPER_GRAB_BUNDLE_AFTER_MS=380000 PROSPER_CAPTURE_DIR=~/<dir> \
+PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700 \
+PROSPER_PAD_SCRIPT=@scripts/gta5/reach-story-mode.pad \
+SDL_VIDEODRIVER=offscreen ./prosper-app <DUMP_ROOT>/PPSA04263-app0
+```
+
+Until a bundle exists, every conclusion in this section is from log statistics rather than from the
+frame's actual contents.
 
 ## The hang is NOT the only blocker — two more, measured (2026-08-15)
 
@@ -3293,6 +3388,132 @@ plausibly selects that path. That is a different hunt from everything above — 
 question, not a GPU one. It shares the frontier with one unfinished measurement: the image ops inside
 the failing compute kernels that no instrument has resolved (see the section below for exactly which,
 and why their null does not count yet).
+
+### The failing kernels bind 4K WRITE-capable storage images (2026-08-17)
+
+The section below draws the census boundary at "the unresolved operations inside the failing compute
+kernels remain outside the census". This looks *inside* that boundary for the first time, using a
+diagnostic that was already ungated and already in every routed log: `[compute-table]`, which dumps a
+program's whole resource table once per program that fails to recompile.
+
+**Two failing programs bind a storage image of exactly 33,177,600 bytes = 3840 × 2160 × 4** — the
+size of a 4K f11f11f10 surface, the very thing the composite's base tap is and does not contain:
+
+| program | binding | guest address | reject |
+| --- | --- | --- | --- |
+| `0x2042f49a00` | 6 | `0x204da00000`, **identical on all four runs** | `pc=16`, MIMG `op=0x1`, `mode=unresolved-operand` |
+| `0x205b557e00` | 13 | run-local (`0x2070f20000`, `0x2072f00000`) | `pc=314`, MIMG `op=0x0`, `srt_tag=0xa0`, `key_res=null pc_res=null` |
+
+`class=4` is `StorageImage` — read/written by `image_load`/`image_store` **without a sampler**, i.e.
+the class a compute producer writes through. `0x205b557e00` also samples a 3840×2160 renderer-owned
+RTT that reports *"has no readable snapshot -> dispatch skipped (#590)"*, so it reads a 4K surface and
+writes a 4K surface, and never runs.
+
+**This is the shape of the missing producer, and it is not proof.** What is established: failing
+kernels do bind 4K write-capable images, so the population the census excluded is not empty and is not
+irrelevant. What is *not* established: that either surface **is** the composite's base tap. Addresses
+are run-local, the tap was identified in an older run, and nothing here correlates the two — the
+honest statement is a size and class match on a population that was previously unexamined.
+
+**The failing population is also much larger than this document has been recording.** The reject
+census table above lists 13 programs; a routed boot has **30, 32, 36 and 35 distinct failing programs**
+across four runs on 2026-08-17. So "the seven failing kernels" understates it by roughly a factor of
+five, and any statement of the form "all the failing kernels were cleared" should be read against a
+count that was never that small.
+
+#### Watching that surface: the only WRITE-class binding of it came from a dispatch that did not run
+
+`PROSPER_COMPUTE_BINDS=204da00000` on a routed boot, 219 rows, 4 distinct programs. Two of them are
+the whole result:
+
+```
+[compute-binds] 0x204da00000 bound by program=0x2042f49a00 binding=6 class=4 fetch_pc=21
+                addr=0x204da00000 size=33177600 3840x2160 outcome=partial-recompile-empty
+[compute-binds] 0x204da00000 bound by program=0x205b557e00 binding=7 class=2 fetch_pc=19
+                addr=0x204da00000 size=33177600 3840x2160 outcome=executed
+```
+
+One 4K surface. `class=4` is `StorageImage`, the write-capable class; `class=2` is `Texture`,
+sampled-only. **The write-class binding is on a dispatch whose recompile failed — it did not run —
+while the sampled binding is on a dispatch that executed.** Across the whole run no executed dispatch
+was observed binding this surface write-class.
+
+Two qualifications, because both matter for how far this can be pushed:
+
+- **Recompile success is per-dispatch, not per-program.** Both programs also appear in the skip list
+  (`0x2042f49a00` at `pc=16` MIMG `op=0x1`; `0x205b557e00` at `pc=314` MIMG `op=0x0`), and a program's
+  resource table differs between dispatches, so the same code address can resolve in one invocation
+  and not in another. The claim is therefore about *observed bindings*, not about programs.
+- **This surface has not been shown to be the composite's base tap.** It is 4K, 33,177,600 bytes, and
+  written by nothing that ran — the right shape, on the right scale, in the population the census
+  excluded. That is a lead, not an identification.
+
+**The remaining 217 rows are instrument noise worth knowing about:** they come from two programs
+binding 256 MB constant buffers whose spans happen to *contain* the watched address. That is the
+documented "match the whole span, not the base" behaviour doing its job, but it means this instrument
+needs its output filtered by `class=` and by an exact `addr=` match before the signal is visible.
+
+**This row existed only because of the fix in `acaea037`.** Before it, `report_compute_binding_watch`
+returned from the `item.spirv.empty()` branch without reporting, so a recompile-failed dispatch
+produced no row at all — and this census would have shown the executed *consumer* and nothing else,
+i.e. exactly the false "no compute producer writes this surface" conclusion. The reviewer's finding
+that the instrument's null did not cover failing shaders is what made this visible.
+
+**Next step, now concrete:** make `0x2042f49a00` recompile. Its reject is a single named instruction —
+`pc=16`, MIMG `op=0x1` (`IMAGE_LOAD_MIP`), `mode=unresolved-operand`, `dmask=0x1 dim=1 glc=1` — and
+the `[mimg-mip-why]` lines for that program report `proven_at_use=1 mip_vgpr=v2 in_zero_set=1
+exec_pristine=1 cfg_known=1` at pcs 16/18/21/25, so the mip level is proven and the failure is the
+descriptor, not the mip analysis. Then re-run this census and see whether the write-class binding
+becomes `outcome=executed`.
+
+### What invalidates the retained depth — 100% of it is prosper's own writeback (2026-08-17)
+
+**Read the retraction first.** An earlier revision of this section reported "~81% self-inflicted" and
+"1,678 **genuine guest** HTILE writes" for the main depth, and named the frontier as the semantics of
+those guest writes. **Both numbers were wrong and the frontier was misdirected.** The instrument had a
+second hole: `notify_guest_gpu_write_preserving_bytes` knew its own classification, printed it to the
+immediate watch, and then called the observer with only `(addr, size)` — so all four byte-preserving
+compute writeback paths arrived at the queue as the **default**, and the default was named `gpu`. A
+bucket that means "nobody said" was therefore reported as "genuinely the guest".
+
+With the origin carried as data across the notification/observer boundary, and the default renamed to
+`unknown` so it can never again be mistaken for a producer:
+
+| origin | count |
+| --- | --- |
+| `compute-writeback(image-guest-bytes)` | 15,017 |
+| `compute-writeback(cpu-fill)` | 10,234 |
+| `gpu-preserving` | 5,590 |
+| `unknown` (unattributed) | **0** |
+
+**30,841 of 30,841 DS invalidations are prosper invalidating its own caches from its own writebacks.
+Not 81% — all of them. There are no genuinely-guest DS invalidations on this route at all.**
+
+For the main depth `dr=0x2052ac0000`, 2,276 invalidations, every one ours:
+
+| aspect hit | origin | count |
+| --- | --- | --- |
+| `htile_hit=1` | `gpu-preserving` | 1,542 |
+| `htile_hit=1` | `compute-writeback(cpu-fill)` | 367 |
+| `htile_hit=0` | `compute-writeback(cpu-fill)` | 367 |
+
+Its depth range is still never directly written — every loss of the plane arrives through the
+conservative "an HTILE overlap may describe both aspects" rule. But the writer is **us**, and 1,542 of
+those come from a path whose whole contract is that *the guest bytes were not modified*.
+
+**So the frontier is not the guest's HTILE semantics.** It is: why does prosper's own byte-preserving
+writeback overlap this depth surface's HTILE range at all, and should a write that provably preserves
+guest bytes invalidate a detached Vulkan depth image? The second half already has an answer on record
+and it is **yes, it must** — byte equality with guest memory says nothing about equality with a
+renderer-owned image the renderer has since drawn into, and *Dead Cells* #611 is the counterexample
+where sparing it makes gameplay geometry disappear. That is why no preservation policy is proposed
+here. The open question is the first half.
+
+**A default is not a measurement.** This is the third time on this title that a default or
+unattributed value was read as a positive finding — the others being a black frame compared against a
+mismatched trigger, and an `htile_hit=0` aggregate dominated by cube shadow maps. In all three the
+number was real and the population behind it was not what the label said. Name unattributed buckets
+`unknown`, and check what a "no origin" case actually means before counting it as evidence.
 
 ### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 

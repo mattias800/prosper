@@ -8430,7 +8430,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             layout_ms += std::chrono::duration<double, std::milli>(layout_done - pack_done).count();
             if (trace) bi.after_hash = fnv1a(destination, bi.guest_bytes);
             const auto notify_start = ComputeClock::now();
+            // Name the writer. "a guest write covers this surface" and "prosper's own compute
+            // writeback covers this surface" are different facts, and only the second says the
+            // emulator is invalidating its own caches. Everything reaching the DS invalidation path
+            // used to report the default `gpu`, which cannot distinguish them.
+            set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
             notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
+            set_guest_gpu_write_origin(nullptr);
             if (!r->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    r->gpu_addr, bi.guest_bytes,
@@ -8442,7 +8448,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         false, std::memory_order_acq_rel);
                 if (!leave_compressed_for_test) {
                     std::memset(bi.dcc_metadata, 0xff, bi.dcc_metadata_bytes);
+                    // This announcement lands on `metadata_addr`, which for a DEPTH surface is its
+                    // HTILE base -- and the DS cache treats an HTILE overlap as "may describe both
+                    // aspects" and invalidates depth as well as stencil. So this reset can discard a
+                    // retained depth image. Tagged so that consequence is attributable rather than
+                    // appearing as an anonymous `gpu` write; whether it SHOULD invalidate is a
+                    // separate question that needs the operation's real HTILE semantics proven.
+                    set_guest_gpu_write_origin("compute-writeback(metadata-reset)");
                     notify_guest_gpu_write(r->metadata_addr, bi.dcc_metadata_bytes);
+                    set_guest_gpu_write_origin(nullptr);
                     if (!r->dcc_metadata_host_data && writer_provenance_enabled())
                         record_guest_write(GuestWriterKind::ComputeBuffer,
                                            r->metadata_addr, bi.dcc_metadata_bytes,

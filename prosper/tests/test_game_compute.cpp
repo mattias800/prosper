@@ -930,7 +930,7 @@ int main() {
     ComputeItem cpu_fill_item = item;
     cpu_fill_item.cpu_fast_path = ComputeCpuFastPath::FillSgprUvec4;
     uint32_t cpu_fill_write_notifications = 0;
-    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
         if (addr == buffer.gpu_addr && size == buffer.size)
             ++cpu_fill_write_notifications;
     });
@@ -1011,7 +1011,7 @@ int main() {
     }
 
     uint32_t unchanged_write_notifications = 0;
-    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
         if (addr == buffer.gpu_addr && size == buffer.size)
             unchanged_write_notifications++;
     });
@@ -1078,7 +1078,7 @@ int main() {
             atomic_item.code_addr = 0x500525200;
 
             uint64_t atomic_notified_bytes = 0;
-            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes) {
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t bytes, const char*) {
                 if (addr == atomic_image.gpu_addr) atomic_notified_bytes = bytes;
             });
             CHECK(prosper::frontend::execute_live_compute_items({atomic_item}),
@@ -1165,7 +1165,7 @@ int main() {
               "arm guest-byte watch around retained compute-buffer result");
 #endif
         uint32_t large_repeat_notifications = 0;
-        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
             if (addr == large_buffer.gpu_addr && size == large_buffer.size)
                 ++large_repeat_notifications;
         });
@@ -1186,7 +1186,7 @@ int main() {
 
         large_result[0] ^= 0xffffffffu;
         uint32_t large_repair_notifications = 0;
-        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
             if (addr == large_buffer.gpu_addr && size == large_buffer.size)
                 ++large_repair_notifications;
         });
@@ -1349,7 +1349,7 @@ int main() {
               gds_replay.computes[1].resources->resources[0].host_data,
           "capture v22 materializes one persistent GDS instance across ordered dispatches");
     uint32_t gds_notifications = 0;
-    set_guest_gpu_write_observer([&](uint64_t, uint64_t) { ++gds_notifications; });
+    set_guest_gpu_write_observer([&](uint64_t, uint64_t, const char*) { ++gds_notifications; });
     CHECK(prosper::frontend::execute_live_compute_items(gds_replay.computes),
           "production live backend executes captured GDS stores");
     set_guest_gpu_write_observer({});
@@ -3168,7 +3168,7 @@ int main() {
             return true;
         });
     bool writable_rtt_published = false;
-    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
         writable_rtt_published |= addr == writable_addr && size == writable_rtt_guest.size();
     });
     const std::vector<uint32_t> writable_spirv = recompile_valu(
@@ -3543,7 +3543,7 @@ int main() {
                 prosper::frontend::live_compute_storage_result_snapshot_bytes();
 #endif
             uint32_t repeated_write_notifications = 0;
-            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                 if (addr == fdst.gpu_addr && size == fdst.size)
                     ++repeated_write_notifications;
             });
@@ -3899,7 +3899,7 @@ int main() {
                 CHECK(fill_equals(after_prove),
                       "failed storage readback does not publish newer image bytes to the guest");
                 uint32_t changed_write_notifications = 0;
-                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                     if (addr == fdst.gpu_addr && size == fdst.size)
                         ++changed_write_notifications;
                 });
@@ -3931,7 +3931,7 @@ int main() {
                     prosper::frontend::live_compute_storage_result_snapshot_bytes();
 #endif
                 uint32_t recovered_repeat_notifications = 0;
-                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+                set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                     if (addr == fdst.gpu_addr && size == fdst.size)
                         ++recovered_repeat_notifications;
                 });
@@ -3965,7 +3965,7 @@ int main() {
 #endif
             fill_guest[0] ^= 0xff;
             uint32_t repaired_write_notifications = 0;
-            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                 if (addr == fdst.gpu_addr && size == fdst.size)
                     ++repaired_write_notifications;
             });
@@ -4221,7 +4221,7 @@ int main() {
                 reinterpret_cast<uint64_t>(raw_guest), raw_guest_bytes);
 #endif
             uint32_t raw_repeat_notifications = 0;
-            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                 if (addr == raw_dst.gpu_addr && size == raw_guest_bytes)
                     ++raw_repeat_notifications;
             });
@@ -4240,7 +4240,7 @@ int main() {
 
             raw_guest[0] ^= 0xff;
             uint32_t raw_repair_notifications = 0;
-            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
                 if (addr == raw_dst.gpu_addr && size == raw_guest_bytes)
                     ++raw_repair_notifications;
             });

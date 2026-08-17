@@ -502,7 +502,7 @@ int main() {
         dma[6] = 0; // selectors are retained for diagnostics; both endpoints are mapped memory
 
         uint64_t observed_addr = 0, observed_size = 0;
-        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
             observed_addr = addr; observed_size = size;
         });
         GpuState st; run_cb(dma, 7, st);
@@ -558,7 +558,7 @@ int main() {
         dma[5] = sizeof(source);
         dma[6] = 1u | (3u << 8) | kDmaDataAddressSource;
         bool notified = false;
-        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t, const char*) { notified = true; });
         GpuState st; run_cb(dma, 7, st);
         set_guest_gpu_write_observer({});
         CHECK(st.dma_copies.size() == 1 && st.dma_copies[0].dst == offset &&
@@ -801,7 +801,7 @@ int main() {
         stream[9] = (uint32_t)src; stream[10] = (uint32_t)(src >> 32);
         stream[11] = sizeof(source); stream[12] = 0;
         bool source_invalidated = false;
-        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t) {
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t, const char*) {
             if (addr == src) source_invalidated = true;
         });
         set_live_target_byte_range_reader(
@@ -1325,7 +1325,7 @@ int main() {
                 gpu_stream[5] = sizeof(gpu_source);
                 bool notified = false;
                 set_guest_gpu_write_observer(
-                    [&](uint64_t address, uint64_t size) {
+                    [&](uint64_t address, uint64_t size, const char*) {
                         notified |= address == gpu_dst && size == sizeof(gpu_source);
                     });
                 GpuState read_only_dma; run_cb(gpu_stream, 7, read_only_dma);
@@ -1344,7 +1344,7 @@ int main() {
                 gpu_stream[5] = sizeof(failed_gpu_source);
                 notified = false;
                 set_guest_gpu_write_observer(
-                    [&](uint64_t, uint64_t) { notified = true; });
+                    [&](uint64_t, uint64_t, const char*) { notified = true; });
                 const uint64_t trap_before_failed_write = prosper_gpu_write_trap_matches();
                 prosper_dma_backing_write_fail_once_for_test();
                 GpuState failed_backing_dma; run_cb(gpu_stream, 7, failed_backing_dma);
@@ -1361,7 +1361,7 @@ int main() {
                 gpu_stream[5] = 3 * sizeof(uint32_t);
                 notified = false;
                 set_guest_gpu_write_observer(
-                    [&](uint64_t address, uint64_t size) {
+                    [&](uint64_t address, uint64_t size, const char*) {
                         notified |= address == gpu_dst && size == 3 * sizeof(uint32_t);
                     });
                 GpuState read_only_fill; run_cb(gpu_stream, 7, read_only_fill);
@@ -1386,7 +1386,7 @@ int main() {
                 gpu_stream[5] = 16;
                 notified = false;
                 set_guest_gpu_write_observer(
-                    [&](uint64_t address, uint64_t size) {
+                    [&](uint64_t address, uint64_t size, const char*) {
                         notified |= address == overlap_dst && size == 16;
                     });
                 GpuState overlapping_dma; run_cb(gpu_stream, 7, overlapping_dma);
@@ -1403,7 +1403,7 @@ int main() {
                 gpu_stream[5] = sizeof(gpu_source);
                 notified = false;
                 set_guest_gpu_write_observer(
-                    [&](uint64_t, uint64_t) { notified = true; });
+                    [&](uint64_t, uint64_t, const char*) { notified = true; });
                 GpuState crossing_dma; run_cb(gpu_stream, 7, crossing_dma);
                 set_guest_gpu_write_observer({});
                 CHECK(*boundary_marker == 0x55667788u && !notified,
@@ -1448,7 +1448,7 @@ int main() {
         dma[3] = (uint32_t)bad_src; dma[4] = (uint32_t)(bad_src >> 32);
         dma[5] = 8;
         bool notified = false;
-        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t, const char*) { notified = true; });
         GpuState st; run_cb(dma, 7, st);
         set_guest_gpu_write_observer({});
         CHECK(target == 0x8877665544332211ull,
@@ -1469,7 +1469,7 @@ int main() {
         dma[5] = sizeof(target);
         dma[6] = kDmaDataAddressSource;
         bool notified = false;
-        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t, const char*) { notified = true; });
         GpuState st; run_cb(dma, 7, st);
         set_guest_gpu_write_observer({});
         CHECK(st.dma_copies.size() == 1 && target == 0x1122334455667788ull && !notified,
@@ -1510,7 +1510,7 @@ int main() {
                 dma[3] = (uint32_t)src; dma[4] = (uint32_t)(src >> 32);
                 dma[5] = sizeof(source);
                 bool notified = false;
-                set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+                set_guest_gpu_write_observer([&](uint64_t, uint64_t, const char*) { notified = true; });
                 GpuState st; run_cb(dma, 7, st);
                 set_guest_gpu_write_observer({});
                 CHECK(page[0] == 0x5A && page[sizeof(source) - 1] == 0x5A,
@@ -1521,7 +1521,7 @@ int main() {
                 dma[4] = 0;
                 dma[5] = 3 * sizeof(uint32_t);
                 notified = false;
-                set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+                set_guest_gpu_write_observer([&](uint64_t, uint64_t, const char*) { notified = true; });
                 GpuState fill; run_cb(dma, 7, fill);
                 set_guest_gpu_write_observer({});
                 CHECK(page[0] == 0x5A && page[3 * sizeof(uint32_t) - 1] == 0x5A,
@@ -2206,6 +2206,45 @@ int main() {
             }
         }
         CHECK(true, "label_hist_report keeps every entry whole across caps 40..400");
+    }
+
+    // The guest-write ORIGIN must cross the notification/observer boundary AS DATA. The observer may
+    // queue the write for a drain that happens later, on another thread, where the producer's
+    // thread-local is long gone -- so anything the notifier knows and does not hand over is lost.
+    //
+    // This is a regression for a defect that was invisible to the immediate view: the byte-preserving
+    // notifier printed `gpu-preserving` to the watch and then called the observer with only
+    // (addr, size), so every byte-preserving compute writeback reached the queue as the unattributed
+    // default. A census then reported those as genuine guest writes -- the exact distinction the field
+    // exists to draw.
+    {
+        struct Seen { uint64_t addr = 0, size = 0; std::string origin; };
+        std::vector<Seen> queued;
+        set_guest_gpu_write_observer(
+            [&](uint64_t addr, uint64_t size, const char* origin) {
+                // Model the delayed consumer: copy what was handed over, and never consult the
+                // thread-local. A drain reading the thread-local is precisely the bug.
+                queued.push_back(Seen{addr, size, origin ? origin : "<null>"});
+            });
+
+        set_guest_gpu_write_origin("test-tagged-writer");
+        notify_guest_gpu_write(0x1000, 64);
+        set_guest_gpu_write_origin(nullptr);          // producer's tag is gone before we read
+
+        notify_guest_gpu_write_preserving_bytes(0x2000, 128);
+        notify_guest_gpu_write(0x3000, 32);           // untagged: must be unattributed, not a producer
+
+        set_guest_gpu_write_observer({});
+
+        CHECK(queued.size() == 3, "every notification reaches the observer");
+        CHECK(queued.size() == 3 && queued[0].origin == "test-tagged-writer",
+              "a tagged write carries its producer's origin across the observer boundary");
+        CHECK(queued.size() == 3 && queued[1].origin == "gpu-preserving",
+              "the byte-preserving notifier forwards its own classification rather than dropping it");
+        CHECK(queued.size() == 3 && queued[2].origin == std::string("unknown"),
+              "an untagged write is UNATTRIBUTED, never named after a producer");
+        CHECK(queued.size() == 3 && queued[1].addr == 0x2000 && queued[1].size == 128,
+              "the preserving notification keeps its exact range");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

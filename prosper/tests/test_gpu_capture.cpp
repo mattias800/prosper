@@ -2865,7 +2865,7 @@ int main(int argc, char** argv) {
             output = current_render_target;
             return LiveTargetByteReadResult::Success;
         });
-    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
         invalidations.emplace_back(addr, size);
     });
     execute_ordered_items(
@@ -2944,7 +2944,7 @@ int main(int argc, char** argv) {
                                              operation.command_order});
     std::array<uint8_t, 4> gds_observed{};
     invalidations.clear();
-    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size, const char*) {
         invalidations.emplace_back(addr, size);
     });
     execute_ordered_items(
