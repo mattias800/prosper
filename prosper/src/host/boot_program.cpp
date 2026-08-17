@@ -188,7 +188,7 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
         unsigned slot = 0;
         for (const auto& path : extra) {
             if (slot >= BOOT_PLUGIN_AUTO_SLOTS) {
-                say("plugin auto-link: no free base slot for %s (max %u) — NOT linked\n",
+                say("plugin auto-link: no free base slot for %s (max %u) -- NOT linked\n",
                        path.c_str(), BOOT_PLUGIN_AUTO_SLOTS);
                 continue;
             }
@@ -240,7 +240,7 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // Loud, self-describing report of every auto-linked plugin the linker refused: which module was
     // dropped, the exact NID that collided, and which already-linked module owns it.
     for (const auto& s : p.skipped_modules)
-        printf("plugin auto-link: SKIPPED %s — it exports NID %s, already provided by %s\n",
+        printf("plugin auto-link: SKIPPED %s -- it exports NID %s, already provided by %s\n",
                s.path.c_str(), s.nid.c_str(), s.owner_path.c_str());
     // Aliased exports (#1635). first-wins is the policy and is unchanged; being silent about it was
     // the defect. Both modules stay mapped and both init_arrays run, and sceKernelDlsym consults the

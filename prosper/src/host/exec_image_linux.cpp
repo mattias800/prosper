@@ -2358,7 +2358,7 @@ namespace {
                 char cb2[224];
                 int cn2 = snprintf(cb2, sizeof cb2,
                     "[prosper] CONCURRENT WORKER-THREAD FAULT: tid=%ld sig=%d addr=%p rip=0x%llx "
-                    "(image+0x%llx) — full dump suppressed, tid=%ld is already reporting\n",
+                    "(image+0x%llx) -- full dump suppressed, tid=%ld is already reporting\n",
                     fc.tid, fc.sig, (void*)(uintptr_t)fc.addr, (unsigned long long)fc.rip,
                     (unsigned long long)(g_base && fc.rip >= g_base ? fc.rip - g_base : fc.rip),
                     expected);
@@ -2456,7 +2456,7 @@ namespace {
                 // allocation, and this TU already calls it unqualified.
                 const char* tcb = !guest_tls_enabled() ? "n/a (guest %fs not enabled)"
                                 : saved_guest_fs       ? "yes"
-                                : "no (host TCB — a leak only if this thread should have had a guest TCB)";
+                                : "no (host TCB -- a leak only if this thread should have had a guest TCB)";
 #endif
                 char tb[224];
                 int t = snprintf(tb, sizeof tb,
@@ -3167,7 +3167,7 @@ void install_trap_handler() {
         const long parsed = strtol(s, &end, 0);
         if (end == s || (end && *end))
             fprintf(stderr, "[lazy-commit] NOT ARMED: PROSPER_LAZY_COMMIT_STRICT='%s' is not a "
-                            "number — the lazy commit stays enabled\n", s);
+                            "number -- the lazy commit stays enabled\n", s);
         else
             g_lazy_commit_strict = parsed != 0;
     }
@@ -3362,7 +3362,7 @@ void arm_hwbp() {
     char b[160];
     if (fd < 0) {
         int n = snprintf(b, sizeof b,
-                         "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — %s\n",
+                         "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) -- %s\n",
                          (unsigned long long)(g_hwbp_addr - g_base), errno,
                          already_anchored ? "this primary thread not armed"
                                           : "HW bp disabled");

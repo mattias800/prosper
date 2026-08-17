@@ -218,15 +218,15 @@ int main(int argc, char** argv) {
                     loser_in_second  = a.loser  >= b2;
                 }
                 CHECK(winner_in_first && loser_in_second,
-                      "#1635: first-wins — the winner is in the earlier image, the loser in the later");
+                      "#1635: first-wins -- the winner is in the earlier image, the loser in the later");
             }
         } else {
-            printf("  [skip] %s has no Media/Plugins/PSN.prx — link wiring not exercised\n",
+            printf("  [skip] %s has no Media/Plugins/PSN.prx -- link wiring not exercised\n",
                    dump_root.c_str());
             skipped_link_wiring = true;   // #1675: 21 of 30 local dumps ship no PSN.prx
         }
     } else {
-        printf("  [skip] no game dump argument — link wiring not exercised\n");
+        printf("  [skip] no game dump argument -- link wiring not exercised\n");
         skipped_link_wiring = true;
     }
 

@@ -168,19 +168,19 @@ void check_nv12_sizes() {
     // implementation would agree with any implementation, including a wrong one.
     static const Case cases[] = {
         // w    h     exact                                    shorthand   short by
-        {  64,  32,  64ull * 32 + 2 * 32 * 16,  "even x even — the shorthand agrees here" },
+        {  64,  32,  64ull * 32 + 2 * 32 * 16,  "even x even, the shorthand agrees"       },
         {  65,  32,  65ull * 32 + 2 * 33 * 16,  "ODD width  (3136 vs 3120, short by 16)"  },
         {  64,  33,  64ull * 33 + 2 * 32 * 17,  "ODD height (3200 vs 3168, short by 32)"  },
         {  65,  33,  65ull * 33 + 2 * 33 * 17,  "BOTH odd   (3267 vs 3217, short by 50)"  },
         { 1920, 1081, 1920ull * 1081 + 2 * 960 * 541,
-          "1920x1081 — EVEN PRODUCT, and the shorthand is still 960 short" },
+          "1920x1081 -- EVEN PRODUCT, and the shorthand is still 960 short" },
         { 1920, 1088, 1920ull * 1088 + 2 * 960 * 544, "the live PPSA19991 geometry" },
         { 3840, 2160, 3840ull * 2160 + 2 * 1920 * 1080, "the live PPSA05325 geometry" },
     };
     for (const Case& c : cases) {
         const uint64_t got = video::nv12_bytes(c.w, c.h);
         char msg[192];
-        std::snprintf(msg, sizeof msg, "nv12_bytes(%u,%u) == %llu — %s", c.w, c.h,
+        std::snprintf(msg, sizeof msg, "nv12_bytes(%u,%u) == %llu -- %s", c.w, c.h,
                       (unsigned long long)c.exact, c.what);
         CHECK(got == c.exact, msg);
         // The discriminator, stated as its own assertion so a reader can see WHICH cases the
@@ -195,7 +195,7 @@ void check_nv12_sizes() {
     }
     // Widening: `2*((w+1)/2)` on a 32-bit `w` at UINT32_MAX would wrap to 0 before the multiply.
     CHECK(video::nv12_bytes(0xFFFFFFFFu, 2) == 0xFFFFFFFFull * 2 + 2 * 0x80000000ull * 1,
-          "nv12_bytes widens before arithmetic — no 32-bit wrap at the top of the range");
+          "nv12_bytes widens before arithmetic -- no 32-bit wrap at the top of the range");
 }
 
 int main(int argc, char** argv) {

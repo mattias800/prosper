@@ -365,7 +365,7 @@ void dcb_diag_tick(bool was_full) {
     if (was_full) { g_dcb_diag_fulls.fetch_add(1, std::memory_order_relaxed); return; }
     const uint64_t n = g_dcb_diag_packets.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1)
-        fprintf(stderr, "[dcbdiag] armed: DCBFULL=%d DCBWIN=%u — this line proves the probe is live; "
+        fprintf(stderr, "[dcbdiag] armed: DCBFULL=%d DCBWIN=%u -- this line proves the probe is live; "
                         "a run without it measured nothing\n",
                 dcb_diag_full() ? 1 : 0, dcb_diag_win());
     // Every 2^14 packets, not 2^20: these runs are `timeout`-bounded, so SIGTERM skips the exit
@@ -462,7 +462,7 @@ inline bool patch_check(uint32_t* cmd, uint32_t want_r, const char* who) {
     uint32_t r = (cmd[0] >> 2) & (R_NUM - 1u), op = (cmd[0] >> 8) & 0xffu;
     if (op == IT_NOP && r == want_r) return true;
     if (patch_budget_ok(who))
-        fprintf(stderr, "[agc] %s: header 0x%08x is not the expected packet (op=0x%x r=0x%x want r=0x%x) — patch refused\n",
+        fprintf(stderr, "[agc] %s: header 0x%08x is not the expected packet (op=0x%x r=0x%x want r=0x%x) -- patch refused\n",
                 who, cmd[0], op, r, want_r);
     return false;
 }
@@ -476,7 +476,7 @@ inline bool patch_target_writable(uint64_t cmd_addr, size_t bytes, const char* w
     g_patch_probe_calls.fetch_add(1, std::memory_order_relaxed);
     if (gpu::guest_writable(cmd_addr, (uint32_t)bytes)) return true;
     if (patch_budget_ok(who))
-        fprintf(stderr, "[agc] %s: packet 0x%llx (%zu bytes) is not writable guest memory — patch refused\n",
+        fprintf(stderr, "[agc] %s: packet 0x%llx (%zu bytes) is not writable guest memory -- patch refused\n",
                 who, (unsigned long long)cmd_addr, bytes);
     return false;
 }
@@ -890,7 +890,7 @@ static bool dma_patch_recover_header(uint32_t* cmd, const char* who) {
                                                     // allocation and desyncs the submit (#1756)
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 8)
-        fprintf(stderr, "[agc] %s: restored clobbered DMA header (dst=0x%llx bytes=%u) — #1124\n",
+        fprintf(stderr, "[agc] %s: restored clobbered DMA header (dst=0x%llx bytes=%u) -- #1124\n",
                 who, (unsigned long long)dst, bytes);
     return true;
 }
@@ -1059,7 +1059,7 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     // make 5+num overflow the length field and mis-frame the submit (#450). begin_packet re-checks the
     // same 0x4001 ceiling defensively, but reject early here with a clear diagnostic.
     if (num > 0x3FFCu) {
-        fprintf(stderr, "[agc] WriteData REJECTED num_dwords=%u (5+num > PM4 max 0x4001 — mis-decoded arg?)\n", num);
+        fprintf(stderr, "[agc] WriteData REJECTED num_dwords=%u (5+num > PM4 max 0x4001 -- mis-decoded arg?)\n", num);
         return 0;
     }
     if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData dst=0x%llx addr=0x%llx num=%u src=%p\n",
@@ -1647,7 +1647,7 @@ HLE(agc_create_prim_state) {  // (cx_regs, uc_regs, hs, gs, prim_type)
     auto* gs = (const AgcShader*)(uintptr_t)a3;
     if (!cx || !uc || !gs || !gs->specials) return kAgcErrInvalidArg;
     if (a2 && getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc] CreatePrimState: hs shader present (tessellation) — not yet modeled\n");
+        fprintf(stderr, "[agc] CreatePrimState: hs shader present (tessellation) -- not yet modeled\n");
     const auto* sp = (const AgcShaderSpecialRegs*)gs->specials;
     using namespace prosper::agc::Pm4;
     cx[0] = sp->vgt_shader_stages_en;
@@ -2020,7 +2020,7 @@ static unsigned submit_stall_us(void) {
     static const unsigned us = [] {
         const char* e = getenv("PROSPER_SUBMIT_STALL_US");
         unsigned v = e ? (unsigned)strtoul(e, nullptr, 0) : 0u;
-        if (v) fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_US=%u ARMED — diagnostic throttle, "
+        if (v) fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_US=%u ARMED -- diagnostic throttle, "
                                "not a fix\n", v);
         return v;
     }();
@@ -2033,11 +2033,11 @@ static bool submit_stall_outside(void) {
         const char* e = getenv("PROSPER_SUBMIT_STALL_OUTSIDE");
         const bool want = e && strtol(e, nullptr, 0) != 0;
         if (want && submit_stall_us())
-            fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_OUTSIDE=1 ARMED — the %u us stall runs "
+            fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_OUTSIDE=1 ARMED -- the %u us stall runs "
                             "AFTER the submit mutex is released (#1226 delay-vs-lock discriminator)\n",
                     submit_stall_us());
         else if (want)
-            fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_OUTSIDE=1 NOT ARMED — "
+            fprintf(stderr, "[agc] PROSPER_SUBMIT_STALL_OUTSIDE=1 NOT ARMED -- "
                             "PROSPER_SUBMIT_STALL_US is unset or zero, so there is no stall to move\n");
         return want && submit_stall_us() != 0;
     }();
@@ -2193,7 +2193,7 @@ static void report_short_fold(const char* who, uint64_t submit_no, const uint32_
     const uint32_t stop = addr && consumed < declared ? addr[consumed] : 0;
     fprintf(stderr,
             "[agc] SHORT FOLD %s #%llu: guest declared %u dwords, decode stopped after %zu "
-            "(%.1f%%) at stream dword 0x%08x — the remaining %zu dwords, INCLUDING ANY BIND, were "
+            "(%.1f%%) at stream dword 0x%08x -- the remaining %zu dwords, INCLUDING ANY BIND, were "
             "never applied%s\n",
             who, (unsigned long long)submit_no, declared, consumed,
             100.0 * (double)consumed / (double)declared, stop,
@@ -2367,7 +2367,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
         static std::atomic<bool> announced{false};
         if (!announced.exchange(true))
             fprintf(stderr, "[agc] PROSPER_AGC_SPLIT_FINAL_STATE=1: SubmitDcbFinal is folding into its "
-                            "OWN register file (#1669 MEASUREMENT, not a fix — this configuration is "
+                            "OWN register file (#1669 MEASUREMENT, not a fix -- this configuration is "
                             "not validated and must not be treated as correct behaviour)\n");
     }
     // #1226: stamp this fold's submit entry point so fence-protocol history can distinguish the
@@ -2501,14 +2501,14 @@ HLE9(agc_cb_branch) {
                     "(first dword 0x%08x is not a type-3 header); %s a%d=0x%llx (first dword 0x%08x); "
                     "arg9=0x%llx. The fold below is from a GUESSED pointer, not the guest's%s\n",
                     (unsigned long long)rejected, first_dword(rejected),
-                    winner < 0 ? "no register qualified —" : "using",
+                    winner < 0 ? "no register qualified --" : "using",
                     winner, (unsigned long long)cand, first_dword(cand),
                     (unsigned long long)a8, n == 15 ? " [further reports suppressed]" : "");
     }
     if (!cand) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 4)
-            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (arg8=0x%llx a0=0x%llx a1=0x%llx) — submit refused\n",
+            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (arg8=0x%llx a0=0x%llx a1=0x%llx) -- submit refused\n",
                     (unsigned long long)a7, (unsigned long long)a0, (unsigned long long)a1);
         return 0;
     }
@@ -2516,7 +2516,7 @@ HLE9(agc_cb_branch) {
     if (!dw_num) {
         static std::atomic<int> logged9{0};
         if (logged9.fetch_add(1) < 4)
-            fprintf(stderr, "[agc] w1KFAHVqpaU: invalid arg9 count 0x%llx — self-terminating fold\n",
+            fprintf(stderr, "[agc] w1KFAHVqpaU: invalid arg9 count 0x%llx -- self-terminating fold\n",
                     (unsigned long long)a8);
     }
     return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, dw_num, "SubmitDcbFinal");

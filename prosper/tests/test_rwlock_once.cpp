@@ -157,7 +157,7 @@ int main() {
                   "the lock is undamaged after the refused wrlocks");
             call1(RWun, (uint64_t)(uintptr_t)&h);
         } else {
-            printf("  [SKIP] this host does not refuse a recursive write acquire (rc=%d) — the"
+            printf("  [SKIP] this host does not refuse a recursive write acquire (rc=%d) -- the"
                    " wrlock half of the #2024 arm cannot run here\n", wr_rc);
         }
         if (rd_rc == EDEADLK) {
@@ -173,7 +173,7 @@ int main() {
                   "the lock is undamaged after the refused rdlocks");
             call1(RWun, (uint64_t)(uintptr_t)&h);
         } else {
-            printf("  [SKIP] this host grants a read acquire while the caller write-holds (rc=%d) —"
+            printf("  [SKIP] this host grants a read acquire while the caller write-holds (rc=%d) --"
                    " the rdlock half of the #2024 arm cannot run here\n", rd_rc);
         }
     }

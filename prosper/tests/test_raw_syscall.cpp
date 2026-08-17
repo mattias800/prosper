@@ -243,7 +243,7 @@ int main() {
         Captured bad = capture_stderr([&] { bad_ret = prosper::raw_write(2, b, (uint64_t)n); });
         CHECK(bad_ret < 0 || bad.n < (size_t)n,
               "apparatus: the unclamped over-read should not have delivered %d bytes "
-              "(ret=%ld, delivered=%zu) — the guard page is not doing its job", n, bad_ret, bad.n);
+              "(ret=%ld, delivered=%zu) -- the guard page is not doing its job", n, bad_ret, bad.n);
 
         // The fix: at most the buffer, and the loss is announced.
         Captured c = capture_stderr([&] { prosper::raw_write_fmt(2, b, cap, n); });
@@ -307,7 +307,7 @@ int main() {
         // exit cleanly. Without it, "the child died" is also consistent with a broken harness —
         // a mismapped guard page, or a chain that faults for some reason other than capacity.
         CHECK(signal_from_child(chain_unclamped, 1024) == 0,
-              "unclamped chain faulted even with room to spare — arm 1's fault is not the overrun");
+              "unclamped chain faulted even with room to spare -- arm 1's fault is not the overrun");
 
         // --- ARM 2 (GREEN): the clamped chain survives the same input ------------------------
         CHECK(signal_from_child(chain_clamped, cap) == 0,
@@ -352,7 +352,7 @@ int main() {
                     sn, snprintf(buf + sn, cap - (size_t)sn, " %s+0x%llx", kModName, kOff), cap);
             CHECK(sn == (int)cap, "cursor must stay saturated after further appends, got %d", sn);
             CHECK(memcmp(before, buf, cap) == 0,
-                  "appends after saturation modified the buffer — the report lost its tail");
+                  "appends after saturation modified the buffer -- the report lost its tail");
             munmap(guard_region, 2 * kPage);
         }
     }

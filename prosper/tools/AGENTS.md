@@ -494,6 +494,36 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   PR claims the same number it says so and suggests stepping *clear* of the contested band rather than
   to the next free number, since every loser stepping to "next free" collides again one number up.
   `ctest -R trap_number` covers it.
+- **`output/check_ascii_output.py`** — refuse a non-ASCII character inside a C/C++ **string
+  literal**. `stdout` carries bytes and the reader decodes by platform: UTF-8 on Linux, the
+  cp1252/cp437 console code page on Windows. One em dash therefore reaches a Windows user as
+  mojibake, so `grep` for the line the tool itself printed does not match it — fatal for a tool
+  whose documented recipe is `--import-slots | grep <name>` — and a test asserting on the rendered
+  string fails on Windows only. #2579 shipped five that way with Linux CI green (#2588). Runs as
+  ctest `ascii_output_literals` and in the CI `Docs` job. **Comments and Markdown keep their
+  punctuation**: comments are stripped before literals are extracted, so the rule is about the
+  bytes a program emits, never source style. Replacements are `--`, `->`, `...`, `"`, `x`.
+  Three tiers, because a gate with standing false positives is one people learn to skip: a raw
+  non-ASCII character and a `\u`/`\U` escape above 127 **fail**; a `\x`/octal byte escape above 127
+  is a **note**, since a multi-byte run like `\xe2\x80\x94` is binary data by construction (the two
+  in the tree are UTF-8 fixtures feeding conversion tests, not messages). The note tier is honestly
+  weaker for a *lone* high byte — `printf("caf\xe9")` is the same defect in escape form and is only
+  noted — so the note **count** is printed on every run to keep growth visible. The tier is decided
+  before the quarantine, not after, or a binary fixture added to a quarantined file would be
+  reported as the defect class it is not.
+  It prints how many files and literals it examined on **every** run, pass or fail — a verdict alone
+  cannot be told apart from a scan that saw nothing — and it self-tests both its parsing and its
+  **line numbers**, the second because its first revision drifted its counter across an unterminated
+  quote and named innocent lines with full confidence.
+  What it does **not** cover, stated so silence is not read as coverage: **Python, shell and CMake
+  literals** (#2609 — 109 characters in 30 files, the same mojibake class, measured); Markdown and
+  comments, deliberately; anything assembled at runtime from a data file, `argv`, or the guest's own
+  UTF-8 strings printed through `%s`; **char literals** (`L'—'` is invisible — their spans are
+  skipped so a quote inside one cannot open a string, and their contents are never read); **C++23
+  delimited escapes** (`\u{2014}`, `\N{EM DASH}`, which GCC and Clang already accept as extensions);
+  and the files in its `QUARANTINE` ledger, which #2588 left to
+  the GPU/compute lane (#2608). That ledger fails on a count that RISES *and* on one that falls,
+  so it cannot outlive the defect it records.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 - **`PROSPER_MB3_POISON`, `PROSPER_PEND_AGE`, `PROSPER_SUBMIT_STALL_US`** — the three in-emulator
   diagnostics for the MallocBinned3 free-list corruption family (#1945/#1226). `MB3_POISON` walks the

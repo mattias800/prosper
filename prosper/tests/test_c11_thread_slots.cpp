@@ -187,14 +187,14 @@ int main() {
         CHECK(spin_until(g_waiter_entered, 5), "control: the waiter reached its _Cnd_wait");
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         CHECK(g_wait_returned.load(std::memory_order_acquire) == 0,
-              "_Cnd_wait on a statically-initialised cnd_t is still WAITING 200 ms later — it used "
+              "_Cnd_wait on a statically-initialised cnd_t is still WAITING 200 ms later -- it used "
               "to skip the wait entirely and report success for a wait that never happened");
         CHECK(g_static_cnd != nullptr && g_static_mtx != nullptr,
-              "…and both slots SELF-INITIALISED: each now names a real host object, the same way "
+              "...and both slots SELF-INITIALISED: each now names a real host object, the same way "
               "scePthreadCondWait resolves them (#793 / #2170), which is the mechanism the arm "
               "above observes rather than a second assertion of it");
         CHECK(broadcast_until_awake(&g_static_cnd, &g_static_mtx, g_wait_returned),
-              "…and the wait RETURNS once the condition is broadcast (a wait that blocks forever "
+              "...and the wait RETURNS once the condition is broadcast (a wait that blocks forever "
               "would be a worse defect than the one being fixed)");
     }
 
@@ -209,11 +209,11 @@ int main() {
         CHECK(spawn_detached(second_locker), "control: a second locker thread starts");
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         CHECK(g_second_locked.load(std::memory_order_acquire) == 0,
-              "a second thread's _Mtx_lock BLOCKS while this one holds it — it used to no-op and "
+              "a second thread's _Mtx_lock BLOCKS while this one holds it -- it used to no-op and "
               "let both threads into the critical section");
         mtx_unlock((uint64_t)(uintptr_t)&g_contended_mtx, 0, 0, 0, 0, 0);
         CHECK(spin_until(g_second_locked, 5),
-              "…and it acquires as soon as the holder releases");
+              "...and it acquires as soon as the holder releases");
     }
 
     // ===== 3. the ORDINARY initialised path is unchanged =======================================
@@ -233,7 +233,7 @@ int main() {
         CHECK(g_init_returned.load(std::memory_order_acquire) == 0,
               "an initialised _Cnd_wait waits too");
         CHECK(broadcast_until_awake(&g_init_cnd, &g_init_mtx, g_init_returned),
-              "…and wakes on _Cnd_broadcast");
+              "...and wakes on _Cnd_broadcast");
     }
 
     // ===== 4. the SIGNAL side, on a slot no wait has resolved yet ==============================
@@ -283,7 +283,7 @@ int main() {
         // would fail nothing in this file.
         cnd_signal((uint64_t)(uintptr_t)&untouched_signal_cnd, 0, 0, 0, 0, 0);
         CHECK(untouched_signal_cnd != nullptr,
-              "_Cnd_signal RESOLVES a statically-initialised cnd_t rather than skipping it — the "
+              "_Cnd_signal RESOLVES a statically-initialised cnd_t rather than skipping it -- the "
               "same slot, and the same answer, scePthreadCondSignal gives for this input");
         cnd_broadcast((uint64_t)(uintptr_t)&untouched_bcast_cnd, 0, 0, 0, 0, 0);
         CHECK(untouched_bcast_cnd != nullptr,

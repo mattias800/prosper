@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     // A zero-row dump would reconcile against a parser that found nothing and both would agree, so
     // refuse rather than emit an empty table that reads as a clean answer.
     if (rows.empty()) {
-        fprintf(stderr, "hle_registry_dump: register_builtin_hle() registered NOTHING — refusing\n");
+        fprintf(stderr, "hle_registry_dump: register_builtin_hle() registered NOTHING -- refusing\n");
         return 2;
     }
     return 0;

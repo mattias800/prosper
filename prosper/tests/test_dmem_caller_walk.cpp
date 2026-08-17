@@ -89,7 +89,7 @@ int main() {
     check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
           "walk beside a guard page clamps instead of faulting");
     if (WIFSIGNALED(st))
-        printf("       child died by signal %d — this is the #1755 crash\n", WTERMSIG(st));
+        printf("       child died by signal %d -- this is the #1755 crash\n", WTERMSIG(st));
     else if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
         printf("       child exit=%d (3=mmap 4=mprotect 5=clamp too wide)\n", WEXITSTATUS(st));
 

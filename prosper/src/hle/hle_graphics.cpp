@@ -819,7 +819,7 @@ HLE(g_vo_wait_vblank) {
       if (!handle.valid()) {
           static std::atomic<bool> warned{false};
           if (!warned.exchange(true))
-              fprintf(stderr, "[vo] sceVideoOutWaitVblank: unknown handle 0x%llx — returning "
+              fprintf(stderr, "[vo] sceVideoOutWaitVblank: unknown handle 0x%llx -- returning "
                               "INVALID_HANDLE and NOT waiting. If this repeats, the argument is "
                               "probably not an sceVideoOutOpen handle (see the CONFIDENCE note).\n",
                       (unsigned long long)a0);

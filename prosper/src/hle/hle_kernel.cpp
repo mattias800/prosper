@@ -1389,7 +1389,7 @@ HLE(k_rwlock_unlock)  {
     if (rc != 0) {
         if (rwlocklog() || !rwlock_unsafe_unlock())
             rw_report(RwReport::Unmatched,
-                      "UNMATCHED unlock: the lock is unheld, or write-held by another thread — "
+                      "UNMATCHED unlock: the lock is unheld, or write-held by another thread -- "
                       "refused (FreeBSD returns EPERM); forwarding it would corrupt the lock",
                       a0, g, rc);
         // POSIX spelling reports the bare FreeBSD errno; the Sony spelling is registered through

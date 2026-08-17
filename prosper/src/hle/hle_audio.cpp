@@ -1446,13 +1446,13 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
         switch (audio_classify_stamped_grain(st.addr == pcm, matches_stamp, total_now)) {
         case AudioGrainVerdict::PointerMoved:
             fprintf(stderr, "[audio-stamp] port%u POINTER-MOVED: stamped 0x%llx, this push "
-                            "published 0x%llx — the port is double-buffered, so a zero read of "
+                            "published 0x%llx -- the port is double-buffered, so a zero read of "
                             "either buffer alone proves nothing\n",
                     port_index + 1, (unsigned long long)st.addr, (unsigned long long)pcm);
             break;
         case AudioGrainVerdict::Intact:
             fprintf(stderr, "[audio-stamp] port%u INTACT: the stamp written to 0x%llx last push "
-                            "survived byte-for-byte — the guest did NOT write this buffer between "
+                            "survived byte-for-byte -- the guest did NOT write this buffer between "
                             "pushes, so prosper is reading memory the guest does not fill and this "
                             "port's zero says nothing about the guest's mix\n",
                     port_index + 1, (unsigned long long)st.addr);
@@ -1463,7 +1463,7 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
             break;
         case AudioGrainVerdict::Cleared:
             fprintf(stderr, "[audio-stamp] port%u CLEARED: the stamp written to 0x%llx last push "
-                            "is gone and the grain is exactly zero — the guest ACTIVELY writes "
+                            "is gone and the grain is exactly zero -- the guest ACTIVELY writes "
                             "this buffer and writes silence into it. The port is a live bus "
                             "carrying no signal, not a buffer prosper is failing to read\n",
                     port_index + 1, (unsigned long long)st.addr);
@@ -1474,7 +1474,7 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
             // says the path works, not that something was missed.
             fprintf(stderr, "[audio-stamp] port%u OVERWRITTEN: the stamp written to 0x%llx last "
                             "push is gone and the guest has filled the buffer with %llu non-zero "
-                            "samples — a live bus carrying signal, which is what a working port "
+                            "samples -- a live bus carrying signal, which is what a working port "
                             "looks like\n",
                     port_index + 1, (unsigned long long)st.addr, (unsigned long long)total_now);
             audio_stamp_print_channels("guest content:", ch_now, channels, peak_now);
@@ -1502,7 +1502,7 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
     const size_t back_got = audio_read_bytes_partial(pcm, back.data(), want);
     if (back_got != want || std::memcmp(back.data(), st.pattern.data(), want) != 0) {
         fprintf(stderr, "[audio-stamp] port%u PROBE-INVALID: read back %zu of %zu stamped bytes "
-                        "and they do not match what was written — this port's read path cannot be "
+                        "and they do not match what was written -- this port's read path cannot be "
                         "shown to report a non-zero sample, so NO verdict is drawn from it\n",
                 port_index + 1, back_got, want);
         st.disabled = true;
@@ -1515,7 +1515,7 @@ void audio_stamp_step(uint32_t port_index, uint64_t pcm, uint32_t channels, uint
     double   peak_back = 0.0;
     audio_stamp_channel_stats(back, channels, data_type, ch_back, peak_back);
     fprintf(stderr, "[audio-stamp] port%u stamp %u/%u written to 0x%llx (%zu bytes, %u ch); "
-                    "read-back OK — this port CAN report a non-zero sample\n",
+                    "read-back OK -- this port CAN report a non-zero sample\n",
             port_index + 1, st.done + 1, budget, (unsigned long long)pcm, want, channels);
     audio_stamp_print_channels("positive control:", ch_back, channels, peak_back);
     st.addr = pcm;

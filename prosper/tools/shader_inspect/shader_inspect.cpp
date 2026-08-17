@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
             "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
             "\n"
             "IMPORTANT: shader_inspect has NO resource table (a raw dump carries no descriptors), so\n"
-            "the recompiler cannot lower MIMG/MUBUF/MTBUF — nor SMEM in the vertex/fragment stages.\n"
+            "the recompiler cannot lower MIMG/MUBUF/MTBUF -- nor SMEM in the vertex/fragment stages.\n"
             "When such an instruction is present, a failed stage recompile is reported as\n"
             "status=undetermined-no-resource-table and is NOT evidence of an unsupported shader.\n"
             "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"

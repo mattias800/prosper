@@ -33,7 +33,7 @@ int main() {
           "an address kRva into the eboot labels as eboot+kRva");
     CHECK(std::strcmp(guest_module_name(BOOT_IL2CPP + kRva), "Il2cpp") == 0 &&
           guest_module_offset(BOOT_IL2CPP + kRva) == kRva,
-          "an IL2CPP address names Il2cpp — not eboot with a shifted offset");
+          "an IL2CPP address names Il2cpp -- not eboot with a shifted offset");
     CHECK(std::strcmp(guest_module_name(BOOT_LIBC + 0x100), "libc.prx") == 0 &&
           guest_module_offset(BOOT_LIBC + 0x100) == 0x100,
           "libc.prx is named and offset from its own base");
@@ -93,7 +93,7 @@ int main() {
                       guest_module_name(il2cpp_ra),
                       (unsigned long long)guest_module_offset(il2cpp_ra));
         CHECK(std::strcmp(line, "Il2cpp+0x1234") == 0,
-              "a rendered label names the module it came from — not 'eboot' with a plausible offset");
+              "a rendered label names the module it came from -- not 'eboot' with a plausible offset");
         // The specific regression the review caught: a widened filter with a hard-coded label renders
         // an in-range offset under the wrong module, which has no tell at all.
         CHECK(std::strncmp(line, "eboot", 5) != 0,

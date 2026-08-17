@@ -291,7 +291,7 @@ int main() {
         CHECK(strstr(log, "is not writable guest memory") != nullptr,
               "#1650 arm4: an undereferenceable packet is reported, not silently skipped");
         CHECK(prosper_agc_patch_probe_count() > probes_before_refusals,
-              "#1650: out-of-ring pointers DO reach the write probe — so arm1's zero-probe "
+              "#1650: out-of-ring pointers DO reach the write probe -- so arm1's zero-probe "
               "assertion measures the registry rather than a counter stuck at zero");
 
         // Arm 4b — the SAME undereferenceable-pointer case, for the six patchers #1650 left
@@ -365,9 +365,9 @@ int main() {
         };
         const size_t flooded = occurrences(log2, "SetCxRegIndirectPatchSetAddress");
         CHECK(flooded > 0 && flooded < 16,
-              "#1650 arm5: a flooded call site is rate-limited — neither silent nor unbounded");
+              "#1650 arm5: a flooded call site is rate-limited -- neither silent nor unbounded");
         CHECK(strstr(log2, "SetShRegIndirectPatchAddRegisters") != nullptr,
-              "#1650 arm5: a DIFFERENT call site still reports after that flood — budgets are per "
+              "#1650 arm5: a DIFFERENT call site still reports after that flood -- budgets are per "
               "call site, so one patcher family can no longer silence another");
 
         bool victim_still_intact = true;

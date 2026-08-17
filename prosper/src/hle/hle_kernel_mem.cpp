@@ -2059,7 +2059,7 @@ HLE(k_ampr_write_address) {   // j0+3uJMxYJY (cb, address, value, flags)
             ok = process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)sizeof(value);
     }
     if (!ok)
-        fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx UNMAPPED — completion write dropped\n",
+        fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx UNMAPPED -- completion write dropped\n",
                 (unsigned long long)a1, (unsigned long long)value);
     else if (wa_log())
         fprintf(stderr, "[apr] write-address *0x%llx = 0x%llx (a3=0x%llx) OK\n",
@@ -2250,7 +2250,7 @@ HLE(k_ampr_push_map) {
             bool mirror_live = (prosper_mincore((void*)(uintptr_t)mirror, 1, &vec) == 0);
             void* q = nullptr;
             if (mirror_live) {
-                MLOG("ampr push-map va=0x%llx mirror=0x%llx SKIPPED (target is live guest memory — "
+                MLOG("ampr push-map va=0x%llx mirror=0x%llx SKIPPED (target is live guest memory -- "
                      "map-flavor mirror would clobber MallocBinned heap, issue #107)\n",
                      (unsigned long long)a1, (unsigned long long)mirror);
             } else {
@@ -4534,7 +4534,7 @@ namespace {
             if (!acquired.address) {  // band contended/undersized: anywhere in-window
                 acquired = acquire_placeholder_window_locked(kGuestAutoVaMin, len, align);
                 if (acquired.address)
-                    MLOG("reserve(huge) top band unavailable — whole-window fallback -> 0x%llx\n",
+                    MLOG("reserve(huge) top band unavailable -- whole-window fallback -> 0x%llx\n",
                          (unsigned long long)(uintptr_t)acquired.address);
             }
             if (!acquired.address) return nullptr;
