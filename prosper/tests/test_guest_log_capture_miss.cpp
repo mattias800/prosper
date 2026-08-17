@@ -103,11 +103,21 @@ int main(int argc, char** argv) {
     // structurally unable to see. Removing that one registration leaves every direct-call check
     // below passing while a real run goes silent again, which is precisely the original defect.
     if (argc > 3 && std::string(argv[1]) == "--unfired-child") {
+        // These two lines go to the inherited STDOUT, so they land inline in the ctest log and
+        // answer "did the child run at all?" without any extra plumbing. A spawn that never starts
+        // and an exit report that never fires both leave the stderr file empty, and only this
+        // witness separates them.
+        std::printf("  [child] started, redirecting stderr to %s\n", argv[3]);
+        std::fflush(stdout);
         // The child redirects its OWN stderr rather than having the parent append a `2>` clause.
         // Shell redirection would put a third quoted path into a command line that cmd.exe already
         // parses awkwardly, and the reopened stream is still what the atexit handler writes to:
         // stdio teardown runs after the exit handlers, so the report lands in this file.
-        if (!std::freopen(argv[3], "w", stderr)) return 2;
+        if (!std::freopen(argv[3], "w", stderr)) {
+            std::printf("  [child] freopen failed\n");
+            std::fflush(stdout);
+            return 2;
+        }
         set_test_env("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG", "LevelDocument Loaded: worldmap");
         set_test_env("PROSPER_CAPTURE_BUNDLE", argv[2]);
         const char guest[] = "LevelDocument Loaded: worldmap [worldmap]\n";
@@ -246,17 +256,27 @@ int main(int argc, char** argv) {
     // above calls the reporter directly and therefore cannot distinguish a registered exit handler
     // from an unregistered one.
     {
-        // make_preferred() is load-bearing on Windows and a no-op elsewhere: CMake and
-        // std::filesystem hand back forward slashes, and cmd.exe will not run a program path
-        // spelled that way — it reads the leading `/` components as switches. The first Windows
-        // CI run failed on exactly that, and only because the note below printed the command.
-        std::filesystem::path self = std::filesystem::path(argv[0]).make_preferred();
-        if (!self.has_parent_path()) self = std::filesystem::path(".") / self;
+        // The program is named RELATIVE to the working directory and left unquoted. ctest runs a
+        // test in the directory the binary was built into (CMake's default WORKING_DIRECTORY), and
+        // a CMake target name can contain no spaces, so this needs no quoting at all — which
+        // removes the leading-quote question from the command line entirely. Two Windows CI runs
+        // were lost to that question with an absolute path, first with forward slashes and then
+        // with native ones.
+        const std::filesystem::path self =
+            std::filesystem::path(argv[0]).filename();   // no directory, no spaces, no quotes
+        const std::string prefix =
+#ifdef _WIN32
+            ".\\";
+#else
+            "./";
+#endif
         const auto child_err =
             (scratch / ("prosper-guest-log-miss-child-" + std::to_string(nonce) + ".stderr"))
                 .make_preferred();
-        const std::string command = "\"" + self.string() + "\" --unfired-child \"" +
+        const std::string command = prefix + self.string() + " --unfired-child \"" +
                                     bundle_path.string() + "\" \"" + child_err.string() + "\"";
+        if (!std::system(nullptr))
+            std::printf("  [note] no command processor is available to std::system\n");
         const int rc = std::system(command.c_str());
         std::string child_text;
         if (FILE* in = std::fopen(child_err.string().c_str(), "rb")) {
@@ -268,8 +288,14 @@ int main(int argc, char** argv) {
         // A spawn, quoting, or redirection problem is indistinguishable from the missing exit
         // report itself — both leave this file empty. Name the apparatus so the two never get
         // confused, which is the failure mode the instrument-trap list keeps recording.
-        if (rc != 0 || child_text.empty())
+        if (rc != 0 || child_text.empty()) {
+            std::error_code note_ec;
+            std::printf("  [note] child rc=%d, stderr file exists=%d size=%lld, cwd=%s\n", rc,
+                        std::filesystem::exists(child_err, note_ec) ? 1 : 0,
+                        static_cast<long long>(std::filesystem::file_size(child_err, note_ec)),
+                        std::filesystem::current_path(note_ec).string().c_str());
             std::printf("  [note] child command was: %s\n", command.c_str());
+        }
         CHECK(rc == 0, "the child process exits cleanly, exactly as the lost Astro Bot run did");
         CHECK(contains(child_text, "never matched") && contains(child_text, "PREFIX"),
               "a process that only returns from main still reports its unfired marker at exit");
