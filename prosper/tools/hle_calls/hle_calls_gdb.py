@@ -32,11 +32,18 @@ both are printed unconditionally:
     "init made no interesting call" from "this run never saw init" — the two read
     identically in a histogram.
   * `finish-failures` counts return-value captures that could not be armed or
-    decoded — but it is NOT the whole story, so each row also prints
+    decoded, and every one of them now names its own reason on the
+    `finish-failure-reasons:` line — a bare count is what let #2075 stay
+    undiagnosed. It is still NOT the whole story, so each row also prints
     `(captured N/M)` whenever fewer values were recorded than calls counted.
     That second form is the one to trust: a handler that leaves its frame
     without returning normally (longjmp, thread teardown) loses its capture
     without incrementing `finish-failures`.
+  * `value-source=dwarf:N,rax:M` says which read answered. Both are the same
+    number when both are available; only DWARF is independent of this tool's
+    "the HLE ABI returns in %rax" assumption, and a disagreement between them
+    is reported loudly on its own line. `dwarf:0` is normal, not degraded:
+    prosper's default build type is Release, which carries no debug info.
   * `window=complete|SHORT` says whether the clock really reached `--ticks`.
     `run`/`continue` also return on a signal gdb stops for, which would
     otherwise print a truncated histogram that reads as a finished window.
@@ -68,6 +75,7 @@ here is a tool bug, not a new emulator defect.
 """
 
 import os
+import re
 import sys
 import gdb
 
@@ -104,6 +112,8 @@ CONTROL = "s_user_getevent"
 CONTROL_LOGIN = 0
 CONTROL_NO_EVENT = 0x80960007
 
+RET_MASK = 0xFFFFFFFFFFFFFFFF
+
 counts = {}
 # How many of CONTROL's calls passed a NON-NULL out-pointer (#2054). The LOGIN is delivered only
 # `if (a0 && ...)`, so a guest polling with nullptr consumes none and gets NO_EVENT forever with no
@@ -112,7 +122,35 @@ counts = {}
 control_eligible = 0
 values = {}                     # name -> {return value: count}
 order = []                      # leading calls, in call order
-state = {"ticks": 0, "calls": 0, "finish_failures": 0, "exited": False}
+state = {"ticks": 0, "calls": 0, "finish_failures": 0, "exited": False,
+         # Where each captured value came from, and whether the two sources ever disagreed.
+         # `rax` is not a degraded mode -- see _Finish.stop() -- but a reader is entitled to know
+         # which one answered, because only `dwarf` is independent of this tool's ABI assumption.
+         "src_dwarf": 0, "src_rax": 0, "src_mismatch": 0}
+# Distinct reasons a capture produced NO value at all, with counts. `finish-failures=N` on its own
+# cost this feature four days of being void with nobody able to say why (#2075): the header said how
+# many captures failed and nothing said what the failure WAS. One line of text is the whole fix.
+finish_failure_reasons = {}
+
+
+REASON_CAP = 32
+
+
+def _reason(kind, exc):
+    # gdb's messages carry the failing ADDRESS ("Cannot access memory at address 0x…"), which differs
+    # per call: left alone, every failure would be its own "distinct" reason and this table would grow
+    # once per call over a window of thousands. Fold the address out, and cap the table below.
+    return re.sub(r"0x[0-9a-fA-F]+", "0x<addr>", "%s: %s: %s" % (kind, type(exc).__name__, exc))[:200]
+
+
+def _note_reason(text):
+    if text in finish_failure_reasons:
+        finish_failure_reasons[text] += 1
+    elif len(finish_failure_reasons) < REASON_CAP:
+        finish_failure_reasons[text] = 1
+    else:
+        overflow = "(+reasons beyond the first %d distinct)" % REASON_CAP
+        finish_failure_reasons[overflow] = finish_failure_reasons.get(overflow, 0) + 1
 
 
 class _Finish(gdb.FinishBreakpoint):
@@ -124,11 +162,58 @@ class _Finish(gdb.FinishBreakpoint):
         self.silent = True
 
     def stop(self):
+        """Read the return value from TWO independent sources, because one of them is optional.
+
+        `gdb.FinishBreakpoint.return_value` is derived from the function's **DWARF return type**, so
+        it exists only on a build that carries debug info. prosper's default build type is `Release`
+        (`-O3 -DNDEBUG`, no `-g`, see prosper/CMakeLists.txt) -- on such a binary gdb has no type for
+        the handler, `return_value` is `None`, and `int(None)` raised once per call: that is #2075,
+        where `finish-failures` equalled the call count exactly and every row read `(captured 0/N)`.
+        Measured one-variable A/B on ONE binary (`objcopy --strip-debug` of a RelWithDebInfo
+        `boot_trace`, same gdb 17.2, same title, same window): with `.debug_*` present
+        `finish-failures=0` and the control reported `ok`; with it removed, 4 calls / 4 failures /
+        `VOID(0-returns-for-4-calls)`. The FinishBreakpoint itself constructed fine in both arms, so
+        the "gdb cannot unwind to the guest caller" hypothesis in #2075 is falsified, not fixed.
+
+        `%rax` needs no debug info and is exactly right for what this tool arms: the driver
+        enumerates only functions with the six-`unsigned long` HLE signature, and every one of those
+        is written through an `HLE(...)` macro that returns `uint64_t` -- an integer return, i.e.
+        `%rax` under SysV. The finish breakpoint stops at the return address in the caller, before
+        any instruction there has executed, so `%rax` still holds the value the handler returned.
+        `CONFIDENCE: HIGH` -- and it is checked rather than asserted: when both sources answer, a
+        disagreement is counted and reported, which is what would fire if a handler ever returned
+        something the ABI does not put in `%rax` (a struct, a float).
+
+        DWARF is preferred when present because it is ABI-aware for ANY return type, so a debug build
+        keeps behaving exactly as it did before this change.
+        """
+        why = []
+        dwarf = None
         try:
-            result = int(self.return_value) & 0xFFFFFFFFFFFFFFFF
-        except Exception:                       # no debug info for the return type
+            rv = self.return_value
+            if rv is None:
+                why.append("return_value: None (this binary has no DWARF return type for the "
+                           "handler -- a Release build; %rax below is the answer)")
+            else:
+                dwarf = int(rv) & RET_MASK
+        except Exception as exc:
+            why.append(_reason("return_value", exc))
+        rax = None
+        try:
+            rax = int(gdb.newest_frame().read_register("rax")) & RET_MASK
+        except Exception as exc:
+            why.append(_reason("rax", exc))
+
+        result = dwarf if dwarf is not None else rax
+        if result is None:
+            # Only now is the capture lost -- and the reader gets to see why, per distinct reason.
             state["finish_failures"] += 1
+            for text in why:
+                _note_reason(text)
             return False
+        if dwarf is not None and rax is not None and dwarf != rax:
+            state["src_mismatch"] += 1
+        state["src_dwarf" if dwarf is not None else "src_rax"] += 1
         values.setdefault(self.hle_name, {})
         values[self.hle_name][result] = values[self.hle_name].get(result, 0) + 1
         return False
@@ -168,7 +253,11 @@ class _Counter(gdb.Breakpoint):
         if VALUES:
             try:
                 _Finish(gdb.newest_frame(), self.hle_name)
-            except Exception:
+            except Exception as exc:
+                # The other half of #2075's diagnosis problem: this site and the decode site above
+                # increment ONE counter, so "finish-failures == calls" could not distinguish "never
+                # armed" from "armed and could not be decoded". Both now say which they were.
+                _note_reason(_reason("FinishBreakpoint()", exc))
                 state["finish_failures"] += 1
         return False
 
@@ -248,15 +337,37 @@ print("HLE_CALLS_BEGIN")
 # `run`/`continue` also return on a signal gdb stops for (SIGABRT is not in the pass list above,
 # and these titles do abort), which otherwise prints a truncated histogram that looks complete.
 control, control_note = _positive_control()
+# `value-source=` says which of the two reads answered (see _Finish.stop()). It is printed only with
+# --values, where it is never noise: `dwarf:0,rax:N` is the normal shape on prosper's default Release
+# build, and it is the field that would have named #2075's cause on sight.
+source = ""
+if VALUES:
+    source = " value-source=dwarf:%d,rax:%d" % (state["src_dwarf"], state["src_rax"])
 print("clock=%s entries=%d/%d window=%s positive-control=%s armed=%d mode=%s calls=%d "
-      "finish-failures=%d exited=%d"
+      "finish-failures=%d exited=%d%s"
       % (CLOCK, state["ticks"], TICKS, "complete" if state["ticks"] >= TICKS else "SHORT",
          control, armed, MODE, state["calls"], state["finish_failures"],
-         1 if state["exited"] else 0))
+         1 if state["exited"] else 0, source))
 # Only a verdict of `ok` needs no explanation. Every other state carries the one sentence that
 # says whether the run is usable, so the reader does not have to have the README open to know.
 if control_note:
     print("positive-control-note: " + control_note)
+# A failure count with no reason is what made #2075 a four-day investigation instead of a one-line
+# diagnosis. Distinct reasons, most frequent first, capped so a pathological run cannot flood.
+if finish_failure_reasons:
+    ranked = sorted(finish_failure_reasons.items(), key=lambda kv: -kv[1])
+    shown = ranked[:4]
+    line = "finish-failure-reasons: " + "; ".join("%dx %s" % (n, t) for t, n in shown)
+    if len(ranked) > len(shown):
+        line += "; +%d more distinct" % (len(ranked) - len(shown))
+    print(line)
+# The check on this tool's own ABI assumption: both sources read the same call, so they can only
+# disagree if the handler's real return does not live in %rax. Loud, because every %rax-sourced value
+# in the run would then be suspect -- including on builds where DWARF is absent and nothing can check.
+if state["src_mismatch"]:
+    print("value-source-MISMATCH: %d captures where the DWARF return value and %%rax disagreed. "
+          "Every rax-sourced value in this run is suspect: a handler whose return does not live in "
+          "%%rax (a struct or float return) breaks this tool's ABI assumption." % state["src_mismatch"])
 if order:
     print("first-calls: " + "  ".join("%d:%s" % (n, name) for n, name in order))
 for count, name in rows:

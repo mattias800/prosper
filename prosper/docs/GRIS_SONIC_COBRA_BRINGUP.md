@@ -844,14 +844,22 @@ on this path are offline-consistent (`sceNetCtlGetState` -> DISCONNECTED, `sceNp
   formed and then falsified against the `DELIVERED` lines above. Any `hle_calls` zero for a
   trampoline-registered handler is **void**. Recorded as instrument trap 105 in
   `GAME_COMPAT_ORCHESTRATION.md`.
-- **`hle_calls --values` is currently void on this machine** (#2075), and its own positive control says so.
-  Three independent arms (60 ticks / 1500 ticks / a single-handler 40-tick arm) report
-  `finish-failures` exactly equal to the call count — 20/20, 543/543, 4/4 — with
-  `positive-control=VOID(0-returns-for-N-calls)` and every row `(captured 0/N)`. gdb is 17.2, the
-  version the tool documents. The counting path is healthy — the same 1500-tick arm with `--values`
-  off reports `calls=257 finish-failures=0`. So no value census can be taken here until #2075 is
-  fixed, and any value figure quoted for this title comes from an earlier arm, not from current
-  master.
+- **`hle_calls --values` was void on this machine** (#2075) — **fixed**, and the cause was not the
+  one this bullet originally suspected. Three independent arms (60 ticks / 1500 ticks / a
+  single-handler 40-tick arm) reported `finish-failures` exactly equal to the call count — 20/20,
+  543/543, 4/4 — with `positive-control=VOID(0-returns-for-N-calls)` and every row `(captured 0/N)`,
+  while the counting path stayed healthy (the same 1500-tick arm with `--values` off reported
+  `calls=257 finish-failures=0`). **gdb 17.2 was innocent, and so was the missing caller frame.**
+  The value came from `FinishBreakpoint.return_value`, which gdb derives from the **DWARF return
+  type** — and `boot_trace` had none, because prosper's default `CMAKE_BUILD_TYPE` is `Release`
+  (`-O3 -DNDEBUG`, no `-g`). One-variable A/B on a single binary (`objcopy --strip-debug` of a
+  RelWithDebInfo build, same gdb, same title, same window): debug sections present →
+  `finish-failures=0` and `positive-control=ok`; removed → `4 calls / 4 failures /
+  VOID(0-returns-for-4-calls)`. The tool now reads `%rax` when DWARF is absent and reports
+  `value-source=dwarf:N,rax:M`, so a value census can be taken here on an ordinary default build:
+  the repro arm gives `s_user_getevent ret 0x0 x1, 0x80960007 x3  positive-control=ok`. Value
+  figures quoted for this title *before* that fix still come from an earlier arm, not from a
+  measurement on the revision they were quoted against.
 
 ### The resource-phase model, the `ui_startup` insertion site, and what boot actually completes (2026-08-06, master `f080fc23`)
 
