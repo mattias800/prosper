@@ -679,6 +679,19 @@ overlong lines; non-stdout streams and descriptors are ignored. The one match di
 adapter that contributed to the line. Do not use a substring or a program address as a substitute for a
 real phase marker. Persistent color/depth targets must remain enabled so the bundle can seed the frame
 boundary it is intended to preserve.
+**Equality means the WHOLE line, and a marker that is merely a prefix of it never fires.** This cost a
+full ~7-minute routed Astro Bot world-map capture (#1684): the guest printed
+`LevelDocument Loaded: worldmap [worldmap]`, the marker was `LevelDocument Loaded: worldmap`, and the run
+reached the checkpoint, exited 0, and wrote nothing at all. Since #1684 an armed gate that never fired
+says so **at process exit**, on stderr, naming the marker, how many guest-stdout lines were compared, and
+the observed line sharing the longest prefix with the marker — escaped, so an invisible trailing byte is
+visible. Copy that line verbatim as the next run's marker. Two distinct outcomes to read carefully:
+`no completed line reached the observer` means the route never produced guest stdout (a wrong route, not
+a wrong marker), whereas a quoted closest line means the marker itself is wrong. The same exit report
+covers the other two automatic gates: an unreached `PROSPER_CAPTURE_BUNDLE_AT_PRESENT` states the present
+count the run actually reached, and an unobserved `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE` states how many
+presents looked for it. **Absence of a bundle is no longer evidence of anything on its own — read the
+exit report.**
 If present counts vary and the title emits no honest guest-stdout marker, use the headless F9 control:
 set `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` together with
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`, keep the trigger absent at process start, and create it

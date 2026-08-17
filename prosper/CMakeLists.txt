@@ -1184,6 +1184,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_log_capture PRIVATE prosper_core)
   add_test(NAME guest_log_capture COMMAND test_guest_log_capture)
 
+  # The same gate's SILENT failure: an armed marker that never matches must diagnose itself instead
+  # of leaving a missing file as the only evidence (#1684). Separate binary because the gate is a
+  # process-wide one-shot and guest_log_capture's marker deliberately fires.
+  add_executable(test_guest_log_capture_miss tests/test_guest_log_capture_miss.cpp)
+  target_link_libraries(test_guest_log_capture_miss PRIVATE prosper_core)
+  add_test(NAME guest_log_capture_miss COMMAND test_guest_log_capture_miss)
+
   # Remote/headless F9 equivalent: an external regular-file witness arms the existing seeded
   # whole-frame capture on the next present. Pure/cross-platform; no game dump or Vulkan device.
   add_executable(test_capture_trigger_file tests/test_capture_trigger_file.cpp)
