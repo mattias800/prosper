@@ -302,9 +302,40 @@ void test_rejects_unsorted_ties() {
                                        "2000 Same$$s\n");
     check(load_symbol_table(dup, nullptr), "two identical records at one rva are accepted");
     check_eq(resolved_name(0x2000), "Same$$s", "…and resolve");
+
+    // ARM 3: the SIGNEDNESS discriminator, and it is the only arm here that can fail for a reason
+    // the others cannot see. resolve.py sorts names by Unicode code point; this side compares
+    // std::string, i.e. bytes. Those agree only because UTF-8 is order-preserving AND
+    // std::char_traits<char> orders as UNSIGNED char. If the byte comparison were signed, every
+    // non-ASCII lead byte (>= 0x80) would sort as negative — before all ASCII — and the two sides
+    // would disagree about exactly the names this project already has.
+    //
+    // "Z" is U+005A and "Ä" is U+00C4, so code-point order puts Z first and this file is correctly
+    // ascending: it must LOAD. Under signed bytes 0xC3 reads as -61 < 'Z', the pair looks
+    // descending, and it would be refused. So a pass here means unsigned, and a failure names the
+    // cause instead of surfacing as a mystery rejection of a real title's table.
+    //
+    // Constructed by hand on purpose. PPSA24651 has 87,851 methods and ZERO tied addresses, so no
+    // sample drawn from it can exercise the tie rule at all — the case is structurally
+    // inexpressible there, and a control built from that data would have passed while testing
+    // nothing.
+    // The literals are split after every hex escape so no following character can be absorbed into
+    // it: "\xC3\x84" is U+00C4 (A-umlaut) in UTF-8.
+    const std::string utf8_tie = write_temp("il2cpp_symtab_test_tieorder_utf8.symtab",
+                                            "prosper-il2cpp-symtab v1 window=0x8000 count=2\n"
+                                            "2000 Z" "\xC3\x84" "$$ascii_first\n"
+                                            "2000 " "\xC3\x84" "Z$$nonascii_second\n");
+    std::string utf8_err;
+    check(load_symbol_table(utf8_tie, &utf8_err),
+          "a tie group ascending by CODE POINT loads — the name comparison is unsigned, so it "
+          "agrees with resolve.py (\"" + utf8_err + "\")");
+    check_eq(resolved_name(0x2000), "\xC3\x84" "Z$$nonascii_second",
+             "…and the last entry of that group is the answer");
+
     std::remove(path.c_str());
     std::remove(ok.c_str());
     std::remove(dup.c_str());
+    std::remove(utf8_tie.c_str());
 }
 
 void test_rejects_missing_window() {

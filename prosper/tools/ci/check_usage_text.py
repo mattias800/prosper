@@ -204,6 +204,11 @@ def main(argv):
         return 2
 
     violations, examined = scan(args.root)
+    # Reported before the empty-set check below, so a root that contains nothing BUT unparseable
+    # files still names them instead of being written off as an empty walk.
+    for path, reason in violations:
+        print('%s: %s' % (path, reason), file=sys.stderr)
+
     if not examined:
         # "0 violations" and "the walk found nothing" are the same output otherwise, and this whole
         # file exists because of a check that could not tell those apart.
@@ -211,8 +216,6 @@ def main(argv):
               'an instrument failure, not a clean tree.' % ', '.join(args.root), file=sys.stderr)
         return 2
 
-    for path, reason in violations:
-        print('%s: %s' % (path, reason), file=sys.stderr)
     print('check_usage_text: %d module(s) read __doc__, %d violation(s)'
           % (len(examined), len(violations)))
     return rc | (1 if violations else 0)

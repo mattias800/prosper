@@ -28,8 +28,8 @@ rest of what makes them agree, and il2cpp_symtab_agreement pins it.
 # It came back once already: #2642 rewrote this header as `#` comments while adding the
 # --emit-symtab line above, so the very usage text that change existed to publish printed `None`
 # again. The guard is now mechanical rather than advisory — tools/ci/check_usage_text.py
-# (ctest `tools_usage_text`) rejects any tool under tools/ that reads `__doc__` without having one,
-# and test_symtab_agreement.py runs this file with no arguments and reads what comes out.
+# (ctest `tools_usage_text`) rejects any module under prosper/ that reads `__doc__` without having
+# one, and test_symtab_agreement.py runs this file with no arguments and reads what comes out.
 import json, bisect, os, re, sys
 
 # Nearest-preceding acceptance window: an offset further than this past a method's start is reported
