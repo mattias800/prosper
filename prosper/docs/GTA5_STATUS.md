@@ -3463,6 +3463,55 @@ exec_pristine=1 cfg_known=1` at pcs 16/18/21/25, so the mip level is proven and 
 descriptor, not the mip analysis. Then re-run this census and see whether the write-class binding
 becomes `outcome=executed`.
 
+### What invalidates the retained depth, now that the diagnostic can say (2026-08-17)
+
+`[ds] invalidate`'s `origin=` field was **structurally incapable of attribution** until the write
+origin was carried through the queue. It read a thread-local set around `notify_guest_gpu_write`, while
+DS/RTT invalidation runs at **drain** time on the draining thread — long after that thread-local is
+reset. So it printed `origin=gpu` for **30,458 of 30,458** invalidations, including ones made by
+writers that already tag themselves.
+
+**How that was found is worth keeping, because tagging looked like it should have been enough.** The
+remaining untagged writers were tagged first — the compute image writeback, its metadata reset, the
+renderer RTT writeback — and the re-run produced **30,458 × `origin=gpu` again, unchanged**. That null
+is what exposed the seam; the tags were correct and were being discarded between queue and drain. The
+queued record now captures the origin on the writing thread, and drain restores it around each range's
+invalidation.
+
+With attribution working, across every DS invalidation on a routed boot:
+
+| origin | count |
+| --- | --- |
+| `compute-writeback(image-guest-bytes)` | 15,777 |
+| `compute-writeback(cpu-fill)` | 11,267 |
+| `gpu` (genuinely the guest) | 6,316 |
+
+**About 81% of DS invalidation traffic is prosper invalidating its own caches from its own
+writebacks** (27,044 of 33,360). Recorded as a **measurement, not a verdict** — a writeback into guest
+memory can legitimately stale a detached cache — but it was invisible before and it is worth a
+decision.
+
+For the main depth `dr=0x2052ac0000`, which the failing 4K producer samples:
+
+| aspect hit | origin | count |
+| --- | --- | --- |
+| `htile_hit=1` | `gpu` | 1,678 |
+| `htile_hit=1` | `compute-writeback(cpu-fill)` | 407 |
+| `htile_hit=0` | `compute-writeback(cpu-fill)` | 407 |
+
+**Its depth range is never directly written.** Every loss of the depth plane arrives through the
+conservative "an HTILE overlap may describe both aspects, so invalidate both" rule, and 1,678 of the
+2,492 are genuine guest HTILE writes of a repeated identical 640 KB at the HTILE base
+`0x2055310000`. The bridge consequence: `hit(depth=69965)` against
+`declined addr=0x2052ac0000 reason=depth-invalid x37751`, with the retained surface reporting
+`dvalid=0 svalid=1`.
+
+**An aggregate over the wrong population reads as an answer.** A first pass over *all* surfaces showed
+24,922 depth invalidations with `htile_hit=0`, which says "HTILE is not involved at all". That
+population is dominated by **cube shadow maps** (`0x2094ec0000`, `0x20948c0000`, …). Filtering to the
+one surface under investigation inverts the conclusion completely. Filter to the subject before
+believing a count.
+
 ### No OBSERVED DECODED path produces `0x2063380000` — which is not the same as "the guest never issues one"
 
 Read the boundary in this heading before using the table. Every path that can write a surface **and
