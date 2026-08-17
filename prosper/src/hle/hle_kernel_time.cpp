@@ -899,6 +899,18 @@ namespace {
                     // the delivered event carries expirations-since-last-read (kqueue EVFILT_TIMER). Other
                     // filters keep replace-in-place (vblank/flip: the newest event wins).
                     int64_t data = (e.filter == -7 || e.filter == -15) ? q.data + e.data : e.data;
+                    // DIAGNOSTIC (PROSPER_EVLOG=1): a replace-in-place is a DELIVERY THAT WILL NOT HAPPEN.
+                    // For a level source (vblank/flip) that is the intended semantics and the line is
+                    // noise; for a COUNTED completion source it is a lost wakeup, and this is the only
+                    // place that can see it — by the time a consumer notices, the evidence is a thread
+                    // blocked in WaitEqueue with nothing to say why. Printed with ident/filter so the
+                    // APR completion filter (-24) is separable from the 60 Hz pump. Same gate as every
+                    // other producer here, so the count can never be an unarmed zero.
+                    if (evlog() && e.filter != -7 && e.filter != -15)
+                        fprintf(stderr, "[ev] coalesce-replace eq=0x%llx ident=%lld filter=%d "
+                                        "(dropped data=%lld, new data=%lld)\n",
+                                (unsigned long long)eq, (long long)e.ident, (int)e.filter,
+                                (long long)q.data, (long long)data);
                     q = e; q.data = data; s->cv.notify_all(); return;
                 }
             }
@@ -1267,6 +1279,10 @@ HLE(k_eq_getcount){
 // eq_post coalesces on (ident,filter), so ident carries the ring to keep concurrent rings'
 // completions from replacing each other; the per-ring coalescing to the HIGHEST counter is exactly
 // the kqueue "completed up to" semantics the listener's range walk implements.
+// SCOPE (#1673): everything in this block describes the COUNTER dialect, and the coalescing above
+// is conditional on it. A third consumer — CRI ADX2 — binds through the same id != 0 branch with a
+// constant ZERO tag and no range walk, so its completions are counted, not levelled, and are posted
+// individually. See the discrimination comment in prosper_eq_post_apr_token below.
 // CONFIDENCE: HIGH — ctor seeding, walk bounds, unconditional last:=cnt store, handler match/hash/
 // null-entry paths all from static disassembly; tag-echo event consumption live-verified (#180).
 namespace {
@@ -1290,10 +1306,10 @@ namespace {
         return (eq_identity << 6) | (ring & 0x3f);
     }
     void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
-                  unsigned ring, uint64_t token) {   // no APR lock held
+                  unsigned ring, uint64_t token, bool coalesce) {   // no APR lock held
         SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
         e.data = (int64_t)token; e.udata = 0;
-        eq_post(eq, e, /*coalesce=*/true, eq_identity);
+        eq_post(eq, e, coalesce, eq_identity);
     }
 }
 // Post an EXACT guest-chosen completion token (the H896Pt-yB4I binding tag) to the binding's own
@@ -1365,15 +1381,54 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
     }
     unsigned ring = (unsigned)(token >> 58) & 0x3f;
     uint64_t cnt = token & ((1ull << 58) - 1);
+    // A THIRD consumer shares this id != 0 branch, and level coalescing is wrong for it (#1673).
+    //
+    // The branch's coalescing is justified by the #208 listener's range walk: it consumes
+    // `last+1 ..= cnt` and stores `last := cnt`, so one knote carrying the HIGHEST counter retires
+    // every batch below it — genuine kqueue "completed up to" level semantics. That justification
+    // rests entirely on the tag BEING a counter.
+    //
+    // CRI ADX2 (cri_ware_unity.prx; Tales of Graces f Remastered PPSA19991, Sonic Origins
+    // PPSA05325) binds through the same NID with a tag that is a literal ZERO (`xor ecx,ecx` at
+    // cri+0x11b88f) and waits with sceKernelWaitEqueue(..., NULL timeout), retrying until
+    // sceKernelGetEventId matches its id (cri+0x11ba65). Its "counter" therefore never advances:
+    // the high-water mark stays 0, every completion posts an IDENTICAL (ident, filter, data=0)
+    // event, and level coalescing collapses N discrete completions into ONE delivery. A CRI waiter
+    // that does not receive one blocks forever — there is no timeout to rescue it and no range walk
+    // to make the lost event redundant.
+    //
+    // So coalesce only when the tag really is a counter, and use the counter itself as the test.
+    // cnt == 0 cannot be a legitimate value in the #208 dialect: the guest's listener ctor seeds the
+    // per-ring counters at 0x3e8 (1000) with last-processed 0x3e7, counters are dense upward from
+    // there, and #180 already forbids posting cnt < 1000 on that channel because the listener's
+    // unconditional `last := cnt` store would REGRESS the seed. Every token with a nonzero counter
+    // therefore takes the pre-existing path with bit-identical behaviour — this cannot perturb the
+    // UE4/IoStore channel, which is the one #180 and #208 constrain.
+    //
+    // Live shape (PPSA19991, headless boot_trace, PROSPER_AMPRLOG=1 PROSPER_EVLOG=1): one shared
+    // equeue, 471 bound submits — 437 on the id == 0 pointer dialect (already non-coalescing since
+    // #210) and 34 on this branch, every one of them `token=0x0 (ring=0)`, with 22 sharing id=1 and
+    // so sharing one coalescing key.
+    //
+    // This restores the rule the other two completion sources already follow: a completion is a
+    // discrete COUNT, never a level (EOP #234, APR pointer-tag #210). The counter dialect is the
+    // single genuine exception, because there the counter value itself carries "completed up to".
+    // CONFIDENCE: HIGH on the CRI half (guest disassembly for the zero tag and the ident-only
+    // waiter, plus the live token census above); HIGH that the counter dialect is untouched (the
+    // predicate is false for every token it can produce).
+    const bool counter_dialect = cnt != 0;
     const uint64_t hwm_key = apr_hwm_key(eq_identity, ring);
     {
         AprTokenState& state = apr_token_state();
         std::lock_guard lk(state.mx);
         if (cnt > state.tag_hwm[hwm_key]) state.tag_hwm[hwm_key] = cnt;
     }
-    if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
-                         (unsigned long long)token, ring, (unsigned long long)eq);
-    std::thread([eq, eq_identity, id, ring, hwm_key] {
+    // `id` is on this line because it is the COALESCING KEY (apr_post posts ident = id + ring) and
+    // was previously unprintable: joining a completion back to its binding meant guessing from the
+    // interleaving of a multi-threaded log, which silently mis-attributes every post.
+    if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u id=%lld) -> eq=0x%llx scheduled\n",
+                         (unsigned long long)token, ring, (long long)id, (unsigned long long)eq);
+    std::thread([eq, eq_identity, id, ring, hwm_key, counter_dialect] {
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
@@ -1382,7 +1437,7 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
             std::lock_guard lk(state.mx);
             hwm = state.tag_hwm[hwm_key];
         }
-        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm);
+        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect);
     }).detach();
 }
 // Assign the next completion token for `ring` (0-based, 6 bits) — for UNBOUND submits only, whose
