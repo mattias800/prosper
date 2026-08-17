@@ -143,8 +143,11 @@ def test_positive_and_mutations() -> None:
             check("untracked names guard", "dirty" in trees["untracked"].blockers, True,
                   str(trees["untracked"].blockers))
             check("untracked counted as untracked", trees["untracked"].dirty_untracked, 1)
+            # These arms run with use_github=False, so the squash-merge cross-check never ran and
+            # the honest verdict is "could not tell", not "this is live work". Both refuse; the
+            # label is the whole point. test_merge_evidence_labels pins the other branch.
             check("unmerged refused", trees["unmerged"].removable, False)
-            check("unmerged names guard", "unmerged" in trees["unmerged"].blockers, True,
+            check("unmerged names guard", "no-merge-evidence" in trees["unmerged"].blockers, True,
                   str(trees["unmerged"].blockers))
             check("in-use refused", trees["inuse"].removable, False)
             check("in-use names guard", "in-use" in trees["inuse"].blockers, True,
@@ -163,6 +166,29 @@ def test_positive_and_mutations() -> None:
             holder.kill()
             holder.wait()
             git(repo, "worktree", "unlock", str(locked), check_rc=False)
+
+
+def test_merge_evidence_labels() -> None:
+    """"Not merged" and "could not tell" must not share a label.
+
+    The ancestor test is blind to squash merges, which is how this repository merges every PR. So
+    without the GitHub cross-check a non-ancestor tree might be live work OR work that landed via
+    a squash, and reporting a `gh` outage as a wall of live branches would be a confident wrong
+    answer. Neither is removable; only the wording differs, and the wording is what a reader acts on.
+    """
+    print("\n[merge evidence: unmerged vs could-not-tell]")
+    unproven = W.Worktree(path="/x", real="/x", merged_by=None, idle_hours=999.0)
+    W.classify(unproven, 12.0, merge_evidence_available=True)
+    check("complete evidence says unmerged", unproven.blockers, ["unmerged"])
+
+    unknown = W.Worktree(path="/x", real="/x", merged_by=None, idle_hours=999.0)
+    W.classify(unknown, 12.0, merge_evidence_available=False)
+    check("incomplete evidence says no-merge-evidence", unknown.blockers, ["no-merge-evidence"])
+
+    proven = W.Worktree(path="/x", real="/x", merged_by="squash-pr#1", idle_hours=999.0)
+    W.classify(proven, 12.0, merge_evidence_available=True)
+    check("proven merged has no blockers", proven.blockers, [])
+    check("proven merged is removable", proven.removable, True)
 
 
 def test_nested_worktree_is_refused() -> None:
@@ -326,6 +352,7 @@ def test_removal_rechecks_state_rather_than_trusting_the_census() -> None:
 def main() -> int:
     for fn in (
         test_positive_and_mutations,
+        test_merge_evidence_labels,
         test_nested_worktree_is_refused,
         test_holder_attributed_to_most_specific_tree,
         test_idle_is_not_measuring_our_own_footprint,

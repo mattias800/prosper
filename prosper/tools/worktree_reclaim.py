@@ -522,9 +522,16 @@ def survey(
     if use_github:
         gh_available, gh_note = probe_github(repo, trees, gh_limit)
 
+    # "Not merged" and "could not tell" are different answers and must not share a label. The
+    # ancestor test is local and always runs, but it is blind to squash merges, so on its own it
+    # cannot distinguish live work from work that landed via a squash. Only a successful GitHub
+    # cross-check licenses the confident UNMERGED verdict; otherwise the honest state is
+    # NO-MERGE-EVIDENCE. Both are equally unremovable -- this is about not reporting a `gh`
+    # outage, or `--no-github`, as a wall of live branches.
+    evidence_complete = use_github and gh_available
     for t in trees:
-        t.merge_evidence_available = True  # `ancestor` always works; gh only widens it
-        classify(t, min_idle_hours, merge_evidence_available=True)
+        t.merge_evidence_available = evidence_complete
+        classify(t, min_idle_hours, merge_evidence_available=evidence_complete)
 
     meta = {
         "repo": repo,
