@@ -390,6 +390,27 @@ Note that the first two fall silent in cases 1 **and** 2, which is why `PROSPER_
   imports `SpeakerArrayCreate` and `GetSpeakerArrayAmbisonicsCoefficients`. Every other title in the
   corpus — *Dragon Quest VII* included — never asks, so for those the bed's order is something
   prosper must infer and cannot negotiate. Start the orientation experiment from one of those five.
+  Their MAIN port widths, measured with `PROSPER_AUDIO_FLOW=1` on a short default boot:
+
+  | title | MAIN `data_format` | channels | note |
+  |---|---|---|---|
+  | `PPSA26414` R-Type Delta | `0xc00` (two MAIN ports; port38 has `flags=0x2`) | 12 | **the best candidate**: a wide bed AND it queries `GetSpeakerInfo` |
+  | `PPSA21564` Astro Bot | `0x800` | 8 | |
+  | `PPSA05143` Little Nightmares III | `0x880` | 8 | **bit 7 set** — see below |
+  | `PPSA09804` GRIS (Wwise) | `0x880` | 8 | **bit 7 set** |
+
+- **`data_format` bit 7 is set by two titles and prosper drops it. Whether it names the channel
+  order is UNVERIFIED — do not repeat the code comment as fact.** `hle_audio.cpp:630` says the bit
+  "selects the standard 8-channel order", which if true would mean the format word carries ordering
+  information and the order is not purely an inference. Two things are established and one is not:
+  **measured**, two titles set it (`0x880` above) and two do not; **established by reading the
+  code**, nothing in prosper consumes it — it is masked off at `hle_audio.cpp:1023` and `:1999`
+  (`& 0x7fu`) and `audio2_format_channels` uses only bits 8..15. **Not established**: what the bit
+  means. The comment entered in #1347, a GTA V *decode* change, with no evidence recorded for it,
+  and it is exactly the shape of claim this project has been burned by — a plausible sentence with a
+  `file:line` that everyone downstream treats as checked. Treat it as a lead for #1720, not as a
+  premise, and re-derive it from a title's own disassembly or from an A/B before building on it.
+  `CONFIDENCE: LOW`.
 
 ## Tests (`ctest`)
 - **`audio_hle`** (`tests/test_audio.cpp`) — always built. Drives the real HLE entrypoints through the
