@@ -142,9 +142,24 @@ bool materialize_uniform_rtt(RttSurf& surface) {
 
 using RttCache = std::unordered_map<uint64_t, RttSurf>;
 
+// A queued guest write carries WHO made it. The origin is a thread-local set around
+// notify_guest_gpu_write, but DS/RTT invalidation runs later at drain time -- on whatever thread
+// drains, long after that thread-local was reset. So an invalidation diagnostic that reads the
+// thread-local reports a constant: measured on a routed GTA V boot, `[ds] invalidate` printed
+// `origin=gpu` for 30,458 of 30,458 invalidations, including ones made by writers that DO tag
+// themselves. The field looked like attribution and was structurally incapable of it.
+//
+// Capturing the origin at QUEUE time is what makes it real, and it is why the origin must live in
+// the record rather than be re-read at the far end of the seam.
+struct PendingGuestGpuWrite {
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    const char* origin = "gpu";   // string literal or static storage; never an owned buffer
+};
+
 struct PendingGuestGpuWrites {
     std::mutex mutex;
-    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    std::vector<PendingGuestGpuWrite> ranges;
     bool overflowed = false;
 };
 
@@ -155,10 +170,12 @@ PendingGuestGpuWrites& pending_guest_gpu_writes() {
 
 void queue_guest_gpu_write(uint64_t addr, uint64_t size) {
     auto& pending = pending_guest_gpu_writes();
+    // Read the origin HERE, on the writing thread, while it is still the writer's.
+    const char* origin = prosper::gpu::guest_gpu_write_origin();
     std::lock_guard<std::mutex> lock(pending.mutex);
     constexpr size_t kMaxPendingRanges = 65536;
     if (pending.ranges.size() < kMaxPendingRanges)
-        pending.ranges.emplace_back(addr, size);
+        pending.ranges.push_back(PendingGuestGpuWrite{addr, size, origin});
     else
         pending.overflowed = true;
 }
@@ -234,7 +251,7 @@ void register_cpu_rtt_dcc_metadata(
 
 void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
     auto& pending = pending_guest_gpu_writes();
-    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    std::vector<PendingGuestGpuWrite> ranges;
     bool overflowed = false;
     {
         std::lock_guard<std::mutex> lock(pending.mutex);
@@ -256,11 +273,16 @@ void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         cache.clear();
         return;
     }
-    for (const auto& [addr, size] : ranges) {
+    for (const auto& write : ranges) {
+        // Restore the writer's own origin for the duration of this range's invalidation, so the
+        // diagnostics inside report who actually wrote the bytes rather than the drain thread's
+        // default. Cleared afterwards so a queued origin never leaks into an unrelated later write.
+        prosper::gpu::set_guest_gpu_write_origin(write.origin);
         if (invalidate_ds)
-            prosper::test::invalidate_persistent_ds_guest_write(addr, size);
-        prosper::test::invalidate_persistent_color_target_guest_write(addr, size);
-        invalidate_cpu_rtt_guest_write(cache, addr, size);
+            prosper::test::invalidate_persistent_ds_guest_write(write.addr, write.size);
+        prosper::test::invalidate_persistent_color_target_guest_write(write.addr, write.size);
+        invalidate_cpu_rtt_guest_write(cache, write.addr, write.size);
+        prosper::gpu::set_guest_gpu_write_origin(nullptr);
     }
 }
 
@@ -5032,9 +5054,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                 destination, pixels, tw, th, tile_mode,
                                                 writeback_pitch, 4u);
                                         }
-                                        if (guest_addr)
+                                        if (guest_addr) {
+                                            // Named for the same reason as the compute writebacks:
+                                            // a renderer writeback into guest memory is prosper's
+                                            // own store, and reads as an anonymous `gpu` write in
+                                            // every cache-invalidation diagnostic downstream.
+                                            prosper::gpu::set_guest_gpu_write_origin(
+                                                "renderer-writeback(rtt-guest-bytes)");
                                             prosper::gpu::notify_guest_gpu_write(
                                                 guest_addr, guest_bytes);
+                                            prosper::gpu::set_guest_gpu_write_origin(nullptr);
+                                        }
                                         // The same guest range can already have a sampled-image decode
                                         // under a different cache key/class. Its pixel representation
                                         // cannot be patched byte-for-byte from R32_UINT, so discard every
