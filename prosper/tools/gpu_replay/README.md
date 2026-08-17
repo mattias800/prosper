@@ -50,6 +50,16 @@ does not accept substrings; CR, LF, and CRLF differ only as line terminators. Fr
 `printf`, `puts`, `putchar`, `fputs`, `fwrite`, or fd writes is observed, and the match diagnostic names the
 contributing adapter(s). Non-stdout output is ignored. Keep persistent targets enabled.
 
+A marker that is only a *prefix* of the real line therefore never fires, and that is the common way to
+lose a long route (#1684). Since that fix the process reports an armed-but-unfired gate on stderr **at
+exit**: it names the marker, how many completed guest-stdout lines were compared, and the observed line
+sharing the longest prefix with the marker, with non-printable bytes escaped so an invisible difference
+is visible. Re-run with that quoted line verbatim. `no completed line reached the observer` is the other
+outcome and means something different — the route never reached guest stdout, so the marker was never
+tested. The same report covers an unreached `PROSPER_CAPTURE_BUNDLE_AT_PRESENT` (it states the present
+count the run reached), an unobserved `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE`, a gate configured without
+`PROSPER_CAPTURE_BUNDLE`, and a conflicting multi-gate configuration.
+
 When neither a fixed present nor guest stdout is phase-stable, set
 `PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=/path/capture.ready` with
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle`. Keep the trigger path absent at startup, watch

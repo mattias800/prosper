@@ -1941,6 +1941,57 @@ constexpr const char* kAutomaticCaptureBundleGates[] = {
     "PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE",
 };
 
+// Every automatic whole-frame capture gate is armed by an environment variable and fires at most
+// once. Until #1684 a gate that never fired said NOTHING: the run completed, exited 0, and simply
+// wrote no bundle — an outcome indistinguishable from a run that was never configured, and the only
+// way to tell them apart was to notice the absence of a file. These flags live at namespace scope
+// rather than inside the gate states because the exit report must stay readable after every static
+// destructor has run, and because two of the three states are built lazily on the first present and
+// so do not exist at all in a run that never presents.
+enum AutomaticCaptureGateIndex : size_t {
+    kGateAtPresent = 0,
+    kGateGuestLog = 1,
+    kGateTriggerFile = 2,
+    kGateCount = 3,
+};
+static_assert(sizeof(kAutomaticCaptureBundleGates) / sizeof(kAutomaticCaptureBundleGates[0]) ==
+                  kGateCount,
+              "gate indices must line up with kAutomaticCaptureBundleGates");
+std::atomic<bool> g_automatic_capture_gate_fired[kGateCount] = {};
+
+// Latched per flip so a gate that never fired can state what the run actually reached, instead of
+// only repeating what was asked for. Two relaxed atomics against a whole present.
+std::atomic<uint64_t> g_presents_observed{0};
+std::atomic<uint64_t> g_last_present_count{0};
+
+// Longest shared prefix, in bytes. Used to pick the observed line closest to an unmatched marker.
+size_t common_prefix_bytes(const std::string& a, const std::string& b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+
+// Renders a guest log line unambiguously. An exact-match failure is very often caused by a byte the
+// operator cannot see — a trailing tab, a stray CR, a BOM — so printing the line raw would reproduce
+// the very invisibility this report exists to remove.
+std::string escape_log_line(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (const unsigned char ch : text) {
+        if (ch == '\\') {
+            out += "\\\\";
+        } else if (ch >= 0x20 && ch < 0x7f) {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            char buf[5];
+            std::snprintf(buf, sizeof(buf), "\\x%02x", ch);
+            out += buf;
+        }
+    }
+    return out;
+}
+
 bool automatic_capture_bundle_gate_conflicts(const char* selected_gate) {
     uint32_t configured = 0;
     for (const char* gate : kAutomaticCaptureBundleGates) {
@@ -1972,6 +2023,15 @@ struct GuestLogCaptureBundleState {
     uint32_t line_sources = 0;
     bool discard_line = false;
     bool suppress_lf_after_cr = false;
+    // Miss bookkeeping (#1684). Only ever read when the marker never matched, and only written on a
+    // completed line while the gate is armed, so it costs one prefix compare per guest log line and
+    // nothing at all in a run with no marker configured.
+    uint64_t lines_observed = 0;
+    uint64_t lines_discarded = 0;
+    std::string closest_line;
+    size_t closest_prefix_bytes = 0;
+    bool has_closest = false;
+    bool marker_too_long = false;
 
     GuestLogCaptureBundleState() {
         const char* marker_env = std::getenv("PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG");
@@ -1989,6 +2049,7 @@ struct GuestLogCaptureBundleState {
         marker = marker_env;
         path = path_env;
         if (marker.size() > kGuestLogCaptureMaxLineBytes) {
+            marker_too_long = true;
             std::fprintf(stderr,
                          "[grab] PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG exceeds the %zu-byte "
                          "line limit\n",
@@ -2008,8 +2069,12 @@ struct GuestLogCaptureBundleState {
 };
 
 GuestLogCaptureBundleState& guest_log_capture_bundle_state() {
-    static GuestLogCaptureBundleState state;
-    return state;
+    // Deliberately never destroyed. The exit report is registered with std::atexit at load time,
+    // and atexit handlers share one LIFO list with static destructors — so a handler registered
+    // FIRST runs LAST, after this object's destructor would have ended its lifetime. Leaking a
+    // singleton reachable from a static pointer keeps the report legal instead of merely lucky.
+    static GuestLogCaptureBundleState* state = new GuestLogCaptureBundleState();
+    return *state;
 }
 } // namespace
 
@@ -2029,10 +2094,24 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
         std::lock_guard<std::mutex> lock(state.mx);
         if (state.fired.load(std::memory_order_relaxed)) return;
         auto complete_line = [&] {
-            if (!state.discard_line && state.line == state.marker) {
+            ++state.lines_observed;
+            if (state.discard_line) {
+                ++state.lines_discarded;
+            } else if (state.line == state.marker) {
                 state.fired.store(true, std::memory_order_release);
                 matched = true;
                 matched_sources = state.line_sources;
+            } else {
+                // Remember the near-miss (#1684). The longest shared prefix is what separates "the
+                // marker is wrong" — a line the report can print verbatim for the operator to copy —
+                // from "the guest log never reached this code path", where nothing shares anything.
+                // Ties keep the FIRST such line, so the answer is deterministic and does not churn.
+                const size_t shared = common_prefix_bytes(state.line, state.marker);
+                if (!state.has_closest || shared > state.closest_prefix_bytes) {
+                    state.closest_line = state.line;
+                    state.closest_prefix_bytes = shared;
+                    state.has_closest = true;
+                }
             }
             state.line.clear();
             state.line_sources = 0;
@@ -2061,6 +2140,7 @@ void observe_guest_log_for_capture(const char* bytes, size_t size,
         }
     }
     if (!matched) return;
+    g_automatic_capture_gate_fired[kGateGuestLog].store(true, std::memory_order_release);
 
     // The marker is a phase gate, not a frame oracle. Skip exactly one completed present so the
     // transition boundary cannot be mistaken for the scene it announced, then use the established
@@ -2099,7 +2179,151 @@ void observe_guest_log_capture_gap() {
     state.suppress_lf_after_cr = false;
 }
 
+std::string format_guest_log_capture_miss(const GuestLogCaptureMiss& miss) {
+    std::string out =
+        "[grab] PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG never matched; NO BUNDLE WAS WRITTEN.\n"
+        "[grab]   The gate requires the COMPLETE guest-stdout line to EQUAL the marker; it is not "
+        "a substring match.\n";
+    out += "[grab]   marker: \"" + escape_log_line(miss.marker) + "\" (" +
+           std::to_string(miss.marker.size()) + " bytes)\n";
+    if (miss.marker_too_long) {
+        out += "[grab]   the marker exceeds the " + std::to_string(kGuestLogCaptureMaxLineBytes) +
+               "-byte line limit, so the gate was never enabled and could never have matched.\n";
+        return out;
+    }
+    out += "[grab]   observed " + std::to_string(miss.lines_observed) +
+           " completed guest-stdout line(s), of which " + std::to_string(miss.lines_discarded) +
+           " were discarded (over the " + std::to_string(kGuestLogCaptureMaxLineBytes) +
+           "-byte limit, or truncated by a stdout gap).\n";
+    if (miss.lines_observed == 0) {
+        out += "[grab]   no completed line reached the observer at all, so the marker was never "
+               "compared against anything: the route did not reach guest stdout output. That is a "
+               "different fault from a wrong marker.\n";
+        return out;
+    }
+    if (miss.lines_observed == miss.lines_discarded) {
+        out += "[grab]   every observed line was discarded, so no comparison was ever made.\n";
+        return out;
+    }
+    out += "[grab]   closest observed line: \"" + escape_log_line(miss.closest_line) + "\" (" +
+           std::to_string(miss.closest_line.size()) + " bytes, sharing the first " +
+           std::to_string(miss.closest_prefix_bytes) + " byte(s) with the marker)\n";
+    if (miss.closest_prefix_bytes == miss.marker.size() &&
+        miss.closest_line.size() > miss.marker.size()) {
+        out += "[grab]   that line BEGINS with the marker and continues past it: the marker is a "
+               "PREFIX of the real line. Re-run with the closest line above as the marker, "
+               "verbatim.\n";
+    } else if (miss.closest_prefix_bytes == 0) {
+        out += "[grab]   nothing observed shares even one leading byte with the marker.\n";
+    }
+    return out;
+}
+
+bool guest_log_capture_miss_snapshot(GuestLogCaptureMiss& out) {
+    GuestLogCaptureBundleState& state = guest_log_capture_bundle_state();
+    // An empty marker means the gate was rejected before the marker was ever parsed (no
+    // PROSPER_CAPTURE_BUNDLE, or a gate conflict). Both already printed their own reason, and
+    // report_unfired_automatic_capture_gates() handles them ahead of this call.
+    if (state.marker.empty()) return false;
+    if (state.fired.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lock(state.mx);
+    out.marker = state.marker;
+    out.lines_observed = state.lines_observed;
+    out.lines_discarded = state.lines_discarded;
+    out.closest_line = state.closest_line;
+    out.closest_prefix_bytes = state.closest_prefix_bytes;
+    out.marker_too_long = state.marker_too_long;
+    return true;
+}
+
+void report_unfired_automatic_capture_gates() {
+    size_t configured = 0, only = 0;
+    const char* only_value = nullptr;
+    for (size_t i = 0; i < kGateCount; ++i) {
+        const char* value = std::getenv(kAutomaticCaptureBundleGates[i]);
+        if (value && *value) {
+            ++configured;
+            only = i;
+            only_value = value;
+        }
+    }
+    if (!configured) return;   // nothing was asked for; silence is the correct answer
+
+    // Reported here as well as at arm time, because a configuration rejected at startup is easy to
+    // miss in a route's log and its only other symptom is the same missing file.
+    const char* bundle = std::getenv("PROSPER_CAPTURE_BUNDLE");
+    if (!bundle || !*bundle) {
+        std::fprintf(stderr,
+                     "[grab] an automatic whole-frame capture gate was configured without "
+                     "PROSPER_CAPTURE_BUNDLE; nothing was ever armed and no bundle was written\n");
+        return;
+    }
+    if (configured > 1) {
+        std::fprintf(stderr,
+                     "[grab] automatic whole-frame capture gates are mutually exclusive; more than "
+                     "one was configured, so none was armed and no bundle was written\n");
+        return;
+    }
+    if (g_automatic_capture_gate_fired[only].load(std::memory_order_acquire)) return;
+
+    const unsigned long long presents = g_presents_observed.load(std::memory_order_relaxed);
+    const unsigned long long last_present = g_last_present_count.load(std::memory_order_relaxed);
+    switch (only) {
+        case kGateGuestLog: {
+            GuestLogCaptureMiss miss;
+            if (guest_log_capture_miss_snapshot(miss))
+                std::fputs(format_guest_log_capture_miss(miss).c_str(), stderr);
+            break;
+        }
+        case kGateAtPresent: {
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long wanted = std::strtoull(only_value, &end, 0);
+            const bool parsed = !errno && end != only_value && end && !*end;
+            if (!parsed) {
+                std::fprintf(stderr,
+                             "[grab] PROSPER_CAPTURE_BUNDLE_AT_PRESENT=\"%s\" is not a number, so "
+                             "the gate was never armed and no bundle was written\n",
+                             only_value);
+                break;
+            }
+            if (!presents)
+                std::fprintf(stderr,
+                             "[grab] PROSPER_CAPTURE_BUNDLE_AT_PRESENT=%llu never fired; NO BUNDLE "
+                             "WAS WRITTEN. The run never presented at all, so no present ordinal "
+                             "could be reached\n",
+                             wanted);
+            else
+                std::fprintf(stderr,
+                             "[grab] PROSPER_CAPTURE_BUNDLE_AT_PRESENT=%llu never fired; NO BUNDLE "
+                             "WAS WRITTEN. The run observed %llu present(s) and its last present "
+                             "count was %llu\n",
+                             wanted, presents, last_present);
+            break;
+        }
+        case kGateTriggerFile:
+            std::fprintf(stderr,
+                         "[grab] PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE=\"%s\" never fired; NO BUNDLE "
+                         "WAS WRITTEN. That path was not a regular file at any of the %llu "
+                         "present(s) this run observed\n",
+                         only_value, presents);
+            break;
+        default:
+            break;
+    }
+}
+
 namespace {
+// Registered at load rather than from a gate's constructor: two of the three gate states are built
+// lazily on the first present, so a run that never presents would register nothing — and that is
+// exactly the run whose silence is hardest to explain. The handler reads only the environment,
+// namespace-scope atomics, and the deliberately leaked guest-log state, so it stays valid after
+// every static destructor has run.
+[[maybe_unused]] const int g_automatic_capture_gate_exit_report = [] {
+    std::atexit(&report_unfired_automatic_capture_gates);
+    return 0;
+}();
+
 struct CaptureBundleTriggerFileState {
     bool enabled = false;
     std::string trigger_path;
@@ -2144,6 +2368,7 @@ void capture_bundle_trigger_file_on_present(uint64_t present_count) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(state.trigger_path, ec) || ec) return;
     if (state.fired.exchange(true, std::memory_order_acq_rel)) return;
+    g_automatic_capture_gate_fired[kGateTriggerFile].store(true, std::memory_order_release);
 
     const std::string replaced =
         request_interactive_capture_bundle(state.bundle_path, state.max_mb);
@@ -3040,6 +3265,11 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,
                                  uint32_t width, uint32_t height) {
+    // Latched so an automatic gate that never fired can report what the run actually reached rather
+    // than only what was asked for ("you asked for present 5000; the run reached 812"). Two relaxed
+    // atomics against the cost of a whole flip.
+    g_presents_observed.fetch_add(1, std::memory_order_relaxed);
+    g_last_present_count.store(present_count, std::memory_order_relaxed);
     // A remote controller can create this file only after a lightweight screenshot proves the title
     // is in the desired phase. Polling stays entirely absent from normal runs; when configured, the
     // file and this log line independently prove the lever moved before the existing F9 state machine
@@ -3086,6 +3316,7 @@ void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64
     static std::atomic<bool> scheduled_fired{false};
     if (scheduled.valid && present_count >= scheduled.present &&
         !scheduled_fired.exchange(true, std::memory_order_acq_rel)) {
+        g_automatic_capture_gate_fired[kGateAtPresent].store(true, std::memory_order_release);
         const std::string replaced =
             request_interactive_capture_bundle(scheduled.path, scheduled.max_mb);
         std::fprintf(stderr,
