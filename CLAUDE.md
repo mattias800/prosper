@@ -196,7 +196,27 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   Never `cd` back to the main repo root to run git or builds. If you MUST touch the main checkout,
   assume another agent is actively working there — check `git status` first and don't reset/stash/
   switch branches under them (the stash stack is shared too — see the worktree note in the environment
-  preamble). Your worktree is auto-cleaned when its branch merges.
+  preamble).
+  - **Nothing cleans your worktree up. This line used to claim "your worktree is auto-cleaned when
+    its branch merges", and that mechanism never existed** — no git hook, no `core.hooksPath`, no
+    `hooks` key in any settings.json, no `.claude/hooks/`, no script in the repo that calls
+    `git worktree remove` or `prune`, no workflow, no timer. The claim entered as prose in #332 with
+    no code beside it, and by the time #1735 measured the damage there were 121 stale trees / 111 GB;
+    a fortnight later, **278**. The likely origin is a real harness feature — subagents launched with
+    `isolation: "worktree"` genuinely are cleaned up — generalized into a promise about hand-made
+    `git worktree add` trees, which the harness knows nothing about. A charter that promises a safety
+    net nobody has is worse than one that admits the manual step: everybody skips the cleanup *and*
+    nobody files the bug.
+  - **So remove your own worktree when your branch merges**, and run the sweeper periodically:
+    ```bash
+    python3 prosper/tools/worktree_reclaim.py              # census; touches nothing
+    python3 prosper/tools/worktree_reclaim.py --remove --yes
+    ```
+    It refuses any tree that is unmerged, dirty (untracked counts), locked, nested, recently touched,
+    or held by a live process — checked against `/proc/*/cwd`, `exe`, open fds and mappings, and
+    re-checked immediately before each individual removal. That last guard is not paranoia:
+    **removing a worktree a live shell is `cd`'d into wedges that shell irrecoverably**, and it has
+    happened here. It never deletes a branch, so nothing becomes unreachable.
 - **On a Windows host, run git through PowerShell (Windows git), not WSL.** The repo lives on the
   Windows filesystem (`C:\...` = `/mnt/c/...`), and worktrees created from Windows store a
   Windows-path gitdir link (`gitdir: C:/Users/.../.git/worktrees/<name>`). WSL's git can't resolve

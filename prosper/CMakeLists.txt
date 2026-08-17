@@ -128,6 +128,14 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # worktree_reclaim deletes directories, so its tests are mutation arms first: each builds a tree
+  # that MUST NOT be removed (dirty, untracked-only, unmerged, held by a live process, recently
+  # touched, locked, nested) and asserts both the refusal and which guard produced it. It also
+  # pins the instrument bug found while writing it -- examining a worktree used to make it look
+  # freshly touched, which reported all 278 real trees as busy (#1735).
+  add_test(NAME worktree_reclaim_tool
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/test_worktree_reclaim.py")
   add_test(NAME re_edis_mapping
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_edis.py")
   # nid_gate_scan answers "does this title BRANCH on an imported function's return value?", and a
