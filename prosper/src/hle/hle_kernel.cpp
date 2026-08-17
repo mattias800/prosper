@@ -2383,13 +2383,7 @@ HLE(k_pthread_detach) { return fbsd_errno(pthread_detach((pthread_t)a0)); }
 // FreeBSD numbering. EDEADLK is the case that proves the mapping runs — 11 on FreeBSD, 35 on Linux —
 // and 35 is FreeBSD's EAGAIN, i.e. a retry hint. A guest told "retry" instead of "you just tried to
 // join yourself" loops on a condition that will never change (#1612).
-//
-// ONE CASE IS NOT CHECKED AND IS NOT CLAIMED: what a join reports when ANOTHER thread is already
-// joining the target. `fbsd_errno` forwards whatever the host decides, which is EINVAL on glibc; a
-// reviewer raised that FreeBSD's libthr may answer ENOTSUP(45) there instead, and neither of us has
-// read that source. If it does, the mapping needs a case of its own, because no host produces 45 for
-// this. Recorded as an open question rather than as a mapping — do not restate either answer as
-// settled without opening libthr's join_common.
+
 SCE_PTHREAD_ALIAS(k_sce_pthread_join,   k_pthread_join)
 SCE_PTHREAD_ALIAS(k_sce_pthread_detach, k_pthread_detach)
 HLE(k_pthread_exit)   {
