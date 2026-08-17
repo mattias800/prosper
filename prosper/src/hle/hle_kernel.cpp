@@ -1835,9 +1835,9 @@ HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam*
 // DELIBERATELY NOT ALIASED — a DEFERRED decision (#2595), not an evidentially settled one. The
 // distinction is the whole point of this block: an earlier draft of it claimed "nothing observed can
 // settle it" and cited `0x5fac7c3` for the claim, which is not a Getname address at all — it is the
-// `lea rsi` inside the *Rename* caller, quoted 950 lines below above SCE_PTHREAD_ALIAS(
-// k_sce_pthread_rename). Anyone opening it would have landed in the wrong listing and drawn the
-// opposite conclusion. Caught in review of #2573.
+// `lea rsi` inside the *Rename* caller, quoted in the block above
+// SCE_PTHREAD_ALIAS(k_sce_pthread_rename) later in this file. Anyone opening it would have landed in
+// the wrong listing and drawn the opposite conclusion. Caught in review of #2573.
 //
 // `scePthreadGetname` is dual-registered with `pthread_getname_np` and IS fallible, so the family
 // rule that swept the rest of #2178 would take it. Re-derived from PPSA17942 for #2573 rather than
