@@ -77,8 +77,10 @@ std::string read_file_bytes(const std::string& path) {
 LibraryMedia::~LibraryMedia() { shutdown(); }
 
 bool LibraryMedia::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, uint32_t queue_family,
-                        VkSampler sampler, bool music_enabled, float music_gain) {
+                        VkSampler sampler, DescriptorBudget* budget, bool music_enabled,
+                        float music_gain) {
     phys_ = phys; device_ = device; queue_ = queue; qfamily_ = queue_family; sampler_ = sampler;
+    budget_ = budget;
     musicGain_ = music_gain;
 
     // BC7 needs both the device feature and the format itself usable as a sampled image. Checking only
@@ -198,22 +200,50 @@ void LibraryMedia::shutdown() {
     recent_.reset();
 
     if (device_) {
-        // An upload may still be in flight; its images and staging memory cannot be freed under it.
-        if (pending_.active && uploadFence_)
-            vkWaitForFences(device_, 1, &uploadFence_, VK_TRUE, UINT64_MAX);
-        vkDeviceWaitIdle(device_);
-        if (pending_.active) {
-            if (pending_.staging)    vkDestroyBuffer(device_, pending_.staging, nullptr);
-            if (pending_.stagingMem) vkFreeMemory(device_, pending_.stagingMem, nullptr);
-            destroy_background(pending_.bg);
-            pending_ = PendingUpload{};
-        }
-        collect_retired(true);   // the device is idle here, so anything still retired can go now
-        destroy_all_backgrounds();
+        release_backgrounds();
         if (uploadFence_) { vkDestroyFence(device_, uploadFence_, nullptr); uploadFence_ = VK_NULL_HANDLE; }
         if (cmdPool_) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; cmd_ = VK_NULL_HANDLE; }
     }
     ready_ = false;
+}
+
+// Every GPU object this layer holds, released; the worker, the audio stream and the music state are
+// deliberately untouched. shutdown() calls this and then tears down the fence and command pool as well;
+// LibraryUi calls it on its own when the descriptor pool is replaced by a larger one, which invalidates
+// every set allocated from the old pool (#1649).
+void LibraryMedia::release_backgrounds() {
+    if (!device_) return;
+    // An upload may still be in flight; its images and staging memory cannot be freed under it.
+    if (pending_.active && uploadFence_)
+        vkWaitForFences(device_, 1, &uploadFence_, VK_TRUE, UINT64_MAX);
+    vkDeviceWaitIdle(device_);
+    if (pending_.active) {
+        if (pending_.staging)    vkDestroyBuffer(device_, pending_.staging, nullptr);
+        if (pending_.stagingMem) vkFreeMemory(device_, pending_.stagingMem, nullptr);
+        destroy_background(pending_.bg);
+    }
+    pending_ = PendingUpload{};
+    collect_retired(true);   // the device is idle here, so anything still retired can go now
+    destroy_all_backgrounds();
+
+    // Forget what was on screen. backdrop() looks the displayed root up in cache_, which is now empty, so
+    // it already reports "nothing" — but leaving focusRoot_ set would make the next set_focus() with the
+    // same title a no-op and that title would never get its art back. Clearing it makes the very next
+    // update() re-request the art that was just dropped. The MUSIC state is not touched: the track is
+    // host memory, has nothing to do with the descriptor pool, and stopping it here would make the user
+    // hear a folder rescan.
+    focusRoot_.clear();
+    focusPending_ = false;
+    shownRoot_.clear();
+    outgoingRoot_.clear();
+    transitionActive_ = false;
+    incomingReady_ = true;
+    lastDrawn_.clear();
+    deferred_.reset();   // decoded bytes for an upload that would land in the pool that is going away
+    // Everything the worker is still carrying belongs to the state just dropped, so retire the
+    // generation: claim_result() then discards it instead of installing a track for a title that is no
+    // longer focused and uploading art nothing will draw. The next set_focus() asks for both again.
+    ++generation_;
 }
 
 // --- worker ---------------------------------------------------------------------------------------
@@ -677,10 +707,16 @@ void LibraryMedia::poll_upload(uint64_t now_ms) {
     ivi.format = pending_.format;
     ivi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     bool ok = vkCreateImageView(device_, &ivi, nullptr, &bg.view) == VK_SUCCESS;
-    if (ok) {
-        bg.set = ImGui_ImplVulkan_AddTexture(sampler_, bg.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        ok = bg.set != VK_NULL_HANDLE;
+    if (ok && budget_) {
+        // Budget first: covers and backgrounds share one pool, and ImGui_ImplVulkan_AddTexture writes to
+        // whatever vkAllocateDescriptorSets returned without checking it, so an exhausted pool must be
+        // detected BEFORE the call rather than from its result (#1649).
+        bg.set = acquire_texture_set(*budget_, VkDescriptorSet(VK_NULL_HANDLE), [&] {
+            return ImGui_ImplVulkan_AddTexture(sampler_, bg.view,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
     }
+    ok = ok && bg.set != VK_NULL_HANDLE;
     if (!ok) {
         fprintf(stderr, "[library] could not publish the background for %s\n", pending_.root.c_str());
         destroy_background(bg);
@@ -731,7 +767,16 @@ void LibraryMedia::collect_retired(bool force) {
 }
 
 void LibraryMedia::destroy_background(Background& bg) {
-    if (bg.set)    ImGui_ImplVulkan_RemoveTexture(bg.set);
+    // The set goes back to the SHARED pool budget, so a released background makes room for a cover.
+    if (budget_) {
+        release_texture_set(*budget_, bg.set, VkDescriptorSet(VK_NULL_HANDLE),
+                            [](VkDescriptorSet s) { ImGui_ImplVulkan_RemoveTexture(s); });
+    } else if (bg.set) {
+        // Unreachable today — without a budget no set is ever taken — but freeing it unconditionally
+        // means a future caller that skips the budget cannot leak a descriptor here.
+        ImGui_ImplVulkan_RemoveTexture(bg.set);
+        bg.set = VK_NULL_HANDLE;
+    }
     if (bg.view)   vkDestroyImageView(device_, bg.view, nullptr);
     if (bg.image)  vkDestroyImage(device_, bg.image, nullptr);
     if (bg.memory) vkFreeMemory(device_, bg.memory, nullptr);

@@ -24,6 +24,7 @@
 // in-flight load plus one queued one, and no GPU work at all for titles passed over.
 
 #include "launcher_media.hpp"
+#include "library_descriptor_budget.hpp"
 
 #include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
@@ -53,16 +54,28 @@ public:
 
     // Call once per instance; a second call without an intervening shutdown() leaks this layer's pool
     // and fence and reassigns the still-joinable worker thread, which terminates the process.
-    // `sampler` is borrowed from the library UI (same filtering as the covers). Returns false only if
-    // the Vulkan objects this layer owns could not be created. A machine with no audio device is NOT a
-    // failure — it yields a silent library, the same outcome as a title with no snd0.at9 — so check
-    // music_enabled() afterwards for the effective audio state rather than this return value.
+    // `sampler` is borrowed from the library UI (same filtering as the covers). `budget` is the library's
+    // descriptor accounting, also borrowed and non-owning: backgrounds and covers come out of ONE pool,
+    // so only a shared counter can tell either of them that the next allocation would fail (#1649). It
+    // must outlive this object — LibraryUi owns both — and is only touched on the UI thread. A null
+    // budget means no background may be registered at all, which is a silent library, not a crash.
+    // Returns false only if the Vulkan objects this layer owns could not be created. A machine with no
+    // audio device is NOT a failure — it yields a silent library, the same outcome as a title with no
+    // snd0.at9 — so check music_enabled() afterwards for the effective audio state rather than this
+    // return value.
     bool init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, uint32_t queue_family,
-              VkSampler sampler, bool music_enabled, float music_gain);
+              VkSampler sampler, DescriptorBudget* budget, bool music_enabled, float music_gain);
 
     // Stop the worker, close the audio stream, destroy every image. Safe without a successful init and
     // safe to call twice. Called before a guest boots, so nothing here outlives the library view.
     void shutdown();
+
+    // Give up every descriptor set, image and staging allocation this layer holds, but keep running: the
+    // worker, the audio stream and the music state are untouched. Used when the library's descriptor
+    // pool is replaced by a larger one, which invalidates every set allocated from the old pool. The
+    // focus is cleared too, so the next set_focus() re-requests the art that was just dropped rather
+    // than seeing the same root and doing nothing. The caller must have waited for the device.
+    void release_backgrounds();
 
     bool ready() const { return ready_; }
 
@@ -177,6 +190,7 @@ private:
     VkQueue          queue_   = VK_NULL_HANDLE;
     uint32_t         qfamily_ = 0;
     VkSampler        sampler_ = VK_NULL_HANDLE;
+    DescriptorBudget* budget_ = nullptr;          // borrowed from LibraryUi; shared with the covers
     VkCommandPool    cmdPool_ = VK_NULL_HANDLE;   // this layer's own, never the UI's
     VkCommandBuffer  cmd_     = VK_NULL_HANDLE;
     VkFence          uploadFence_ = VK_NULL_HANDLE;

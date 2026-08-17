@@ -13,11 +13,13 @@
 // resources, and event translation.
 
 #include "game_library.hpp"
+#include "library_descriptor_budget.hpp"
 #include "library_media.hpp"
 
 #include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -101,6 +103,19 @@ private:
 
     bool create_render_target(VkFormat format, const std::vector<VkImage>& images, VkExtent2D extent);
     void destroy_render_target();
+
+    // The library's single descriptor pool, shared by ImGui's font atlas, one set per cover, and the
+    // background art (#1630). Sized from the library rather than fixed at 256 (#1649).
+    VkDescriptorPool create_descriptor_pool(uint32_t sets) const;
+    // Make sure the pool can hold `title_count` covers plus the background allowance, growing it if not.
+    // A grow releases every set prosper holds and re-initialises ImGui's Vulkan backend, which is the
+    // only way to point it at a different pool without patching the vendored backend — so the caller
+    // must have destroyed the covers and waited for the device first. Returns false when the pool could
+    // not be grown; the view keeps working at its current capacity and the budget absorbs the shortfall.
+    bool ensure_descriptor_capacity(size_t title_count);
+    // Everything ImGui_ImplVulkan_Init needs, rebuilt from the members so init() and a grow agree.
+    bool init_imgui_vulkan();
+
     // Decode icon0.png and upload it. Returns VK_NULL_HANDLE on any failure; the grid then draws a
     // placeholder, because a missing or corrupt icon must not remove a bootable title from the list.
     VkDescriptorSet cover_for(const GameEntry& game);
@@ -115,14 +130,25 @@ private:
     };
 
     SDL_Window*      window_   = nullptr;
+    VkInstance       instance_ = VK_NULL_HANDLE;   // kept only so a pool grow can re-init ImGui's backend
     VkDevice         device_   = VK_NULL_HANDLE;
     VkPhysicalDevice phys_     = VK_NULL_HANDLE;
     VkQueue          queue_    = VK_NULL_HANDLE;
     uint32_t         qfamily_  = 0;
     VkFormat         format_   = VK_FORMAT_B8G8R8A8_UNORM;
     VkExtent2D       extent_   {};
+    uint32_t         imageCount_ = 2;              // swapchain image count, for ImGui's init info
 
     VkDescriptorPool pool_       = VK_NULL_HANDLE;
+    uint32_t         poolSets_   = 0;              // maxSets the live pool was created with
+    // How many of pool_'s sets prosper itself may allocate — covers here, backgrounds in LibraryMedia.
+    // Consulted BEFORE ImGui_ImplVulkan_AddTexture, which would otherwise write to a VK_NULL_HANDLE set
+    // when the pool is full (#1649); see library_descriptor_budget.hpp.
+    DescriptorBudget budget_;
+    // PROSPER_LIBRARY_POOL_SETS caps the pool, so #1649's exhaustion path is reproducible on a small
+    // library. 0 = unset. Not a tuning knob: capping it below the library deliberately costs covers.
+    uint32_t         poolCap_    = 0;
+    bool             poolFullWarned_ = false;   // the exhaustion notice is per run, not per title
     VkRenderPass     renderPass_ = VK_NULL_HANDLE;
     VkCommandPool    cmdPool_    = VK_NULL_HANDLE;
     VkCommandBuffer  cmd_        = VK_NULL_HANDLE;

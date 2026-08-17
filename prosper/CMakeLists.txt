@@ -603,6 +603,16 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_library_nav PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_library_nav COMMAND test_prosper_app_library_nav)
 
+  # Library descriptor-pool sizing and the exhaustion rule (#1649): the pool must follow the title count
+  # instead of a fixed 256, and a set must never be allocated out of a full pool — ImGui's backend writes
+  # to whatever vkAllocateDescriptorSets returned without checking it. Pure arithmetic plus a fake
+  # allocator that records whether it ran, so no Vulkan, no ImGui and no window.
+  add_executable(test_prosper_app_library_descriptor_budget
+                 frontends/prosper-app/test_library_descriptor_budget.cpp)
+  target_include_directories(test_prosper_app_library_descriptor_budget PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_library_descriptor_budget
+           COMMAND test_prosper_app_library_descriptor_budget)
+
   # Library background art and focus music (#1630): DDS/BC7 and RIFF/ATRAC9 container validation plus
   # the debounce, two-stage fade and LRU policy. Pure byte and arithmetic work — the containers are
   # synthesized in the test, so no dump, no GPU and no audio device is involved.
