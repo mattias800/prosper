@@ -1113,6 +1113,18 @@ if(TARGET prosper_core)
     add_test(NAME dmem_write_trace COMMAND test_dmem_write_trace)
   endif()
 
+  # #1932: SIGTRAP arbitration between PROSPER_HWBP/PROSPER_HWWATCH and PROSPER_BP. Linux-only --
+  # the live arm opens a real per-task perf execute breakpoint and patches a real int3 into this
+  # test's own hand-assembled stubs. Links nothing: src/host/trap_arbitration.hpp is header-only,
+  # so the decision table also builds where the handler does not. The source path is handed to the
+  # wiring check, which confirms the production handler still calls the shared predicate.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_trap_arbitration tests/test_trap_arbitration.cpp)
+    target_compile_definitions(test_trap_arbitration PRIVATE
+      PROSPER_EXEC_IMAGE_LINUX_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/exec_image_linux.cpp")
+    add_test(NAME trap_arbitration COMMAND test_trap_arbitration)
+  endif()
+
   # Unannounced-32-bit index-buffer fingerprint (#304 — DOLL's Slate/UMG quads). No Vulkan needed.
   add_executable(test_index_size_detect tests/test_index_size_detect.cpp)
   target_link_libraries(test_index_size_detect PRIVATE prosper_core)
