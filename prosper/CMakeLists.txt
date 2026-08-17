@@ -347,6 +347,7 @@ if(TARGET prosper_core)
   target_link_libraries(test_videodec2_decode PRIVATE prosper_core)
   add_test(NAME videodec2_decode COMMAND test_videodec2_decode)
   add_test(NAME videodec2_decode_optout COMMAND test_videodec2_decode --no-decode)
+  add_test(NAME videodec2_decode_format COMMAND test_videodec2_decode --format-probe)
 
   add_executable(test_json2 tests/test_json2.cpp)
   target_link_libraries(test_json2 PRIVATE prosper_core)

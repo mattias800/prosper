@@ -123,16 +123,31 @@ private:
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    const bool no_decode = argc > 1 && std::string(argv[1]) == "--no-decode";
-    if (no_decode) {
+// PROSPER_VDEC2_FORMAT's positive control, and it exists because of what it is used FOR. `format` is
+// the one VdecOutput field prosper cannot derive, so the variable is how a candidate value gets
+// swept against a live title without a rebuild. A sweep that reports "no title behaviour changed"
+// is worthless unless the lever provably moved — otherwise "the guest ignores this field" and "the
+// override never reached the guest" are the same observation. This arm establishes only the second
+// half: the value the variable names is what lands in the guest's struct. It says nothing about
+// whether a guest reads it, which is the open question.
+constexpr uint32_t kFormatProbe = 0x2a;
+
+void set_env(const char* name, const char* value) {
 #if defined(_WIN32)
-        _putenv_s("PROSPER_VDEC2_NO_DECODE", "1");
+    _putenv_s(name, value);
 #else
-        setenv("PROSPER_VDEC2_NO_DECODE", "1", 1);
+    setenv(name, value, 1);
 #endif
-    }
-    printf("== test_videodec2_decode (%s) ==\n", no_decode ? "opt-out arm" : "decode arm");
+}
+
+int main(int argc, char** argv) {
+    const std::string arg = argc > 1 ? argv[1] : "";
+    const bool no_decode = arg == "--no-decode";
+    const bool format_probe = arg == "--format-probe";
+    if (no_decode) set_env("PROSPER_VDEC2_NO_DECODE", "1");
+    if (format_probe) set_env("PROSPER_VDEC2_FORMAT", "42");   // decimal 42 == kFormatProbe
+    printf("== test_videodec2_decode (%s) ==\n",
+           no_decode ? "opt-out arm" : format_probe ? "format-override arm" : "decode arm");
     register_builtin_hle();
 
     auto alloc_queue    = Hle::lookup("eD+X2SmxUt4");
@@ -224,6 +239,12 @@ int main(int argc, char** argv) {
               "Decode publishes the decoded picture's dimensions and pitch");
         CHECK(out.codec == config.codec && out.frame == frame.data && out.frame_size == nv12_bytes,
               "Decode publishes the guest's own frame buffer as the picture's location");
+        // `format` is unestablished (#2270) and defaults to 0 rather than to a plausible constant.
+        // The override is the sweep instrument; both halves are pinned so a sweep's result can be
+        // read at all — see kFormatProbe.
+        CHECK(out.format == (format_probe ? kFormatProbe : 0u),
+              format_probe ? "PROSPER_VDEC2_FORMAT reaches the guest's output struct"
+                           : "the unestablished output format defaults to 0, not to a guess");
         // The pixels, not just the flags. A handler that set the flags and copied nothing would
         // pass every check above — that is precisely the false-success shape in a new costume.
         bool luma_ok = true, chroma_ok = true;
