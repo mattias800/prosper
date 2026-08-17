@@ -119,7 +119,7 @@ bool load_symbol_table(const std::string& path, std::string* err) {
                 if (line.compare(0, std::strlen(kMagic), kMagic) != 0) {
                     // The overwhelmingly likely mistake is pointing this at a raw script.json.
                     status.error = "first line is not '" + std::string(kMagic) +
-                                   "' — produce this file with "
+                                   "' -- produce this file with "
                                    "tools/il2cpp/resolve.py --emit-symtab <script.json> <out>";
                     break;
                 }

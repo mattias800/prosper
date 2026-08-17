@@ -138,7 +138,7 @@ void test_aperture() {
     check(resolve_guest_va(prosper::BOOT_IL2CPP + rva).state == ResolveState::Resolved,
           "an address in the IL2CPP aperture resolves");
     check_eq(resolve_guest_va(prosper::BOOT_IL2CPP + rva).name, "Prosper.Fixture.Alpha$$Start",
-             "…to the same method resolve_rva names");
+             "...to the same method resolve_rva names");
     // ARM: the SAME offset in the eboot's aperture must not be symbolicated. #1659: a single wide
     // range labelled every module in it "eboot+", i.e. wrong binary, not merely wrong offset. An
     // implementation that masked or modulo'd the address instead of range-checking resolves this.
@@ -178,19 +178,19 @@ void test_three_negative_states(const std::string& fixture) {
     const std::string unavailable_annotation =
         annotation_for_guest_va(prosper::BOOT_IL2CPP + 0x100208);
     check(!loaded, "a missing symbol file fails to load");
-    check(!err.empty(), "…with a non-empty reason: \"" + err + "\"");
+    check(!err.empty(), "...with a non-empty reason: \"" + err + "\"");
     check(symbol_table_status().attempted && !symbol_table_status().loaded,
           "status() reports attempted-but-not-loaded");
-    check(symbol_table_status().count == 0, "…and zero symbols");
+    check(symbol_table_status().count == 0, "...and zero symbols");
     check_eq(unavailable_token, "unavailable", "a failed load reads as unavailable");
     check_eq(unavailable_annotation, " <il2cpp-symbols-unavailable>",
-             "…and says so at the point of use");
+             "...and says so at the point of use");
 
     check(load_symbol_table(fixture, nullptr), "fixture reloads");
     const std::string nomatch_token = state_of(0x1000);
     const std::string nomatch_annotation = annotation_for_guest_va(prosper::BOOT_IL2CPP + 0x1000);
     check_eq(nomatch_token, "no-managed-method", "a loaded table with no covering method");
-    check_eq(nomatch_annotation, " <no-managed-method>", "…says THAT, not silence");
+    check_eq(nomatch_annotation, " <no-managed-method>", "...says THAT, not silence");
 
     // ARM: the three are pairwise distinct, in both the token and the printed annotation. A
     // resolver that answered "" or "unknown" for all three would satisfy every individual
@@ -201,7 +201,7 @@ void test_three_negative_states(const std::string& fixture) {
     check(not_configured_annotation != unavailable_annotation &&
               unavailable_annotation != nomatch_annotation &&
               not_configured_annotation != nomatch_annotation,
-          "…and three distinct annotations");
+          "...and three distinct annotations");
 }
 
 void test_rejects_a_raw_script_json() {
@@ -213,8 +213,8 @@ void test_rejects_a_raw_script_json() {
     std::string err;
     check(!load_symbol_table(path, &err), "a raw script.json is REFUSED");
     check(err.find("prosper-il2cpp-symtab v1") != std::string::npos,
-          "…naming the header it wanted: \"" + err + "\"");
-    check(symbol_table_status().count == 0, "…and loads zero symbols");
+          "...naming the header it wanted: \"" + err + "\"");
+    check(symbol_table_status().count == 0, "...and loads zero symbols");
 
     // ARM: the same body BEHIND a valid header loads. This proves the refusal is the header check
     // and not "anything unusual fails" — without it, a resolver that rejected every file would pass.
@@ -223,7 +223,7 @@ void test_rejects_a_raw_script_json() {
         "prosper-il2cpp-symtab v1 window=0x8000 count=1\n"
         "1e3e00 {\"ScriptMethod\":[{\"Address\":1980928,\"Name\":\"X\"}]}\n");
     check(load_symbol_table(ok_path, nullptr), "the same text behind a valid header loads");
-    check(symbol_table_status().count == 1, "…as exactly one symbol");
+    check(symbol_table_status().count == 1, "...as exactly one symbol");
     std::remove(path.c_str());
     std::remove(ok_path.c_str());
 }
@@ -235,7 +235,7 @@ void test_rejects_truncation() {
                                         "2000 B$$b\n");
     std::string err;
     check(!load_symbol_table(path, &err), "a file with fewer entries than count= is REFUSED");
-    check(err.find("count=3") != std::string::npos, "…quoting the mismatch: \"" + err + "\"");
+    check(err.find("count=3") != std::string::npos, "...quoting the mismatch: \"" + err + "\"");
     // ARM: the identical entries with an honest count load. Isolates the count check from the
     // parse; a resolver that rejected two-entry files for any other reason fails here.
     const std::string ok = write_temp("il2cpp_symtab_test_short_ok.symtab",
@@ -243,7 +243,7 @@ void test_rejects_truncation() {
                                       "1000 A$$a\n"
                                       "2000 B$$b\n");
     check(load_symbol_table(ok, nullptr), "the same entries with count=2 load");
-    check(symbol_table_status().count == 2, "…as two symbols");
+    check(symbol_table_status().count == 2, "...as two symbols");
     std::remove(path.c_str());
     std::remove(ok.c_str());
 }
@@ -255,7 +255,7 @@ void test_rejects_unsorted() {
                                         "1000 A$$a\n");
     std::string err;
     check(!load_symbol_table(path, &err), "an out-of-order table is REFUSED");
-    check(err.find("sorted") != std::string::npos, "…saying why: \"" + err + "\"");
+    check(err.find("sorted") != std::string::npos, "...saying why: \"" + err + "\"");
     // ARM: the same two entries in ascending order load and resolve. Without this, "refuses
     // everything" would pass the assertion above.
     const std::string ok = write_temp("il2cpp_symtab_test_sorted_ok.symtab",
@@ -263,7 +263,7 @@ void test_rejects_unsorted() {
                                       "1000 A$$a\n"
                                       "2000 B$$b\n");
     check(load_symbol_table(ok, nullptr), "the same entries in order load");
-    check_eq(resolved_name(0x2000), "B$$b", "…and resolve");
+    check_eq(resolved_name(0x2000), "B$$b", "...and resolve");
     std::remove(path.c_str());
     std::remove(ok.c_str());
 }
@@ -281,7 +281,7 @@ void test_rejects_unsorted_ties() {
                                         "2000 Alpha$$a\n");   // descending WITHIN the tie group
     std::string err;
     check(!load_symbol_table(path, &err), "a table whose tied entries are out of order is REFUSED");
-    check(err.find("sorted") != std::string::npos, "…saying why: \"" + err + "\"");
+    check(err.find("sorted") != std::string::npos, "...saying why: \"" + err + "\"");
 
     // ARM 1: the same three entries with the tie group ascending are accepted, and the answer at
     // the shared address is the LAST of the group — the property the rule protects.
@@ -291,7 +291,7 @@ void test_rejects_unsorted_ties() {
                                       "2000 Alpha$$a\n"
                                       "2000 Zeta$$z\n");
     check(load_symbol_table(ok, nullptr), "the same entries with the tie group in order load");
-    check_eq(resolved_name(0x2000), "Zeta$$z", "…and a tied address resolves to the LAST entry");
+    check_eq(resolved_name(0x2000), "Zeta$$z", "...and a tied address resolves to the LAST entry");
 
     // ARM 2: EQUAL names at a shared rva are legal — resolve.py's sort is non-strict, so a duplicate
     // record must not be rejected. Without this arm the check above would also pass if the
@@ -301,7 +301,7 @@ void test_rejects_unsorted_ties() {
                                        "2000 Same$$s\n"
                                        "2000 Same$$s\n");
     check(load_symbol_table(dup, nullptr), "two identical records at one rva are accepted");
-    check_eq(resolved_name(0x2000), "Same$$s", "…and resolve");
+    check_eq(resolved_name(0x2000), "Same$$s", "...and resolve");
 
     // ARM 3: the SIGNEDNESS discriminator, and it is the only arm here that can fail for a reason
     // the others cannot see. resolve.py sorts names by Unicode code point; this side compares
@@ -327,10 +327,10 @@ void test_rejects_unsorted_ties() {
                                             "2000 " "\xC3\x84" "Z$$nonascii_second\n");
     std::string utf8_err;
     check(load_symbol_table(utf8_tie, &utf8_err),
-          "a tie group ascending by CODE POINT loads — the name comparison is unsigned, so it "
+          "a tie group ascending by CODE POINT loads -- the name comparison is unsigned, so it "
           "agrees with resolve.py (\"" + utf8_err + "\")");
     check_eq(resolved_name(0x2000), "\xC3\x84" "Z$$nonascii_second",
-             "…and the last entry of that group is the answer");
+             "...and the last entry of that group is the answer");
 
     std::remove(path.c_str());
     std::remove(ok.c_str());
@@ -344,7 +344,7 @@ void test_rejects_missing_window() {
                                         "1000 A$$a\n");
     std::string err;
     check(!load_symbol_table(path, &err), "a header without window= is REFUSED");
-    check(err.find("window") != std::string::npos, "…saying so: \"" + err + "\"");
+    check(err.find("window") != std::string::npos, "...saying so: \"" + err + "\"");
     // ARM: the window is READ from the file, not hard-coded here. A file declaring window=0x10
     // must stop resolving at +0x10 even though the production window is 0x8000 — no constant
     // baked into this side can produce that answer.
@@ -352,9 +352,9 @@ void test_rejects_missing_window() {
                                         "prosper-il2cpp-symtab v1 window=0x10 count=1\n"
                                         "1000 A$$a\n");
     check(load_symbol_table(tiny, nullptr), "a window=0x10 table loads");
-    check(symbol_table_status().window == 0x10, "…and status reports window=0x10");
-    check_eq(state_of(0x100f), "resolved", "…resolving at +0xf");
-    check_eq(state_of(0x1010), "no-managed-method", "…and stopping at +0x10");
+    check(symbol_table_status().window == 0x10, "...and status reports window=0x10");
+    check_eq(state_of(0x100f), "resolved", "...resolving at +0xf");
+    check_eq(state_of(0x1010), "no-managed-method", "...and stopping at +0x10");
     std::remove(path.c_str());
     std::remove(tiny.c_str());
 }
@@ -367,11 +367,11 @@ void test_utf8_name_roundtrip() {
                                         "prosper-il2cpp-symtab v1 window=0x8000 count=1\n"
                                         "1000 " + name + "\n");
     check(load_symbol_table(path, nullptr), "a table with a non-ASCII name loads");
-    check(resolved_name(0x1000) == name, "…and the bytes round-trip exactly");
+    check(resolved_name(0x1000) == name, "...and the bytes round-trip exactly");
     // ARM: byte length, not character count — a parser that re-encoded or truncated at the first
     // high byte cannot produce this number.
     check(resolved_name(0x1000).size() == name.size(),
-          "…with the same byte length (" + std::to_string(name.size()) + ")");
+          "...with the same byte length (" + std::to_string(name.size()) + ")");
     std::remove(path.c_str());
 }
 
@@ -381,7 +381,7 @@ void test_env_path(const std::string& fixture) {
     ensure_symbol_table_loaded();
     check(!symbol_table_status().attempted, "an unset PROSPER_IL2CPP_SYMBOLS attempts no load");
     check_eq(state_of(0x100208), "not-configured",
-             "…and reads as not-configured, NOT as a failed load");
+             "...and reads as not-configured, NOT as a failed load");
 
     clear_symbol_table();
     set_test_env("PROSPER_IL2CPP_SYMBOLS", fixture);
@@ -389,8 +389,8 @@ void test_env_path(const std::string& fixture) {
     // ARM against the arm above: the same call, the same code path, one environment variable
     // different, and now the table is present. Only the env branch can produce this pair.
     check(symbol_table_status().loaded, "PROSPER_IL2CPP_SYMBOLS pointing at the fixture loads it");
-    check(symbol_table_status().count == 5, "…with all 5 symbols");
-    check_eq(resolved_name(0x100208), "Prosper.Fixture.Alpha$$Start", "…and resolves through it");
+    check(symbol_table_status().count == 5, "...with all 5 symbols");
+    check_eq(resolved_name(0x100208), "Prosper.Fixture.Alpha$$Start", "...and resolves through it");
     clear_test_env("PROSPER_IL2CPP_SYMBOLS");
 }
 
