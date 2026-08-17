@@ -61,8 +61,8 @@ each derived from a **measured** instance rather than invented:
 
 | | count |
 | --- | --- |
-| `PROSPER_*` variables read anywhere in the tree | **658** |
-| read sites for them | **1,067** |
+| `PROSPER_*` variables read anywhere in the tree | **659** |
+| read sites for them | **1,068** |
 | variables read at more than one site | **158** |
 | env predicate functions resolved (`udprov_enabled()` and friends) | **43** |
 | **findings** (`SPLIT-CALL` 3, `SPLIT-LOCAL` 19, `TWO-GATE` 81) | **103** |
@@ -74,8 +74,17 @@ Classification of the 54 keys, from `tools/env/diag_gate_baseline.txt`:
 | --- | --- | --- |
 | `defect` | 2 | a confirmed instance; the note names the issue |
 | `config-echo` | 10 | the field echoes **configuration**, so `0` truthfully means "unconstrained" — the shape rule 1 recommends |
-| `benign` | 2 | read and judged sound, with the reason in the note: two deliberate entry points into one arming helper, and a pure clock read whose call sites disagree |
-| `unreviewed` | 40 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
+| `benign` | 42 | read and judged sound, with the mechanism, a `file:line` and the judging issue in the note — now enforced, rule 4 in `baseline_integrity()` |
+| `unreviewed` | 0 | found by the sweep and **not judged**. #2572 worked the inherited 79 down to zero, so a row carrying this class again is *new* debt, and `UNREVIEWED_BUDGET` is 0 |
+
+The 42 `benign` judgements are #2572's, re-applied onto #2628's keys row by row rather than by taking
+either branch's file whole: 39 keys survived unchanged and took their note verbatim, 14 took the note
+of the predecessor their `[#2628 re-keyed; was …]` marker names — 10 of those needed **re-arguing**,
+because the predecessor's argument was about a requirement the re-key removed — and 1 row
+(`diagnostic_elapsed_ms`) is new under #2628 and keeps its own. The count that matters for the next
+merger is the second one: a note that survives a re-key unread is a verdict whose argument has quietly
+stopped applying to it, which is the same silent loss as a stubbed note and is invisible to every
+mechanical check here.
 
 Before #2628 the same tree read **177 findings / 93 keys** against **61** predicates. The drop is the
 scanner getting *narrower*, not the tree getting cleaner — nothing in `src/` changed.
@@ -108,11 +117,73 @@ afterwards and the summary is where anyone would look for it:
 
 **There is deliberately no class meaning "the variables share a name family, so it is probably
 fine".** An earlier revision had one, and it was the single most misreadable thing in this document:
-a label that is *factually* true and reads as a clearance. Membership of a name family is now
-recorded in the **note** of an `unreviewed` row and is triage only — because #2149's fourth instance
+a label that is *factually* true and reads as a clearance. Membership of a name family is triage
+only — because #2149's fourth instance
 was `PROSPER_PROGRESS` + `PROSPER_PROGRESS_UNIMPL`, which **is** a name family, and the family is
 exactly what made the coupling invisible: the name promised what only the pair delivered. A shared
-family cannot be the end of an argument, so it does not get to be a class.
+family cannot be the end of an argument, so it does not get to be a class. #2572's review bears this
+out from the other side: of the rows whose notes recorded a shared family, the family was never the
+argument that settled them — polarity, defaults and aliases were.
+
+### What the 79 unreviewed rows turned out to be (#2572)
+
+They were read one by one against the two questions in the scanner's docstring. **None was a new
+defect**, and the reason is worth stating precisely rather than as a reassurance: in **47 of the
+79** the scanner's *second* clause is **not a requirement at all**. Four mechanisms produce that,
+and each is a lexical limit rather than a mistake in the tree:
+
+| mechanism | what the code does | what the scanner records |
+| --- | --- | --- |
+| **inverted / opt-out** | `getenv("PROSPER_NO_X") == nullptr`, or `if (!getenv("X"))` | `X` is required — when in truth the block runs *when `X` is unset* |
+| **defaulted** | `X ? atoi(X) : 60`, then the code uses the default | `X` is required — when it is an optional parameter |
+| **default-on mode** | `pertarget = getenv(A) != nullptr \|\| getenv(B) == nullptr` | the clause `A\|B` — satisfied on every default run |
+| **lambda alias** | a helper lambda whose body carries an env-gated branch | every later *call* of that helper reads as env-gated |
+
+The last one is the least obvious and the highest-leverage, so it was checked with a hand-built
+two-arm control rather than argued: a fixture in `gpu_executor.cpp`'s `readable` shape — a
+guest-memory probe lambda containing `if (!profile_fold) return guest_readable(...)` — yields
+`TWO-GATE|…|PROSPER_DYNTRACE+PROSPER_STAGE_FOLD_PROFILE`, and **the same fixture with only that one
+profiling line deleted yields no finding at all.** The requirement is manufactured by the alias.
+
+All four are fixable, and closing them is **#2628** — with the caveat that every one of those fixes
+makes the scanner report *fewer* findings, which is the direction that can silently disable a rule
+(see the `SPLIT-LOCAL` row in `## Ruled out`). Each needs a must-match arm beside its
+must-not-match arm, and the two `defect` rows must still reproduce afterwards.
+
+The single largest cluster is the third row: `PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`
+appears in 23 keys and is true on a default boot — `live_renderer.cpp:1442` makes `pertarget` true
+unless `PROSPER_RTT_SINGLE_TARGET` is set, and `:1044-1050` goes further and `setenv`s
+`PROSPER_RTT_PERTARGET=1` into the process when neither is armed. The `(any)` clause in this file's
+keys is a 14-27 name amalgam that *contains* those two, so it is satisfied on a default run for the
+same reason.
+
+**Two findings point back at the convention itself, and they are the ones to carry forward:**
+
+- **Complying with rule 1 mechanically produces a `TWO-GATE` finding.** `command_processor.cpp:1572`
+  prints *"INIT-TRIP NOT A CONTROL — `PROSPER_MB3_FREELIST_GUARD` is on … so `member=0` here is
+  structural, not a measurement"*. A banner that states an armed state is by construction
+  conditioned on both switches. So a rising `TWO-GATE` count is not evidence of decay, and this is
+  a reason to read notes rather than counts.
+- **The same shape appears for rule 2.** `guest_write_watch.cpp:1372` refuses to run and names the
+  missing switch (`invalid reason=PROSPER_DMEM_CALLER-disabled`); `gpu_timeline.cpp:2288` and
+  `:2742` are the "you armed only half the pair" complaints. All three are flagged because the
+  scanner counts a *negated* env test in an `if` as a requirement.
+
+**What a `benign` `TWO-GATE` row does not say:** that the remaining, genuinely single-gated
+diagnostic cannot print an unmeasured field. That is `SPLIT-LOCAL`'s question, with its own blind
+spots. The reduction answers the rule that fired and nothing else.
+
+The review did turn up one real instrument defect, one level *below* this scanner's reach: `[persist]
+… rgb_nonblack=0` (`live_renderer.cpp:7902`) cannot distinguish an all-black present from no present
+at all, because `selected_pixels` may be null and the counting loop then never runs. Producer and
+printer share one switch, so no signature fires; it is #2255's absent-vs-zero collapse, which the
+same file already fixed for its sibling counter and documents at `:7266-7270`. Filed as **#2627**.
+
+The review's discriminator was checked on a matched pair inside one function rather than on a
+fixture: `gpu_executor.cpp`'s `fresh` (declared `:6595`, filled under `udprov_enabled()`, printed
+`:6611` **outside** it) and its `[udprov]` block (`:6658`, printer **inside** the same predicate,
+unrecorded registers printing `@never`). Same file, same two switches, 47 lines apart — one is the
+open defect, the other is sound, and the procedure separated them.
 
 ### What #2628 sharpened, and how the shrink was kept honest
 
@@ -144,8 +215,8 @@ structured   TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROS
 flat         TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL_ADDR|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN
 ```
 
-`gpu_executor.cpp:402` is `if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;` — required —
-and `:403-404` reads `PROSPER_DYNTRACE_FAIL_ADDR` into an optional filter. The flat read keeps
+`gpu_executor.cpp:403` is `if (!std::getenv("PROSPER_DYNTRACE_FAIL")) return false;` — required —
+and `:404-405` reads `PROSPER_DYNTRACE_FAIL_ADDR` into an optional filter. The flat read keeps
 exactly the wrong one, so a reader following that `defect` row would arm the filter and get silence:
 the defect this document is about, committed by the tool that detects it. **No count could have
 caught it** — not the finding total, not the key total, not a diff of "the numbers went down as
@@ -196,7 +267,7 @@ sends them hunting for a row nobody lost. Two footnotes, both of which have alre
   whose argument still applies while naming the other two.
 
 **One row is new, and it is the rule working rather than decaying.** `diagnostic_elapsed_ms`
-(`live_renderer.cpp:534`) is called under `PROSPER_PASS_LOG` and under `PROSPER_DUMP_PERSISTENT`.
+(`live_renderer.cpp:650`) is called under `PROSPER_PASS_LOG` and under `PROSPER_DUMP_PERSISTENT`.
 Those two sites always disagreed; the spurious `PROSPER_RTT_PERTARGET|…` clause they used to share
 was hiding it. So sharpening a rule can *add* findings as well as remove them.
 
@@ -346,7 +417,7 @@ this tree can print an unmeasured field"*.
 - **"A reduced fixture reproducing a bug is a positive control for it."** Both reductions written
   for this scanner passed while their live originals went unnoticed. `hle_agc.cpp:1774` is
   `dump_call_log(stderr)` — a call with no format string — and the fixture used an `fprintf`;
-  `gpu_executor.cpp:6402`'s real guard is `if (log || g_dyntrace_force)`, where the alternative is a
+  `gpu_executor.cpp:6403`'s real guard is `if (log || g_dyntrace_force)`, where the alternative is a
   **global flag** rather than a `getenv`, and the fixture used `if (log)`. Each reduction removed
   the very property under test. The fixtures now carry the real shapes. #2149.
 - **"`PROSPER_UD_TAIL_ALIGN=off` gives you the `[udtail]` report without the mutation."** It does
@@ -363,13 +434,18 @@ this tree can print an unmeasured field"*.
   missing switch (`guest_write_watch.cpp:1372`) are each conditioned on two variables by
   construction. Read the notes, not the total. #2572.
 - **"Sharpening a rule can only remove findings."** `SPLIT-CALL` gained one at
-  `live_renderer.cpp:534` when the spurious clause its three call sites shared went away: the
+  `live_renderer.cpp:650` when the spurious clause its three call sites shared went away: the
   disagreement had been there all along and the extra clause was masking it. #2628.
 - **"A flat bag of literals is good enough for a predicate body."** It was, only because negation
-  was ignored — the two errors cancelled. `dyntrace_failed_shader_enabled` (`gpu_executor.cpp:401`)
+  was ignored — the two errors cancelled. `dyntrace_failed_shader_enabled` (`gpu_executor.cpp:402`)
   has a guard on `PROSPER_DYNTRACE_FAIL` that *is* required and a filter on
   `PROSPER_DYNTRACE_FAIL_ADDR` that is not; a flat polarity read keeps the wrong one of the two.
   Predicate bodies are read as function bodies (`predicate_clauses`). #2628.
+- **"`PROSPER_RTT_PERTARGET` being in a requirement means a per-target run is needed."** It is the
+  default: `live_renderer.cpp:1442` makes `pertarget` true unless `PROSPER_RTT_SINGLE_TARGET` is
+  set, and `:1044-1050` writes `PROSPER_RTT_PERTARGET=1` into the environment when neither is armed.
+  23 baseline keys carried that clause before #2628 retired it as a requirement; the mode itself is
+  unchanged, so the misreading is still available on any older key or capture note. #2572.
 
 ## See also
 

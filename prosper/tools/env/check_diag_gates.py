@@ -112,9 +112,10 @@ BASELINE_CLASSES = ("defect", "config-echo", "benign", "unreviewed")
 #     echo it, and the header's class counts were skipped as comments.
 #   fewer than this -> debt was PAID. Tightening the number is then a one-line, visible, reviewable
 #     edit, and the ratchet is self-arming: it can only be loosened deliberately and in the diff.
-# #2572 is annotating the remaining rows; when it lands this becomes 0 and no unjudged row can
-# enter the baseline again.
-UNREVIEWED_BUDGET = 40
+# #2572 annotated the remaining rows and this is now 0: no unjudged row can enter the baseline
+# again, and a `--emit-baseline` regeneration -- which classifies every row `unreviewed` -- fails on
+# the first row it writes rather than after it has laundered 54 judgements.
+UNREVIEWED_BUDGET = 0
 
 ENV_NAME = r"PROSPER_[A-Z0-9_]+"
 # Every way this tree asks for a PROSPER_* variable. `env_enabled("X")` and friends pass the name
@@ -1716,7 +1717,18 @@ def _header_class_counts(text: str) -> dict[str, int]:
     return declared
 
 
-def baseline_integrity(text: str, budget: int = UNREVIEWED_BUDGET) -> list[str]:
+# Rule 4's two demands on a `benign` note. A `file:line` the next reader can open, and the issue the
+# judgement was made under. Deliberately `benign`-ONLY: the general form (every non-`unreviewed` row)
+# fails 13 of the 14 such rows the #2628 baseline shipped, and fails them where the demand is wrong --
+# ten identical `config-echo` notes that are CLASS STATEMENTS rather than arguments, and two `defect`
+# rows that carry an issue number and rightly no file:line. Forcing a citation into those manufactures
+# evidence for a regex. `benign` is the one class whose entire content IS an argument, so it is the one
+# class where "the note was replaced by a stub" is a loss the tool can define.
+BENIGN_CITATION_RE = re.compile(r"[A-Za-z0-9_]+\.(?:c|cc|cpp|h|hpp|py):\d+")
+BENIGN_ISSUE_RE = re.compile(r"#\d+")
+
+
+def baseline_integrity(text: str, budget: int | None = None) -> list[str]:
     """Check the baseline against ITSELF. Returns one message per failure; empty means sound.
 
     The gate above this one gets half the job. It fails on a stale KEY and on a missing KEY, and it
@@ -1727,20 +1739,27 @@ def baseline_integrity(text: str, budget: int = UNREVIEWED_BUDGET) -> list[str]:
     the other lane's 79 notes, with no conflict left over and a diff that reads as your own edit
     (the trap-41 / #1701 shape).
 
-    Three rules, each cheap and each falsifiable:
+    Four rules, each cheap and each falsifiable:
 
       1. every row carries a class from BASELINE_CLASSES;
       2. the header's own class counts match the rows, for all four classes -- a summary nobody
          checks is the same silent-drift door one level up, and this file's header is quoted
          verbatim in docs/DIAGNOSTIC_GATE_AUDIT.md;
-      3. the `unreviewed` count equals UNREVIEWED_BUDGET exactly (see that constant).
+      3. the `unreviewed` count equals UNREVIEWED_BUDGET exactly (see that constant);
+      4. every `benign` note names a file:line and an issue (see BENIGN_CITATION_RE) -- the class
+         whose whole content is an argument is the class where a note can be replaced by `ok` and
+         still pass rules 1-3.
 
     Rule 3 is the one with teeth, because `unreviewed` is what a regeneration turns every judgement
-    into. What none of the three can see, stated so nobody quotes this as more than it is: a
-    baseline copied WHOLE from one branch over another is internally consistent by construction and
-    passes all three. Only merge ORDER protects against that -- land the branch that rebuilds the
-    keys first, so the second merger's "keep mine" resolution is the one that fails loudly.
+    into; rule 4 closes the one hole rule 3 leaves open in the same direction -- keeping the CLASS
+    and stubbing the NOTE. What none of the four can see, stated so nobody quotes this as more than
+    it is: a baseline copied WHOLE from one branch over another is internally consistent by
+    construction and passes all four. Only merge ORDER protects against that -- land the branch that
+    rebuilds the keys first, so the second merger's "keep mine" resolution is the one that fails
+    loudly.
     """
+    if budget is None:
+        budget = UNREVIEWED_BUDGET
     rows: list[tuple[str, str]] = []
     for line in text.split("\n"):
         line = line.strip()
@@ -1759,6 +1778,18 @@ def baseline_integrity(text: str, budget: int = UNREVIEWED_BUDGET) -> list[str]:
             failures.append(
                 f"row carries no recognised classification (want one of "
                 f"{', '.join(BASELINE_CLASSES)}): {key}")
+
+    for key, note in rows:
+        if note.split(":", 1)[0].strip() != "benign":
+            continue
+        if not BENIGN_CITATION_RE.search(note):
+            failures.append(
+                f"`benign` note names no file:line -- the mechanism has to be at somewhere the next "
+                f"reader can open, or the row records a verdict with its argument deleted: {key}")
+        if not BENIGN_ISSUE_RE.search(note):
+            failures.append(
+                f"`benign` note names no issue -- say which review judged it, so the reasoning is "
+                f"recoverable when the code moves under the citation: {key}")
 
     declared = _header_class_counts(text)
     for cls in BASELINE_CLASSES:
@@ -1794,10 +1825,11 @@ _SOUND_BASELINE = """\
 #   unreviewed: 2
 #
 TWO-GATE|src/a.cpp|report|PROSPER_A+PROSPER_B  # defect: the printer needs both. #2149
-SPLIT-LOCAL|src/b.cpp|hits|PROSPER_C  # benign: structural, not a count of things observed. #2572
+SPLIT-LOCAL|src/b.cpp|hits|PROSPER_C  # benign: structural (b.cpp:12), not a count of things observed. #2572
 TWO-GATE|src/c.cpp|report|PROSPER_D+PROSPER_E  # unreviewed: not judged
 TWO-GATE|src/d.cpp|report|PROSPER_F+PROSPER_G  # unreviewed: not judged
 """
+_SOUND_BENIGN = "# benign: structural (b.cpp:12), not a count of things observed. #2572"
 
 BASELINE_INTEGRITY_TESTS = (
     ("a sound baseline passes", _SOUND_BASELINE, 2, ""),
@@ -1812,11 +1844,19 @@ BASELINE_INTEGRITY_TESTS = (
     # and the messages have to differ too -- "debt was added" and "debt was paid" call for opposite
     # actions from whoever reads them.
     ("a judgement downgraded to `unreviewed` is caught",
-     _SOUND_BASELINE.replace("# benign: structural, not a count of things observed. #2572",
-                             "# unreviewed: not judged").replace("#   benign: 1", "#   benign: 0")
+     _SOUND_BASELINE.replace(_SOUND_BENIGN, "# unreviewed: not judged")
+                    .replace("#   benign: 1", "#   benign: 0")
                     .replace("#   unreviewed: 2", "#   unreviewed: 3"),
      2, "debt was ADDED"),
     ("debt paid without tightening the ratchet is caught", _SOUND_BASELINE, 3, "debt was PAID"),
+    # The two rule-4 arms. Both keep the CLASS -- which is what makes this hole invisible to rules
+    # 1-3 -- and delete one half of what makes the class mean anything.
+    ("a `benign` note stubbed of its file:line is caught",
+     _SOUND_BASELINE.replace(_SOUND_BENIGN, "# benign: ok, structural rather than measured. #2572"),
+     2, "names no file:line"),
+    ("a `benign` note stubbed of its issue reference is caught",
+     _SOUND_BASELINE.replace(_SOUND_BENIGN, "# benign: structural (b.cpp:12), not a count."),
+     2, "names no issue"),
 )
 
 
