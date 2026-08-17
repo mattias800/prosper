@@ -2307,8 +2307,85 @@ int guest_thread_spawn(uint64_t entry, uint64_t arg, const char* name,
 // a wild/unmapped address -> intermittent SIGSEGV (IL2CPP bdwgc's GC_pthread_create calls the 4-arg form).
 // Force name=null for the 4-arg entry point.
 HLE(k_pthread_create_noname) { return k_pthread_create(a0, a1, a2, a3, 0, 0); }
-HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv : nullptr); if (a1) *(void**)(uintptr_t)a1 = rv; return 0; }
-HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
+// #2575: both of these DISCARDED the host result and returned 0 unconditionally — the SILENT
+// SUCCESS class #1983 fixed in `k_cond_wait`, and the sharper half of it. `pthread_join` reports
+// ESRCH (no such thread), EINVAL (the target is detached, or another thread is already joining it)
+// and EDEADLK (joining yourself); `pthread_detach` reports ESRCH and EINVAL. Every one of them
+// reached the guest as `0` = "the thread was joined, and here is its result".
+//
+// THE `value_ptr` WRITE IS THE SECOND HALF, and it is what makes this worse than an ignored return
+// code. The old body wrote `rv` through the guest's pointer whether or not the join happened, and
+// on every failure path `rv` is still the `nullptr` it was initialised to. So a guest joining a
+// worker to read its exit value could not distinguish "the worker returned NULL" from "there was no
+// such thread": both arrived as rc 0 with a NULL result. A SELF-join (EDEADLK) was reported as a
+// successful join returning NULL, and the caller proceeded as if its worker had finished.
+// FreeBSD's pthread_join writes through `value_ptr` only when it really joined, and so does this now.
+HLE(k_pthread_join)   {
+    void* rv = nullptr;
+    const int rc = pthread_join((pthread_t)a0, &rv);
+    if (rc == 0 && a1) *(void**)(uintptr_t)a1 = rv;   // only a real join produces an exit value
+    return fbsd_errno(rc);   // bare here (#1612); scePthreadJoin encodes through the alias below
+}
+HLE(k_pthread_detach) { return fbsd_errno(pthread_detach((pthread_t)a0)); }
+// Both bodies are registered under BOTH spellings, which is why the fix cannot live in the body
+// alone: `pthread_join` / `pthread_detach` must report the bare FreeBSD errno and `scePthreadJoin`
+// (onNY9Byn-W8) / `scePthreadDetach` (4qGrR6eoP9Y) the libkernel-encoded `0x8002_0000 | errno`, so
+// the two consumers of one body want opposite answers. Same split as #1983 needed for
+// scePthreadCondWait. (NIDs read out of the 3.20 firmware dump, libkernel.c:8764 and :8753 — the
+// issue's first revision had them swapped and corrected itself, so they are quoted from the dump
+// rather than carried over.)
+//
+// EVIDENCE, from the shipped guest libc.prx of PPSA24651, re-derived for #2575 rather than assumed.
+// Its C11 `_Thrd_join` (export YvmY5Jf0VYU @0x4d60) and `_Thrd_detach` (L7f7zYwBvZA @0x4dc0) are the
+// known consumers. Each PLT thunk was resolved to its import through the JMPREL slot, so the pairing
+// is read out of the relocation rather than inferred from adjacency:
+//
+//   _Thrd_join   -> 0x1155a0 -> GOT 0x192328 -> onNY9Byn-W8 (scePthreadJoin)
+//     4d80: call   0x1155a0
+//     4d85: mov    ecx,eax
+//     4d87: mov    eax,0x4          ; _Thrd_error
+//     4d8c: test   ecx,ecx          ; <-- a TEST, not a compare against a named constant
+//     4d8e: jne    0x4d9c           ; nonzero -> return _Thrd_error, and the res slot is NOT read
+//     4d90: xor    eax,eax          ; _Thrd_success
+//     4d92: test   rbx,rbx          ; caller passed a res pointer?
+//     4d97: mov    ecx,[rbp-0x20]   ; the slot it handed scePthreadJoin as value_ptr
+//     4d9a: mov    [rbx],ecx
+//
+//   _Thrd_detach -> 0x1155b0 -> GOT 0x192330 -> 4qGrR6eoP9Y (scePthreadDetach)
+//     4dc4: call   0x1155b0
+//     4dc9: xor    ecx,ecx
+//     4dcb: test   eax,eax
+//     4dcd: setne  cl                ; nonzero -> 4 (_Thrd_error), zero -> 0 (_Thrd_success)
+//
+// TWO SEPARATE READINGS COME OUT OF THAT, and they land at different strengths:
+//
+//   * The guest DOES consume these results — unlike `_Cnd_wait`, which discards
+//     scePthreadCondWait's (#1983). Under the old always-0 body a FAILED join was reported to the
+//     C11 layer as `_Thrd_success`, so `std::thread::join()` returned normally from a join that
+//     never happened. TWO DIFFERENT CALLERS, and an earlier wording here ran them together: a
+//     caller that passes a `res` pointer (C11 `thrd_join(thr, &res)`) additionally read the slot
+//     prosper had just zeroed, whereas `std::thread::join()` passes `res == nullptr`, so
+//     `4d92: test rbx,rbx` / `4d95: je` skips the copy for it. Both are wrong; only the first
+//     involves the value. Caught in review of #2575.
+//     CONFIDENCE: HIGH that the result must be reported at all.
+//     The listing also shows the value_ptr rule above is safe for this consumer: it reads its own
+//     slot ONLY after the `test` says success, so leaving it untouched on a refusal is never read.
+//   * It does NOT settle the ENCODING. `test eax,eax` is nonzero in both spaces, exactly like the
+//     `scePthreadGetname` caller quoted above `k_pthread_getname` — so this rules nothing out in
+//     either direction, and pointing at it as support for the encoded form would repeat the reading
+//     that was already falsified once here (the `%08x` argument, recorded in the Rename block).
+//     CONFIDENCE: MED on the encoded form, at the same strength and for the same reason as
+//     scePthreadRename (#2382) and the TLS-key pair (#1983): the libkernel-wide convention (#2178)
+//     applied to a fallible entry point. Do not raise it without a caller that COMPARES against a
+//     named constant, the way `_Mtx_lock` compares 0x8002000b.
+//
+// The BARE half is settled independently of the encoding: the failure must reach the guest in
+// FreeBSD numbering. EDEADLK is the case that proves the mapping runs — 11 on FreeBSD, 35 on Linux —
+// and 35 is FreeBSD's EAGAIN, i.e. a retry hint. A guest told "retry" instead of "you just tried to
+// join yourself" loops on a condition that will never change (#1612).
+
+SCE_PTHREAD_ALIAS(k_sce_pthread_join,   k_pthread_join)
+SCE_PTHREAD_ALIAS(k_sce_pthread_detach, k_pthread_detach)
 HLE(k_pthread_exit)   {
     // Host pthread_exit unwinds without ever returning through thread_trampoline, so this is its own
     // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68) and drop its stack
@@ -4621,8 +4698,8 @@ void register_kernel_hle() {
     R("scePthreadYield", k_pthread_yield);
     R("__stack_chk_fail", k_stack_chk_fail);   // diagnostic: log the guest canary on a canary-check failure
     R("scePthreadCreate", k_sce_pthread_create);
-    R("scePthreadJoin", k_pthread_join);
-    R("scePthreadDetach", k_pthread_detach);
+    R("scePthreadJoin", k_sce_pthread_join);       // reports its join since #2575 (was always 0)
+    R("scePthreadDetach", k_sce_pthread_detach);   // reports its detach since #2575 (was always 0)
     R("scePthreadExit", k_pthread_exit);
     R("scePthreadAttrInit", k_sce_attr_init);
     R("scePthreadAttrDestroy", k_attr_destroy);
