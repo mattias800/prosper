@@ -12,6 +12,7 @@
 #include "gpu/compressed_source_authority.hpp"
 
 #include "gpu/tile.hpp"
+#include "gpu/gpu_execute.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -419,6 +420,44 @@ int main() {
         f.compression_enabled = true;
         CHECK(!sampled_source_decision(f).may_read_guest_base(),
               "a compressed source with no authority forbids the base");
+    }
+
+    // THE KIND HOOK FAILS CLOSED. The decision refuses to guess the metadata kind, so the hook that
+    // supplies it must answer Unknown whenever nothing established one -- no registered renderer, or no
+    // metadata address at all. A backend running without a renderer then cannot inherit a guess.
+    {
+        set_metadata_kind_query({});   // no renderer registered
+        MetadataKindRequest request;
+        request.metadata_addr = 0x2055310000ull;
+        request.resource_addr = 0x2052ac0000ull;
+        request.format = DataFormat::Float32;
+        request.num_components = 1;
+        request.img_dim = 1;
+        CHECK(classify_compression_metadata_kind(request) == CompressionMetadataKind::Unknown,
+              "with no registered renderer the metadata kind is Unknown, never assumed");
+
+        // Installed, it forwards -- so the Unknown above is the absence of a correlator, not a stub.
+        set_metadata_kind_query([](const MetadataKindRequest& r) {
+            return r.metadata_addr == 0x2055310000ull ? CompressionMetadataKind::Htile
+                                                      : CompressionMetadataKind::Dcc;
+        });
+        CHECK(classify_compression_metadata_kind(request) == CompressionMetadataKind::Htile,
+              "a registered correlator's answer is forwarded");
+        MetadataKindRequest other = request;
+        other.metadata_addr = 0x2099990000ull;
+        CHECK(classify_compression_metadata_kind(other) == CompressionMetadataKind::Dcc,
+              "and it is asked per address rather than cached across them");
+
+        // A descriptor with no metadata address has nothing to correlate, even with a correlator that
+        // would answer for anything.
+        set_metadata_kind_query([](const MetadataKindRequest&) {
+            return CompressionMetadataKind::Htile;
+        });
+        MetadataKindRequest none = request;
+        none.metadata_addr = 0;
+        CHECK(classify_compression_metadata_kind(none) == CompressionMetadataKind::Unknown,
+              "no metadata address means Unknown, whatever a correlator would say");
+        set_metadata_kind_query({});
     }
 
     // Names are part of the contract: a decline must be attributable in a log.

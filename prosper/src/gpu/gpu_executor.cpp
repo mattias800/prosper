@@ -5,6 +5,7 @@
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu_execute.hpp"
+#include "watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu_capture.hpp"
 #include "gpu_timeline.hpp"
 #include "capture_compute_policy.hpp"
@@ -10192,16 +10193,36 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     static std::array<TargetWatch, kMaxWatch> watch{};
                     static size_t watch_count = 0;
                     static std::atomic<uint64_t> watch_draws{0};
+                    // Parsed by the shared STRICT parser, which is the whole reason it exists. This
+                    // site was the original occurrence of the base-0 trap: `strtoull(..., 0)` accepts a
+                    // bare decimal, so `PROSPER_TARGET_WATCH=2063380000` armed a watch on
+                    // 2,063,380,000, printed "watching 1 address(es)", and produced a confident zero
+                    // for an address nobody asked about. A watch whose null is meaningless is worse
+                    // than no watch, and this one's nulls are quoted as evidence.
+                    //
+                    // A malformed list arms NOTHING. An oversized list is REJECTED rather than
+                    // truncated: silently dropping the ninth address would answer "never a target" for
+                    // a surface that was never examined.
                     static const bool watch_enabled = [] {
                         const char* spec = std::getenv("PROSPER_TARGET_WATCH");
                         if (!spec || !*spec) return false;
-                        for (const char* p = spec; *p && watch_count < kMaxWatch;) {
-                            char* end = nullptr;
-                            const uint64_t v = std::strtoull(p, &end, 0);
-                            if (end == p) break;
-                            watch[watch_count++].addr = v;
-                            p = (*end == ',') ? end + 1 : end;
+                        std::vector<uint64_t> addrs;
+                        if (!prosper::gpu::parse_hex_watch_list(spec, addrs)) {
+                            std::fprintf(stderr,
+                                         "[target-watch] ignoring malformed PROSPER_TARGET_WATCH=\"%s\" "
+                                         "(expected 0x-prefixed hex addresses, comma separated) "
+                                         "-- NOT armed\n", spec);
+                            return false;
                         }
+                        if (addrs.size() > kMaxWatch) {
+                            std::fprintf(stderr,
+                                         "[target-watch] PROSPER_TARGET_WATCH lists %zu addresses, "
+                                         "more than the %zu-address bound -- NOT armed (truncating "
+                                         "would report 'never a target' for addresses never examined)\n",
+                                         addrs.size(), kMaxWatch);
+                            return false;
+                        }
+                        for (const uint64_t v : addrs) watch[watch_count++].addr = v;
                         std::fprintf(stderr, "[target-watch] watching %zu address(es)\n",
                                      watch_count);
                         return watch_count != 0;
@@ -10892,6 +10913,16 @@ void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
 }
 void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn) {
     g_live_target_image_written = std::move(written_fn);
+}
+
+static MetadataKindQueryFn g_metadata_kind_query;
+void set_metadata_kind_query(MetadataKindQueryFn fn) { g_metadata_kind_query = std::move(fn); }
+
+CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindRequest& request) {
+    // No renderer, no correlation, no kind. Unknown authorizes nothing downstream, so a backend running
+    // without a registered renderer fails closed rather than inheriting a guess.
+    if (!request.metadata_addr || !g_metadata_kind_query) return CompressionMetadataKind::Unknown;
+    return g_metadata_kind_query(request);
 }
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import) {
