@@ -269,6 +269,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   non-zero instead of `status=ok` (#2007), and the manifest summary carries `guest_state` and the
   fault address. Pass `--allow-guest-fault` only when the route deliberately samples a crashing
   title; it yields `status=GUEST-FAULT-ALLOWED`, never `ok`.
+  Sampling also **stops** once the guest is dead *and* the present layer has published nothing for
+  `--guest-fault-settle-seconds` (1 s), so the run no longer spends its remaining `--seconds` /
+  `--timeout` re-photographing one frame (#2584: 24 of 25 PNGs were byte-identical). Every sample
+  already taken is kept and the verdict is unchanged; the summary reads `saved/requested` with
+  `stop=guest-fault` beside it, and the manifest summary carries `stop_reason`, so **a short PNG set
+  is not evidence of a crashed harness — read `stop_reason` before assuming a run was truncated**.
+  `--no-stop-after-guest-fault` restores full-length sampling.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
   export RVAs. Use `--find-symbol NID` for a focused import/export query, and **`--import-slots`**
   to print the GOT/PLT relocation slot each import lands in — the step that starts every

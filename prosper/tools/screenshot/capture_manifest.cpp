@@ -62,6 +62,27 @@ RunVerdict decide_run_verdict(bool assertions_failed, const GuestOutcome& guest,
     return {"ok", 0};
 }
 
+const char* sampling_stop_name(SamplingStop stop) {
+    switch (stop) {
+        case SamplingStop::Timeout:    return "timeout";
+        case SamplingStop::GuestFault: return "guest-fault";
+        case SamplingStop::RequestSatisfied: break;
+    }
+    return "request-satisfied";
+}
+
+bool should_stop_after_guest_fault(const GuestOutcome& guest, bool enabled,
+                                   double seconds_since_fault_observed,
+                                   double seconds_since_present_advanced,
+                                   double settle_seconds) {
+    if (!enabled) return false;
+    if (guest.state != GuestRunState::Faulted) return false;
+    // Both windows, not either: the first proves in-flight work had its chance, the second proves
+    // nothing is still arriving. See the header for why the fault alone is not enough.
+    return seconds_since_fault_observed >= settle_seconds &&
+           seconds_since_present_advanced >= settle_seconds;
+}
+
 void normalize_capture_rgba(CaptureSource source, std::vector<uint8_t>& pixels) {
     // A republished guest scanout is normalized like a composited frame and for the same reason:
     // both reach the desktop through the OPAQUE swapchain, so neither one's alpha attenuates the
@@ -259,6 +280,11 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
          << ",\"min_present_count\":" << c.min_present_count
          << ",\"min_frame_seq\":" << c.min_frame_seq
          << ",\"allow_guest_fault\":" << (c.allow_guest_fault ? "true" : "false")
+         // Sampling policy rather than an assertion, but recorded in the same object so one line
+         // still reproduces the whole invocation.
+         << ",\"stop_after_guest_fault\":" << (c.stop_after_guest_fault ? "true" : "false")
+         << ",\"guest_fault_settle_seconds\":" << std::fixed << std::setprecision(6)
+         << c.guest_fault_settle_seconds
          << ",\"required_crc32\":";
     if (c.required_crc32_set)
         line << "\"" << std::hex << std::setw(8) << std::setfill('0') << c.required_crc32
@@ -303,13 +329,17 @@ std::string manifest_sample_json(int index, const std::string& png_path,
     return line.str();
 }
 
-std::string manifest_summary_json(int saved, int requested, bool timed_out,
+std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
                                   const CaptureTracker& tracker, const RunVerdict& verdict,
                                   const GuestOutcome& guest, bool allow_guest_fault) {
     std::ostringstream line;
     line << "{\"type\":\"summary\",\"schema\":1,\"saved\":" << saved
          << ",\"requested\":" << requested
-         << ",\"timed_out\":" << (timed_out ? "true" : "false")
+         // `saved` < `requested` alone cannot tell a truncated harness from a run that stopped
+         // because nothing new could arrive. `stop_reason` is what separates them; `timed_out` is
+         // derived from the same value so an existing consumer keeps reading the same field.
+         << ",\"timed_out\":" << (stop == SamplingStop::Timeout ? "true" : "false")
+         << ",\"stop_reason\":\"" << sampling_stop_name(stop) << "\""
          << ",\"distinct_source_frames\":" << tracker.distinct_source_frames()
          << ",\"pixel_distinct_frames\":" << tracker.pixel_distinct_frames()
          << ",\"rendered_samples\":" << tracker.rendered_samples()

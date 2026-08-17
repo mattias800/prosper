@@ -121,6 +121,33 @@ struct RunVerdict {
 RunVerdict decide_run_verdict(bool assertions_failed, const GuestOutcome& guest,
                               bool allow_guest_fault);
 
+// Why the sampling loop ended. `RequestSatisfied` and `Timeout` are the two reasons the loop always
+// had; `GuestFault` is the early stop (#2584).
+enum class SamplingStop : uint8_t { RequestSatisfied, Timeout, GuestFault };
+
+const char* sampling_stop_name(SamplingStop stop);   // request-satisfied | timeout | guest-fault
+
+// Should the sampler stop before its request is satisfied, because nothing new can arrive?
+//
+// This deliberately does NOT stop at the fault itself, and that is the whole design. `GuestOutcome`
+// describes only the thread `run_entry` entered (see the scope note above): other guest threads and
+// a renderer backlog can still publish frames after the primary thread dies, and a stop keyed on the
+// fault alone would discard those silently — the truncated run would look exactly like a satisfied
+// one. So the stop also requires the present layer to have gone quiet, which makes the condition
+// detect its own invalidity: a run that keeps producing frames keeps sampling them.
+//
+// Both windows are measured against the same settle duration. The one measured from the fault is
+// what gives work already in flight a chance to land; the one measured from the last publication is
+// what establishes that nothing is still arriving.
+//
+// `Returned` is deliberately NOT a stop. A title exiting on its own is not a dead guest, the tool
+// already reports it, and a run cut short by it must keep tripping the saved/requested assertion —
+// the contract `README.md` states and #2007 relied on.
+bool should_stop_after_guest_fault(const GuestOutcome& guest, bool enabled,
+                                   double seconds_since_fault_observed,
+                                   double seconds_since_present_advanced,
+                                   double settle_seconds);
+
 struct CaptureRunConfig {
     std::string title;
     std::string timestamp;
@@ -147,6 +174,8 @@ struct CaptureRunConfig {
     bool required_crc32_set = false;
     uint32_t required_crc32 = 0;
     bool allow_guest_fault = false;
+    bool stop_after_guest_fault = true;
+    double guest_fault_settle_seconds = 0;
 };
 
 class CaptureTracker {
@@ -187,8 +216,10 @@ std::string manifest_sample_json(int index, const std::string& png_path,
                                  const std::string& input_route);
 // The verdict, the guest's terminal state and the opt-out are all required parameters: a caller that
 // forgets to wire the guest state must fail to compile rather than emit a summary that quietly omits
-// it, which is the shape of the defect this signature exists to prevent (#2007).
-std::string manifest_summary_json(int saved, int requested, bool timed_out,
+// it, which is the shape of the defect this signature exists to prevent (#2007). `stop` is required
+// for the same reason: a short artifact set that does not say why it is short is the same legibility
+// defect one level down (#2584). It also supplies the `timed_out` field, so the two cannot disagree.
+std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
                                   const CaptureTracker& tracker, const RunVerdict& verdict,
                                   const GuestOutcome& guest, bool allow_guest_fault);
 

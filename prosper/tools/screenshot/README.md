@@ -35,6 +35,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--min-pixel-distinct-frames N] [--max-pixel-stale-seconds S]
            [--require-composited-frame] [--min-present-count N]
            [--min-frame-seq N] [--require-crc32 N] [--allow-guest-fault]
+           [--no-stop-after-guest-fault] [--guest-fault-settle-seconds S]
 ```
 
 | Option | Default | Meaning |
@@ -60,6 +61,8 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--min-frame-seq N` | 0 | Fail unless a captured sample reaches rendered-frame N |
 | `--require-crc32 N` | unset | Fail unless a sample has this RGBA CRC32 (decimal or `0xHEX`) |
 | `--allow-guest-fault` | off | Do not fail the run when the guest's primary thread dies (deliberate fault-reproduction routes) |
+| `--no-stop-after-guest-fault` | off | Keep sampling the full request after the guest's primary thread dies |
+| `--guest-fault-settle-seconds S` | 1 | Quiescence required before that early stop: the guest must be dead **and** the present layer silent this long |
 
 Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
@@ -105,6 +108,37 @@ that (#2007: a title that crashed 0.4 s into boot produced 25 identical PNGs and
 Scope: this observes the thread `run_entry` entered. A *worker* thread's fatal fault already
 `_exit(90)`s the whole process on Linux, which every caller that checks an exit status can see; the
 primary thread was the one that could die silently.
+
+### Sampling stops once nothing new can arrive
+
+The verdict was only half of it: the loop used to keep running to the full `--seconds`/`--count`/
+`--timeout` after the guest had died, writing one identical PNG per interval. On the `PPSA26414`
+reproduction that was 24 byte-identical PNGs over 24 s (#2584).
+
+Sampling now stops when **both** hold: the guest's primary thread is dead, *and* the present layer
+has published nothing for `--guest-fault-settle-seconds` (1 s by default). The second condition is
+not redundant — `GuestOutcome` covers only the thread `run_entry` entered, so other guest threads and
+a renderer backlog can still publish frames after it dies. A run that keeps producing frames keeps
+sampling them, so the stop cannot silently truncate evidence; it can only remove a tail that is
+already known-identical.
+
+- **Every sample already taken is kept**, and the run finishes normally: same verdict, same
+  assertions, same manifest, same exit status.
+- **The short artifact set explains itself.** The summary line reads
+  `done: 3/25 screenshot(s) … stop=guest-fault … status=GUEST-FAULT`, and the manifest summary
+  carries `stop_reason` (`request-satisfied` | `timeout` | `guest-fault`) beside the `saved` and
+  `requested` it already had. Three PNGs where 25 were asked for must never read as a crashed
+  harness.
+- **The saved/requested assertion is excused only where the skipped samples would otherwise have
+  been written** — wall-clock (`--seconds`) mode with at least one sample taken, where the sampler
+  is due again regardless of the guest and the remainder are guaranteed duplicates. In frame
+  (`--every`) mode a dead, quiet guest produces no new frame for `due` to fire on, so nothing more
+  would have been written and the shortfall still fails.
+- **A guest that *returns* does not trigger this.** A title exiting on its own is not a dead guest,
+  and a run cut short by it must keep tripping the saved/requested assertion, as above.
+- `--no-stop-after-guest-fault` restores the old full-length sampling, and both the flag and the
+  settle window are recorded in the manifest's run header, so an archived artifact set says whether
+  its tail was dropped or never produced.
 
 Warmup is useful when llvmpipe makes a frame-counted startup take minutes. The guest and GPU command
 decoder continue at native speed while Vulkan work is skipped; normal screenshots begin once warmup
