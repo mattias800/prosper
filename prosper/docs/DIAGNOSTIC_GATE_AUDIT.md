@@ -75,13 +75,15 @@ Classification of the 93 keys, from `tools/env/diag_gate_baseline.txt`:
 | `defect` | 2 | a confirmed instance; the note names the issue |
 | `config-echo` | 10 | the field echoes **configuration**, so `0` truthfully means "unconstrained" — the shape rule 1 recommends |
 | `benign` | 2 | read and judged sound, with the reason in the note: two deliberate entry points into one arming helper, and a behaviour predicate that prints nothing |
-| `family` | 28 | **triage, not a clearance** — every variable in the requirement shares a name family, so a reader who arms one can find the other from the names |
-| `unreviewed` | 51 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
+| `unreviewed` | 79 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
 
-**`family` is not a clean bill of health, and this is the one line in this document most likely to
-be misread.** #2149's fourth instance was `PROSPER_PROGRESS` + `PROSPER_PROGRESS_UNIMPL` — which *is*
-a name family, and the family is exactly what made the coupling invisible. Read a `family` row before
-quoting its output as a measurement.
+**There is deliberately no class meaning "the variables share a name family, so it is probably
+fine".** An earlier revision had one, and it was the single most misreadable thing in this document:
+a label that is *factually* true and reads as a clearance. Membership of a name family is now
+recorded in the **note** of an `unreviewed` row and is triage only — because #2149's fourth instance
+was `PROSPER_PROGRESS` + `PROSPER_PROGRESS_UNIMPL`, which **is** a name family, and the family is
+exactly what made the coupling invisible: the name promised what only the pair delivered. A shared
+family cannot be the end of an argument, so it does not get to be a class.
 
 ### Confirmed instances
 
@@ -91,6 +93,38 @@ quoting its output as a measurement.
 | `src/gpu/gpu_executor.cpp` (`[udcand]`) | `fresh_extent` | filled only under `PROSPER_UDPROV` / `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE`, printed regardless | **open, #2149 inst. 3** — `fresh_extent=0` reads as *"the bind programmed nothing"* |
 | `src/hle/hle_agc.cpp` | unimplemented-NID call-count table | needed `PROSPER_PROGRESS` as well as `PROSPER_PROGRESS_UNIMPL` | **fixed** — the dump now has its own cadence |
 | `src/gpu/gpu_executor.cpp` (`record_guest_write`) | `color=…` | the `ColorTarget` recorder sat behind `PROSPER_PROVENANCE_DIM` | **fixed by #2143** — the scanner agrees: the post-fix shape produces no finding |
+
+### The baseline key, and the two churn doors shut in it
+
+The key is `KIND|file|subject|requirement`. What it deliberately does **not** contain is as
+important as what it does, because several lanes edit this tree at once and a key that moves under
+an unrelated edit fails the `Docs` job on a PR that did nothing wrong. The obvious repair for such a
+failure is *"regenerate the baseline"* — which silently downgrades every `defect` row it carries to
+whatever the regenerator writes. That is the same laundering this document is about, performed by
+hand, so both doors are shut:
+
+| door | what would churn | how it is shut |
+| --- | --- | --- |
+| **line number** | every edit *above* a finding re-keys it, twice over — one "new finding" plus one "stale row" | the key carries no line; the line is printed in the finding, not the identity |
+| **alternation membership** | this tree has a 28-alternative "some dump is on" predicate; the display form elides it as `..23more`, and that **count is membership** — adding one `PROSPER_DUMP_*` variable re-keys every finding depending on it | a clause with more than three alternatives renders as `(any)` in the key; presentation keeps the count, identity does not |
+
+The second door was measured rather than imagined: on the first baseline, **13 of 93 rows embedded
+an elision count, and all 13 were in one file** — `frontends/shared/live_renderer.cpp`, which was
+under active edit in two open PRs at the time. One added variable would have moved all thirteen at
+once. The principle underneath both: **the conjunction is identity; a long alternation is
+presentation** — the same argument the display form makes for eliding it, since printing all 28
+buries the conjunction, which is the part a reader has to see.
+
+Two self-test arms hold this, and the second is what makes the first mean anything:
+
+- adding a name to a long any-of clause must move **no** key — insensitivity;
+- changing the **conjunction** must move the key — discrimination. Without it, insensitivity is also
+  satisfied by a key that never changes at all.
+
+The residual is stated rather than papered over: the threshold is a boundary, so a clause growing
+from three to four alternatives *does* re-key. That is a genuine loosening of a small, deliberate
+alternation and is worth re-reading; the hazard guarded against is an unrelated name joining a bulk
+one.
 
 ## Re-running the audit
 

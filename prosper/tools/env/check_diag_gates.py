@@ -390,16 +390,44 @@ class Finding:
                        else f"{names[0]}|{names[1]}|..{len(names) - 2}more")
         return "+".join(sorted(out))
 
+    @staticmethod
+    def render_key(ctx) -> str:
+        """The requirement AS IDENTITY. Long alternations collapse to `(any)` -- no membership.
+
+        `render()` is presentation and may elide with a count; identity must not, and the two must
+        not share a function. The count IS membership: this tree has a 28-alternative "some
+        diagnostic dump is on" predicate, and with `..23more` inside the key, adding ONE
+        `PROSPER_DUMP_*` variable to it re-keys every finding that depends on it -- measured on the
+        first baseline, 13 rows, all in one file, all of them changing together. That would fail
+        the Docs job on a PR that did nothing wrong, pointing at a baseline table rather than at
+        the cause, and the fix would look like "just regenerate the baseline" -- which is exactly
+        how a `defect` row silently becomes an `unreviewed` one.
+
+        The principle: **the conjunction is identity; a long alternation is presentation.** That is
+        the same argument render()'s own docstring makes for eliding it -- printing all of them
+        buries the conjunction, which is the part a reader has to see.
+
+        The residual, stated rather than papered over: the threshold is a boundary, so a clause
+        crossing 3 -> 4 names DOES re-key. That is a genuine loosening of a small, deliberate
+        alternation and is worth re-reading; the hazard this guards against is an unrelated name
+        joining a bulk one.
+        """
+        out = []
+        for cl in ctx:
+            names = sorted(cl)
+            out.append("|".join(names) if len(names) <= 3 else "(any)")
+        return "+".join(sorted(out))
+
     def key(self) -> str:
-        """Baseline identity: NO line number.
+        """Baseline identity: no line number, and no membership of a long alternation.
 
         A line-numbered key churns on every unrelated edit above the finding, and each churn shows
         up twice -- once as a new finding, once as a stale baseline row. In a tree several lanes
-        edit at once that turns the gate into noise people learn to regenerate past, which is how
-        a `defect` row silently becomes an `unreviewed` one. File + subject + requirement is
-        stable under code motion and still distinguishes two different couplings in one file.
+        edit at once that turns the gate into noise people learn to regenerate past. File +
+        subject + requirement is stable under code motion and still distinguishes two different
+        couplings in one file; see render_key() for the second churn door and why it is shut.
         """
-        return f"{self.kind}|{self.where.rsplit(':', 1)[0]}|{self.subject}|{self.render(self.gates)}"
+        return f"{self.kind}|{self.where.rsplit(':', 1)[0]}|{self.subject}|{self.render_key(self.gates)}"
 
     def line(self) -> str:
         return f"{self.key()}  @{self.where}  {self.detail}"
@@ -994,6 +1022,91 @@ void diagnose_resource_provenance(const State& st) {
 ]
 
 
+# --------------------------------------------------------------------------------------------
+# Key-stability arms. These test the BASELINE KEY rather than the signatures, because the key is
+# what the multi-lane gate stands on: if an unrelated edit re-keys a row, the Docs job fails on a
+# PR that did nothing wrong, and the obvious repair -- regenerate the baseline -- silently
+# downgrades every classification it carries.
+#
+# Two arms, and the second is the one that makes the first mean anything. Insensitivity alone is
+# satisfiable by a key that never changes at all, which would be useless; the discrimination arm
+# is what shows the key still separates two different requirements.
+# --------------------------------------------------------------------------------------------
+_LONG_PREDICATE = """
+bool any_dump_enabled() {
+    static const bool on = std::getenv("PROSPER_DUMP_ATLAS") != nullptr ||
+        std::getenv("PROSPER_DUMP_DRAWSTEPS") != nullptr ||
+        std::getenv("PROSPER_DUMP_RAWTEX") != nullptr ||
+        std::getenv("PROSPER_DUMP_RTGROUPS") != nullptr ||
+        std::getenv("PROSPER_DUMP_TEX") != nullptr%s;
+    return on;
+}
+void report_block(const State& st) {
+    uint32_t hits = 0;
+    if (any_dump_enabled()) {
+        hits = st.count;
+    }
+    fprintf(stderr, "[dump] hits=%%u\\n", hits);
+}
+"""
+
+# The discrimination arm changes the CONJUNCTION: the producer now needs a SECOND, independent
+# variable that the printer still does not. That is a real change in what a reader must arm for
+# the field to carry a measurement, so the key must move.
+#
+# Note where the gate had to go. Wrapping the *fprintf* instead leaves the finding's requirement
+# untouched -- SPLIT-LOCAL keys on the clauses the writes need and the print does not -- so that
+# version of this arm passed while proving nothing. The arm has to change the thing the key is
+# made of, which is the same mistake as a reduced fixture that drops the property under test.
+_LONG_PREDICATE_TWO_GATE = _LONG_PREDICATE.replace(
+    "        hits = st.count;",
+    '        if (getenv("PROSPER_RTT")) {\n            hits = st.count;\n        }')
+
+
+def _keys_for(snippet: str) -> set:
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "src").mkdir()
+        (root / "src" / "fixture.cpp").write_text(snippet, encoding="utf-8")
+        _files, _preds, findings = scan_tree(root)
+    return {f.key() for f in findings}
+
+
+def run_key_stability_test(verbose: bool = False) -> int:
+    bad = 0
+    base = _keys_for(_LONG_PREDICATE % "")
+    if not base:
+        print("  [FAIL] key-stability fixture produced NO findings -- it cannot test anything")
+        return 1
+
+    # Arm 1: one more name joins the 5-way alternation. Nothing about the requirement a reader
+    # must satisfy has changed in kind, so no key may move.
+    grown = _keys_for(_LONG_PREDICATE % '||\n        std::getenv("PROSPER_DUMP_NEWCOMER") != nullptr')
+    if grown != base:
+        bad += 1
+        print("  [FAIL] key-stability: adding a name to a long any-of clause re-keyed a finding")
+        for k in sorted(base ^ grown):
+            print(f"           {k}")
+    elif verbose:
+        print(f"  [ok]   key stability: +1 name in a long alternation moves no key ({len(base)} key(s))")
+
+    # Arm 2: the CONJUNCTION changes -- a second independent gate on the same report. Without
+    # this arm, arm 1 is also satisfied by a key that ignores the requirement entirely.
+    changed = _keys_for(_LONG_PREDICATE_TWO_GATE % "")
+    if changed == base:
+        bad += 1
+        print("  [FAIL] key-discrimination: adding an INDEPENDENT gate left every key unchanged --")
+        print("         the key is insensitive rather than stable, and cannot separate two")
+        print("         different requirements in one file")
+    elif verbose:
+        print("  [ok]   key discrimination: a changed conjunction moves the key")
+
+    if not bad:
+        print("  [ok]   key stability: 2 arms (membership-insensitive, conjunction-sensitive)")
+    return bad
+
+
 def run_self_test(verbose: bool = False) -> int:
     import tempfile
 
@@ -1053,7 +1166,7 @@ def main() -> int:
     args = ap.parse_args()
 
     print("== check_diag_gates ==")
-    if run_self_test(args.verbose):
+    if run_self_test(args.verbose) or run_key_stability_test(args.verbose):
         return 1
     if args.selftest:
         print("== all checks passed ==")
