@@ -24,6 +24,7 @@
 #include "../src/host/exec_image.hpp"
 #include "../src/host/runtime_module_load.hpp"
 #include "../src/loader/linker.hpp"
+#include "test_scratch.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -175,9 +176,19 @@ static std::vector<uint8_t> build_module(const std::string& export_nid,
 
 int main(int argc, char** argv) {
     printf("== test_runtime_prx_load ==\n");
-    // A scratch "dump root". argv[1] lets CTest place it on real disk (never /tmp on this project's
-    // Linux box); default to the build directory the test is run from.
-    const std::string root = (argc >= 2) ? argv[1] : std::string("./runtime-prx-test-root");
+    // A scratch "dump root", on real disk and never /tmp: tests/test_scratch.h roots it at
+    // PROSPER_TEST_SCRATCH_DIR (which prosper/CMakeLists.txt points into the build tree, per ctest
+    // case) with a pid component beneath, and removes it at normal exit.
+    //
+    // #2582: it used to be the FIXED path `<build dir>/runtime-prx-test-root`, passed by the ctest
+    // registration. Two ctest invocations against one build directory then wrote and mapped the same
+    // synthetic .prx, and a load racing the other process's rewrite of those bytes fails to parse.
+    // Measured: 6 concurrent runs sharing one root failed 4, all with `load returned 0x80020008 (no
+    // module was loaded)`; 6 with distinct roots passed 6. Nothing in the failure names a file, so it
+    // reads as a loader defect. argv[1] still overrides, for a hand-run that wants to keep the tree.
+    const std::string root = (argc >= 2)
+        ? std::string(argv[1])
+        : prosper_test::test_scratch_file("runtime-prx-test-root");
     const std::string prx_dir = root + "/prx";          // deliberately NOT Media/Plugins
     const std::string prx_path = prx_dir + "/prosper_runtime_test.prx";
     {
