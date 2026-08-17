@@ -167,6 +167,16 @@ if(Python3_Interpreter_FOUND)
   # actually runs rather than on a copy.
   add_test(NAME hle_calls_positive_control
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/hle_calls/test_hle_calls.py")
+  # The sibling above is pure; this one cannot be. #2075 was not a logic bug: `--values` recorded
+  # NOTHING on prosper's own default build, because gdb's FinishBreakpoint.return_value comes from
+  # the DWARF return type and `Release` carries no `-g`. Only a real gdb over a real no-debug-info
+  # binary reproduces that, so this compiles test_values_fixture.cpp twice (-g0 and -g) and runs the
+  # real driver over each. A missing gdb/compiler exits 77 -> reported as `(Skipped)` by name, which
+  # is the one thing a silently-skipped end-to-end test cannot do.
+  add_test(NAME hle_calls_value_capture
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/hle_calls/test_hle_calls_values.py")
+  set_tests_properties(hle_calls_value_capture PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   add_test(NAME snapshot_guard_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/snapshot/test_snapshot.py")
   add_test(NAME gpu_replay_regress_logic

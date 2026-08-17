@@ -105,7 +105,15 @@ captures that could not be **armed or decoded**, and it does not see the more
 common loss: a handler that leaves its frame without returning normally (longjmp,
 thread teardown) loses its value silently. So each row prints `(captured N/M)`
 whenever fewer values were recorded than calls counted — that is the field to
-read before calling a value set complete.
+read before calling a value set complete. Every failure also names itself on a
+`finish-failure-reasons:` line; a bare count is what let #2075 stay undiagnosed.
+
+`value-source=dwarf:N,rax:M` says which of the two reads answered: gdb's
+DWARF-typed `return_value`, or the SysV integer return register. `dwarf:0` is
+normal rather than degraded — prosper's default build type is `Release`, which
+carries no debug info, and that is precisely the configuration on which this
+feature used to record nothing at all (#2075). When both answer they must agree,
+and a disagreement prints a loud `value-source-MISMATCH:` line.
 
 Two limits to know before believing a number: `--values` records the return
 **register**, never an out-struct, so a handler that returns 0 while writing
@@ -133,7 +141,9 @@ applies to `--launch` only; passing it with `--pid` is an error, because there i
 no inferior whose output this tool controls.
 
 Requirements: Linux, `gdb` with Python, `nm`, and ptrace attach permitted
-(`kernel.yama.ptrace_scope=0`). The prosper binary must not be stripped.
+(`kernel.yama.ptrace_scope=0`, for `--pid`; `--launch` runs its own child). The
+prosper binary must not be stripped — the handler enumeration below reads the
+symbol table. Debug info is not required, `--values` included.
 """
 
 import argparse

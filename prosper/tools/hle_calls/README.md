@@ -151,9 +151,26 @@ a null event pointer, which answers `NO_EVENT` without consuming the LOGIN; the 
 not be *armed or decoded*, and it does not see the more common loss: a handler that leaves its frame
 without returning normally (longjmp, thread teardown) loses its value silently. Each row therefore
 prints `(captured N/M)` whenever fewer values were recorded than calls counted, and that is the field
-to read before calling a value set complete.
+to read before calling a value set complete. **Every failure now names itself** on a
+`finish-failure-reasons:` line (`4x return_value: TypeError: …`) — a bare count is what let #2075
+stay undiagnosed while the feature recorded nothing at all.
 
-Two limits before believing a number:
+### Where a value comes from — `value-source=dwarf:N,rax:M`
+
+Two independent reads answer "what did it return", and the header says which one did:
+
+- **`dwarf`** — gdb's `FinishBreakpoint.return_value`, decoded from the function's DWARF return
+  type. ABI-aware for any return type, and available only on a build that carries debug info.
+- **`rax`** — the SysV integer return register, read at the return address before the caller has
+  executed an instruction. Needs no debug info, and is exactly right for what this tool arms: the
+  driver enumerates only the six-`unsigned long` HLE signature, whose `HLE(…)` macro returns
+  `uint64_t`.
+
+`dwarf:0,rax:N` is the **normal** shape, not a degraded one: prosper's default `CMAKE_BUILD_TYPE` is
+`Release` (`-O3 -DNDEBUG`, no `-g`). When both answer they must agree; a disagreement prints a loud
+`value-source-MISMATCH:` line, and it would mean a handler whose return does not live in `%rax`.
+
+Three limits before believing a number:
 
 - `--values` records the return **register**, never an out-struct. A handler that returns 0 while
   writing wrong bytes through a pointer argument is invisible — and on this codebase that is a common
@@ -165,6 +182,9 @@ Two limits before believing a number:
   control on one call in three, the row read `ret 0x80960007 x13, 0x0 x7` with a complete-looking
   20-of-20 capture, because the seven landing values were *recorded* rather than lost.
   `positive-control=VIOLATED(login-x7)` was the only field in the run that said so.
+- A `rax`-sourced value rests on one assumption — that the handler returns an integer — which holds
+  by construction for everything this tool arms, and which only a `dwarf` run can independently
+  check. On a debug build the two are compared on every call; on a `Release` build nothing else can.
 
 `window=complete|SHORT` in the header is the matching check for the run as a whole: `run`/`continue`
 also return on a signal gdb stops for (`SIGABRT` is not passed through, and these titles do abort),
@@ -194,10 +214,29 @@ own state, and the positive control is what caught it. The same shape of mistake
 line always prints `entries` and `armed`: a result you cannot sanity-check against a known-live
 number is not a result.
 
+## Ruled out
+
+One line per hypothesis this tool's own investigations have killed, so nobody re-derives a dead
+answer at full cost.
+
+- **"`--values` is broken by gdb 17.2 / by the missing caller CFI."** Falsified while fixing #2075.
+  The `gdb.FinishBreakpoint` construction succeeds on every call — measured directly, `ctor-ok` for
+  4 of 4 — even though `gdb.Frame.older()` on a handler entered from guest code returns `None`, so
+  the absent caller frame is real and harmless. The cause was the *decode*: `return_value` comes
+  from the DWARF return type, and the binary had none. One-variable A/B on **one** binary
+  (`objcopy --strip-debug`, same gdb 17.2, same title, same window): `.debug_*` present →
+  `finish-failures=0`, `positive-control=ok`; removed → `4 calls / 4 failures /
+  VOID(0-returns-for-4-calls)`.
+- **"`--values` needs a debug build."** True before #2075's fix, and no longer: a `Release` binary
+  is captured through `%rax` (`value-source=dwarf:0,rax:N`). Do not reintroduce a `-g` requirement
+  in the docs — it would send readers to rebuild the emulator to work around a fixed defect.
+
 ## Requirements
 
 Linux, `gdb` with Python support, `nm`/`c++filt`, and ptrace attach permitted
-(`kernel.yama.ptrace_scope=0`). The prosper binary must not be stripped.
+(`kernel.yama.ptrace_scope=0`, `--pid` mode only — `--launch` runs its own child). The prosper
+binary must not be **stripped**: the driver enumerates handlers out of the symbol table with `nm`.
+Debug info is *not* required, including for `--values`.
 
 ## Cost
 
