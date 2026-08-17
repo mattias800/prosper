@@ -57,7 +57,7 @@ int main() {
           "prosper's own image for the flipped address wins: unscaled, no CPU round trip");
     CHECK(guest_scanout_read_warranted(false, false, true, k4k, k4k) ==
               GuestScanoutDecision::SkipRendererSource,
-          "a surviving selected frame keeps its priority — selection already refused wrong extents");
+          "a surviving selected frame keeps its priority -- selection already refused wrong extents");
 
     // The paths that must stay byte-for-byte unaffected.
     CHECK(guest_scanout_read_warranted(false, false, false, 0, k4k) ==

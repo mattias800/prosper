@@ -24,7 +24,7 @@ int main() {
     // Empty list → empty array.
     std::vector<BootEvent> empty;
     std::string empty_json = JsonWriter::write_events(empty);
-    CHECK(empty_json == "[]", "empty events → []");
+    CHECK(empty_json == "[]", "empty events -> []");
 
     // Single event.
     BootEvent single(BootPhase::BOOT_COMPLETE, 42.5);
@@ -51,7 +51,7 @@ int main() {
     // Verify phase_name for all known phases.
     CHECK(std::string(phase_name(BootPhase::PROCESS_START)) == "PROCESS_START", "PROCESS_START name");
     CHECK(std::string(phase_name(BootPhase::LINKING)) == "LINKING", "LINKING name");
-    CHECK(std::string(phase_name(BootPhase::_COUNT)) == "UNKNOWN", "_COUNT → UNKNOWN");
+    CHECK(std::string(phase_name(BootPhase::_COUNT)) == "UNKNOWN", "_COUNT -> UNKNOWN");
 
     printf(fails ? "\ntest_diagnostics_json: %d FAILURE(S)\n"
                  : "\ntest_diagnostics_json: all ok\n", fails);

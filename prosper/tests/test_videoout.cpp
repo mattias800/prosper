@@ -678,7 +678,7 @@ int main() {
         CHECK(videoout_read_front_linear(read) && !read.guest_authored,
               "re-registering over reused memory does NOT inherit the previous authorship");
         CHECK(read.pixels == reference,
-              "…and the frame is still read correctly; only the authorship claim is withheld");
+              "...and the frame is still read correctly; only the authorship claim is withheld");
 
         // The raw byte primitive stays raw: a diagnostic that dumps guest memory must keep seeing
         // exactly what is there, so only the image reader de-swizzles.
@@ -775,7 +775,7 @@ int main() {
         CHECK(videoout_read_front_linear(unmapped) && !unmapped.padded_footprint,
               "a stride wide enough on its own does NOT license reading past the allocation");
         CHECK(unmapped.pixels == expected_partial,
-              "…and the read stops exactly at the bytes the mapping vouches for");
+              "...and the read stops exactly at the bytes the mapping vouches for");
         CHECK(unreg(handle, 0, 0, 0, 0, 0) == 0, "unregistered the far-apart scanouts");
         host::notify_guest_mapping_removed(first, linear_bytes);
         host::notify_guest_mapping_removed(second, linear_bytes);

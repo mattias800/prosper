@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
                reached, raises, gfxcalls);
         return 0;
     }
-    if (!gc_stw)   printf("\n== FAIL: GC stop-the-world never ran (%d raises) — deadlock/GC regression? ==\n", raises);
-    if (!graphics) printf("\n== FAIL: never reached graphics init (%d gfx calls) in %ld ms — boot regressed before GPU/display (or raise PROSPER_BOOTTEST_TIMEOUT_MS) ==\n", gfxcalls, ceil_ms);
+    if (!gc_stw)   printf("\n== FAIL: GC stop-the-world never ran (%d raises) -- deadlock/GC regression? ==\n", raises);
+    if (!graphics) printf("\n== FAIL: never reached graphics init (%d gfx calls) in %ld ms -- boot regressed before GPU/display (or raise PROSPER_BOOTTEST_TIMEOUT_MS) ==\n", gfxcalls, ceil_ms);
     return 2;
 }

@@ -225,7 +225,7 @@ static int check_emitter_coverage(const std::string& src_root) {
             if (name == g.emitter) gap = &g;
         if (exercised && gap) {
             printf("  [FAIL] emitter coverage: %s is now validated, so its known-gap entry is "
-                   "stale — delete it\n", name.c_str());
+                   "stale -- delete it\n", name.c_str());
             ++problems;
         } else if (!exercised && !gap) {
             printf("  [FAIL] emitter coverage: %s emits SPIR-V that this gate never validates.\n"
@@ -241,7 +241,7 @@ static int check_emitter_coverage(const std::string& src_root) {
     for (const KnownGap& g : kKnownGaps)
         if (!declared.count(g.emitter)) {
             printf("  [FAIL] emitter coverage: known-gap entry %s no longer names a declared "
-                   "emitter — delete it\n", g.emitter);
+                   "emitter -- delete it\n", g.emitter);
             ++problems;
         }
     // An emitter exercised below but absent from every header means the scan stopped seeing it.
@@ -249,7 +249,7 @@ static int check_emitter_coverage(const std::string& src_root) {
     for (const std::string& name : exercised_emitters)
         if (!declared.count(name)) {
             printf("  [FAIL] emitter coverage: a module was emitted from %s, but the header scan no "
-                   "longer finds it declared — the scan has stopped working\n", name.c_str());
+                   "longer finds it declared -- the scan has stopped working\n", name.c_str());
             ++problems;
         }
     if (!problems) {
@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     // this tool exists to stop.
     if (argc <= 2) {
         printf("== FAIL: usage: spv_validate <output-dir> <source-root> ==\n"
-               "  <source-root> is prosper/ — the emitter-coverage check reads its headers.\n");
+               "  <source-root> is prosper/ -- the emitter-coverage check reads its headers.\n");
         return 1;
     }
     const std::string src_root = argv[2];

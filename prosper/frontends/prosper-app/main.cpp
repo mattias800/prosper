@@ -910,10 +910,10 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
             const auto sl = dump.find_last_of("/\\");
             name = (sl == std::string::npos ? dump : dump.substr(sl + 1));
         }
-        return "prosper — " + name;
+        return "prosper - " + name;
     }
-    if (test_pattern) return "prosper — test pattern";
-    return "prosper — no game (drop a game folder here, or press Ctrl+O)";
+    if (test_pattern) return "prosper - test pattern";
+    return "prosper - no game (drop a game folder here, or press Ctrl+O)";
 }
 
 // The guest, and the one boot this process gets. run_entry() never observes prosper_request_stop(),
@@ -1743,7 +1743,7 @@ int main(int argc, char** argv) {
                 rejectedThisBatch = true;
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "prosper",
                     ("That is not a PS5 game:\n\n" + picked +
-                     "\n\nChoose the game's app0 folder — the one holding eboot.bin and sce_sys.").c_str(),
+                     "\n\nChoose the game's app0 folder -- the one holding eboot.bin and sce_sys.").c_str(),
                     win);
             }
             return false;
@@ -1766,7 +1766,7 @@ int main(int argc, char** argv) {
             // boot_program links and maps the whole module set inline, which takes seconds on a
             // large title and pumps no events meanwhile. Say so in the title bar first, or the
             // window just stops responding.
-            SDL_SetWindowTitle(win, "prosper — loading…");
+            SDL_SetWindowTitle(win, "prosper - loading...");
             std::string err;
             if (!start_guest(root, &err)) {
                 fprintf(stderr, "[app] boot failed: %s\n", err.c_str());
@@ -1938,7 +1938,7 @@ int main(int argc, char** argv) {
 #endif
                         prosper_set_paused(false);
                     }
-                    SDL_SetWindowTitle(win, paused ? (title + " — paused").c_str() : title.c_str());
+                    SDL_SetWindowTitle(win, paused ? (title + " - paused").c_str() : title.c_str());
                     fprintf(stderr, "[app] %s at guest flip boundary\n",
                             paused ? "pause requested" : "resumed");
                     break;
@@ -2269,7 +2269,7 @@ int main(int argc, char** argv) {
                         "  no bundle content was written; the output path was %s\n"
                         "  %s\n"
                         "  %s\n"
-                        "  budget in force: %llu MiB — raise it with "
+                        "  budget in force: %llu MiB -- raise it with "
                         "PROSPER_CAPTURE_BUNDLE_MAX_MB=<64..3072> and re-arm the capture\n"
                         "============================================================================\n\n",
                         grab.error.c_str(), grab.bundle_path.c_str(), state.c_str(),
@@ -2277,10 +2277,10 @@ int main(int argc, char** argv) {
                             ? "the .bmp screenshot for this press is a separate file with the same stem"
                             : "this capture was configured, not pressed; it has no screenshot",
                         static_cast<unsigned long long>(grab.max_unique_bytes >> 20));
-                    grabNotice = "F9 GRAB FAILED — see console (raise PROSPER_CAPTURE_BUNDLE_MAX_MB)";
+                    grabNotice = "F9 GRAB FAILED - see console (raise PROSPER_CAPTURE_BUNDLE_MAX_MB)";
                 }
                 grabNoticeUntil = std::chrono::steady_clock::now() + std::chrono::seconds(grab.ok ? 4 : 12);
-                if (win) SDL_SetWindowTitle(win, (title + " — " + grabNotice).c_str());
+                if (win) SDL_SetWindowTitle(win, (title + " - " + grabNotice).c_str());
             }
             if (!grabNotice.empty() && std::chrono::steady_clock::now() >= grabNoticeUntil) {
                 grabNotice.clear();

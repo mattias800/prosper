@@ -38,7 +38,7 @@ int show_box(uint32_t sdl_flags, const char* title, const char* msg, const MsgBu
 // writes the entered text (UTF-16) into the request's guest input buffer (bounded by max_text_length).
 int run_ime_modal(const ImeRequest& req) {
     SDL_Window* win = nullptr; SDL_Renderer* ren = nullptr;
-    const char* wtitle = req.title.empty() ? "prosper — text entry" : req.title.c_str();
+    const char* wtitle = req.title.empty() ? "prosper - text entry" : req.title.c_str();
     if (!SDL_CreateWindowAndRenderer(wtitle, 560, 150, 0, &win, &ren)) {
         SDL_Log("prosper: ime window failed: %s", SDL_GetError());
         return 1;   // treat as cancel
@@ -312,7 +312,7 @@ struct SdlPlatformUi : PlatformUi {
     bool errorDialogOpen(uint64_t param) override {
         char buf[96];
         std::snprintf(buf, sizeof buf, "An error occurred.\n\nError code: 0x%08X", read_error_code(param));
-        show_box(SDL_MESSAGEBOX_ERROR, "prosper — Error", buf, msg_buttons_for(0 /*OK*/));
+        show_box(SDL_MESSAGEBOX_ERROR, "prosper - Error", buf, msg_buttons_for(0 /*OK*/));
         err_status.store(3 /*FINISHED*/);
         return true;
     }

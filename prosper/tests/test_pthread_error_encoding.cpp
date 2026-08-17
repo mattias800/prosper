@@ -298,7 +298,7 @@ int main() {
                   "a zero-count guest semaphore initializes");
             CHECK(sem_trywait((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0) == 0x80020023ull,
                   "scePthreadSemTrywait on an empty semaphore reports encoded FreeBSD EAGAIN "
-                  "(0x80020023) — not a bare 35, and not the host's 11");
+                  "(0x80020023) -- not a bare 35, and not the host's 11");
             // The POSIX half, and the sharpest arm in the file: -1 is the C contract, and the
             // 35 in errno is FreeBSD's EAGAIN where the host's is 11. An implementation that
             // published the host number would still return -1 here and would still look right to
@@ -308,7 +308,7 @@ int main() {
             CHECK(posix_rc == (uint64_t)(int64_t)-1,
                   "sem_trywait on the same semaphore returns -1, per C11 7.26 / sem_wait(3)");
             CHECK(errno == 35,
-                  "sem_trywait leaves FreeBSD EAGAIN (35) in errno — not the host's 11, which is "
+                  "sem_trywait leaves FreeBSD EAGAIN (35) in errno -- not the host's 11, which is "
                   "FreeBSD's EDEADLK and would turn a retryable wait into a deadlock report");
             sem_destroy((uint64_t)(uintptr_t)slot, 0, 0, 0, 0, 0);
         }
@@ -337,7 +337,7 @@ int main() {
                 // A host whose ERRORCHECK unlock is permissive cannot run this arm. Say so rather
                 // than passing vacuously — an assertion that held while the mechanism never ran is
                 // the trap this repository keeps rediscovering.
-                printf("  [SKIP] this host permits unlocking an unheld ERRORCHECK mutex — the"
+                printf("  [SKIP] this host permits unlocking an unheld ERRORCHECK mutex -- the"
                        " EPERM half of the #2178 mutex arm cannot run here\n");
             } else {
                 CHECK(sony_rc == 0x80020001ull,
@@ -462,7 +462,7 @@ int main() {
             CHECK(pos_getspec(key, 0, 0, 0, 0, 0) == 0x2a,
                   "control: pthread_getspecific reads the small value back unencoded");
             CHECK(sce_getspec && sce_getspec(key, 0, 0, 0, 0, 0) == 0x2a,
-                  "control: scePthreadGetspecific reads back 0x2a, NOT 0x8002002a — the arm that "
+                  "control: scePthreadGetspecific reads back 0x2a, NOT 0x8002002a -- the arm that "
                   "catches a mechanical sweep reaching a value-returning handler");
             CHECK(sce_kdelete(key, 0, 0, 0, 0, 0) == 0,
                   "control: scePthreadKeyDelete of a real key reports 0");

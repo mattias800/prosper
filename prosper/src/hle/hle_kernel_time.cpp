@@ -709,7 +709,7 @@ HLE(k_load_start_mod) {   // Windows/MinGW: no import-boundary %fs swap -> guest
 // _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
 // exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.
 HLE(k_exit) {
-    fprintf(stderr, "[prosper] guest _exit(%d) — terminating\n", (int)a0);
+    fprintf(stderr, "[prosper] guest _exit(%d) -- terminating\n", (int)a0);
     host::guest_dmem_write_trace_report();
     fflush(nullptr);
     _Exit((int)a0);
@@ -718,7 +718,7 @@ HLE(k_exit) {
 // it from failed check()s in shipping builds). Report and terminate rather than "return 0" and
 // let the guest run on in an undefined state.
 HLE(k_debug_raise_release) {
-    fprintf(stderr, "[prosper] guest sceKernelDebugRaiseExceptionOnReleaseMode(code=0x%llx, arg=0x%llx) — terminating\n",
+    fprintf(stderr, "[prosper] guest sceKernelDebugRaiseExceptionOnReleaseMode(code=0x%llx, arg=0x%llx) -- terminating\n",
             (unsigned long long)a0, (unsigned long long)a1);
     host::guest_dmem_write_trace_report();
     fflush(nullptr);

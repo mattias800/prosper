@@ -270,12 +270,12 @@ int main() {
         CHECK(overlaps.load() == 0,
               "MUTUAL EXCLUSION: no two of 8 threads were ever inside the critical section at once");
         if (overlaps.load() != 0)
-            std::printf("         (%llu overlapping entries observed — the lock excludes nothing)\n",
+            std::printf("         (%llu overlapping entries observed -- the lock excludes nothing)\n",
                         (unsigned long long)overlaps.load());
         CHECK(shared == expected,
               "MUTUAL EXCLUSION: 8 threads x 5000 unsynchronised increments total EXACTLY 40000");
         if (shared != expected)
-            std::printf("         (got %llu, expected %llu — updates were lost, so the lock is not real)\n",
+            std::printf("         (got %llu, expected %llu -- updates were lost, so the lock is not real)\n",
                         (unsigned long long)shared, (unsigned long long)expected);
     }
 
@@ -363,7 +363,7 @@ int main() {
         CHECK(hw > kNumWorkerThread,
               "the runtime OBSERVES that more ulthreads ran at once than numWorkerThread=3");
         if (hw <= kNumWorkerThread)
-            std::printf("         (high-water %llu — the deviation counter is not measuring)\n",
+            std::printf("         (high-water %llu -- the deviation counter is not measuring)\n",
                         (unsigned long long)hw);
     }
 

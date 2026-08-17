@@ -241,6 +241,18 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME cached_env_arming_logic
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_cached_env.py"
                    "${CMAKE_SOURCE_DIR}")
+  # stdout carries BYTES, and Windows decodes them as cp1252/cp437. One em dash in a printf literal
+  # therefore reaches a Windows user as three mojibake characters, so a grep for the line the tool
+  # itself printed does not match it -- and a test asserting on the rendered string fails on
+  # Windows only, which is how
+  # #2579 shipped five of them past a green Linux CI (#2588). Also runs in the Docs job, which
+  # needs nothing built: this is a text scan, and a defect it can see should not wait for a build.
+  # The scanner self-tests its own parsing AND its line numbers, because both failure modes are
+  # silent -- a pattern that stops matching reports a clean tree forever, and a drifted line counter
+  # sends the reader to innocent code while the real site goes unexamined (the first revision did).
+  add_test(NAME ascii_output_literals
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/output/check_ascii_output.py"
+                   "${CMAKE_SOURCE_DIR}")
   # A diagnostic whose PRODUCER is armed by a different switch than its PRINTER reports unarmed
   # state as a confident, well-formed ZERO -- indistinguishable from a measured negative, and
   # exactly what the interesting hypothesis usually predicts (#2149; #2111 emitted 183 such

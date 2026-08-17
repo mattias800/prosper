@@ -643,7 +643,7 @@ int main(int argc, char** argv) {
         auto now = std::chrono::steady_clock::now();
         double el = std::chrono::duration<double>(now - t0).count();
         if (timeout > 0 && el > timeout) {
-            fprintf(stderr, "[shot] timeout after %.0fs with %d/%d saved — game not rendering enough "
+            fprintf(stderr, "[shot] timeout after %.0fs with %d/%d saved -- game not rendering enough "
                             "(wrong guest env for this title? see the README)\n", el, saved, count);
             stop = screenshot::SamplingStop::Timeout;
             break;
@@ -849,7 +849,7 @@ int main(int argc, char** argv) {
                                     "fault reproduction");
     else if (guest_outcome.state == screenshot::GuestRunState::Returned)
         fprintf(stderr, "[shot] guest exit: the guest's primary thread returned during capture "
-                        "(%s). This is not treated as a failure — a title may legitimately exit\n",
+                        "(%s). This is not treated as a failure -- a title may legitimately exit\n",
                 guest_outcome.detail.c_str());
 
     screenshot::RunVerdict verdict =

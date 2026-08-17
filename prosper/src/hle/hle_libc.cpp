@@ -807,7 +807,7 @@ HLE(h_heap_get_trace_info) {
     // The size field is caller-set; only fill the layout we know (exactly 32 bytes — never write
     // past the caller's struct; cf. the f_fstat oversized-write lesson).
     if (*(uint64_t*)info != 32) {
-        fprintf(stderr, "[prosper] sceLibcHeapGetTraceInfo: unexpected info->size=%llu (want 32) — leaving untouched\n",
+        fprintf(stderr, "[prosper] sceLibcHeapGetTraceInfo: unexpected info->size=%llu (want 32) -- leaving untouched\n",
                 (unsigned long long)*(uint64_t*)info);
         return 0;
     }

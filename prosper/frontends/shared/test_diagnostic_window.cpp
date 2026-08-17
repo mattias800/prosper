@@ -60,7 +60,7 @@ int main() {
         CHECK(!w.contains(5003, 240050),
               "the time window is three callbacks wide, not 'the rest of the run'");
         CHECK(!w.contains(9000, 330000),
-              "the latch does not re-open later — this is the runaway-census guard");
+              "the latch does not re-open later -- this is the runaway-census guard");
     }
     {
         // The two PROSPER_PASS_LOG call sites ask about the SAME ordinal (one loads the counter, the
