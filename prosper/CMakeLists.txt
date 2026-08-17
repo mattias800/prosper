@@ -1073,6 +1073,26 @@ if(TARGET prosper_core)
     set_tests_properties(plugin_autolink PROPERTIES SKIP_RETURN_CODE 77)
   endif()
 
+  # link_program's structural contract on SYNTHESIZED modules (#2567). plugin_autolink's remaining
+  # 14 assertions — the export table, the collision guard's effect on link_program, and the #1635
+  # alias record — sat behind `if (argc >= 2)` plus a real Media/Plugins/PSN.prx, so they never ran
+  # in CI and never ran for an agent without that title installed. These two cases register
+  # UNCONDITIONALLY: their fixtures are minimal ET_SCE_DYNAMIC PRX modules emitted at test time by
+  # tests/synth_prx.h and tests/handmade_prx.h, so there is no dump, no network and no committed
+  # binary. Every byte is synthesized from the published ELF64 layout — nothing is carved out of a
+  # dump, which would put Sony-built code in a public repository.
+  #
+  # Two cases, not one, because "the loader accepts this" and "the loader refuses that" are different
+  # claims and the second is the one that gives the first its meaning: _reject holds the corrupted
+  # variants, each differing from a linking control in exactly one field.
+  add_executable(test_loader_synth_link tests/test_loader_synth_link.cpp)
+  target_link_libraries(test_loader_synth_link PRIVATE prosper_core)
+  add_test(NAME loader_synth_link COMMAND test_loader_synth_link)
+
+  add_executable(test_loader_synth_reject tests/test_loader_synth_reject.cpp)
+  target_link_libraries(test_loader_synth_reject PRIVATE prosper_core)
+  add_test(NAME loader_synth_reject COMMAND test_loader_synth_reject)
+
   # ATRAC9 decode (vendored LibAtrac9 + prosper glue): an embedded 16-superframe slice of a real PS5
   # snd0.at9 decodes bit-exact vs the LibAtrac9 reference (CRC32). Pure, no game dump; runs in CI.
   add_executable(test_atrac9 tests/test_atrac9.cpp)
