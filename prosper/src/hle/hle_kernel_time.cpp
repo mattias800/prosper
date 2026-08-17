@@ -752,12 +752,22 @@ HLE(k_uuid_create) {                                       // fill 16 non-zero b
 
 // --- C11 threads (used by MSVC STL std::mutex/std::condition_variable) ---
 HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t)); pthread_mutexattr_t at; pthread_mutexattr_init(&at); pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(m, &at); pthread_mutexattr_destroy(&at); *(void**)P(a0) = m; } return 0; }
-// #2596: every one of these used a PRIVATE `if (a0 && *(void**)P(a0))` guard, so a slot holding a
-// STATIC INITIALISER -- NULL for PTHREAD_MUTEX_INITIALIZER, and the other sub-page sentinels FreeBSD
-// uses -- read as "there is no object here" and the operation was SKIPPED ENTIRELY. `_Mtx_lock` then
-// reported success without taking the lock, which is precisely the bdwgc GC_allocate_ml
-// static-mutex shape that was the ROOT CAUSE of the level-1 heap corruption (#793), reached through
-// the other spelling; `_Cnd_wait` reported success for a wait that never happened.
+// #2596: every one of these used a PRIVATE `if (a0 && *(void**)P(a0))` guard, and it was wrong in
+// TWO different ways depending on which sentinel the slot held -- a distinction worth stating,
+// because the first revision of this comment claimed the whole class was merely "skipped" and a
+// reviewer falsified that in one grep. The guard tests the slot's VALUE for non-zero, while
+// `pt_static_sentinel` (hle_kernel.cpp) treats EVERYTHING below 0x1000 as a static initialiser:
+//
+//   * NULL (PTHREAD_MUTEX_INITIALIZER) -- the guard is false, so the operation was SKIPPED
+//     ENTIRELY. `_Mtx_lock` reported success without taking the lock, which is precisely the bdwgc
+//     GC_allocate_ml static-mutex shape that was the ROOT CAUSE of the level-1 heap corruption
+//     (#793), reached through the other spelling; `_Cnd_wait` reported success for a wait that
+//     never happened.
+//   * ANY OTHER SENTINEL -- 1 (PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP) and the destroyed poison
+//     kPtDestroyed (0xDEA) -- the guard is TRUE, so the value was DEREFERENCED AS AN OBJECT
+//     POINTER: `interruptible_mutex_lock((pthread_mutex_t*)0xDEA)`. Not a silent skip at all, a
+//     segfault. Routing through the resolver fixes a use-after-destroy crash on this spelling as
+//     well as the missing operation.
 //
 // The guard is gone in favour of guest_mutex_from_slot / guest_cond_from_slot, which ARE
 // ensure_mutex / ensure_cond -- the same resolution scePthreadMutexLock and scePthreadCondWait use.

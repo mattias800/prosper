@@ -1121,8 +1121,17 @@ HLE(k_cond_timedwait) {
     // k_cond_wait alone, which left this function's null-deadline branch -- an INDEFINITE park
     // through the identical call -- invisible to the busy check, so a destroy retired the slot out
     // from under a thread parked forever. Scoping the body rather than the call means a future
-    // branch added here cannot miss it; a future BODY still has to remember, which is why the three
-    // cond-wait bodies are the unit and there are exactly three.
+    // branch added here cannot miss it; a future BODY still has to remember, which is why the
+    // cond-wait bodies are the unit.
+    //
+    // THREE bodies take this scope, and that is NOT the same as "all of them" -- the earlier
+    // wording here said "there are exactly three", and #2596 made it false while relying on it.
+    // The C11 `m_cnd_wait` (hle_kernel_time.cpp) is a fourth body that can park, because it now
+    // resolves a statically-initialised slot instead of skipping it, and it does NOT take the
+    // scope. So a thread parked through the C11 spelling is still invisible to the busy check
+    // below, and a destroy will retire the object out from under it -- #2168's exact failure
+    // through a different door. Tracked as #2623 with the file:line and the mechanism; recorded
+    // here rather than in the issue alone because a bare count is what the next reader trusts.
     GuestCondWaiterScope waiting(c);
     if (!a2) {
         int rc = interruptible_cond_wait(c, m, GuestWaitKind::ConditionSequence, 0,

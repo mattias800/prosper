@@ -26,7 +26,8 @@
 //                                             happened has already "returned".
 //   N2  restore the guard on m_mtx_lock    -> FAIL (2): §2's "self-initialised into a real host
 //                                             mutex" and "a second thread BLOCKS"
-//   N3  make m_cnd_broadcast skip again    -> FAIL (2): the wake arm of §1 AND of §3 — nobody is
+//   N3  make m_cnd_broadcast never broadcast AT ALL (`if (false && a0)`)
+//                                          -> FAIL (2): the wake arm of §1 AND of §3 — nobody is
 //                                             ever woken, and the bounded retry reports it as a
 //                                             failure rather than hanging
 //   N4  make guest_cond_from_slot refuse an ALREADY-INITIALISED slot (sentinels only)
@@ -35,10 +36,24 @@
 //                                             §1 and §2 both pass under it, so without §3 a change
 //                                             that fixed the sentinel path by breaking the ordinary
 //                                             one would land green.
+//   N5  restore the OLD GUARD on m_cnd_broadcast (`if (a0 && *(void**)P(a0))`)
+//                                          -> FAIL (1): §4's `_Cnd_broadcast` arm, and ONLY that
+//                                             one. §1, §2 and §3 all pass under it — see §4.
+//   N6  restore the OLD GUARD on m_mtx_unlock
+//                                          -> FAIL (1): §4's `_Mtx_unlock` arm, and only that one.
 //
-// No single arm covers another: N1/N2 are blind to N3 and N4 (both leave the wait blocking, which
-// is what they assert), and N3/N4 are blind to N1/N2 (a skipped wait "returns" immediately, which
-// satisfies every wake arm).
+// N3 AND N5 ARE DIFFERENT MUTATIONS, and an earlier revision of this header ran N3 while describing
+// N5. A reviewer caught the mismatch by reading, and measuring the arm they described produced
+// something worse than either of us predicted: with the old guard genuinely restored the suite
+// passed COMPLETELY. §4 exists because of that, and the header now names the exact lever each row
+// pulls rather than a paraphrase of it — a row describing a mutation nobody ran is how coverage
+// that does not exist gets believed (the shape #2573 corrected in its own M5 row).
+//
+// No single arm covers another: N1/N2 are blind to N3-N6 (all of those leave the wait blocking,
+// which is what N1/N2 assert), N3/N4 are blind to N1/N2 (a skipped wait "returns" immediately,
+// satisfying every wake arm), and N5/N6 are invisible to every section except §4. N3 kills §4's
+// broadcast arm as well as the two wake arms, which is why its count is 3 — a broadcast that never
+// fires also never resolves.
 //
 // HANG SAFETY. Every worker here is DETACHED and every wait is bounded, deliberately: a regression
 // in this area is a thread that never wakes, and a test that expresses that as a hang burns ctest's
@@ -212,6 +227,37 @@ int main() {
               "an initialised _Cnd_wait waits too");
         CHECK(broadcast_until_awake(&g_init_cnd, &g_init_mtx, g_init_returned),
               "…and wakes on _Cnd_broadcast");
+    }
+
+    // ===== 4. the SIGNAL side, on a slot no wait has resolved yet ==============================
+    // THIS SECTION EXISTS BECAUSE ITS ABSENCE WAS INVISIBLE, and the way that came out is worth
+    // recording. A reviewer questioned the N3 row and derived that restoring the old guard on
+    // `m_cnd_broadcast` should fail only §1's wake arm, not §3's. Measuring it produced something
+    // worse than either reading: restoring the guard made the suite pass **completely**.
+    //
+    // The reason is structural, not a fluke. §1 and §3 both WAIT before they broadcast, and the
+    // wait self-initialises the slot — so by the time any broadcast runs, every slot in this file
+    // already holds a real pointer and the old guard is satisfied. Those sections therefore cannot
+    // see the signal/broadcast half of the change AT ALL, however the mutation is phrased. A
+    // positive control that has already resolved the thing under test is not a control.
+    //
+    // The only observable that discriminates is the resolution itself, on a slot NOTHING has waited
+    // on: after the call the slot must NAME AN OBJECT. That is not an implementation detail — it is
+    // the whole mechanism, because a later waiter resolves the same slot, so a signal that skipped
+    // it would be signalling an object no waiter will ever use. Nothing weaker works here: a
+    // broadcast to an empty condvar has no other effect to assert.
+    printf("-- _Cnd_broadcast / _Mtx_unlock resolve a slot no wait has touched --\n");
+    {
+        static void* untouched_cnd = nullptr;   // a static sentinel, never waited on
+        static void* untouched_mtx = nullptr;
+        cnd_broadcast((uint64_t)(uintptr_t)&untouched_cnd, 0, 0, 0, 0, 0);
+        CHECK(untouched_cnd != nullptr,
+              "_Cnd_broadcast RESOLVES a statically-initialised cnd_t rather than skipping it — the "
+              "slot now names the same object a later _Cnd_wait will resolve");
+        mtx_unlock((uint64_t)(uintptr_t)&untouched_mtx, 0, 0, 0, 0, 0);
+        CHECK(untouched_mtx != nullptr,
+              "_Mtx_unlock likewise resolves rather than skipping, so the C11 family agrees with "
+              "itself about what a static sentinel means");
     }
 
     if (fails) printf("== FAIL (%d) ==\n", fails);
