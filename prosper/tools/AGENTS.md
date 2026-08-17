@@ -481,6 +481,25 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   citation at all, losing 22 of 118 references (5 of them in `.cpp`/`.hpp`/test comments) **with the
   gate still green and the success line still saying "all resolving"**. Run by the CI `Docs` job;
   `ctest -R trap_citation_checker` covers it.
+- **`docs/check_merge_result.py`** — run the numbered-table gate against the **merge result**, against
+  a freshly fetched base, as the last step before merging (#2211). A `pull_request` job validates
+  `refs/pull/N/merge`, which GitHub computes when the event fires and never recomputes as the base
+  moves, so a **green** required check is a statement about a merge that may no longer exist — and
+  unlike a red one, nobody re-derives it (instrument trap 189). Uses `git merge-tree --write-tree`,
+  so it touches neither your working tree nor the index and cannot collide with another agent in the
+  same repository. Reports a textual conflict as a conflict rather than as a table defect, and a
+  checker failure as a checker failure. **`--base` defaults to `origin/master`, which is wrong for a
+  stacked PR** — pass the branch it will actually merge into, or the green run describes a merge that
+  will never happen.
+  **Measured boundary, so its value is not overstated:** for two same-numbered rows inserted at a row
+  boundary in an otherwise identical file, separation 0 lines (both appending at the tail) makes git
+  *conflict*, and separation ≥ 1 leaves the offending branch **already red on its own head** —
+  because inserting a duplicate-numbered row above the tail puts that branch's *own* column out of
+  ascending order, which is an artifact of how those cases were generated rather than a general
+  property of separated insertions. So in that family `--ordered` alone closes the hole. What it does
+  **not** close, and this tool does, is the artifact a *human* produces: resolving that separation-0
+  conflict by keeping both rows gives a duplicate on master while **both heads were green**, which is
+  how `33, 34, 35, 32` reached master in #1696. `ctest -R doc_merge_result_checker` covers it.
 - **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/master`
   **and every open PR** (#1729). Prints each claimant so you can see whether you are in a race, not
   just a bare number. An **advisor, not a gate**: two lanes running it in the same minute both see the
