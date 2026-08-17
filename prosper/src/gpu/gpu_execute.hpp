@@ -944,7 +944,14 @@ void notify_compute_authority_boundary(const ComputeAuthorityBoundary& boundary)
 // Guest GPU writes can change backing memory represented by a persistent host-side image. Backends
 // register one observer so guest-memory-producing backends can invalidate overlapping cached surfaces
 // without making prosper_core depend on Vulkan.
-using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
+// The origin is passed AS DATA rather than read from the thread-local by the observer. The observer
+// may queue the write for a later drain on another thread, where the producer's thread-local is long
+// gone -- so a notifier that knows its own classification must hand it over here or the information
+// is lost. `notify_guest_gpu_write_preserving_bytes` knows it is "gpu-preserving" and used to drop
+// that on the floor at exactly this boundary, which silently filed every byte-preserving compute
+// writeback under the unattributed default.
+using GuestGpuWriteObserver =
+    std::function<void(uint64_t addr, uint64_t size, const char* origin)>;
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
 // Names the PM4 packet responsible for the next guest write, for PROSPER_GUEST_WRITE_WATCH. Thread
 // local and reset by the caller; a watch line that says only "a guest write covered this" cannot
