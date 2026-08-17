@@ -14788,11 +14788,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // IMAGE_LOAD_MIP's final address is a real guest mip selector. Specialize it away only
             // after the per-use fold and the materialized-resource checks agree. The 2D_ARRAY form
             // retains its slice coordinate; only the separately proven mip operand is discarded.
+            // `res->compression_enabled` is deliberately absent from this LOAD gate; see
+            // shader_resource_allows_zero_mip_specialization for why it is not a mip term. The
+            // physical-source question it used to stand in for is answered at bind time by the live
+            // compute backend, which fails closed for a compressed sampled source with no authority.
+            // The STORE gate below keeps its compression term: a store is a different risk and
+            // nothing in the evidence for this change bears on it.
             if (is_zero_mip_load &&
                 (!rdna2_mimg_zero_mip_shape(in) || !res->proven_zero_mip ||
                  res->img_dim != in.mimg_dim || res->sample_count != 1u ||
                  res->declared_mip_levels != 1u || res->in_mip_tail ||
-                 res->compression_enabled || (in.mimg_dim == 5u && !b.is_compute))) {
+                 (in.mimg_dim == 5u && !b.is_compute))) {
                 // Name the sub-condition. Seven terms collapse into one
                 // `mode=unresolved-operand`, and an investigation cannot act on that: "the mip is
                 // not proven zero" and "the resource declares compression" are different pieces of

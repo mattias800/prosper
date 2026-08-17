@@ -4920,20 +4920,46 @@ int main() {
     }
     ShaderResourceTable unproven_load_mip = rt_zero_mip_2d;
     unproven_load_mip.resources[0].proven_zero_mip = false;
-    ShaderResourceTable compressed_load_mip = rt_zero_mip_2d;
-    compressed_load_mip.resources[0].compression_enabled = true;
     ShaderResourceTable multilevel_load_mip = rt_zero_mip_2d;
     multilevel_load_mip.resources[0].declared_mip_levels = 2;
     if (!recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
                         &unproven_load_mip).empty() ||
         !recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
-                        &compressed_load_mip).empty() ||
-        !recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
                         &multilevel_load_mip).empty()) {
-        printf("  [FAIL] IMAGE_LOAD_MIP accepted an unproven, DCC, or multilevel resource\n");
+        printf("  [FAIL] IMAGE_LOAD_MIP accepted an unproven or multilevel resource\n");
         return 1;
     }
-    printf("  [ok]   IMAGE_LOAD_MIP 2D requires the exact one-level uncompressed proof\n");
+    printf("  [ok]   IMAGE_LOAD_MIP 2D requires the exact one-level mip proof\n");
+
+    // COMPRESSION IS NOT A MIP TERM, and this arm moved rather than disappeared. It used to sit in
+    // the negative list above, asserting that a DCC-marked resource fails to RECOMPILE. That
+    // conflated two questions: "is the mip operand zero" (a shader-semantic fact, proven by the
+    // per-use fold) and "can the base allocation's bytes be read" (a physical-source fact, knowable
+    // only once the binding resolves). The second question now lives where it can be answered -- the
+    // live compute backend fails closed for a compressed sampled source with no imported image, no
+    // exact fast-clear materialization, and no metadata proving the base uncompressed.
+    //
+    // So the compressed resource must now COMPILE, on exactly the same proof as the uncompressed one.
+    ShaderResourceTable compressed_load_mip = rt_zero_mip_2d;
+    compressed_load_mip.resources[0].compression_enabled = true;
+    const std::vector<uint32_t> compressed_load_mip_spv = recompile_valu(
+        gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0, &compressed_load_mip);
+    if (compressed_load_mip_spv.empty() || !has_opcode(compressed_load_mip_spv, OpImageFetch)) {
+        printf("  [FAIL] compressed IMAGE_LOAD_MIP did not compile on the zero-mip proof "
+               "(compression is a source-authority question, not a mip question)\n");
+        return 1;
+    }
+    // And the move must not have leaked into the mip proof itself: compression still must not rescue
+    // a resource whose mip is unproven. Without this arm the change above is indistinguishable from
+    // deleting the gate.
+    ShaderResourceTable compressed_unproven_load_mip = compressed_load_mip;
+    compressed_unproven_load_mip.resources[0].proven_zero_mip = false;
+    if (!recompile_valu(gta_load_mip_2d, std::size(gta_load_mip_2d), 1, 0,
+                        &compressed_unproven_load_mip).empty()) {
+        printf("  [FAIL] compressed IMAGE_LOAD_MIP compiled without the zero-mip proof\n");
+        return 1;
+    }
+    printf("  [ok]   compressed IMAGE_LOAD_MIP compiles on the mip proof, and still needs it\n");
 
     const uint32_t gta_load_mip_2da[] = {
         0x7e060206u,                         // v_mov_b32 v3, s6; v2 remains the slice

@@ -2177,10 +2177,27 @@ int main() {
     dcc_zero_mip_t8[7] = 0x20553100u;       // nonzero metadata address payload
     const DecodedImageDescriptor dcc_zero_mip_descriptor =
         decode_image_descriptor(dcc_zero_mip_t8);
+    // The descriptor still decodes as compressed -- WORD6[21] is set for depth and colour alike, with
+    // the metadata address carrying HTILE in the depth case (here 0x20553100 << 8 = 0x2055310000,
+    // this surface's real HTILE base on a routed boot). That decode is correct and unchanged.
+    //
+    // What changed is that compression no longer VETOES the mip proof. It describes byte encoding;
+    // this predicate is about which LOD is addressed. Whether those bytes may actually be read is a
+    // physical-source question answered at bind time, where the live compute backend fails closed
+    // without an imported image, an exact fast-clear materialization, or metadata proving the base
+    // uncompressed. Keeping the veto here cost the whole program: GTA V's 0x2042f49a00 also writes
+    // two 4K storage images, and none of that work reached the GPU.
     CHECK(dcc_zero_mip_descriptor.compression_enabled &&
-              !shader_resource_allows_zero_mip_specialization(
+              shader_resource_allows_zero_mip_specialization(
                   materialized_zero_mip_use, dcc_zero_mip_descriptor, zero_mip_view),
-          "GTA V's DCC-backed IMAGE_LOAD_MIP remains fail-visible at materialization");
+          "GTA V's DCC-backed IMAGE_LOAD_MIP specializes on the mip proof (source authority is a "
+          "bind-time question)");
+    // Compression must not become a back door into the proof: the mip still has to be proven.
+    SrtUse unproven_dcc_zero_mip_use = materialized_zero_mip_use;
+    unproven_dcc_zero_mip_use.proven_zero_mip = false;
+    CHECK(!shader_resource_allows_zero_mip_specialization(
+                  unproven_dcc_zero_mip_use, dcc_zero_mip_descriptor, zero_mip_view),
+          "a compressed resource still requires the zero-mip proof");
 
     // The same live Astro visibility kernel assembles a sampled T# in s[44:51] from four
     // consecutive entry-user-data pairs before image_load. Preserve both lanes of s_mov_b64 and

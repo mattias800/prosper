@@ -1035,10 +1035,11 @@ int main() {
     stats = shader_recompile_cache_stats();
     CHECK(!cached_proven_zero_mip.empty() && cached_unproven_zero_mip.empty() &&
               repeated_proven_zero_mip == cached_proven_zero_mip &&
-              cached_multilevel_zero_mip.empty() && cached_dcc_zero_mip.empty() &&
+              cached_multilevel_zero_mip.empty() && !cached_dcc_zero_mip.empty() &&
               cached_tail_zero_mip.empty() &&
               stats.misses == 5 && stats.hits == 1 && stats.entries == 5,
-          "compute cache partitions zero-mip proof, levels, DCC, and texture-tail safety");
+          "compute cache partitions zero-mip proof, levels, and texture-tail safety, and "
+          "compiles the DCC case (source authority is decided at bind time)");
 
     clear_shader_recompile_cache();
     static const uint32_t kZeroStoreMipCompute[] = {

@@ -361,8 +361,23 @@ int main() {
         };
         CHECK(unsafe_realization_fails(multilevel_tsharp, false, 2),
               "compute realization keeps a multilevel IMAGE_LOAD_MIP fail-visible");
-        CHECK(unsafe_realization_fails(dcc_tsharp, true, 1),
-              "compute realization keeps GTA-shaped DCC IMAGE_LOAD_MIP fail-visible");
+        // The GTA-shaped DCC descriptor now REALIZES. Compression describes byte encoding and this
+        // stage is about mip addressing; whether those bytes may be read is decided at bind time,
+        // where the live compute backend fails closed for a compressed sampled source with no
+        // imported image, no exact fast-clear materialization, and no metadata proving the base
+        // uncompressed. The resource must still carry `compression_enabled` -- the decode is correct
+        // and unchanged, it simply no longer vetoes the proof.
+        auto compressed_realization_succeeds = [&](const uint32_t* descriptor) {
+            std::vector<OperationRealizationFailure> failures;
+            const std::vector<ComputeItem> items = realize_compute_dispatches(
+                make_zero_mip_submit(descriptor), 2482, &failures);
+            if (items.size() != 1 || !failures.empty() || !items[0].resources) return false;
+            const ShaderResource* texture = items[0].resources->by_fetch_pc(4);
+            return texture && texture->compression_enabled && texture->proven_zero_mip &&
+                texture->declared_mip_levels == 1u;
+        };
+        CHECK(compressed_realization_succeeds(dcc_tsharp),
+              "compute realization admits GTA-shaped DCC IMAGE_LOAD_MIP on the mip proof");
     }
 
     // #584: graphics and compute are one PM4 timeline. The planner must retain the asymmetric

@@ -556,9 +556,12 @@ int main() {
         reinterpret_cast<uint64_t>(zero_mip_texture_shader), true, 3);
     const prosper::gpu::ShaderResource* dcc_zero_mip_texture =
         realized_dcc_zero_mip ? realized_dcc_zero_mip->by_fetch_pc(1) : nullptr;
+    // The descriptor still decodes as compressed, and the mip proof now survives it: compression
+    // describes byte encoding, the proof is about which LOD is addressed. Reading those bytes is a
+    // bind-time question the live compute backend answers fail-closed.
     CHECK(dcc_zero_mip_texture && dcc_zero_mip_texture->compression_enabled &&
-              !dcc_zero_mip_texture->proven_zero_mip,
-          "build_stage_table leaves DCC-backed IMAGE_LOAD_MIP fail-visible");
+              dcc_zero_mip_texture->proven_zero_mip,
+          "build_stage_table keeps the zero-mip proof on a DCC-backed IMAGE_LOAD_MIP");
 
     const uint32_t direct_seed_fetch[] = {
         0xE0002000u, 0x80020100u,   // pc=0: buffer_load_format_x v1, v0, s[8:11], 0 idxen

@@ -5652,13 +5652,27 @@ static bool gta_optional_null_linear_load_launch(
     return true;
 }
 
+// Whether the MIP OPERAND can be specialized away. Every term below is about mip addressing: the use
+// proved the operand zero, and the descriptor exposes exactly one base level outside a tail.
+//
+// `compression_enabled` is deliberately NOT a term. Compression describes how the base allocation's
+// bytes are ENCODED; this predicate is about which LOD is ADDRESSED, and the two are orthogonal. It
+// used to be here, where it silently cleared a proof the per-use fold had already established --
+// GTA V's 0x2042f49a00 reports `proven_at_use=1` at pc=16 and `proven_zero_mip=0` downstream, which
+// looks like a contradiction and is really this one line.
+//
+// Removing it does NOT authorize reading a compressed base allocation. That is a question about the
+// physical source, it is answered where the answer is knowable -- at bind time in the live compute
+// backend, which fails closed without an imported image, an exact fast-clear materialization, or
+// metadata proving the base uncompressed -- and that guard landed first, on purpose. Keeping the term
+// here conflated "we cannot decode these bytes" with "this whole program is unsupported", and the
+// cost was every other thing the program does: for 0x2042f49a00, two 4K storage-image writes.
 bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view) {
     return use.proven_zero_mip && descriptor.sample_count == 1u &&
         descriptor.base_level == 0u && descriptor.last_level == 0u &&
-        descriptor.max_mip == 0u && !view.in_mip_tail &&
-        !descriptor.compression_enabled;
+        descriptor.max_mip == 0u && !view.in_mip_tail;
 }
 
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
