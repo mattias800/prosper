@@ -291,6 +291,42 @@ int main() {
                   "a record whose own range overflows covers nothing");
         }
 
+        // JOINTLY OVERSIZED RANGES. The two ranges agree with each other perfectly, so containment is
+        // satisfied and nothing wraps -- but both exceed the extent the layout claims, so they describe
+        // bytes outside the resource. The arm keeps record and read IDENTICAL: enlarging only the
+        // producer would leave the consumer failing containment instead, and the arm would then pass
+        // for a reason unrelated to the bound it is meant to test.
+        {
+            SampledSourceLayout small = layout;
+            small.guest_bytes = 64; small.resource_bytes = 64;      // claims only 64 bytes
+
+            ProducerWritebackRecord over = rec;
+            ConsumerReadRequest over_read = read;
+            over.layout = small;       over_read.layout = small;
+            over.byte_offset = 0;      over.byte_size = 128;        // both exceed the claimed extent
+            over_read.byte_offset = 0; over_read.byte_size = 128;
+            CHECK(!decide(over, over_read).may_read_guest_base(),
+                  "two mutually consistent ranges that exceed the layout extent authorize nothing");
+
+            ProducerWritebackRecord past = rec;
+            ConsumerReadRequest past_read = read;
+            past.layout = small;       past_read.layout = small;
+            past.byte_offset = 64;      past.byte_size = 1;         // starts at the extent boundary
+            past_read.byte_offset = 64; past_read.byte_size = 1;
+            CHECK(!decide(past, past_read).may_read_guest_base(),
+                  "a matching pair starting at the extent boundary authorizes nothing");
+
+            // ...and the in-bounds full-extent pair over that SAME small layout still works, so the two
+            // arms above are about the bound rather than about the small layout itself.
+            ProducerWritebackRecord exact = rec;
+            ConsumerReadRequest exact_read = read;
+            exact.layout = small;       exact_read.layout = small;
+            exact.byte_offset = 0;      exact.byte_size = 64;
+            exact_read.byte_offset = 0; exact_read.byte_size = 64;
+            CHECK(decide(exact, exact_read).may_read_guest_base(),
+                  "an exact full-extent pair over the same layout still authorizes the base");
+        }
+
         // TWO UNKNOWN TEXEL WIDTHS must not compare equal. Zero means "cannot establish", not "matches".
         {
             SampledSourceLayout unknown_width = layout;

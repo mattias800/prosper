@@ -109,6 +109,23 @@ bool producer_writeback_covers_read(const ProducerWritebackRecord& record,
     if (read.byte_offset < record.byte_offset) return false;
     if (read.byte_offset + read.byte_size > record.byte_offset + record.byte_size) return false;
 
+    // BOUND BOTH RANGES BY THE LAYOUT THEY CLAIM TO DESCRIBE. Containment alone only relates the two
+    // ranges to each other, so two matching oversized claims authorized bytes outside the resource: an
+    // identical layout with a 64-byte extent, a record of [0,128) and a read of [0,128) satisfied every
+    // other check here. Overflow checking does not help -- that range does not wrap, it is simply out
+    // of bounds.
+    const uint64_t extent =
+        std::min<uint64_t>(record.layout.guest_bytes, record.layout.resource_bytes);
+    if (!extent) return false;
+
+    // Current policy is deliberately the STRICTEST one that covers the real case: an exact FULL-extent
+    // writeback, which is what the ordered storage-writeback round trip already produces and what the
+    // storage cache key already represents. Partial coverage is representable by the containment logic
+    // above and stays unauthorized until some real shape needs it and can be evaluated on its own
+    // evidence -- a narrower authority cannot be wrong in a way that shows up as plausible pixels.
+    if (record.byte_offset != 0 || record.byte_size != extent) return false;
+    if (read.byte_offset != 0 || read.byte_size != extent) return false;
+
     // Ordering: the consumer must come after the producer on the same submit timeline.
     if (record.submit_no != read.submit_no) return false;
     return record.command_order < read.command_order;

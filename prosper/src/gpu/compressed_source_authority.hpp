@@ -127,6 +127,9 @@ struct ProducerWritebackRecord {
     bool present = false;
     SampledSourceLayout layout;
     uint64_t content_version = 0;
+    // Relative to `layout.base_addr`, and bounded by the layout's own extent — a range is only
+    // meaningful against the allocation it claims to describe. Two ranges that agree with each other
+    // and exceed that extent used to authorize bytes outside the resource.
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
     // Ordering: the consumer must come after the producer in the same submit timeline.
@@ -138,6 +141,7 @@ struct ProducerWritebackRecord {
 struct ConsumerReadRequest {
     SampledSourceLayout layout;
     uint64_t content_version = 0;
+    // Relative to `layout.base_addr`, as above.
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
     uint64_t submit_no = 0;
