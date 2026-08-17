@@ -10893,6 +10893,16 @@ void set_live_target_image_importer(LiveTargetImageImportFn import_fn,
 void set_live_target_image_written_notifier(LiveTargetImageWrittenFn written_fn) {
     g_live_target_image_written = std::move(written_fn);
 }
+
+static MetadataKindQueryFn g_metadata_kind_query;
+void set_metadata_kind_query(MetadataKindQueryFn fn) { g_metadata_kind_query = std::move(fn); }
+
+CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindRequest& request) {
+    // No renderer, no correlation, no kind. Unknown authorizes nothing downstream, so a backend running
+    // without a registered renderer fails closed rather than inheriting a guess.
+    if (!request.metadata_addr || !g_metadata_kind_query) return CompressionMetadataKind::Unknown;
+    return g_metadata_kind_query(request);
+}
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import) {
     import = LiveTargetImageImport{};

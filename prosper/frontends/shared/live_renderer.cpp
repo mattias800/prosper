@@ -1030,6 +1030,33 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // The compute backend must not sample a surface whose CURRENT pixels live in this renderer's
     // RTT cache (raw guest memory is then empty/stale — the Dead Cells 642x362 lesson): publish the
     // exact-match identity and immutable CPU snapshot used by live compute (#590).
+    // Establish WHICH kind of compression metadata an address is, by correlation with retained state.
+    // The descriptor cannot say: WORD6[21] is set for depth and colour alike and shares one metadata
+    // address field, and a Float32x1 view is not necessarily depth. Only the renderer holds the retained
+    // depth surfaces, so the correlation lives here.
+    prosper::gpu::set_metadata_kind_query(
+        [](const prosper::gpu::MetadataKindRequest& request) {
+            // HTILE is POSITIVELY identified: some retained depth/stencil surface names this exact
+            // address as its HTILE base. That is the evidence the review asked for, rather than
+            // inferring depth from the T# format.
+            for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
+                (void)image;
+                if (key.htile && key.htile == request.metadata_addr)
+                    return prosper::gpu::CompressionMetadataKind::Htile;
+            }
+            // No HTILE correlation. A DEPTH-SHAPED view then stays Unknown rather than being assumed to
+            // be colour DCC: single-component Float32 is exactly the shape whose metadata was previously
+            // read with colour-DCC sizing, and guessing here is how that happened. Unknown authorizes
+            // nothing, so this is a safe answer rather than a missing one.
+            const bool depth_shaped = request.format == prosper::gpu::DataFormat::Float32 &&
+                                      (request.num_components ? request.num_components : 1u) == 1u;
+            if (depth_shaped) return prosper::gpu::CompressionMetadataKind::Unknown;
+            // An ordinary multi-component colour view with compression declared is DCC by elimination:
+            // the depth registry did not claim it, and colour is the only other kind GFX10 puts in this
+            // field.
+            return prosper::gpu::CompressionMetadataKind::Dcc;
+        });
+
     prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
         drain_guest_gpu_writes(g_rtt, invalidate_ds);
         auto it = g_rtt.find(addr);

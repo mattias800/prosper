@@ -17,6 +17,7 @@
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
+#include "compressed_source_authority.hpp"  // CompressionMetadataKind
 #include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
 #include "videoout_present.hpp"    // PresentFrameOrigin: a rendered frame carries its provenance
 #include <algorithm>
@@ -1008,6 +1009,31 @@ bool have_submit_compute();
 // backend imports an immutable CPU snapshot for sampled bindings. Writable bindings seed from the
 // snapshot, publish their result to guest backing, and notify the renderer to invalidate its copy.
 using LiveTargetQueryFn = std::function<bool(uint64_t gpu_addr)>;
+
+// WHICH kind of compression metadata a descriptor's metadata address points at (#2606).
+//
+// The descriptor cannot say. T# WORD6[21] is set for depth/stencil and colour alike, with PAL putting
+// HTILE's address in the same `meta_data_address` field it puts DCC's — and the T# format is not enough
+// either, because a Float32x1 view is not necessarily depth. The reliable evidence is correlation with
+// RETAINED depth/HTILE state, which only the renderer holds, so it registers this the same way it
+// registers the live-target query above.
+//
+// The sampled-source decision takes the kind as an input and refuses to guess: an aspect-unknown plane
+// authorizes nothing, because which bit pattern means "decompressed" depends on the kind. Answering
+// Unknown is therefore always safe and never silently wrong.
+struct MetadataKindRequest {
+    uint64_t metadata_addr = 0;
+    uint64_t resource_addr = 0;
+    DataFormat format = DataFormat::Float32;
+    uint32_t num_components = 1;
+    uint32_t img_dim = 0;
+};
+using MetadataKindQueryFn = std::function<CompressionMetadataKind(const MetadataKindRequest&)>;
+void set_metadata_kind_query(MetadataKindQueryFn fn);
+
+// Unknown when no renderer is registered, so a backend running without one cannot accidentally
+// authorize a base allocation through a kind nobody established.
+CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindRequest& request);
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
 enum class LiveTargetPixelFormat : uint8_t { Rgba8Unorm, Rgba16Float, R11G11B10Float };
