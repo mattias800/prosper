@@ -12,21 +12,31 @@ This resolves that statically, with no boot and no GPU:
       -> every `call rel32` that reaches the stub (plus any `call *[rip+d]` straight to the slot)
       -> objdump the bytes right after each call and classify what happens to eax.
 
-CAVEAT — this tool UNDER-REPORTS const-sensitivity, and the limit is structural.
-`classify_window` stops at the first branch, so a site that tests the result generically and THEN
-const-compares it *inside its error arm* is bucketed as a plain non-zero test. Measured: PPSA08804
-compares against 0x809F000F at 0x4e41a32, past the branch, and this scan reports it as `nonzero`
-(#2023 review). So a `nonzero` verdict means "no const compare before the first branch", NOT "this
-title does not care which error code it gets". Read the error arm before concluding an errno is
-inert.
+THE ERROR ARM IS READ. This used to carry a caveat saying it was not: `classify_window` stopped at
+the first branch, so a site that tests the result generically and THEN const-compares it *inside its
+error arm* was bucketed as a plain non-zero test, and a `nonzero` verdict meant only "no const
+compare before the first branch". Measured then: PPSA08804 compares against 0x809F000F at 0x4e41a32,
+past the branch, reported as `nonzero` (#2023 review). That under-reporting is now fixed —
+`classify_site_following` forks the walk at every branch the value survives and explores both
+successors — and PPSA08804's site is reported as `const`.
 
-Buckets (see `classify_window`):
-    const        the window compares eax against --const (the gate idiom this was written for)
-    nonzero      `test eax,eax` / `cmp eax,0` / sign test -> conditional branch (any error gates)
+What remains, and it is a different claim: a site whose arms leave this scan's reach is reported
+`gate-open` or `forward`, NEVER `nonzero`. So the bucket that says "this site cannot tell one error
+code from another" now earns that meaning, and the buckets that cannot say it are loud. Pass
+`--no-follow-arms` to reproduce the pre-2026-08 numbers.
+
+Buckets (see `classify_site_following` for the default walk, `classify_window` for the legacy one):
+    const        some reachable path compares eax against --const (the idiom this was written for)
+    nonzero      gated on zero/non-zero, and the value is then dead on EVERY reachable path — the
+                 one bucket that means "this site cannot be affected by WHICH non-zero answer"
+    gate-open    gated, but at least one arm left the scan's reach (returned, spilled, indirect
+                 branch, unmapped, or the block budget ran out) — NOT cleared, read by hand
     other-cmp    compares eax against some *other* immediate
-    forward      eax is moved/returned/stored without a local branch — the gate, if any, is in a
+    alu-gate     flags derive from an ALU transform of the result (`and eax,mask; jne`)
+    forward      eax is moved/returned/stored and never gated here — the gate, if any, is in a
                  caller or behind a spilled value; needs a look by hand
     ignored      eax is dead before it is read — this call site cannot be affected
+    undecodable  objdump could not decode the window: a VOID sample, not a negative one
 
 Usage:
     nid_gate_scan.py <module|app0-dir> --nid <NID> [--const 0x805a1001] [--window 48] [-v]
@@ -321,6 +331,15 @@ def disasm(blob, base):
     Raises on an objdump failure rather than returning an empty list: a silent empty decode would
     be classified as an ordinary window and drain into a bucket, turning a broken toolchain into a
     plausible-looking measurement.
+
+    `--no-show-raw-insn` is load-bearing, not cosmetic. objdump wraps the raw-byte column after
+    seven bytes, and the continuation line carries the SAME `<addr>:\\t<hex bytes>` shape as a real
+    instruction — so the parse below read ` 310d73a:\\t03 00 00 00` as an instruction `00` at a VA
+    that is *inside* the 11-byte `mov DWORD PTR [rdi+rax*4+0x6e0],0x3` starting at 0x310d733
+    (PPSA04263). A phantom mnemonic is inert in the taint walk, but a phantom VA is not: the walk
+    uses instruction addresses to continue a block past the end of a window, and continuing from
+    the middle of an instruction decodes garbage. Suppressing the byte column removes the wrap and
+    with it the whole class.
     """
     od = objdump_binary()
     if od is None:
@@ -331,7 +350,7 @@ def disasm(blob, base):
     with open(tmp, "wb") as f:
         f.write(blob)
     r = subprocess.run(
-        [od, "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel",
+        [od, "-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel", "--no-show-raw-insn",
          "--adjust-vma=%#x" % base, tmp],
         capture_output=True, text=True)
     if r.returncode != 0:
@@ -339,9 +358,9 @@ def disasm(blob, base):
     out = r.stdout
     insns = []
     for line in out.splitlines():
-        m = re.match(r"\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(\S+)\s*(.*)", line)
+        m = re.match(r"\s*([0-9a-f]+):\s+(\S+)\s*(.*)", line)
         if m:
-            insns.append((int(m.group(1), 16), m.group(3), m.group(4).split("#")[0].strip()))
+            insns.append((int(m.group(1), 16), m.group(2), m.group(3).split("#")[0].strip()))
     return insns
 
 
@@ -389,40 +408,69 @@ def canon(operand):
 ALU_RMW = {"and", "or", "xor", "add", "sub", "shl", "shr", "sar", "not", "neg", "inc", "dec", "imul"}
 
 
-def classify_window(insns, const):
-    """Classify what the code right after the call does with the returned eax.
+def _direct_target(ops):
+    """The VA a direct branch goes to, or None when the operand is not a bare absolute address.
+
+    objdump's raw-binary Intel output prints a direct jump's destination as a plain `0x...`
+    (already shifted by --adjust-vma, so it is a VA in the flat image). An indirect branch prints
+    a register or a memory operand instead, and there is nothing static to follow.
+    """
+    op = ops.strip()
+    return int(op, 16) if re.fullmatch(r"0x[0-9a-f]+", op) else None
+
+
+def _is_cond_jump(mn):
+    """Any conditional jump. Every x86 mnemonic starting with `j` is a jump, and `jmp` is the only
+    unconditional one, so this is exact rather than an enumeration that can miss `jp`/`jrcxz`."""
+    return mn.startswith("j") and mn != "jmp"
+
+
+def _walk_block(insns, const, live, spilled, follow=False, fall_va=None):
+    """One block of the taint walk. Returns (bucket, evidence, state).
 
     Tracks the result as a small taint set of registers rather than looking only at eax: the
     common compiler output moves eax into another register and *then* zeroes eax as the enclosing
     function's own return value, so an eax-only reader calls a live gate "ignored" (measured on
     GTA V eboot+0x2d850cc: `mov ecx,eax; xor eax,eax; test ecx,ecx`).
 
-    Buckets: const / nonzero / other-cmp / alu-gate all mean "branches on the result"; `forward`
-    means the result left the window still live (returned, spilled, or tail-jumped) and needs a
-    look by hand; `ignored` means it was dead before any read; `undecodable` means objdump could
-    not decode the window, which is a VOID sample, not a negative one.
+    `follow=False` is the legacy single-window walk: it STOPS at the first branch, which is the
+    under-reporting this file's header caveat is about. `follow=True` instead reports the block's
+    successors in `state["edges"]` — a zero-gate no longer terminates the walk, it forks it — so
+    `classify_site_following` can read the ERROR ARM. `fall_va` is where the block continues if the
+    walk runs off the end of the decoded window; None means "the window is the end of what I have".
     """
     const_forms = {"0x%x" % const, str(const)}
-    live = {"a"}
-    spilled = False
-    for va, mn, ops in insns:
+    live = set(live)
+    gated = None                                          # the gate's own (va, mn, ops), once seen
+
+    def st(edges=()):
+        return {"live": live, "spilled": spilled, "edges": list(edges), "gated": gated}
+
+    for i, (va, mn, ops) in enumerate(insns):
+        ev = (va, mn, ops)
         if mn.startswith("(bad)") or mn.startswith(".byte") or mn in ("data16", "rex.W", "rex.RB"):
             # The decode ran into data or a prefix objdump could not attach. Say so instead of
             # letting a broken window fall into `forward`, where it is indistinguishable from a
             # real forward and quietly weakens every count in the table.
-            return "undecodable", (va, mn, ops)
+            return "undecodable", ev, st()
         parts = [p.strip() for p in ops.split(",")] if ops else []
         dst = canon(parts[0]) if parts else None
         src = canon(parts[-1]) if len(parts) > 1 else None
         if mn == "cmp" and dst in live:
             imm = parts[-1]
             if imm in const_forms:
-                return "const", (va, mn, ops)
+                return "const", ev, st()
             if imm in ("0x0", "0"):
-                return "nonzero", (va, mn, ops)
-            return "other-cmp", (va, mn, ops)
+                if not follow:
+                    return "nonzero", ev, st()
+                gated = gated or ev                       # the gate is real; keep reading past it
+                continue
+            return "other-cmp", ev, st()
         if mn == "test" and dst in live and src in live:
-            return "nonzero", (va, mn, ops)
+            if not follow:
+                return "nonzero", ev, st()
+            gated = gated or ev
+            continue
         if mn in ("mov", "movsxd", "movzx", "movsx") and src in live:
             if dst:
                 live.add(dst)
@@ -435,26 +483,159 @@ def classify_window(insns, const):
             if src == dst and mn in ("xor", "sub"):
                 live.discard(dst)                         # self-xor / self-sub: the zeroing idiom
                 if not live:
-                    return ("forward" if spilled else "ignored"), (va, mn, ops)
+                    return ("forward" if spilled else "ignored"), ev, st()
                 continue
-            return "alu-gate", (va, mn, ops)              # flags now derive from the result
+            return "alu-gate", ev, st()                   # flags now derive from the result
         if mn == "ret":
-            return ("forward" if ("a" in live or spilled) else "ignored"), (va, mn, ops)
+            return ("forward" if ("a" in live or spilled) else "ignored"), ev, st()
         if mn == "jmp":
             # An unconditional jump ends this basic block; anything after it belongs to unrelated
             # code. Without this the scan walked straight on and could pick up a `cmp` from the
             # NEXT block, over-reporting a gate that the result never reaches.
-            return ("forward" if (live or spilled) else "ignored"), (va, mn, ops)
+            if not (live or spilled):
+                return "ignored", ev, st()
+            tgt = _direct_target(ops) if follow else None
+            if tgt is None:
+                return "forward", ev, st()                # legacy mode, or an indirect tail-call
+            return "edges", ev, st([tgt])
+        if _is_cond_jump(mn):
+            if not follow:
+                continue                                  # legacy: walked straight through
+            # Both successors are reachable with the value in the same state, so BOTH are queued —
+            # including when the branch tests flags this walk did not set. Exploring only the
+            # fall-through is what let a const compare hide in the taken arm.
+            tgt = _direct_target(ops)
+            nxt = insns[i + 1][0] if i + 1 < len(insns) else fall_va
+            if tgt is None or nxt is None:
+                return "forward", ev, st()                # indirect, or the window ran out
+            return "edges", ev, st([tgt, nxt])
         if mn == "call":
             live -= CALLER_SAVED
             if not live:
-                return ("forward" if spilled else "ignored"), (va, mn, ops)
+                return ("forward" if spilled else "ignored"), ev, st()
             continue
         if dst in live and mn not in ("cmp", "test", "push"):
             live.discard(dst)                             # overwritten from a non-result source
             if not live:
-                return ("forward" if spilled else "ignored"), (va, mn, ops)
-    return ("forward" if (live or spilled) else "ignored"), (insns[0] if insns else (0, "", ""))
+                return ("forward" if spilled else "ignored"), ev, st()
+    last = insns[-1] if insns else (0, "", "")
+    if not (live or spilled):
+        return "ignored", (insns[0] if insns else last), st()
+    if follow and fall_va is not None:
+        return "edges", last, st([fall_va])               # the block simply continues past the window
+    return "forward", (insns[0] if insns else last), st()
+
+
+def classify_window(insns, const):
+    """Classify what the code right after the call does with the returned eax — ONE window, no
+    branch following. This is the legacy classifier, kept so `--no-follow-arms` reproduces every
+    number this tool published before arm following existed.
+
+    Buckets: const / nonzero / other-cmp / alu-gate all mean "branches on the result"; `forward`
+    means the result left the window still live (returned, spilled, or tail-jumped) and needs a
+    look by hand; `ignored` means it was dead before any read; `undecodable` means objdump could
+    not decode the window, which is a VOID sample, not a negative one.
+    """
+    bucket, ev, _state = _walk_block(insns, const, {"a"}, False)
+    return bucket, ev
+
+
+# Decoded blocks per call site. A site that needs more than this is reported UNRESOLVED
+# (`gate-open` / `forward`), never quietly cleared — running out of budget must not look like a
+# clean negative, which is the whole failure mode arm following exists to remove.
+ARM_BLOCK_LIMIT = 192
+
+# Worst-to-best. The site's verdict is the strongest thing found on ANY reachable path, so one arm
+# that const-compares makes the whole site `const` no matter how many arms drop the value.
+_SITE_RANK = ("ignored", "nonzero", "gate-open", "forward", "undecodable",
+              "alu-gate", "other-cmp", "const")
+
+
+MAX_X86_INSN = 16          # an x86-64 instruction is at most 15 bytes; 16 is the safe round number
+
+
+def block_fetcher(img, window):
+    """`va -> (instructions strictly inside [va, va+window), next_va)`, memoised.
+
+    The over-read by one maximum instruction length is what makes both halves exact, and neither is
+    optional once the walk follows branches:
+      * every returned instruction is COMPLETE. objdump decodes whatever bytes it is handed, so the
+        last instruction in a blob cut at a fixed size decodes as `(bad)`/`.byte` junk — which is
+        the `undecodable` bucket, i.e. a truncation artifact wearing the name of a real finding.
+        Reading 16 bytes past the boundary and then discarding everything that starts at or after
+        it leaves only instructions whose bytes were all present.
+      * `next_va` is EXACT, with no instruction-length table anywhere: it is simply the first
+        instruction that starts at or after the boundary, which is where the block continues if the
+        walk runs off the end of the window.
+    Junk in the MIDDLE of a window is still reported `undecodable`, because there it is data rather
+    than truncation — which is the distinction the bucket is supposed to carry.
+    """
+    cache = {}
+
+    def fetch(va):
+        if va not in cache:
+            fo = img.foff(va)
+            if fo is None:
+                cache[va] = (None, None)                 # unmapped: honestly unresolvable
+            else:
+                end = va + window
+                ins = disasm(img.raw[fo:fo + window + MAX_X86_INSN], va)
+                body = [i for i in ins if i[0] < end]
+                tail = [i for i in ins if i[0] >= end]
+                cache[va] = (body, tail[0][0] if tail else None) if body else (None, None)
+        return cache[va]
+
+    return fetch
+
+
+def classify_site_following(fetch, start, const, limit=ARM_BLOCK_LIMIT):
+    """Classify a call site by exploring EVERY reachable path the result stays live on.
+
+    This is the fix for the caveat at the top of this file. The legacy walk stops at the first
+    branch, so `test eax,eax; je .ok; cmp eax,<errno>; ...` — a site that gates generically and
+    discriminates inside its error arm — was reported as a plain `nonzero`, i.e. as if it could not
+    tell two error codes apart. Here the gate forks the walk and both arms are read.
+
+    Buckets are the legacy ones plus **`gate-open`**: the site does gate on the value, and at least
+    one reachable arm left this scan's reach (returned it, spilled it, jumped indirectly, or ran the
+    block budget out). `nonzero` is correspondingly STRONGER than in the legacy walk — it now means
+    the value is gated and then provably dead on every reachable path, so that site cannot tell one
+    non-zero answer from another. `gate-open` and `forward` are the not-cleared buckets.
+    """
+    outcomes, gate_ev, other_ev = set(), None, None
+    work = [(start, frozenset({"a"}), False)]
+    seen, blocks = set(), 0
+    while work:
+        key = work.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        va, live, spilled = key
+        blocks += 1
+        if blocks > limit:
+            outcomes.add("forward")                      # budget: unresolved, not cleared
+            break
+        insns, fall = fetch(va)
+        if not insns:
+            outcomes.add("forward")                      # unmapped, or nothing decodable: not cleared
+            continue
+        bucket, ev, state = _walk_block(insns, const, set(live), spilled, True, fall)
+        gate_ev = gate_ev or state["gated"]
+        if bucket == "edges":
+            nlive, nspill = frozenset(state["live"]), state["spilled"]
+            work += [(tgt, nlive, nspill) for tgt in state["edges"]]
+            continue
+        if bucket == "const":
+            return "const", ev                           # one positive instance settles the site
+        outcomes.add(bucket)
+        if bucket in ("other-cmp", "alu-gate", "undecodable"):
+            other_ev = other_ev or ev
+    if gate_ev:
+        if "forward" in outcomes:
+            outcomes = (outcomes - {"forward"}) | {"gate-open"}
+        outcomes = (outcomes - {"ignored"}) | {"nonzero"}
+    verdict = max(outcomes or {"ignored"}, key=_SITE_RANK.index)
+    return verdict, (other_ev or gate_ev or (start, "", ""))
 
 
 ENDBR64 = b"\xf3\x0f\x1e\xfa"
@@ -491,21 +672,25 @@ def call_sites(img, xref, sym_index):
     return sorted(set(sites))
 
 
-def classify_sites(img, sites, const, window):
+def classify_sites(img, sites, const, window, follow=True):
     """(census, details) for a set of call sites. `details` rows are (site, bucket, ev, arg0)."""
     census, details = {}, []
+    fetch = block_fetcher(img, window)
     for site, kind in sites:
         after = site + (6 if kind == "call*" else 5)
         fo = img.foff(after)
         if fo is None:
             continue
-        bucket, ev = classify_window(disasm(img.raw[fo:fo + window], after), const)
+        if follow:
+            bucket, ev = classify_site_following(fetch, after, const)
+        else:
+            bucket, ev = classify_window(disasm(img.raw[fo:fo + window], after), const)
         census[bucket] = census.get(bucket, 0) + 1
         details.append((site, bucket, ev, arg0_before(img.raw, img.foff(site))))
     return census, details
 
 
-def scan_module(path, nid, const, window, verbose=False):
+def scan_module(path, nid, const, window, verbose=False, follow=True):
     """Returns (status, detail) where status is 'no-import', 'no-slot', or a bucket census dict."""
     try:
         img = Image(flatten(path))
@@ -516,7 +701,7 @@ def scan_module(path, nid, const, window, verbose=False):
         return "no-import", {}
     if not img.jump_slots(idx):
         return "import-no-slot", {}
-    census, details = classify_sites(img, call_sites(img, scan_code(img), idx), const, window)
+    census, details = classify_sites(img, call_sites(img, scan_code(img), idx), const, window, follow)
     if verbose:
         for site, bucket, ev, arg in details:
             argtxt = ("id=%#x%s" % (arg[0], "" if arg[1] else "?")) if arg else "id=?"
@@ -524,7 +709,9 @@ def scan_module(path, nid, const, window, verbose=False):
     return "ok", census
 
 
-GATED = ("const", "nonzero", "other-cmp", "alu-gate")
+GATED = ("const", "nonzero", "other-cmp", "alu-gate", "gate-open")
+# Buckets that say "this site was not resolved", as opposed to "resolved, and it does not care".
+UNRESOLVED = ("gate-open", "forward", "undecodable")
 
 
 def load_nid_names(libs_dir):
@@ -556,7 +743,7 @@ def load_nid_names(libs_dir):
     return names
 
 
-def sweep_module(path, const, window, names, min_gated, verbose):
+def sweep_module(path, const, window, names, min_gated, verbose, follow=True):
     """Classify EVERY imported NID of one module. Prints a row per import that has call sites."""
     img = Image(flatten(path))
     if img.dynsym() is None:
@@ -570,7 +757,7 @@ def sweep_module(path, const, window, names, min_gated, verbose):
         sites = call_sites(img, xref, idx)
         if not sites:
             continue                                         # imported, never called: no gate here
-        census, details = classify_sites(img, sites, const, window)
+        census, details = classify_sites(img, sites, const, window, follow)
         gated = sum(census.get(b, 0) for b in GATED)
         rows.append((gated, len(sites), nid, census, details))
     rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
@@ -596,24 +783,30 @@ def sweep_summary(label, rows, shown, min_gated):
     """The trailing `#` block: what was hidden, and why the table is not a clean partition.
 
     A row that is not gated is NOT automatically a row that cannot matter. `forward` means the
-    result left the window still live and needs a look by hand, and `undecodable` is a void sample.
-    Reporting only "N called, M shown" invites exactly the wrong reading — that everything below the
-    cut is cleared — which is the expensive direction in a document whose whole purpose is to stop
-    the next reader re-deriving a dead answer. So state the three-way split explicitly, and print
-    the site-level bucket totals so the undecodable share is impossible to miss.
+    result left the scan's reach still live and needs a look by hand, `gate-open` means the same of
+    an arm, and `undecodable` is a void sample. Reporting only "N called, M shown" invites exactly
+    the wrong reading — that everything below the cut is cleared — which is the expensive direction
+    in a document whose whole purpose is to stop the next reader re-deriving a dead answer. So state
+    the split explicitly, count the rows that are not resolved SEPARATELY from the ones that are not
+    gated (a `gate-open` row is both gated and unresolved), and print the site-level bucket totals.
     """
     gated_rows = sum(1 for g, _n, _i, _c, _d in rows if g)
     ignored_only = sum(1 for g, _n, _i, c, _d in rows if not g and set(c) <= {"ignored"})
     unresolved = len(rows) - gated_rows - ignored_only
+    open_rows = sum(1 for _g, _n, _i, c, _d in rows if set(c) & set(UNRESOLVED))
     totals = {}
     for _g, _n, _i, c, _d in rows:
         for k, v in c.items():
             totals[k] = totals.get(k, 0) + v
     print("# %s: %d imported NIDs are called; %d shown at --min-gated=%d"
           % (label, len(rows), shown, min_gated))
-    print("#   %d gated, %d ignored-only (cannot matter), %d unresolved "
-          "(>=1 forward/undecodable window — NOT cleared, read by hand)"
-          % (gated_rows, ignored_only, unresolved))
+    print("#   %d gated, %d ignored-only (cannot matter), %d neither "
+          "(no gate, and >=1 site not cleared)" % (gated_rows, ignored_only, unresolved))
+    # A `gate-open` row IS gated — it branches on the result — so it is counted above and is still
+    # not cleared. Reporting only the "neither" column would hide exactly those rows, which is the
+    # expensive direction: they read as answered.
+    print("#   %d rows carry >=1 site the scan could not resolve (%s) — read those by hand"
+          % (open_rows, "/".join(UNRESOLVED)))
     print("#   site buckets: %s" % " ".join("%s=%d" % kv for kv in sorted(totals.items())))
 
 
@@ -629,6 +822,10 @@ def main():
                     help="with --all-nids, hide imports with fewer than N gated call sites (default 1)")
     ap.add_argument("--const", default="0x805a1001")
     ap.add_argument("--window", type=lambda s: int(s, 0), default=48)
+    ap.add_argument("--no-follow-arms", action="store_true",
+                    help="legacy single-window walk: stop at the first branch and never read the "
+                         "error arm. UNDER-REPORTS const-sensitivity (see this file's header); it "
+                         "exists to reproduce numbers published before arm following")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     if bool(a.nid) == bool(a.all_nids):
@@ -645,12 +842,13 @@ def main():
         targets = [a.target]
 
     names = load_nid_names(a.names) if a.names else {}
+    follow = not a.no_follow_arms
 
     if a.all_nids:
         for t in sorted(targets):
             label = os.path.relpath(t, a.target) if os.path.isdir(a.target) else t
             try:
-                rows, shown = sweep_module(t, const, a.window, names, a.min_gated, a.verbose)
+                rows, shown = sweep_module(t, const, a.window, names, a.min_gated, a.verbose, follow)
             except Exception as e:                           # noqa: BLE001 — report, keep going
                 # Loud and per module: a directory sweep must not lose one module's failure in the
                 # noise of the others', and this is where dynsym()'s deliberate raises surface.
@@ -661,7 +859,7 @@ def main():
 
     total = {}
     for t in sorted(targets):
-        status, census = scan_module(t, a.nid, const, a.window, a.verbose)
+        status, census = scan_module(t, a.nid, const, a.window, a.verbose, follow)
         if status == "no-import" and not a.verbose:
             continue
         label = os.path.relpath(t, a.target) if os.path.isdir(a.target) else t

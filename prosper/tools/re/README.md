@@ -215,18 +215,28 @@ Flattening happens in memory, so there is no `prx_to_elf.py` step.
 
 | bucket | meaning |
 |---|---|
-| `const` | compares the result against `--const` |
-| `nonzero` | `test eax,eax` / `cmp eax,0` → conditional branch |
+| `const` | some reachable path compares the result against `--const` |
+| `nonzero` | gated on zero/non-zero, and the value is then dead on **every** reachable path — the only bucket that says this site cannot tell one non-zero answer from another |
+| `gate-open` | gated, but an arm left the scan's reach (returned, spilled, indirect branch, unmapped, budget) — **not** cleared; read it by hand |
 | `alu-gate` | folds the result into flags (`and eax,mask` …) and branches on that |
 | `other-cmp` | compares against some other immediate |
-| `forward` | still live when the window ends — returned, spilled, or tail-jumped; read it by hand |
+| `forward` | never gated here and still live — returned, spilled, or tail-jumped; read it by hand |
 | `ignored` | dead before any read: this call site cannot be affected |
 | `undecodable` | objdump could not decode the window — a **void** sample, not a negative one |
 
+**The error arm is read.** The scan forks at every branch the value survives and explores both
+successors, so a site that tests the result generically and *then* const-compares it inside its error
+arm lands in `const`. That case used to land in `nonzero` — indistinguishable from a site that cannot
+care — which is why `nonzero` now carries the stronger meaning above and `gate-open` exists to hold
+everything the walk could not finish. `--no-follow-arms` restores the old single-window walk, and is
+there only to reproduce numbers published before this existed; it under-reports `const`, measurably
+(PPSA08804's `sceSaveDataTransferringMountPs4` site: `nonzero` without, `const` with).
+
 **Read the output as a bound, not a census.** It classifies the *compare*, never the branch target,
-so it tells you which titles *can* change behaviour, not which do; and site discovery follows one
-stub level and one call deep, so a count is a lower bound. `forward=0` across a corpus is worth
-quoting for the opposite reason — together with `undecodable=0` it shows every window decoded.
+so it tells you which titles *can* change behaviour, not which do; site discovery follows one stub
+level and one call deep, so a count is a lower bound; and the walk is intra-module, so a value handed
+to a caller is `gate-open` rather than cleared. `gate-open=0 forward=0 undecodable=0` across a corpus
+is worth quoting for the opposite reason — together they say every site was resolved.
 
 The classifier tracks the result as a small register taint set rather than watching `eax` alone,
 because the ordinary compiler output is `mov ecx,eax; xor eax,eax; test ecx,ecx` — the `xor` is the
@@ -260,23 +270,25 @@ Rows sort by gated call sites descending, so the head of the table is libc, and 
 block is the part to read first:
 
 ```text
-Ovb2dSJOAuE  strcmp                libSceLibcInternal  sites=981 gated=973 forward=7 nonzero=972 …
+Ovb2dSJOAuE  strcmp                libSceLibcInternal  sites=981 gated=979 gate-open=65 nonzero=912 …
 …
-fMP5NHUOaMk  sceSysmoduleIsLoaded  libSceSysmodule     sites=5   gated=5   const=1 nonzero=4
+fMP5NHUOaMk  sceSysmoduleIsLoaded  libSceSysmodule     sites=5   gated=5   const=1 gate-open=1 nonzero=3
 …
-# <path>: 536 imported NIDs are called; 247 shown at --min-gated=1
-#   247 gated, 157 ignored-only (cannot matter), 132 unresolved (>=1 forward/undecodable window
-#   — NOT cleared, read by hand)
-#   site buckets: alu-gate=125 const=1 forward=3445 ignored=14432 nonzero=3440 other-cmp=166
-#                 undecodable=2699
+# <path>: 536 imported NIDs are called; 254 shown at --min-gated=1
+#   254 gated, 202 ignored-only (cannot matter), 80 neither (no gate, and >=1 site not cleared)
+#   180 rows carry >=1 site the scan could not resolve (gate-open/forward/undecodable) — read
+#   those by hand
+#   site buckets: alu-gate=522 const=1 forward=1817 gate-open=897 ignored=18462 nonzero=2287
+#                 other-cmp=313 undecodable=9
 ```
 
-**Not-gated is not the same as cleared, and the summary says so on purpose.** `ignored` is the only
-bucket that means an answer cannot matter at that site; `forward` explicitly needs a look by hand and
-`undecodable` is a void sample. A two-way "called / gated" split invites the reading that everything
-below the cut is struck off — here that would wrongly retire 132 rows, and 11.1% of all windows are
-undecodable. The three-way split plus the site-bucket totals make it impossible to mistake the table
-for a clean partition.
+**Not-gated is not the same as cleared, and neither is gated.** `ignored` is the only bucket that
+means an answer cannot matter at that site, and `nonzero` the only one that means it cannot matter
+*which* non-zero answer; `forward` and `gate-open` explicitly need a look by hand and `undecodable`
+is a void sample. A two-way "called / gated" split invites the reading that everything below the cut
+is struck off — and the `gate-open` rows show the same trap above the cut, since a row can gate on
+the result and still be unresolved. That is why the summary prints the not-resolved row count
+separately from the not-gated one, and the site-bucket totals underneath both.
 
 `--names` points at the gitignored PS5 firmware `genstub.py` library dump and is **symbolication
 only** — an unlabelled NID is still scanned and still reported, so a missing dump costs names, never
