@@ -6046,7 +6046,62 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  (unsigned long long)r->metadata_addr,
                                  sampled_dcc_clear_code);
 
+                // Does the metadata itself prove the base allocation carries ordinary texels? An
+                // all-0xff DCC plane is "nothing is compressed", so the base bytes ARE the image.
+                // Computed here rather than after the read below, because it is an authority for
+                // reading, not merely a cache-eligibility fact -- which is all it used to be.
+                const bool sampled_metadata_proves_uncompressed =
+                    sampled_dcc_metadata && sampled_dcc_metadata_bytes &&
+                    std::all_of(sampled_dcc_metadata,
+                                sampled_dcc_metadata + sampled_dcc_metadata_bytes,
+                                [](uint8_t value) { return value == 0xff; });
+
                 if (!sampled_dcc_fast_clear) {
+                    // FAIL CLOSED: a COMPRESSED sampled source may not enter guest preparation
+                    // without an authoritative representation. `readable` below is not one -- a
+                    // mapped base allocation whose texels live in DCC/HTILE decodes to plausible
+                    // garbage, which is strictly worse than declining, because it arrives as wrong
+                    // pixels instead of a visible skip.
+                    //
+                    // The three admissible authorities are: an imported retained Vulkan image
+                    // (`bi.imported`), the exact supported fast-clear materialization
+                    // (`sampled_dcc_fast_clear`, handled in the other arm), and metadata that
+                    // proves the base is uncompressed. Anything else declines.
+                    //
+                    // This exists because the compression term in the recompiler's zero-mip gate is
+                    // about to stop standing in for it. That term is not part of the zero-mip proof
+                    // -- compression describes byte ENCODING, the proof is about which LOD is
+                    // addressed -- but while it is there it is the only thing keeping a compressed
+                    // compute sampled binding away from this raw read. Removing it first would turn
+                    // GTA V's `0x2042f49a00` from "recompile-empty" into "reads compressed bytes".
+                    // The guard lands first, deliberately, so no routed A/B can consume garbage.
+                    //
+                    // SCOPED TO SURFACES WHOSE PIXELS LIVE SOMEWHERE ELSE, and the scope is the
+                    // whole correctness of this guard. `renderer_owned || depth_import_eligible` is
+                    // exactly the set that ATTEMPTED the import above, so reaching here with one of
+                    // them means the import MISSED -- the live pixels are in a Vulkan image or in
+                    // HTILE, and the base allocation is stale or encoded.
+                    //
+                    // An ordinary guest-backed surface is deliberately NOT covered. prosper's own
+                    // compute writeback puts plain texels in the base and can leave the guest's
+                    // metadata reading "compressed"; the base is then authoritative because we wrote
+                    // it, and `game_compute_exec` pins exactly that round-trip
+                    // ("unresolved DCC promotion keeps the ordinary sampled guest fallback
+                    // correct"). A guard without this scope fails that test, which is how the scope
+                    // was found rather than reasoned.
+                    //
+                    // `!bi.imported` is stated rather than assumed. An imported binding is expected
+                    // to bypass guest preparation entirely, but this is a safety interlock and must
+                    // not depend on an invariant proven elsewhere in a 6,000-line function.
+                    // CONFIDENCE: HIGH (declining is safe here; the risk is over-declining).
+                    if (r->compression_enabled && !bi.imported &&
+                        (renderer_owned || depth_import_eligible) &&
+                        !sampled_metadata_proves_uncompressed) {
+                        skip_image(r, "compressed sampled source without authority "
+                                      "(no imported image, no fast clear, metadata does not prove "
+                                      "the base allocation uncompressed)");
+                        break;
+                    }
                     sampled_guest_source = resource_bytes_for(r, sampled_guest_need);
                     const bool readable =
                         (r->host_data && r->host_data_size >= sampled_guest_need) ||
@@ -6054,13 +6109,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
                 }
 
-                bool dcc_cache_safe = !r->compression_enabled;
-                if (r->compression_enabled) {
-                    dcc_cache_safe = sampled_dcc_metadata && sampled_dcc_metadata_bytes &&
-                        std::all_of(sampled_dcc_metadata,
-                                    sampled_dcc_metadata + sampled_dcc_metadata_bytes,
-                                    [](uint8_t value) { return value == 0xff; });
-                }
+                const bool dcc_cache_safe =
+                    !r->compression_enabled || sampled_metadata_proves_uncompressed;
                 // Fast clears are keyed by metadata, not by the inactive base allocation. Keep
                 // this first narrow path uncached rather than teaching the existing base-byte key
                 // an unsafe partial identity; staging materialization is still far cheaper than
