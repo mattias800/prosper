@@ -117,6 +117,13 @@ void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* nam
     reg[nid] = { fn, name ? name : "", true, nullptr };
 }
 const std::vector<ShadowedReg>& Hle::shadowed_registrations() { return shadow_list(); }
+std::vector<RegisteredFn> Hle::registrations() {
+    std::vector<RegisteredFn> out;
+    out.reserve(registry().size());
+    for (const auto& kv : registry())
+        out.push_back({ kv.first, kv.second.name, (const void*)kv.second.fn, kv.second.placeholder });
+    return out;
+}
 HleFn Hle::lookup(const std::string& nid) {
     auto it = registry().find(nid);
     return it == registry().end() ? nullptr : it->second.fn;

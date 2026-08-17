@@ -78,6 +78,14 @@ struct ShadowedReg {
     std::string new_name;     // display name of the registration that won
 };
 
+// One row of the live registry, as reported by Hle::registrations() (see below).
+struct RegisteredFn {
+    std::string nid;          // the NID the guest imports
+    std::string name;         // prosper's display name for it
+    const void* fn = nullptr; // handler address; equal addresses = Sony entry points that collapse
+    bool placeholder = false; // registered as a deliberately-overridable tracing thunk
+};
+
 // Registry of implemented functions, keyed by NID.
 class Hle {
 public:
@@ -94,6 +102,13 @@ public:
     // is the healthy state; a non-empty list is the #330 double-registration-shadow class and must be
     // reviewed (the winner is the LAST registration). Populated as register_fn runs.
     static const std::vector<ShadowedReg>& shadowed_registrations();
+    // The registry as it actually stands, one row per NID — the table the guest's calls resolve
+    // through. Exists so a static reader of `src/hle` can be RECONCILED against ground truth
+    // (#2070): a registration shape a parser does not recognise is invisible to it and shrinks its
+    // census with nothing looking wrong, and only the built binary can settle which `#if` arm won.
+    // `fn` is the handler address, so rows sharing one address are the Sony entry points that
+    // collapse onto a single answer. Diagnostics only; order is unspecified.
+    static std::vector<RegisteredFn> registrations();
 };
 
 // Wire the unimplemented-call logger to the global stub-slot table + name DB.

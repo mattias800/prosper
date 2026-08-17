@@ -141,6 +141,18 @@ if(Python3_Interpreter_FOUND)
   # address" the same empty output (#2186).
   add_test(NAME re_stub_nid_map
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_stub_nid_map.py")
+  # hle_handler_map answers "how many Sony entry points collapse onto ONE prosper handler?" — the
+  # blind spot a runtime return-value histogram cannot see, because it keys on the handler. Every
+  # way the parser can be wrong yields a plausible table rather than a failure, so the shapes, the
+  # `#if` arms and the per-name (not per-site) counting are all pinned (#2070).
+  add_test(NAME re_hle_handler_map
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_hle_handler_map.py")
+  # ...and reconciled against the registry the compiled binary actually builds, so a registration
+  # SHAPE the parser does not recognise fails loudly instead of quietly shrinking the census.
+  add_test(NAME re_hle_handler_map_reconcile
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/re/test_hle_registry_reconcile.py"
+                   "$<TARGET_FILE:hle_registry_dump>")
   # prx_to_elf.py writes an ELF header by hand, four bytes apart from a field that means something
   # else entirely — #2016 put the program-header count in the section-header-count slot, and the
   # result was a malformed image no consumer complained about until binutils refused the file. The
@@ -345,6 +357,12 @@ if(TARGET prosper_core)
   add_executable(test_hle_no_shadow tests/test_hle_no_shadow.cpp)
   target_link_libraries(test_hle_no_shadow PRIVATE prosper_core)
   add_test(NAME hle_no_shadow COMMAND test_hle_no_shadow)
+
+  # Ground truth for tools/re/hle_handler_map.py: the registry register_builtin_hle() really builds
+  # (#2070). Pure setup — no game dump, no GPU — so the static parser can be reconciled against the
+  # compiled binary on every run instead of being trusted.
+  add_executable(hle_registry_dump tools/re/hle_registry_dump.cpp)
+  target_link_libraries(hle_registry_dump PRIVATE prosper_core)
 
   # Cooperative stop signal (issue #164 P0): request_stop/stop_requested the frontend uses to wind
   # the guest run-loop down on window-close. Pure, no deps.
