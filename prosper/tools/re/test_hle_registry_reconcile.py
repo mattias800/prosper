@@ -101,12 +101,25 @@ def main():
           "as unresolved)" % (len(declared_missing), len(missing), len(sc.unresolved)))
     check("every runtime-only NID is accounted for", len(declared_missing), len(missing))
 
-    # The reverse direction is bounded, not zero: a registrar the dump's build does not call would
-    # show up here, and so would a genuine parser over-report. Either is worth seeing.
-    check("the parser invents no registrations beyond a small, explainable set", len(extra) <= 8,
-          True)
+    # The reverse direction: a NID the parser produced that the binary does not register. Today
+    # there are ZERO, so the assertion is zero — not a slack bound.
+    #
+    # A magic bound would buy nothing and cost legibility: a drift of one through N would land
+    # silently, and the number itself gives no reader a way to tell whether it was measured or
+    # guessed. If a legitimate exception ever appears (a registrar this build genuinely does not
+    # call), name it here with the reason, so each one has to be justified once rather than hidden
+    # inside a threshold. Same argument as the residual detector: make the exception explicit or
+    # make it fail.
+    ALLOWED_PARSED_ONLY = {
+        # NID: why the parser sees it but `register_builtin_hle()` does not register it.
+    }
+    unexpected_extra = [n for n in extra if n not in ALLOWED_PARSED_ONLY]
+    check("the parser invents no registrations the binary does not make", unexpected_extra, [])
     if extra:
         print("  parsed but not registered at runtime: %s" % " ".join(extra[:20]))
+    if ALLOWED_PARSED_ONLY:
+        print("  (%d allowlisted: %s)"
+              % (len(ALLOWED_PARSED_ONLY), ", ".join(sorted(ALLOWED_PARSED_ONLY))))
 
     # Sound direction only: shared-by-the-parser must be shared-by-address at runtime.
     check("every shared handler the parser found shares one runtime address", groups, [])

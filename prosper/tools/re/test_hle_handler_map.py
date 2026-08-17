@@ -462,9 +462,33 @@ def test_unparsable_shape_is_reported():
     try:
         open(os.path.join(d, "dispatch.hpp"), "w").write(DISPATCH_HPP)
         open(os.path.join(d, "demo.cpp"), "w").write(BROKEN_SHAPE)
-        r = subprocess.run([sys.executable, TOOL, "--src", d], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, TOOL, "--src", d, "--platform", "linux"],
+                           capture_output=True, text=True)
         check("exit 3 (incomplete), not 0", r.returncode, 3)
         check("says so on stdout", "UNCLAIMED" in r.stdout, True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_platform_is_required():
+    """Omitting `--platform` must be refused, not silently answered for the host.
+
+    The entire 41-vs-36 error was a platform-counting artifact, and `s_ok` is a case where a
+    platform-blind count is wrong on every platform — so there is no safe default to fall back to.
+    A tool that picks silently reproduces the class it was built to detect.
+    """
+    print("--platform has no default:")
+    d = tempfile.mkdtemp(prefix="hle_handler_map_t_")
+    try:
+        open(os.path.join(d, "dispatch.hpp"), "w").write(DISPATCH_HPP)
+        open(os.path.join(d, "demo.cpp"), "w").write(SHAPES)
+        r = subprocess.run([sys.executable, TOOL, "--src", d], capture_output=True, text=True)
+        check("refused without --platform", r.returncode != 0, True)
+        check("and says which argument is missing", "--platform" in r.stderr, True)
+        check("nothing was printed as an answer", r.stdout.strip(), "")
+        ok = subprocess.run([sys.executable, TOOL, "--src", d, "--platform", "linux"],
+                            capture_output=True, text=True)
+        check("with --platform it runs", ok.returncode, 0)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -476,9 +500,13 @@ def test_empty_tree_refuses():
     try:
         open(os.path.join(d, "dispatch.hpp"), "w").write(DISPATCH_HPP)
         open(os.path.join(d, "empty.cpp"), "w").write("namespace prosper { int x = 1; }\n")
-        r = subprocess.run([sys.executable, TOOL, "--src", d], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, TOOL, "--src", d, "--platform", "linux"],
+                           capture_output=True, text=True)
         check("exit 2 (refused)", r.returncode, 2)
-        check("stderr explains", "refused" in r.stderr, True)
+        # argparse also exits 2, so this assertion is what makes the exit code mean
+        # "the scan refused" rather than "the command line was wrong".
+        check("stderr says refused, not an argparse usage error", "refused" in r.stderr, True)
+        check("and it is not an argparse error", "the following arguments" in r.stderr, False)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -522,6 +550,7 @@ def main():
     test_registration_beside_a_forward_is_not_swallowed()
     test_shapes_are_discovered()
     test_unparsable_shape_is_reported()
+    test_platform_is_required()
     test_empty_tree_refuses()
     test_real_tree()
     print("\n%s" % ("all checks passed" if not fails else "%d CHECK(S) FAILED" % fails))

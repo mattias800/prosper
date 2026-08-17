@@ -14,7 +14,7 @@ some other Sony function, and therefore cannot be trusted from a `--values` row 
 
     nid_gate_scan.py <DUMP_ROOT>/PPSA05325-app0/eboot.bin --all-nids \
         --names ../PS5-3.20_Libs > gated.txt
-    hle_handler_map.py --names ../PS5-3.20_Libs --gated gated.txt
+    hle_handler_map.py --platform linux --names ../PS5-3.20_Libs --gated gated.txt
 
 This tool is the registration half. It parses prosper's OWN registration tables under `src/hle/`
 and reports `NID -> (Sony name, prosper handler, how many distinct Sony names that handler serves)`.
@@ -73,11 +73,14 @@ first `libSceXxx.c` in sorted order that exports the NID; that rule is shared wi
 is crossed against, so the two cannot disagree about a library.
 
 Usage:
-    hle_handler_map.py [--src DIR] [--platform linux|windows|macos] [--names DIR]
+    hle_handler_map.py --platform linux|windows|macos [--src DIR] [--names DIR]
                        [--gated FILE] [--registry FILE] [--all] [--min-names N]
 
+    --platform   REQUIRED. Which arm of the `#if` tree to evaluate. There is no default and no
+                 platform-independent answer: `hle_kernel_mem.cpp` compiles a different
+                 `register_kernel_mem_hle()` per platform, and a tool that picks silently is how
+                 the 41-vs-36 error below happened.
     --src        prosper source root holding `src/hle` (default: inferred from this file's path)
-    --platform   which arm of the `#if` tree to evaluate (default: the host platform)
     --names      PS5 3.20 firmware genstub dump, for Sony names and library attribution
     --gated      output of `nid_gate_scan.py --all-nids`; restricts the cross to those NIDs
     --registry   an `hle_registry_dump` TSV; reconciles the parse against the compiled binary
@@ -979,10 +982,14 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap.add_argument("--src", default=os.path.join(os.path.dirname(here), "..", "src", "hle"),
                     help="prosper's src/hle directory (default: relative to this script)")
-    ap.add_argument("--platform", choices=sorted(PLATFORM_DEFINES),
-                    default=("windows" if sys.platform.startswith("win")
-                             else "macos" if sys.platform == "darwin" else "linux"),
-                    help="which #if arm to evaluate (default: this host)")
+    # REQUIRED, deliberately. A default would answer for one platform silently, and that is exactly
+    # how this measurement went wrong the first time: the whole 41-vs-36 gap is a platform-counting
+    # artifact, and the `s_ok` case is one where a platform-blind count is wrong on EVERY platform.
+    # Making the reader name the arm costs six characters and removes the class.
+    ap.add_argument("--platform", choices=sorted(PLATFORM_DEFINES), required=True,
+                    help="which #if arm to evaluate — REQUIRED; `hle_kernel_mem.cpp` compiles a "
+                         "different register_kernel_mem_hle() per platform, so there is no "
+                         "platform-independent answer to give")
     ap.add_argument("--names", metavar="DIR", help="PS5 firmware genstub dump, for names+libraries")
     ap.add_argument("--gated", metavar="FILE", help="a `nid_gate_scan.py --all-nids` report to cross")
     ap.add_argument("--registry", metavar="FILE",

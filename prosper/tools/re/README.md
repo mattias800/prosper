@@ -349,7 +349,7 @@ python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA05325-app0/eboot.bin \
     --all-nids --names ../PS5-3.20_Libs > gated.txt
 
 # 2. which of those are answered by a handler that also answers something else?
-python3 tools/re/hle_handler_map.py --names ../PS5-3.20_Libs --gated gated.txt
+python3 tools/re/hle_handler_map.py --platform linux --names ../PS5-3.20_Libs --gated gated.txt
 ```
 
 Measured on *Sonic Origins* (`PPSA05325`) at the time of writing: of 247 gated rows, **36** sit on a
@@ -406,7 +406,8 @@ prosper actually builds — no boot, no game dump, no GPU, because registration 
 
 ```bash
 ./build-linux/hle_registry_dump registry.tsv
-python3 tools/re/hle_handler_map.py --registry registry.tsv --names ../PS5-3.20_Libs
+python3 tools/re/hle_handler_map.py --platform linux --registry registry.tsv \
+    --names ../PS5-3.20_Libs
 ```
 
 A NID the binary registers that the parser never produced is, by definition, a registration shape the
@@ -418,13 +419,14 @@ handler — unequal addresses do prove a distinct one.
 
 ### Two things that moved the number, both of which look like nothing
 
-* **`--platform` matters.** `hle_kernel_mem.cpp` defines `register_kernel_mem_hle()` **twice**,
+* **`--platform` is REQUIRED, and that is the point.** `hle_kernel_mem.cpp` defines `register_kernel_mem_hle()` **twice**,
   ~3,200 lines apart, in the two arms of one `#if defined(__linux__) || defined(__APPLE__)`. A
   line-based extraction counts both arms, so every kernel-memory handler looks registered for two
   Sony names and gets promoted to "shared". Five handlers that answer exactly one Sony function each
   — `k_dmem_size`, `k_virtual_query`, `k_alloc_dmem`, `k_mtypeprotect`, `k_mprotect` — were counted
   as collapses this way. The tool evaluates the conditionals for one platform and prints how many
-  lines it skipped.
+  lines it skipped. There is no default: a tool whose default silently answers for one platform is
+  how this class of error starts, so the reader has to name the arm.
 * **Distinct Sony NAMES, not registration SITES.** `scePthreadAttrSetaffinity` is registered to
   `k_attr_noop` at both `hle_kernel.cpp:4539` and `:4588`. That is one Sony entry point; counting the
   lines inflates every handler with a duplicate.

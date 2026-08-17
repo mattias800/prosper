@@ -331,11 +331,13 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   into a registration call — and the parse is **reconciled against the registry the binary actually
   builds** (`re/hle_registry_dump.cpp`, ctest `re_hle_handler_map_reconcile`), so a shape it cannot
   read fails loudly instead of quietly shrinking the census. Exit `3` means the table is a lower
-  bound; exit `2` means nothing was parsed. **Pass `--platform`**: `hle_kernel_mem.cpp` defines
-  `register_kernel_mem_hle()` twice in two arms of one `#if`, and counting both promotes five
-  single-name handlers to "shared" — that plus per-site (rather than per-distinct-name) counting is
-  the whole difference between the 41 this measurement was first published with and the 36 that is
-  correct (#2070). See `re/README.md`.
+  bound; exit `2` means nothing was parsed. **`--platform` is required, with no default**:
+  `hle_kernel_mem.cpp` defines `register_kernel_mem_hle()` twice in two arms of one `#if`, and
+  counting both promotes five single-name handlers to "shared" — that plus per-site (rather than
+  per-distinct-name) counting is the whole difference between the 41 this measurement was first
+  published with and the 36 that is correct (#2070). There is no platform-independent answer to give,
+  and `s_ok` is a case where the platform-blind count is wrong on *every* platform, so the tool
+  refuses to pick for you. See `re/README.md`.
 - **`re/pak_index.py`** — resolve UE4 `.pak` byte offsets to asset names, and decode a
   `PROSPER_FILELOG=1` run's `[apr] read-submit` stream into an ordered asset load trace. Answers
   "which map/blueprint/texture did the guest actually load, and where did loading stop?" offline,
