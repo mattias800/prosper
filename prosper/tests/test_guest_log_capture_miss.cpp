@@ -243,9 +243,15 @@ int main(int argc, char** argv) {
         if (self.find('/') == std::string::npos && self.find('\\') == std::string::npos)
             self = "./" + self;
         const auto child_err = scratch / ("prosper-guest-log-miss-child-" + std::to_string(nonce) + ".stderr");
+        // More than two quote characters, so cmd.exe does not strip the outermost pair and the
+        // string is used as written; /bin/sh treats it the same way. Paths here are the test
+        // binary and its own scratch directory.
         const std::string command = "\"" + self + "\" --unfired-child \"" + bundle_path.string() +
                                     "\" 2> \"" + child_err.string() + "\"";
         const int rc = std::system(command.c_str());
+        // Printed on any failure so a spawn or quoting problem is never mistaken for the defect
+        // this arm exists to catch — the two look identical from the assertions alone.
+        if (rc != 0) std::printf("  [note] child command was: %s\n", command.c_str());
         std::string child_text;
         if (FILE* in = std::fopen(child_err.string().c_str(), "rb")) {
             char buf[4096];
