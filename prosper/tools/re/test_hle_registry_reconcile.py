@@ -77,10 +77,12 @@ def main():
     platform = ("windows" if sys.platform.startswith("win")
                 else "macos" if sys.platform == "darwin" else "linux")
     sc = H.scan_tree(SRC_HLE, platform)
-    missing, extra, groups, unresolved = H.reconcile(sc, registry)
+    hard_missing, declared_missing, extra, groups = H.reconcile(sc, registry, SRC_HLE)
+    missing = hard_missing + declared_missing
 
     print("  platform=%s  runtime=%d NIDs  parsed=%d NIDs  (parser also saw %d sites whose NID is "
-          "not a literal)" % (platform, len(registry), len({x.nid for x in sc.regs}), unresolved))
+          "not a literal)" % (platform, len(registry), len({x.nid for x in sc.regs}),
+                              len(sc.unresolved)))
 
     check("the dump is not empty", len(registry) > 900, True)
     check("the parse is not empty", len(sc.regs) > 900, True)
@@ -94,13 +96,10 @@ def main():
     #     `kAgcNids[Offset + Is]`) -> a declared limit, reported in the coverage block on every run.
     #   * it is anywhere else -> the parser cannot see how it got registered at all. That is a
     #     missed shape, and it is the failure this test exists for.
-    literals = declared_table_nids(sc)
-    explained = [n for n in missing if n in literals]
-    hard_missing = [n for n in missing if n not in literals]
     check("no NID is registered by a shape the parser cannot read", hard_missing, [])
     print("  (%d of the %d runtime-only NIDs come from the %d array-driven sites the parser names "
-          "as unresolved)" % (len(explained), len(missing), unresolved))
-    check("every runtime-only NID is accounted for", len(explained), len(missing))
+          "as unresolved)" % (len(declared_missing), len(missing), len(sc.unresolved)))
+    check("every runtime-only NID is accounted for", len(declared_missing), len(missing))
 
     # The reverse direction is bounded, not zero: a registrar the dump's build does not call would
     # show up here, and so would a genuine parser over-report. Either is worth seeing.
@@ -139,42 +138,6 @@ def main():
 
     print("\n%s" % ("all checks passed" if not fails else "%d CHECK(S) FAILED" % fails))
     return 1 if fails else 0
-
-
-def declared_table_nids(sc):
-    """NIDs living in the specific arrays the parser NAMED as unresolved — nothing wider.
-
-    This is the budget for "runtime NIDs the parser is allowed not to have". It must be tied to the
-    exact tables the parser pointed at, not to "appears as a literal somewhere in src/hle": the
-    looser rule passes even when a whole FILE is dropped from the parse, because that file's NIDs are
-    of course literals in it. (Measured — dropping `hle_font.cpp` left 75 runtime-only NIDs and the
-    loose rule called all 75 explained, which is exactly the silent shrink this test exists to
-    catch.)
-
-    So: read the array identifier out of each unresolved expression (`kUlt[kIdxInitialize].nid` ->
-    `kUlt`), find that array's initializer in the file the parser reported it from, and take the NID
-    literals inside it. A NID from anywhere else is unexplained, and unexplained means a missed shape.
-    """
-    out = set()
-    seen = set()
-    for fn, _line, _shape, expr in sc.unresolved:
-        for arr in H.re.findall(r"\b([A-Za-z_]\w*)\s*\[", expr):
-            if (fn, arr) in seen:
-                continue
-            seen.add((fn, arr))
-            path = os.path.join(SRC_HLE, fn)
-            if not os.path.isfile(path):
-                continue
-            text = open(path, errors="ignore").read()
-            m = H.re.search(r"\b%s\s*\[\s*\]\s*=\s*\{" % H.re.escape(arr), text)
-            if not m:
-                continue
-            close = H._matching_brace(text, m.end() - 1)
-            if close is None:
-                continue
-            for lit in H.re.finditer(r'"([A-Za-z0-9+\-]{11})"', text[m.end() - 1:close + 1]):
-                out.add(lit.group(1))
-    return out
 
 
 if __name__ == "__main__":

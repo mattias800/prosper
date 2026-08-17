@@ -355,17 +355,6 @@ def discover_apis(dispatch_hpp_text):
     return sorted(set(re.findall(r"\bstatic\s+[\w:<>]+\s+(register_\w+)\s*\(", scope)))
 
 
-def _api_call_at(text, apis, pos):
-    """If a qualified `Hle::register_*` call starts at `pos`, return (api, args, end)."""
-    m = re.compile(r"\bHle\s*::\s*(register_\w+)\s*\(").match(text, pos)
-    if not m or m.group(1) not in apis:
-        return None
-    args, end = split_args(text, m.end() - 1)
-    if args is None:
-        return None
-    return m.group(1), args, end
-
-
 C_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "sizeof", "do", "else",
               "template", "namespace", "class", "struct", "operator", "decltype", "static_assert"}
 
@@ -757,22 +746,65 @@ def read_registry(path):
     return rows
 
 
-def reconcile(sc, registry):
+def declared_table_nids(sc, src_hle):
+    """NIDs living in the specific arrays the parser NAMED as unresolved — nothing wider.
+
+    This is the budget for "runtime NIDs the parser is allowed not to have". It has to be tied to
+    the exact tables the parser pointed at rather than to "appears as a literal somewhere in
+    src/hle", because the looser rule passes even when a whole FILE is dropped from the parse —
+    that file's NIDs are of course literals in it. (Measured: dropping `hle_font.cpp` leaves 75
+    runtime-only NIDs, and the loose rule calls all 75 explained, which is precisely the silent
+    shrink this reconciliation exists to catch.)
+
+    So: read the array identifier out of each unresolved expression (`kUlt[kIdxInitialize].nid` ->
+    `kUlt`), locate that array's initializer in the file the parser reported it from, and take the
+    NID literals inside it. A runtime NID from anywhere else is unexplained, and unexplained means
+    a registration shape the parser cannot see.
+    """
+    out, seen = set(), set()
+    for fn, _line, _shape, expr in sc.unresolved:
+        for arr in re.findall(r"\b([A-Za-z_]\w*)\s*\[", expr):
+            if (fn, arr) in seen:
+                continue
+            seen.add((fn, arr))
+            path = os.path.join(src_hle, fn)
+            if not os.path.isfile(path):
+                continue
+            text = open(path, errors="ignore").read()
+            m = re.search(r"\b%s\s*\[\s*\]\s*=\s*\{" % re.escape(arr), text)
+            if not m:
+                continue
+            close = _matching_brace(text, m.end() - 1)
+            if close is None:
+                continue
+            for lit in re.finditer(r'"([A-Za-z0-9+\-]{11})"', text[m.end() - 1:close + 1]):
+                out.add(lit.group(1))
+    return out
+
+
+def reconcile(sc, registry, src_hle):
     """Compare the static parse against the registry the compiled binary built.
 
-    Returns (missing, extra, handler_groups_missed). `missing` is the load-bearing one: a NID the
-    binary registers and the parser never saw is, by definition, a registration SHAPE the parser
-    cannot read — the failure this whole tool is built to make loud.
+    Returns (hard_missing, declared_missing, extra, handler_groups_missed).
+
+    `hard_missing` is the load-bearing one: a NID the binary registers that the parser never saw
+    AND that does not live in one of the tables the parser openly reported as unresolved. That is,
+    by definition, a registration SHAPE the parser cannot read — the failure this whole tool exists
+    to make loud. `declared_missing` is the rest: an already-announced limit, not a coverage gap,
+    so it must not be reported the same way or exit 3 fires on a healthy tree and stops meaning
+    anything.
 
     The handler-address column is used only as an UPPER bound on collapse. Two distinct handlers
     with identical machine code can be folded to one address by the linker, so equal addresses do
     not prove a shared handler; unequal addresses do prove a distinct one. Everything the static
-    parse calls shared must therefore also share an address at runtime, and that direction is what
-    `handler_groups_missed` checks.
+    parse calls shared must therefore also share an address at runtime, and that direction — the
+    sound one — is what `handler_groups_missed` checks.
     """
     static_nids = {r.nid for r in sc.regs}
-    unresolved_expected = len(sc.unresolved)
     missing = sorted(set(registry) - static_nids)
+    declared = declared_table_nids(sc, src_hle)
+    hard_missing = [n for n in missing if n not in declared]
+    declared_missing = [n for n in missing if n in declared]
     extra = sorted(static_nids - set(registry))
     groups_missed = []
     for handler, d in handler_index(sc.regs).items():
@@ -781,7 +813,7 @@ def reconcile(sc, registry):
         addrs = {registry[n][1] for n in d if n in registry}
         if len(addrs) > 1:
             groups_missed.append((handler, sorted(d), sorted(addrs)))
-    return missing, extra, groups_missed, unresolved_expected
+    return hard_missing, declared_missing, extra, groups_missed
 
 
 def read_gated(path):
@@ -949,14 +981,17 @@ def main():
 
     reconcile_bad = False
     if a.registry:
-        missing, extra, groups, _unres = reconcile(sc, read_registry(a.registry))
+        registry = read_registry(a.registry)
+        hard, declared, extra, groups = reconcile(sc, registry, src)
         print("=== reconciled against the registry the binary builds (%s) ===" % a.registry)
         print("   %d NIDs registered at runtime; %d recovered by this parser"
-              % (len(read_registry(a.registry)), len({r.nid for r in sc.regs})))
+              % (len(registry), len({r.nid for r in sc.regs})))
         print("   %d registered at runtime but NOT found by the parser  <-- a MISSED SHAPE"
-              % len(missing))
-        for n in missing[:40]:
+              % len(hard))
+        for n in hard[:40]:
             print("      missing %s" % n)
+        print("   %d more are literals in the array-driven tables the parser lists as unresolved "
+              "(a declared limit, not a coverage gap)" % len(declared))
         print("   %d found by the parser but not registered at runtime (an inactive arm, or a "
               "registrar this build does not call)" % len(extra))
         for n in extra[:40]:
@@ -965,7 +1000,7 @@ def main():
         for h, nids, addrs in groups[:20]:
             print("      %s: %s across %d addresses" % (h, " ".join(nids), len(addrs)))
         print()
-        reconcile_bad = bool(missing or groups)
+        reconcile_bad = bool(hard or groups)
 
     idx = print_shared(sc, names, a.min_names, a.all)
     if a.gated:
