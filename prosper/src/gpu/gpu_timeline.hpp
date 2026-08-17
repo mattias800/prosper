@@ -327,6 +327,33 @@ bool guest_log_capture_bundle_enabled();
 void observe_guest_log_for_capture(
     const char* bytes, size_t size,
     GuestLogCaptureSource source = GuestLogCaptureSource::Unknown);
+
+// What an armed guest-log gate actually observed, so "the marker never matched" can say WHY rather
+// than leaving the operator to infer it from a missing file (#1684). The match is EXACT and stays
+// exact: a marker that is a prefix of the real line — `LevelDocument Loaded: worldmap` against
+// `LevelDocument Loaded: worldmap [worldmap]` — cost a full ~7-minute routed run that exited 0 and
+// wrote nothing. `closest_line` is the observed line sharing the longest prefix with the marker, so
+// the report can print the exact string the operator should have asked for.
+struct GuestLogCaptureMiss {
+    std::string marker;             // the exact line that was demanded
+    uint64_t lines_observed = 0;    // completed guest-stdout lines the observer saw
+    uint64_t lines_discarded = 0;   // of those, lines dropped for exceeding the byte limit or a gap
+    std::string closest_line;       // observed line sharing the longest prefix with the marker
+    size_t closest_prefix_bytes = 0;   // length of that shared prefix
+    bool marker_too_long = false;   // the marker itself exceeds kGuestLogCaptureMaxLineBytes
+};
+// Pure: the exact stderr text for an armed marker that never matched. Exported so the diagnosis is
+// regressable without booting a title, and so the near-miss reasoning can be asserted directly.
+// Non-printable bytes are escaped in both the marker and the observed line, because an invisible
+// difference (a trailing tab, a stray CR) is precisely the failure this report has to make visible.
+std::string format_guest_log_capture_miss(const GuestLogCaptureMiss& miss);
+// Snapshot of the live gate. Returns true when a miss report is due — i.e. a marker was configured
+// and never matched. Returns false when no marker was configured or the marker matched.
+bool guest_log_capture_miss_snapshot(GuestLogCaptureMiss& out);
+// Prints one report for the configured automatic whole-frame capture gate when it never armed a
+// capture. Registered with std::atexit at load time, so a run that silently produced no bundle now
+// says so; exported so the same text can be asserted by a test.
+void report_unfired_automatic_capture_gates();
 // Marks bytes omitted by a bounded stdout adapter. It deliberately discards through the next observed
 // line ending so an unobserved suffix can cause only a missed match, never a false exact-line match.
 void observe_guest_log_capture_gap();
