@@ -341,6 +341,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_avplayer PRIVATE prosper_core)
   add_test(NAME avplayer_hle COMMAND test_avplayer)
 
+  # #2270. Two ctest entries over ONE binary, because the opt-out is read once into a function-local
+  # static (deliberately — this is a per-frame path), so both arms cannot run in one process.
+  add_executable(test_videodec2_decode tests/test_videodec2_decode.cpp)
+  target_link_libraries(test_videodec2_decode PRIVATE prosper_core)
+  add_test(NAME videodec2_decode COMMAND test_videodec2_decode)
+  add_test(NAME videodec2_decode_optout COMMAND test_videodec2_decode --no-decode)
+
   add_executable(test_json2 tests/test_json2.cpp)
   target_link_libraries(test_json2 PRIVATE prosper_core)
   add_test(NAME json2_hle COMMAND test_json2)
@@ -1814,8 +1821,13 @@ if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
     target_link_libraries(test_video_vaapi PRIVATE prosper_video_vaapi)
     # Point the test at a committed test-pattern clip so it decodes a real stream. On headless CI
     # (no VA-API hardware) a successful decode exercises the default software-decode fallback (#320).
+    # The second asset is a raw Annex-B H.264 ELEMENTARY STREAM, not a container: sceVideodec2's
+    # caller demuxes itself and submits access units, so the AU-decode section (#2270) needs a
+    # stream with no container around it, framed by access-unit delimiters the way a live guest's
+    # is. Its expected per-frame hashes come from an independent host `ffmpeg` decode.
     target_compile_definitions(test_video_vaapi PRIVATE
-      PROSPER_TEST_VIDEO_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/testpattern.mp4")
+      PROSPER_TEST_VIDEO_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/testpattern.mp4"
+      PROSPER_TEST_H264_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_annexb_testpattern.264")
     add_test(NAME video_vaapi COMMAND test_video_vaapi)
 
     if(TARGET boot_trace)

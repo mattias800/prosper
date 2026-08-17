@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace prosper::video;
@@ -185,6 +186,132 @@ int main(int argc, char** argv) {
                 backend()->close(sw_id);
             }
             unsetenv("PROSPER_AVP_VAAPI_DEVICE");
+        }
+
+        // ---- sceVideodec2's access-unit path (#2270) -----------------------------------------
+        //
+        // A DIFFERENT contract from everything above: no container, no demux, no seeking — the
+        // caller submits one compressed access unit and expects at most one picture back. The
+        // committed asset is a raw Annex-B H.264 elementary stream whose framing is the one a live
+        // guest actually submits: every access unit begins `00 00 00 01 09` (a 4-byte start code
+        // and an access-unit delimiter), exactly as Tales of Graces f's criMvPly does, and the
+        // first one carries the SPS at profile_idc 100 (High) that title configures.
+        //
+        // WHY EXACT HASHES, and why they are not circular. The expected values below were produced
+        // by decoding this same file with the host `ffmpeg` COMMAND-LINE TOOL and hashing the raw
+        // NV12 it wrote — a separate program, invoked outside this build, not the code under test.
+        // H.264 reconstruction is normatively exact, so any conformant decoder must reproduce them
+        // bit for bit; a wrong chroma plane, a swapped U/V, a stale reference frame or a dropped
+        // access unit all change the hash while still producing something that looks like video.
+        // "It decoded and the picture looks plausible" is precisely the claim this project has a
+        // recorded trap for, so it is not the claim made here.
+        if (const char* au_asset =
+#ifdef PROSPER_TEST_H264_AU_ASSET
+                PROSPER_TEST_H264_AU_ASSET
+#else
+                nullptr
+#endif
+        ) {
+            std::vector<uint8_t> stream;
+            if (std::FILE* h = std::fopen(au_asset, "rb")) {
+                std::fseek(h, 0, SEEK_END);
+                const long size = std::ftell(h);
+                std::fseek(h, 0, SEEK_SET);
+                if (size > 0) {
+                    stream.resize(static_cast<size_t>(size));
+                    if (std::fread(stream.data(), 1, stream.size(), h) != stream.size())
+                        stream.clear();
+                }
+                std::fclose(h);
+            }
+            CHECK(!stream.empty(), "the committed H.264 access-unit asset can be read");
+
+            // Split on access-unit delimiters, which is what the delimiter is FOR and what the
+            // guest's own demuxer produces. Splitting per NAL instead would submit an SPS as its
+            // own "access unit" and change the picture count for a reason unrelated to decoding.
+            std::vector<std::pair<size_t, size_t>> units;
+            for (size_t i = 0; i + 4 < stream.size(); ++i) {
+                if (stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 0 &&
+                    stream[i + 3] == 1 && (stream[i + 4] & 0x1F) == 9) {
+                    if (!units.empty()) units.back().second = i - units.back().first;
+                    units.emplace_back(i, stream.size() - i);
+                }
+            }
+            CHECK(units.size() == 12, "the asset splits into the expected 12 access units");
+            CHECK(!units.empty() && units[0].second > 0 && stream[units[0].first + 4] == 0x09,
+                  "every access unit begins with the delimiter the live guest's stream carries");
+
+            // Produced by: ffmpeg -i <asset> -f rawvideo -pix_fmt nv12 ref.nv12, then FNV-1a-64
+            // over each 128*96*3/2 = 18432-byte frame. All twelve differ, so a decoder that
+            // repeated one picture would fail rather than pass on a lucky constant.
+            static const uint64_t kExpected[12] = {
+                0x0954fe299ef88406ull, 0x06650c3b8b9ad8d7ull, 0x708abc6ac86599bfull,
+                0xec63425d07c5a7bfull, 0xaff60e55974aa1f6ull, 0x588a5618a347d4cbull,
+                0xafbdf999f2c63e11ull, 0x85c9459ed1f0aac2ull, 0x09f6e4532aaf8453ull,
+                0xcecb63ab8c09525full, 0x7ccfc3e128c5e594ull, 0x0ad1a3f4d15f0157ull,
+            };
+            constexpr uint32_t kW = 128, kH = 96;
+
+            // BOTH decode paths, against the same reference. decode_au converts differently in each
+            // — the hardware path transfers an NV12 surface, the software path interleaves YUV420P
+            // chroma on the CPU — so one set of hashes covering only whichever the host happened to
+            // pick would leave the other completely unchecked.
+            for (int pass = 0; pass < 2 && !stream.empty(); ++pass) {
+                const bool force_software = pass == 1;
+                if (force_software)
+                    setenv("PROSPER_AVP_VAAPI_DEVICE", "/prosper-missing/renderD999", 1);
+                else
+                    unsetenv("PROSPER_AVP_VAAPI_DEVICE");
+                const char* what = force_software ? "software" : "default (VA-API if present)";
+
+                const int dec = backend()->open_decoder(1);
+                CHECK(dec >= 0, force_software
+                                    ? "AVC access-unit decoder opens with VA-API forced off"
+                                    : "AVC access-unit decoder opens (codec=1)");
+                if (dec < 0) continue;
+
+                std::vector<uint64_t> got;
+                bool geometry_ok = true;
+                for (const auto& u : units) {
+                    VideoFrame pic{};
+                    if (!backend()->decode_au(dec, stream.data() + u.first, u.second, pic)) continue;
+                    if (pic.width != kW || pic.height != kH || !pic.y || !pic.uv ||
+                        pic.y_stride < kW)
+                        geometry_ok = false;
+                    uint64_t hv = 0xcbf29ce484222325ull;
+                    auto absorb = [&hv](const uint8_t* p, size_t n) {
+                        for (size_t i = 0; i < n; ++i) { hv ^= p[i]; hv *= 0x100000001b3ull; }
+                    };
+                    absorb(pic.y, static_cast<size_t>(kW) * kH);
+                    absorb(pic.uv, static_cast<size_t>(kW) * kH / 2);
+                    got.push_back(hv);
+                }
+                std::printf("  [info] %s pass: %zu pictures from %zu access units\n", what,
+                            got.size(), units.size());
+                CHECK(got.size() == 12,
+                      force_software ? "12 access units yield 12 pictures (software)"
+                                     : "12 access units yield 12 pictures");
+                CHECK(geometry_ok, "every decoded picture reports the stream's 128x96 NV12 geometry");
+                size_t matched = 0;
+                for (size_t i = 0; i < got.size() && i < 12; ++i) {
+                    if (got[i] == kExpected[i]) { ++matched; continue; }
+                    std::printf("  [info] frame %zu: got 0x%016llx expected 0x%016llx\n", i,
+                                static_cast<unsigned long long>(got[i]),
+                                static_cast<unsigned long long>(kExpected[i]));
+                }
+                CHECK(matched == 12,
+                      force_software
+                          ? "every decoded picture is byte-identical to the independent decode"
+                            " (software path)"
+                          : "every decoded picture is byte-identical to the independent decode");
+                backend()->close_decoder(dec);
+            }
+            unsetenv("PROSPER_AVP_VAAPI_DEVICE");
+
+            // A codec prosper has not identified must be REFUSED, not opened on a guess. #2270's
+            // whole subject is an entry point that answered successfully when it could not deliver.
+            CHECK(backend()->open_decoder(0xBADC0DE) < 0,
+                  "an unidentified codec is refused rather than opened on a guess");
         }
     }
     uninstall_vaapi_backend();
