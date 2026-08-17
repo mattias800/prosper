@@ -105,6 +105,16 @@ def objdump_free_checks():
     check("t-alu-mask-is-a-gate", tbucket(("and", "eax,0x80000000")), "alu-gate")
     check("t-self-xor-is-ignored", tbucket(("xor", "eax,eax"), ("ret", "")), "ignored")
     check("t-call-clobbers", tbucket(("call", "0x2000"), ("ret", "")), "ignored")
+    #  …but a result MOVED INTO an argument register before the call is the callee's argument, not a
+    #  dead value. `ignored` there would claim "cannot be affected" about a value handed one frame
+    #  down — the same error as stopping at the first branch, one level out.
+    #  Follow mode only — the legacy walk stays bug-for-bug identical, because its whole remaining
+    #  job is reproducing numbers already quoted in the tree.
+    check("t-arg-register-at-a-call-is-not-dead",
+          twalk(("mov", "edi,eax"), ("xor", "eax,eax"), ("call", "0x2000"), ("ret", "")),
+          ("forward", [], False))
+    check("t-legacy-keeps-clearing-an-arg-register-at-a-call",
+          tbucket(("mov", "edi,eax"), ("xor", "eax,eax"), ("call", "0x2000"), ("ret", "")), "ignored")
     check("t-ret-forwards", tbucket(("ret", "")), "forward")
     check("t-callee-saved-survives-call",
           tbucket(("mov", "r14d,eax"), ("call", "0x2000"), ("test", "r14d,r14d")), "nonzero")

@@ -391,6 +391,12 @@ for _wide, _key in (("si", "si"), ("di", "di"), ("bp", "bp"), ("sp", "sp")):
 # survive one — but rbx/rbp/r12-r15 do.
 CALLER_SAVED = {"a", "c", "d", "si", "di", "r8", "r9", "r10", "r11"}
 
+# The SysV integer argument registers, in order. A tainted value sitting in one of these AT a call is
+# not dead — it is the callee's argument, and the compare may be one frame down. Clearing the site
+# there would be the same mistake as stopping at the first branch, one level out: `ignored` and
+# `nonzero` both mean "cannot be affected", and neither is established by a value being handed away.
+ARG_REGS = {"di", "si", "d", "c", "r8", "r9"}
+
 
 def canon(operand):
     """Canonical register name for an operand, or None if it is not a bare register."""
@@ -510,6 +516,10 @@ def _walk_block(insns, const, live, spilled, follow=False, fall_va=None):
                 return "forward", ev, st()                # indirect, or the window ran out
             return "edges", ev, st([tgt, nxt])
         if mn == "call":
+            if follow and live & ARG_REGS:
+                # Not applied in legacy mode: `--no-follow-arms` is a reproduction path, so it stays
+                # bug-for-bug identical to the walk whose numbers are quoted in the tree.
+                return "forward", ev, st()                # handed to the callee: not dead, not here
             live -= CALLER_SAVED
             if not live:
                 return ("forward" if spilled else "ignored"), ev, st()
@@ -805,7 +815,7 @@ def sweep_summary(label, rows, shown, min_gated):
     # A `gate-open` row IS gated — it branches on the result — so it is counted above and is still
     # not cleared. Reporting only the "neither" column would hide exactly those rows, which is the
     # expensive direction: they read as answered.
-    print("#   %d rows carry >=1 site the scan could not resolve (%s) — read those by hand"
+    print("#   %d rows carry >=1 site the scan could not resolve (%s) -- read those by hand"
           % (open_rows, "/".join(UNRESOLVED)))
     print("#   site buckets: %s" % " ".join("%s=%d" % kv for kv in sorted(totals.items())))
 
