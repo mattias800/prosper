@@ -3175,34 +3175,49 @@ HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
     interruptible_mutex_lock(&s->m); s->count += n; interruptible_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
 // #1640: PollSema's "not available" value is 0x80020023 (FreeBSD EAGAIN) where its sibling
 // `k_ef_poll` above answers 0x80020010 (EBUSY). EBUSY is the obvious guess by symmetry. IT IS NOT
-// TAKEN, because a static census of the whole 44-dump corpus shows the corpus CANNOT tell the two
-// apart, so changing it would be a guess dressed as a fix:
+// TAKEN, because a static census of the whole 44-dump corpus finds nothing in it that can tell the
+// two apart, so changing it would be a guess dressed as a fix:
 //
-//   python3 tools/re/nid_gate_scan.py <DUMP_ROOT>/PPSA*-app0 --nid 12wOHk8ywb0 --const 0x80020010 -v
+//   python3 tools/re/nid_gate_scan.py <DUMP_ROOT> --nid 12wOHk8ywb0 --const 0x80020010 -v
 //
 // Four titles import `sceKernelPollSema` (PPSA02801, PPSA04263, PPSA08576, PPSA13579 — confirmed
 // independently by `nid_census --registered --names`, which agrees on exactly that set). Across
 // their 49 call sites: **0 compare the result against any constant.** 29 are `ignored` (the result
-// is dead before any read), 17 are `test eax,eax`, and the 3 `forward` windows were read by hand
-// with `edis.py` — all three are the same `call PollSema; jmp <back>` into a shared
-// `xor r15d,r15d; test eax,eax; je <success>`, i.e. `nonzero` as well. 0 undecodable windows.
+// is dead before any read); 18 are `nonzero` (gated on zero/non-zero, and the value is then dead on
+// every reachable path, so the site cannot tell one non-zero answer from another); the remaining 2
+// the tool declines to clear, and both were read BY HAND:
+//   * PPSA04263+0x2b1e081, `gate-open`. Its ERROR arm — `test eax,eax; je`, not taken — never reads
+//     eax at all, and `call 0x33911f0` at +0x2b1e09b clobbers it. The site is unresolved only
+//     because the SUCCESS arm spills eax at +0x2b1e0e4, where the value is provably zero.
+//   * PPSA04263+0x310cd21, `undecodable`. Both consumers reduce the result to one bit — `sete sil`
+//     at +0x310cd30 and `test ebx,ebx; jne` at +0x310cd48 — and no decodable path reaches a compare
+//     against any constant. The bucket comes from one path running into inter-function NOP padding.
 //
-// That is a BOUND, not merely an absence, and this is the part worth keeping: both candidate values
-// are non-zero AND both are negative as int32 (0x80020010, 0x80020023). So a `test eax,eax` gate —
-// and equally a `js`/`jns` on it — is *structurally* incapable of distinguishing them. Every one of
-// the 49 sites is therefore provably insensitive to the choice, which is why no amount of re-running
-// this scan will settle it.
+// READING THE ERROR ARM IS THE WHOLE POINT, and an earlier version of this comment claimed a bound
+// it had not earned. `nid_gate_scan` used to stop at the first branch, so a site that gates
+// generically and const-compares INSIDE its error arm was bucketed `nonzero` — indistinguishable
+// from one that cannot care. That is precisely `k_ef_poll`'s own evidence above (Sonic Origins'
+// `RsdxWaitEvent` gates first and discriminates second), so a census run that way could not have
+// found the case it was looking for. The tool now forks at every branch the value survives, and
+// `--no-follow-arms` restores the old walk — diffed against the pre-change census, byte for byte.
 //
-// The instrument is not silently broken: the same tool, same corpus, same classifier finds
-// `sceKernelPollEventFlag` (9lvj5DjHZiA) compared against `cmp eax,0x80020010` at **9 sites** in
-// PPSA05325 — independently re-deriving, from static disassembly, the live-trace evidence recorded
-// in `k_ef_poll` above. So the class "a poll import const-compared against a libkernel errno" is
-// expressible and does get found; it simply does not occur for this NID.
+// The positive control is drawn from OUTSIDE this NID and outside this scan, because a control
+// sharing the null's instrument only shows the instrument runs: PPSA08804 const-compares
+// `sceSaveDataTransferringMountPs4` against 0x809F000F inside an error arm at +0x4e41a32 — found by
+// hand in review of #2208 — and the same bytes report `nonzero` under the old walk and `const` under
+// the new one. PPSA07809's site answers `const` for 0x809F000F but `other-cmp` for 0x809F0003, so
+// the finder discriminates rather than agreeing with whatever constant it is handed; and Sonic
+// Frontiers' five sites stay `nonzero` under both, matching the independently recorded finding that
+// it gates on the sign alone (docs/SONIC_FRONTIERS_STATUS.md).
+//
+// WHAT THIS DOES NOT ESTABLISH: it bounds the CORPUS, not Sony's libkernel. Site discovery follows
+// one stub level and one call deep, so 49 is a lower bound — an indirect call through a function
+// pointer does not appear at all. The walk is intra-module and does not follow the value into a
+// caller; a site that returns it is reported `gate-open`, never cleared.
 //
 // WHAT WOULD SETTLE IT: a caller that compares the result against a named constant (the way
 // `_Mtx_trylock` compares 0x80020010), or a live `[sync2] SEMA.*` trace of a title branching on the
-// value. Site discovery follows one stub level and one call deep, so the 49 is a lower bound —
-// an indirect call through a function pointer would not appear.
+// value.
 // CONFIDENCE: LOW on 0x80020023 being what Sony's libkernel reports. It is a legitimate FreeBSD
 // EAGAIN and NOT an instance of #1612 (a host errno leaking into a FreeBSD-numbered field), so it is
 // left as it is rather than swapped on symmetry alone.
