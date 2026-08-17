@@ -805,10 +805,24 @@ def report(trees: list[Worktree], meta: dict, do_redact: bool, verbose: bool) ->
 def recheck_and_remove(repo: str, t: Worktree, base: str, min_idle_hours: float,
                        scan_fds: bool, scan_maps: bool, use_github: bool,
                        gh_limit: int, do_redact: bool) -> bool:
-    """Re-run every guard against fresh state, then remove. Returns True on removal.
+    """Re-probe the local guards against fresh state, then remove. Returns True on removal.
 
-    The census is deliberately not trusted here. An agent can cd into a tree between the scan and
-    the delete, and that race is the entire reason the scan exists.
+    The census is deliberately not trusted for anything local. An agent can cd into a tree between
+    the scan and the delete, and that race is the entire reason the scan exists, so the worktree
+    list, status, idle time and holder scan are all re-run per candidate.
+
+    The ONE exception is the GitHub merge evidence, which reuses the census-time merged/open
+    snapshot via _GH_CACHE. Refetching it per candidate is exactly what that cache exists to
+    prevent: with 146 candidates it means 146 paginated queries and a near-certain rate limit,
+    whose symptom is trees refusing under a mislabelled verdict. The staleness is harmless in the
+    direction that matters -- a PR merging mid-run can only make MORE trees removable, never fewer,
+    and a tree wrongly still qualified by an old snapshot is still gated behind every local guard.
+
+    Consequence worth knowing: a transient `gh` failure is cached too, so it is sticky for the
+    process lifetime and the rest of the run proceeds on ancestry alone. That is the safe
+    direction -- fewer trees qualify -- but it means a one-off network blip quietly narrows the
+    evidence for the whole run rather than for one candidate. Re-run the tool rather than assuming
+    a small candidate count means the trees are live.
     """
     fmt = redact if do_redact else (lambda p: p)
     fresh = list_worktrees(repo)

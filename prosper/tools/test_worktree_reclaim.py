@@ -244,10 +244,15 @@ def test_github_merge_evidence() -> None:
     check("detached qualifies on sha alone", detached.merged_by, "squash-pr#333")
     check("unmatched sha stays unqualified", untouched.merged_by, None)
 
-    # A branch whose tip has MOVED past the merged PR is live work, not a stale tree.
-    moved = wt("moved", "e" * 40, "feat/moved")
+    # A branch whose tip has MOVED past the merged PR is live work, not a stale tree. The branch
+    # name here MUST be the merged PR's own `feat/landed`: with any other name this arm asserts
+    # nothing that `untouched` above does not already cover, because the sha simply is not in
+    # by_oid either way. Sharing the name is what makes it the one arm that fails if qualification
+    # were ever keyed on branch name instead of sha -- which is the plausible refactor, since the
+    # recycled-branch guard right beside it legitimately does key on the name.
+    moved = wt("moved", "e" * 40, "feat/landed")
     W._apply_github([moved], {"a" * 40: 111}, open_branches=set())
-    check("advanced branch tip stays unqualified", moved.merged_by, None)
+    check("advanced tip of a merged branch stays unqualified", moved.merged_by, None)
 
     # --- probe_github: the open-PR query failing must fail the WHOLE cross-check closed ----
     real_run = W.run
