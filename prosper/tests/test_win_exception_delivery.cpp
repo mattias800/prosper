@@ -5,11 +5,13 @@
 #include "../src/hle/sync_futex.hpp"
 #include "../src/host/exec_image.hpp"
 #include "../src/host/sse4a.hpp"
+#include "test_scratch.h"
 #include <pthread.h>
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace prosper;
@@ -696,7 +698,10 @@ int main() {
     pin_boundary_transition = 0;
     pin_boundary_republished = 0;
     pin_boundary_finish = 0;
-    const char* pin_trace_path = "test_win_exception_delivery_pin_boundary.tmp";
+    // #1621: per-case scratch directory, not a fixed name in the shared ctest working directory.
+    const std::string pin_trace_storage =
+        prosper_test::test_scratch_file("test_win_exception_delivery_pin_boundary.tmp");
+    const char* pin_trace_path = pin_trace_storage.c_str();
     DeleteFileA(pin_trace_path);
     pthread_t pin_thread{};
     const int pin_create = pthread_create(&pin_thread, nullptr, pin_boundary_worker, nullptr);
