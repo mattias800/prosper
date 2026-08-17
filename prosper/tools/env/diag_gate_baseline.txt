@@ -28,6 +28,26 @@
 # the pair delivered. A shared family cannot be the end of an argument, so it does not get to be a
 # class that reads like a clearance.
 #
+# #2628 SHARPENED THE SCANNER, so this file shrank from 93 keys to 54 and 15 of the survivors
+# re-keyed. That is the direction which can silently disable a rule, so the rows were NOT
+# regenerated: every surviving row was matched to its predecessor by the finding's own file:line,
+# and 38 removals and 15 re-keys were read one at a time. Rows that re-keyed carry
+# `[#2628 re-keyed; was ...]` so the previous requirement stays greppable. What went away, by the
+# mechanism that produced it:
+#   * a negated env test read as a requirement -- the `PROSPER_NO_*` opt-out idiom, the default-on
+#     PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET mode, and BOTH of the convention's own rule-2
+#     shapes (guest_write_watch.cpp:1372's refusal, gpu_timeline.cpp:2288/:2742's half-a-pair
+#     complaints), which were flagged for complying with #2149;
+#   * an alias holding a compiled-in default (PROSPER_AGCSHADER_OUT);
+#   * a stored lambda exporting its body's switches to its call sites (PROSPER_STAGE_FOLD_PROFILE);
+#   * two call-site gates where one IMPLIES the other rather than disagreeing (hle_audio audio2log).
+# Rule ONE's shape still produces findings and deliberately so: command_processor.cpp:1572's
+# armed-state banner is conditioned on both switches by construction, and no lexical test separates
+# "this banner explains the other switch" from "this report silently needs it". Both
+# command_processor rows are still here.
+# One row is NEW and is the rule working rather than decaying: with the spurious shared clause gone,
+# SPLIT-CALL can see that diagnostic_elapsed_ms's three sites disagree.
+#
 # Regenerate the key list with:
 #     python3 tools/env/check_diag_gates.py <root> --emit-baseline
 # then re-apply the classifications. Never let a regeneration silently downgrade a `defect` row to
@@ -35,22 +55,19 @@
 #   benign: 2
 #   config-echo: 10
 #   defect: 2
-#   unreviewed: 79
+#   unreviewed: 40
 #
-SPLIT-CALL|src/gpu/command_processor.cpp|generation_guard|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # benign: the callee is a BEHAVIOUR predicate, not a producer of printed state -- there is no field it could leave unmeasured. The rule's shape matches; its subject does not.
+SPLIT-CALL|frontends/shared/live_renderer.cpp|diagnostic_elapsed_ms|PROSPER_DUMP_PERSISTENT+PROSPER_PASS_LOG  # benign: the callee is a pure clock read (live_renderer.cpp:534-538 returns steady_clock::now() minus a function-local static origin) -- it holds no counter and prints nothing, so no call site can leave a producer unarmed. Its own comment (:530-533) states the shared origin is deliberate, so `ms:` windows in PROSPER_PASS_LOG and PROSPER_DUMP_PERSISTENT aim at one instant. Surfaced by #2628: the spurious clause the three sites used to share is gone, so the rule can now see they disagree. #2628
 SPLIT-CALL|src/gpu/gpu_timeline.cpp|automatic_capture_bundle_gate_conflicts|PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-SPLIT-CALL|src/hle/hle_audio.cpp|audio2log|PROSPER_AUDIO2LOG+PROSPER_AUDIO2LOG|PROSPER_AUDIO2_PROBE  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 SPLIT-CALL|src/host/exec_image_linux.cpp|arm_hwwatch|PROSPER_HWBP|PROSPER_HWWATCH+PROSPER_HWWATCH_ABS  # benign: two DELIBERATE entry points into one arming helper (absolute watch vs register-relative on the first exec-bp hit). Neither switch is a producer for the other's printer, and nothing prints a field either could have measured.
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_compute_image_hit|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_submit_query|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validated_bytes|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validation_ms|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_active|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_disabled|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_only|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_query|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_stability|(any)  # unreviewed: not judged
-SPLIT-LOCAL|frontends/shared/live_renderer.cpp|seed|PROSPER_RTT_NOSEED  # unreviewed: not judged
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_submit_query|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validated_bytes|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validation_ms|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_active|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_disabled|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_only|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_query|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB+PROSPER_TEXTURE_WRITE_WATCH_MIN_KB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
+SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_watch_stability|PROSPER_NO_TEXTURE_DECODE_CACHE|PROSPER_TEXTURE_DECODE_CACHE_MB  # unreviewed: not judged [#2628 re-keyed; was `(any)`]
 SPLIT-LOCAL|src/gpu/gpu_executor.cpp|fresh|PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE|PROSPER_UDPROV  # defect: #2569 fresh_extent: prints 0, which reads as 'the bind programmed nothing'
 SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_after_compute_program|PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
 SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_compute_program|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
@@ -62,50 +79,17 @@ SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_min_draws|PROSPER_GPU_TIMELINE_CAPTU
 SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_height|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
 SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_min_index|PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
 SPLIT-LOCAL|src/gpu/gpu_timeline.cpp|select_target_width|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM  # config-echo: selector value echoed by [timeline]; 0 truthfully means UNCONSTRAINED
-SPLIT-LOCAL|tests/render_runner.h|cached_color|PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_compute.cpp|report|PROSPER_COMPUTE_PHASE_TIMING+PROSPER_COMPUTE_TIMING_TRACE_ONLY  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|frontends/shared/live_compute.cpp|report|PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION+PROSPER_NO_IMPORTED_IMAGE_GUEST_BYPASS+PROSPER_NO_NATIVE_2D_COMPUTE_TRANSFER|PROSPER_NO_NATIVE_3D_COMPUTE_TRANSFER  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|frontends/shared/live_compute.cpp|report|PROSPER_NO_NORMALIZED_UNORM_RTT_BIND|PROSPER_NO_UNORM_RTT_VALUE_REUSE+PROSPER_RENDER_SCALE  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|(any)+PROSPER_DETILE_STATS  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|(any)+PROSPER_DSBRIDGE_LOG  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|(any)+PROSPER_DS_UNBRIDGED_FAR  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|(any)+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DETILE+PROSPER_DUMP_RAWTILE+PROSPER_NODETILE  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DSLOG+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_DRAWSTEPS+PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_PASS+PROSPER_DUMP_PASS_EVERY+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_PASS+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_PERSISTENT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RAWTILE+PROSPER_NODETILE  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RTGROUPS+PROSPER_DUMP_RTGROUPS_ADDR+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RTGROUPS_ADDR+PROSPER_DUMP_RTGROUPS_RGBA+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_SAMPLED_RTT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_EAGER_RESOLVE_READBACK+PROSPER_NO_RESOLVE+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_MRT_CENSUS+PROSPER_MRT_SHAPE_FOR+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_MRT_CENSUS+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_NO_RESOLVE+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_PASS_LOG+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_PASS_LOG|PROSPER_PASS_LOG_NODEFER+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_READBACK_WHY+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DETILE+PROSPER_DUMP_RAWTILE  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_DETILE+PROSPER_DUMP_RAWTILE+PROSPER_NODETILE`]
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_MRT_CENSUS+PROSPER_MRT_SHAPE_FOR  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_MRT_CENSUS+PROSPER_MRT_SHAPE_FOR+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`]
 TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RENDER_TIMING+PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RESOLVE_CENSUS+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_GUESTPEEK+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_NOSEED+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET  # unreviewed: not judged
-TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET+PROSPER_TARGET_STEP_HASH_MIN_DRAWS  # unreviewed: not judged
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG+PROSPER_RTTLOG_MIN_SUBMIT  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_GFXLOG|PROSPER_RENDER_REFVS|PROSPER_SKIP_DRAW+PROSPER_RTTLOG+PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`]
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_RTTLOG|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_GUESTPEEK  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_RTTLOG|PROSPER_RTTLOG_MAX_SUBMIT|PROSPER_RTTLOG_MIN_SUBMIT+PROSPER_RTT_GUESTPEEK+PROSPER_RTT|PROSPER_RTT_PERTARGET|PROSPER_RTT_SINGLE_TARGET`]
 TWO-GATE|src/gpu/command_processor.cpp|report|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # unreviewed: not judged
 TWO-GATE|src/gpu/command_processor.cpp|report|PROSPER_INIT_TRIP+PROSPER_MB3_FREELIST_GUARD  # unreviewed: not judged
 TWO-GATE|src/gpu/gpu_execute.hpp|report|PROSPER_CAPTION_DIAG+PROSPER_FRAME_DIR  # unreviewed: not judged
-TWO-GATE|src/gpu/gpu_execute.hpp|report|PROSPER_FORCE_COLORWRITE+PROSPER_NO_EARLY_NO_EFFECT  # unreviewed: not judged
 TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_COMPUTE_TREE_WATCH_AUX+PROSPER_COMPUTE_TREE_WATCH_DUMP  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROSPER_DYNTRACE_FAIL_ADDR|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN  # defect: #2146 [udtail]: the one report answering #305 also needs PROSPER_UD_TAIL_ALIGN, which the charter requires stay OFF
-TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE|PROSPER_DYNTRACE_FAIL|PROSPER_DYNTRACE_FAIL_ADDR+PROSPER_STAGE_FOLD_PROFILE  # unreviewed: not judged
-TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE|PROSPER_UDPROV+PROSPER_RESDUMP  # unreviewed: not judged
-TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_CAPTURE_BUNDLE+PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_CAPTURE_BUNDLE+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
+TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN  # defect: #2146 [udtail]: the one report answering #305 also needs PROSPER_UD_TAIL_ALIGN, which the charter requires stay OFF [#2628 re-keyed; was `PROSPER_DYNTRACE_FAIL|PROSPER_DYNTRACE_FAIL_ADDR|PROSPER_GFXLOG+PROSPER_UD_TAIL_ALIGN`]
+TWO-GATE|src/gpu/gpu_executor.cpp|report|PROSPER_DYNTRACE_FAIL|PROSPER_RESDUMP+PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE|PROSPER_UDPROV  # unreviewed: not judged [#2628 re-keyed; was `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE|PROSPER_UDPROV+PROSPER_RESDUMP`]
 TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_AFTER_COMPUTE_PROGRAM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE+PROSPER_GPU_TIMELINE_CAPTURE_DEPTH+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
@@ -121,12 +105,9 @@ TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRA
 TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_COMPUTE_PROGRAM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_DISPATCH_DIM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|src/gpu/gpu_timeline.cpp|report|PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM+PROSPER_GPU_TIMELINE_CAPTURE|PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|src/hle/hle_graphics.cpp|report|PROSPER_AGCSHADER+PROSPER_AGCSHADER_OUT  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|src/hle/hle_pad.cpp|report|PROSPER_PAD_SCRIPT+PROSPER_PAD_SCRIPT_RELOAD  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|src/host/exec_image_win.cpp|report|PROSPER_NULL_PAGE+PROSPER_NULL_PAGE_LOG  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
-TWO-GATE|src/host/guest_write_watch.cpp|report|PROSPER_DMEM_CALLER+PROSPER_DMEM_WRITE_TRACE  # unreviewed: not judged; every gate shares a name family (TRIAGE ONLY -- see the header)
 TWO-GATE|tests/render_runner.h|report|PROSPER_BACKEND_TIMING_WINDOWS+PROSPER_RENDER_TIMING  # unreviewed: not judged
 TWO-GATE|tests/render_runner.h|report|PROSPER_DRAW_ISO+PROSPER_ISO_AT  # unreviewed: not judged
-TWO-GATE|tests/render_runner.h|report|PROSPER_NO_BACKEND_PIPELINE_CACHE+PROSPER_PIPEKEY_LOG  # unreviewed: not judged
 TWO-GATE|tools/boot_trace/boot_trace.cpp|report|PROSPER_CRASHPEEK+PROSPER_PEEK_CLASS  # unreviewed: not judged
 TWO-GATE|tools/boot_trace/boot_trace.cpp|report|PROSPER_CRASHPEEK+PROSPER_PEEK_CODE  # unreviewed: not judged
