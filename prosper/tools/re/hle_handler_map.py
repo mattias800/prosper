@@ -74,12 +74,13 @@ is crossed against, so the two cannot disagree about a library.
 
 Usage:
     hle_handler_map.py [--src DIR] [--platform linux|windows|macos] [--names DIR]
-                       [--gated FILE] [--all] [--min-names N] [--json FILE]
+                       [--gated FILE] [--registry FILE] [--all] [--min-names N]
 
     --src        prosper source root holding `src/hle` (default: inferred from this file's path)
     --platform   which arm of the `#if` tree to evaluate (default: the host platform)
     --names      PS5 3.20 firmware genstub dump, for Sony names and library attribution
     --gated      output of `nid_gate_scan.py --all-nids`; restricts the cross to those NIDs
+    --registry   an `hle_registry_dump` TSV; reconciles the parse against the compiled binary
     --all        list every registered NID, not only the shared-handler ones
     --min-names  a handler must serve at least N distinct Sony names to be listed (default 2)
 """
