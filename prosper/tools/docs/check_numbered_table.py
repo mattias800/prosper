@@ -103,7 +103,12 @@ What ARITY specifically cannot see, stated so silence is not read as coverage:
     nothing about the cells being in the right ORDER or the right columns.
   * Fenced regions, deliberately: a ``` block of shell pipes is not a table, and a checker that
     fires on pasted tool output gets disabled. Nested/mismatched fences (``` inside ~~~) are
-    tracked as a single toggle, so a document mixing the two markers could desynchronise.
+    tracked as a single toggle, so a document mixing the two markers could desynchronise. This
+    applies to the conflict-marker scan too, and it is a real blind spot rather than a free choice:
+    a genuine unresolved conflict that happens to land inside a fenced block is invisible here. The
+    alternative -- rejecting every document that quotes a marker as an example -- would reject the
+    documentation of this very defect, so the trade is made the same way it is made for tables.
+    `git diff --check` has no such blind spot and remains the backstop the charter runs separately.
 
 WHY GAPLESSNESS WAS REMOVED (#2089), and what took over its job. Until 2026-08-17 the opt-in class
 was `--sequential`: unique, ascending AND gapless. Gaplessness is the reason this file used to carry
@@ -555,12 +560,27 @@ def check(
     # `git diff --check` found it instead -- which is why the charter runs that as a separate gate --
     # but nothing stops a marker reaching a branch where nobody runs it, and the numbering was
     # meanwhile reported "unique and ascending" over a line that was a merge artifact.
-    conflicts = [
-        f"{path}:{i}: unresolved merge conflict marker: {line.strip()[:60]!r}. A marker directly "
-        f"after a table's last row ENDS the table rather than splitting it, so no other check here "
-        f"can see it."
-        for i, line in enumerate(lines, start=1) if CONFLICT.match(line)
-    ]
+    #
+    # FENCED REGIONS ARE SKIPPED, like every other class here, and the first draft of this scan
+    # forgot it -- running before parse_tables, with no fence tracking, always on, including the
+    # repo-wide *.md sweep. It therefore rejected any document that PASTES an example conflict
+    # inside a ``` block, which is exactly how this defect gets documented. This file's own header
+    # settled that question long ago: "this file's own defect example would otherwise fail the check
+    # that documents it." Same self-referential shape as the marker that got past it in the first
+    # place (#2610 review).
+    conflicts: list[str] = []
+    fenced = False
+    for i, line in enumerate(lines, start=1):
+        if FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced or not CONFLICT.match(line):
+            continue
+        conflicts.append(
+            f"{path}:{i}: unresolved merge conflict marker: {line.strip()[:60]!r}. A marker directly "
+            f"after a table's last row ENDS the table rather than splitting it, so no other check "
+            f"here can see it."
+        )
     if conflicts:
         # Return immediately: every other class would be measuring a file that is half two files.
         return conflicts

@@ -424,7 +424,8 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   be *gapless*, which made a lane's `Docs` job red purely because a lower number sat in another
   lane's unmerged branch — unrepairable by its author, since the only local fix is the forbidden
   renumber. It was kept for catching a **deleted** row, and measurement showed it only ever caught an
-  *interior* deletion: on master's 192-row table, dropping the highest row passed green, and a
+  *interior* deletion: on master's 186-row Instrument table, dropping the highest row passed green,
+  and a
   whole-file `git checkout` from an old revision lost 61 rows and reported "contiguous and unbroken".
   `--baseline` does that job completely — interior, tail, whole-file revert, and renumber — and
   cannot be made to fire by another lane's timing. **Gaps are now legal**, so a collision is repaired

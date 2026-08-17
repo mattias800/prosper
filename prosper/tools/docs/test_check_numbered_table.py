@@ -189,7 +189,8 @@ run("a deleted INTERIOR row is caught",
 
 # THE discriminating case, and the reason gaplessness was not merely relaxed but replaced. Deleting
 # the HIGHEST row leaves 1,2,3 -- still gapless, still ascending, still unique. The old --sequential
-# gate passed this green, measured on master's real 192-row table (delete row 186 -> rc=0).
+# gate passed this green, measured on master's real Instrument table (186 rows at 0c268362;
+# deleting row 186 -> rc=0).
 run("a deleted TAIL row is caught -- gaplessness could not see this",
     "| # | What |\n|---|---|\n| 1 | a |\n| 2 | b |\n| 3 | c |\n",
     ordered=True, baseline=BASE, want_problems=True, want_count=1, expect_text="GONE from this table: 4")
@@ -344,6 +345,25 @@ run("a conflict marker after the last row is caught",
 run("a conflict marker inside the table is caught",
     "| # | What |\n|---|---|\n| 1 | a |\n<<<<<<< HEAD\n| 2 | b |\n",
     want_problems=True, expect_text="unresolved merge conflict marker")
+
+# THE ARM THE FENCE FIX NEEDED. The first draft of the conflict scan ran before parse_tables, with
+# no fence tracking and always on -- so it rejected any document that PASTES an example conflict
+# inside a ``` block, which is how this defect gets documented. This file's own header settled that
+# question for every other class ("this file's own defect example would otherwise fail the check
+# that documents it"); the scan had to make the same trade (#2610 review).
+run("a conflict marker inside a fence is an example, not a defect",
+    "```\n>>>>>>> 8f124852 (some commit)\n```\n\n" + TABLE,
+    ordered=True, want_problems=False)
+
+run("...and one inside a fence does not fire on the plain sweep either",
+    "```\n<<<<<<< HEAD\n| 5 | a |\n>>>>>>> other\n```\n\n" + TABLE,
+    want_problems=False)
+
+# The counter-arm that keeps the fix honest: a marker AFTER the fence closes is still a defect, so
+# "skip fenced" cannot decay into "skip everything once a fence is seen".
+run("a marker after a closed fence is still caught",
+    "```\nexample output\n```\n\n" + TABLE + ">>>>>>> 8f124852 (real leftover)\n",
+    ordered=True, want_problems=True, expect_text="unresolved merge conflict marker")
 
 # `=======` is a legal setext heading underline, so it must NOT be treated as a marker -- a checker
 # that fires on correct Markdown gets deleted rather than heeded.

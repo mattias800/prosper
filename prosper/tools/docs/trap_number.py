@@ -147,12 +147,25 @@ def added_rows_from_patch(patch: str, path: str) -> list[int]:
     return sorted(added - removed)
 
 
-def added_rows_from_diff(repo: str, number: int, path: str) -> list[int] | None:
-    """`added_rows_from_patch` over this PR's patch. None if the diff cannot be read."""
+def added_rows_from_diff(repo: str, number: int, path: str) -> list[int]:
+    """`added_rows_from_patch` over this PR's patch.
+
+    RAISES rather than returning None on a failed `gh pr diff`, and that is the whole point. The
+    first version returned None, the caller treated it as falsy, and the report fell through to the
+    set-difference branch -- the exact logic this function was added to REPLACE, because set
+    arithmetic cannot see a duplicate the base already holds. So an unreadable diff would have
+    silently restored the defect while the run looked successful: B4's shape, one function over
+    (#2610 review).
+    """
     proc = subprocess.run(["gh", "pr", "diff", str(number), "--repo", repo],
                           capture_output=True, text=True)
     if proc.returncode != 0:
-        return None
+        raise ScanError(
+            f"`gh pr diff {number}` failed (rc={proc.returncode}): {proc.stderr.strip()}. Without "
+            f"the patch this PR's claim cannot be distinguished from an amended row, and falling "
+            f"back to comparing file contents would silently miss a duplicate already on "
+            f"{repo}'s base."
+        )
     return added_rows_from_patch(proc.stdout, path)
 
 
