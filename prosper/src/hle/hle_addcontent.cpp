@@ -2,6 +2,7 @@
 #include "hle_addcontent.hpp"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +24,46 @@ constexpr size_t kMaxEntries = 1024;             // dlc_emu producer limit
 std::mutex g_inventory_mutex;              // also guards g_app_params
 AddcontentInventorySnapshot g_inventory;
 AppParamDeclaration g_app_params;
+
+// Budget for the mount/unmount transition diagnostics below (see addcontent_mount). Guarded by
+// g_inventory_mutex; every caller already holds it.
+constexpr int kMaxMountDiagnostics = 64;
+int g_mount_diagnostics = 0;
+
+// Format-checked, following hle_ult.cpp's log_line precedent. An always-on instrument is exactly
+// the place a format-string mismatch must be a compile error rather than a garbled log line that
+// someone later reads as evidence.
+#if defined(__GNUC__) || defined(__clang__)
+void log_addcontent_event(const char* format, ...) __attribute__((format(printf, 1, 2)));
+#endif
+void log_addcontent_event(const char* format, ...) {
+    if (g_mount_diagnostics > kMaxMountDiagnostics) return;
+    if (g_mount_diagnostics == kMaxMountDiagnostics) {
+        ++g_mount_diagnostics;
+        std::fprintf(stderr,
+                     "[addcontent] further mount/unmount diagnostics suppressed after %d lines "
+                     "(this is a cap, not the guest's call count)\n", kMaxMountDiagnostics);
+        return;
+    }
+    ++g_mount_diagnostics;
+    std::va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+}
+
+// Both the entitlement label and the unmount mount point arrive as raw guest bytes, so neither is
+// known-printable at the point it is logged (only a label that MATCHES an inventory entry has been
+// through valid_entitlement_label, and the interesting diagnostic is precisely the one that did
+// not). A diagnostic must not be able to garble the log it is describing, so render anything outside
+// printable ASCII as '?' — the same fail-visible direction the rest of this file takes.
+std::string printable(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value)
+        out.push_back(ch >= 0x20 && ch < 0x7f ? ch : '?');
+    return out;
+}
 
 enum class BoundedFileState {
     Missing,
@@ -668,8 +709,27 @@ AddcontentInventorySnapshot addcontent_inventory_snapshot() {
 AddcontentMountResult addcontent_mount(uint32_t service_label, std::string_view entitlement_label,
                                        uint64_t output_address, AddcontentMountWriter writer) {
     std::lock_guard<std::mutex> lock(g_inventory_mutex);
-    if (g_inventory.state != AddcontentInventoryState::Ready)
+    // "What did prosper tell the guest the mount point IS?" — the question every DLC-carrying
+    // title's path investigation reaches, and the one no existing instrument could answer. The
+    // mount point is an OUT-PARAMETER, so `PROSPER_SVCLOG` (opt-in per handler, and this handler
+    // never called svc_log) and `tools/hle_calls` (return values only, and its value capture
+    // reported itself VOID on the run this was written against) both see that the call happened and
+    // not what it answered. Issue #1993 bounced twice for want of exactly this line: a title probed
+    // `/app0/dlc3/sound/Foo.awb`, the string `/app0/dlc3` appears nowhere in its eboot, and there
+    // was no way to confirm the prefix came from here short of attaching a debugger.
+    //
+    // Always on, and bounded rather than env-gated: gated, it is absent the one time somebody needs
+    // it, which is precisely the failure being recorded. A mount is a rare state TRANSITION (four
+    // per boot on the title this was written for), but a guest that loops mount/unmount could still
+    // spam, so the budget caps the family and says so once. If you ever read these as a rate, quote
+    // the cap rather than the volume. Reported inside the lock, so the text is exactly the bytes the
+    // guest was handed.
+    const std::string label = printable(entitlement_label);
+    if (g_inventory.state != AddcontentInventoryState::Ready) {
+        log_addcontent_event("[addcontent] mount label='%s' service=%u -> NOT_FOUND (no validated "
+                             "local inventory)\n", label.c_str(), service_label);
         return AddcontentMountResult::NotFound;
+    }
     size_t index = g_inventory.entries.size();
     for (size_t i = 0; i < g_inventory.entries.size(); ++i) {
         const InstalledAddcontent& entry = g_inventory.entries[i];
@@ -680,21 +740,44 @@ AddcontentMountResult addcontent_mount(uint32_t service_label, std::string_view 
             break;
         }
     }
-    if (index == g_inventory.entries.size()) return AddcontentMountResult::NotFound;
-    InstalledAddcontent& entry = g_inventory.entries[index];
-    if (!entry.mountable || entry.guest_mount_point.empty() || entry.download_status != 4)
+    if (index == g_inventory.entries.size()) {
+        log_addcontent_event("[addcontent] mount label='%s' service=%u -> NOT_FOUND (no declared "
+                             "add-content carries this label)\n", label.c_str(), service_label);
         return AddcontentMountResult::NotFound;
-    if (entry.mounted) return AddcontentMountResult::Busy;
+    }
+    InstalledAddcontent& entry = g_inventory.entries[index];
+    if (!entry.mountable || entry.guest_mount_point.empty() || entry.download_status != 4) {
+        log_addcontent_event("[addcontent] mount label='%s' service=%u -> NOT_FOUND (declared, but "
+                             "not a mountable installed package)\n", label.c_str(), service_label);
+        return AddcontentMountResult::NotFound;
+    }
+    if (entry.mounted) {
+        log_addcontent_event("[addcontent] mount label='%s' service=%u -> BUSY ('%s' is already "
+                             "claimed by this label)\n", label.c_str(), service_label,
+                             entry.guest_mount_point.c_str());
+        return AddcontentMountResult::Busy;
+    }
     for (const InstalledAddcontent& other : g_inventory.entries) {
-        if (other.mounted && other.guest_mount_point == entry.guest_mount_point)
+        if (other.mounted && other.guest_mount_point == entry.guest_mount_point) {
+            log_addcontent_event("[addcontent] mount label='%s' service=%u -> BUSY ('%s' is already "
+                                 "claimed by label '%s')\n", label.c_str(), service_label,
+                                 entry.guest_mount_point.c_str(),
+                                 other.entitlement_label.c_str());
             return AddcontentMountResult::Busy;
+        }
     }
     std::array<char, 16> mount_point{};
     std::memcpy(mount_point.data(), entry.guest_mount_point.data(),
                 entry.guest_mount_point.size());
-    if (!writer || !writer(output_address, mount_point.data(), mount_point.size()))
+    if (!writer || !writer(output_address, mount_point.data(), mount_point.size())) {
+        log_addcontent_event("[addcontent] mount label='%s' service=%u -> OUTPUT ERROR (the guest's "
+                             "mount-point buffer was not writable; the claim is NOT consumed)\n",
+                             label.c_str(), service_label);
         return AddcontentMountResult::OutputError;
+    }
     entry.mounted = true;
+    log_addcontent_event("[addcontent] mount label='%s' service=%u -> '%s'\n", label.c_str(),
+                         service_label, entry.guest_mount_point.c_str());
     return AddcontentMountResult::Mounted;
 }
 
@@ -710,13 +793,21 @@ AddcontentMountResult addcontent_mount(uint32_t service_label, std::string_view 
 // to release would trade a stuck mount for a mount released behind the guest's back.
 AddcontentUnmountResult addcontent_unmount(std::string_view guest_mount_point) {
     std::lock_guard<std::mutex> lock(g_inventory_mutex);
-    if (guest_mount_point.empty()) return AddcontentUnmountResult::NotMounted;
+    const std::string point = printable(guest_mount_point);
+    if (guest_mount_point.empty()) {
+        log_addcontent_event("[addcontent] unmount '' -> NOT_MOUNTED (empty mount point)\n");
+        return AddcontentUnmountResult::NotMounted;
+    }
     for (InstalledAddcontent& entry : g_inventory.entries) {
         if (entry.mounted && entry.guest_mount_point == guest_mount_point) {
             entry.mounted = false;
+            log_addcontent_event("[addcontent] unmount '%s' -> released (label '%s')\n",
+                                 point.c_str(), entry.entitlement_label.c_str());
             return AddcontentUnmountResult::Unmounted;
         }
     }
+    log_addcontent_event("[addcontent] unmount '%s' -> NOT_MOUNTED (not a currently-claimed mount "
+                         "point)\n", point.c_str());
     return AddcontentUnmountResult::NotMounted;
 }
 
