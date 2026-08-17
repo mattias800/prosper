@@ -378,9 +378,10 @@ Note that the first two fall silent in cases 1 **and** 2, which is why `PROSPER_
 - **"The mix loop might not be applying the fold table it documents."** Falsified end to end, not by
   inspection: `test_audio`'s `test_bed_routing_matrix` pushes one unit impulse per source channel
   through the real `sceAudioOut2*` entrypoints for **every** width 1..16 and reads the gain that
-  arrives at the host sink. All 96 placed gains match the table, and every channel at index ≥ 8
-  measures exactly `{0, 0}` at every width above 8 — the "unplaced" contract, measured rather than
-  asserted. Note precisely what this does and does not establish: it pins the **application** of the
+  arrives at the host sink. That is **136 channel measurements** across the sixteen widths: the
+  **100** placed ones all match the table's gains, and the **36** unplaced ones — every channel at
+  index ≥ 8, at every width above 8 — measure exactly `{0, 0}`, so the "unplaced contributes
+  nothing" contract is measured rather than asserted. Note precisely what this does and does not establish: it pins the **application** of the
   table, and the orientation question below is untouched by it (#1720).
 - **Which titles could ever settle the left/right orientation — surveyed, so nobody re-searches.**
   Only **5 of 44** dumps import `sceAudioOut2GetSpeakerInfo` (`DImz2Ft9E2g`), the one call through
