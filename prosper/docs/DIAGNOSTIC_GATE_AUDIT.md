@@ -74,8 +74,9 @@ Classification of the 93 keys, from `tools/env/diag_gate_baseline.txt`:
 | --- | --- | --- |
 | `defect` | 2 | a confirmed instance; the note names the issue |
 | `config-echo` | 10 | the field echoes **configuration**, so `0` truthfully means "unconstrained" — the shape rule 1 recommends |
+| `benign` | 2 | read and judged sound, with the reason in the note: two deliberate entry points into one arming helper, and a behaviour predicate that prints nothing |
 | `family` | 28 | **triage, not a clearance** — every variable in the requirement shares a name family, so a reader who arms one can find the other from the names |
-| `unreviewed` | 53 | found by the sweep and **not judged**; honest debt |
+| `unreviewed` | 51 | found by the sweep and **not judged**; honest debt, tracked by #2572 |
 
 **`family` is not a clean bill of health, and this is the one line in this document most likely to
 be misread.** #2149's fourth instance was `PROSPER_PROGRESS` + `PROSPER_PROGRESS_UNIMPL` — which *is*

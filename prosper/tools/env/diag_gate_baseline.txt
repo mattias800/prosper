@@ -19,6 +19,8 @@
 #                was PROSPER_PROGRESS + PROSPER_PROGRESS_UNIMPL, which IS a name family, and the
 #                family is what made the coupling invisible -- the name promised what only the
 #                pair delivered. Read one of these before quoting its output as a measurement.
+#   benign       read and judged sound: the shape matches but nothing can print unmeasured. The
+#                note says why, so the judgement is checkable rather than asserted.
 #   unreviewed   found by the sweep and NOT judged. Honest debt, counted in the audit doc.
 #
 # Regenerate the key list with:
@@ -27,13 +29,14 @@
 # `unreviewed` -- that is the laundering this tool exists to prevent, performed by hand.
 #   config-echo: 10
 #   defect: 2
+#   benign: 2
 #   family: 28
-#   unreviewed: 53
+#   unreviewed: 51
 #
-SPLIT-CALL|src/gpu/command_processor.cpp|generation_guard|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-CALL|src/gpu/command_processor.cpp|generation_guard|PROSPER_GENERATION_GUARD+PROSPER_MB3_FREELIST_GUARD  # benign: the callee is a BEHAVIOUR predicate, not a producer of printed state -- there is no field it could leave unmeasured. The rule's shape matches; its subject does not.
 SPLIT-CALL|src/gpu/gpu_timeline.cpp|automatic_capture_bundle_gate_conflicts|PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG+PROSPER_CAPTURE_BUNDLE_TRIGGER_FILE  # family: every gate shares a name family -- the coupling is discoverable from the names
 SPLIT-CALL|src/hle/hle_audio.cpp|audio2log|PROSPER_AUDIO2LOG+PROSPER_AUDIO2LOG|PROSPER_AUDIO2_PROBE  # family: every gate shares a name family -- the coupling is discoverable from the names
-SPLIT-CALL|src/host/exec_image_linux.cpp|arm_hwwatch|PROSPER_HWBP+PROSPER_HWWATCH_ABS  # unreviewed: found by the #2149 sweep, not judged
+SPLIT-CALL|src/host/exec_image_linux.cpp|arm_hwwatch|PROSPER_HWBP+PROSPER_HWWATCH_ABS  # benign: two DELIBERATE entry points into one arming helper (absolute watch vs register-relative on the first exec-bp hit, :3228 and :3138). Neither switch is a producer for the other's printer, and nothing prints a field either could have measured.
 SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_compute_image_hit|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..25more  # unreviewed: found by the #2149 sweep, not judged
 SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_submit_query|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
 SPLIT-LOCAL|frontends/shared/live_renderer.cpp|resource_texture_validated_bytes|PROSPER_DUMP_ATLAS|PROSPER_DUMP_DRAWSTEPS|..23more  # unreviewed: found by the #2149 sweep, not judged
