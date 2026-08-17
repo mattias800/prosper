@@ -246,8 +246,8 @@ int main() {
     // signal/broadcast half of the change at all, however the mutation is phrased. A positive
     // control that has already resolved the thing under test is not a control.
     //
-    // WHAT THESE TWO ARMS ARE FOR, stated carefully because the first revision of this block gave a
-    // reason that CANNOT HAPPEN. It said a skipped signal "would be signalling an object no waiter
+    // WHAT THESE THREE ARMS ARE FOR, stated carefully because the first revision of this block gave
+    // a reason that CANNOT HAPPEN. It said a skipped signal "would be signalling an object no waiter
     // will ever use". There is no such waiter: `ensure_cond` installs the object with a CAS before
     // returning it, and `m_cnd_wait` can only park on what it returns, so a slot still holding a
     // sentinel has nobody parked on it by construction. On a NULL sentinel a skipped broadcast
@@ -255,15 +255,22 @@ int main() {
     // replaced because a plausible-but-impossible failure mode in a test's rationale is exactly what
     // stops the next reader questioning the arm.
     //
-    // The two things these arms really establish:
-    //   1. CROSS-SPELLING PARITY, which is this PR's whole thesis (#1873). `k_cond_broadcast` and
-    //      `k_mutex_unlock` resolve the identical guest slot for the identical input. §4 is the only
-    //      place in the suite that asserts the C11 spelling agrees, and the only place the resolver
-    //      is exercised on the signal side at all.
-    //   2. THE CRASH PATH. The old guard tested the slot's VALUE, so it was TRUE for every sentinel
-    //      except NULL: sentinel 1 and the destroyed poison kPtDestroyed (0xDEA) were dereferenced
-    //      as object pointers. Routing through the resolver is what turns
-    //      `interruptible_cond_broadcast((pthread_cond_t*)0xDEA)` into a refusal.
+    // WHAT THE THREE ARMS ESTABLISH -- one thing, not two:
+    //   CROSS-SPELLING PARITY, which is this PR's whole thesis (#1873). `k_cond_signal`,
+    //   `k_cond_broadcast` and `k_mutex_unlock` resolve the identical guest slot for the identical
+    //   input. §4 is the only place in the suite that asserts the C11 spelling agrees, and the only
+    //   place the resolver is exercised on the signal side at all.
+    //
+    // WHAT THEY DO NOT ESTABLISH, though the change fixes it: THE CRASH PATH. The old guard tested
+    // the slot's VALUE, so it was TRUE for every sentinel except NULL -- sentinel 1 and the destroyed
+    // poison kPtDestroyed (0xDEA) were dereferenced as object pointers, and routing through the
+    // resolver turns `interruptible_cond_broadcast((pthread_cond_t*)0xDEA)` into a refusal. Every
+    // clause of that is true and NO ARM BELOW SHOWS IT: all three slots here hold nullptr, so nothing
+    // in this file exercises a non-NULL sentinel. Correctness by construction, not by measurement.
+    // An arm that stored `(void*)1` would not fix that -- under the mutation it would SIGSEGV rather
+    // than fail an assertion, which is a worse instrument than none. The third reviewer caught this
+    // attribution, and it is the SAME class as the retraction three paragraphs up: a true statement
+    // filed under an arm that cannot support it.
     // The observable is the resolution itself, because a broadcast to a condvar with no waiters has
     // no other effect to assert.
     printf("-- _Cnd_signal / _Cnd_broadcast / _Mtx_unlock resolve a slot no wait has touched --\n");
