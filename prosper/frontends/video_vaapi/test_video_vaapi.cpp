@@ -1,5 +1,6 @@
 #include "vaapi_backend.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
