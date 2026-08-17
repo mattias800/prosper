@@ -500,13 +500,21 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     **Run the docs gate locally first** — it is the one check that can actually fail on a docs diff, and
     it takes a second:
     ```bash
-    python3 prosper/tools/docs/check_numbered_table.py --sequential \
-        --table-header Instrument prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+    F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+    git show "origin/master:$F" > /var/tmp/orch-base.md          # what CI passes as --baseline
+    python3 prosper/tools/docs/check_numbered_table.py --ordered \
+        --table-header Instrument --baseline /var/tmp/orch-base.md "$F"
     git ls-files '*.md' -z | xargs -0 python3 prosper/tools/docs/check_numbered_table.py
     ```
-    This matters most for `GAME_COMPAT_ORCHESTRATION.md`'s numbered tables, where the gate requires rows
-    to be unique, ascending **and gapless**: several lanes append to them concurrently, so a PR that was
-    contiguous when written can be gapped by the time it merges (#2087 sat conflicting for exactly this).
+    This matters most for `GAME_COMPAT_ORCHESTRATION.md`'s numbered tables. The gate requires rows to be
+    unique and ascending, and requires that **no row present in the base is missing** (`--baseline`).
+    **Gaps are legal** — `--sequential` and its gapless rule were removed on 2026-08-17 (#2089) because a
+    gap is usually another lane's unmerged number, which no edit of *your* branch can supply, so the check
+    served only to serialize independent lanes; the flag now errors and names its replacement. So if you
+    lose a collision, renumber to any number above the current highest and merge — you no longer have to
+    wait for the number below yours. Before writing a row, allocate with
+    `python3 prosper/tools/docs/trap_number.py`, which scans master **and every open PR** (#1729);
+    reading master alone is what produced the #2574/#2581 collision.
     Confirm the diff really is `.md`-only — `git diff --name-only origin/master...HEAD | grep -v '\.md$'`
     should be empty. The exception is about the *diff*, not the intent; one stray file makes it an
     ordinary PR again.

@@ -410,15 +410,31 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   **`spirv-val` must be on `PATH`** (`spirv-tools`, `mingw-w64-ucrt-x86_64-spirv-tools`, or
   `brew install spirv-tools`); its absence fails the suite rather than skipping the gate.
 - **`docs/check_numbered_table.py`** — validate Markdown tables that other documents cite by row
-  number. Three classes: **structure** (always on) rejects a blank line that splits a table, which
+  number. Four classes: **structure** (always on) rejects a blank line that splits a table, which
   in Markdown silently renders everything after it as a *separate* table; **arity** (always on)
-  requires every row to have its header's cell count; **`--sequential`**
-  (opt-in, plus `--table-header` to select one table) additionally requires the numbered column
-  to be unique, ascending and gapless. Sequence is a convention of the instrument-trap table
+  requires every row to have its header's cell count; **`--ordered`**
+  (opt-in, plus `--table-header` to select one table) requires the numbered column
+  to be unique and strictly ascending; **`--baseline <base copy>`** requires that every row number
+  the base had is still present. Order is a convention of the instrument-trap table
   ("append, never renumber"), not a property of numbered tables — most here lead with frame or
-  draw ordinals where gaps are correct — so do not apply it broadly. Catches the case where two
+  draw ordinals where repeats are correct — so do not apply it broadly. Catches the case where two
   branches append the same row number, which merges textually clean and green. Run by the CI
   `Docs` job; `ctest -R doc_table_checker` covers the checker itself.
+  **`--sequential` was removed on 2026-08-17 and now errors** (#2089). It also required the column to
+  be *gapless*, which made a lane's `Docs` job red purely because a lower number sat in another
+  lane's unmerged branch — unrepairable by its author, since the only local fix is the forbidden
+  renumber. It was kept for catching a **deleted** row, and measurement showed it only ever caught an
+  *interior* deletion: on master's 192-row table, dropping the highest row passed green, and a
+  whole-file `git checkout` from an old revision lost 61 rows and reported "contiguous and unbroken".
+  `--baseline` does that job completely — interior, tail, whole-file revert, and renumber — and
+  cannot be made to fire by another lane's timing. **Gaps are now legal**, so a collision is repaired
+  by bumping to any higher number and merging.
+- **`docs/trap_number.py`** — allocate the next instrument-trap row number against `origin/master`
+  **and every open PR** (#1729). Prints each claimant so you can see whether you are in a race, not
+  just a bare number. An **advisor, not a gate**: two lanes running it in the same minute both see the
+  same free number, so it shrinks the collision window and cannot close it — merge order does that,
+  and `--ordered` is the backstop. Reading master alone is what produced the #2574/#2581 collision.
+  `ctest -R trap_number` covers it.
   **On arity, and why it is not optional:** GFM splits a row into cells on `|` *before* it parses
   inline content, so a pipe inside an inline `code span` is a cell boundary, and a row with more
   cells than the header has the excess **silently discarded** on the rendered page. Write `\|`

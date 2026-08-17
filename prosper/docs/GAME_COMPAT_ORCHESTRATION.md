@@ -96,10 +96,24 @@ session. Prefer breadth when a hard lane stalls — overall library progress mat
 **Every entry below is a phantom defect that came from the measuring apparatus, not the subject.**
 Several cost hours; one cost two sessions. This is the single highest-value page in this document.
 
-*Maintenance:* **append, never renumber** — an existing number may already be cited from an issue or a
-commit message. Deliberately no total is stated here: a restated count goes stale the moment a lane
-appends, and it already had (the header read "Fourteen" against a 17-row table). If you need the
-count, read the last row's number.
+*Maintenance:* **append, never renumber** — an existing number may already be cited from an issue, a
+commit message, another document or a source comment (64 places do, as of 2026-08-17). Deliberately
+no total is stated here: a restated count goes stale the moment a lane appends, and it already had
+(the header read "Fourteen" against a 17-row table). The last row's number is the **high-water
+mark**, which is what you want for allocating; it is not the row count, because **gaps are legal**.
+
+*Allocating a number under concurrency:* run
+`python3 tools/docs/trap_number.py` before you write the row. It reports the highest number on
+`origin/master` **and in every open PR**, names the claimant of each, and prints the next free
+number. Reading master alone is what produced the #2574/#2581 collision on 2026-08-17 — both lanes
+read 181, both wrote 182 — and it is what #1729 was filed for. The tool is an **advisor, not a
+gate**: two lanes running it in the same minute still both see the same free number. It shrinks the
+window; only merge order closes it.
+
+*If you collide anyway:* renumber your row to **any** number above the current highest and merge.
+Nothing waits on anything. The gapless rule that used to make this a re-derivation against a moving
+master was removed on 2026-08-17 (#2089); `check_numbered_table.py --ordered` enforces unique and
+ascending, and `--baseline` enforces that no existing row has been deleted or renumbered.
 
 | # | Instrument | How it lied |
 |---|---|---|
