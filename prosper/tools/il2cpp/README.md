@@ -109,10 +109,18 @@ actually have" is never inferred from the absence of names:
 Pointing the variable at a raw `script.json` is **refused**, naming the header it wanted, rather
 than being read as a table with zero symbols.
 
-`<no-managed-method>` is a real and common answer, not a failure: 26 of 36 live IL2CPP addresses
-sampled from a running PPSA24651 boot were in the il2cpp *runtime* (the VM's own native C++, which
-is compiled into the same PRX below the managed-method region — PPSA24651's lowest managed method
-is at RVA `0x1e3e00`), and `resolve.py` reports exactly the same thing for them.
+`<no-managed-method>` is a real and common answer, not a failure. Of 36 live IL2CPP addresses
+sampled from a running PPSA24651 boot, 26 were in the il2cpp *runtime* — the VM's own native C++,
+compiled into the same PRX **below** the managed-method region, since PPSA24651's lowest managed
+method is at RVA `0x1e3e00` — and `resolve.py` reports exactly the same thing for them.
+
+Read that sample as what it is: a live sanity check, not the agreement evidence. Those 26 sit below
+the first record, so neither implementation could have named anything there and no disagreement was
+expressible; only the remaining **10** addresses were in the covered region at all. The evidence
+that the two lookups agree is the `il2cpp_symtab_agreement` ctest case above, which synthesizes its
+own corpus, probes 656 addresses, checks that the probe set contains **both** outcomes before
+believing the agreement, and carries a planted-disagreement arm proving the comparator can report
+one.
 
 ### Limits
 

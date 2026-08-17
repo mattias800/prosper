@@ -28,7 +28,9 @@
 // VERBATIM to end of line. The name may contain spaces -- 1,326 of PPSA24651's 87,851 methods do,
 // because IL2CPP spells generic arguments `Foo<A, B>$$Bar` -- so a whitespace-tokenising parser
 // silently truncates them. Entries are sorted by (rva, name), which is the order resolve.py's own
-// bisect operates on.
+// bisect operates on, and the loader ENFORCES both halves of that key -- a table whose tied entries
+// are reordered is refused rather than read, because a lookup at a shared rva takes the last entry
+// of the tie group and would otherwise return a different name with no sign anything was wrong.
 //
 // The magic line is REQUIRED and carries the acceptance `window=`: the file states its own lookup
 // semantics rather than each side hard-coding a constant that can drift. A file without it is

@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
-# resolve.py — map runtime addresses / btrace frames to C# method names using the
-# Il2CppDumper output (script.json). Companion to prx_to_elf.py; see README.md.
+"""resolve.py — map runtime addresses / btrace frames to C# method names.
+
+Uses the Il2CppDumper output (script.json). Companion to prx_to_elf.py; see README.md.
+
+usage:
+  python3 resolve.py <script.json> 0x16b981 0x11e63c ...      # bare RVAs
+  python3 resolve.py <script.json> il+0x16b981,eb+0xada254    # a btrace chain
+  echo '[btrace] ... chain=il+0x1e23b8,il+0xde92e9' | python3 resolve.py <script.json> -
+  python3 resolve.py <script.json> --base 0x440000000 0x4402140d0   # absolute runtime addr
+  python3 resolve.py <script.json> --emit-symtab out.symtab   # for RUNTIME symbolication
+
+The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and PPSA02664 —
+src/host/boot_program.hpp BOOT_IL2CPP), so a method's runtime address = base + RVA, and
+script.json's "Address" field == RVA (the flattened ELF has p_offset == p_vaddr). A prosper
+[btrace] chain prints frames as "il+0x<offset>", where <offset> is already the RVA — feed those
+straight in.
+
+--emit-symtab writes the flat table prosper reads IN-PROCESS via PROSPER_IL2CPP_SYMBOLS
+(src/host/il2cpp_symbols.{hpp,cpp}, #2551). It is written from this file's own load(), so the
+runtime resolver and this one share the record set; the ordering and window notes below are the
+rest of what makes them agree, and il2cpp_symtab_agreement pins it.
+"""
+# The usage block above is the module DOCSTRING, not a comment, because `main()` prints `__doc__` on
+# a bad invocation — and a header made only of `#` comments makes that print the literal string
+# `None` (#2399, where the same arrangement in xref.py sent a caller to invented syntax).
 #
-# The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and
-# PPSA02664 — src/host/boot_program.hpp BOOT_IL2CPP), so a method's runtime address
-# = base + RVA, and script.json's "Address" field == RVA (the flattened ELF has
-# p_offset == p_vaddr). A prosper [btrace] chain prints frames as "il+0x<offset>",
-# where <offset> is already the RVA — feed those straight in.
-#
-# Usage:
-#   python3 resolve.py <script.json> 0x16b981 0x11e63c ...      # bare RVAs
-#   python3 resolve.py <script.json> il+0x16b981,eb+0xada254    # a btrace chain
-#   echo '[btrace] ... chain=il+0x1e23b8,il+0xde92e9' | python3 resolve.py <script.json> -
-#   python3 resolve.py <script.json> --base 0x440000000 0x4402140d0   # absolute runtime addr
-#   python3 resolve.py <script.json> --emit-symtab out.symtab   # for RUNTIME symbolication
-#
-# --emit-symtab writes the flat table prosper reads IN-PROCESS via PROSPER_IL2CPP_SYMBOLS
-# (src/host/il2cpp_symbols.{hpp,cpp}, #2551). It is written from this file's own load(), so the
-# runtime resolver and this one share the record set; the ordering and window notes below are the
-# rest of what makes them agree, and il2cpp_symtab_agreement pins it.
+# It came back once already: #2642 rewrote this header as `#` comments while adding the
+# --emit-symtab line above, so the very usage text that change existed to publish printed `None`
+# again. The guard is now mechanical rather than advisory — tools/ci/check_usage_text.py
+# (ctest `tools_usage_text`) rejects any tool under tools/ that reads `__doc__` without having one,
+# and test_symtab_agreement.py runs this file with no arguments and reads what comes out.
 import json, bisect, os, re, sys
 
 # Nearest-preceding acceptance window: an offset further than this past a method's start is reported

@@ -268,6 +268,45 @@ void test_rejects_unsorted() {
     std::remove(ok.c_str());
 }
 
+// The TIE half of the (rva, name) key, which the loader used to trust rather than check. This is
+// the only place the tie rule is observable: resolve() answers a shared rva with the LAST entry of
+// the group, so a reordered tie group returns a different, equally plausible method name — the
+// failure mode #2514 is open about. Both directions are asserted, because "refuses everything" and
+// "refuses the right thing" are the same result on the rejection arm alone.
+void test_rejects_unsorted_ties() {
+    const std::string path = write_temp("il2cpp_symtab_test_tieorder.symtab",
+                                        "prosper-il2cpp-symtab v1 window=0x8000 count=3\n"
+                                        "1000 A$$a\n"
+                                        "2000 Zeta$$z\n"
+                                        "2000 Alpha$$a\n");   // descending WITHIN the tie group
+    std::string err;
+    check(!load_symbol_table(path, &err), "a table whose tied entries are out of order is REFUSED");
+    check(err.find("sorted") != std::string::npos, "…saying why: \"" + err + "\"");
+
+    // ARM 1: the same three entries with the tie group ascending are accepted, and the answer at
+    // the shared address is the LAST of the group — the property the rule protects.
+    const std::string ok = write_temp("il2cpp_symtab_test_tieorder_ok.symtab",
+                                      "prosper-il2cpp-symtab v1 window=0x8000 count=3\n"
+                                      "1000 A$$a\n"
+                                      "2000 Alpha$$a\n"
+                                      "2000 Zeta$$z\n");
+    check(load_symbol_table(ok, nullptr), "the same entries with the tie group in order load");
+    check_eq(resolved_name(0x2000), "Zeta$$z", "…and a tied address resolves to the LAST entry");
+
+    // ARM 2: EQUAL names at a shared rva are legal — resolve.py's sort is non-strict, so a duplicate
+    // record must not be rejected. Without this arm the check above would also pass if the
+    // comparison had been written as a strict `>`, which would refuse real emitter output.
+    const std::string dup = write_temp("il2cpp_symtab_test_tieorder_dup.symtab",
+                                       "prosper-il2cpp-symtab v1 window=0x8000 count=2\n"
+                                       "2000 Same$$s\n"
+                                       "2000 Same$$s\n");
+    check(load_symbol_table(dup, nullptr), "two identical records at one rva are accepted");
+    check_eq(resolved_name(0x2000), "Same$$s", "…and resolve");
+    std::remove(path.c_str());
+    std::remove(ok.c_str());
+    std::remove(dup.c_str());
+}
+
 void test_rejects_missing_window() {
     const std::string path = write_temp("il2cpp_symtab_test_nowindow.symtab",
                                         "prosper-il2cpp-symtab v1 count=1\n"
@@ -395,6 +434,7 @@ int main(int argc, char** argv) {
     test_rejects_a_raw_script_json();
     test_rejects_truncation();
     test_rejects_unsorted();
+    test_rejects_unsorted_ties();
     test_rejects_missing_window();
     test_utf8_name_roundtrip();
     test_env_path(fixture);

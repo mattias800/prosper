@@ -28,7 +28,7 @@ struct Entry {
 };
 
 struct Table {
-    std::vector<Entry> entries;   // non-decreasing by rva, ties in emitter order (see below)
+    std::vector<Entry> entries;   // non-decreasing by (rva, name); both halves enforced (see below)
     uint64_t window = 0;
 };
 
@@ -144,11 +144,27 @@ bool load_symbol_table(const std::string& path, std::string* err) {
             // side re-sorted with any other tie rule the two implementations would disagree on
             // exactly the addresses where several methods share a start. Preserving emitter order
             // and refusing anything else keeps the agreement structural.
-            if (!table->entries.empty() && entry.rva < table->entries.back().rva) {
-                std::ostringstream why;
-                why << "entries are not sorted by rva (line " << line_no << ")";
-                status.error = why.str();
-                break;
+            //
+            // BOTH halves of that key are checked, because only the rva half used to be. The header
+            // in il2cpp_symbols.hpp promised (rva, name) while a file whose tied entries were in any
+            // order at all was accepted -- so the one situation the tie rule exists for was the one
+            // situation nothing verified. It matters because resolve() answers a shared rva with the
+            // LAST entry of the group: reorder a tie group and the lookup returns a different, and
+            // equally plausible-looking, method name.
+            //
+            // Comparing the names as bytes here matches resolve.py comparing them by code point:
+            // std::char_traits<char> orders as unsigned char, and UTF-8 is order-preserving, so
+            // byte order and code-point order coincide for every name either side can write.
+            if (!table->entries.empty()) {
+                const Entry& prev = table->entries.back();
+                const bool ordered = entry.rva > prev.rva ||
+                                     (entry.rva == prev.rva && !(entry.name < prev.name));
+                if (!ordered) {
+                    std::ostringstream why;
+                    why << "entries are not sorted by (rva, name) (line " << line_no << ")";
+                    status.error = why.str();
+                    break;
+                }
             }
             table->entries.push_back(std::move(entry));
         }

@@ -156,6 +156,28 @@ def compare(offline, runtime, probes):
     return bad
 
 
+def check_usage_message():
+    """resolve.py's no-argument run must print its usage, not the literal string `None`.
+
+    `main()` answers a bad invocation with `print(__doc__)`, which is a usage message only while the
+    header is a docstring. Rewritten as `#` comments it becomes `None` — the tool still exits 1, so
+    nothing looks broken and the caller is simply told nothing. That is #2399, and it came back in
+    #2642 on this very file, in the same change that added the `--emit-symtab` line being asserted
+    below. This is the behavioural half of the guard; tools/ci/check_usage_text.py (ctest
+    `tools_usage_text`) asks the same question of every tool in the tree at once.
+    """
+    p = subprocess.run([sys.executable, RESOLVE], capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    check(p.returncode != 0, 'resolve.py refuses a no-argument invocation (exit %d)' % p.returncode)
+    check(out != '' and out != 'None',
+          'resolve.py prints real usage text, not %r' % (out[:40] or ''))
+    check('usage' in out.lower() and 'script.json' in out,
+          'the usage text names the invocation shape')
+    # The regression is specifically that a usage block gets edited and then never printed, so
+    # assert the CURRENT feature is in the text a caller actually receives.
+    check('--emit-symtab' in out, 'the printed usage documents --emit-symtab')
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -164,6 +186,8 @@ def main(argv):
     if not os.path.exists(binary):
         print('[FAIL] probe binary not found: %s' % binary)
         return 2
+
+    check_usage_message()
 
     with tempfile.TemporaryDirectory(prefix='il2cpp_symtab_agree_') as work:
         script_path = os.path.join(work, 'script.json')

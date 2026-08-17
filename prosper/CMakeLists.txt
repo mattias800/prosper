@@ -231,6 +231,18 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
+  # `print(__doc__)` is a usage message only while the header is a docstring; rewritten as `#`
+  # comments it prints the literal string `None` and the tool still exits non-zero, so nothing
+  # looks broken and the caller is told nothing (#2399). Three tools have shipped that way, the
+  # last of them twice -- resolve.py regressed in #2642 inside the very change that added a line
+  # to its usage block, with nine checks green, because the only guard in the tree named xref.py.
+  # So this asks the whole tree instead of one file. Unlike ctest_gate_checker above, the scan
+  # itself is registered rather than only the selftest: the root it needs is ${CMAKE_SOURCE_DIR},
+  # known at configure time, so it runs from any build directory. --selftest runs beside it
+  # because a walk that matches nothing and a clean tree otherwise print the same thing.
+  add_test(NAME tools_usage_text
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_usage_text.py"
+                   --selftest --root "${CMAKE_SOURCE_DIR}")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
   # runtime, the arm becomes invisible -- and the test does not fail, it goes vacuous and keeps
   # printing [ok], which is why #2214 surfaced only as one unrelated-looking Vulkan binding error on
