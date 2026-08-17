@@ -1632,6 +1632,16 @@ if(TARGET prosper_core)
     target_link_libraries(test_pthread_error_encoding PRIVATE prosper_core)
     add_test(NAME pthread_error_encoding COMMAND test_pthread_error_encoding)
 
+    # #2596: the C11 _Mtx_* / _Cnd_* handlers must resolve a guest sync slot the way the libkernel
+    # entry point they forward to on hardware resolves it. Asserts what the handler DID (blocked,
+    # excluded a second thread, self-initialised the slot), never what it returned -- _Cnd_wait's
+    # unconditional 0 is the shipped contract. TIMEOUT is generous because every arm is a bounded
+    # spin: a regression here is a thread that never wakes, and each arm reports it as a failure.
+    add_executable(test_c11_thread_slots tests/test_c11_thread_slots.cpp)
+    target_link_libraries(test_c11_thread_slots PRIVATE prosper_core)
+    add_test(NAME c11_thread_slots COMMAND test_c11_thread_slots)
+    set_tests_properties(c11_thread_slots PROPERTIES TIMEOUT 120)
+
     # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68), and
     # normal return leaves guest %fs before glibc resumes host pthread cleanup (#644).
     add_executable(test_tls_dtv_purge tests/test_tls_dtv_purge.cpp)

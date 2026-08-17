@@ -10,6 +10,7 @@
 #include "callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
+#include "pthread_slot.hpp"   // #2596: resolve a guest sync slot the way libkernel does
 #include "sync_futex.hpp"
 #include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include <pthread.h>
@@ -751,8 +752,39 @@ HLE(k_uuid_create) {                                       // fill 16 non-zero b
 
 // --- C11 threads (used by MSVC STL std::mutex/std::condition_variable) ---
 HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t)); pthread_mutexattr_t at; pthread_mutexattr_init(&at); pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(m, &at); pthread_mutexattr_destroy(&at); *(void**)P(a0) = m; } return 0; }
-HLE(m_mtx_lock)   { if (a0 && *(void**)P(a0)) interruptible_mutex_lock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
-HLE(m_mtx_unlock) { if (a0 && *(void**)P(a0)) pthread_mutex_unlock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
+// #2596: every one of these used a PRIVATE `if (a0 && *(void**)P(a0))` guard, and it was wrong in
+// TWO different ways depending on which sentinel the slot held -- a distinction worth stating,
+// because the first revision of this comment claimed the whole class was merely "skipped" and a
+// reviewer falsified that in one grep. The guard tests the slot's VALUE for non-zero, while
+// `pt_static_sentinel` (hle_kernel.cpp) treats EVERYTHING below 0x1000 as a static initialiser:
+//
+//   * NULL (PTHREAD_MUTEX_INITIALIZER) -- the guard is false, so the operation was SKIPPED
+//     ENTIRELY. `_Mtx_lock` reported success without taking the lock, which is precisely the bdwgc
+//     GC_allocate_ml static-mutex shape that was the ROOT CAUSE of the level-1 heap corruption
+//     (#793), reached through the other spelling; `_Cnd_wait` reported success for a wait that
+//     never happened.
+//   * ANY OTHER SENTINEL -- 1 (PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP) and the destroyed poison
+//     kPtDestroyed (0xDEA) -- the guard is TRUE, so the value was DEREFERENCED AS AN OBJECT
+//     POINTER: `interruptible_mutex_lock((pthread_mutex_t*)0xDEA)`. Not a silent skip at all, a
+//     segfault. Routing through the resolver fixes a use-after-destroy crash on this spelling as
+//     well as the missing operation.
+//
+// The guard is gone in favour of guest_mutex_from_slot / guest_cond_from_slot, which ARE
+// ensure_mutex / ensure_cond -- the same resolution scePthreadMutexLock and scePthreadCondWait use.
+// That is where the guest itself answers the question: its C11 wrappers pass the slot pointer
+// STRAIGHT THROUGH to those entry points and inspect nothing (_Cnd_wait @0x5670 and _Mtx_lock
+// @0x5e80 in the shipped libc.prx, both re-derived through their JMPREL slots for #2596 -- see
+// pthread_slot.hpp), so a private guard here answers a different question from the one libkernel
+// answers. A null slot ADDRESS, and a slot holding the destroyed sentinel, still resolve to nullptr
+// and still skip -- there genuinely is no object.
+//
+// The family moves TOGETHER on purpose. Fixing only the wait would leave `_Mtx_lock` no-opping on a
+// static mutex while `_Cnd_wait` self-initialised and waited on it, i.e. a wait on a mutex nothing
+// had locked -- one spelling of the #1873 shape, where the answer depends on which entry point the
+// guest happened to use. Destroy is NOT in this list: retiring an object the guest never
+// initialised would be a new defect, not a fix.
+HLE(m_mtx_lock)   { if (auto* m = guest_mutex_from_slot(a0)) interruptible_mutex_lock(m); return 0; }
+HLE(m_mtx_unlock) { if (auto* m = guest_mutex_from_slot(a0)) pthread_mutex_unlock(m); return 0; }
 // _Mtx_destroy / _Cnd_destroy are the guest STL's own spelling of the same objects, so they carry
 // the same lifetime rule as scePthreadMutexDestroy / scePthreadCondDestroy: quarantine the storage
 // instead of freeing it here, and defer the host destroy to reclaim, because a thread may be parked
@@ -761,9 +793,15 @@ HLE(m_mtx_unlock) { if (a0 && *(void**)P(a0)) pthread_mutex_unlock((pthread_mute
 HLE(m_mtx_destroy){ if (a0 && *(void**)P(a0)) { retire_sync_object(*(void**)P(a0), SyncObjectKind::StlMutex,
                                                           [](void* p) { pthread_mutex_destroy((pthread_mutex_t*)p); }); } return 0; }
 HLE(m_cnd_init)   { if (a0) { auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)P(a0) = c; } return 0; }
-HLE(m_cnd_signal) { if (a0 && *(void**)P(a0)) interruptible_cond_signal((pthread_cond_t*)*(void**)P(a0)); return 0; }
-HLE(m_cnd_broadcast){ if (a0 && *(void**)P(a0)) interruptible_cond_broadcast((pthread_cond_t*)*(void**)P(a0)); return 0; }
-HLE(m_cnd_wait)   { if (a0 && *(void**)P(a0) && a1 && *(void**)P(a1)) interruptible_cond_wait((pthread_cond_t*)*(void**)P(a0), (pthread_mutex_t*)*(void**)P(a1)); return 0; }
+HLE(m_cnd_signal) { if (auto* c = guest_cond_from_slot(a0)) interruptible_cond_signal(c); return 0; }
+HLE(m_cnd_broadcast){ if (auto* c = guest_cond_from_slot(a0)) interruptible_cond_broadcast(c); return 0; }
+// The `return 0` here is NOT the defect and must stay. The shipped guest libc.prx's own `_Cnd_wait`
+// is `push rbp; mov rbp,rsp; call <plt scePthreadCondWait>; xor eax,eax; pop rbp; ret` -- it
+// discards the result on every path, so an unconditional 0 is the CONTRACT rather than an oversight
+// (#1983, recorded above k_cond_wait, which is where the reading was made). #2596 is only about the
+// wait not happening. Do not "fix" this line.
+HLE(m_cnd_wait)   { auto* c = guest_cond_from_slot(a0); auto* m = guest_mutex_from_slot(a1);
+                    if (c && m) interruptible_cond_wait(c, m); return 0; }
 HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { auto* c = (pthread_cond_t*)*(void**)P(a0); interruptible_cond_forget(c); retire_sync_object(c, SyncObjectKind::StlCond,
                                                                        [](void* p) { pthread_cond_destroy((pthread_cond_t*)p); }); } return 0; }
 
