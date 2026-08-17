@@ -365,6 +365,23 @@ run("a marker after a closed fence is still caught",
     "```\nexample output\n```\n\n" + TABLE + ">>>>>>> 8f124852 (real leftover)\n",
     ordered=True, want_problems=True, expect_text="unresolved merge conflict marker")
 
+# An UNCLOSED fence silences every check from that point on, so a real marker after it reads clean.
+# That is the fenced-region skip decaying from a trade into a blind spot, and unlike the
+# fenced-example case it has no legitimate shape (#2610 review). Measured safe: 0 of 101 tracked
+# Markdown files end unbalanced.
+run("an unclosed fence hiding a real marker is caught",
+    TABLE + "```\nsome output\n>>>>>>> 8f124852 (real leftover)\n",
+    ordered=True, want_problems=True, expect_text="opened and never closed")
+
+run("an unclosed fence is caught on the plain sweep too",
+    "| # | a |\n|---|---|\n| 1 | x |\n\n```\nunterminated\n",
+    want_problems=True, expect_text="opened and never closed")
+
+# ...and a BALANCED fence must not fire, or every document that quotes output would be rejected.
+run("a balanced fence is not an unterminated one",
+    TABLE + "```\nsome output\n```\n",
+    ordered=True, want_problems=False)
+
 # `=======` is a legal setext heading underline, so it must NOT be treated as a marker -- a checker
 # that fires on correct Markdown gets deleted rather than heeded.
 run("a setext heading underline is not a conflict marker",

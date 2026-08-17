@@ -267,7 +267,9 @@ def main() -> int:
     sane = [c[2] for c in claims if c[2] is not None and c[2] <= base_max + MAX_JUMP]
     wild = [(c[0], c[2]) for c in claims if c[2] is not None and c[2] > base_max + MAX_JUMP]
     overall = max([base_max] + sane)
-    claimed: set[int] = {n for c in claims for n in c[4] if n <= base_max + MAX_JUMP}
+    # Same notion as `contested` below: patch-derived, so a stacked PR's inherited rows are not
+    # counted as its claims.
+    claimed: set[int] = {n for c in claims for n in c[5] if n <= base_max + MAX_JUMP}
     if args.quiet:
         print(overall + 1)
         return 0
@@ -277,11 +279,19 @@ def main() -> int:
     for number, title, pr_max, draft, added, dup in sorted(claims, key=lambda c: -(c[2] or 0)):
         if pr_max is None:
             note = "no numbered table in its copy"
-        elif dup and (clash := [n for n in dup if n in base_numbers]):
+        elif clash := [n for n in dup if n in base_numbers]:
             note = (f"DUPLICATES {', '.join(str(n) for n in clash)} ALREADY ON {args.base} "
                     f"-- its patch ADDS a row with that number")
+        elif dup:
+            # `dup` (what the PATCH adds), never `added` (this file's numbers minus master's). A
+            # STACKED PR inherits its base's rows, so `added` credits it with claims that belong to
+            # the branch underneath: #2616 is stacked on #2610 and was reported as claiming 189 for
+            # #2610's row. One notion of "claim" throughout, or the report and the collision
+            # arithmetic disagree (#2610 review).
+            note = f"CLAIMS {', '.join(str(n) for n in dup)}"
         elif added:
-            note = f"CLAIMS {', '.join(str(n) for n in added)}"
+            note = (f"inherits {', '.join(str(n) for n in added)} from its base branch, "
+                    f"claims nothing of its own")
         else:
             note = "no claim (older base, adds no row)"
         flag = " [draft]" if draft else ""
@@ -296,9 +306,22 @@ def main() -> int:
     # does, "next free" is a trap: every loser steps to it simultaneously and collides again one
     # number up. Stepping CLEAR of the whole contested band is the cheap fix, and it is only safe
     # because gaps stopped being defects (#2089).
-    contested = sorted(n for n in claimed if sum(1 for c in claims if n in c[4]) > 1)
+    #
+    # TWO FIXES HERE, and only one of them is the crash. The collision arithmetic read `added`
+    # (index 4: this PR's numbers minus master's) when the tool also carries `dup` (index 5:
+    # patch-derived, what the PR's diff actually ADDS). Those disagree exactly where it matters. A
+    # STACKED PR inherits its base's rows, so `added` reports them as its own claims -- #2616 is
+    # stacked on #2610 and both showed `CLAIMS 189` for one row -- while `dup` correctly attributes
+    # nothing to it. So the weaker notion invented a collision that did not exist.
+    #
+    # Switching to the patch-derived set removes that misreport, and it also removes the TRIGGER for
+    # the crash below. It does NOT remove the crash: the unpack in `racing` still names five fields
+    # of a six-field tuple, so a GENUINE collision would still die here -- in the one path this tool
+    # exists for, after printing the table, with `--quiet` returning cleanly beforehand so a scripted
+    # caller sees nothing wrong. Fixing only the trigger would have left that live and looked green.
+    contested = sorted(n for n in claimed if sum(1 for c in claims if n in c[5]) > 1)
     if contested:
-        racing = [f"#{n}" for n, _, _, _, added in claims if set(added) & set(contested)]
+        racing = [f"#{n}" for n, _, _, _, _, dup in claims if set(dup) & set(contested)]
         band = ", ".join(str(n) for n in contested)
         print(f"COLLISION: {band} claimed by more than one open PR ({', '.join(racing)}).")
         print(f"next free number: {overall + 1}   --   CONSIDER {overall + 4} INSTEAD: if every")

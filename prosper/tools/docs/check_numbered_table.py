@@ -581,6 +581,17 @@ def check(
             f"after a table's last row ENDS the table rather than splitting it, so no other check "
             f"here can see it."
         )
+    if fenced:
+        # An UNCLOSED fence makes every check here go quiet from that point on -- the marker scan
+        # above, the table scan below -- so a real conflict marker after it reads CLEAN. That is the
+        # skip turning into a blind spot rather than a trade, and unlike the fenced-example case it
+        # has no legitimate shape: a document that opens a fence and never closes it is malformed.
+        # Safe to gate on by the same measurement that made the marker scan safe: 0 of 101 tracked
+        # Markdown files end with an unbalanced fence count (#2610 review).
+        conflicts.append(
+            f"{path}: a fenced block is opened and never closed, so every check in this file goes "
+            f"silent from that point on -- including the conflict-marker scan. Close the fence."
+        )
     if conflicts:
         # Return immediately: every other class would be measuring a file that is half two files.
         return conflicts
