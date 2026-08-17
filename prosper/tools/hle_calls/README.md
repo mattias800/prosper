@@ -48,7 +48,8 @@ Output:
 ```
 clock=prosper::k_usleep entries=400/400 window=complete \
     positive-control=absent(attach:login-consumed-pre-window) \
-    armed=151 mode=attach calls=72 finish-failures=0 exited=0
+    armed=151 mode=attach calls=72 finish-failures=0 exited=0 \
+    elf=ET_EXEC load-bias=0x0 symbol-check=8/8
 positive-control-note: expected in attach mode and NOT a defect: init consumed the …
 first-calls: 1:pad_read_state  2:s_user_getevent  3:s_syss_getstatus  …
       36  s_user_getevent
@@ -299,14 +300,36 @@ Linux, `gdb` with Python support, `nm`/`c++filt`, and ptrace attach permitted
 binary must not be **stripped**: the driver enumerates handlers out of the symbol table with `nm`.
 Debug info is *not* required, including for `--values`.
 
-**The target must be non-PIE (`ET_EXEC`)**, which prosper's binaries are under the toolchains this
-project uses. Every breakpoint is armed at the raw link-time address `nm` reports; in a PIE those are
-offsets from a run-time load base, so each one lands in unmapped memory and gdb answers
-`Cannot insert breakpoint N / Cannot access memory at address 0x…` per handler. **The driver checks
-the ELF type and refuses with that explanation** rather than reporting a window that armed nothing.
-This is not hypothetical: Ubuntu's gcc defaults to `-pie` and Fedora's does not, so the same source
-builds differently on the two — measured when this tool's own test passed on Fedora and failed on a
-GitHub `ubuntu-24.04` runner. Rebuild with `-DCMAKE_EXE_LINKER_FLAGS=-no-pie`; the bias-aware fix is #2605.
+**PIE and non-PIE targets both work** (#2605). Every breakpoint is armed at the raw link-time address
+`nm` reports, which on an `ET_EXEC` binary is already the runtime address; on a PIE it is an offset
+from a base the kernel picks per run, so the tool reads that base out of the live process and adds it
+before arming. This matters because the toolchains disagree — Ubuntu's gcc defaults to `-pie` and
+Fedora's does not, so the same source builds differently on the two, and this tool's own test once
+passed on Fedora while failing on a GitHub `ubuntu-24.04` runner with
+`Cannot insert breakpoint N / Cannot access memory at address 0x…` per handler.
+
+The result block says where the breakpoints went, and you should read it:
+
+```
+… elf=ET_DYN load-bias=0x555555554000 symbol-check=8/8
+```
+
+- `load-bias` is `running entry − link-time entry`, the running one from `/proc/<pid>/auxv`'s
+  `AT_ENTRY` and cross-checked against gdb's own `info files`. It is **read, never assumed** — under
+  gdb the base is `0x555555554000` every time because gdb disables randomization, but an ordinary
+  `--pid` attach measured `0x5634df2d1000`, so a constant would be right until it silently was not.
+- `symbol-check=N/N` is the observation behind it: gdb was asked what lives at a sample of the
+  addresses about to be armed, and every one named a function *start*. A wrong bias (or a `--binary`
+  that is not the image the process is running) fails this and the run is **refused by name** —
+  `HLE_CALLS_ABORT: … do not land on a function start …` — before a single breakpoint is inserted.
+
+`--launch` on a PIE stops the process at its first instruction (`starti`, i.e. the dynamic loader's
+first instruction, before anything of the program has run) purely to read the base, then arms and
+continues. **No init coverage is lost**: the window still opens where it did on a non-PIE target, and
+the built-in `positive-control=ok` — the once-per-process LOGIN — is what says so.
+
+Requires gdb 8.1 or newer for `starti` on a PIE `--launch`; an older gdb is refused with that
+explanation, and `-DCMAKE_EXE_LINKER_FLAGS=-no-pie` remains a way out.
 
 ## Cost
 

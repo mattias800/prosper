@@ -18,6 +18,9 @@ environment so the driver can stay a plain subprocess call:
                       the launched emulator's entire run log would inherit that pipe and
                       accumulate in the driver's memory. gdb opens the path; it does not
                       create it, so the driver does that first.
+    HLE_CALLS_ELF_TYPE   the target's ELF `e_type` (2 = ET_EXEC, 3 = ET_DYN/PIE)
+    HLE_CALLS_ELF_ENTRY  its link-time entry point -- one half of the load-bias
+                      subtraction below (#2605)
 
 Every handler gets a Python breakpoint whose `stop()` counts the hit and returns
 False, so the inferior is never actually stopped for the user. The count is kept
@@ -50,6 +53,12 @@ both are printed unconditionally:
   * `window=complete|SHORT` says whether the clock really reached `--ticks`.
     `run`/`continue` also return on a signal gdb stops for, which would
     otherwise print a truncated histogram that reads as a finished window.
+  * `elf=`, `load-bias=` and `symbol-check=` say where the breakpoints actually
+    went. On an `ET_EXEC` target the bias is `0x0` and the check is a formality;
+    on a PIE it is the whole difference between a measurement and a window that
+    armed nothing, so it is derived from the live process and then verified
+    against gdb's own symbol table before a single breakpoint is inserted
+    (`_resolve_load_bias` / `_symbol_landing`, #2605).
   * `positive-control=` states the verdict on the value-capture mechanism
     itself, so the reader never has to derive it — and, critically, so the rule
     is applied **per mode**. See `_positive_control()` below for the whole state
@@ -90,6 +99,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hle_calls_control as _control
 
 
+def _abort(text):
+    """Stop the run with a named cause, rather than letting it produce a window that armed nothing.
+
+    The driver prints an `HLE_CALLS_ABORT:` line INSTEAD of the raw gdb transcript, so whatever is
+    said here is what a reader sees. Exit code 3 so a caller can tell "this tool refused" from "gdb
+    died" (1) -- both differ from a clean run's 0.
+    """
+    print("HLE_CALLS_ABORT: " + text)
+    sys.stdout.flush()
+    gdb.execute("quit 3")
+
+
 def _load_syms(path):
     out = []
     with open(path) as handle:
@@ -110,6 +131,17 @@ ORDER_N = int(os.environ.get("HLE_CALLS_ORDER", "24"))
 # 0 = off. When non-zero, snapshot this many bytes at a0/a1 before and after every call (#2045).
 OUT_BYTES = int(os.environ.get("HLE_CALLS_OUT_BYTES", "0"))
 INFERIOR_TTY = os.environ.get("HLE_CALLS_INFERIOR_TTY", "")
+# The target's linkage, from the driver's own read of the ELF header. ET_EXEC (2) means `nm`'s
+# addresses are already runtime addresses; ET_DYN (3) means they are offsets and the bias below has
+# to come from the live process. 0 = the driver did not recognise the file as an ELF.
+ELF_TYPE = int(os.environ.get("HLE_CALLS_ELF_TYPE", "2"))
+ELF_ENTRY = int(os.environ.get("HLE_CALLS_ELF_ENTRY", "0"))
+ET_EXEC = 2
+ET_DYN = 3
+AT_ENTRY = 9                    # auxv key: the entry point the kernel actually jumped to
+# How many enumerated symbols to verify land exactly on a function start before arming anything.
+# A sample, not the whole table: this is one gdb command per symbol and the table reaches ~750.
+SYMBOL_CHECK_N = 8
 
 # The built-in control for the value-capture mechanism, and the two values it can answer.
 # src/hle/hle_service.cpp `HLE(s_user_getevent)`: a function-local `static` flag makes the
@@ -412,6 +444,163 @@ def _on_exited(event):
     state["exited"] = True
 
 
+# --- load bias (#2605) --------------------------------------------------------------------------
+# Every address in SYMS is a LINK-TIME address, because that is what `nm` reports. On an ET_EXEC
+# target those are the runtime addresses and there is nothing to do. On a PIE (`ET_DYN`) they are
+# offsets from a base the kernel picks per run, and arming them unrelocated puts every breakpoint in
+# unmapped memory -- which is not a wrong measurement, it is no measurement, and it reads like one
+# (#2593 refused such a target outright; this replaces the refusal).
+#
+# The base is NOT guessed. gdb disables randomization by default, so `0x555555554000` is what a
+# launch under gdb happens to produce on x86-64 Linux today -- and an ordinary attach to a running
+# process measured `0x5634df2d1000`. A constant that is right until it silently is not is worse than
+# a refusal, so the bias is read from the process and then checked against a second, independent
+# source before anything is armed.
+
+
+def _auxv_entry(pid):
+    """The entry point the KERNEL jumped to, from `/proc/<pid>/auxv` -- or None.
+
+    `AT_ENTRY` is the runtime address of the ELF's `e_entry`, so their difference is the load bias by
+    definition, for a PIE and a non-PIE alike. This is the same quantity gdb derives for itself
+    (see `_gdb_entry_point`), obtained a different way, which is what makes the two a cross-check
+    rather than one value read twice.
+
+    Deliberately NOT "the first mapping in `/proc/<pid>/maps`", which is the obvious reading and is
+    wrong on the very target this tool exists for: prosper maps the GUEST image low, so a live
+    `boot_trace`'s first three map lines are `410000000-...` and the executable's own text does not
+    appear until far down the file (measured 2026-08-17 on a PIE build; the real bias that run was
+    `0x55b927796000`). A maps-based derivation therefore has to match the executable by path -- with
+    `(deleted)` suffixes, symlinks and containers to get right -- while `AT_ENTRY` is one unambiguous
+    word the kernel wrote.
+    """
+    try:
+        with open("/proc/%d/auxv" % pid, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    width = 8                   # x86-64: two 8-byte words per auxv entry
+    for off in range(0, len(data) - 2 * width + 1, 2 * width):
+        key = int.from_bytes(data[off:off + width], "little")
+        if key == AT_ENTRY:
+            return int.from_bytes(data[off + width:off + 2 * width], "little")
+    return None
+
+
+def _gdb_entry_point():
+    """gdb's own view of the running entry point, from `info files` -- or None.
+
+    Measured on gdb 17.2: before the inferior exists this reports the file's link-time entry, and
+    once the main executable has been relocated it reports the runtime one. So it answers the same
+    question as `AT_ENTRY` through gdb's displacement logic instead of the kernel's auxv.
+    """
+    try:
+        text = gdb.execute("info files", to_string=True)
+    except gdb.error:
+        return None
+    match = re.search(r"Entry point:\s*(0x[0-9a-fA-F]+)", text)
+    return int(match.group(1), 16) if match else None
+
+
+def _symbol_landing(bias, sample_n=SYMBOL_CHECK_N):
+    """Do the biased addresses actually land on the functions they name? `(exact, named, total, misses)`
+
+    This is the check that makes a wrong bias fail LOUDLY instead of producing an empty histogram.
+    It asks gdb -- whose symbol table is relocated independently of the arithmetic above -- what
+    lives at each address this run is about to arm. A correct bias yields `<name> in section .text`;
+    a wrong one yields `No symbol matches` (unmapped) or `<other> + 19` (mid-function). Both are
+    caught, and the caller refuses the run.
+
+    `exact` (the address is a function START) is the criterion, not the name: identical-code folding
+    can put two handlers at one address, so gdb naming the other one there is not an error. `named`
+    is reported alongside it for the reader, never used to refuse.
+    """
+    total = min(sample_n, len(SYMS))
+    if not total:
+        return (0, 0, 0, [])
+    # Spread across the table rather than taking the first N: a bias that is wrong only for part of
+    # the image (a mismatched --binary, a rebuilt target) shows up at the far end.
+    picks = [i * len(SYMS) // total for i in range(total)]
+    exact = named = 0
+    misses = []
+    for i in picks:
+        addr, name = SYMS[i]
+        try:
+            text = gdb.execute("info symbol %#x" % (addr + bias), to_string=True).strip()
+        except gdb.error as exc:
+            text = "info symbol failed: %s" % exc
+        head = text.split(" in section ")[0]
+        if " in section " in text and not re.search(r"\+ \d+$", head):
+            exact += 1
+            if name in text:
+                named += 1
+        else:
+            misses.append("%s -> %#x -> %s" % (name, addr + bias, text.splitlines()[0][:120]))
+    return (exact, named, total, misses)
+
+
+def _resolve_load_bias():
+    """`(bias, note)` -- and in launch mode this is what first brings the process into existence.
+
+    The hard half of #2605 is that `--launch` arms every breakpoint BEFORE the process runs, which is
+    the entire point of the mode (it is the only way to cover init), so there is no base to read yet.
+    `starti` resolves that without giving anything up: it stops at the FIRST instruction of the
+    process, which on a dynamically linked binary is the loader's `_start` -- measured on gdb 17.2,
+    the stop is at `_start () from /lib64/ld-linux-x86-64.so.2` with the executable already mapped
+    (`/proc/<pid>/maps` shows it) and gdb's symbols already relocated. Nothing of the program has run,
+    so the window still opens where it did before: no instruction of init is lost.
+
+    Rejected alternatives, so they are not re-derived:
+      * assuming gdb's disabled-randomization base -- see the block comment above;
+      * arming at the entry point, stopping there, then arming the rest -- that DOES lose the
+        instructions before the entry point, and `starti` makes it unnecessary;
+      * letting gdb relocate symbol-spec breakpoints (`break 'prosper::s_user_getevent'`) instead of
+        addresses -- gdb would handle the bias, but the specs are ambiguous for exactly the symbols
+        this tool arms: every handler is `static` (nm reports `t`), anonymous-namespace names are
+        not unique across translation units under GCC's `_GLOBAL__N_1` mangling, and a name matching
+        several locations silently changes what a row counts. Addresses select one function; the
+        enumeration already picked which one.
+    """
+    if ELF_TYPE != ET_DYN:
+        return (0, "ET_EXEC: link-time addresses are runtime addresses")
+    if MODE == "launch":
+        try:
+            gdb.execute("starti")
+        except gdb.error as exc:
+            _abort("this target is a PIE (ET_DYN), so its load bias can only be read from the "
+                   "running process, and `starti` -- which stops at the first instruction, before "
+                   "anything of the program has run -- failed: %s. `starti` needs gdb 8.1 or newer. "
+                   "Either use a newer gdb, or build the target non-PIE "
+                   "(cmake -DCMAKE_EXE_LINKER_FLAGS=-no-pie)." % exc)
+    try:
+        pid = gdb.selected_inferior().pid
+    except Exception:
+        pid = 0
+    if not pid:
+        _abort("this target is a PIE (ET_DYN) and there is no live inferior to read a load bias "
+               "from, so every breakpoint would land in unmapped memory. Refusing rather than "
+               "reporting a window that armed nothing.")
+    kernel = _auxv_entry(pid)
+    debugger = _gdb_entry_point()
+    if kernel is None and debugger is None:
+        _abort("this target is a PIE (ET_DYN) and neither /proc/%d/auxv nor gdb's own `info files` "
+               "would give the running entry point, so the load bias cannot be derived. Refusing "
+               "rather than reporting a window that armed nothing." % pid)
+    if kernel is not None and debugger is not None and kernel != debugger:
+        # Two independent readings of one quantity. If they disagree, one of them is about a
+        # different image than the other, and picking either would be a guess.
+        _abort("the running entry point disagrees between its two sources: /proc/%d/auxv AT_ENTRY "
+               "is %#x and gdb's `info files` says %#x. One of them is describing a different image "
+               "(a mismatched --binary, or an exec this tool did not follow). Refusing rather than "
+               "picking one." % (pid, kernel, debugger))
+    entry = kernel if kernel is not None else debugger
+    bias = entry - ELF_ENTRY
+    return (bias, "ET_DYN: %#x = running entry %#x - link-time entry %#x, from %s"
+            % (bias, entry, ELF_ENTRY,
+               "/proc/<pid>/auxv AT_ENTRY (gdb agrees)" if kernel is not None and debugger is not None
+               else "/proc/<pid>/auxv AT_ENTRY" if kernel is not None else "gdb `info files`"))
+
+
 def _positive_control():
     """Forwards to the lifted, gdb-free verdict machine (#2053).
 
@@ -432,10 +621,41 @@ gdb.execute("set confirm off")
 gdb.execute("handle SIGSEGV SIGBUS SIGILL SIGFPE nostop noprint pass")
 gdb.events.exited.connect(_on_exited)
 
+if MODE == "launch" and INFERIOR_TTY:
+    # Before `starti`/`run`, because it takes effect when the inferior is created. Without it the
+    # inferior inherits gdb's stdout/stderr, which the driver holds on a pipe until the window
+    # closes: the emulator's ENTIRE run log would then sit in the driver's memory (a
+    # PROSPER_GFXLOG/PROSPER_DBG log reaches 1.5 GB, and exhausting memory on this box takes every
+    # concurrent lane's shell down with it). gdb's own stdout stays on the pipe — the result block
+    # is a few hundred bytes.
+    # `set inferior-tty` OPENS this path and does not create it, so the driver creates and truncates
+    # it first — otherwise gdb aborts at `run` with "No such file or directory" before a single
+    # breakpoint fires. It also redirects the inferior's stdin. The path is interpolated unquoted,
+    # so the driver refuses whitespace (gdb itself handles spaces fine — see the note there; the
+    # restriction is this driver's, not gdb's).
+    gdb.execute("set inferior-tty %s" % INFERIOR_TTY)
+
+# On a PIE this starts the inferior (stopped at its first instruction) so the base can be read; on
+# an ET_EXEC target it costs nothing and returns 0.
+LOAD_BIAS, bias_note = _resolve_load_bias()
+LAUNCH_STARTED = MODE == "launch" and ELF_TYPE == ET_DYN
+exact, named, checked, misses = _symbol_landing(LOAD_BIAS)
+print("hle_calls: load bias %#x — %s" % (LOAD_BIAS, bias_note))
+if checked and exact != checked:
+    # The bias is arithmetic; this is the observation. gdb's symbol table is relocated by gdb's own
+    # logic, so it is an independent answer to "is this address the function we think it is" — and
+    # it is the check that turns a wrong bias into a named refusal instead of a silent empty window.
+    _abort("%d of %d sampled handler addresses do not land on a function start at load bias %#x, so "
+           "arming them would measure nothing. The binary passed to --binary is not the one this "
+           "process is running, or its load bias could not be derived. Misses: %s"
+           % (checked - exact, checked, LOAD_BIAS, "; ".join(misses[:4])))
+print("hle_calls: symbol check %d/%d sampled addresses land exactly on a function start "
+      "(%d also match by name)" % (exact, checked, named))
+
 armed = 0
 for addr, name in SYMS:
     try:
-        _Counter(addr, name)
+        _Counter(addr + LOAD_BIAS, name)
         armed += 1
     except gdb.error as exc:  # a symbol the running binary does not actually have
         print("hle_calls: skip %s (%s)" % (name, exc))
@@ -445,25 +665,15 @@ try:
 except gdb.error as exc:
     raise SystemExit("hle_calls: cannot set the clock breakpoint on %s: %s" % (CLOCK, exc))
 
-print("hle_calls: armed %d handler breakpoints; window = %d entries of %s (mode=%s values=%s)"
-      % (armed, TICKS, CLOCK, MODE, "on" if VALUES else "off"))
+print("hle_calls: armed %d handler breakpoints at load bias %#x; window = %d entries of %s "
+      "(mode=%s values=%s)" % (armed, LOAD_BIAS, TICKS, CLOCK, MODE, "on" if VALUES else "off"))
 
 if MODE == "launch":
-    if INFERIOR_TTY:
-        # Without this the inferior inherits gdb's stdout/stderr, which the driver holds on a
-        # pipe until the window closes: the emulator's ENTIRE run log would then sit in the
-        # driver's memory (a PROSPER_GFXLOG/PROSPER_DBG log reaches 1.5 GB, and exhausting
-        # memory on this box takes every concurrent lane's shell down with it). gdb's own
-        # stdout stays on the pipe — the result block is a few hundred bytes.
-        # `set inferior-tty` OPENS this path and does not create it, so the driver creates and
-        # truncates it first — otherwise gdb aborts at `run` with "No such file or directory"
-        # before a single breakpoint fires. It also redirects the inferior's stdin. The path is
-        # interpolated unquoted, so the driver refuses whitespace (gdb itself handles spaces
-        # fine — see the note there; the restriction is this driver's, not gdb's).
-        gdb.execute("set inferior-tty %s" % INFERIOR_TTY)
-    # Every breakpoint above is already in place, so the window opens at the
-    # process's first instruction — which is the whole point of this mode.
-    gdb.execute("run")
+    # Every breakpoint above is already in place, so the window opens at the process's first
+    # instruction — which is the whole point of this mode. On a PIE the process is already stopped
+    # AT that first instruction (see _resolve_load_bias), so `continue` opens the same window `run`
+    # does; nothing of init has executed either way.
+    gdb.execute("continue" if LAUNCH_STARTED else "run")
 else:
     gdb.execute("continue")
 
@@ -481,11 +691,17 @@ if VALUES:
     source = " value-source=dwarf:%d,rax:%d" % (state["src_dwarf"], state["src_rax"])
 if OUT_BYTES:
     source += " out-bytes=%d" % OUT_BYTES
+# `elf=`/`load-bias=`/`symbol-check=` are in the header rather than only in the arming line above
+# because the driver forwards only this block to stdout. A reader must be able to tell WHERE the
+# breakpoints went from the result itself: on a PIE that is the difference between a histogram and a
+# window that armed nothing, and the pair of them is also what says the tool ran at all (#2605).
 print("clock=%s entries=%d/%d window=%s positive-control=%s armed=%d mode=%s calls=%d "
-      "finish-failures=%d exited=%d%s"
+      "finish-failures=%d exited=%d elf=%s load-bias=%#x symbol-check=%d/%d%s"
       % (CLOCK, state["ticks"], TICKS, "complete" if state["ticks"] >= TICKS else "SHORT",
          control, armed, MODE, state["calls"], state["finish_failures"],
-         1 if state["exited"] else 0, source))
+         1 if state["exited"] else 0,
+         "ET_DYN" if ELF_TYPE == ET_DYN else "ET_EXEC" if ELF_TYPE == ET_EXEC else "unknown",
+         LOAD_BIAS, exact, checked, source))
 # Only a verdict of `ok` needs no explanation. Every other state carries the one sentence that
 # says whether the run is usable, so the reader does not have to have the README open to know.
 if control_note:

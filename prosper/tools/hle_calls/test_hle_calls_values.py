@@ -18,6 +18,18 @@ condition) and once with `-g` -- and runs the real driver over each. The two arm
 result more than self-agreement: the debug arm's values come from gdb's own ABI-aware decode, the
 stripped arm's from this tool's `%rax` read, and the test asserts they produce the SAME histogram.
 
+Three further arms guard the load-bias handling (#2605), and they are not interchangeable:
+
+  * `pie` — the same fixture built `-pie` must yield the SAME histogram as its `-no-pie` twin.
+  * `mismatched-binary` — a run whose `--binary` names a different image must be REFUSED by name.
+    This is the mutation arm for the landing check: without it the run also fails, but as an
+    unexplained `VOID` three steps from its cause.
+  * `attach-pie` — the only arm that can tell a *derived* bias from a hardcoded one. Under `--launch`
+    gdb disables randomization, so `0x555555554000` satisfies every launch-mode assertion above
+    (measured: a build with the bias replaced by that constant passes the `pie` arm in full and
+    fails only here). This arm reads the real base out of `/proc/<pid>/maps` itself and requires the
+    tool to have reported that number. It skips loudly where ptrace forbids attaching to a sibling.
+
 The price is a dependency on gdb, a C++ compiler, `nm` and `c++filt`. A missing one exits **77**,
 which CMake registers as `SKIP_RETURN_CODE`, so ctest reports the run as `(Skipped)` by name rather
 than as a pass. That distinction matters here more than usual: this repository already carries a
@@ -30,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, "hle_calls.py")
@@ -90,14 +103,65 @@ def gdb_can_launch(gdb):
     return None
 
 
-def compile_fixture(cxx, out, debug, pie=False, optional=False):
-    """Build the fixture. `-no-pie` is load-bearing, not tidiness.
+def attach_is_permitted(gdb):
+    """Can this gdb ptrace-attach to a SIBLING process here? `None` if it can, a reason if not.
 
-    hle_calls arms breakpoints at the raw link-time addresses `nm` reports, so the target must be
-    `ET_EXEC` -- as prosper's own binaries are. Ubuntu's gcc defaults to `-pie` while Fedora's does
-    not, so a fixture built without this flag is a different program on the two, and the CI arm of
-    this very test failed that way (`Cannot access memory at address 0x1149`, no result block) while
-    passing locally. The `pie=True` arm below exists to pin the REFUSAL that now replaces that spew.
+    Asked rather than inferred from a failed run. `kernel.yama.ptrace_scope=1` -- Ubuntu's default,
+    and therefore CI's -- permits attaching only to descendants, and gdb is a child of the driver
+    while the fixture is a child of this test, so they are siblings and the attach is refused. That
+    is an environment fact, not a regression in the tool, and it must not read as one.
+    """
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        probe = subprocess.run([gdb, "-p", str(child.pid), "-batch", "-ex", "quit"],
+                               capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "gdb could not be run for an attach probe: %s" % exc
+    finally:
+        child.kill()
+        child.wait()
+    text = (probe.stderr + probe.stdout).strip()
+    if probe.returncode != 0 or "ptrace" in text or "not permitted" in text:
+        return ("this gdb cannot attach to a sibling process here (kernel.yama.ptrace_scope?): %s"
+                % (text.splitlines()[-1][:160] if text else "gdb said nothing, exit %d"
+                   % probe.returncode))
+    return None
+
+
+def executable_base(pid, path):
+    """The load address of `path` in `pid`, read straight out of `/proc/<pid>/maps` -- or None.
+
+    Deliberately a SECOND, independent derivation of the number the tool reports: the tool reads
+    `AT_ENTRY` out of auxv and subtracts the ELF's link-time entry, while this matches the mapping by
+    pathname and takes its lowest start. Both must land on the same address. (The tool does not use
+    this method itself because prosper maps the guest image low, so the first line of a live
+    `boot_trace`'s maps is a guest mapping, not the executable.)
+    """
+    lowest = None
+    try:
+        with open("/proc/%d/maps" % pid) as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 6 and os.path.realpath(parts[-1]) == os.path.realpath(path):
+                    start = int(parts[0].split("-")[0], 16)
+                    lowest = start if lowest is None else min(lowest, start)
+    except OSError:
+        return None
+    return lowest
+
+
+def compile_fixture(cxx, out, debug, pie=False, optional=False):
+    """Build the fixture. The linkage is stated explicitly because BOTH shapes have to be covered.
+
+    hle_calls arms breakpoints at the raw link-time addresses `nm` reports. On an `ET_EXEC` target
+    those are the runtime addresses; on a PIE they are offsets from a base the kernel picks per run,
+    and the tool has to read that base out of the live process (#2605). Ubuntu's gcc defaults to
+    `-pie` while Fedora's does not, so a fixture built without an explicit flag is a DIFFERENT
+    program on the two -- which is how the CI arm of this very test once failed
+    (`Cannot access memory at address 0x1149`, no result block) while passing locally. Pinning the
+    flag makes each arm mean one thing, and the `pie=True` arms below cover the shape this box does
+    not produce by default.
     """
     cmd = [cxx, "-O0", "-g" if debug else "-g0",
            "-fPIE" if pie else "-fno-pie", "-pie" if pie else "-no-pie",
@@ -113,13 +177,19 @@ def compile_fixture(cxx, out, debug, pie=False, optional=False):
     return True
 
 
-def run_arm(binary, ticks=12, out_bytes=0):
-    """Run the real driver over one fixture build; return (header_fields, rows, outs, raw)."""
+def run_arm(binary, ticks=12, out_bytes=0, pid=None, symbols=None):
+    """Run the real driver over one fixture build; return (header_fields, rows, outs, raw).
+
+    `pid` attaches to an already-running process instead of launching one; `symbols` overrides
+    `--binary`, which is how the mismatched-binary arm below builds a wrong address by hand.
+    """
     cmd = [sys.executable, DRIVER, "--ticks", str(ticks), "--values", "--order", "8",
            "--filter", "^s_", "--timeout", "180"]
     if out_bytes:
         cmd += ["--out-bytes", str(out_bytes)]
-    cmd += ["--launch", binary]
+    if symbols:
+        cmd += ["--binary", symbols]
+    cmd += ["--pid", str(pid)] if pid else ["--launch", binary]
     done = subprocess.run(cmd, capture_output=True, text=True)
     raw = done.stdout + done.stderr
     fields, rows, outs = {}, {}, {}
@@ -154,13 +224,33 @@ def run_arm(binary, ticks=12, out_bytes=0):
     return fields, rows, outs, raw
 
 
-def check_arm(label, fields, rows, raw, expect_source):
+def check_arm(label, fields, rows, raw, expect_source, expect_elf="ET_EXEC", expect_mode="launch"):
     if not fields:
         check(False, "%s: the driver produced a result block\n%s" % (label, raw[-2000:]))
         return
     check(fields.get("window") == "complete" and fields.get("exited") == "0",
           "%s: the window closed on the clock, not on an exit (window=%s exited=%s)"
           % (label, fields.get("window"), fields.get("exited")))
+    # WHERE the breakpoints went. On an ET_EXEC target the bias must be exactly zero -- a non-zero
+    # one there would mean the tool relocated addresses that were already runtime addresses -- and on
+    # a PIE it must not be, because every link-time address is an offset (#2605). The symbol check
+    # is the observation behind both: gdb was asked what lives at each sampled armed address.
+    check(fields.get("elf") == expect_elf,
+          "%s: the header states the target's linkage (elf=%s, expected %s)"
+          % (label, fields.get("elf"), expect_elf))
+    bias = fields.get("load-bias", "")
+    if expect_elf == "ET_DYN":
+        check(bias.startswith("0x") and int(bias, 16) != 0,
+              "%s: a PIE run reports the load bias it resolved (load-bias=%s)" % (label, bias))
+    else:
+        check(bias == "0x0", "%s: an ET_EXEC run relocates nothing (load-bias=%s)" % (label, bias))
+    checked = fields.get("symbol-check", "")
+    match = re.fullmatch(r"(\d+)/(\d+)", checked)
+    check(bool(match) and match.group(1) == match.group(2) and int(match.group(2)) > 0,
+          "%s: every sampled armed address landed on a function start (symbol-check=%s)"
+          % (label, checked))
+    check(fields.get("mode") == expect_mode,
+          "%s: the run used the mode asked for (mode=%s)" % (label, fields.get("mode")))
     # THE regression. On master this reads finish-failures=<calls>, and every row (captured 0/N).
     check(fields.get("finish-failures") == "0",
           "%s: no capture failed (finish-failures=%s of calls=%s)"
@@ -303,7 +393,7 @@ def main():
         # the configuration on which every value capture failed.
         arms = (("no-debug-info", os.path.join(work, "fixture_nodbg"), False, "rax"),
                 ("debug-info", os.path.join(work, "fixture_dbg"), True, "dwarf"))
-        built = {}
+        built, measured = {}, {}
         for label, path, debug, expect in arms:
             if not compile_fixture(cxx, path, debug):
                 global fails
@@ -311,6 +401,7 @@ def main():
                 continue
             built[label] = path
             fields, rows, outs, raw = run_arm(path)
+            measured[label] = (fields, rows)
             check_arm(label, fields, rows, raw, expect)
         # Third arm: the same no-debug-info binary, now with --out-bytes. Run apart from the two
         # above so the default path (out-bytes off) stays covered rather than only the new one.
@@ -318,32 +409,95 @@ def main():
             fields, rows, outs, raw = run_arm(built["no-debug-info"], out_bytes=12)
             check_out_arm(fields, rows, outs, raw)
 
-        # Fourth arm: a PIE build must be REFUSED by name, not attempted. Every address this tool
-        # arms is a link-time address, so on a PIE they are offsets and each breakpoint lands in
-        # unmapped memory -- gdb then prints "Cannot insert breakpoint N" per handler and the run
-        # produces no result block, which is three steps from naming its own cause. This arm is here
-        # because that is exactly how the test failed on a GitHub ubuntu-24.04 runner while passing
-        # on Fedora: the two toolchains disagree on the -pie default, so the fixture was a different
-        # program on each.
+        # Fourth arm: a PIE build must produce the SAME measurement as its -no-pie twin (#2605).
+        # Every address this tool arms is a link-time address, so on a PIE they are offsets from a
+        # base the kernel picks per run; unrelocated, each breakpoint lands in unmapped memory and
+        # gdb prints "Cannot insert breakpoint N" per handler with no result block at the end --
+        # which is exactly how this test failed on a GitHub ubuntu-24.04 runner while passing on
+        # Fedora, the two toolchains disagreeing on the -pie default. #2593 replaced that with a
+        # refusal; this arm is the refusal's replacement, and the histogram equality below is what
+        # makes it a measurement rather than merely a non-crash.
         pie_path = os.path.join(work, "fixture_pie")
-        if compile_fixture(cxx, pie_path, debug=False, pie=True, optional=True):
+        have_pie = compile_fixture(cxx, pie_path, debug=False, pie=True, optional=True)
+        if have_pie:
+            fields, rows, _, raw = run_arm(pie_path)
+            check_arm("pie", fields, rows, raw, "rax", expect_elf="ET_DYN")
+            if "no-debug-info" in measured:
+                twin_fields, twin_rows = measured["no-debug-info"]
+                # The fixture calls each handler exactly once per loop and the clock closes the
+                # window at the end of the 12th, so the histogram is a fixed number -- and the two
+                # linkages must agree on all of it, name for name and count for count. A bias that
+                # is wrong by any amount cannot produce this: it produces no result block at all.
+                check(rows and {n: r["calls"] for n, r in rows.items()}
+                      == {n: r["calls"] for n, r in twin_rows.items()},
+                      "pie: the PIE histogram equals its -no-pie twin's, handler for handler (%s vs %s)"
+                      % (sorted((n, r["calls"]) for n, r in rows.items()),
+                         sorted((n, r["calls"]) for n, r in twin_rows.items())))
+                check(twin_fields.get("load-bias") == "0x0" and fields.get("load-bias", "0x0") != "0x0",
+                      "pie: and it got there through a non-zero bias its twin did not need "
+                      "(pie=%s no-pie=%s)" % (fields.get("load-bias"), twin_fields.get("load-bias")))
+
+        # Fifth arm: the check that makes a WRONG address refuse instead of measuring nothing.
+        # Constructed by hand rather than by disabling the fix: launch the PIE fixture while naming
+        # its -no-pie twin as the symbol source. The addresses are then real, well-formed, and about
+        # a different image -- the shape a stale --binary or a rebuilt target produces -- and every
+        # one of them lands in unmapped memory. Without this arm, "the PIE arm passed" would say
+        # nothing about whether a wrong bias is detectable at all.
+        if have_pie and "no-debug-info" in built:
             done = subprocess.run([sys.executable, DRIVER, "--ticks", "4", "--values",
-                                   "--filter", "^s_", "--timeout", "60", "--launch", pie_path],
+                                   "--filter", "^s_", "--timeout", "60",
+                                   "--binary", built["no-debug-info"], "--launch", pie_path],
                                   capture_output=True, text=True)
             message = done.stdout + done.stderr
+            # Note which of these three is load-bearing. A run with the landing check REMOVED also
+            # exits non-zero and also emits no result block -- gdb fails to insert the breakpoints
+            # and the driver reports VOID -- so those two pass either way and prove nothing on their
+            # own (measured: with `_symbol_landing` neutered, only the second check below fails).
+            # The two that discriminate are the abort line, which only the check can print, and the
+            # absence of gdb's insertion error, which only reaching the arming step can produce.
             check(done.returncode != 0,
-                  "pie: the driver refuses a PIE target (exit %d)" % done.returncode)
-            check("position-independent" in message and "-no-pie" in message,
-                  "pie: and the refusal names the cause and the fix (%s)"
-                  % message.strip().splitlines()[-1][:160] if message.strip() else "pie: no message")
-            # The refusal must come BEFORE any work, and the tell has to be a string only the
-            # not-taken path can print. Two earlier attempts here were void for exactly the reason
-            # this test exists to catch: "Cannot insert breakpoint" and "armed" both appear in the
-            # refusal itself, which QUOTES the gdb error it is preventing -- so each check would
-            # have passed or failed on the wording of the message rather than on the behaviour.
-            # `hle_calls: N handler symbols in ...` is printed only once enumeration has run.
-            check("handler symbols in" not in message,
-                  "pie: it refuses before enumerating handlers or starting gdb")
+                  "mismatched-binary: the run is refused (exit %d)" % done.returncode)
+            check("HLE_CALLS_ABORT:" in message and "do not land on a function start" in message,
+                  "mismatched-binary: and it says which check failed (%s)"
+                  % next((l for l in message.splitlines() if "ABORT" in l), "no abort line")[:200])
+            check("Cannot insert breakpoint" not in message,
+                  "mismatched-binary: it refused BEFORE arming — gdb never tried to insert a "
+                  "breakpoint into unmapped memory")
+            check("clock=" not in done.stdout,
+                  "mismatched-binary: no result block was produced — nothing was measured")
+
+        # Sixth arm: --pid against a PIE with the kernel's own randomization in play. This is the
+        # arm that separates a DERIVED bias from a hardcoded one: under gdb the base is
+        # 0x555555554000 every time (gdb disables randomization), so a constant would satisfy every
+        # launch-mode assertion above. Here the test reads the real base out of /proc itself and
+        # requires the tool to have reported that number.
+        if have_pie:
+            reason = attach_is_permitted(gdb)
+            if reason:
+                print("  [skip] attach-pie: %s" % reason)
+                print("         Nothing else in this test can tell a derived load bias from a "
+                      "hardcoded one, so that distinction is UNCHECKED on this machine.")
+            else:
+                child = subprocess.Popen([pie_path], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                try:
+                    time.sleep(1.0)
+                    base = executable_base(child.pid, pie_path)
+                    fields, rows, _, raw = run_arm(pie_path, pid=child.pid)
+                    check(base is not None and fields.get("load-bias") == "%#x" % base,
+                          "attach-pie: the reported bias is the base this process actually got "
+                          "(reported=%s /proc says=%s)"
+                          % (fields.get("load-bias"), None if base is None else "%#x" % base))
+                    check(sum(r["calls"] for r in rows.values()) > 0
+                          and fields.get("window") == "complete",
+                          "attach-pie: and the window measured real calls (window=%s calls=%s)"
+                          % (fields.get("window"), fields.get("calls")))
+                    check(fields.get("elf") == "ET_DYN" and fields.get("mode") == "attach",
+                          "attach-pie: on a PIE target, in attach mode (elf=%s mode=%s)"
+                          % (fields.get("elf"), fields.get("mode")))
+                finally:
+                    child.kill()
+                    child.wait()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
