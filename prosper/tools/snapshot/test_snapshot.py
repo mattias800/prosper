@@ -215,6 +215,37 @@ while True:
             with self.assertRaisesRegex(RuntimeError, "did not complete"):
                 SNAPSHOT.analyze_content_manifest(tmp, {"min_colors": 1})
 
+    def test_guest_fault_is_named_in_the_exit_status_message(self):
+        # The frontend's own `[shot] guest fault:` line goes to the run log, which is DEVNULL unless
+        # the caller asked for one. Without this the operator sees a bare exit code for a run whose
+        # guest crashed -- the same unreadable result as #2007 itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "capture.jsonl")
+            with open(manifest, "w") as f:
+                f.write(json.dumps({
+                    "type": "summary", "exit_code": 1, "saved": 25, "requested": 25,
+                    "guest_state": "faulted", "guest_kind": 2,
+                    "guest_detail": "SIGSEGV at addr=(nil)  rip=0x410024055 (image+0x24055)",
+                    "guest_fault_rip": "0x410024055", "status": "GUEST-FAULT",
+                }) + "\n")
+            suffix = SNAPSHOT._guest_failure_suffix(manifest)
+            self.assertIn("primary thread faulted", suffix)
+            self.assertIn("image+0x24055", suffix)
+
+            # An intact guest adds nothing, so the suffix cannot be reporting a fault for every
+            # failing run -- the assertion above would pass either way without this arm.
+            with open(manifest, "w") as f:
+                f.write(json.dumps({
+                    "type": "summary", "exit_code": 1, "saved": 2, "requested": 3,
+                    "guest_state": "running", "status": "FAILED",
+                }) + "\n")
+            self.assertEqual("", SNAPSHOT._guest_failure_suffix(manifest))
+            # A manifest an older binary wrote, or none at all, must not raise.
+            with open(manifest, "w") as f:
+                f.write(json.dumps({"type": "summary", "exit_code": 1}) + "\n")
+            self.assertEqual("", SNAPSHOT._guest_failure_suffix(manifest))
+            self.assertEqual("", SNAPSHOT._guest_failure_suffix(os.path.join(tmp, "absent.jsonl")))
+
     def test_content_result_reports_each_failed_contract(self):
         summary = {
             "qualifying": [{}], "pixel_changes": 0, "dimensions_consistent": True,

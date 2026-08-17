@@ -16,11 +16,18 @@
 //     --timeout S  give up after S seconds if the game isn't rendering enough (default 900; 0 = none)
 //     --warmup-seconds S  skip Vulkan rendering for S seconds before capture
 //     --warmup-submits N  skip Vulkan rendering before submit N
+//     --allow-guest-fault the guest's primary thread dying is not a failure (fault-repro routes)
+//
+// A run whose guest died still writes every PNG it managed to sample — frames from a crashing boot
+// are real evidence — but it reports `status=GUEST-FAULT` and exits non-zero, because every sample
+// after the fault is the same stale frame and no exit status used to say so (#2007).
 //
 // Reaching a rendering frame loop needs the guest switches the render frontier documents; this tool
-// defaults PROSPER_GUEST_FS=1 and PROSPER_GUEST_ARGS=-force-gfx-direct (Unity/Messenger recipe) if
-// they aren't already set. For other titles, set the appropriate env before running (e.g. a UE4
-// title: PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1).
+// defaults PROSPER_GUEST_ARGS=-force-gfx-direct (Unity/Messenger recipe) if it isn't already set,
+// and PROSPER_GUEST_FS=1 on APPLE ONLY — see the guarded set_environment call below and #2098; this
+// header used to claim the latter unconditionally, which is exactly the recipe agents copy from.
+// For other titles, set the appropriate env before running (e.g. a UE4 title:
+// PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1).
 #include "loader/linker.hpp"          // Program
 #include "host/boot_program.hpp"       // boot_program
 #include "host/exec_image.hpp"         // run_entry
@@ -269,7 +276,7 @@ int main(int argc, char** argv) {
     int render_every_arg = -1;
     uint64_t min_present_count = 0, min_frame_seq = 0, required_crc32 = 0;
     bool manifest_disabled = false, require_composited_frame = false, required_crc32_set = false;
-    bool warmup_seconds_set = false, warmup_submits_set = false;
+    bool warmup_seconds_set = false, warmup_submits_set = false, allow_guest_fault = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--every"   && i + 1 < argc) every = atoi(argv[++i]);
@@ -337,6 +344,7 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--require-composited-frame") require_composited_frame = true;
+        else if (a == "--allow-guest-fault") allow_guest_fault = true;
         else if (a == "--warmup-seconds" && i + 1 < argc) {
             warmup_seconds_set = true;
             if (!parse_nonnegative_double(argv[++i], warmup_seconds)) {
@@ -361,7 +369,8 @@ int main(int argc, char** argv) {
                         "[--render-every N] [--render-every-for-seconds S] "
                         "[--max-stale-seconds S] [--min-pixel-distinct-frames N] "
                         "[--max-pixel-stale-seconds S] [--require-composited-frame] "
-                        "[--min-present-count N] [--min-frame-seq N] [--require-crc32 N]\n");
+                        "[--min-present-count N] [--min-frame-seq N] [--require-crc32 N] "
+                        "[--allow-guest-fault]\n");
         return 2;
     }
     if (every < 1) every = 1;
@@ -489,6 +498,7 @@ int main(int argc, char** argv) {
         run_config.min_frame_seq = min_frame_seq;
         run_config.required_crc32_set = required_crc32_set;
         run_config.required_crc32 = static_cast<uint32_t>(required_crc32);
+        run_config.allow_guest_fault = allow_guest_fault;
         const std::string run_line = screenshot::manifest_run_json(run_config);
         if (fprintf(manifest, "%s\n", run_line.c_str()) < 0 || fflush(manifest) != 0) {
             fprintf(stderr, "screenshot: cannot write manifest header '%s': %s\n",
@@ -518,6 +528,14 @@ int main(int argc, char** argv) {
     })) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
     std::thread guest([&prog] {
         const BootResult result = run_entry(prog.imgs[0]);
+        // Hand the sampling thread the result FIRST. Without this the thread is detached with the
+        // fault known only to the log, the summary reports `status=ok`, and a dead-guest run is
+        // indistinguishable by exit status from a clean one (#2007). Publishing ahead of the log
+        // lines also biases the one-instruction race the right way: if the sampler happens to
+        // finish in between, the run still reports the fault, and the main thread's own report
+        // below carries kind/rip/addr/detail even when the backtrace lines lose the sprint.
+        screenshot::publish_guest_outcome(result.kind, result.fault_rip, result.fault_addr,
+                                          result.detail.c_str());
         fprintf(stderr,
                 "[shot] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
                 "rbp=0x%llx rsp=0x%llx\n",
@@ -693,20 +711,45 @@ int main(int argc, char** argv) {
         assertion_failed("required pixel CRC32 %08llx was not captured",
                          (unsigned long long)required_crc32);
 
+    // Read the guest's terminal state ONCE, after sampling has stopped, so the printed summary, the
+    // manifest summary and the process exit status all describe the same observation.
+    const screenshot::GuestOutcome guest_outcome = screenshot::read_guest_outcome();
+    if (guest_outcome.state == screenshot::GuestRunState::Faulted)
+        fprintf(stderr, "[shot] guest fault: the guest's primary thread died during capture "
+                        "(kind=%d rip=0x%llx addr=0x%llx %s). Every sample after that moment is "
+                        "stale by construction%s\n",
+                guest_outcome.kind,
+                (unsigned long long)guest_outcome.fault_rip,
+                (unsigned long long)guest_outcome.fault_addr,
+                guest_outcome.detail.c_str(),
+                allow_guest_fault ? "; --allow-guest-fault permitted it"
+                                  : "; pass --allow-guest-fault if this route is a deliberate "
+                                    "fault reproduction");
+    else if (guest_outcome.state == screenshot::GuestRunState::Returned)
+        fprintf(stderr, "[shot] guest exit: the guest's primary thread returned during capture "
+                        "(%s). This is not treated as a failure — a title may legitimately exit\n",
+                guest_outcome.detail.c_str());
+
+    screenshot::RunVerdict verdict =
+        screenshot::decide_run_verdict(exit_code != 0, guest_outcome, allow_guest_fault);
     if (manifest) {
         const std::string summary = screenshot::manifest_summary_json(
-            saved, count, timed_out, tracker, exit_code);
+            saved, count, timed_out, tracker, verdict, guest_outcome, allow_guest_fault);
         if (fprintf(manifest, "%s\n", summary.c_str()) < 0 || fclose(manifest) != 0) {
             fprintf(stderr, "[shot] manifest close failed: %s: %s\n",
                     manifest_path.c_str(), strerror(errno));
-            exit_code = 1;
+            // Re-fold rather than poke the exit code, so the printed status cannot drift away from
+            // the status the process actually exits with.
+            verdict = screenshot::decide_run_verdict(true, guest_outcome, allow_guest_fault);
         }
     }
     fprintf(stderr, "[shot] done: %d screenshot(s) in %s; source-distinct=%llu "
-                    "pixel-distinct=%llu max-source-stale=%.1fs max-pixel-stale=%.1fs status=%s\n",
+                    "pixel-distinct=%llu max-source-stale=%.1fs max-pixel-stale=%.1fs guest=%s "
+                    "status=%s\n",
             saved, out.c_str(), (unsigned long long)tracker.distinct_source_frames(),
             (unsigned long long)tracker.pixel_distinct_frames(), tracker.max_stale_seconds(),
-            tracker.max_pixel_stale_seconds(), exit_code ? "FAILED" : "ok");
+            tracker.max_pixel_stale_seconds(),
+            screenshot::guest_run_state_name(guest_outcome.state), verdict.status);
     gpu::close_gpu_timeline();
-    _exit(exit_code);   // the guest thread is detached and running guest code; don't block on teardown
+    _exit(verdict.exit_code);   // the guest thread is detached and running guest code; don't block on teardown
 }

@@ -889,6 +889,28 @@ def capture(entry, run_log=None):
             _cleanup(tmp)
 
 
+def _guest_failure_suffix(manifest):
+    """Name a guest-side death in the exit-status message.
+
+    The frontend's own `[shot] guest fault:` line goes to the run log, which is DEVNULL unless the
+    caller asked for one — so without this the operator sees a bare exit code for a run whose guest
+    crashed, which is the same class of unreadable result as #2007 itself.
+    """
+    try:
+        with open(manifest) as f:
+            for line in f:
+                event = json.loads(line)
+                if event.get("type") != "summary":
+                    continue
+                if event.get("guest_state") == "faulted":
+                    return (f" — the guest's primary thread faulted during capture"
+                            f" ({event.get('guest_detail', 'no detail')});"
+                            f" every sample after that moment is stale")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def capture_content(entry, run_log=None):
     """Run the title and measure normal composited screenshots, never renderer intermediates."""
     validate_content_entry(entry)
@@ -935,7 +957,8 @@ def capture_content(entry, run_log=None):
         if proc.poll() is None:
             raise RuntimeError(f"screenshot frontend exceeded {runner_timeout + 15}s")
         if proc.returncode != 0:
-            raise RuntimeError(f"screenshot frontend exited with code {proc.returncode}")
+            raise RuntimeError(f"screenshot frontend exited with code {proc.returncode}"
+                               f"{_guest_failure_suffix(os.path.join(tmp, 'capture.jsonl'))}")
         summary = analyze_content_manifest(tmp, entry)
         return summary["richest"]["path"], summary, tmp
     except Exception:

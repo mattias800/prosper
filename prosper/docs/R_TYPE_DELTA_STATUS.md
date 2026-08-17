@@ -532,11 +532,15 @@ the race no longer hides it. Tracked in #2006.
 
 Two apparatus notes for whoever picks that up:
 
-- **`tools/screenshot` prints `status=ok` after the guest thread has died** (#2007). On the
-  unthrottled default route it wrote 25 PNGs and reported `status=ok` while the log also carried
-  `[shot] guest thread ended: kind=2 detail=SIGSEGV … +0x24055`. The tells are
-  `source-distinct=1 pixel-distinct=1` and `max-*-stale` equal to the whole route. Read the
-  `guest thread ended` line before believing any `status=ok`, or pass `--min-pixel-distinct-frames`.
+- **`tools/screenshot` printed `status=ok` after the guest thread had died — fixed** (#2007). On
+  the unthrottled default route it wrote 25 PNGs and reported `status=ok` while the log also carried
+  `[shot] guest thread ended: kind=2 detail=SIGSEGV … +0x24055`. The tells were
+  `source-distinct=1 pixel-distinct=1` and `max-*-stale` equal to the whole route.
+  The same route now reports `guest=faulted status=GUEST-FAULT` and exits 1, and the manifest
+  summary carries `guest_state` / `guest_fault_rip`. The **reproduction is unchanged and still a
+  race**: on `20153833` with a warm page cache and `PROSPER_RENDER=1`, three attempts split two
+  boots to one fault, so retry the launch to get either arm. A route that *intends* to sample this
+  crash passes `--allow-guest-fault`.
 - The flat post-movie colour is *not* the same value as the pre-fault black (`crc=064567f8`); the two
   are distinguishable by CRC, which makes them separable in a route manifest.
 
@@ -769,8 +773,9 @@ the Force-device screen.
 The `dropcache` route is not yet a *guaranteed* win of the #1746 race on a shared host: of two
 consecutive attempts at this exact head, one booted (above) and one still faulted at
 `eboot+0x24055` after a verified 98.2 → 0.0 MB eviction. That is the same product decision recorded
-above, unchanged by this fix — retry the launch. Note that the losing run still printed
-`status=ok` (#2007); read the `guest thread ended` line, not the status.
+above, unchanged by this fix — retry the launch. The losing run used to print `status=ok`; since
+#2007 was fixed it prints `guest=faulted status=GUEST-FAULT` and exits 1, so a losing launch is now
+distinguishable from a winning one by exit status alone.
 
 Rung 3 (gameplay with real GPU draws) is the next step and needs an input route: the title screen
 waits on a button press.

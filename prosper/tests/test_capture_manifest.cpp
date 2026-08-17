@@ -182,12 +182,80 @@ int main() {
               "run header records a 40-char revision (or \"unknown\" outside a git checkout)");
     }
 
-    const std::string summary = manifest_summary_json(3, 5, true, tracker, 1);
+    CHECK(run.find("\"allow_guest_fault\":false") != std::string::npos,
+          "run header records whether a guest fault was permitted");
+
+    GuestOutcome running_guest;
+    const RunVerdict failed_verdict = decide_run_verdict(true, running_guest, false);
+    const std::string summary =
+        manifest_summary_json(3, 5, true, tracker, failed_verdict, running_guest, false);
     CHECK(summary.find("\"timed_out\":true") != std::string::npos &&
           summary.find("\"pixel_distinct_frames\":2") != std::string::npos &&
           summary.find("\"max_pixel_stale_seconds\":2.500000") != std::string::npos &&
           summary.find("\"exit_code\":1") != std::string::npos,
           "summary records incomplete failure");
+
+    // #2007: the guest runs on a DETACHED thread, so its BootResult reached only the log. The run
+    // then reported `status=ok` and exit 0 for a title that had died 0.4 s into the boot and been
+    // sampled 25 times off one stale frame. Three things must hold: the outcome survives the trip
+    // from the guest thread, a fault outranks a clean assertion sweep, and the verdict is the same
+    // object the summary line, the manifest and the exit status are all built from.
+    {
+        CHECK(read_guest_outcome().state == GuestRunState::Running,
+              "before the guest thread publishes anything the run is 'still running'");
+
+        // The exact values the R-Type Delta reproduction produced on master.
+        publish_guest_outcome(2, 0x410024055ull, 0,
+                              "SIGSEGV at addr=(nil)  rip=0x410024055 (image+0x24055)");
+        const GuestOutcome faulted = read_guest_outcome();
+        CHECK(faulted.state == GuestRunState::Faulted && faulted.kind == 2 &&
+              faulted.fault_rip == 0x410024055ull && faulted.fault_addr == 0 &&
+              faulted.detail.find("image+0x24055") != std::string::npos,
+              "a published guest fault survives the trip to the sampling thread intact");
+
+        const RunVerdict fault_verdict = decide_run_verdict(/*assertions_failed=*/false, faulted,
+                                                           /*allow_guest_fault=*/false);
+        CHECK(std::string(fault_verdict.status) == "GUEST-FAULT" && fault_verdict.exit_code == 1,
+              "a dead guest fails the run even though every capture assertion passed");
+
+        // Positive control for the discriminator: the same call with no fault must still be clean,
+        // so the check above cannot be satisfied by a verdict function that fails everything.
+        const RunVerdict clean = decide_run_verdict(false, running_guest, false);
+        CHECK(std::string(clean.status) == "ok" && clean.exit_code == 0,
+              "an intact guest with passing assertions is still ok and still exits 0");
+
+        // The opt-out permits the fault without laundering it: exit 0, but never `status=ok`.
+        const RunVerdict allowed = decide_run_verdict(false, faulted, /*allow_guest_fault=*/true);
+        CHECK(std::string(allowed.status) == "GUEST-FAULT-ALLOWED" && allowed.exit_code == 0,
+              "--allow-guest-fault permits the exit code without hiding the fault");
+        const RunVerdict allowed_but_failing = decide_run_verdict(true, faulted, true);
+        CHECK(std::string(allowed_but_failing.status) == "FAILED" &&
+              allowed_but_failing.exit_code == 1,
+              "--allow-guest-fault does not disarm the capture assertions");
+
+        const std::string fault_summary =
+            manifest_summary_json(25, 25, false, tracker, fault_verdict, faulted, false);
+        CHECK(fault_summary.find("\"guest_state\":\"faulted\"") != std::string::npos &&
+              fault_summary.find("\"guest_kind\":2") != std::string::npos &&
+              fault_summary.find("\"guest_fault_rip\":\"0x410024055\"") != std::string::npos &&
+              fault_summary.find("\"status\":\"GUEST-FAULT\"") != std::string::npos &&
+              fault_summary.find("\"exit_code\":1") != std::string::npos,
+              "the manifest summary carries the fault so batch consumers can filter on it");
+
+        // A guest whose entry RETURNS is reported but is not a failure: titles legitimately exit,
+        // and a truncated run is already caught by the saved/requested assertion.
+        publish_guest_outcome(0, 0, 0, "entry returned");
+        const GuestOutcome returned = read_guest_outcome();
+        const RunVerdict returned_verdict = decide_run_verdict(false, returned, false);
+        CHECK(returned.state == GuestRunState::Returned &&
+              std::string(returned_verdict.status) == "ok" && returned_verdict.exit_code == 0,
+              "a guest that exits normally is recorded but does not fail the run");
+        const std::string returned_summary =
+            manifest_summary_json(5, 5, false, tracker, returned_verdict, returned, false);
+        CHECK(returned_summary.find("\"guest_state\":\"returned\"") != std::string::npos &&
+              returned_summary.find("\"guest_fault_rip\":null") != std::string::npos,
+              "a normal guest exit is still visible in the manifest, with no fault address");
+    }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");

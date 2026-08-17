@@ -73,6 +73,54 @@ struct CaptureClassification {
     double pixel_stale_seconds = 0;
 };
 
+// Terminal state of the PRIMARY guest thread, as the sampling thread is able to observe it.
+//
+// Scope, and it is narrow on purpose: `run_entry` produces a `BootResult` for the one guest thread
+// it entered. A worker thread that faults recovers through its own per-thread recovery point and
+// never reaches here — on Linux a fatal worker fault already `_exit(90)`s the process, which every
+// caller that checks an exit status can see. The primary thread was the silent one (#2007).
+enum class GuestRunState : uint8_t { Running, Returned, Faulted };
+
+struct GuestOutcome {
+    GuestRunState state = GuestRunState::Running;
+    int kind = 0;              // BootResult::kind — 0 returned, 2 fatal fault (SEGV/BUS/FPE), 3 SIGILL
+    uint64_t fault_rip = 0;
+    uint64_t fault_addr = 0;
+    std::string detail;        // BootResult::detail, truncated to the channel's buffer
+};
+
+const char* guest_run_state_name(GuestRunState state);   // running | returned | faulted
+
+// The join between the DETACHED guest thread and the sampling thread — this is the entire mechanism
+// #2007 was missing, so treat it as load-bearing rather than as a convenience.
+//
+// `publish_guest_outcome` is called exactly once, by the guest thread, when `run_entry` returns.
+// `read_guest_outcome` may be called any number of times by the sampling thread; before the first
+// publish it reports `Running`. The publish is release-ordered and the read acquire-ordered, so a
+// reader that observes a terminal state also observes that state's fault fields and detail text.
+void publish_guest_outcome(int kind, uint64_t fault_rip, uint64_t fault_addr, const char* detail);
+GuestOutcome read_guest_outcome();
+
+// The one verdict a run reports: the `status=` token in the summary line, the `exit_code` in the
+// manifest, and the process exit status all come from here so they cannot disagree.
+struct RunVerdict {
+    const char* status = "ok";
+    int exit_code = 0;
+};
+
+// Fold the capture assertions and the guest's own terminal state into that single verdict.
+//
+//   guest faulted, not allowed   -> GUEST-FAULT          exit 1   (root cause outranks its symptoms)
+//   assertions failed            -> FAILED               exit 1
+//   guest faulted, allowed       -> GUEST-FAULT-ALLOWED  exit 0   (never "ok" — a fault stays visible)
+//   otherwise                    -> ok                   exit 0
+//
+// `Returned` is deliberately NOT a failure. The guest's entry legitimately returns when a title
+// exits, and a title that exits just as the last sample lands would otherwise make an intact run
+// flaky; a truncated run is already caught by the saved/requested assertion. It is still reported.
+RunVerdict decide_run_verdict(bool assertions_failed, const GuestOutcome& guest,
+                              bool allow_guest_fault);
+
 struct CaptureRunConfig {
     std::string title;
     std::string timestamp;
@@ -98,6 +146,7 @@ struct CaptureRunConfig {
     uint64_t min_frame_seq = 0;
     bool required_crc32_set = false;
     uint32_t required_crc32 = 0;
+    bool allow_guest_fault = false;
 };
 
 class CaptureTracker {
@@ -136,7 +185,11 @@ std::string manifest_sample_json(int index, const std::string& png_path,
                                  const CaptureObservation& observation,
                                  const CaptureClassification& classification,
                                  const std::string& input_route);
+// The verdict, the guest's terminal state and the opt-out are all required parameters: a caller that
+// forgets to wire the guest state must fail to compile rather than emit a summary that quietly omits
+// it, which is the shape of the defect this signature exists to prevent (#2007).
 std::string manifest_summary_json(int saved, int requested, bool timed_out,
-                                  const CaptureTracker& tracker, int exit_code);
+                                  const CaptureTracker& tracker, const RunVerdict& verdict,
+                                  const GuestOutcome& guest, bool allow_guest_fault);
 
 } // namespace prosper::screenshot
