@@ -4919,8 +4919,9 @@ resolved folds split into two orientations, and only `s4` is fixed:
 | `s16` | 4 | 8252 | `0x20f8482140` | `0x20f849233c` |
 | `s12` | 4 | 8252 | `0x20f849233c` | `0x20f8482140` |
 
-The two input/output pairs **swap** between orientations, and they do so in strict alternation — the
-resolved folds read ABABAB... in a period-11 pattern of 6 A to 5 B, i.e. exactly 24 x (6,5) = 144 / 120.
+The two input/output pairs **swap** between orientations, and they do so in a fixed repeating pattern —
+the resolved folds are one 11-fold block of 6 A and 5 B repeated 24 times, i.e. exactly 24 x (6,5) =
+144 / 120. It is not a strict A-B alternation: each period carries one A-A seam.
 That is the double-buffering `### The writer is the CONSUMER ITSELF` (above) documents, seen from the
 register side. Reading either column as "the" mapping is exactly the cross-dispatch attribution error
 that produced the retracted cyclic-table root cause.
