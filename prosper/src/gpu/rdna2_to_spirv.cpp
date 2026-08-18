@@ -13483,6 +13483,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             bool instance_vfetch = false;
             bool folded_vfetch = false; // by-fetch V# base already includes OFFSET/SOFFSET
             const ShaderResource* resolved_buffer = nullptr;
+            // Per-site buffer-op disposition (PROSPER_DBG). A buffer op that resolves a
+            // NUM_RECORDS=0 descriptor folds to zero (loads) or drops (stores) and emits NO memory
+            // access at all. That is architecturally correct for an empty descriptor, but in the
+            // emitted module it is INDISTINGUISHABLE from an op that was never decoded — both leave
+            // no trace. Offline dissection of a program whose buffer traffic has vanished therefore
+            // cannot tell "folded because the descriptor is empty" from "never reached the emitter",
+            // and those two have completely different causes. This line separates them.
+            const auto buf_op_disposition = [&](const char* how) {
+                if (!std::getenv("PROSPER_DBG")) return;
+                std::fprintf(stderr,
+                             "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d %s\n",
+                             (unsigned long long)b.diagnostic.program_address, in.pc,
+                             in.fmt == Rdna2Format::MUBUF ? "MUBUF" : "MTBUF",
+                             in.opcode, n, (int)is_store, (int)is_atomic, how);
+            };
             bool gta5_selected_sbuffer_consumer = false;
             bool indirect_pointer_descriptor_source = false;
             if (is_format) {
@@ -13576,6 +13591,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false; return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
+                    buf_op_disposition("zero-record");
                     // The exact live V# is empty. The producer admitted only selectors whose OOB
                     // result is zero; re-check that contract so a malformed table cannot silently
                     // turn SQ_SEL_1 into zero. Apply the result only to active EXEC lanes, preserving
@@ -13591,6 +13607,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     return true;
                 }
+                buf_op_disposition("emitted");
                 resolved_buffer = res;
                 binding = res->binding;
                 stride = res->stride;
@@ -13747,6 +13764,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
+                    buf_op_disposition("zero-record");
                     // The front half proved all four live V# words at this exact instruction and
                     // decoded NUM_RECORDS=0. RDNA2's OOB contract returns zero for every raw load
                     // component, drops raw stores, and performs no memory operation for an atomic.
@@ -13791,6 +13809,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     gta5_selected_sbuffer_consumer = true;
                 }
+                buf_op_disposition("emitted");
                 resolved_buffer = res;
                 binding = res->binding;
                 stride  = res->stride;
