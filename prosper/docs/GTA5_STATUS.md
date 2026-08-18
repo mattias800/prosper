@@ -3,13 +3,127 @@
 **Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws. The HUD, radar and
 tutorial text render; the 3D world does not.
 
-Tracker: **#1873**. Active frontier: **#2542** (#2481 is CLOSED and superseded by it; the
+Tracker: **#1873**. Active frontier: **#2542** and **#2690** — #2542 names ONE hanging compute
+program and its title still calls it "the sole remaining cause"; there are at least three (#2690).
+(#2481 is CLOSED and superseded by #2542; the
 pointer here and in `CLAUDE.md` said #2481 long after it closed). Route: `scripts/gta5/reach-story-mode.pad`
 (read its header — the flip timing is measured, not estimated, and the tab navigation needs four R1
 presses for a reason).
 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
+
+## Three hanging compute programs, not one — and the structurizer bypass behind them (2026-08-18)
+
+`0x413dc6700` is **not** the only program that hangs the GPU on this route. Declining it and re-running
+finds a second; declining both finds a third. The count is a **lower bound** — each decline only reveals
+the next one, and no run has yet finished the route with zero device losses.
+
+| # | program | found by declining | device loss at |
+| --- | --- | --- | --- |
+| 1 | `0x413dc6700` | *(nothing)* | `submit=9016 dispatch=40` |
+| 2 | `0x413e14900` | #1 | `submit=34930 dispatch=135` |
+| 3 | `0x413e16400` | #1, #2 | `submit=3628 dispatch=2946` |
+
+The submit indices are **not** monotonic down the table, and that is not a typo: each row is a
+different run whose trajectory changed when a program was declined, and submit ordering already varies
+run to run on this title (#2516). Read the column as "where this run died", never as a progression.
+
+Filed as **#2690**. `PROSPER_COMPUTE_SKIP_PROGRAM` has always accepted a comma list
+(`frontends/shared/live_compute.cpp:4247`), but every run in this document's history declined only one
+program, which cannot reveal a second — it only moves the loss past where most captures stop. With all
+three declined a run reached **400 s** with zero losses, but that run was **capped at 400 s and did not
+finish the route**, so it is not a zero-loss completion and does not close the search. Read the two
+sentences together: three is what declining twice revealed, not a total.
+
+**`0x413e16400` is the first with a named fallback cause**, from the reporter added in #2684:
+
+```
+[divloop-reject] program=0x413e16400 role=emit condition-region-not-branch-free at pc=230 ...
+```
+
+suggesting a chain from a named guard to a hung GPU: *guard refuses → every loop in the shader
+discarded → CFG dispatcher → emulated loop → `VK_ERROR_DEVICE_LOST`*.
+
+**Two of those arrows are weaker than the chain reads, and both are load-bearing.**
+
+- *→ CFG dispatcher* is **not** implied by the reject, and this document will not say what replaces
+  it. An empty loop list is one input among several to a decision taken in `emit_body`, over values
+  the reject site cannot see. That is the whole of what is established here.
+  **Three successive attempts to say something sharper were each false**, which is why the sharper
+  sentence is gone rather than refined: "falls back to the CFG dispatcher" (the reporter's own line
+  until #2700); "a shader with two branches and a refused loop is rejected outright and emits
+  nothing" (false — `portable_compute_dpp_ror8` reaches a dispatcher before `complex_compute_cfg` is
+  consulted, and `exact_compute_wave_cfg` has no branch-count term); and "every dispatcher entry
+  requires `allow_cfg_dispatcher`" (false — `emit_phase` and the LDS fminmax path do not consult it,
+  and the flag is not inherited across re-entry). The third was written to fix the second and was
+  narrower than it. **A narrower claim about another function is still a claim about another
+  function.** The trailing parenthetical is elided in the quote above so this block does not go stale
+  when #2700 lands.
+- *→ `VK_ERROR_DEVICE_LOST`* is **correlation plus mechanism, not proof**. The
+  `RADV_DEBUG=hang` / `vm_fault.log` check that established "genuine hang, not OOB write" has been run
+  for `0x413dc6700` only, never for either new program.
+
+### Barrier-phased programs bypass BOTH structured paths
+
+`0x413dc6700` emitted no `[divloop-reject]` line in the runs to date. **Do not read that as "it can
+never reach the structured paths" — an earlier draft of this section said exactly that, and it is
+wrong.** The bypass is conditional:
+
+- the phased branch is entered only when
+  `phased.guarded || initial_dispatch_active || force_barrier_phases`
+  (`rdna2_to_spirv.cpp:22055`), and `guarded && initial_dispatch_active` is refused at `:22079`;
+- `emit_phase` routes a phase to `emit_cfg_state_machine` only when `!guarded || initial_dispatch_active`
+  (`:22101`); otherwise the phase re-enters `emit_body` (`:22106`) and **can** report.
+
+**All three disjuncts matter, and the third is the one to look at first.** `force_barrier_phases` is
+how the *phased retry* is entered (`:22866`) — with `!guarded` and `initial_dispatch_active == 0` —
+so an enumeration over only the first two makes that retry look unreachable and quietly contradicts
+the paragraph below. It also happens to be the most plausible route for this program: it is
+barrier-phased, a guest `s_barrier` clears `cfg_dispatch_safe` (`:22717`), so it reaches `:22856`,
+takes the `!cfg_dispatch_safe` arm and hits the force retry. A reader working from a two-valued gate
+would rule out exactly the path that would settle the question.
+
+So "reaches neither structured path" holds only for `!phased.guarded && initial_dispatch_active != 0`
+**on the first entry**. In the guarded case every phase re-enters `emit_body` and can emit
+`[structured-wave-reject]`; on the force-retry route the retry is reached only *through* that
+reporter's own condition, so it necessarily emits one first. **Which case `0x413dc6700` is in has not
+been established**, and per #2690 the absence of a line is not by itself proof of anything — but the
+force-retry route above is the cheapest thing to check next, and needs no device loss.
+
+An experiment that routed loop-bearing phases into `emit_body` was tried and **did not move the
+outcome**: all three phases still produced dispatcher maps, because `emit_body` has its own gate —
+`allow_cfg_dispatcher && exact_compute_wave_cfg && !structured_compute_wave_cfg` (`:22856`) — that
+outranks the loop path.
+
+### Conjunct census for the non-phased population (#2695)
+
+Over 1,366 compute recompiles on this route: 906 `exact_wave=0`, **23** dispatcher cases, 437 structured.
+The 23 resolve to five distinct `(program, conjunct)` pairs — **4 `nested-wave-forward-if`**, 1
+`cross-lane-mbcnt`. A prediction that `cross-lane-mbcnt` would dominate was wrong — it is the rarer of the two. The
+reasoning behind the prediction was wrong too, and in a way worth recording: it rested on
+`cross-lane-mbcnt` being *the* conjunct with no `native_subgroup_size` escape, when in fact three of
+the four reported conjuncts lack one. That claim also reached #2695's commit message, where it is now
+uncorrectable, so it is corrected here.
+
+### Ruled out by the 2026-08-18 runs
+
+These belong to the canonical `## Ruled out` section far below; they are kept beside their evidence
+here and deliberately use a distinct heading so the two do not collide as anchors.
+
+- **"The guest flip stall discriminates the compute hang."** Falsified by its own control. `present_count`
+  (guest `present_flip` only) reads 0.19–0.32 of `frame_seq` with 131–300 s stalls in *both* the default
+  and `SKIP` arms. The stall is caused by the device loss that precedes it, and both arms lose the device
+  — at different times, from different programs. An early partial read showed `SKIP` at 1.00 and looked
+  like a clean discriminator; that was simply the control not having reached the stalling stage yet.
+  (2026-08-18, #2542.)
+- **"`PROSPER_CFG_TRIP_BOUND=N` + `_PROGRAM=` arms a bound."** It does not. `_PHASE` is **required**, and
+  without it the emitter prints `PROSPER_CFG_TRIP_BOUND_PHASE is REQUIRED and is unset: no bound emitted`
+  once, via `call_once`, and emits nothing. Three experiments were run on top of this assumption before
+  the line was read. The rule is already stated in this document's own env table — the failure was not
+  reading it. The **22,117-colour measurement recorded below** (§ *RESOLVED CHAIN*) **did** set
+  `_PHASE=0` and stands; it was publicly doubted before that was checked, and the retraction is on
+  #2542. (2026-08-18.)
 
 ## RESOLVED CHAIN: the world IS rendered, and then lit by nothing (2026-08-18)
 
