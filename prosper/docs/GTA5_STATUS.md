@@ -4875,8 +4875,9 @@ to a constant zero, 23 stores (41 dwords) dropped — **none of the 41 MUBUF sit
 access**. (The module is not access-free: it retains exactly one `StorageBuffer` access chain, from a
 non-MUBUF path.) After fold 88
 every fold resolves real descriptors. Measured in two runs whose submit numbering otherwise differs,
-and the boundary is **deterministic** in both: 3,608 zero-record folds (= 88 folds x 41 sites),
-contiguous at the very start, then none.
+and the boundary is **deterministic** in both: **88 zero-record folds** (3,608 buffer-op site
+observations = 88 folds x 41 sites), contiguous from fold 0, then none. No fold mixes the two states —
+0 of 352 are mixed — which is what makes 88 x 41 and 264 x 41 identities rather than coincidences.
 
 `PROSPER_COMPUTE_MEMPROBE=413dc6700:0:0:40` dumps that table and confirms both states are genuine: the
 bytes are **unchanged between its two sample points** for the empty ones too, so those dispatches are
@@ -4904,7 +4905,7 @@ the next (measured: the loss landed on `at=2`'s submit in one run and ~400 submi
 one in the next). The capture is also pre-submit, so it holds the *inputs* to the submit, not its
 result.
 
-### What the program is, from its resolved descriptors
+### What the descriptor shape establishes — and what it does not
 
 Every one of the five buffers carries **2063 records**, and the dispatch is `groups=9x1x1
 local=256x1x1` = 2304 threads. **The register→base assignment is NOT stable across folds** — the 264
@@ -4918,9 +4919,11 @@ resolved folds split into two orientations, and only `s4` is fixed:
 | `s16` | 4 | 8252 | `0x20f8482140` | `0x20f849233c` |
 | `s12` | 4 | 8252 | `0x20f849233c` | `0x20f8482140` |
 
-The two input/output pairs **swap** between orientations — which is the double-buffering the retraction
-below describes, seen from the register side. Reading either column as "the" mapping is exactly the
-cross-dispatch attribution error that produced the retracted cyclic-table root cause.
+The two input/output pairs **swap** between orientations, and they do so in strict alternation — the
+resolved folds read ABABAB... in a period-11 pattern of 6 A to 5 B, i.e. exactly 24 x (6,5) = 144 / 120.
+That is the double-buffering `### The writer is the CONSUMER ITSELF` (above) documents, seen from the
+register side. Reading either column as "the" mapping is exactly the cross-dispatch attribution error
+that produced the retracted cyclic-table root cause.
 
 What the shape establishes: a **2063-record, per-item read/modify/write or traversal-shaped pass** — one
 64-byte record per item read and written, plus two u32 inputs and two u32 outputs per item. It is
@@ -4928,7 +4931,8 @@ What the shape establishes: a **2063-record, per-item read/modify/write or trave
 descriptor shape does not identify the records as entities, does not identify the shader as visibility,
 and does not establish that it gates world content.
 
-**Read the cyclic-table retraction below before using any base address in that table.** Those are the
+**Read `## RETRACTED: the cyclic-table root cause` (above) before using any base address in that
+table.** Those are the
 bases resolved across a *whole run*, not one dispatch's. This program runs many times per submit with
 **different tables**, and attributing one dispatch's buffer to another is precisely the error that
 produced the retracted cyclic-table root cause. Re-deriving the link graph from `0x20f848417c` and
