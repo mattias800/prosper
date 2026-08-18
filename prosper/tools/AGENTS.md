@@ -1100,12 +1100,17 @@ already materialised — no submit, no GPU state, no reordering — so it can be
 `PROSPER_CFG_TRIP_BOUND`'s witness in the same run. That pairing is what established the causal
 direction (22/22: every runaway read an already-cyclic array).
 
+**The post-dispatch half and the dump additionally require the compute trace** — they live inside the
+writeback loop, so `PROSPER_COMPUTELOG_CODE=0xADDR` (or `PROSPER_COMPUTELOG`) must be set as well.
+Arming only `PROSPER_COMPUTE_PARENTSCAN` gives the pre-dispatch census and an empty dump directory,
+which looks like "nothing corrupted" rather than "the second half never ran".
+
 `PROSPER_COMPUTE_PARENTSCAN_DUMP=DIR` additionally writes the input and output arrays of a dispatch that
 turns a **clean** array cyclic — the transition only, with the retained input required to belong to that
 same dispatch, so the pair in one filename is genuinely one dispatch. Two caveats: the switch takes a
-**program address**, not `=1` (it says so if given something that cannot be one), and coverage depends on
-how often a buffer is materialised — `PROSPER_COMPUTE_BUFFER_CACHE_MB=0` raised it from 3 submits to 9
-on a routed run, though the mechanism for that is not established.
+**program address**, not `=1` (it says so if given something that cannot be one), and coverage varies: `PROSPER_COMPUTE_BUFFER_CACHE_MB=0` raised it
+from 3 submits to 9 on a routed run, and **why is not established** — the scan runs before
+`acquire_cached_buffer`, so the obvious "a cache hit skips the hook" explanation is wrong.
 
 **`PROSPER_COMPUTE_SKIP_PROGRAM=0xADDR[,0xADDR...]` — decline named compute programs.** A bisection
 instrument: one dispatch can take down everything after it (a GPU hang costs the process its compute

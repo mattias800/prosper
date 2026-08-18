@@ -4136,23 +4136,36 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
-- **`0x413dc6700` runs away because prosper's portable wave vote adds workgroup barriers the guest does
-  not have.** *Solid.* The scope difference is real and was worth testing: the guest contains **zero**
-  `s_barrier` (SOPP `0x0a`), its exit is per-wave (`s_cbranch_execz`, 64 lanes), and prosper emulates it
-  with a 256-way LDS OR plus eight `OpControlBarrier`, because the program's 256-thread workgroup is four
-  waves and the conservative multi-wave default refuses it a native contract
-  (`[subgroup] cs=0x413dc6700 guest-wave=64 native=0 multiwave=0`, against `native=64` for a single-wave
-  program beside it). `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` grants the exact subgroup shell, which
-  removes those workgroup barriers while keeping one native subgroup per guest wave. Two runs, identical
-  but for that switch, with `PROSPER_COMPUTE_PARENTSCAN`: **identical in every column** — 11 trip-bound
-  HITs, 21 cyclic inputs, 22 cyclic outputs, and the same device loss at `0x413d85e00` dispatch 55. The
-  barriers are not the mechanism. #2711, #2717.
-- **The corruption is produced by whatever consumes it / by prosper's own declines.** *Solid, both
-  halves.* `0x413dc6700` does **not** corrupt a clean input: eight consecutive submits show 88 dispatches
-  running `0 -> 0` on all four link arrays. It corrupts only after being handed a cyclic array, and a
-  single dispatch — clean input, terminating normally, not a runaway — turns a clean 2063-entry array
-  into 537 cyclic entries. Declining the other runaway programs is not the cause either: a run declining
-  **nothing** shows the same `0 -> 84` corruption. #2711, #2717.
+- **The eight `OpControlBarrier` in `0x413dc6700` are the guest's own `s_barrier`s rather than
+  emulation scaffolding.** *Solid.* They are not: the guest contains **zero** `s_barrier` (SOPP `0x0a`,
+  `kSoppOpcodeBarrier`), its loop exit is per-wave (`s_cbranch_execz`), and the emitted module votes
+  workgroup-wide — a 256-way OR of a per-lane pending bit into `LDS[260]`, with eight barriers around
+  it. Wave 64, workgroup 256, so four waves; the LDS array is 261 entries (256 lane slots + 4 wave
+  slots + the result) and the wave index is `%92 >> 6`. So the barriers are emulation scaffolding and
+  the scope is wider than the guest's. This falsifies the speculation recorded under "Void, not
+  falsified" below; it does **not** establish that the barriers cause anything. #2717.
+- **Whether that scope difference causes the corruption — still VOID, and for a known reason.** The
+  obvious A/B (`PROSPER_NATIVE_COMPUTE_MULTIWAVE=1`, two runs identical in every column: 11 trip HITs,
+  21 cyclic inputs, 22 cyclic outputs, same loss at `0x413d85e00` d55) **proves nothing**, because the
+  lever cannot move for this program. `PROSPER_NATIVE_COMPUTE_MULTIWAVE` sets only
+  `config.native_subgroup_size`; `rdna2_to_spirv.cpp:23668` then forces `b.native_subgroup_size = 0`
+  whenever `partial_barrier_phases || exact_partial_dispatcher`, and this dispatch is both
+  (`threads=2063`, `local=256`). Every wave-width lowering gates on `b.`, not `config.`. The
+  `[subgroup] … native=0 multiwave=0` line reports the **config**, not the emitted lowering, so it
+  cannot witness the arm either. This is instrument trap **164** — the same switch, the same program,
+  the same byte-identical module `d04fd09b13408f9b4da7287fae34f692` in both arms — and its rule
+  applies: hash the artefact the switch is supposed to change, **before** reading the outcome. A real
+  test needs a lever that reaches `b.native_subgroup_size`. #2717.
+- **`0x413dc6700` never corrupts a clean input.** *Falsified.* Eight consecutive submits do show 88
+  dispatches running `0 -> 0` on all four link arrays, which is what suggested it — but with coverage
+  widened to nine submits, **one dispatch with a clean input turns a clean 2063-entry array into 537
+  cyclic entries while terminating normally**, and is not a runaway. So the consumer does corrupt clean
+  input, on one dispatch in nine submits. That also restores this file's own
+  `### The writer is the CONSUMER ITSELF` finding, which an earlier revision of this row contradicted.
+  #2711, #2717.
+- **Our own `PROSPER_COMPUTE_SKIP_PROGRAM` declines leave stale arrays that read as cyclic.** *Solid.*
+  A run declining **nothing** shows the same corruption (`0 -> 84` at the first runaway submit) before
+  dying at `0x413e14900`. The workaround is not manufacturing the defect. #2711, #2717.
 
 - **`0x413dc6700` computes on zeros because prosper cannot express its pointer-chase load, so GTA V's
   world needs `PhysicalStorageBuffer` / `VK_KHR_buffer_device_address`.** *Solid.* Filed as #2709 and
