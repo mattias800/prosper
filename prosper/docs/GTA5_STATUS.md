@@ -4148,8 +4148,11 @@ falsification.
   guest's loop exit is **per-wave** (`s_cbranch_execz`), while the emitted module votes
   **workgroup-wide** — a 256-way OR of a per-lane pending bit into `LDS[260]`, four waves of 64 in a
   261-entry array, wave index `%92 >> 6`. The module carries **eight** `OpControlBarrier` against the
-  guest's **two**, so six are the vote's and two correspond to the guest's own phase boundaries.
-  Whether that scope difference causes anything is untested — see the next row. #2717.
+  guest's **two**. Of the eight, **three** immediately follow a store to the vote word — one per
+  dispatcher phase, the write→barrier→read the vote needs. The remaining five are **not attributed**:
+  saying "six are the vote's and two are the guest's" would be arithmetic, not a measurement, and the
+  mapping from the guest's two `s_barrier` onto specific emitted ones has not been established.
+  Whether the scope difference causes anything is untested — see the next row. #2717.
 - **`0x413dc6700` never corrupts a clean input.** *Falsified.* Eight consecutive submits do show 88
   dispatches running `0 -> 0` on all four link arrays, which is what suggested it — but with coverage
   widened to nine submits, **one dispatch with a clean input turns a clean 2063-entry array into 537
