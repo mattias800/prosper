@@ -4236,17 +4236,110 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             metadata.size());
                             } else if (!dcc_uncompressed) {
                                 static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;
-                                if (warned_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
+                                if (warned_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second) {
+                                    // WHICH KIND this metadata is, by positive correlation with
+                                    // retained renderer state -- never inferred from the descriptor.
+                                    // T# WORD6[21] (`compression_enabled`) is set for depth/stencil
+                                    // and colour alike, and AMD PAL puts GetHtile256BAddr() in the
+                                    // same `meta_data_address` field it uses for DCC, so the
+                                    // descriptor cannot separate them. This branch assumed DCC,
+                                    // which is how GTA V's main depth (0x2052ac0000, HTILE at
+                                    // 0x2055310000) came to be reported as "DCC-compressed" (#2674).
+                                    //
+                                    // This is the FIRST production caller of the correlator anywhere
+                                    // in the tree. It was easy to assume the compute path already
+                                    // used it -- a query is registered for it in this file -- but
+                                    // registering a query is not calling one, and on master every
+                                    // reference to `classify_compression_metadata_kind` outside its
+                                    // own definition is a test.
+                                    //
+                                    // Classified HERE, inside the first-sighting guard, rather than
+                                    // beside the footprint: the query walks the retained DS cache and
+                                    // the RTT map, which is O(surfaces) and this path runs per
+                                    // sampled texture. Behind the guard it runs at most once per
+                                    // (base, metadata) pair for the process, so the hot path is
+                                    // unchanged.
+                                    //
+                                    // Used ONLY TO REPORT. It deliberately does not change which
+                                    // footprint is taken or what is authorized: the HTILE helper is
+                                    // fail-closed on sample_count != 4 and this surface is
+                                    // single-sample, so routing it there today returns 0 exactly as
+                                    // the DCC helper does, while changing the path every other title
+                                    // takes. Widening that gate needs its own evidence (#2674).
+                                    const prosper::gpu::CompressionMetadataKind kind =
+                                        prosper::gpu::classify_compression_metadata_kind(
+                                            prosper::gpu::MetadataKindRequest{
+                                                r.metadata_addr, r.gpu_addr, r.format,
+                                                r.num_components, r.img_dim});
+                                    // Name the KIND, and print the inputs the sizing helpers
+                                    // actually gate on. The previous line called every declined
+                                    // surface "DCC-compressed" and omitted `samples` and
+                                    // `pipe_aligned` -- two of the three conditions in
+                                    // gfx10_htile_msaa_metadata_bytes(). The DCC sizer gates only on
+                                    // tile mode and bytes-per-texel; it takes `pipe_aligned` and
+                                    // explicitly discards it (`(void)pipe_aligned` in tile.cpp), so
+                                    // that field is diagnostic for the HTILE route only. Either way
+                                    // the old line could not say WHICH gate failed, and a reader
+                                    // chasing a depth surface was sent looking for a DCC defect.
+                                    //
+                                    // `first=` is printed only when bytes were actually read.
+                                    // metadata=0/0 means the footprint was zero, so nothing was
+                                    // fetched and the first byte is an unread default, not a
+                                    // measurement of the plane -- reporting 0x00 there stated a fact
+                                    // about our own buffer as though it were one about the guest.
+                                    //
+                                    // `ds_live=` disambiguates the TWO independent reasons the
+                                    // footprint can be zero, which the old line could not separate:
+                                    // the size expression is gated on `!has_ds_live` outright, or the
+                                    // sizing helper fail-closed on the shape. Without it,
+                                    // "metadata=0/0" is compatible with both and a reader is free to
+                                    // pick the one that suits their hypothesis -- which is how a gate
+                                    // analysis gets written against the wrong gate. One was.
+                                    //
+                                    // Read `ds_live=0` as "the size expression called a helper", NOT
+                                    // as "no retained DS image exists". The lookup above is itself
+                                    // gated on `!has_live_rtt && !is_storage_image && img_dim == 1 &&
+                                    // cls == Texture`, so a binding the gate rejects never reaches it
+                                    // and reads 0 for a reason that has nothing to do with residency
+                                    // -- on an `img_dim == 6` surface it is structurally 0.
+                                    //
+                                    // `dim=` and `ncomp=` are printed because the ROUTING, not the
+                                    // sample count, decides which gate applies:
+                                    // `dcc_metadata_footprint` reaches the HTILE sizer only for
+                                    // `img_dim == 6 && Float32 && num_components == 1`, and
+                                    // otherwise uses the DCC sizer, which fail-closes on tile mode
+                                    // and never looks at `sample_count`. All three conjuncts must be
+                                    // visible: `fmt=` cannot stand in for `ncomp=`, because it
+                                    // prints the DataFormat enum and `Float32` is reached from raw
+                                    // IMG_FMT 22/64/74/77 with one, two, three or four components.
+                                    // With any conjunct missing, "the sample count blocked it" and
+                                    // "it was never routed to the HTILE sizer at all" stay
+                                    // indistinguishable -- which they were, and a gate analysis was
+                                    // written against the wrong gate because of it.
+                                    const char* kind_name =
+                                        kind == prosper::gpu::CompressionMetadataKind::Htile
+                                            ? "HTILE"
+                                            : kind == prosper::gpu::CompressionMetadataKind::Dcc
+                                                  ? "DCC"
+                                                  : "UNCORRELATED";
+                                    char first_text[24] = "(unread)";
+                                    if (metadata_got)
+                                        std::snprintf(first_text, sizeof first_text, "0x%02x",
+                                                      metadata[0]);
                                     fprintf(stderr,
-                                            "[render] DCC-compressed sampled image addr=0x%llx "
-                                            "meta=0x%llx %ux%ux%u fmt=%u tile=%u is unsupported; "
-                                            "metadata=%zu/%llu first=0x%02x\n",
+                                            "[render] compressed sampled image kind=%s addr=0x%llx "
+                                            "meta=0x%llx %ux%ux%u fmt=%u ncomp=%u dim=%u tile=%u "
+                                            "samples=%u pipe_aligned=%u ds_live=%u is unsupported; "
+                                            "metadata=%zu/%llu first=%s\n",
+                                            kind_name,
                                             (unsigned long long)r.gpu_addr,
                                             (unsigned long long)r.metadata_addr,
-                                            tw, th, r.depth, (unsigned)r.format, r.tile_mode,
-                                            metadata_got,
-                                            (unsigned long long)metadata_bytes,
-                                            metadata_got ? metadata[0] : 0u);
+                                            tw, th, r.depth, (unsigned)r.format, r.num_components,
+                                            r.img_dim, r.tile_mode, r.sample_count,
+                                            r.meta_pipe_aligned ? 1u : 0u,
+                                            has_ds_live ? 1u : 0u, metadata_got,
+                                            (unsigned long long)metadata_bytes, first_text);
+                                }
                             }
                         }
                         // PROSPER_DS_UNBRIDGED_FAR=1 — DIAGNOSTIC ONLY, never a shipped default.
