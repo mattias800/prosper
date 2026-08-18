@@ -3102,6 +3102,64 @@ HLE(agc_patch_release_mem_data) {
     return 0;
 }
 
+// libSceAgc::Ikfdt-rIqCE — the jump-target patcher: fill in a Jump packet's target and length.
+//
+//   Ikfdt-rIqCE(packet, cache_policy, target_addr, target_size_dwords)
+//
+// Argument roles come from the guest's own disassembly — five direct call sites reached through the
+// adapter at eboot+0x1df090, each forming rdi=packet, esi=cache policy (observed 0 and 2), rdx=target
+// command-buffer address, ecx=size in dwords — and are confirmed by the live values below.
+//
+// THE PACKET IS OURS, AND THAT MATTERS MORE THAN THE NAME. A public catalogue labels this NID
+// `sceAgcJumpPatchSetTarget`, but that literal string hashes to `2BS4EtAaF28` (the separate
+// three-argument 3.20 export), so this is documented under its NID as the extended/cache-policy form
+// until a matching SDK header settles the spelling.
+//
+// Kyty's handler for this same NID validates IT_INDIRECT_BUFFER and writes cmd[1] address-low
+// preserving low control bits, cmd[2] address-high, and cmd[3] as cache policy in bits 28..29 with
+// size in bits 0..19. **Copying that here would corrupt the stream.** prosper's sceAgcDcbJump does not
+// emit IT_INDIRECT_BUFFER; it emits this project's custom IT_NOP/R_JUMP, whose payload the decoder
+// reads as [1..2]=target lo/hi, [3]=dword COUNT, [4]=predicated flag (pm4_decode.cpp R_JUMP). Kyty's
+// cmd[3] store would therefore land a policy-packed value on top of the segment's dword count.
+//
+// So the shape was measured before anything was written. A routed run with a probe that reported the
+// header and patched nothing (PPSA04263, Linux) gave the same answer at every call site:
+//
+//   [agc] JumpPatchTarget PROBE #0 cmd=0x203dfc5eb0 hdr=0xc0031078 op=0x10 r=0x1e count=3
+//         shape=IT_NOP/R_JUMP(ours) payload=00000000,00000000,00000000,00000000
+//         | policy=0x2 target=0x203dfe0080 ndw=0x23c7 -- NOT patched
+//
+// Two things that log settles. The packet is **ours** (`op=0x10 IT_NOP`, `r=0x1e R_JUMP`), so the
+// layout below is the right one; and its payload arrives **all zero**, so the guest creates the Jump
+// empty and relies on this call to fill it. Without this handler prosper folded an R_JUMP with
+// target=0 and dword count=0 — a jump to nothing — which is exactly the "prosper can fold a command
+// graph different from the one the guest built" confounder (#2711 Q5).
+//
+// cmd[4] is deliberately NOT touched: predication is owned by sceAgcSetPacketPredication on this same
+// packet, and the composite segments this title jumps to are predicated (#319). Cache policy has no
+// field in the R_JUMP representation and prosper's own sceAgcDcbJump likewise records no policy, so it
+// is logged rather than stored — a slot invented for it here would be read by nothing.
+// CONFIDENCE: HIGH on the argument roles and the packet shape (both measured); MED on cache policy
+// being safely ignorable, which holds only while the decoder has no policy semantics.
+HLE(agc_jump_patch_target) {
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, kDwJump * sizeof(uint32_t), "JumpPatchTarget")) return 0;
+    if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) return 0;
+    const uint32_t pre_lo = cmd[1], pre_hi = cmd[2], pre_ndw = cmd[3];
+    cmd[1] = (uint32_t)(a2 & 0xffffffffu);
+    cmd[2] = (uint32_t)(a2 >> 32u);
+    cmd[3] = (uint32_t)a3;
+    if (getenv("PROSPER_GFXLOG"))
+        // Print the PRE-patch payload next to the new one: a success line that only echoes its own
+        // argument cannot distinguish "patched" from "patched with what was already there", and here
+        // the pre-state is the evidence that the guest really did leave the packet empty.
+        fprintf(stderr, "[agc] JumpPatchTarget cmd=%p pre=(0x%08x%08x,ndw=%u) "
+                        "target=0x%llx ndw=%u policy=0x%llx\n",
+                (const void*)cmd, pre_hi, pre_lo, pre_ndw,
+                (unsigned long long)a2, (uint32_t)a3, (unsigned long long)a1);
+    return 0;
+}
+
 HLE(agc_dispatch_indirect_get_size)   { (void)a0; return kDwDispatchIndirect * 4u; }
 HLE(agc_dma_data_get_size)            { (void)a0; return kDwDmaData * 4u; }
 HLE(agc_event_write_get_size)         { (void)a0; return kDwEventWrite * 4u; }
@@ -3132,7 +3190,8 @@ void register_agc_hle() {
     RN("qMlfB1ZhMDc", agc_draw_index_offset_get_size);   // sceAgcDcbDrawIndexOffsetGetSize
     RN("mStuvI0zOtc", agc_draw_index_indirect_get_size); // sceAgcDcbDrawIndexIndirectGetSize
     RN("Abendgtz+3o", agc_dispatch_get_size);            // sceAgcCbDispatchGetSize
-    RN("MlEw1feXcjg", agc_patch_release_mem_data);       // ReleaseMem packet: set the data payload
+    RN("MlEw1feXcjg", agc_patch_release_mem_data);
+    RN("Ikfdt-rIqCE", agc_jump_patch_target);            // Jump packet: fill in target + dword count (#2711 Q5)       // ReleaseMem packet: set the data payload
     RN("w8HVkEeXPv8", agc_dispatch_indirect_get_size);   // sceAgcDcbDispatchIndirectGetSize
     RN("PxKWV2fVAps", agc_dispatch_indirect_get_size);   // sceAgcAcbDispatchIndirectGetSize
     RN("2ccJz9LQI+w", agc_dma_data_get_size);            // sceAgcDcbDmaDataGetSize
