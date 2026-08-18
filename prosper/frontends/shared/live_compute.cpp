@@ -4356,6 +4356,53 @@ ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_count) {
     return out;
 }
 
+// Retained pre-dispatch copies for PROSPER_COMPUTE_PARENTSCAN, keyed by guest address. Small and
+// bounded: one 8 KiB array per link buffer, overwritten each dispatch.
+std::map<uint64_t, std::vector<uint8_t>>& parent_scan_stash_map() {
+    static std::map<uint64_t, std::vector<uint8_t>> m;
+    return m;
+}
+std::mutex& parent_scan_stash_mutex() { static std::mutex m; return m; }
+
+void parent_scan_stash(uint64_t addr, const uint8_t* bytes, size_t count) {
+    if (!bytes || !count || count > (1u << 20)) return;
+    std::lock_guard<std::mutex> lk(parent_scan_stash_mutex());
+    auto& v = parent_scan_stash_map()[addr];
+    v.assign(bytes, bytes + count);
+}
+
+// Write the input and output of a dispatch that turned a clean link array cyclic. This is the artifact
+// the whole investigation has lacked: the exact bytes that provoke the defect, captured at the moment it
+// happens rather than sampled afterwards.
+void parent_scan_dump_pair(uint64_t addr, const uint8_t* after, size_t count,
+                           uint64_t code, uint64_t submit, uint64_t dispatch) {
+    const char* dir = std::getenv("PROSPER_COMPUTE_PARENTSCAN_DUMP");
+    if (!dir || !*dir) return;
+    std::vector<uint8_t> before;
+    {
+        std::lock_guard<std::mutex> lk(parent_scan_stash_mutex());
+        auto it = parent_scan_stash_map().find(addr);
+        if (it != parent_scan_stash_map().end()) before = it->second;
+    }
+    char path[512];
+    for (int half = 0; half < 2; ++half) {
+        const std::vector<uint8_t>* src = nullptr;
+        std::vector<uint8_t> tail;
+        if (half == 0) { src = &before; }
+        else { tail.assign(after, after + count); src = &tail; }
+        if (src->empty()) continue;
+        std::snprintf(path, sizeof(path), "%s/parent_%llx_s%llu_d%llu_%s.bin", dir,
+                      (unsigned long long)addr, (unsigned long long)submit,
+                      (unsigned long long)dispatch, half == 0 ? "in" : "out");
+        if (FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(src->data(), 1, src->size(), f);
+            std::fclose(f);
+            std::fprintf(stderr, "[parentscan-dump] program=0x%llx wrote %s (%zu bytes)\n",
+                         (unsigned long long)code, path, src->size());
+        }
+    }
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -5044,6 +5091,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (std::strtoull(pscan, nullptr, 16) ==
                             static_cast<uint64_t>(item.code_addr) && resource->stride == 4u) {
                         const ParentScanResult ps = scan_parent_array(source, buffers[i].bytes);
+                        // Stash the input so the post-dispatch half can dump BOTH halves the instant it
+                        // sees a clean->cyclic transition. Without this the corrupting dispatch is only
+                        // ever observable through six sampled ring members: the array that produced it is
+                        // gone by the time we know it mattered, and a capture cannot be aimed at it
+                        // (arming one changes which dispatches corrupt).
+                        parent_scan_stash(resource->gpu_addr, source, buffers[i].bytes);
                         std::fprintf(stderr,
                                      "[parentscan] program=0x%llx submit=%llu dispatch=%llu "
                                      "binding=%u addr=0x%llx records=%u terminating=%u cyclic=%u "
@@ -8782,6 +8835,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  (unsigned long long)buffer.resource->gpu_addr,
                                  pa.records, pa.terminating, pa.cyclic, pa.cycle_nodes, pa.longest,
                                  (unsigned long long)buffer.changed_bytes);
+                    if (pa.cyclic > 0)
+                        parent_scan_dump_pair(buffer.resource->gpu_addr, bytes,
+                                              buffer.resource->size, item.code_addr,
+                                              item.submit_no, item.dispatch_index);
                     for (uint32_t s = 0; s < pa.sample_count; ++s)
                         std::fprintf(stderr,
                                      "[parentscan-ring]   idx=%u word=0x%08x -> next=%u%s\n",
