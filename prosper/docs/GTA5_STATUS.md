@@ -113,10 +113,17 @@ here and deliberately use a distinct heading so the two do not collide as anchor
 
 - **"The guest flip stall discriminates the compute hang."** Falsified by its own control. `present_count`
   (guest `present_flip` only) reads 0.19–0.32 of `frame_seq` with 131–300 s stalls in *both* the default
-  and `SKIP` arms. The stall is caused by the device loss that precedes it, and both arms lose the device
-  — at different times, from different programs. An early partial read showed `SKIP` at 1.00 and looked
-  like a clean discriminator; that was simply the control not having reached the stalling stage yet.
-  (2026-08-18, #2542.)
+  and `SKIP` arms. The stall follows the device loss that precedes it, and in the pair measured here
+  both arms lost the device — at different times, from different programs. **Two other runs did not lose it:** § *Gameplay
+  frame characterised end to end* records two that declined `0x413dc6700` alone with **zero** losses.
+  That is an observation, not a mechanism — per the standard in § *Three hanging compute programs, not
+  one*, neither finished the route (one stopped with the guest still running, one on its own 520 s
+  timeout), so their zero losses are equally consistent with a window that ended before the next
+  program's loss. **Nothing in the record separates
+  that from nondeterminism**, and the flip measurement here records no duration, no loss timestamp and
+  no list of which programs its `SKIP` arm declined. An early partial read showed `SKIP` at
+  1.00 and looked like a clean discriminator; that was simply the control not having reached the
+  stalling stage yet. (2026-08-18, #2542.)
 - **"`PROSPER_CFG_TRIP_BOUND=N` + `_PROGRAM=` arms a bound."** It does not. `_PHASE` is **required**, and
   without it the emitter prints `PROSPER_CFG_TRIP_BOUND_PHASE is REQUIRED and is unset: no bound emitted`
   once, via `call_once`, and emits nothing. Three experiments were run on top of this assumption before
