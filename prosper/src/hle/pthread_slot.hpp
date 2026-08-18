@@ -19,7 +19,9 @@
 //                                  0x115510 -> GOT 0x1922e0 -> 9UK1vLZQft4 (scePthreadMutexLock)
 //
 // The two differ in what they do with the RESULT — `_Cnd_wait` discards it, `_Mtx_lock` maps it
-// onto a `_Thrd_*` code — and that difference is not the point here. The point is what neither of
+// onto a `_Thrd_*` code (that mapping is `thrd_rc_from_mutex_lock` below, landed by #2626; it was
+// still a discard when this paragraph was written) — and that difference is not the point here,
+// which is why #2596 deferred it. The point is what neither of
 // them does: **inspect the slot**. Each is a single call with the guest's slot pointer passed
 // straight through, so every question about "is this object initialised, destroyed, or a static
 // sentinel" is answered inside libkernel. A private `if (*slot)` guard in prosper's C11 handler
@@ -150,6 +152,7 @@
 // read by no caller here.
 #pragma once
 
+#include "sce_errno.hpp"     // the libkernel encoding the Sony spelling and the C11 wrapper both use
 #include "sync_retire.hpp"   // SyncObjectKind — the destroy pair keeps its own census bucket
 
 #include <cstdint>
@@ -183,6 +186,105 @@ uint64_t guest_cond_wait_slot(uint64_t cond_slot, uint64_t mutex_slot);
 // EBUSY(16) when the condvar still has waiters — checked BEFORE the slot is claimed, so a refusal
 // leaves the guest a handle that still works (#2168).
 uint64_t guest_cond_destroy_slot(uint64_t slot_addr, SyncObjectKind kind);
+
+// --- the three result conventions those bodies feed (#2626) --------------------------------------
+// THREE spellings reach the identical body and each reports its failure differently. Getting this
+// wrong is the #1612/#1945 family, and it has cost this project a title:
+//
+//   POSIX  `pthread_mutex_lock`   -> the BARE FreeBSD errno, exactly what the bodies above return.
+//   Sony   `scePthreadMutexLock`  -> `sce_pthread_rc` below: 0x8002_0000 | that errno.
+//   C11    `_Mtx_lock`            -> a Dinkumware `_Thrd_*` code, `thrd_rc_from_mutex_lock` below.
+//
+// The C11 transform is DEFINED IN TERMS OF the Sony one rather than beside it, because that is how
+// the guest's own wrapper computes it: it compares `scePthreadMutexLock`'s ENCODED result against
+// the encoded constant. Re-derived independently for #2626 from the shipped `libc.prx` of
+// PPSA24651 — flattened with `tools/il2cpp/prx_to_elf.py`, the export located by NID
+// (`_Mtx_lock` = `iS4aWbUonl0`) in the dynsym at 0x5e80 with st_size 29, the body decoded with
+// `tools/re/edis.py`, and the call taken to its import through the JMPREL slot with
+// `tools/re/stub_nid_map.py` (0x115510 -> `9UK1vLZQft4` scePthreadMutexLock, libkernel):
+//
+//     push rbp; mov rbp,rsp
+//     call   0x115510            ; scePthreadMutexLock
+//     xor    ecx,ecx
+//     cmp    eax,0x8002000b      ; SCE_KERNEL_ERROR_EDEADLK — the ENCODED form, not a bare 11
+//     setne  cl
+//     add    ecx,0x3             ; ecx = 3 if EDEADLK, 4 otherwise
+//     test   eax,eax
+//     cmovne eax,ecx             ; success passes through untouched
+//     pop rbp; ret
+//
+// Two independent controls came with that decode and both fired: `_Mtx_unlock` (0x5e70, 13 bytes)
+// reproduced its recorded `xor eax,eax` DISCARD byte for byte, so this method resolves the right
+// symbol; and `_Mtx_trylock` (0x5ea0, 29 bytes) carries the SAME transform against 0x80020010
+// (encoded EBUSY). That second one is what settles the NAME rather than only the number: two
+// different libkernel refusals — "would deadlock" and "already held" — both land on 3, which is
+// what `_Thrd_busy` means and nothing else in the enum does.
+// CONFIDENCE: HIGH on the numbers (they are the guest's own bytes, quoted above) and on the names
+// (Dinkumware's `_Thrd_*` ordering, already relied on by the `_Thrd_error`(4) reading recorded
+// above SCE_PTHREAD_ALIAS in hle_kernel.cpp).
+inline uint64_t sce_pthread_rc(uint64_t posix_rc) {
+    // Pass through success, and anything a body already encoded or that is not an errno.
+    if (posix_rc == 0 || (posix_rc & ~0xffull) != 0) return posix_rc;
+    return hle::sce_kernel_error(static_cast<hle::FreeBsdErrno>(static_cast<uint32_t>(posix_rc)));
+}
+
+// Dinkumware's C11 result enum, in its declaration order. Only the three the mutex-lock transform
+// can produce are reachable from here; the other two are spelled out so a future `_Mtx_timedlock`
+// transform does not have to re-guess the ordering. Every value below is PINNED BY THE GUEST'S OWN
+// BYTES rather than by analogy to a published header — each is the constant a decoded wrapper in the
+// shipped `libc.prx` of PPSA24651 actually produces (#2626):
+//
+//   0 success   every wrapper: `test eax,eax` then `cmove`/`je` — success passes through untouched
+//   1 nomem     `_Cnd_init`      0x5560: cmp ecx,0x8002000c (ENOMEM)    -> lea eax,[rax+rax*2+1]
+//   2 timedout  `_Mtx_timedlock` 0x5ec0: cmp eax,0x8002003c (ETIMEDOUT) -> lea ecx,[rcx+rcx*1+2]
+//   3 busy      `_Mtx_trylock`   0x5ea0: cmp eax,0x80020010 (EBUSY)     -> add ecx,3
+//   4 error     all four: the failure none of them discriminates
+//
+// THIS ENUM IS NOT THE WHOLE RANGE, and the promise above is deliberately narrower than it once was.
+// An earlier revision offered these values to a future `_Cnd_timedwait` transform as well, and that
+// reader would have been one value short: `_Cnd_timedwait` (0x5680, 73 bytes, its call taken through
+// the JMPREL slot to 0x115650 -> `BmMjYxmew1w` scePthreadCondTimedwait) produces a value outside
+// {0..4}.
+//
+//     56a2: cmp eax,0x8002003c   ; ETIMEDOUT -> mov eax,2
+//     56ad: test ecx,ecx         ; success   -> 0
+//     56b1: cmp ecx,0x80020001   ; EPERM
+//     56b7: sete al
+//     56ba: or   eax,0x4         ; EPERM -> 5, anything else -> 4
+//
+// So its full transform is `0->0, ETIMEDOUT->2, EPERM->5, else->4`. That it discriminates EPERM at
+// all agrees with the #2327 note above `guest_mutex_not_owned_by_self` in hle_kernel.cpp, which
+// records Sony's own `_Cnd_timedwait` testing for it — two independent readings of the same
+// behaviour. The 5 is recorded here so the follow-up does not re-derive it, and deliberately NOT
+// added to the enum below: the bytes give the NUMBER, and Dinkumware's spelling for it has not been
+// traced in this repository. Naming it would be the same unforced guess the block above
+// `thrd_rc_from_mutex_lock` declines to make about which exception `_Thrd_busy` raises.
+// CONFIDENCE: HIGH on every number, address and byte in this block (the guest's own bytes,
+// re-derived with prx_to_elf.py / edis.py / stub_nid_map.py). The names carry the confidence stated
+// above `sce_pthread_rc`, which is where they come from.
+enum : uint64_t {
+    kThrdSuccess  = 0,
+    kThrdNomem    = 1,
+    kThrdTimedout = 2,
+    kThrdBusy     = 3,
+    kThrdError    = 4,
+};
+
+// `_Mtx_lock`'s result transform, applied to a BARE body result. Note what it is NOT: "zero stays
+// zero, non-zero becomes an error". The guest's wrapper spends four instructions singling EDEADLK
+// out, so the two refusals are meant to be distinguishable and collapsing them is a defect even
+// though both are non-zero. What the difference costs is recorded rather than inferred: the
+// `_Thrd_error`(4) path is the one this repository has already traced to
+// `std::_Throw_C_error(4)` -> an uncaught `std::system_error("invalid argument")` that terminates
+// the guest (see the note above SCE_PTHREAD_ALIAS in hle_kernel.cpp, and #1945 where it killed
+// *The Oregon Trail*). The exact exception Dinkumware raises for `_Thrd_busy` has NOT been traced
+// here and is deliberately not stated — what is established is that it is a different path from the
+// one that terminates.
+inline uint64_t thrd_rc_from_mutex_lock(uint64_t posix_rc) {
+    const uint64_t sce = sce_pthread_rc(posix_rc);
+    if (sce == 0) return kThrdSuccess;
+    return sce == hle::kSceKernelErrorEDEADLK ? kThrdBusy : kThrdError;
+}
 
 // Test-only. The missed-wakeup generation counter is bumped by exactly one function
 // (`guest_cond_advance`, hle_kernel.cpp) whose only callers are the signal/broadcast bodies, and its

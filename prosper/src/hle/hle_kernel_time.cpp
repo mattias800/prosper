@@ -826,12 +826,23 @@ HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthre
 // the pair's 30 call sites read the value (the reading is worked through in pthread_slot.hpp,
 // #2636). So both destroys answer 0, and #2168's refusal is expressed where it is actually
 // observable: in the object NOT being retired. `_Mtx_lock` maps its result onto a `_Thrd_*` code
-// (`0 -> 0, 0x8002000b -> 3, else 4`) and prosper still answers 0 unconditionally there -- a separate
-// false-success defect, filed as #2626 rather than folded in, because a `_Thrd_error` reaching
-// Dinkumware TERMINATES the guest (see the note above SCE_PTHREAD_ALIAS in hle_kernel.cpp), so it
-// needs its own evidence about which titles reach it. `guest_mutex_lock_slot` already computes the
-// value; the `(void)` below is where it is dropped, deliberately and visibly.
-HLE(m_mtx_lock)   { (void)guest_mutex_lock_slot(a0); return 0; }
+// (`0 -> 0, 0x8002000b -> 3, else 4`), and #2626 is where prosper stopped answering 0 unconditionally
+// there. It was the widest false success left in the family: `std::mutex::lock()` was told it holds a
+// lock it does not, on the two paths `guest_mutex_lock_slot` can refuse — a slot carrying the
+// destroyed poison, and a same-thread relock of an ERRORCHECK mutex.
+//
+// WHY THIS IS A DIVERGENCE AND NOT A STYLE QUESTION, in this repository's own terms: the linker
+// resolves an import against sibling guest modules FIRST ("Cross-module export beats a stub slot",
+// linker.cpp pass 2). So a title that ships `sce_module/libc.prx` runs the wrapper disassembled in
+// pthread_slot.hpp and gets the `_Thrd_*` mapping; a title that does not ships that import to THIS
+// handler instead. Before #2626 the two answered a failing lock differently — the #1873 shape, with
+// the door chosen by the title's packaging rather than by anything it does.
+//
+// The blast radius is bounded on the side that matters: the SUCCESS path is untouched, and a
+// `_Thrd_error` can only reach Dinkumware (where it terminates the guest — see the note above
+// SCE_PTHREAD_ALIAS in hle_kernel.cpp) on a lock prosper REFUSED, which is a lock the guest does not
+// hold. Terminating there is the shipped wrapper's own contract; returning 0 was a corruption.
+HLE(m_mtx_lock)   { return thrd_rc_from_mutex_lock(guest_mutex_lock_slot(a0)); }
 HLE(m_mtx_unlock) { (void)guest_mutex_unlock_slot(a0); return 0; }
 // _Mtx_destroy / _Cnd_destroy are the guest STL's own spelling of the same objects, so they carry
 // the same lifetime rule as scePthreadMutexDestroy / scePthreadCondDestroy: quarantine the storage
