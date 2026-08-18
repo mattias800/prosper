@@ -34,7 +34,7 @@ constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_CONTEXT_REG = 
                    IT_SET_SH_REG = 0x76, IT_SET_UCONFIG_REG = 0x79,
                    R_DRAW_RESET = 0x05, R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12,
-                   R_UC_REGS_INDIRECT = 0x13, R_DMA_DATA = 0x19;
+                   R_UC_REGS_INDIRECT = 0x13, R_DMA_DATA = 0x19, R_JUMP = 0x1e;
 
 struct ShaderRegister { uint32_t offset, value; };
 
@@ -735,6 +735,50 @@ int main() {
     }
     CHECK(identity_mapping,
           "Gen5 interpolant helper initializes all 32 virtual-offset/value pairs");
+
+
+    // ---- Ikfdt-rIqCE: the Jump-packet target patcher (#2711 Q5) -------------------------------
+    // GTA V builds Jump packets EMPTY and fills them in through this call, so an unregistered
+    // handler left every one of them reaching the command processor with target=0 and count=0.
+    // The pairing is what matters and is what this locks: sceAgcDcbJump BUILDS the packet, this
+    // patches it, and cmd[4] belongs to sceAgcSetPacketPredication and must survive untouched.
+    {
+        auto jump  = Hle::lookup("xSAR0LTcRKM");   // sceAgcDcbJump
+        auto jpatch = Hle::lookup("Ikfdt-rIqCE");  // the target patcher under test
+        CHECK(jump && jpatch, "DcbJump and JumpPatchTarget are both registered");
+        if (jump && jpatch) {
+            // Build it the way the guest does: through the real builder, with a null target.
+            uint32_t* const jpkt = dcb.cursor_up;
+            const uint64_t jr = jump(D, 0, 0, /*target=*/0, /*ndw=*/0, 0);
+            CHECK(jr == (uint64_t)(uintptr_t)jpkt, "DcbJump returned the packet it built");
+            CHECK(jpkt[1] == 0 && jpkt[2] == 0 && jpkt[3] == 0,
+                  "the built Jump packet starts EMPTY (target=0, count=0) -- the state the guest patches");
+            jpkt[4] = 0xA5A5A5A5u;   // stand in for sceAgcSetPacketPredication's flag
+
+            const uint32_t header_before = jpkt[0];
+            jpatch((uint64_t)(uintptr_t)jpkt, /*cache policy=*/2,
+                   /*target=*/0x0000002040290080ull, /*dwords=*/359, 0, 0);
+
+            CHECK(jpkt[1] == 0x40290080u, "JumpPatchTarget wrote cmd[1] = target low");
+            CHECK(jpkt[2] == 0x00000020u, "JumpPatchTarget wrote cmd[2] = target high");
+            CHECK(jpkt[3] == 359u,        "JumpPatchTarget wrote cmd[3] = dword COUNT (not a packed policy)");
+            CHECK(jpkt[4] == 0xA5A5A5A5u, "JumpPatchTarget left cmd[4] (predication) untouched");
+            CHECK(jpkt[0] == header_before, "JumpPatchTarget left the header untouched");
+
+            // Wrong packet class must be refused byte-for-byte. patch_check is the only thing standing
+            // between a mis-typed pointer and five clobbered dwords, and a live run does hand this
+            // handler a non-Jump header once per run (#2715).
+            uint32_t decoy[6];
+            memset(decoy, 0, sizeof decoy);
+            decoy[0] = PM4(6, IT_NOP, R_DMA_DATA);
+            for (uint32_t i = 1; i < 6; ++i) decoy[i] = 0xDEADBE00u + i;
+            uint32_t decoy_before[6];
+            memcpy(decoy_before, decoy, sizeof decoy);
+            jpatch((uint64_t)(uintptr_t)decoy, 2, 0x0000002040290080ull, 359, 0, 0);
+            CHECK(memcmp(decoy, decoy_before, sizeof decoy) == 0,
+                  "JumpPatchTarget refuses a non-Jump packet without modifying a single dword");
+        }
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
