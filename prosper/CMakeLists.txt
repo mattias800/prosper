@@ -1367,6 +1367,22 @@ if(TARGET prosper_core)
     add_test(NAME guest_writable_cache COMMAND test_guest_writable_cache)
   endif()
 
+  # #2393: the caches above are guarded ONLY by host::guest_mapping_generation(), so every change
+  # to guest page protection must advance it -- including the software watchpoints in the Linux
+  # fault handler, which flip a live guest page to PROT_READ and back. Linux-only: it drives the
+  # real arm path (prosper_arm_label_watch_force) against a page it maps itself. Both production
+  # sources are handed to the wiring check, which confirms no protection change in the handler
+  # bypasses the notifying wrapper and that the notifier is still lock-free.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_watch_mapping_generation tests/test_watch_mapping_generation.cpp)
+    target_link_libraries(test_watch_mapping_generation PRIVATE prosper_core)
+    target_compile_definitions(test_watch_mapping_generation PRIVATE
+      PROSPER_EXEC_IMAGE_LINUX_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/exec_image_linux.cpp"
+      PROSPER_GUEST_MEMORY_MAP_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/guest_memory_map.hpp"
+      PROSPER_GUEST_WRITE_WATCH_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/guest_write_watch.cpp")
+    add_test(NAME watch_mapping_generation COMMAND test_watch_mapping_generation)
+  endif()
+
   if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_write_watch tests/test_guest_write_watch.cpp)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
