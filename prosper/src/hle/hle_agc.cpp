@@ -3123,7 +3123,9 @@ HLE(agc_patch_release_mem_data) {
 // cmd[3] store would therefore land a policy-packed value on top of the segment's dword count.
 //
 // So the shape was measured before anything was written. A routed run with a probe that reported the
-// header and patched nothing (PPSA04263, Linux) gave the same answer at every call site:
+// header and patched nothing (PPSA04263, Linux) answered identically at 402 of 403 call sites. The
+// residual is one stable non-Jump header per run, refused rather than patched (#2715), so the
+// malformed-command-graph confounder is removed for the recognised 402 and NOT for that one:
 //
 //   [agc] JumpPatchTarget PROBE #0 cmd=0x203dfc5eb0 hdr=0xc0031078 op=0x10 r=0x1e count=3
 //         shape=IT_NOP/R_JUMP(ours) payload=00000000,00000000,00000000,00000000
@@ -3143,7 +3145,10 @@ HLE(agc_patch_release_mem_data) {
 // being safely ignorable, which holds only while the decoder has no policy semantics.
 HLE(agc_jump_patch_target) {
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
-    if (!patch_target_writable(a0, kDwJump * sizeof(uint32_t), "JumpPatchTarget")) return 0;
+    // FOUR dwords, not kDwJump: this handler reads cmd[0] and writes cmd[1..3], and the span contract
+    // above is the dwords each handler actually TOUCHES rather than the packet's nominal length.
+    // cmd[4] is deliberately outside it -- predication belongs to sceAgcSetPacketPredication.
+    if (!patch_target_writable(a0, 4u * sizeof(uint32_t), "JumpPatchTarget")) return 0;
     if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) return 0;
     const uint32_t pre_lo = cmd[1], pre_hi = cmd[2], pre_ndw = cmd[3];
     cmd[1] = (uint32_t)(a2 & 0xffffffffu);
@@ -3190,8 +3195,8 @@ void register_agc_hle() {
     RN("qMlfB1ZhMDc", agc_draw_index_offset_get_size);   // sceAgcDcbDrawIndexOffsetGetSize
     RN("mStuvI0zOtc", agc_draw_index_indirect_get_size); // sceAgcDcbDrawIndexIndirectGetSize
     RN("Abendgtz+3o", agc_dispatch_get_size);            // sceAgcCbDispatchGetSize
-    RN("MlEw1feXcjg", agc_patch_release_mem_data);
-    RN("Ikfdt-rIqCE", agc_jump_patch_target);            // Jump packet: fill in target + dword count (#2711 Q5)       // ReleaseMem packet: set the data payload
+    RN("MlEw1feXcjg", agc_patch_release_mem_data);      // ReleaseMem packet: set the data payload
+    RN("Ikfdt-rIqCE", agc_jump_patch_target);            // Jump packet: fill in target + dword count (#2711 Q5)
     RN("w8HVkEeXPv8", agc_dispatch_indirect_get_size);   // sceAgcDcbDispatchIndirectGetSize
     RN("PxKWV2fVAps", agc_dispatch_indirect_get_size);   // sceAgcAcbDispatchIndirectGetSize
     RN("2ccJz9LQI+w", agc_dma_data_get_size);            // sceAgcDcbDmaDataGetSize
