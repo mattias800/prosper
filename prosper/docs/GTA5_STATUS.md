@@ -3,12 +3,142 @@
 **Rung 3** on the bring-up ladder: routed gameplay entry with real GPU draws. The HUD, radar and
 tutorial text render; the 3D world does not.
 
-Tracker: **#1873**. Active frontier: **#2481**. Route: `scripts/gta5/reach-story-mode.pad`
+Tracker: **#1873**. Active frontier: **#2542** (#2481 is CLOSED and superseded by it; the
+pointer here and in `CLAUDE.md` said #2481 long after it closed). Route: `scripts/gta5/reach-story-mode.pad`
 (read its header — the flip timing is measured, not estimated, and the tab navigation needs four R1
 presses for a reason).
 
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
+
+## Gameplay frame characterised end to end, with the hang declined (2026-08-18)
+
+Two routed runs, Linux/RADV, `scripts/gta5/reach-story-mode.pad`, 4K, `tools/screenshot`, with
+`PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700`. **Zero device losses in both**, guest still running at the
+end of the first; the second ended on its own 520 s timeout. 40 and 69 samples respectively.
+
+**What renders, and what does not.** At gameplay the composite contains:
+
+- the **radar/minimap** — complete: player arrow, three blips, compass rose with `N`, and the
+  green/blue/gold legend bar;
+- the **tutorial caption** — `The Radar shows your position within the world.`, every glyph present;
+- **three point lights with lens-flare streaks**, plus very faint blue structure toward the right;
+- **no geometry at all.**
+
+So the lighting and post path reaches the scanout while the geometry it illuminates does not. The 2D
+and UI composite is in good shape — the 4K loading screen (Michael, skyline, logo, and
+`Entering Story Mode: (90%)`) renders essentially correctly.
+
+**Route note.** This route enters the **prologue** (`Ludendorff, North Yankton, nine years ago.`
+renders correctly over black), not the free-roam resume the route README describes. The prologue
+legitimately opens on black before fading in, so a capture that stops around 200 s will read as "black
+world" for a reason that has nothing to do with the renderer. The first run did exactly that; the
+second is why the state above is stated at all. **Capture past 400 s on this route** before concluding
+anything about the world.
+
+### Skipping is not fixing — a correction worth keeping
+
+It is tempting to read "world still absent with `0x413dc6700` declined" as evidence against #2542's
+framing. **It is not.** A declined dispatch produces nothing, so an absent world is exactly what that
+route predicts if the program is a world producer. The SKIP route can show that the *rest* of the
+frame survives without a device loss; it cannot demonstrate a correct world, and no run under it
+should be quoted as if it could.
+
+### Compute rejects on this frame: one shared mode, and it is not a missing emitter
+
+Nine distinct compute programs are declined, **every one `mode=unresolved-operand`**, across five
+instruction families (MUBUF, DS, MIMG, SOP1, VOP3). Per `rdna2_to_spirv.cpp` that mode means the
+lowering ran and could not resolve an operand or a resource-table descriptor — so these are descriptor
+failures, not absent lowerings.
+
+The ungated `[compute-table]` dump answers the next question directly: **does the rejecting
+instruction's own fetch pc appear as a key in the table that program was handed?**
+
+| program | reject pc | keys | pc is a key | min key |
+| --- | ---: | ---: | :---: | ---: |
+| `0x2042f49a00` | 16 | 4 | **YES** | 16 |
+| `0x205b5e8600` | 314 | 75 | NO | 6 |
+| `0x205b654a00` | 1180 | 82 | NO | 16 |
+| `0x205b657200` | 313 | 34 | NO | 16 |
+| `0x205b658800` | 82 | 150 | NO | 6 |
+| `0x413cf9200` | 5 | 9 | NO | 64 |
+| `0x413cf9a00` | 39 | 5 | NO | 11 |
+| `0x413cf9d00` | 70 | 16 | NO | 26 |
+| `0x413d14100` | 6 | 10 | NO | 41 |
+
+**8 of 9 reject at a pc for which no resource was offered.** Two — `0x413cf9200` at pc 5 and
+`0x413d14100` at pc 6 — reject *before the first key in their own table*, at the top of the program
+where a root pointer is loaded. `0x413cf9200` pc 5 decodes as
+`buffer_load_dword v17, v0, s[4:7], 0`: an SGPR-based descriptor, and every resource in that table
+carries `sgpr=0xffffffff`, so nothing is keyed by SGPR base either.
+
+**This rules out the framing in `gpu_executor.cpp`** that a resource with
+`srt=0xffffffff sgpr=0xffffffff` is "invisible to every lookup": the same diagnostic reports
+`0 with no lookup key` for all nine, because those entries are still keyed by fetch pc. The failure is
+not "the resource has no key" but "no resource was offered for the site that needs one".
+
+Two caveats, both load-bearing:
+
+- **No comparison population.** `[compute-table]` prints only for *rejected* programs (it sits inside
+  `report_compute_recompile_skip_once`), so every row above is a reject by construction. This cannot
+  show the pattern discriminates rejected from accepted programs; that needs the table dumped for
+  accepted ones, which no switch does today.
+- **`0x2042f49a00` is the internal positive control** — its rejecting pc *is* a key, so the analysis
+  can print YES, and the eight NOs are not a matcher that always misses.
+
+### The sampled depth is declined, and the reason printed is the wrong one
+
+```
+[render] DCC-compressed sampled image addr=0x2052ac0000 meta=0x2055310000
+         3840x2160x1 fmt=1 tile=24 is unsupported; metadata=0/0 first=0x00
+```
+
+`0x2052ac0000` is this title's main depth and `0x2055310000` its HTILE — neither is DCC. The renderer's
+sampled-image path never consults `sampled_source_decision()`; the metadata-kind correlator is
+registered only for the compute hook. Filed as **#2674**.
+
+**A correction, kept because the reasoning error is the instructive part.** The first analysis
+concluded that gate 2 (the metadata footprint) is what blocks this surface, and attributed it to
+`gfx10_htile_msaa_metadata_bytes()` fail-closing on `sample_count != 4`. That conclusion is not
+established by the evidence, because the size expression is
+
+```cpp
+!has_ds_live && r.compression_enabled ? gpu_capture_dcc_metadata_footprint(r) : 0u
+```
+
+so `metadata=0/0` is *equally* consistent with `has_ds_live` being true — in which case no footprint
+helper is consulted at all and the gate discussion is irrelevant. For a title's main depth buffer,
+which the renderer demonstrably renders into, that branch is not exotic. The branch that fitted the
+hypothesis already held was the one chosen; `ds_live=` was added to the diagnostic so the next run
+answers it as a measurement. `first=0x00` was likewise the *unread default*, not a reading of the
+plane.
+
+**Measured, 2026-08-18: `ds_live=0`.** No retained DS image exists for this surface, so the size
+expression does call the footprint helper and the helper returns zero. The original conclusion was
+therefore correct — but it is only now *established*, and it was not established when first written.
+The distinction matters here more than the answer: the same claim reached by the same route would
+have been wrong on any surface the renderer does own.
+
+What is measured, in full: `kind=HTILE` (the correlator classifies it correctly on this path),
+`tile=24` matching `TileMode::Sw64KbZX`, `pipe_aligned=1`, `ds_live=0`, and `samples=1` against a
+required 4. **Every gate condition passes except the sample count**, and the surface is never routed
+to the HTILE helper in the first place — it is sized by the DCC one, which fail-closes on a tile mode
+that is not `SW_64KB_R_X`. The function's own comment records that the sample-count gate is conservatism rather than
+arithmetic:
+
+> HTILE sizing is independent of the depth sample count, but this API deliberately retains the
+> observed 4xaa gate rather than claiming broader support.
+
+`meta_pipe_aligned` (T# word6 bit 19, `agc_shader_layout.cpp:386`) is the third condition and is **not
+printed by the decline line**, so today the log cannot say which gate failed. Making the gate legible
+is the prerequisite for deciding whether the 4xAA gate can widen with evidence rather than by
+inference from a comment.
+
+### Also observed
+
+- **#2445 (dropped `r`/`s`/`m` glyphs) does not reproduce on Linux/RADV.** Both strings the issue
+  names render complete here. That is not a falsification — the issue is Windows/NVIDIA — but it
+  suggests a platform asymmetry, which is a much smaller search than a general text defect.
 
 ## THE CORRUPTING PROGRAM IS `0x413dc3400` (2026-08-15)
 
