@@ -4302,6 +4302,8 @@ const std::set<uint64_t>& compute_skip_programs() {
 // `v_bfe_u32 v1, v1, 3, 27` with NUM_RECORDS as the bound).
 struct ParentScanResult {
     uint32_t records = 0, terminating = 0, cyclic = 0, cycle_nodes = 0, longest = 0;
+    uint32_t sample_count = 0;
+    uint32_t sample_idx[6]{}, sample_word[6]{}, sample_next[6]{};
 };
 
 ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_count) {
@@ -4341,6 +4343,16 @@ ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_count) {
         else if (state[k] == 2) ++out.cyclic;
     }
     out.cycle_nodes = static_cast<uint32_t>(cycle_nodes.size());
+    // Keep a few actual ring members. A count says corruption happened; the entries say what SHAPE it
+    // is, and the shape is usually the mechanism -- a self-loop (parent[i]==i), a 2-cycle, or a ring of
+    // stale generation are three different bugs and the count cannot tell them apart.
+    for (uint32_t node : cycle_nodes) {
+        if (out.sample_count >= 6u) break;
+        out.sample_idx[out.sample_count] = node;
+        out.sample_word[out.sample_count] = words[node];
+        out.sample_next[out.sample_count] = (words[node] >> 3) & 0x7FFFFFFu;
+        ++out.sample_count;
+    }
     return out;
 }
 
@@ -8770,6 +8782,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  (unsigned long long)buffer.resource->gpu_addr,
                                  pa.records, pa.terminating, pa.cyclic, pa.cycle_nodes, pa.longest,
                                  (unsigned long long)buffer.changed_bytes);
+                    for (uint32_t s = 0; s < pa.sample_count; ++s)
+                        std::fprintf(stderr,
+                                     "[parentscan-ring]   idx=%u word=0x%08x -> next=%u%s\n",
+                                     pa.sample_idx[s], pa.sample_word[s], pa.sample_next[s],
+                                     pa.sample_next[s] == pa.sample_idx[s] ? "  SELF-LOOP" : "");
                 }
             }
             std::fprintf(stderr,
