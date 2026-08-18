@@ -13458,12 +13458,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.indirect_buffer_atomic_binding == UINT32_MAX ||
                     b.indirect_buffer_atomic_byte_offset != offset ||
                     (offset & 7u) != 0u) {
+                    buf_op.how = "reject-packed-pointer-atomic";
                     ok = false;
                     return true;
                 }
                 const auto lo = rs.vreg.find(in.dst.value);
                 const auto hi = rs.vreg.find(in.dst.value + 1);
                 if (lo == rs.vreg.end() || hi == rs.vreg.end()) {
+                    buf_op.how = "reject-packed-pointer-atomic";
                     ok = false;
                     return true;
                 }
@@ -13472,6 +13474,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 (void)b.cbuf_atomic_x2_rtn(
                     Op_AtomicOr, b.uconst(offset / 8u), value,
                     b.indirect_buffer_atomic_binding, access, b.uconst64(0u));
+                buf_op.how = "packed-pointer-atomic";
                 return true;
             }
             // PC-relative EMBEDDED TABLE (#273): this load's V# was built from s_getpc_b64 and the
