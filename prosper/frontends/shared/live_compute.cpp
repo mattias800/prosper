@@ -8751,6 +8751,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (const auto& buffer : buffers) {
             if (!buffer.resource || buffer.alias_of != SIZE_MAX) continue;
             const uint8_t* bytes = resource_bytes(buffer.resource);
+            // POST-dispatch half of PROSPER_COMPUTE_PARENTSCAN. The pre-dispatch scan says whether a
+            // dispatch's INPUT was cyclic; this says whether its OUTPUT is. A dispatch whose input was
+            // clean and whose output is cyclic is the one that INTRODUCED the cycle -- which is the
+            // whole question, and neither half answers it alone.
+            if (const char* pscan_after = std::getenv("PROSPER_COMPUTE_PARENTSCAN")) {
+                if (std::strtoull(pscan_after, nullptr, 16) ==
+                        static_cast<uint64_t>(item.code_addr) && buffer.resource->stride == 4u) {
+                    const ParentScanResult pa = scan_parent_array(bytes, buffer.resource->size);
+                    std::fprintf(stderr,
+                                 "[parentscan-after] program=0x%llx submit=%llu dispatch=%llu "
+                                 "binding=%u addr=0x%llx records=%u terminating=%u cyclic=%u "
+                                 "cycle-nodes=%u longest=%u changed=%llu\n",
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)item.submit_no,
+                                 (unsigned long long)item.dispatch_index,
+                                 buffer.resource->binding,
+                                 (unsigned long long)buffer.resource->gpu_addr,
+                                 pa.records, pa.terminating, pa.cyclic, pa.cycle_nodes, pa.longest,
+                                 (unsigned long long)buffer.changed_bytes);
+                }
+            }
             std::fprintf(stderr,
                          "[compute]   writeback binding=%u addr=0x%llx size=%u changed=%llu "
                          "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
