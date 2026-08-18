@@ -4144,9 +4144,11 @@ falsification.
   `StorageBuffer` pointer. The inference from that was wrong, because **a legal `NUM_RECORDS=0` fold
   and a never-decoded instruction leave identical evidence**: both leave no access chain, no load, no
   trace at all. This was the fold. The `[buf-op]` disposition line (#2712) says which — all 41 sites,
-  `zero-record` — and a live `[dyntrace]` census over 14,432 folds then showed **10,824 (75%) resolve
-  concrete descriptors with real extents**, the five bases matching the five SRT pointer slots exactly.
-  `pc91` itself resolves a real V# in **264 of 352** folds. Nothing about this program requires
+  `zero-record` — and a live `[dyntrace]` census over **352 program folds** (14,432 buffer-op *site*
+  observations: 352 folds x 41 MUBUF sites) then showed **10,824 of those site observations resolve
+  concrete descriptors with real extents against 3,608 zero-record**. Per fold the split is clean:
+  `pc91` resolves a real V# in **264 of 352** folds and is zero-record in the other 88. Quoting 14,432
+  as a fold count conflates the two units and does not survive comparison with any dispatch count. Nothing about this program requires
   address-based memory access; the translated-guest-address work in #2711 Q3 stands on its own merits
   and must not be justified by this program. #2709, #2712.
 
@@ -4869,14 +4871,19 @@ out of that table at `+0x18/+0x20/+0x28/+0x30/+0x50` and builds all five of its 
 
 For the program's first **88** folds those five slots read zero, so every V# decodes
 `{base=0, stride=<immediate>, NUM_RECORDS=0}` and all 41 of its buffer ops fold: 18 loads (49 dwords)
-to a constant zero, 23 stores (41 dwords) dropped, **no memory access emitted at all**. After fold 88
+to a constant zero, 23 stores (41 dwords) dropped — **none of the 41 MUBUF sites emits a memory
+access**. (The module is not access-free: it retains exactly one `StorageBuffer` access chain, from a
+non-MUBUF path.) After fold 88
 every fold resolves real descriptors. Measured in two runs whose submit numbering otherwise differs,
 and the boundary is **deterministic** in both: 3,608 zero-record folds (= 88 folds x 41 sites),
 contiguous at the very start, then none.
 
 `PROSPER_COMPUTE_MEMPROBE=413dc6700:0:0:40` dumps that table and confirms both states are genuine: the
 bytes are **unchanged between its two sample points** for the empty ones too, so those dispatches are
-really handed an empty table rather than read too early. This is startup, not a defect.
+really handed an empty table rather than read too early — a genuine empty-SRT input state, not a
+fold-time staleness artifact. That is what refutes the emitter-drop reading; it is **not** by itself
+proof that no producer is missing, so the supported claim is "a startup phase, and not evidence of a
+recompiler defect", not "not a defect".
 
 **The capture trap this creates, which cost this investigation a night.**
 `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` fires on the *first* submit containing the program — inside the
@@ -4900,18 +4907,26 @@ result.
 ### What the program is, from its resolved descriptors
 
 Every one of the five buffers carries **2063 records**, and the dispatch is `groups=9x1x1
-local=256x1x1` = 2304 threads:
+local=256x1x1` = 2304 threads. **The register→base assignment is NOT stable across folds** — the 264
+resolved folds split into two orientations, and only `s4` is fixed:
 
-| SGPR | base | stride | size | role |
-| --- | --- | ---: | ---: | --- |
-| `s4` | `0x209cc76000` | 64 | 132032 | the entity records — read (13 loads) **and** written (10 stores) |
-| `s0` | `0x20f848417c` | 4 | 8252 | per-entity u32, read-only |
-| `s16` | `0x20f8482140` | 4 | 8252 | per-entity u32, read-only |
-| `s8` | `0x20f848a240` | 4 | 8252 | per-entity u32, write-only |
-| `s12` | `0x20f849233c` | 4 | 8252 | per-entity u32, write-only |
+| SGPR | stride | size | 144 folds | 120 folds |
+| --- | ---: | ---: | --- | --- |
+| `s4` | 64 | 132032 | `0x209cc76000` | `0x209cc76000` (stable) |
+| `s0` | 4 | 8252 | `0x20f848417c` | `0x20f848a240` |
+| `s8` | 4 | 8252 | `0x20f848a240` | `0x20f848417c` |
+| `s16` | 4 | 8252 | `0x20f8482140` | `0x20f849233c` |
+| `s12` | 4 | 8252 | `0x20f849233c` | `0x20f8482140` |
 
-2063 entities with a 64-byte record each, two per-entity input arrays and two output arrays: a scene
-traversal / visibility pass, consistent with this program gating world content.
+The two input/output pairs **swap** between orientations — which is the double-buffering the retraction
+below describes, seen from the register side. Reading either column as "the" mapping is exactly the
+cross-dispatch attribution error that produced the retracted cyclic-table root cause.
+
+What the shape establishes: a **2063-record, per-item read/modify/write or traversal-shaped pass** — one
+64-byte record per item read and written, plus two u32 inputs and two u32 outputs per item. It is
+*consistent with* a scene traversal / visibility pass, and that is a **hypothesis, not a finding**: the
+descriptor shape does not identify the records as entities, does not identify the shader as visibility,
+and does not establish that it gates world content.
 
 **Read the cyclic-table retraction below before using any base address in that table.** Those are the
 bases resolved across a *whole run*, not one dispatch's. This program runs many times per submit with
