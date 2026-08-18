@@ -4246,6 +4246,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     // which is how GTA V's main depth (0x2052ac0000, HTILE at
                                     // 0x2055310000) came to be reported as "DCC-compressed" (#2674).
                                     //
+                                    // This is the FIRST production caller of the correlator anywhere
+                                    // in the tree. It was easy to assume the compute path already
+                                    // used it -- a query is registered for it in this file -- but
+                                    // registering a query is not calling one, and on master every
+                                    // reference to `classify_compression_metadata_kind` outside its
+                                    // own definition is a test.
+                                    //
                                     // Classified HERE, inside the first-sighting guard, rather than
                                     // beside the footprint: the query walks the retained DS cache and
                                     // the RTT map, which is O(surfaces) and this path runs per
@@ -4264,13 +4271,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             prosper::gpu::MetadataKindRequest{
                                                 r.metadata_addr, r.gpu_addr, r.format,
                                                 r.num_components, r.img_dim});
-                                    // Name the KIND, and print the inputs the footprint helpers
+                                    // Name the KIND, and print the inputs the sizing helpers
                                     // actually gate on. The previous line called every declined
                                     // surface "DCC-compressed" and omitted `samples` and
-                                    // `pipe_aligned`, which are two of the three conditions in
-                                    // gfx10_htile_msaa_metadata_bytes() and one in the DCC helper --
-                                    // so it could not say WHICH gate failed, and a reader chasing a
-                                    // depth surface was sent looking for a DCC defect (#2674).
+                                    // `pipe_aligned` -- two of the three conditions in
+                                    // gfx10_htile_msaa_metadata_bytes(). The DCC sizer gates only on
+                                    // tile mode and bytes-per-texel; it takes `pipe_aligned` and
+                                    // explicitly discards it (`(void)pipe_aligned` in tile.cpp), so
+                                    // that field is diagnostic for the HTILE route only. Either way
+                                    // the old line could not say WHICH gate failed, and a reader
+                                    // chasing a depth surface was sent looking for a DCC defect.
                                     //
                                     // `first=` is printed only when bytes were actually read.
                                     // metadata=0/0 means the footprint was zero, so nothing was
@@ -4280,12 +4290,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     //
                                     // `ds_live=` disambiguates the TWO independent reasons the
                                     // footprint can be zero, which the old line could not separate:
-                                    // a retained DS image exists for this surface (the size
-                                    // expression is gated on `!has_ds_live` outright), or the DCC
-                                    // helper fail-closed on the shape. Without it, "metadata=0/0" is
-                                    // compatible with both and a reader is free to pick the one that
-                                    // suits their hypothesis -- which is how a gate analysis gets
-                                    // written against the wrong gate.
+                                    // the size expression is gated on `!has_ds_live` outright, or the
+                                    // sizing helper fail-closed on the shape. Without it,
+                                    // "metadata=0/0" is compatible with both and a reader is free to
+                                    // pick the one that suits their hypothesis -- which is how a gate
+                                    // analysis gets written against the wrong gate. One was.
+                                    //
+                                    // Read `ds_live=0` as "the size expression called a helper", NOT
+                                    // as "no retained DS image exists". The lookup above is itself
+                                    // gated on `!has_live_rtt && !is_storage_image && img_dim == 1 &&
+                                    // cls == Texture`, so a binding the gate rejects never reaches it
+                                    // and reads 0 for a reason that has nothing to do with residency
+                                    // -- on an `img_dim == 6` surface it is structurally 0.
+                                    //
+                                    // `dim=` is printed because it, not the sample count, selects
+                                    // which helper runs: `dcc_metadata_footprint` routes to the HTILE
+                                    // sizer ONLY for `img_dim == 6 && Float32 && 1 component`, and
+                                    // otherwise to the DCC sizer, which fail-closes on tile mode and
+                                    // never looks at `sample_count`. Without `dim=` the two gate
+                                    // stories -- "the sample count blocked it" and "it was never
+                                    // routed to the HTILE sizer at all" -- are indistinguishable.
                                     const char* kind_name =
                                         kind == prosper::gpu::CompressionMetadataKind::Htile
                                             ? "HTILE"
@@ -4298,14 +4322,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                       metadata[0]);
                                     fprintf(stderr,
                                             "[render] compressed sampled image kind=%s addr=0x%llx "
-                                            "meta=0x%llx %ux%ux%u fmt=%u tile=%u samples=%u "
-                                            "pipe_aligned=%u ds_live=%u is unsupported; "
+                                            "meta=0x%llx %ux%ux%u fmt=%u dim=%u tile=%u "
+                                            "samples=%u pipe_aligned=%u ds_live=%u is unsupported; "
                                             "metadata=%zu/%llu first=%s\n",
                                             kind_name,
                                             (unsigned long long)r.gpu_addr,
                                             (unsigned long long)r.metadata_addr,
-                                            tw, th, r.depth, (unsigned)r.format, r.tile_mode,
-                                            r.sample_count, r.meta_pipe_aligned ? 1u : 0u,
+                                            tw, th, r.depth, (unsigned)r.format, r.img_dim,
+                                            r.tile_mode, r.sample_count,
+                                            r.meta_pipe_aligned ? 1u : 0u,
                                             has_ds_live ? 1u : 0u, metadata_got,
                                             (unsigned long long)metadata_bytes, first_text);
                                 }

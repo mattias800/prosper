@@ -94,8 +94,11 @@ Two caveats, both load-bearing:
 ```
 
 `0x2052ac0000` is this title's main depth and `0x2055310000` its HTILE — neither is DCC. The renderer's
-sampled-image path never consults `sampled_source_decision()`; the metadata-kind correlator is
-registered only for the compute hook. Filed as **#2674**.
+sampled-image path never consults `sampled_source_decision()`, and — corrected in review — the
+metadata-kind correlator had **no production caller anywhere in the tree**. A query is registered for
+it in `live_renderer.cpp`, which made it natural to assume the compute path used it; registering a
+query is not calling one, and on master every reference to `classify_compression_metadata_kind`
+outside its own definition is a test. Filed as **#2674**.
 
 **A correction, kept because the reasoning error is the instructive part.** The first analysis
 concluded that gate 2 (the metadata footprint) is what blocks this surface, and attributed it to
@@ -113,26 +116,42 @@ hypothesis already held was the one chosen; `ds_live=` was added to the diagnost
 answers it as a measurement. `first=0x00` was likewise the *unread default*, not a reading of the
 plane.
 
-**Measured, 2026-08-18: `ds_live=0`.** No retained DS image exists for this surface, so the size
-expression does call the footprint helper and the helper returns zero. The original conclusion was
-therefore correct — but it is only now *established*, and it was not established when first written.
-The distinction matters here more than the answer: the same claim reached by the same route would
-have been wrong on any surface the renderer does own.
+**Measured, 2026-08-18: `ds_live=0`** — and this needs reading precisely, because the obvious reading
+is wrong. It does **not** mean "no retained DS image exists for this surface". The lookup that sets
+it is itself gated on `!has_live_rtt && !is_storage_image && img_dim == 1 && cls == Texture`
+(`live_renderer.cpp:2899`), so a binding the gate rejects never reaches the lookup and reads 0 for a
+reason unrelated to residency — on an `img_dim == 6` surface it is *structurally* 0.
+
+What survives is the narrower claim, and it is the one that matters: `has_ds_live` is false, therefore
+`!has_ds_live && r.compression_enabled` holds, therefore the size expression **did call a sizing
+helper** and that helper returned zero.
+
+**Which helper, and therefore which gate, is still undetermined.** `dcc_metadata_footprint`
+(`gpu_capture.cpp`) routes to the HTILE sizer only for `img_dim == 6 && Float32 && 1 component`, and
+otherwise to the DCC sizer — which fail-closes on tile mode and **never looks at `sample_count`**. So
+"the 4xAA gate blocked it" and "it was never routed to the HTILE sizer at all" are both consistent
+with everything measured so far, and `img_dim` was the one field not printed. #2679 now prints
+`dim=`. Until that is read, no gate conclusion should be quoted from this section.
+
+That is the second withdrawal on this surface, and the pattern is worth naming: each time, a
+measurement narrowed the question without settling it, and each time the tempting move was to treat
+the surviving hypothesis as confirmed because it was the last one standing. It was not confirmed;
+there was simply no instrument pointed at its rival.
 
 What is measured, in full: `kind=HTILE` (the correlator classifies it correctly on this path),
-`tile=24` matching `TileMode::Sw64KbZX`, `pipe_aligned=1`, `ds_live=0`, and `samples=1` against a
-required 4. **Every gate condition passes except the sample count**, and the surface is never routed
-to the HTILE helper in the first place — it is sized by the DCC one, which fail-closes on a tile mode
-that is not `SW_64KB_R_X`. The function's own comment records that the sample-count gate is conservatism rather than
+`tile=24` matching `TileMode::Sw64KbZX`, `pipe_aligned=1`, `ds_live=0`, and `samples=1`. Note that
+these two readings of them are **mutually exclusive and not yet separated**: if `img_dim == 6` the
+HTILE sizer ran and the sample count is the failing gate; if not, the DCC sizer ran, fail-closed on
+tile mode, and the sample count was never consulted. `dim=` decides it and is printed as of #2679. The function's own comment records that the sample-count gate is conservatism rather than
 arithmetic:
 
 > HTILE sizing is independent of the depth sample count, but this API deliberately retains the
 > observed 4xaa gate rather than claiming broader support.
 
-`meta_pipe_aligned` (T# word6 bit 19, `agc_shader_layout.cpp:386`) is the third condition and is **not
-printed by the decline line**, so today the log cannot say which gate failed. Making the gate legible
-is the prerequisite for deciding whether the 4xAA gate can widen with evidence rather than by
-inference from a comment.
+`meta_pipe_aligned` (T# word6 bit 19, `agc_shader_layout.cpp:386`) is the third condition. It, the
+sample count, `ds_live` and `img_dim` were all absent from the decline line, so the log could not say
+which gate failed; #2679 prints them. Making the gate legible is the prerequisite for deciding
+whether the 4xAA gate can widen with evidence rather than by inference from a comment.
 
 ### Also observed
 
