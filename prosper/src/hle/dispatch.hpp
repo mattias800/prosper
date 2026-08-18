@@ -270,6 +270,10 @@ void tls_dtv_purge_current_thread();
 // Number of threads currently holding live DTV entries (test/diagnostic introspection: lets the
 // regression test assert that thread exit really purged — i.e. no per-thread-churn leak).
 size_t tls_dtv_thread_count();
+// #2613 test hook: true once hle_kernel.cpp's static-storage objects have been destroyed. A canary
+// declared before every registry in that file flips it, so an exit-time probe can prove it really
+// ran after static destruction instead of passing vacuously. Always false while main() runs.
+bool hle_kernel_statics_destroyed();
 
 // Guest initial-exec TLS. Enabled by default on Linux/Windows (PROSPER_NO_GUEST_FS opts out); macOS
 // trap emulation is opt-in with PROSPER_GUEST_FS. Backs guest %fs-relative static thread-locals with a

@@ -1,6 +1,7 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "exec_image.hpp"
+#include "immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "sse4a.hpp"
 #include "x86_read_decode.hpp"
 #include "guest_write_watch.hpp"
@@ -63,6 +64,23 @@ struct f_owner_ex { int type; pid_t pid; };
 namespace prosper {
 
 namespace {
+    // #2613 static-destruction ordering canary. Declared BEFORE every registry in this file, so the
+    // reverse-order static destruction pass destroys it AFTER all of them: once this flag reads
+    // true, every object in this translation unit that still had a static destructor has already run
+    // it. tests/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran
+    // after this TU's destruction — without that check a probe that ran too early would pass
+    // vacuously. The flag is a constant-initialized atomic: no dynamic initialization, no destructor.
+    std::atomic<bool> g_exec_image_statics_destroyed{false};
+    struct ExecImageDestructionCanary {
+        ExecImageDestructionCanary() noexcept {
+            g_exec_image_statics_destroyed.store(false, std::memory_order_relaxed);
+        }
+        ~ExecImageDestructionCanary() {
+            g_exec_image_statics_destroyed.store(true, std::memory_order_release);
+        }
+    };
+    ExecImageDestructionCanary g_exec_image_destruction_canary;
+
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
     // #1659: label guest addresses through the shared, module-aware helpers instead of subtracting a
     // literal base. These sites hard-coded 0x400000000 — the eboot's address BEFORE #825 relocated it
@@ -75,8 +93,16 @@ namespace {
     // stack we allocate (the main thread's mmap'd stack; workers' stacks from
     // k_pthread_create), so the GC/thread code gets accurate bounds without the fragile
     // pthread_getattr_np.
-    std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;   // tid -> (base, size)
-    std::mutex g_smx;
+    // #2613: immortal. thread_trampoline's tail calls unregister_thread_stack() and nothing joins
+    // guest threads at shutdown, so this registry is reached while the process is running its exit
+    // handlers — after a plain namespace-scope container's destructor would have run.
+    // See host/immortal.hpp.
+    Immortal<std::map<uint64_t, std::pair<uint64_t, uint64_t>>> g_stacks;   // tid -> (base, size)
+    Immortal<std::mutex> g_smx;
+    static_assert(std::is_trivially_destructible_v<decltype(g_stacks)> &&
+                  std::is_trivially_destructible_v<decltype(g_smx)>,
+                  "#2613: the guest thread-stack registry must register no static destructor -- a "
+                  "guest thread reaches it from the trampoline tail while the process is exiting");
     // Recovery point. Only the (single) thread that armed it — always the main thread running
     // run_entry/run_guest_inits — can be longjmp'd back; guest worker faults have no armed point and
     // terminate the process cleanly. We key "who armed" on the real kernel tid (SYS_gettid, a syscall
@@ -3549,18 +3575,22 @@ std::string describe_code_address(uint64_t address) {
     return text;
 }
 
+bool exec_image_statics_destroyed() {   // #2613, see the canary at the top of this file
+    return g_exec_image_statics_destroyed.load(std::memory_order_acquire);
+}
+
 void register_thread_stack(uint64_t tid, void* base, uint64_t size) {
-    std::lock_guard<std::mutex> lk(g_smx);
-    g_stacks[tid] = { (uint64_t)base, size };
+    std::lock_guard<std::mutex> lk(*g_smx);
+    (*g_stacks)[tid] = { (uint64_t)base, size };
 }
 void unregister_thread_stack(uint64_t tid) {
-    std::lock_guard<std::mutex> lk(g_smx);
-    g_stacks.erase(tid);
+    std::lock_guard<std::mutex> lk(*g_smx);
+    g_stacks->erase(tid);
 }
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
-    std::lock_guard<std::mutex> lk(g_smx);
-    auto it = g_stacks.find(tid);
-    if (it == g_stacks.end()) return false;
+    std::lock_guard<std::mutex> lk(*g_smx);
+    auto it = g_stacks->find(tid);
+    if (it == g_stacks->end()) return false;
     *base = (void*)it->second.first; *size = (size_t)it->second.second;
     return true;
 }
