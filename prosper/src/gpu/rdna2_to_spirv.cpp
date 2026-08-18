@@ -13403,6 +13403,52 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     atomic_op = Op_AtomicOr; break;
                 default: ok = false; return true;           // remaining typed/atomic opcodes deferred
             }
+            // Per-instruction buffer-op disposition (PROSPER_DBG). A buffer op whose V# decodes to
+            // NUM_RECORDS=0 — or that matches one of the no-backing markers below — is folded away:
+            // loads become a constant, stores are dropped, and no backing buffer is declared. That is
+            // architecturally correct for an empty descriptor. It is also, in the emitted SPIR-V,
+            // INDISTINGUISHABLE from an instruction that never reached the emitter at all: both leave
+            // no access chain, no load, no trace of any kind. Those two have completely different
+            // causes, and offline dissection of a program whose buffer traffic has vanished cannot
+            // separate them without this line (#2709 built an argument for a whole new memory model
+            // on exactly that ambiguity, and was wrong).
+            //
+            // Reported from a scope guard rather than at each decision site so EVERY exit path emits
+            // exactly one line. A path nobody classified prints `unclassified` rather than printing
+            // nothing — so a census can detect its own incompleteness instead of silently
+            // under-counting, which a per-site call cannot do. The three pre-switch rejects above are
+            // deliberately outside it: they set ok=false, and a rejected program is already reported
+            // by the recompile-reject census -- as is the switch's own `default:` arm, which is
+            // also above this point. That is FOUR uncovered rejects, not three, and the `default:`
+            // one matters most to a census: an unmodelled buffer opcode is literally the "never
+            // reached the emitter" case this line exists to identify. So the tempting identity
+            // "instructions in the stream == lines emitted" holds only for a program with none of
+            // the four; it happened to hold for 0x413dc6700 (41 == 41) and that is not a guarantee.
+            // Hoisting the guard above the switch is not the fix: n/is_store/is_atomic are unset
+            // there, so it would print `n=0 store=0 atomic=0`, which is less honest than no line.
+            //
+            // `rt=` is on the line because `unclassified` alone does not mean "instrument hole".
+            // recompile_coverage() translates on a table-less compute shell, so every buffer op it
+            // sees takes a no-table path and prints `unclassified` for a reason that has nothing to
+            // do with coverage. `rt=0` marks those. A hole is `rt=1 ... unclassified`.
+            struct BufOpDisposition {
+                bool on;
+                const SpirvCompute& b;
+                const Rdna2Inst& in;
+                const uint32_t& n;
+                const bool& is_store;
+                const bool& is_atomic;
+                const ShaderResourceTable* rt;
+                const char* how = "unclassified";
+                ~BufOpDisposition() {
+                    if (!on) return;
+                    std::fprintf(stderr,
+                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d rt=%d %s\n",
+                                 (unsigned long long)b.diagnostic.program_address, in.pc,
+                                 in.fmt == Rdna2Format::MUBUF ? "MUBUF" : "MTBUF", in.opcode, n,
+                                 (int)is_store, (int)is_atomic, (int)(rt != nullptr), how);
+                }
+            } buf_op{std::getenv("PROSPER_DBG") != nullptr, b, in, n, is_store, is_atomic, rt};
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
             const bool indirect_pointer_descriptor_source_candidate =
@@ -13425,12 +13471,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     b.indirect_buffer_atomic_binding == UINT32_MAX ||
                     b.indirect_buffer_atomic_byte_offset != offset ||
                     (offset & 7u) != 0u) {
+                    buf_op.how = "reject-packed-pointer-atomic";
                     ok = false;
                     return true;
                 }
                 const auto lo = rs.vreg.find(in.dst.value);
                 const auto hi = rs.vreg.find(in.dst.value + 1);
                 if (lo == rs.vreg.end() || hi == rs.vreg.end()) {
+                    buf_op.how = "reject-packed-pointer-atomic";
                     ok = false;
                     return true;
                 }
@@ -13439,6 +13487,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 (void)b.cbuf_atomic_x2_rtn(
                     Op_AtomicOr, b.uconst(offset / 8u), value,
                     b.indirect_buffer_atomic_binding, access, b.uconst64(0u));
+                buf_op.how = "packed-pointer-atomic";
                 return true;
             }
             // PC-relative EMBEDDED TABLE (#273): this load's V# was built from s_getpc_b64 and the
@@ -13463,6 +13512,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.vreg[d] = acc;
                         predicate_write(b, rs, d, old);
                     }
+                    buf_op.how = "pcrel-table";
                     return true;
                 }
             }
@@ -13470,7 +13520,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // bindings. Only external buffer accesses require the stage's SMEM/MUBUF resource gate.
             // Keep this check after the fold so resource-free graphics shaders (Astro Bot's loading VS)
             // can consume their embedded lookup table without making unresolved V# accesses permissive.
-            if (!allow_smem) { ok = false; return true; }
+            if (!allow_smem) { buf_op.how = "reject-no-smem"; ok = false; return true; }
             uint32_t binding = 2, stride = 0;   // overwritten by SRSRC resolution below whenever a resource
                                                 // table is present (format AND raw ops); the binding-2 default
                                                 // survives only on the table-less offline path (see below)
@@ -13573,6 +13623,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 !rt ? "no-table" : (tagged_res ? "yes" : "null"),
                                 rt ? rt->resources.size() : 0u);
                     }
+                    buf_op.how = "reject-unresolved";
                     ok = false; return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
@@ -13580,17 +13631,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // result is zero; re-check that contract so a malformed table cannot silently
                     // turn SQ_SEL_1 into zero. Apply the result only to active EXEC lanes, preserving
                     // the old destination in masked lanes, and never declare a backing buffer.
-                    if (is_store) { ok = false; return true; }
+                    if (is_store) { buf_op.how = "reject-zero-record-format-store"; ok = false; return true; }
                     for (uint32_t k = 0; k < n; ++k) {
                         const uint32_t selector = res->swizzle[k];
-                        if (selector != 0u && selector < 4u) { ok = false; return true; }
+                        if (selector != 0u && selector < 4u) { buf_op.how = "reject-zero-record-selector"; ok = false; return true; }
                         const int d = in.dst.value + static_cast<int>(k);
                         const uint32_t old = vreg_old(b, rs, d);
                         rs.vreg[d] = b.uconst(0);
                         predicate_write(b, rs, d, old);
                     }
+                    buf_op.how = "zero-record";
                     return true;
                 }
+                buf_op.how = "resolved";
                 resolved_buffer = res;
                 binding = res->binding;
                 stride = res->stride;
@@ -13632,6 +13685,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 pp ? "yes" : "null",
                                 sreg_range_written(rs, in.src[1].value, 4), rt->resources.size());
                     }
+                    buf_op.how = "reject-raw-unresolved";
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
                 }
                 if (indirect_pointer_descriptor_source_candidate) {
@@ -13666,6 +13720,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.indirect_pointer_source_root_lo_var &&
                         b.indirect_pointer_source_root_hi_var;
                     if (!exact_source) {
+                        buf_op.how = "reject-indirect-pointer-source";
                         ok = false;
                         return true;
                     }
@@ -13680,6 +13735,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         access == GtaCf9200NoBackingAccess::None ||
                         (access == GtaCf9200NoBackingAccess::LoadZero && is_store) ||
                         (access == GtaCf9200NoBackingAccess::DropStore && !is_store)) {
+                        buf_op.how = "reject-cf9200";
                         ok = false;
                         return true;
                     }
@@ -13689,6 +13745,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.vreg[destination] = b.uconst(0u);
                         predicate_write(b, rs, destination, old);
                     }
+                    buf_op.how = "cf9200-no-backing";
                     return true;
                 }
                 if (is_proven_null_nullable_raw_buffer(*res)) {
@@ -13702,6 +13759,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         access == Gta5NullableOutputAccess::None ||
                         (access == Gta5NullableOutputAccess::LoadDword && is_store) ||
                         (access == Gta5NullableOutputAccess::StoreDword && !is_store)) {
+                        buf_op.how = "reject-proven-null-nullable";
                         ok = false;
                         return true;
                     }
@@ -13711,6 +13769,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rs.vreg[d] = b.uconst(0);
                         predicate_write(b, rs, d, old);
                     }
+                    buf_op.how = "proven-null-nullable";
                     return true;
                 }
                 if (is_optional_null_raw_load_buffer(*res)) {
@@ -13719,6 +13778,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // dword load may consume it; stores, atomics, wider loads, and packet variants
                     // stay fail-visible rather than inheriting drop-write behavior.
                     if (!rdna2_optional_null_raw_load_shape(in)) {
+                        buf_op.how = "reject-optional-null-load";
                         ok = false;
                         return true;
                     }
@@ -13726,6 +13786,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t old = vreg_old(b, rs, d);
                     rs.vreg[d] = b.uconst(0);
                     predicate_write(b, rs, d, old);
+                    buf_op.how = "optional-null-load";
                     return true;
                 }
                 if (is_proven_null_guarded_raw_store(*res)) {
@@ -13741,12 +13802,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                          in.opcode == kMubufOpcodeStoreDwordX3) &&
                         rdna2_gta5_null_guarded_raw_store_site(in);
                     if (!supported_store || res->fetch_pc != in.pc) {
+                        buf_op.how = "reject-null-guarded-store";
                         ok = false;
                         return true;
                     }
+                    buf_op.how = "null-guarded-store";
                     return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
+                    // Safe at the TOP here, unlike the format path: none of this block's three arms
+                    // (atomic, store-drop, load-fold) sets ok=false, so no later outcome can
+                    // contradict the label. A fail-visible guard added below must move this down.
+                    buf_op.how = "zero-record";
                     // The front half proved all four live V# words at this exact instruction and
                     // decoded NUM_RECORDS=0. RDNA2's OOB contract returns zero for every raw load
                     // component, drops raw stores, and performs no memory operation for an atomic.
@@ -13786,11 +13853,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         in.src[1].kind == OperandKind::SGPR && in.src[1].value == 8 &&
                         in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0;
                     if (!exact_operands) {
+                        buf_op.how = "reject-selected-sbuffer-operands";
                         ok = false;
                         return true;
                     }
                     gta5_selected_sbuffer_consumer = true;
                 }
+                buf_op.how = "resolved";
                 resolved_buffer = res;
                 binding = res->binding;
                 stride  = res->stride;
