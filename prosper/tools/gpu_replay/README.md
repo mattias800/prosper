@@ -590,7 +590,7 @@ is the `guest_addr` printed by `--inspect-only`. This exposes the input to opera
 the selected submit executes, and the inspection conversion is not a pixel oracle for HDR values.
 
 Live runs can narrow intermediate-target dumps with
-`PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes> PROSPER_DUMP_RTGROUPS_ADDR=0x...`; only a target whose guest base
+`PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes> PROSPER_DUMP_RTGROUPS_ADDR=0x...`; since #2680 the address is matched against **every MRT slot**, not only slot 0 (the report names which slot matched, and the dumped pixels remain slot 0's). Only a target whose guest base
 matches the optional address filter is written. A sampled-texture filter A/B uses
 `PROSPER_TESTTEX_FILTER=linear|point` together with `PROSPER_TESTTEX_DRAW=N` and/or
 `PROSPER_TESTTEX_BINDING=B`. It changes only the matching descriptor's minification and magnification filters.
