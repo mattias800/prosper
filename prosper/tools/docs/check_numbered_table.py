@@ -206,6 +206,7 @@ now fixed -- #1709: fence line numbers are recorded and a gap containing one is 
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import re
 import sys
@@ -725,7 +726,6 @@ def check(
     return problems
 
 
-
 _STDOUT_GONE = False
 
 
@@ -742,17 +742,57 @@ def say(text: str = "") -> None:
     the crash to those failure paths -- so this helper is not incidental tidying, it is what keeps
     the change from trading a silent green for a meaningless red.
 
-    The dup2 to /dev/null matters as much as the except: without it the interpreter's own flush at
-    shutdown raises again, and Python prints `Exception ignored in: <_io.TextIOWrapper ...>` to
-    stderr after main() has already returned its status.
+    The dup2 to /dev/null matters as much as the except, and MORE than an earlier draft of this
+    docstring claimed. It said the interpreter's shutdown flush would merely print
+    `Exception ignored in: <_io.TextIOWrapper ...>`. Measured: without the dup2 the process exits
+    **120**, so the status is lost after main() already computed the right one -- the note is a
+    symptom, not the cost.
+
+    The catch is `OSError`, deliberately wider than `BrokenPipeError`. Narrowing it puts a failure
+    path back to 120 whenever stdout fails for any other reason -- `> /dev/full` is the reachable
+    one -- which is precisely what this helper exists to prevent. Measured on a full device: broad
+    catch gives 0 clean / 1 with problems, narrow gives 120 for both.
+
+    An errno that is NOT a departed reader is worth one line on stderr before going quiet, because
+    "could not write the summary" is otherwise indistinguishable from "there was nothing to say" --
+    the silent direction, and the only place in this tool that could move that way.
+
+    That warning goes out as `os.write(2, ...)` -- a raw write to the FILE DESCRIPTOR, naming
+    neither `sys.stderr` nor `print`. Two drafts of this one line were wrong, in the two different
+    ways the surrounding code is about, so both are recorded rather than summarised:
+
+      1. `print(..., file=sys.stderr)` BUFFERS. A failed write leaves the bytes in the
+         TextIOWrapper and raises NOTHING here; the interpreter's shutdown flush raises instead,
+         after main() has returned, and the process exits **120** -- the dup2's mechanism above,
+         reintroduced on the other stream by the line meant to close a silent path. Measured with
+         `> log 2>&1` where the write cannot land: buffered 120, raw 0.
+      2. `os.write(sys.stderr.fileno(), ...)` fixes the buffering and adds a new door. With fd 2
+         CLOSED, CPython sets `sys.stderr` to **None**, so the attribute access raises
+         `AttributeError` -- not an OSError, so it escapes this except clause, skips the dup2 below,
+         and the poisoned stdout raises at shutdown anyway: `> /dev/full 2>&-` gave 120. Draft 1
+         survived that case only by accident, because `print` to a `None` file is a no-op.
+         `os.write(2, ...)` removes the class rather than adding `AttributeError` to a tuple.
+
+    What is NOT claimed: that no write can fail here in any way. That absolute is what an earlier
+    revision of this docstring asserted, inside the PR whose whole subject is a claim that outran
+    its evidence. The shape closed is "the warning cannot turn a well-defined status into 120";
+    fd 2 pointing at something that fails for an exotic reason is caught by the except and
+    swallowed, which is the intended answer, not a proof that it cannot happen.
     """
     global _STDOUT_GONE
     if _STDOUT_GONE:
         return
     try:
         print(text, flush=True)
-    except (BrokenPipeError, OSError):
+    except (BrokenPipeError, OSError) as exc:
         _STDOUT_GONE = True
+        if getattr(exc, "errno", None) not in (errno.EPIPE, errno.ESHUTDOWN):
+            try:
+                # fd 2 by number, never sys.stderr: with fd 2 closed that attribute is None.
+                os.write(2, f"warning: stdout could not be written ({exc}); "
+                            f"the exit status still stands\n".encode("utf-8", "replace"))
+            except OSError:
+                pass    # stderr is gone too; the exit status is all that is left to say it
         try:
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         except OSError:
