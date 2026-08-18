@@ -5697,9 +5697,10 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                                             const char* caller_role = "emit") {
     std::vector<DivLoop> out;
     // PROSPER_DBG: name WHICH rejection discards the loops. Every `return {}` here throws away
-    // EVERY loop in the shader, not just the one that failed, and the caller then falls back to the
-    // whole-stream CFG dispatcher, which EMULATES the loop instead of emitting a real SPIR-V one.
-    // So one unhandled shape silently changes how an entire program executes. Static reading can
+    // EVERY loop in the shader, not just the one that failed. What the caller then does with an
+    // empty list is NOT fixed -- see the note on `caller_role` below -- but one of the outcomes is
+    // the whole-stream CFG dispatcher, which EMULATES the loop instead of emitting a real SPIR-V
+    // one. So one unhandled shape silently changes how an entire program executes. Static reading can
     // narrow a symptom to this function in minutes and then stall, because the sites are
     // indistinguishable from outside; this makes them distinguishable.
     //
@@ -5721,12 +5722,37 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
     // different shaders rejecting at the same cause and pc into one line, making a count of
     // distinct programs read LOW. An unattributed line is not a weaker finding, it is a wrong one.
     //
+    // The message states ONLY what is certain at this point, and deliberately says nothing about
+    // what happens next. It is tempting to add "and the stream then falls back to the CFG
+    // dispatcher" -- an earlier version did, and so did the first attempt at THIS comment, which
+    // asserted the opposite outcome just as confidently and was equally wrong.
+    //
+    // The honest statement is that the outcome is not determined here, and this comment will not
+    // enumerate the ways it can go -- deliberately, because two drafts already got an enumeration
+    // wrong in opposite directions.
+    //
+    // What is checkable and sufficient: an empty list is ONE input among several to a decision taken
+    // in `emit_body`, whose branches carry predicates over values not visible here (whether the
+    // dispatcher is permitted at all for this sub-stream, whether a guest barrier made it unsafe,
+    // the branch count, the presence of particular ops). At least one caller withholds the
+    // dispatcher outright, so "refused loop" and "loop emulated" are not the same claim. That is as
+    // far as this function can see, and it is far enough to know the consequence is not its to
+    // state. Plumbing those values in purely to keep a sentence would be the wrong trade: the
+    // sentence is what should go.
+    //
+    // (Found reviewing #2695, which fixed the same over-assertion one level up. Counting both
+    // earlier drafts of this comment -- one asserting the dispatcher, one asserting outright
+    // rejection, one asserting a false universal over the entries -- the shared shape is that the
+    // clause gets written where the CAUSE is detected rather than where the EFFECT is decided, and
+    // those are different functions. Writing a *narrower* claim is not a fix if it is still a claim
+    // about the other function.)
+    //
     // `caller_role` is in the message AND in the de-dup key, and both halves are load-bearing.
     // Two callers reach this function with the same `safe` set and the same program, and their
     // consequences are NOT the same:
     //
-    //   emit            -- the recompile. Every loop in the shader is discarded and the stream
-    //                      falls back to the CFG dispatcher, which emulates the loop.
+    //   emit            -- the recompile. Every loop in the shader is discarded; what the stream
+    //                      does next is decided by the caller, not here (see the note above).
     //   multiwave-probe -- `compute_shader_prefers_native_multiwave`, which only tests
     //                      `loops.empty()`. Nothing is discarded and no fallback happens; the
     //                      preference analysis simply proceeds as though the shader were loop-free.
@@ -5755,7 +5781,7 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                              "[divloop-reject] program=0x%llx role=%s %s at pc=%u (%s)\n",
                              (unsigned long long)diagnostic.program_address, caller_role, why, pc,
                              std::strcmp(caller_role, "emit") == 0
-                                 ? "all loops discarded; stream falls back to the CFG dispatcher"
+                                 ? "all loops discarded; what the stream does next is the caller's"
                                  : "probe only: nothing discarded, analysis proceeds as loop-free");
         }
         return {};
