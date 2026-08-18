@@ -4283,6 +4283,67 @@ const std::set<uint64_t>& compute_skip_programs() {
     return programs;
 }
 
+// PROSPER_COMPUTE_PARENTSCAN=0xADDR — CPU-side cyclicity census of a link/parent array, taken
+// PRE-dispatch from the exact bytes the dispatch is about to read.
+//
+// This exists because the obvious instrument does not work. Deciding whether a runaway dispatch's INPUT
+// is ALREADY cyclic needs the array and the runaway record from the SAME run, and arming
+// PROSPER_GPU_CAPTURE to obtain the array changes which dispatches run away — measured on GTA V's
+// 0x413dc6700: 11 dispatches of both parities without a capture, reproducibly, versus 5 odd-only
+// ordinals with one armed. An instrument that alters the phenomenon cannot establish its cause.
+//
+// A walk of bytes the front half has already materialized touches no GPU state, issues no submit and
+// cannot reorder one, so this can run alongside PROSPER_CFG_TRIP_BOUND's witness and be read against it.
+//
+// The link encoding is the title's own: next = (word >> 3) & 0x7FFFFFF, terminating on 0 or on an index
+// at/after the record count — an out-of-range RDNA2 buffer load returns zero, which is exactly what
+// exits the guest's pc88..97 walk. The line reports `records` and the encoding's shift/mask so a wrong
+// guess is visible rather than silent. CONFIDENCE: HIGH on the encoding (it is the guest's own
+// `v_bfe_u32 v1, v1, 3, 27` with NUM_RECORDS as the bound).
+struct ParentScanResult {
+    uint32_t records = 0, terminating = 0, cyclic = 0, cycle_nodes = 0, longest = 0;
+};
+
+ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_count) {
+    ParentScanResult out;
+    if (!bytes || byte_count < 4) return out;
+    const uint32_t records = static_cast<uint32_t>(byte_count / 4);
+    out.records = records;
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(bytes);
+    // 0 = unclassified, 1 = reaches a terminator, 2 = enters a cycle. Memoized so the whole array is
+    // classified in O(records) rather than O(records * path length).
+    std::vector<uint8_t> state(records, 0);
+    std::vector<uint32_t> path;
+    std::vector<uint32_t> seen_at(records, UINT32_MAX);
+    std::set<uint32_t> cycle_nodes;
+    for (uint32_t start = 0; start < records; ++start) {
+        if (state[start]) continue;
+        path.clear();
+        uint32_t i = start;
+        uint8_t verdict = 1;
+        while (true) {
+            if (i == 0 || i >= records) { verdict = 1; break; }         // terminator / OOB read -> 0
+            if (state[i]) { verdict = state[i]; break; }                // already classified
+            if (seen_at[i] != UINT32_MAX) {                             // revisited on THIS walk
+                for (size_t k = seen_at[i]; k < path.size(); ++k) cycle_nodes.insert(path[k]);
+                verdict = 2;
+                break;
+            }
+            seen_at[i] = static_cast<uint32_t>(path.size());
+            path.push_back(i);
+            i = (words[i] >> 3) & 0x7FFFFFFu;
+        }
+        if (path.size() > out.longest) out.longest = static_cast<uint32_t>(path.size());
+        for (uint32_t node : path) { state[node] = verdict; seen_at[node] = UINT32_MAX; }
+    }
+    for (uint32_t k = 0; k < records; ++k) {
+        if (state[k] == 1) ++out.terminating;
+        else if (state[k] == 2) ++out.cyclic;
+    }
+    out.cycle_nodes = static_cast<uint32_t>(cycle_nodes.size());
+    return out;
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -4965,6 +5026,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     source = buffers[i].linear_seed.data();
                 }
                 if (trace) buffers[i].before_hash = fnv1a(source, buffers[i].bytes);
+                if (const char* pscan = std::getenv("PROSPER_COMPUTE_PARENTSCAN")) {
+                    // Stride 4 restricts this to the per-entity u32 arrays; the 64-byte record buffer
+                    // is not a link array and scanning it would report noise as structure.
+                    if (std::strtoull(pscan, nullptr, 16) ==
+                            static_cast<uint64_t>(item.code_addr) && resource->stride == 4u) {
+                        const ParentScanResult ps = scan_parent_array(source, buffers[i].bytes);
+                        std::fprintf(stderr,
+                                     "[parentscan] program=0x%llx submit=%llu dispatch=%llu "
+                                     "binding=%u addr=0x%llx records=%u terminating=%u cyclic=%u "
+                                     "cycle-nodes=%u longest=%u enc=(w>>3)&0x7ffffff\n",
+                                     (unsigned long long)item.code_addr,
+                                     (unsigned long long)item.submit_no,
+                                     (unsigned long long)item.dispatch_index,
+                                     resource->binding,
+                                     (unsigned long long)resource->gpu_addr,
+                                     ps.records, ps.terminating, ps.cyclic, ps.cycle_nodes,
+                                     ps.longest);
+                    }
+                }
                 buffers[i].cache_key = {
                     resource->gpu_addr, reinterpret_cast<uintptr_t>(resource->host_data),
                     static_cast<uint32_t>(buffers[i].bytes),
