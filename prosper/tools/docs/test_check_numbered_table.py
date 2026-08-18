@@ -11,6 +11,7 @@ Run directly, or via ctest as doc_table_checker.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from check_numbered_table import check  # noqa: E402
 CHECKER = Path(__file__).resolve().parent / "check_numbered_table.py"
 
 FAILURES: list[str] = []
+SKIPPED: list[str] = []
 
 
 def run(name: str, body: str, *, ordered: bool = False, header: str | None = None,
@@ -754,10 +756,127 @@ cli_closed_stdout("a removed flag still exits 2 with stdout closed",
 cli_closed_stdout("an unknown flag still exits 2 with stdout closed",
                   ["--gapless", "<FILE>"], TABLE, want_rc=2)
 
+
+# The OTHER way a stdout write fails, and the one that must NOT be silent. A departed reader is
+# routine and deserves no noise; a write that fails for any other reason means the summary was lost,
+# and "could not say it" is otherwise indistinguishable from "there was nothing to say". `/dev/full`
+# is the reachable instance (ENOSPC on every write). This also pins the deliberately BROAD
+# `except (BrokenPipeError, OSError)`: narrowed to BrokenPipeError these two exit 120 again.
+def cli_full_device(name: str, args: list[str], body: str, *, want_rc: int) -> None:
+    if not os.path.exists("/dev/full"):
+        # Announced AND counted. ctest captures stdout and shows it only on failure, so a printed
+        # SKIP is invisible on a green Windows run -- the tail count below is what makes the
+        # difference between "91 passed" and "89 passed, 2 skipped" legible in either place.
+        SKIPPED.append(name)
+        print(f"  SKIP {name} (no /dev/full on this platform)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "case.md"
+        path.write_text(body, encoding="utf-8")
+        with open("/dev/full", "w") as full:
+            proc = subprocess.run(
+                [sys.executable, str(CHECKER)] + [a.replace("<FILE>", str(path)) for a in args],
+                stdout=full, stderr=subprocess.PIPE, text=True,
+            )
+    if proc.returncode != want_rc:
+        FAILURES.append(f"{name}: expected rc={want_rc} on a full device, got {proc.returncode}")
+    elif "stdout could not be written" not in proc.stderr:
+        FAILURES.append(f"{name}: a lost summary must say so on stderr, got {proc.stderr[:200]!r}")
+    else:
+        print(f"  ok  {name}")
+
+
+cli_full_device("a lost summary says so on stderr and keeps rc=0",
+                ["--ordered", "<FILE>"], TABLE, want_rc=0)
+cli_full_device("a lost summary says so on stderr and keeps rc=1",
+                ["--ordered", "<FILE>"], OUT_OF_ORDER_2, want_rc=1)
+
+
+# The warning about a lost summary must not itself become the crash, and there are TWO ways it can
+# be, which is why there are two helpers below rather than one.
+#
+#   BOTH STREAMS UNWRITABLE -- `check ... > log 2>&1` on a full or over-quota filesystem, which this
+#   repository's own guidance warns recurs here. `print(..., file=sys.stderr)` BUFFERS: a failed
+#   write raises nothing at the call, then raises at interpreter shutdown after main() returned the
+#   right status -> rc=120.
+#
+#   FD 2 CLOSED -- `check ... > /dev/full 2>&-`. CPython sets `sys.stderr` to None, so
+#   `sys.stderr.fileno()` raises AttributeError, which is not an OSError: it escapes say()'s except
+#   clause, the dup2 never runs, and the poisoned stdout raises at shutdown -> rc=120.
+#
+# Both shipped, in successive drafts of the same one line (#2696 review rounds 1 and 2), and the
+# second was opened by the fix for the first. `os.write(2, ...)` closes both: no buffer, and no
+# attribute to be None. Neither arm is a substitute for the other -- draft 1 passes the fd-2-closed
+# case by accident (`print` to a None file is a no-op) and draft 2 passes the both-full case.
+def cli_both_streams_full(name: str, args: list[str], body: str, *, want_rc: int) -> None:
+    if not os.path.exists("/dev/full"):
+        SKIPPED.append(name)
+        print(f"  SKIP {name} (no /dev/full on this platform)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "case.md"
+        path.write_text(body, encoding="utf-8")
+        with open("/dev/full", "w") as full:
+            proc = subprocess.run(
+                [sys.executable, str(CHECKER)] + [a.replace("<FILE>", str(path)) for a in args],
+                stdout=full, stderr=full,
+            )
+    if proc.returncode != want_rc:
+        FAILURES.append(f"{name}: expected rc={want_rc} with BOTH streams unwritable, got "
+                        f"{proc.returncode}"
+                        + (" -- the stderr warning buffered and raised at shutdown"
+                           if proc.returncode == 120 else ""))
+        return
+    print(f"  ok  {name}")
+
+
+cli_both_streams_full("a clean run survives BOTH streams being unwritable",
+                      ["--ordered", "<FILE>"], TABLE, want_rc=0)
+
+
+def cli_stderr_closed(name: str, args: list[str], body: str, *, stdout_full: bool,
+                      want_rc: int) -> None:
+    """fd 2 CLOSED, not redirected. `stdout_full` is the control switch, and it is what makes the
+    arm test the INTERACTION rather than merely "stderr was closed": with stdout healthy nothing
+    reaches say()'s except branch at all, so that case is 0 on every draft and on master."""
+    if stdout_full and not os.path.exists("/dev/full"):
+        SKIPPED.append(name)
+        print(f"  SKIP {name} (no /dev/full on this platform)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "case.md"
+        path.write_text(body, encoding="utf-8")
+        out = open("/dev/full", "w") if stdout_full else subprocess.DEVNULL
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(CHECKER)] + [a.replace("<FILE>", str(path)) for a in args],
+                stdout=out, preexec_fn=(lambda: os.close(2)) if hasattr(os, "fork") else None,
+            )
+        finally:
+            if stdout_full:
+                out.close()
+    if proc.returncode != want_rc:
+        FAILURES.append(f"{name}: expected rc={want_rc} with fd 2 closed, got {proc.returncode}"
+                        + (" -- AttributeError from sys.stderr being None escaped say()"
+                           if proc.returncode == 120 else ""))
+        return
+    print(f"  ok  {name}")
+
+
+cli_stderr_closed("a lost summary with fd 2 CLOSED still exits 0",
+                  ["--ordered", "<FILE>"], TABLE, stdout_full=True, want_rc=0)
+# The control. Passes on every draft and on master, so on its own it proves nothing -- it is here to
+# show the arm above fails for the INTERACTION and not merely for having closed fd 2.
+cli_stderr_closed("fd 2 closed with a healthy stdout is unremarkable",
+                  ["--ordered", "<FILE>"], TABLE, stdout_full=False, want_rc=0)
+
 print()
 if FAILURES:
     for f in FAILURES:
         print(f"FAIL: {f}", file=sys.stderr)
     print(f"\n{len(FAILURES)} case(s) failed.", file=sys.stderr)
     sys.exit(1)
-print("all cases passed")
+# A count, not just a verdict: "all cases passed" reads identically whether every arm ran or half of
+# them skipped, and two of these arms need /dev/full, which Windows does not have.
+print(f"all cases passed ({len(SKIPPED)} skipped"
+      + (": " + ", ".join(SKIPPED) if SKIPPED else "") + ")")
