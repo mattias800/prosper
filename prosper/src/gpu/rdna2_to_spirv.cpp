@@ -13720,6 +13720,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.indirect_pointer_source_root_lo_var &&
                         b.indirect_pointer_source_root_hi_var;
                     if (!exact_source) {
+                        buf_op.how = "reject-indirect-pointer-source";
                         ok = false;
                         return true;
                     }
@@ -13852,6 +13853,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         in.src[1].kind == OperandKind::SGPR && in.src[1].value == 8 &&
                         in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0;
                     if (!exact_operands) {
+                        buf_op.how = "reject-selected-sbuffer-operands";
                         ok = false;
                         return true;
                     }
