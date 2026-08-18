@@ -5682,13 +5682,84 @@ bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch
     return compare->n_src != 0;
 }
 
-// Returns the loops in header-pc order, or {} when any backward branch doesn't fit the shape (the
-// caller then rejects the stream loudly, exactly as before this feature). `safe` carries the
-// linearized branches (waterfalls etc.) which are not loop back-edges.
+// Returns the loops in header-pc order, or {} when any backward branch doesn't fit the shape.
+// `safe` carries the linearized branches (waterfalls etc.) which are not loop back-edges.
+//
+// An empty result has TWO causes that the caller cannot tell apart, and neither can the log: no
+// eligible backward branch was found at all (the `out.empty()` early return below, which reaches
+// none of the reject sites), or a shape check refused. Callers conflate them deliberately --
+// `(cf_rejected || Ls.empty())` -- so this distinction matters only to a reader of the diagnostic,
+// which is why the reject reporter below prints on exactly one of those two paths.
 std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                                             const std::unordered_set<uint32_t>& safe,
-                                            bool exact_fragment_wave_breaks = false) {
+                                            bool exact_fragment_wave_breaks = false,
+                                            const RecompileDiagnosticContext& diagnostic = {},
+                                            const char* caller_role = "emit") {
     std::vector<DivLoop> out;
+    // PROSPER_DBG: name WHICH rejection discards the loops. Every `return {}` here throws away
+    // EVERY loop in the shader, not just the one that failed, and the caller then falls back to the
+    // whole-stream CFG dispatcher, which EMULATES the loop instead of emitting a real SPIR-V one.
+    // So one unhandled shape silently changes how an entire program executes. Static reading can
+    // narrow a symptom to this function in minutes and then stall, because the sites are
+    // indistinguishable from outside; this makes them distinguishable.
+    //
+    // Do NOT read an absent line as "this function was never called for that program". Absence has
+    // three other causes: the `out.empty()` early return (no eligible backward branch, so no site is
+    // reached), a caller that supplies no diagnostic context (suppressed below), and PROSPER_DBG
+    // itself, which desyncs a timing-dependent pad script badly enough that a routed run may never
+    // reach the dispatch you wanted to observe (see the note at the top of this file). Whether a
+    // given caller consults this function at all is a question for the CALL SITE, not for the log.
+    // Reported ONCE per (program, cause, pc). A program is recompiled or re-looked-up many times
+    // over a run, so an unfiltered print repeats the same rejection -- measured on a GTA V gameplay
+    // run, the busiest single site emitted 70 lines. A log whose line count far exceeds its finding
+    // count invites exactly one mistake: quoting the line count as a finding count. De-duplicating
+    // here means the raw count is the honest statistic.
+    //
+    // Reported ONLY when the caller supplied a real program address. Both graphics stages have no
+    // diagnostic parameter at all and so stay silent: they would report `program=0x0`, which is
+    // wrong twice over -- the address is not a program, and the de-dup key would merge genuinely
+    // different shaders rejecting at the same cause and pc into one line, making a count of
+    // distinct programs read LOW. An unattributed line is not a weaker finding, it is a wrong one.
+    //
+    // `caller_role` is in the message AND in the de-dup key, and both halves are load-bearing.
+    // Two callers reach this function with the same `safe` set and the same program, and their
+    // consequences are NOT the same:
+    //
+    //   emit            -- the recompile. Every loop in the shader is discarded and the stream
+    //                      falls back to the CFG dispatcher, which emulates the loop.
+    //   multiwave-probe -- `compute_shader_prefers_native_multiwave`, which only tests
+    //                      `loops.empty()`. Nothing is discarded and no fallback happens; the
+    //                      preference analysis simply proceeds as though the shader were loop-free.
+    //
+    // Without the role in the KEY the probe silences the recompile, because the probe runs first
+    // (`gpu_executor.cpp` calls it before the recompile). Without the role in the MESSAGE the
+    // surviving line states the recompile's consequence over the probe's cause -- which reads as
+    // proof that a recompile discarded the loops when no recompile has happened yet. That is
+    // precisely the misreading this diagnostic exists to prevent, so it must not manufacture it.
+    auto divloop_reject = [&](const char* why, uint32_t pc) -> std::vector<DivLoop> {
+        if (getenv("PROSPER_DBG") && diagnostic.program_address != 0) {
+            static std::mutex seen_mu;
+            // Keyed by string VALUE, not by pointer: every caller passes a literal today, so
+            // pointer identity would happen to work, and would break silently the first time
+            // someone passes a computed name.
+            static std::set<std::tuple<uint64_t, std::string, uint32_t, std::string>> seen;
+            std::lock_guard<std::mutex> lk(seen_mu);
+            // The key space is (programs x causes x pcs x roles) and a long session keeps loading
+            // new shaders, so leave nothing unbounded even on a diagnostic path. Clearing rather
+            // than refusing to insert means the reporter degrades into REPEATING lines, never into
+            // dropping them -- for a diagnostic, losing tidiness beats losing findings. Measured at
+            // 14 tuples on a full routed GTA V run, so the cap is not expected to be reached.
+            if (seen.size() >= 4096u) seen.clear();
+            if (seen.emplace(diagnostic.program_address, why, pc, caller_role).second)
+                std::fprintf(stderr,
+                             "[divloop-reject] program=0x%llx role=%s %s at pc=%u (%s)\n",
+                             (unsigned long long)diagnostic.program_address, caller_role, why, pc,
+                             std::strcmp(caller_role, "emit") == 0
+                                 ? "all loops discarded; stream falls back to the CFG dispatcher"
+                                 : "probe only: nothing discarded, analysis proceeds as loop-free");
+        }
+        return {};
+    };
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
     // Pass 1: each backward s_branch / s_cbranch_execnz is a candidate back-edge.
@@ -5702,10 +5773,11 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
         L.header_pc = branch_target(in);
         L.backedge_pc = in.pc;
         L.exit_pc = in.pc + in.len_dwords;
-        if (L.header_pc >= L.backedge_pc || L.exit_pc > end_pc) return {};
+        if (L.header_pc >= L.backedge_pc) return divloop_reject("degenerate-loop-bounds", L.header_pc);
+        if (L.exit_pc > end_pc) return divloop_reject("exit-past-end-of-program", L.header_pc);
         bool hdr_ok = false;
         for (const auto& h : ins) { if (h.pc == L.header_pc) { hdr_ok = true; break; } if (h.pc > L.header_pc) break; }
-        if (!hdr_ok) return {};
+        if (!hdr_ok) return divloop_reject("header-pc-is-not-an-instruction", L.header_pc);
         out.push_back(L);
         backedge_execnz.push_back(in.opcode == 0x09);
     }
@@ -5730,10 +5802,10 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
     for (size_t i = 0; i < out.size(); i++)
         for (size_t j = i + 1; j < out.size(); j++) {
             const DivLoop& A = out[i]; const DivLoop& B = out[j];   // A.header_pc <= B.header_pc
-            if (A.header_pc == B.header_pc) return {}; // shared header: not modeled
+            if (A.header_pc == B.header_pc) return divloop_reject("shared-header", A.header_pc); // shared header: not modeled
             const bool disjoint = B.header_pc >= A.exit_pc;
             const bool nested   = B.exit_pc <= A.backedge_pc;       // B entirely inside A's body
-            if (!disjoint && !nested) return {};      // partial overlap: unstructured
+            if (!disjoint && !nested) return divloop_reject("partial-overlap", B.header_pc);    // partial overlap: unstructured
         }
     // Pass 2: validate each loop's interior branches and find the canonical exit + breaks. A branch
     // inside a NESTED child loop belongs to the child (which validates itself in its own pass-2
@@ -5756,14 +5828,14 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                 case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: break;
                 default: continue;   // hints
             }
-            if (in.simm16 < 0) return {};         // second back-edge inside -> nested loop
+            if (in.simm16 < 0) return divloop_reject("nested-backedge-in-body", in.pc);         // second back-edge inside -> nested loop
             if (safe.count(in.pc)) continue;                    // linearized (kill-mask / safe-execz)
             uint32_t tgt = branch_target(in);
             if (in.opcode == 0x02) {                            // forward s_branch: an else-arm terminator
-                if (tgt > L.backedge_pc) return {}; // may not leave the body
+                if (tgt > L.backedge_pc) return divloop_reject("else-arm-branch-leaves-body", in.pc); // may not leave the body
                 continue;                                       // (validated by detect_forward_ifs)
             }
-            if (tgt > L.exit_pc) return {};       // conditional jumping past the loop
+            if (tgt > L.exit_pc) return divloop_reject("conditional-branch-past-loop", in.pc);      // conditional jumping past the loop
             if (tgt == L.exit_pc) {                             // an exit test
                 if (!L.exit_branch_pc) {                        // first one = the canonical exit
                     if (in.opcode == 0x08) {                    // execz -> EXIT
@@ -5781,12 +5853,19 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                         // scc0 exits while SCC==0 (continue on set); scc1 has the opposite polarity.
                         L.condition = DivLoop::Condition::Scc;
                         L.continue_on_set = in.opcode == 0x04;
+                    } else if (in.opcode == 0x06 && !execnz) {
+                        // Reached the vccz arm but the compare was not proven wave-uniform.
+                        return divloop_reject("vcc-exit-not-proven-wave-uniform", in.pc);
+                    } else if (execnz) {
+                        // A scalar/vcc exit test combined with an execnz back-edge: the bottom-tested
+                        // lowering owns that back-edge, so this exit shape is not the one modeled.
+                        return divloop_reject("scalar-exit-with-execnz-backedge", in.pc);
                     } else {
-                        return {};
+                        return divloop_reject("exit-branch-opcode-not-modeled", in.pc);
                     }
                     L.exit_branch_pc = in.pc;
                 } else {                                        // later ones = breaks
-                    if (in.opcode != 0x06 && in.opcode != 0x08) return {}; // vccz/execz only
+                    if (in.opcode != 0x06 && in.opcode != 0x08) return divloop_reject("break-not-vccz-or-execz", in.pc); // vccz/execz only
                     // With an execnz back-edge, a cleared lane skips to the next header check. With
                     // an unconditional back-edge that could re-enable EXEC, only an EXECZ branch is
                     // exact: the emitter sends the cleared lane directly to the loop merge instead.
@@ -5796,7 +5875,7 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                         // approximation could not carry it to the merge. The fragment shell now
                         // reduces VCC over an enforced wave64 subgroup and can branch the complete
                         // guest wave directly at the loop latch. Other stages remain conservative.
-                        if (!exact_fragment_wave_breaks || in.opcode != 0x06) return {};
+                        if (!exact_fragment_wave_breaks || in.opcode != 0x06) return divloop_reject("vccz-break-unsupported-stage", in.pc);
                         L.direct_wave_breaks = true;
                     } else if (!execnz) {
                         L.direct_exec_breaks = true;
@@ -5813,7 +5892,7 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
             // would turn an arbitrary backward branch into a do-while (and commonly an infinite
             // one). GTA V's nested lighting loop ends in V_CMPX; the regression uses S_MOV_B64
             // EXEC,0. Nested child branches were already validated and skipped above.
-            if (!execnz) return {};
+            if (!execnz) return divloop_reject("bottom-tested-needs-execnz-backedge", L.backedge_pc);
             const Rdna2Inst* condition_writer = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < L.header_pc) continue;
@@ -5821,7 +5900,7 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                 condition_writer = &in;
             }
             if (!condition_writer ||
-                !rdna2_instruction_may_change_exec(*condition_writer)) return {};
+                !rdna2_instruction_may_change_exec(*condition_writer)) return divloop_reject("bottom-tested-no-exec-writer", L.backedge_pc);
             L.exit_branch_pc = L.backedge_pc;
             L.condition = DivLoop::Condition::Exec;
             L.continue_on_set = true;
@@ -5835,12 +5914,12 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
                 if (in.pc >= L.exit_branch_pc) break;
                 if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
                 if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 &&
-                    !safe.count(in.pc)) return {};
+                    !safe.count(in.pc)) return divloop_reject("condition-region-not-branch-free", in.pc);
             }
         }
         // The execnz flavor's unconditional-continue lowering requires the header check to
         // immediately re-test EXEC (empty condition region) — see the shape comment.
-        if (execnz && !L.bottom_tested && L.exit_branch_pc != L.header_pc) return {};
+        if (execnz && !L.bottom_tested && L.exit_branch_pc != L.header_pc) return divloop_reject("execnz-nonempty-condition-region", L.header_pc);
     }
     // A nested child must lie entirely within its parent's BODY: after the parent's canonical exit
     // test (the condition region [header, exit_branch) stays branch-free) and before its back-edge.
@@ -5848,7 +5927,7 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
         for (size_t j = i + 1; j < out.size(); j++)
             if (out[j].exit_pc <= out[i].backedge_pc &&        // nested per the classification above
                 !out[i].bottom_tested &&
-                out[j].header_pc <= out[i].exit_branch_pc) return {};
+                out[j].header_pc <= out[i].exit_branch_pc) return divloop_reject("child-header-inside-parent-condition-region", out[j].header_pc);
     // Pass 3: no branch from OUTSIDE a loop may target its interior (an unstructured entry edge).
     for (const auto& in : ins) {
         if (in.is_end) break;
@@ -5858,7 +5937,7 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
         for (const auto& L : out) {
             const bool inside_br = in.pc >= L.header_pc && in.pc <= L.backedge_pc;
             const bool inside_tgt = tgt > L.header_pc && tgt < L.exit_pc;
-            if (!inside_br && inside_tgt) return {};
+            if (!inside_br && inside_tgt) return divloop_reject("entry-edge-from-outside-loop", in.pc);
         }
     }
     return out;
@@ -22502,7 +22581,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // loop with header phis for carried register/mask state. Fragment conditions are exact wave64
         // votes; vertex and the guarded compute cases retain their per-invocation form. The IF
         // machinery recurses into loop bodies and handles their nested forward-execz regions.
-        Ls = detect_divergent_loops(ins, safe, b.is_fragment);
+        Ls = detect_divergent_loops(ins, safe, b.is_fragment, b.diagnostic);
         if (b.is_compute) {
             // Compute VCC-exit loops (#590, extending #615): the fragment-stage uniformity proof is
             // data-provenance-based, not stage-based — vcc_exit_is_wave_uniform accepts a compare only
@@ -23616,7 +23695,8 @@ bool compute_shader_prefers_native_multiwave(const std::vector<Rdna2Inst>& ins,
     // explicit experiment until their additional compute guards are shared with this analysis.
     auto safe = safe_execz_branches(ins);
     for (uint32_t pc : waterfall_branches(ins)) safe.insert(pc);
-    const std::vector<DivLoop> loops = detect_divergent_loops(ins, safe, /*fragment*/false);
+    const std::vector<DivLoop> loops =
+        detect_divergent_loops(ins, safe, /*fragment*/false, diagnostic, "multiwave-probe");
     if (!loops.empty()) return false;
 
     bool rejected = false;
