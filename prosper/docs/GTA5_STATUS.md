@@ -46,6 +46,21 @@ unbounded it hangs at dispatch 40, bounded it truncates its own output. Fixing t
 the direct route to a lit world, and this is the first evidence tying the hang to the darkness by
 mechanism rather than by coincidence of timing.
 
+### A correction that understated its own evidence
+
+The bridge-override arm was first reported as **"73 overrides"**. That was the number of *log lines*
+across **7** addresses — and the instrument emits on a **power-of-two schedule**, so lines are not
+events. The main depth's own last line reads `count=32768`.
+
+So the arm covered **at least 32,768 samples on `0x2052ac0000`**, not 73: the depth falsification is
+roughly **450x better supported** than it was written up as. Recorded because the error ran in the
+unusual direction — an under-claim, which nobody is motivated to check, and which would have left the
+next reader thinking the strongest negative result in this document rested on a few dozen samples.
+
+Two separate mistakes produced it: counting emitted lines as if they were events, and quoting a
+sampled counter without reading its own schedule. Both are cheap to avoid — the schedule is three
+lines above the print.
+
 ### Choose instruments by census, and beware what they perturb
 
 Two rules this pass paid for repeatedly:
@@ -98,7 +113,7 @@ So the break is in one of the first two stages, and everything after them is exo
 ### Eliminated, each with a controlled experiment
 
 - **depth** — three levers, every one confirmed to have fired: `0.0f`, a confirmed `1.0f`
-  (`path=f32 filled=1f`), and serving the real retained depth despite `dvalid=0` (**73 overrides**).
+  (`path=f32 filled=1f`), and serving the real retained depth despite `dvalid=0` (**>= 32,768 overrides on the main depth alone**).
   No world at any. Note the earlier "both poles" falsification was **void** — the byte fill made the
   far pole NaN on a Float32 depth (#2680).
 - **draw rejection** — zero `[render] skip draw` lines across six routed runs (unconditional
