@@ -131,6 +131,20 @@ here and deliberately use a distinct heading so the two do not collide as anchor
   reading it. The **22,117-colour measurement recorded below** (§ *RESOLVED CHAIN*) **did** set
   `_PHASE=0` and stands; it was publicly doubted before that was checked, and the retraction is on
   #2542. (2026-08-18.)
+- **"Implementing the missing end-of-pipe data patch lights the world."** It does not.
+  `sceAgcQueueEndOfPipeActionPatchData` (#2708) is genuinely missing and now lands — 8,116 successful
+  writes, **zero** refused — but `0x413dc6700` still loses the device at `dispatch=40`, and after that
+  loss the composite freezes for the rest of the run (pixel CRC identical t=120s..600s). **This result
+  is not scoped to any particular theory of the black world**: it stands whatever the cause turns out
+  to be, so do not read it as bearing only on #2705's SRT question. An earlier version of this row
+  headlined it as "what leaves the resource table zero" — that premise is **withdrawn**: a live
+  memprobe shows 209 of 286 folds carrying non-zero data (#2704).
+  The pre-patch payload establishes something worse than "the value was stale": `data_sel=2` routes to
+  an 8-byte fence write, so before this change prosper was **writing `0xfffffffffffffffe` as the fence
+  value on every one of those packets that executed**. 8,116 is the count of successful patches and is
+  an upper bound on the writes, not a count of them: `honor_eop_write` returns early on `!rel_addr`,
+  misalignment and `!guest_readable`, only submitted-and-folded packets execute, and nothing shows the
+  packets target distinct addresses. (2026-08-18, #2708, #2704.)
 
 ## RESOLVED CHAIN: the world IS rendered, and then lit by nothing (2026-08-18)
 
