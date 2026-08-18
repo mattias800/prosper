@@ -3067,6 +3067,41 @@ HLE(agc_draw_index_auto_get_size)     { (void)a0; return kDwDrawIndexAuto * 4u; 
 HLE(agc_draw_index_offset_get_size)   { (void)a0; return kDwDrawIndexOffset * 4u; }
 HLE(agc_draw_index_indirect_get_size) { (void)a0; return kDwDrawIndexIndirect * 4u; }
 HLE(agc_dispatch_get_size)            { (void)a0; return kDwDispatch * 4u; }
+
+// sceAgcQueueEndOfPipeActionPatchData (MlEw1feXcjg) — the DATA half of the ReleaseMem patch pair.
+//
+// `sceAgcQueueEndOfPipeActionPatchAddress` was already implemented (agc_patch_release_mem_addr);
+// its sibling was not, so a packet built with a placeholder value got the right DESTINATION and kept
+// the wrong VALUE. GTA V calls this 9,126 times in 150 s of its story route, with a1 running 1, 2,
+// 3, … — an end-of-pipe fence sequence — and every one of them was discarded (#2707).
+//
+// Payload layout is prosper's own builder's, not an inferred PM4 one (agc_cb_release_mem above):
+//   cmd[1..2] address   cmd[3] data_sel   cmd[4..5] data   cmd[6] action   cmd[7] build_pre-hi
+// so this writes cmd[4..5] exactly as the address patch writes cmd[1..2].
+//
+// Deliberately does NOT touch the fence journal: `prosper_fence_journal_record` keys on the
+// destination ADDRESS, which the address patch already recorded. Recording again here with a DATA
+// value would enter a fence value where an address is expected.
+// CONFIDENCE: HIGH on the dword offsets (read from the builder in this file, and the packet is
+// re-validated as R_RELEASE_MEM before any write); MED on the argument order, which is taken from
+// the sibling's (cmd, value) shape and the observed call pattern rather than from a published
+// prototype.
+HLE(agc_patch_release_mem_data) {
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_target_writable(a0, 6 * sizeof(uint32_t), "ReleaseMemPatchData")) return 0;
+    if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchData")) return 0;
+    const uint32_t pre_lo = cmd[4], pre_hi = cmd[5];
+    cmd[4] = (uint32_t)(a1 & 0xffffffffu);
+    cmd[5] = (uint32_t)(a1 >> 32u);
+    if (getenv("PROSPER_GFXLOG"))
+        // Print data_sel and the PRE-patch payload as well as the new value, so the run proves the
+        // write landed AND that it changed something -- a success line that only echoes its own
+        // argument cannot distinguish "patched" from "patched with what was already there".
+        fprintf(stderr, "[agc] ReleaseMemPatchData cmd=%p data_sel=%u pre=0x%08x%08x data=0x%llx\n",
+                (const void*)cmd, cmd[3], pre_hi, pre_lo, (unsigned long long)a1);
+    return 0;
+}
+
 HLE(agc_dispatch_indirect_get_size)   { (void)a0; return kDwDispatchIndirect * 4u; }
 HLE(agc_dma_data_get_size)            { (void)a0; return kDwDmaData * 4u; }
 HLE(agc_event_write_get_size)         { (void)a0; return kDwEventWrite * 4u; }
@@ -3097,6 +3132,7 @@ void register_agc_hle() {
     RN("qMlfB1ZhMDc", agc_draw_index_offset_get_size);   // sceAgcDcbDrawIndexOffsetGetSize
     RN("mStuvI0zOtc", agc_draw_index_indirect_get_size); // sceAgcDcbDrawIndexIndirectGetSize
     RN("Abendgtz+3o", agc_dispatch_get_size);            // sceAgcCbDispatchGetSize
+    RN("MlEw1feXcjg", agc_patch_release_mem_data);       // ReleaseMem packet: set the data payload
     RN("w8HVkEeXPv8", agc_dispatch_indirect_get_size);   // sceAgcDcbDispatchIndirectGetSize
     RN("PxKWV2fVAps", agc_dispatch_indirect_get_size);   // sceAgcAcbDispatchIndirectGetSize
     RN("2ccJz9LQI+w", agc_dma_data_get_size);            // sceAgcDcbDmaDataGetSize
