@@ -4371,26 +4371,70 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ? static_cast<uint8_t>(strtoul(
                                   getenv("PROSPER_DS_UNBRIDGED_FILL"), nullptr, 0))
                             : 0xffu;
+                        // PROSPER_DS_UNBRIDGED_FILL_F32=<float> — fill FLOAT TEXELS, not bytes.
+                        //
+                        // The byte fill above is correct for a UNORM depth, where 0xff really is 1.0.
+                        // It is NOT correct for a Float32 depth (`fmt=1`), where 0xffffffff is
+                        // **NaN**: every comparison against it is false, so the "far" pole is not far,
+                        // it is a third failure mode. A two-pole run over {0x00, 0xff} on a Float32
+                        // surface therefore tests {0.0f, NaN} and never tests 1.0f at all -- which
+                        // silently voids the discriminator this lever exists to be. One such run was
+                        // published as a falsification before the arithmetic was checked.
+                        static const bool have_f32_fill =
+                            PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FILL_F32") != nullptr;
+                        static const float f32_fill = have_f32_fill
+                            ? strtof(PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FILL_F32"), nullptr)
+                            : 1.0f;
                         if (!rtt_hit && !has_ds_live && !fr.is_storage_image &&
                             !far_mode.empty() && far_mode != "0" &&
                             (far_mode != "cube" || r.img_dim == 3u) &&
                             prosper::test::is_retained_ds_plane(r.gpu_addr)) {
-                            std::fill(texture_pixels.begin(), texture_pixels.end(), far_fill);
+                            const bool f32_path = have_f32_fill &&
+                                r.format == prosper::gpu::DataFormat::Float32 &&
+                                texture_pixels.size() % sizeof(float) == 0;
+                            if (f32_path) {
+                                float* texels = reinterpret_cast<float*>(texture_pixels.data());
+                                std::fill(texels, texels + texture_pixels.size() / sizeof(float),
+                                          f32_fill);
+                            } else {
+                                std::fill(texture_pixels.begin(), texture_pixels.end(), far_fill);
+                            }
+                            // PER-ADDRESS count, not just a global one. The report prints once per
+                            // address, so a global running total cannot say how many of a given
+                            // surface's missed samples the fill actually reached -- and that is
+                            // exactly the number a reader needs: this lever only fires when
+                            // `is_retained_ds_plane` holds, so it can cover an arbitrary fraction of
+                            // the misses a run observes. Without it, "filled, and nothing changed"
+                            // is not a falsification, because the fill may have reached 2 of 161.
                             static std::mutex far_mutex;
-                            static std::set<uint64_t> far_seen;
+                            static std::map<uint64_t, uint64_t> far_hits;
                             static std::atomic<uint64_t> far_count{0};
                             const uint64_t n = far_count.fetch_add(1) + 1;
                             bool first = false;
+                            uint64_t per_addr = 0;
                             {
                                 std::lock_guard lock(far_mutex);
-                                first = far_seen.insert(r.gpu_addr).second;
+                                per_addr = ++far_hits[r.gpu_addr];
+                                first = per_addr == 1;
                             }
+                            // Re-report on a power-of-two schedule so coverage is visible without
+                            // flooding: 1, 2, 4, 8 ... fills per address.
+                            first = first || (per_addr & (per_addr - 1)) == 0;
+                            char fill_text[32];
+                            if (f32_path)
+                                std::snprintf(fill_text, sizeof fill_text, "%gf", f32_fill);
+                            else
+                                std::snprintf(fill_text, sizeof fill_text, "0x%02x",
+                                              (unsigned)far_fill);
                             if (first)
                                 fprintf(stderr,
-                                        "[ds-far] addr=0x%llx %ux%ux%u dim=%u filled 0x%02x "
-                                        "(unbridged retained DS plane; total=%llu)\n",
+                                        "[ds-far] addr=0x%llx %ux%ux%u dim=%u fmt=%u path=%s "
+                                        "filled=%s (unbridged retained DS plane; "
+                                        "fills-this-addr=%llu total=%llu)\n",
                                         (unsigned long long)r.gpu_addr, tw, th, r.depth, r.img_dim,
-                                        (unsigned)far_fill, (unsigned long long)n);
+                                        (unsigned)r.format, f32_path ? "f32" : "byte",
+                                        fill_text, (unsigned long long)per_addr,
+                                        (unsigned long long)n);
                             rtt_hit = true;   // do not overwrite it with a guest-byte decode below
                             resource_rtt_hit = true;
                         }
