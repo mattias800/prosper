@@ -1294,9 +1294,20 @@ static void pipetrace_shader_user_data(const char* tag, const AgcShader* h) {
     const AgcShaderUserData* ud = h->user_data;
     if (!ud) { fprintf(stderr, "  [ud] %s shader=%p user_data=(null)\n", tag, (const void*)h); return; }
 
+    // `code=` is what makes this line joinable. The instruments that matter for a resource question
+    // key on the CODE address -- `[divloop-reject]`, `[structured-wave-reject]`,
+    // `log_recompile_diagnostic`, `[compute-table]`, the GPU capture's resource tables,
+    // `PROSPER_COMPUTE_SKIP_PROGRAM` -- while this line printed only the AgcShader header pointer. So
+    // a shader's declared `srt`/`eud` could not be tied to the program whose resources are in
+    // question. That is the join a GTA V investigation needed (#2704, #2705): a routed run emits
+    // ~96.5k of these LINES (not registrations -- this helper has three call sites), 1.11% of them
+    // declaring a non-zero SRT, and there was no way to ask whether a given compute program was
+    // among them.
     fprintf(stderr,
-            "  [ud] %s shader=%p user_data=%p eud=%u srt=%u direct_count=%u sharp_counts={%u,%u,%u,%u}\n",
-            tag, (const void*)h, (const void*)ud, ud->eud_size_dw, ud->srt_size_dw,
+            "  [ud] %s shader=%p code=0x%llx user_data=%p eud=%u srt=%u direct_count=%u "
+            "sharp_counts={%u,%u,%u,%u}\n",
+            tag, (const void*)h, (unsigned long long)(uintptr_t)h->code, (const void*)ud,
+            ud->eud_size_dw, ud->srt_size_dw,
             ud->direct_resource_count, ud->sharp_resource_count[0], ud->sharp_resource_count[1],
             ud->sharp_resource_count[2], ud->sharp_resource_count[3]);
 
