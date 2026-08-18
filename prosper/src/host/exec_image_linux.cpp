@@ -4,6 +4,7 @@
 #include "sse4a.hpp"
 #include "x86_read_decode.hpp"
 #include "guest_write_watch.hpp"
+#include "guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
 #include "trap_arbitration.hpp"   // #1932: which instrument owns an incoming SIGTRAP
 #include "fs_emu.hpp"
 #include "raw_syscall.hpp"
@@ -204,6 +205,39 @@ namespace {
         return true;
     }
 #endif
+    // #2393: EVERY mprotect in this file goes through here, with no exceptions. The software
+    // watchpoints below (PROSPER_WATCH_LABEL / _ABS / _HOT and PROSPER_WATCH_COMPANION) work by
+    // flipping a live guest page between PROT_READ and PROT_READ|PROT_WRITE, and gpu_executor.cpp's
+    // guest_readable/guest_writable caches memoize positive permission answers until
+    // host::guest_mapping_generation() moves. A bare mprotect here therefore leaves guest_writable
+    // answering TRUE, from cache, for a page this handler has just made read-only -- for as long as
+    // nothing unrelated advances the generation. Before #2389 the Linux arm re-parsed
+    // /proc/self/maps on every call and saw `r--p`, so this became reachable with that PR.
+    //
+    // Signal safety, stated precisely rather than generously. mprotect is NOT on POSIX's
+    // async-signal-safe list (checked against `man 7 signal-safety`, which does not name it, nor
+    // mmap or munmap) -- but the handler already called it, unavoidably, since flipping page
+    // protection is the entire mechanism these watchpoints are built on. In practice glibc's
+    // mprotect is a bare syscall wrapper: no lock, no allocation, and the only shared state it
+    // touches is errno, which is thread-local. This wrapper therefore adds NOTHING to the
+    // handler's existing obligations. The one call it does add,
+    // notify_guest_page_protection_changed(), is a single fetch_add on a lock-free atomic and is
+    // safe by inspection -- see its comment in guest_memory_map.hpp for why it, and not
+    // notify_guest_mapping_added/removed, is the correct call from a fault handler and from a
+    // watchpoint generally.
+    //
+    // The notify is UNCONDITIONAL, including when mprotect fails. A failed mprotect leaves the
+    // protection unchanged, so the advance is merely spurious -- which costs one cache refill and
+    // can never produce a wrong answer -- whereas making it conditional adds a way to be wrong for
+    // nothing. Returns mprotect's own status so call sites that check it still can.
+    //
+    // The signature deliberately mirrors the libc call exactly so this is a drop-in, and so the
+    // test's wiring check can assert that every protection change in this file routes through here.
+    inline int watch_mprotect(void* addr, size_t len, int prot) {
+        const int rc = mprotect(addr, len, prot);
+        prosper::host::notify_guest_page_protection_changed();
+        return rc;
+    }
     // PROSPER_WATCH_COMPANION: write-watchpoint on the companion slot [obj+0x140] that the reader
     // eboot+0xba6e08 finds null. Armed on the first such read (r15 known); the slot is null there, so
     // any real writer MUST run after — this catches all of them. Implemented by mprotect-ing the
@@ -293,7 +327,7 @@ namespace {
     void il2cpp_kscan(void* uctx);   // defined after bp_eval_probes
     void bp_write_byte(uint64_t addr, uint8_t val) {
         uint64_t pg = addr & ~(uint64_t)0xfff;
-        mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+        watch_mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
         *(volatile uint8_t*)addr = val;
         __builtin___clear_cache((char*)addr, (char*)addr + 1);
     }
@@ -1925,13 +1959,13 @@ namespace {
                     if (n < (int)sizeof b - 1) b[n++] = '\n';
                     raw_write_fmt(2, b, sizeof b, n);
                     if (g_lwatch_hits >= g_lwatch_max) {   // caught enough — disarm, leave page RW
-                        mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                        watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                         g_lwatch_armed = 0; g_lwatch_stepping = false; g_lwatch_step_rip = 0;
                         return;
                     }
                 }
                 g_lwatch_step_rip = 0;
-                if (g_lwatch_armed) mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
+                if (g_lwatch_armed) watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
                 g_lwatch_stepping = false;
                 return;
             }
@@ -1943,7 +1977,7 @@ namespace {
                 raw_write_fmt(2, b, sizeof b, n);
                 g_lwatch_step_rip = 0;
             }
-            if (g_lwatch_armed) mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
+            if (g_lwatch_armed) watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
             g_lwatch_stepping = false;
             return;
         }
@@ -1968,7 +2002,7 @@ namespace {
                         uint64_t v = *(const uint64_t*)(rsp + o);
                         if (gin(v)) g_lwatch_stk[g_lwatch_stkn++] = v;
                     }
-                    mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                    watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                     PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // TF -> single-step the write
                     g_lwatch_stepping = true;
                     return;
@@ -2003,12 +2037,12 @@ namespace {
                     raw_write_fmt(2, b, sizeof b, n);
                     g_lwatch_step_rip = rip;
                     if (g_lwatch_hits >= g_lwatch_max) {   // bounded: disarm after enough evidence
-                        mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                        watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                         g_lwatch_armed = 0;
                         return;
                     }
                 }
-                mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                 PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // TF -> single-step the write
                 g_lwatch_stepping = true;
                 return;
@@ -2026,7 +2060,7 @@ namespace {
             char b[128];
             int n = snprintf(b, sizeof b, "[watch]   -> slot now=0x%llx  obj[+0]=0x%llx\n", slot, tag);
             raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
-            mprotect((void*)g_watch_page, 0x1000, PROT_READ);
+            watch_mprotect((void*)g_watch_page, 0x1000, PROT_READ);
             g_watch_stepping = false;
             return;
         }
@@ -2037,7 +2071,7 @@ namespace {
                 uint64_t r15 = (uint64_t)PROSPER_GREGS(uc)[REG_R15];
                 g_watch_addr = r15 + 0x140;
                 g_watch_page = g_watch_addr & ~(uint64_t)0xfff;
-                if (mprotect((void*)g_watch_page, 0x1000, PROT_READ) == 0) {
+                if (watch_mprotect((void*)g_watch_page, 0x1000, PROT_READ) == 0) {
                     g_watch_armed = true;
                     char b[128];
                     int n = snprintf(b, sizeof b, "[watch] armed on companion slot 0x%llx (obj r15=0x%llx) reader-tid=%ld\n",
@@ -2064,7 +2098,7 @@ namespace {
                                      (int)g_watch_hits);
                     raw_write_fmt(2, b, sizeof b, n);   /* raw syscall: no libc TLS access */
                 }
-                mprotect((void*)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
+                watch_mprotect((void*)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
                 PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // set TF -> single-step the write
                 g_watch_stepping = true;
                 return;
@@ -3110,7 +3144,7 @@ extern "C" void prosper_arm_label_watch_force(uint64_t addr) {
     g_lwatch_shift = getenv("PROSPER_WATCH_SHIFT") != nullptr;
     g_lwatch_slot = addr;
     g_lwatch_page = addr & ~(uint64_t)0xfff;
-    if (mprotect((void*)g_lwatch_page, 0x1000, PROT_READ) == 0) {
+    if (watch_mprotect((void*)g_lwatch_page, 0x1000, PROT_READ) == 0) {
         g_lwatch_armed = 1;
         fprintf(stderr, "[lwatch] armed slot=0x%llx page=0x%llx max=%d shift=%d\n",
                 (unsigned long long)addr, (unsigned long long)g_lwatch_page, g_lwatch_max,
@@ -3597,12 +3631,12 @@ static void dump_fault_bytes(uint64_t start, int n) {
                       | (perms[2] == 'x' ? PROT_EXEC : 0);
         uint64_t pg_lo = cur & ~0xfffull;
         size_t span = (size_t)(((cur + chunk - 1) & ~0xfffull) - pg_lo + 0x1000);
-        if (!readable && mprotect((void*)pg_lo, span, prot_orig | PROT_READ) != 0) {
+        if (!readable && watch_mprotect((void*)pg_lo, span, prot_orig | PROT_READ) != 0) {
             fprintf(stderr, " (unreadable@0x%llx)", (unsigned long long)cur); return;
         }
         const uint8_t* p = (const uint8_t*)cur;
         for (int i = 0; i < chunk; i++) fprintf(stderr, " %02x", p[i]);
-        if (!readable) mprotect((void*)pg_lo, span, prot_orig);   // restore execute-only
+        if (!readable) watch_mprotect((void*)pg_lo, span, prot_orig);   // restore execute-only
         cur += chunk; remaining -= chunk;
     }
 }

@@ -1,4 +1,5 @@
 #include "guest_write_watch.hpp"
+#include "guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
 
 #include <algorithm>
 #include <atomic>
@@ -182,12 +183,25 @@ DWORD read_only_protection(DWORD protection) {
     return PAGE_READONLY;
 }
 
+// #2393: every protection change in this arm goes through here, for the same reason as the POSIX
+// arm's watch_mprotect() -- gpu_executor.cpp's guest_readable/guest_writable caches memoize
+// positive permission answers and drop them only when host::guest_mapping_generation() moves, so
+// an unpublished revocation leaves guest_writable answering TRUE for a page that is now read-only.
+// notify_guest_page_protection_changed() is one fetch_add on a lock-free atomic; see
+// guest_memory_map.hpp. Unconditional, including on failure: a spurious advance costs one cache
+// refill and can never produce a wrong answer.
+BOOL watch_virtual_protect(void* addr, SIZE_T size, DWORD protection, DWORD* previous) {
+    const BOOL ok = VirtualProtect(addr, size, protection, previous);
+    notify_guest_page_protection_changed();
+    return ok;
+}
+
 bool restore_page(WatchedPage& page) {
     bool ok = true;
     for (const PageAlias& alias : page.aliases) {
         DWORD ignored = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
-                            kPageSize, alias.protection, &ignored))
+        if (!watch_virtual_protect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                   kPageSize, alias.protection, &ignored))
             ok = false;
     }
     page.armed = false;
@@ -236,12 +250,12 @@ bool set_pages_armed(const std::vector<WatchedPage*>& pages, bool armed) {
     size_t changed = 0;
     for (const ProtectionRun& run : runs) {
         DWORD ignored = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
-                            static_cast<SIZE_T>(run.size), run.to, &ignored)) {
+        if (!watch_virtual_protect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
+                                   static_cast<SIZE_T>(run.size), run.to, &ignored)) {
             while (changed) {
                 const ProtectionRun& prior = runs[--changed];
-                VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
-                               static_cast<SIZE_T>(prior.size), prior.from, &ignored);
+                watch_virtual_protect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
+                                      static_cast<SIZE_T>(prior.size), prior.from, &ignored);
             }
             return false;
         }
@@ -547,6 +561,29 @@ int host_prot(uint32_t p) {
 }
 bool cpu_writable(uint32_t p) { return (p & 0x2) != 0; }
 
+// #2393: EVERY protection change in this arm goes through here. This mechanism arms guest pages
+// read-only to catch CPU writes, and gpu_executor.cpp's guest_readable/guest_writable caches
+// memoize positive permission answers until host::guest_mapping_generation() moves -- so a bare
+// mprotect here leaves guest_writable answering TRUE, from cache, for a page this file has just
+// made read-only. Same invariant, same remedy, and the same reason it must be THIS notifier: six
+// of these call sites run inside the SIGSEGV/SIGTRAP handler, where notify_guest_mapping_added/
+// removed would take guest_mapping_mutex. See guest_memory_map.hpp for the full statement.
+//
+// Two further reasons notify_guest_mapping_* would be wrong here even off the signal path: this
+// file protects individual 4 KiB pages inside mappings the kernel-memory HLE owns, so removing
+// and re-adding registry entries would corrupt the owner's view; and the arm is transient by
+// design, restored on the very next fault.
+//
+// Unconditional, including on failure: a failed mprotect leaves the protection unchanged, so the
+// advance is merely spurious, which costs one cache refill and can never produce a wrong answer.
+// Per-call rather than once per batch for the same reason -- spurious advances are free, and a
+// batched notify is one more thing to get wrong on the rollback paths.
+int watch_mprotect(void* addr, size_t len, int prot) {
+    const int rc = mprotect(addr, len, prot);
+    notify_guest_page_protection_changed();
+    return rc;
+}
+
 struct AliasRange { uint64_t addr = 0, size = 0, phys = 0; uint32_t prot = 0; };
 struct PageAlias  { uint64_t addr = 0; uint32_t prot = 0; };
 // One physical page and every guest VA that currently maps it. `armed` == the pages are mprotect'd
@@ -711,12 +748,12 @@ bool set_pages_armed(WatchState& w, const std::vector<WatchedPage*>& pages, bool
     const std::vector<ProtectionRun> runs = protection_runs(w, pages, arm);
     size_t changed = 0;
     for (const ProtectionRun& run : runs) {
-        if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
-                     static_cast<size_t>(run.size), run.to) != 0) {
+        if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(run.addr)),
+                           static_cast<size_t>(run.size), run.to) != 0) {
             while (changed) {
                 const ProtectionRun& prior = runs[--changed];
-                mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
-                         static_cast<size_t>(prior.size), prior.from);
+                watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(prior.addr)),
+                               static_cast<size_t>(prior.size), prior.from);
             }
             return false;
         }
@@ -883,13 +920,13 @@ bool set_trace_armed_locked(WatchState& w, bool armed, bool force_writable) {
             const int wanted = armed || (!force_writable && production_armed)
                                    ? (full & ~PROT_WRITE)
                                    : full;
-            if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
-                         wanted) != 0) {
+            if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
+                               wanted) != 0) {
                 while (!changed.empty()) {
                     const Changed rollback = changed.back();
                     changed.pop_back();
-                    (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(rollback.alias.addr)),
-                                   kPage, rollback.from);
+                    (void)watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(rollback.alias.addr)),
+                                         kPage, rollback.from);
                 }
                 return false;
             }
@@ -937,7 +974,7 @@ bool trace_invalidate_from_signal_locked(WatchState& w,
     for (const DmemTracePage& page : trace.pages) {
         for (const PageAlias& alias : page.aliases) {
             if (!cpu_writable(alias.prot)) continue;
-            const bool restored = mprotect(
+            const bool restored = watch_mprotect(
                 reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
                 host_prot(alias.prot)) == 0;
             if (!restored) all_restored = false;
@@ -1574,8 +1611,8 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
         page->aliases.push_back({va, protection});
         w.pages_by_addr[va] = page;
         if (page->armed &&
-            mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), kPage,
-                     host_prot(protection) & ~PROT_WRITE) != 0)
+            watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), kPage,
+                           host_prot(protection) & ~PROT_WRITE) != 0)
             page->generation++;   // couldn't arm the new alias -> mark Dirty so the renderer re-creates
     }
 }
@@ -1770,7 +1807,7 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         bool page_faulting_alias_restored = page != production_page;
         for (const PageAlias& alias : page->aliases) {
             if (!cpu_writable(alias.prot)) continue;
-            const bool ok = mprotect(
+            const bool ok = watch_mprotect(
                 reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
                 host_prot(alias.prot)) == 0;
             if (!ok)
@@ -1872,8 +1909,8 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         for (const DmemTracePage& page : w.trace.pages)
             for (const PageAlias& alias : page.aliases)
                 if (cpu_writable(alias.prot))
-                    (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
-                                   kPage, host_prot(alias.prot));
+                    (void)watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                         kPage, host_prot(alias.prot));
         w.trace.armed = false;
         w.pending_trace_step_tid.store(0, std::memory_order_release);
         w.trace.status = GuestDmemWriteTraceStatus::Overflow;
@@ -1925,8 +1962,8 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
     for (const DmemTracePage& page : w.trace.pages) {
         for (const PageAlias& alias : page.aliases) {
             if (!cpu_writable(alias.prot)) continue;
-            const bool ok = mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
-                                     kPage, host_prot(alias.prot)) == 0;
+            const bool ok = watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                           kPage, host_prot(alias.prot)) == 0;
             if (!ok) all_restored = false;
             if ((alias.addr & ~(kPage - 1)) == fault_page && ok) faulting_alias_restored = true;
         }
@@ -2007,8 +2044,8 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
         for (const DmemTracePage& page : trace.pages) {
             for (const PageAlias& alias : page.aliases) {
                 if (!cpu_writable(alias.prot)) continue;
-                if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
-                             host_prot(alias.prot) & ~PROT_WRITE) != 0)
+                if (watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)), kPage,
+                                   host_prot(alias.prot) & ~PROT_WRITE) != 0)
                     rearmed = false;
             }
         }
@@ -2023,8 +2060,8 @@ GuestDmemWriteTraceStepAction guest_dmem_write_trace_complete_step(
         for (const DmemTracePage& page : trace.pages)
             for (const PageAlias& alias : page.aliases)
                 if (cpu_writable(alias.prot))
-                    (void)mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
-                                   kPage, host_prot(alias.prot));
+                    (void)watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(alias.addr)),
+                                         kPage, host_prot(alias.prot));
         trace.armed = false;
         trace.status = GuestDmemWriteTraceStatus::Invalid;
         if (trace.invalid_reason == GuestDmemWriteTraceInvalidReason::None)
