@@ -2811,7 +2811,36 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
         // resolve it as depth — the historical behaviour, and the only plane #1275 ever bridged.
         if (!is_depth_plane && !is_stencil_plane) continue;
         if (!image.layout_initialized || !image.image) continue;
-        if (is_depth_plane ? !image.depth_valid : !image.stencil_valid) continue;
+        // PROSPER_DS_BRIDGE_IGNORE_VALID=1 -- DIAGNOSTIC ONLY, never a shipped default.
+        //
+        // GTA V's deferred lighting pass samples the main depth 0x2052ac0000, and the bridge
+        // declines it here with dvalid=0 while svalid=1 on the SAME surface -- prosper holds the
+        // image, the extent matches, and only the depth aspect is marked invalid. The sample then
+        // falls back to guest memory, which is black for a surface prosper rendered into.
+        //
+        // Serving a stale depth is wrong as output. It is decisive as a DISCRIMINATOR: if the world
+        // appears, the aspect-validity state is what withholds it and the fix is upstream in what
+        // clears depth_valid; if nothing changes, the bridge is not the gate and this hypothesis
+        // dies with it. Reports whether it actually overrode anything, so a null cannot be read as a
+        // negative when the lever never fired.
+        static const bool ignore_valid = getenv("PROSPER_DS_BRIDGE_IGNORE_VALID") != nullptr;
+        const bool aspect_valid = is_depth_plane ? image.depth_valid : image.stencil_valid;
+        if (!aspect_valid && !ignore_valid) continue;
+        if (!aspect_valid && ignore_valid) {
+            static std::mutex override_mutex;
+            static std::map<uint64_t, uint64_t> overrides;
+            uint64_t n = 0;
+            {
+                std::lock_guard lock(override_mutex);
+                n = ++overrides[addr];
+            }
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "[dsbridge] OVERRIDE addr=0x%llx %ux%u aspect=%s served despite "
+                             "invalid (count=%llu)\n",
+                             (unsigned long long)addr, key.w, key.h,
+                             is_depth_plane ? "depth" : "stencil", (unsigned long long)n);
+        }
         if (!best.image || image.last_depth_write > best_write) {
             best = {&image, static_cast<VkFormat>(key.fmt), key.w, key.h,
                     is_depth_plane ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT};

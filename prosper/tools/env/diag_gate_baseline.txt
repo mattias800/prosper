@@ -105,7 +105,7 @@
 # count must equal UNREVIEWED_BUDGET in check_diag_gates.py exactly, in both directions. So a
 # regeneration fails the gate, and paying debt down requires tightening the budget in the same
 # commit. (Note that --emit-baseline currently writes its banner to stdout as well -- #2649.)
-#   benign: 42
+#   benign: 43
 #   config-echo: 10
 #   defect: 2
 #   unreviewed: 0
@@ -164,3 +164,4 @@ TWO-GATE|tests/render_runner.h|report|PROSPER_BACKEND_TIMING_WINDOWS+PROSPER_REN
 TWO-GATE|tests/render_runner.h|report|PROSPER_DRAW_ISO+PROSPER_ISO_AT  # benign: MODE + its required argument -- PROSPER_ISO_AT is the pixel coordinate the isolation pass cannot run without (render_runner.h:7746-7748), not a producer. Every printed field (per-draw blend/mask/viewport, the per-kill results) is computed inside the same block. #2572
 TWO-GATE|tools/boot_trace/boot_trace.cpp|report|PROSPER_CRASHPEEK+PROSPER_PEEK_CLASS  # benign: MODE + its required argument. PROSPER_PEEK_CLASS is a sub-selector of the PROSPER_CRASHPEEK post-fault dump (boot_trace.cpp:350) and supplies the addresses to peek; every printed value is read from guest memory in the same loop (:427), so there is no producer whose arming differs from the printer's. Unarmed -> no output at all. #2572
 TWO-GATE|tools/boot_trace/boot_trace.cpp|report|PROSPER_CRASHPEEK+PROSPER_PEEK_CODE  # benign: MODE + its required argument. PROSPER_PEEK_CODE is a sub-selector of the PROSPER_CRASHPEEK post-fault dump (boot_trace.cpp:350) and supplies the addresses to peek; every printed value is read from guest memory in the same loop (:457), so there is no producer whose arming differs from the printer's. Unarmed -> no output at all. #2572
+TWO-GATE|frontends/shared/live_renderer.cpp|report|PROSPER_DUMP_RTGROUPS_ADDR+PROSPER_DUMP_RTGROUPS|PROSPER_DUMP_RTGROUPS_RGBA  # benign: BOTH gates are load-bearing, not a split producer/printer. The dump arms at live_renderer.cpp:7501 and the address filter is read at :7504; the report at :7533 names which MRT SLOT that filter matched. With no ADDR filter there is no match to report, and with no dump variant armed nothing is written for the match to describe. Every field it prints -- the wanted address, the matched slot, the pass's slot-0 base -- is computed at :7504-:7512 under the same condition that prints it, so it cannot report unarmed state as a measurement. #2542
