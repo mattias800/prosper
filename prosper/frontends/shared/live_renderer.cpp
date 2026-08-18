@@ -7504,12 +7504,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const char* address_filter = PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS_ADDR");
                         const uint64_t wanted_base = address_filter && *address_filter
                             ? strtoull(address_filter, nullptr, 0) : 0;
+                        // Match the address against EVERY MRT slot, not just slot 0.
+                        //
+                        // `base` is the pass's slot-0 attachment. A G-buffer names different
+                        // surfaces per slot, so filtering by a slot-2 address matched ONE pass in a
+                        // full routed run for a target the draw census credits with 6,672 draws --
+                        // and a near-empty result reads as "that target is empty" rather than as
+                        // "the filter asked the wrong question". The dumped pixels are still slot
+                        // 0's; what this fixes is WHICH PASSES are selected, so naming any slot of a
+                        // G-buffer selects that G-buffer's passes.
+                        bool slot_match = !wanted_base || base == wanted_base;
+                        uint32_t matched_slot = 0;
+                        if (wanted_base && !slot_match)
+                            for (uint32_t slot = 1; slot < pass_bases.size(); ++slot)
+                                if (pass_bases[slot] == wanted_base) {
+                                    slot_match = true; matched_slot = slot; break;
+                                }
                         const char* dd = getenv("PROSPER_FRAME_DIR");
                         // Identify the pass by its first..last draw index so multiple passes to the same
                         // target VA in one frame do not silently overwrite each other.
                         const uint64_t pass_d0 = render_pass.empty() ? 0u : render_pass.front()->draw_index;
                         const uint64_t pass_d1 = render_pass.empty() ? 0u : render_pass.back()->draw_index;
-                        if (!wanted_base || base == wanted_base) {
+                        if (slot_match) {
+                            if (wanted_base && matched_slot) {
+                                static std::set<std::pair<uint64_t, uint32_t>> slot_seen;
+                                if (slot_seen.emplace(wanted_base, matched_slot).second)
+                                    fprintf(stderr,
+                                            "[rtt] rtgroup filter 0x%llx matched slot %u of a pass "
+                                            "whose slot-0 base is 0x%llx; dumped pixels are SLOT 0\n",
+                                            (unsigned long long)wanted_base, matched_slot,
+                                            (unsigned long long)base);
+                            }
                             if (const char* rg = PROSPER_ENV_VALUE("PROSPER_DUMP_RTGROUPS"); rg && nz >= (size_t)atol(rg)) {
                                 const std::vector<uint8_t> inspected = inspection_rgba8(
                                     rendered_pixels, gw, gh, pass_format);
