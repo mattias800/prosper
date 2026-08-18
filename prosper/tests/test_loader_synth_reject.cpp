@@ -10,6 +10,10 @@
 // The arms are grouped by what the loader must do, because "reject" is not one behaviour:
 //   * REFUSE the module — `Module::load` fails and `link_program` returns false with the path in the
 //     message (a wrong machine, a missing PT_DYNAMIC, a file truncated before its program headers);
+//   * REFUSE the module at IMAGE-BUILD time — everything parses, and only the PT_LOAD copy can see
+//     that the file is shorter than the segment claims (#2631). These are the arms whose control is
+//     doing the most work: the corrupted module is byte-identical to the control up to the cut, so
+//     an arm that "passes" by refusing broadly would take the control down with it;
 //   * REFUSE the relocation but keep the module — a relocation whose target is outside the mapped
 //     image, or straddles its end, must not be applied and must not write past the buffer. The
 //     straddle pair is four bytes apart and lands on opposite sides of module.cpp's `p + 8 > end`
@@ -115,6 +119,69 @@ int main() {
         const std::string p = emit("reject_truncated_all.prx", s);
         const std::string e = link_error(p);
         CHECK(!e.empty(), "a four-byte file is refused");
+    }
+
+    // ---- truncated modules: the FILE is shorter than a PT_LOAD says it is (#2631) ---------------
+    // These are the quiet ones. A cut inside the program header table (above) removes PT_DYNAMIC and
+    // is refused by `Module::load`; a cut AFTER the tables removes nothing the parser reads, so every
+    // earlier stage reports success and only the segment copy in `build_image` can see it. Before
+    // #2631 that copy was skipped in full - the segment mapped all-zero, the bytes that DO exist were
+    // discarded, and build_image returned true. Each arm differs from `good_spec` in `truncate_to`
+    // alone, and the "control" line above (an unmodified fixture links) is that field at its default.
+    {
+        // The measurement recorded in #2631: 0x1000 declared, 0x400 present.
+        SynthModuleSpec s = good_spec; s.truncate_to = 0x400;
+        const std::string path = emit("reject_truncated_load.prx", s);
+
+        std::string err;
+        auto mod = Module::load(path, &err);
+        CHECK(mod.has_value(),
+              "truncated PT_LOAD: the module still PARSES - no earlier stage can see the cut");
+        if (mod) {
+            CHECK(mod->symbols.size() == 2,
+                  "truncated PT_LOAD: its symbol table still reads back (null symbol + the export)");
+            LoadedImage img;
+            CHECK(!build_image(*mod, kBase1, img, &err),
+                  "truncated PT_LOAD: build_image refuses instead of mapping the segment all-zero");
+            CHECK(contains(err, "declares 0x1000 bytes"),
+                  "truncated PT_LOAD: the refusal quotes the length the segment declared");
+            CHECK(contains(err, "the file holds only 0x400 bytes"),
+                  "truncated PT_LOAD: the refusal quotes what the file actually holds");
+        }
+        const std::string e = link_error(path);
+        CHECK(!e.empty() && contains(e, path) && contains(e, "the file holds only"),
+              "truncated PT_LOAD: link_program fails and the message names the path");
+    }
+    {
+        // The razor: one 0x100 block short of the declared 0x1000, so EVERY table the loader reads -
+        // dynamic, symtab, strtab, RELA, JMPREL, DT_INIT_ARRAY, DT_INIT - survives intact and the
+        // module is fully parseable. Deliberately strict: the missing tail happens to be the
+        // fixture's zero padding, and prosper still refuses it, because a file that does not contain
+        // a segment cannot be shown to contain zeros there. Measured to cost nothing on real content
+        // - across the 44 local dumps no PT_LOAD even ENDS at EOF, let alone runs past it.
+        SynthModuleSpec s = good_spec; s.truncate_to = prosper_test::kSynthFileSize - 0x100;
+        const std::string path = emit("reject_truncated_tail.prx", s);
+
+        std::string err;
+        auto mod = Module::load(path, &err);
+        CHECK(mod.has_value(), "one-block-short PT_LOAD: the module still parses");
+        if (mod) {
+            CHECK(mod->symbols.size() == 2 && mod->symbols[1].nid == kExport,
+                  "one-block-short PT_LOAD: its export still resolves by NID - nothing else notices");
+            LoadedImage img;
+            CHECK(!build_image(*mod, kBase1, img, &err),
+                  "one-block-short PT_LOAD: build_image refuses");
+            CHECK(contains(err, "the file holds only 0xf00 bytes"),
+                  "one-block-short PT_LOAD: the refusal quotes the short length");
+        }
+    }
+    {
+        // ... and the same knob set to the file's own size truncates nothing, so the arms above
+        // cannot be passing by refusing every module that carries a `truncate_to` at all.
+        SynthModuleSpec s = good_spec; s.truncate_to = prosper_test::kSynthFileSize;
+        const std::string path = emit("truncate_noop.prx", s);
+        CHECK(link_error(path).empty(),
+              "truncate control: a cut at exactly the declared size removes nothing and links");
     }
 
     // ---- relocation-level rejections ------------------------------------------------------------
@@ -228,6 +295,50 @@ int main() {
         const std::string e = link_error(hand_bad);
         CHECK(!e.empty() && contains(e, "no PT_DYNAMIC"),
               "hand-built: retyping the PT_DYNAMIC header to PT_NULL is refused");
+
+        // (c) The truncation arm, in a geometry the generator cannot express (#2631). The hand-laid
+        // module has TWO PT_LOADs - text at file 0x0000 and data at file 0x1000 - so cutting the file
+        // at 0x1800 leaves program header 0 complete and takes 0x800 bytes off program header 1. Every
+        // dynamic table lives below 0x1800, so the module parses in full and both exports and the
+        // import still resolve: the ONLY stage that can see the damage is the segment copy. A
+        // single-PT_LOAD fixture cannot pose this question at all - there, a short file always cuts
+        // the one segment there is - which is the whole reason this file exists.
+        std::vector<uint8_t> cut = prosper_test::handmade_prx_bytes(kHandA, kHandB, kHandI);
+        cut.resize(0x1800);
+        const std::string hand_cut = dir + "/handmade_truncated.prx";
+        CHECK(prosper_test::write_module_bytes(hand_cut, cut, &err),
+              "hand-built: the truncated fixture is written");
+
+        auto cut_mod = Module::load(hand_cut, &err);
+        CHECK(cut_mod.has_value(), "hand-built truncated: the module still parses");
+        if (cut_mod) {
+            CHECK(cut_mod->symbols.size() == 4, "hand-built truncated: all four symbols still read back");
+            CHECK(cut_mod->symbols[1].nid == kHandA && cut_mod->symbols[2].nid == kHandB,
+                  "hand-built truncated: both exports still resolve by NID");
+            CHECK(cut_mod->imports.size() == 1, "hand-built truncated: the import still resolves");
+            LoadedImage img;
+            CHECK(!build_image(*cut_mod, kBase1, img, &err),
+                  "hand-built truncated: build_image refuses the short data segment");
+            CHECK(contains(err, "program header 1"),
+                  "hand-built truncated: the refusal names the SHORT segment, not the intact one");
+            CHECK(contains(err, "declares 0x1000 bytes at file offset 0x1000") &&
+                      contains(err, "the file holds only 0x1800 bytes"),
+                  "hand-built truncated: the refusal quotes the declared span and the file length");
+        }
+        // The control for that arm: the same module uncut maps its data segment's bytes, so the
+        // refusal above is about the truncation and not about the second PT_LOAD existing.
+        {
+            auto ok_mod = Module::load(hand_good, &err);
+            CHECK(ok_mod.has_value(), "hand-built control: the uncut module parses");
+            if (ok_mod) {
+                LoadedImage img;
+                CHECK(build_image(*ok_mod, kBase1, img, &err),
+                      "hand-built control: the uncut module's image builds");
+                const uint8_t* strtab = img.at(kBase1 + prosper_test::kHandStrtabVa + 1);
+                CHECK(strtab != nullptr && memcmp(strtab, kHandA.c_str(), kHandA.size()) == 0,
+                      "hand-built control: the DATA segment's own bytes reach the image");
+            }
+        }
     }
 
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);

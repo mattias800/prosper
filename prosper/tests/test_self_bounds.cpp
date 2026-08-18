@@ -13,11 +13,18 @@
 //      reads past the buffer. Now requires an in-range NUL. Guarded by test_str_at().
 //   D) build_image() allowed a huge non-wrapping PT_LOAD span to reach vector::assign; the uncaught
 //      length_error/bad_alloc terminated linking. Image construction is now fallible and reports it.
+//   E) build_image() SKIPPED any PT_LOAD it could not copy in full - a filesz past EOF, a segment
+//      outside the image it had just sized - and returned true anyway, so the module mapped a
+//      zero-filled hole where its own bytes belonged and the caller was told it had loaded (#2631).
+//      Every such segment is now a refusal with a message naming the program header and the
+//      shortfall. The arms below are the malformed-input half; tests/test_loader_synth_reject.cpp
+//      carries the truncated-module half, where the module otherwise parses perfectly.
 // No game dump needed: pure in-memory construction.
 #include "../src/self/module.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace prosper;
@@ -106,28 +113,71 @@ static void test_build_image_bounds() {
         const uint8_t* p = img.at(0x100000000ull + 0x4000);
         CHECK(p && p[0] == 1 && p[7] == 8, "valid PT_LOAD maps its filesz bytes");
     }
+    {   // E) the razor for #2631: the SAME segment as the control above, differing in p_filesz alone
+        // (9 rather than 8), against the same 8-byte file. One byte of the segment does not exist.
+        // Pre-fix, the copy was skipped in full and build_image returned true, so the eight bytes
+        // that DO exist were replaced by zeros and the caller was told the module had loaded.
+        Module m;
+        m.file = {1,2,3,4,5,6,7,8};
+        Segment s; s.type = PT_LOAD; s.vaddr = 0x4000; s.filesz = 9; s.memsz = 0x4000; s.file_off = 0; s.flags = 4;
+        m.segments.push_back(s);
+        LoadedImage img;
+        std::string err;
+        CHECK(!build_image(m, 0x100000000ull, img, &err),
+              "a PT_LOAD one byte longer than its file is refused");
+        CHECK(err.find("declares 0x9 bytes at file offset 0x0") != std::string::npos,
+              "the refusal quotes the declared length and offset");
+        CHECK(err.find("the file holds only 0x8 bytes") != std::string::npos,
+              "the refusal quotes what the file actually holds");
+    }
     {   // malformed huge filesz that WRAPS BOTH naive checks (dest and source) so they pass -> a huge
-        // OOB memcpy (hard segfault). The overflow-safe check must skip it. vaddr=0x4001 -> dst=1;
+        // OOB memcpy (hard segfault). The overflow-safe check must catch it. vaddr=0x4001 -> dst=1;
         // with filesz=UINT64_MAX and file_off=1, both `1 + (2^64-1)` wrap to 0, which the OLD
         // `a + b <= size` accepts; the memcpy size itself stays 2^64-1.
+        //
+        // Reaching this line at all IS the memory-safety assertion - the pre-fix code segfaults here
+        // and never returns, whatever the return value. What changed with #2631 is only the verdict:
+        // the segment used to be dropped and the load called successful, which mapped nothing of a
+        // module the caller then linked. A segment this malformed is unloadable, so the honest answer
+        // is a refusal that says which header and why.
         Module m;
         m.file.assign(64, 0xAB);
         Segment bad; bad.type = PT_LOAD; bad.vaddr = 0x4001; bad.filesz = UINT64_MAX; bad.memsz = 0x4000; bad.file_off = 1; bad.flags = 4;
         m.segments.push_back(bad);
         LoadedImage img;
-        CHECK(build_image(m, 0x100000000ull, img), "wrapping filesz image still builds safely");
-        CHECK(img.mem.size() > 0, "wrapping huge filesz skipped, no OOB memcpy (image still sized)");
+        std::string err;
+        CHECK(!build_image(m, 0x100000000ull, img, &err),
+              "wrapping filesz is refused, not silently skipped (no OOB memcpy either way)");
+        CHECK(err.find("does not fit the mapped image") != std::string::npos,
+              "wrapping filesz names the image it could not fit");
+        CHECK(err.find("program header 0") != std::string::npos,
+              "wrapping filesz names the offending program header");
+        // Restores what the pre-#2631 `img.mem.size() > 0` carried: the extent computation still
+        // sized the window correctly (vaddr 0x4001 + memsz 0x4000, aligned out to [0x4000, 0xc000))
+        // in the presence of the malformed filesz. The refusal message quotes those bounds, so
+        // asserting them here keeps the fact pinned without a second build_image call.
+        CHECK(err.find("[0x4000, 0xc000)") != std::string::npos,
+              "wrapping filesz still sized the image correctly before refusing");
     }
     {   // malformed huge memsz: vaddr+memsz does not overflow (passes the extent-skip guard) but
-        // align_up(hi) wraps to 0, giving max_vaddr(0) < min_vaddr(0x8000). Without the clamp,
-        // mem.assign(0 - 0x8000) requests ~2^64 bytes -> bad_alloc/terminate. The clamp keeps it empty.
+        // align_up(hi) wraps to 0, giving max_vaddr(0) < min_vaddr(0x8000). Unguarded,
+        // mem.assign(0 - 0x8000) requests ~2^64 bytes -> bad_alloc/terminate; the wrap is detected
+        // before the allocation, which is what keeps this arm from being a crash.
+        //
+        // It used to be detected and then CLAMPED to an empty image with a `true` return - a module
+        // declaring a 16-exabyte span "loaded" with nothing mapped (#2631). The wrap is now the
+        // refusal it always was, and it is reported before any allocation is attempted.
         Module m;
         m.file = {1,2,3,4};
         Segment s; s.type = PT_LOAD; s.vaddr = 0x8000; s.filesz = 4; s.memsz = UINT64_MAX - 0x8000; s.file_off = 0; s.flags = 4;
         m.segments.push_back(s);
         LoadedImage img;
-        CHECK(build_image(m, 0x100000000ull, img), "align-up-wrapped extent returns an empty image");
-        CHECK(img.mem.size() == 0, "align_up-wrapped extent clamped to empty (no giant allocation)");
+        std::string err;
+        CHECK(!build_image(m, 0x100000000ull, img, &err),
+              "align-up-wrapped extent is refused (no giant allocation, no empty-image success)");
+        CHECK(err.find("overflows the 64-bit address space") != std::string::npos,
+              "align-up-wrapped extent reports the address-space overflow by name");
+        CHECK(img.mem.size() == 0, "a refused image leaves the caller's LoadedImage untouched");
     }
     {   // A huge but non-wrapping extent passes the arithmetic guards above and is still far below a
         // 64-bit vector::max_size(). Before #1299 it reached vector::assign; Linux overcommit could

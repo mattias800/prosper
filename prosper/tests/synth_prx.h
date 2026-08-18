@@ -93,13 +93,14 @@ struct SynthModuleSpec {
     bool     omit_dynamic_phdr = false;              // no PT_DYNAMIC -> the module must be rejected
     bool     zero_value_exports = false;             // st_value == 0: defined, but NOT an export
     uint64_t relative_reloc_offset = kSynthInitArray;// where DT_INIT_ARRAY[0] is patched
-    // 0 = whole file; else write only N bytes. Cutting inside the program header table is refused
-    // (test_loader_synth_reject). Cutting LATER is not: #2631 — a PT_LOAD whose declared p_filesz
-    // exceeds the file is skipped ENTIRELY, so the segment maps all-zero, the bytes that do exist
-    // are discarded, and build_image still returns true with no diagnostic. Measured with this knob:
-    // truncate_to = 0x400 parses 2 symbols and yields a 16 KiB image with 0 nonzero bytes. That path
-    // is deliberately left unpinned by any arm — an assertion today would bless silent corruption as
-    // correct, and the fix changes loader acceptance for every title.
+    // 0 = whole file; else write only N bytes. Two different refusals, both pinned in
+    // test_loader_synth_reject: cutting INSIDE the program header table removes PT_DYNAMIC, so
+    // `Module::load` refuses the module; cutting LATER removes nothing the parser reads, so the
+    // module parses in full and `build_image` is the only stage that can see it (#2631, fixed).
+    // Before that fix the later cut was silent: a PT_LOAD whose declared p_filesz exceeded the file
+    // was skipped ENTIRELY, the segment mapped all-zero, the bytes that did exist were discarded, and
+    // build_image still returned true. Measured with this knob at the time: truncate_to = 0x400
+    // parsed 2 symbols and yielded a 16 KiB image with 0 nonzero bytes, against a control of 79.
     uint64_t truncate_to = 0;
 };
 
