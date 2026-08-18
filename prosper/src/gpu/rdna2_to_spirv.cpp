@@ -13418,7 +13418,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // nothing — so a census can detect its own incompleteness instead of silently
             // under-counting, which a per-site call cannot do. The three pre-switch rejects above are
             // deliberately outside it: they set ok=false, and a rejected program is already reported
-            // by the recompile-reject census.
+            // by the recompile-reject census -- as is the switch's own `default:` arm, which is
+            // also above this point. That is FOUR uncovered rejects, not three, and the `default:`
+            // one matters most to a census: an unmodelled buffer opcode is literally the "never
+            // reached the emitter" case this line exists to identify. So the tempting identity
+            // "instructions in the stream == lines emitted" holds only for a program with none of
+            // the four; it happened to hold for 0x413dc6700 (41 == 41) and that is not a guarantee.
+            // Hoisting the guard above the switch is not the fix: n/is_store/is_atomic are unset
+            // there, so it would print `n=0 store=0 atomic=0`, which is less honest than no line.
+            //
+            // `rt=` is on the line because `unclassified` alone does not mean "instrument hole".
+            // recompile_coverage() translates on a table-less compute shell, so every buffer op it
+            // sees takes a no-table path and prints `unclassified` for a reason that has nothing to
+            // do with coverage. `rt=0` marks those. A hole is `rt=1 ... unclassified`.
             struct BufOpDisposition {
                 bool on;
                 const SpirvCompute& b;
@@ -13426,16 +13438,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t& n;
                 const bool& is_store;
                 const bool& is_atomic;
+                const ShaderResourceTable* rt;
                 const char* how = "unclassified";
                 ~BufOpDisposition() {
                     if (!on) return;
                     std::fprintf(stderr,
-                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d %s\n",
+                                 "[buf-op] program=0x%llx pc=%u %s op=0x%x n=%u store=%d atomic=%d rt=%d %s\n",
                                  (unsigned long long)b.diagnostic.program_address, in.pc,
                                  in.fmt == Rdna2Format::MUBUF ? "MUBUF" : "MTBUF", in.opcode, n,
-                                 (int)is_store, (int)is_atomic, how);
+                                 (int)is_store, (int)is_atomic, (int)(rt != nullptr), how);
                 }
-            } buf_op{std::getenv("PROSPER_DBG") != nullptr, b, in, n, is_store, is_atomic};
+            } buf_op{std::getenv("PROSPER_DBG") != nullptr, b, in, n, is_store, is_atomic, rt};
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
             const bool indirect_pointer_descriptor_source_candidate =
@@ -13507,7 +13520,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // bindings. Only external buffer accesses require the stage's SMEM/MUBUF resource gate.
             // Keep this check after the fold so resource-free graphics shaders (Astro Bot's loading VS)
             // can consume their embedded lookup table without making unresolved V# accesses permissive.
-            if (!allow_smem) { ok = false; return true; }
+            if (!allow_smem) { buf_op.how = "reject-no-smem"; ok = false; return true; }
             uint32_t binding = 2, stride = 0;   // overwritten by SRSRC resolution below whenever a resource
                                                 // table is present (format AND raw ops); the binding-2 default
                                                 // survives only on the table-less offline path (see below)
@@ -13610,6 +13623,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 !rt ? "no-table" : (tagged_res ? "yes" : "null"),
                                 rt ? rt->resources.size() : 0u);
                     }
+                    buf_op.how = "reject-unresolved";
                     ok = false; return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
@@ -13671,6 +13685,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 pp ? "yes" : "null",
                                 sreg_range_written(rs, in.src[1].value, 4), rt->resources.size());
                     }
+                    buf_op.how = "reject-raw-unresolved";
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
                 }
                 if (indirect_pointer_descriptor_source_candidate) {
@@ -13794,6 +13809,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
+                    // Safe at the TOP here, unlike the format path: none of this block's three arms
+                    // (atomic, store-drop, load-fold) sets ok=false, so no later outcome can
+                    // contradict the label. A fail-visible guard added below must move this down.
                     buf_op.how = "zero-record";
                     // The front half proved all four live V# words at this exact instruction and
                     // decoded NUM_RECORDS=0. RDNA2's OOB contract returns zero for every raw load
