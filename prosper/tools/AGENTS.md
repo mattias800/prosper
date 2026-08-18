@@ -1086,6 +1086,27 @@ A refusal also clears `producer_epoch_ok`, which the next `ParserStall` latches 
 later **indirect** draw and dispatch untried. A single named decline can therefore account for a
 frame's worth of missing geometry.
 
+**`PROSPER_COMPUTE_PARENTSCAN=0xADDR` — CPU-side cyclicity census of a compute program's link arrays.**
+For a kernel that walks a per-item successor array (GTA V's `0x413dc6700` is the motivating case), this
+classifies every entry of each **stride-4** bound buffer as terminating or cyclic, **before** the
+dispatch reads it and again **after** it writes, and prints `records / terminating / cyclic /
+cycle-nodes / longest` plus a few ring members. `terminating + cyclic == records` always; the link
+encoding it assumes is printed on every line so a wrong guess is visible rather than silent.
+
+It exists because the obvious instrument does not work: arming `PROSPER_GPU_CAPTURE` to obtain the array
+**changes which dispatches misbehave** (measured on this title: 11 runaway dispatches of both parities
+without a capture, reproducibly, versus 5 odd-only with one armed). This walks bytes the front half has
+already materialised — no submit, no GPU state, no reordering — so it can be read against
+`PROSPER_CFG_TRIP_BOUND`'s witness in the same run. That pairing is what established the causal
+direction (22/22: every runaway read an already-cyclic array).
+
+`PROSPER_COMPUTE_PARENTSCAN_DUMP=DIR` additionally writes the input and output arrays of a dispatch that
+turns a **clean** array cyclic — the transition only, with the retained input required to belong to that
+same dispatch, so the pair in one filename is genuinely one dispatch. Two caveats: the switch takes a
+**program address**, not `=1` (it says so if given something that cannot be one), and coverage depends on
+how often a buffer is materialised — `PROSPER_COMPUTE_BUFFER_CACHE_MB=0` raised it from 3 submits to 9
+on a routed run, though the mechanism for that is not established.
+
 **`PROSPER_COMPUTE_SKIP_PROGRAM=0xADDR[,0xADDR...]` — decline named compute programs.** A bisection
 instrument: one dispatch can take down everything after it (a GPU hang costs the process its compute
 backend), so "which dispatch is responsible?" is worth asking directly instead of by rebuilding. It

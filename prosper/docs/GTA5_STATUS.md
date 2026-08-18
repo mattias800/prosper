@@ -4136,6 +4136,24 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **`0x413dc6700` runs away because prosper's portable wave vote adds workgroup barriers the guest does
+  not have.** *Solid.* The scope difference is real and was worth testing: the guest contains **zero**
+  `s_barrier` (SOPP `0x0a`), its exit is per-wave (`s_cbranch_execz`, 64 lanes), and prosper emulates it
+  with a 256-way LDS OR plus eight `OpControlBarrier`, because the program's 256-thread workgroup is four
+  waves and the conservative multi-wave default refuses it a native contract
+  (`[subgroup] cs=0x413dc6700 guest-wave=64 native=0 multiwave=0`, against `native=64` for a single-wave
+  program beside it). `PROSPER_NATIVE_COMPUTE_MULTIWAVE=1` grants the exact subgroup shell, which
+  removes those workgroup barriers while keeping one native subgroup per guest wave. Two runs, identical
+  but for that switch, with `PROSPER_COMPUTE_PARENTSCAN`: **identical in every column** — 11 trip-bound
+  HITs, 21 cyclic inputs, 22 cyclic outputs, and the same device loss at `0x413d85e00` dispatch 55. The
+  barriers are not the mechanism. #2711, #2717.
+- **The corruption is produced by whatever consumes it / by prosper's own declines.** *Solid, both
+  halves.* `0x413dc6700` does **not** corrupt a clean input: eight consecutive submits show 88 dispatches
+  running `0 -> 0` on all four link arrays. It corrupts only after being handed a cyclic array, and a
+  single dispatch — clean input, terminating normally, not a runaway — turns a clean 2063-entry array
+  into 537 cyclic entries. Declining the other runaway programs is not the cause either: a run declining
+  **nothing** shows the same `0 -> 84` corruption. #2711, #2717.
+
 - **`0x413dc6700` computes on zeros because prosper cannot express its pointer-chase load, so GTA V's
   world needs `PhysicalStorageBuffer` / `VK_KHR_buffer_device_address`.** *Solid.* Filed as #2709 and
   argued further in its comments; also carried into #2711's Q1/Q2 answers as a premise. The emitted
