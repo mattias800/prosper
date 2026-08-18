@@ -257,6 +257,10 @@ int main(int argc, char** argv) {
             // — the hardware path transfers an NV12 surface, the software path interleaves YUV420P
             // chroma on the CPU — so one set of hashes covering only whichever the host happened to
             // pick would leave the other completely unchecked.
+            //
+            // #2586. Which path each pass ACTUALLY took, as opposed to which it requested. Recorded
+            // per pass so the run can state its own coverage instead of claiming it.
+            bool pass_hardware[2] = {false, false};
             for (int pass = 0; pass < 2 && !stream.empty(); ++pass) {
                 const bool force_software = pass == 1;
                 if (force_software)
@@ -278,6 +282,7 @@ int main(int argc, char** argv) {
                 std::vector<uint8_t> dst(kNv12 + 256, 0xC3);
                 std::vector<uint64_t> got;
                 bool geometry_ok = true, guard_ok = true;
+                int hardware_pictures = 0, software_pictures = 0;
                 for (const auto& u : units) {
                     VideoBackend::AuPicture pic{};
                     std::fill(dst.begin(), dst.end(), 0xC3);
@@ -287,14 +292,23 @@ int main(int argc, char** argv) {
                     if (pic.width != kW || pic.height != kH || pic.y_stride < kW ||
                         pic.nv12_bytes != kNv12)
                         geometry_ok = false;
+                    if (pic.hardware) ++hardware_pictures; else ++software_pictures;
                     for (size_t i = kNv12; i < dst.size(); ++i)
                         if (dst[i] != 0xC3) { guard_ok = false; break; }
                     uint64_t hv = 0xcbf29ce484222325ull;
                     for (size_t i = 0; i < kNv12; ++i) { hv ^= dst[i]; hv *= 0x100000001b3ull; }
                     got.push_back(hv);
                 }
-                std::printf("  [info] %s pass: %zu pictures from %zu access units\n", what,
-                            got.size(), units.size());
+                pass_hardware[pass] = hardware_pictures > 0;
+                std::printf("  [info] %s pass: %zu pictures from %zu access units, decoded in %s "
+                            "(%d hardware / %d software)\n", what, got.size(), units.size(),
+                            hardware_pictures ? "HARDWARE (VA-API)" : "SOFTWARE",
+                            hardware_pictures, software_pictures);
+                // One decoder must not silently change path mid-stream in EITHER direction: the two
+                // conversions differ (surface transfer vs CPU chroma interleave), so a pass that did
+                // both would be reporting one hash set produced by two code paths.
+                CHECK(hardware_pictures == 0 || software_pictures == 0,
+                      "a single decoder stays on ONE decode path for the whole stream");
                 CHECK(got.size() == 12,
                       force_software ? "12 access units yield 12 pictures (software)"
                                      : "12 access units yield 12 pictures");
@@ -315,6 +329,179 @@ int main(int argc, char** argv) {
                 backend()->close_decoder(dec);
             }
             unsetenv("PROSPER_AVP_VAAPI_DEVICE");
+
+            // WHAT THE TWO PASSES ACTUALLY COVERED (#2586). The passes above REQUEST different
+            // paths; a request is not an outcome. On a host with no usable VA-API device both are
+            // software, and until AuPicture::hardware existed nothing here could say so -- the claim
+            // "covered both the hardware and software paths" was then true as a request and
+            // unverified as a result, on exactly the headless CI where it matters.
+            //
+            // A host without VA-API is a SUPPORTED configuration, so this must not become "hardware
+            // is required" -- that would turn a diagnostic gap into a broken build. What is asserted
+            // is only what is verifiable on any host; the rest is reported.
+            //
+            // THE RESIDUAL LIMIT, measured rather than reasoned about, because "what else could
+            // satisfy this assertion" is the question #2586 exists to ask. Two mutation arms were run
+            // against a host that HAS VA-API (12 of 12 pictures in the hardware format):
+            //
+            //   AuPicture::hardware forced TRUE  -> both assertions below FAIL. Detected.
+            //   AuPicture::hardware forced FALSE -> this test PASSES, and prints "this host
+            //                                       negotiated NO VA-API hardware decode" on a host
+            //                                       that plainly has it. NOT detected.
+            //
+            // That asymmetry is not fixable from inside a single run, and it is worth stating rather
+            // than hiding: "the flag is stuck false" and "this host has no VA-API" are the same
+            // observation, and the second is a legitimate supported state. A device having been
+            // CREATED does not settle it either -- libavcodec may negotiate a software format behind
+            // an attached VA-API device, which is exactly why open_decoder's log says "requested".
+            // So the honest guarantee is one-sided: this can prove a pass ran in software, and it can
+            // prove two passes differed; it cannot prove a host's hardware path went unexercised.
+            CHECK(!pass_hardware[1],
+                  "the forced-software pass really did decode in software, not merely ask to");
+            if (pass_hardware[0]) {
+                CHECK(pass_hardware[0] != pass_hardware[1],
+                      "the two passes exercised DIFFERENT decode paths: hardware and software");
+                std::puts("  [info] coverage: BOTH decode paths exercised (hardware and software).");
+            } else {
+                // Stated rather than asserted, and stated plainly: this run is the one-path case.
+                std::puts("  [info] coverage: this host negotiated NO VA-API hardware decode, so "
+                          "BOTH passes ran the SOFTWARE path and the hardware surface-transfer path "
+                          "is NOT covered by this run (#2586). Not a failure: a host without VA-API "
+                          "is supported.");
+            }
+
+            // ---- sceVideodec2Reset: discard the buffered state, keep the decoder (#2585) --------
+            //
+            // Two halves of one contract, each with a hand-built positive instance and a control
+            // that must come out the OTHER way. A control drawn from the same setup as the claim
+            // would only show the machinery runs; these two show the case is expressible and that
+            // the fix is what decides it.
+            //
+            // The asset is what makes this testable: it carries an IDR with its own SPS+PPS at
+            // access unit 0 AND at access unit 6, so the second half can be re-fed with the
+            // parameter sets stripped -- which is exactly a stream that supplies them once.
+            {
+                // Strip every SPS(7)/PPS(8) NAL out of one access unit. Annex-B start codes are 3 or
+                // 4 bytes and this asset uses both, so both are walked.
+                auto strip_parameter_sets = [](const uint8_t* p, size_t len) {
+                    std::vector<std::pair<size_t, int>> starts;
+                    for (size_t i = 0; i + 3 <= len;) {
+                        if (p[i] == 0 && p[i + 1] == 0) {
+                            if (i + 4 <= len && p[i + 2] == 0 && p[i + 3] == 1) {
+                                starts.emplace_back(i, 4); i += 4; continue;
+                            }
+                            if (p[i + 2] == 1) { starts.emplace_back(i, 3); i += 3; continue; }
+                        }
+                        ++i;
+                    }
+                    std::vector<uint8_t> out;
+                    for (size_t k = 0; k < starts.size(); ++k) {
+                        const size_t s = starts[k].first;
+                        const size_t e = (k + 1 < starts.size()) ? starts[k + 1].first : len;
+                        const int nal = p[s + starts[k].second] & 0x1F;
+                        if (nal == 7 || nal == 8) continue;
+                        out.insert(out.end(), p + s, p + e);
+                    }
+                    return out;
+                };
+                constexpr size_t kNv12 = static_cast<size_t>(kW) * kH * 3 / 2;
+                std::vector<uint8_t> dst(kNv12, 0);
+                // Confirm the fixture really is the case under test before drawing conclusions from
+                // it: if the asset ever stopped repeating its parameter sets at unit 6, the stripped
+                // units below would be trivially undecodable and both arms would "pass" for the
+                // wrong reason.
+                const auto stripped_head =
+                    strip_parameter_sets(stream.data() + units[6].first, units[6].second);
+                CHECK(stripped_head.size() < units[6].second,
+                      "access unit 6 really does carry parameter sets for the strip arm to remove");
+
+                auto feed = [&](int dec, size_t from, size_t to, bool strip) {
+                    int pictures = 0;
+                    for (size_t i = from; i < to; ++i) {
+                        VideoBackend::AuPicture pic{};
+                        const std::vector<uint8_t> tmp =
+                            strip ? strip_parameter_sets(stream.data() + units[i].first,
+                                                         units[i].second)
+                                  : std::vector<uint8_t>();
+                        const uint8_t* p = strip ? tmp.data() : stream.data() + units[i].first;
+                        const size_t n = strip ? tmp.size() : units[i].second;
+                        if (backend()->decode_au(dec, p, n, dst.data(), kNv12, pic) ==
+                            VideoBackend::AuResult::Decoded)
+                            ++pictures;
+                    }
+                    return pictures;
+                };
+
+                // ARM 1 -- the parameter sets SURVIVE a Reset. This is #2585 itself: closing the
+                // decoder and reopening (what this used to do) throws the parsed SPS/PPS away, and a
+                // title whose stream carries them once then cannot decode again at all.
+                {
+                    const int dec = backend()->open_decoder(1);
+                    CHECK(dec >= 0, "a decoder opens for the Reset arms");
+                    if (dec >= 0) {
+                        const int before = feed(dec, 0, 6, false);
+                        CHECK(before == 6, "6 access units decode before the Reset");
+                        CHECK(backend()->reset_decoder(dec),
+                              "the backend performs an in-place Reset");
+                        const int after = feed(dec, 6, 12, true);
+                        CHECK(after == 6,
+                              "after a Reset the decoder still decodes access units whose SPS/PPS "
+                              "have been STRIPPED -- the parameter sets survived (#2585)");
+                        backend()->close_decoder(dec);
+                    }
+                }
+                // ARM 1's CONTROL, built by hand and outside the arm: a FRESH decoder is exactly
+                // what close-and-reopen produced, and it must fail on the same bytes. Without this
+                // the arm above would also pass if `reset_decoder` did nothing at all.
+                {
+                    const int dec = backend()->open_decoder(1);
+                    if (dec >= 0) {
+                        const int after = feed(dec, 6, 12, true);
+                        CHECK(after == 0,
+                              "CONTROL: a FRESH decoder -- what close-and-reopen gives -- decodes "
+                              "NOTHING from the same stripped access units (#2585)");
+                        backend()->close_decoder(dec);
+                    }
+                }
+
+                // ARM 2 -- the DPB really is DROPPED. Reset's other half, and it must not be lost
+                // while fixing the first: units 7..11 are non-IDR slices with no IDR among them, so
+                // a decoder that still holds the pre-reset references decodes them and one that
+                // forgot them cannot.
+                {
+                    const int dec = backend()->open_decoder(1);
+                    if (dec >= 0) {
+                        CHECK(feed(dec, 0, 6, false) == 6, "6 access units decode before the Reset");
+                        CHECK(backend()->reset_decoder(dec), "the backend performs an in-place Reset");
+                        CHECK(feed(dec, 7, 12, false) == 0,
+                              "after a Reset, non-IDR access units decode to NOTHING -- every "
+                              "decoded reference was forgotten (#2585)");
+                        backend()->close_decoder(dec);
+                    }
+                }
+                // ARM 2's CONTROL: the same units WITHOUT a Reset must decode, or the arm above
+                // proves only that non-IDR units never decode.
+                {
+                    const int dec = backend()->open_decoder(1);
+                    if (dec >= 0) {
+                        CHECK(feed(dec, 0, 6, false) == 6, "6 access units decode before the control");
+                        // `> 0` AND NOT A FIXED COUNT, deliberately. The real margin here is ONE
+                        // picture, not five: the decoder errors out on the rest once the references
+                        // diverge. Measured, and independently reproduced against libavcodec 8.1.2
+                        // with a separate access-unit splitter. Do NOT "tighten" this to 5 -- a
+                        // fixed count is brittle across libavcodec versions and would then fail for
+                        // a reason that has nothing to do with Reset.
+                        CHECK(feed(dec, 7, 12, false) > 0,
+                              "CONTROL: without a Reset the same non-IDR units DO decode, against "
+                              "the references the Reset is what discards (#2585)");
+                        backend()->close_decoder(dec);
+                    }
+                }
+
+                // Reset on an id the backend does not know must say so rather than report success.
+                CHECK(!backend()->reset_decoder(0x5EED),
+                      "Reset on an unknown decoder id is refused, not silently reported as done");
+            }
 
             // A frame buffer smaller than the picture reports its OWN outcome, distinct from "no
             // picture yet". Collapsed into one bool these are indistinguishable, and the benign one

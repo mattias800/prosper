@@ -11,7 +11,7 @@ it (`src/hle/video_backend.hpp`):
 | shape | entry points | used by |
 | --- | --- | --- |
 | stream | `open` / `open_memory` / `info` / `next_video` / `seek` / `close` | `sceAvPlayer` |
-| access unit | `open_decoder` / `decode_au` / `close_decoder` | `sceVideodec2` |
+| access unit | `open_decoder` / `decode_au` / `reset_decoder` / `close_decoder` | `sceVideodec2` |
 
 The Linux implementation is `frontends/video_vaapi/vaapi_backend.cpp`. `decode_au` is
 `avcodec_send_packet` / `avcodec_receive_frame`, which is natively access-unit shaped — so this is a
@@ -78,6 +78,58 @@ the copy path was rewritten to write straight into the guest's buffer. The regre
 `test_video_vaapi` runs the same comparison offline against a committed 128×96 Annex-B asset whose
 per-frame hashes came from a host `ffmpeg` decode, over **both** the hardware and software paths.
 
+## Three lifecycle verbs, three contracts
+
+`libSceVideodec2` exports eighteen functions (PS5 3.20 firmware symbol database), among them
+`CreateDecoder`, `Decode`, `Flush`, `Reset` and `DeleteDecoder` as five separate entry points with no
+re-initialise call between them. Three of them dispose of decoder state and
+they are **not** interchangeable — implementing one as another is #2585, and it is the kind of defect
+that shows up as a hang rather than as an error:
+
+| call | what it disposes of | carries a `VdecFrame`/`VdecOutput` |
+| --- | --- | --- |
+| `sceVideodec2Flush` | **drains** — hands the buffered pictures back | yes |
+| `sceVideodec2Reset` | **discards** — throws the buffered state away | no |
+| `sceVideodec2DeleteDecoder` | **destroys** — the decoder and the handle are gone | no |
+
+**The warrant for flushing is the dominance argument below — read that first.** Whether the Sony
+contract keeps or drops the parsed sequence headers is *not* established (`CONFIDENCE: MED`), and it
+does not need to be, because `avcodec_flush_buffers` dominates:
+
+| if the true contract is... | close and reopen (what prosper did) | flush in place (what it does) |
+| --- | --- | --- |
+| drop the DPB, **keep** the parameter sets | **broken** — the decoder cannot decode until the next in-band SPS | correct |
+| drop the DPB **and** the parameter sets | works only if the stream repeats its parameter sets | **no worse either way, and strictly better under row 1**: a stream that repeats them replaces the retained ones in-band by id, and a stream that does not repeat them is one where retaining is the only thing that decodes at all. Under this row retention can make prosper decode where a faithful implementation would not — the decision is unaffected, but the claim is "no worse", not "correct" |
+
+There is no reading of the contract under which closing wins, so the fix does not depend on resolving
+the open half.
+
+A weaker supporting claim, deliberately **not** the reason: **Reset must leave the decoder usable**,
+derivable from the export list rather than assumed — the library has no re-initialise entry point
+between `CreateDecoder` and `DeleteDecoder`, so a Reset that destroyed the decoder would leave the
+guest no way to rebuild it except Delete + Create with the whole `VdecConfig`, which is what Delete
+is already for. `CONFIDENCE: HIGH` — **but it is not load-bearing**, because the pre-fix code already
+satisfied it in the guest-visible sense: the handle stayed valid and the next `Decode` reopened. Cite
+the dominance argument as the warrant, not this.
+
+Both halves of what `avcodec_flush_buffers` actually does were **measured against this
+build's libavcodec**, not read off its documentation, using the committed asset and a hand-built
+positive instance of each case (`test_video_vaapi`, and `VaapiBackend::reset_decoder`'s comment):
+
+- **parameter sets are kept** — a flushed context fed access units 6–11 with every SPS and PPS NAL
+  stripped out decodes **6** pictures; a **fresh** context fed the same bytes decodes **0**.
+- **the DPB is dropped** — a flushed context fed access units 7–11 (non-IDR slices, no IDR among
+  them) decodes **0** pictures; an **unflushed** one decodes against the stale pre-reset references.
+  **That control's margin is one picture, not five** (the decoder errors out on the rest once the
+  references diverge), independently reproduced against libavcodec 8.1.2 with a separate access-unit
+  splitter. The test therefore asserts `> 0` rather than a fixed count — **do not "tighten" it to 5**;
+  a fixed count is brittle across libavcodec versions and would fail for a reason unrelated to Reset.
+
+A backend with no in-place reset falls back to close-and-reopen and **says so once**. That forgets too
+much rather than too little, which is the right direction to fail: leaving the DPB live would decode
+the guest's next access units against references it just asked us to forget, and that is a corrupt
+picture rather than an error.
+
 **The decoder writes into the CALLER's buffer, not into its own.** `decode_au` takes a destination
 and copies under its own lock, and `AuPicture` carries no plane pointers at all. That is deliberate:
 the earlier shape handed back pointers into the decoder's staging buffer that stayed valid only
@@ -112,6 +164,23 @@ Every executable image in the local corpus scanned for `sceVideodec2Decode`'s NI
 A title that never reaches `Decode` cannot be affected: the decode path is entered only from inside
 `sceVideodec2Decode` on a live decoder handle.
 
+**All six also import `sceVideodec2Reset` (`wJXikG6QFN8`), and `sceVideodec2Flush` (`l1hXwscLuCY`).**
+Re-measured over the same 44 dumps / 589 executable images, with `sceVideodec2Decode`'s own NID as
+the positive control — it returns exactly the six titles above, so the method reproduces a known
+answer before being trusted on a new one. Note what this does and does not say: **an import is a
+linked symbol, not a call.** CRI's player links the surface it may use. But it does replace #2585's
+original framing — "no title is recorded calling `sceVideodec2Reset` at all", which was a fact about
+a handler that had no logging rather than about any title — with a measured one: every affected title
+links it, and three of the six are recorded reaching `Decode` live.
+
+Seven of `libSceVideodec2`'s eighteen exports are still unregistered: `CreateDecoderBid`,
+`CreateHevcDecoder`, `QueryHevcDecoderMemoryInfo`, `GetHevcPictureInfo`, `GetVp9PictureInfo`,
+`MapMemory`, `MapDirectMemory`. **Zero titles in the local corpus import any of them** (same scan,
+same control), which is why this is recorded rather than urgent — but an unregistered NID answers
+`SCE_OK` without writing its out-parameter, so an HEVC title would receive a successful-looking
+decoder handle that was never written. It is loud (`prosper_on_unimpl` prints once per NID), so the
+gap is recorded rather than silent; it is the return *value* that is wrong. #2630.
+
 **Decoding a movie does not make prosper render it.** On `PPSA05325` every presented sample is
 `source=guest_scanout` and **68 of 68** `[rtt] GUEST SCANOUT` lines still report *"no present source
 and no renderer target"* — the same figure #2267 measured before any of this. The renderer authors
@@ -138,16 +207,50 @@ that its rendering works.
   behaviour. `PROSPER_VDEC2_FORMAT` sweeps candidates without a rebuild, and a ctest arm pins that
   the value it names reaches the guest's struct, so a sweep's null is about the guest rather than
   about the instrument.
-- **`sceVideodec2Flush` does not drain the decoder** — #2562.
-- **`sceVideodec2Reset` closes and reopens instead of `avcodec_flush_buffers`**, which discards the
-  parsed SPS/PPS as well as the DPB — #2585. `CONFIDENCE: MED` on the current mechanism.
+- **`sceVideodec2Flush` does not drain the decoder** — #2562. Note it is also still **unlogged**, so
+  "no title calls it" remains a statement about the instrument rather than about any title.
 - **`sceVideodec2GetAvcPictureInfo`'s structure** is unestablished — #1658.
-- **The two-pass decode test cannot prove it ran two different paths** — #2586.
+- **Which sequence-header disposition Sony specifies for `sceVideodec2Reset`** — `CONFIDENCE: MED`,
+  and the fix does not depend on it (see the dominance table above). Resolving it wants a title that
+  actually resets; `sceVideodec2Reset` now `svc_log`s, so the next boot that makes one will say so.
 - **Windows.** `frontends/video_mf` implements the stream shape only, so Videodec2 titles get the
   honest no-decoder announcement there rather than a picture. #2563.
 
 ## Ruled out
 
+- **"Closing the backend decoder is an acceptable way to express `sceVideodec2Reset`, because
+  forgetting more than a reset needs to is a safe direction to err."** Falsified by measurement
+  against this build's libavcodec: a **fresh** `AVCodecContext` — exactly what close-and-reopen
+  produces — decodes **0** pictures from access units whose SPS/PPS have been stripped, while a
+  **flushed** one decodes all 6. Over-forgetting is not safe here, because the parsed sequence
+  headers are the one piece of state a mid-stream reset may be unable to re-supply: Videodec2's
+  caller demuxes itself, so whether parameter sets are repeated in-band is title-dependent. #2585,
+  and both arms plus their controls are in `test_video_vaapi`.
+- **"No title in this repository's history calls `sceVideodec2Reset`, so the mechanism is bounded."**
+  **Void, not false** — and *unfalsifiable in principle*, not merely unobserved. `wJXikG6QFN8` has
+  been a **registered** NID since #1368, and `prosper_on_unimpl` fires only for imports with **no**
+  registered handler, so a registered handler with no `svc_log` leaves no trace in *any* instrument on
+  *any* boot. The claim was about the instrument, not about any title, and it was used as a reason the
+  defect was not urgent. `sceVideodec2Reset` now `svc_log`s. #2585.
+  **It is not true that the other entry points already did.** Of the eleven registered Videodec2
+  handlers, **six log and five do not** — `Flush`, `DeleteDecoder`, `ReleaseComputeQueue`, and both
+  `GetPictureInfo` forms are still silent. Said explicitly because an earlier draft of this row
+  claimed Reset "now logs like every other Videodec2 entry point", which contradicted this document's
+  own open-issues entry for `Flush` (#2562) — and a `## Ruled out` row asserting Flush already logs is
+  exactly the sentence that stops the next reader checking.
+- **"The two-pass access-unit decode test covers the hardware and the software path."** True as a
+  *request* and unverified as an *outcome*: both passes are software on a host with no usable VA-API
+  device, which is precisely the headless CI where the claim was being relied on. `AuPicture` now
+  carries `hardware`, set from the pixel format a frame actually came back in, and the run states its
+  own coverage. #2586.
+  **The guarantee is deliberately one-sided, and this was measured, not reasoned about.** On a host
+  with VA-API (12 of 12 pictures in the hardware format), forcing `hardware` **true** fails two
+  assertions, and forcing it **false** *passes* while printing "this host negotiated NO VA-API
+  hardware decode". So the test can prove a pass ran in software and that two passes differed; it
+  **cannot** prove a host's hardware path went unexercised — "the flag is stuck false" and "this host
+  has no VA-API" are the same observation, and the second is a supported state. A created device does
+  not settle it either: libavcodec may negotiate a software format behind an attached VA-API device,
+  which is why `open_decoder` logs *"requested"*.
 - **"The output `format` enum must be established before decoding can be enabled."** This kept the
   decode path opt-in behind `PROSPER_VDEC2_DECODE` (#2281). **Falsified by measurement, and the
   measurement is what carries it**: on `PPSA19991` decode-off freezes the composite at one CRC for

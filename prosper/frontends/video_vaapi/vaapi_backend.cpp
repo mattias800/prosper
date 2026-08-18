@@ -1095,7 +1095,12 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
     // planes as they are -- no colour conversion, no chroma interleave, nothing per-pixel on the CPU
     // beyond the transfer the guest's own buffer requires anyway.
     const AVFrame* pic = d.frame;
-    if (d.hw_pix_fmt != AV_PIX_FMT_NONE && d.frame->format == d.hw_pix_fmt) {
+    // THE ONLY MOMENT HARDWARE DECODE IS KNOWABLE (#2586). `hw_device` merely says a VA-API device
+    // was created and attached; libavcodec can still negotiate a software format behind it, which is
+    // why open_decoder's log says "requested". The frame arriving in the hardware pixel format is
+    // the outcome, so it is what gets reported.
+    const bool hardware = d.hw_pix_fmt != AV_PIX_FMT_NONE && d.frame->format == d.hw_pix_fmt;
+    if (hardware) {
         av_frame_unref(d.sw_frame);
         d.sw_frame->format = AV_PIX_FMT_NV12;          // ask for NV12 directly from the surface
         if (av_hwframe_transfer_data(d.sw_frame, d.frame, 0) < 0) return AuResult::NoPicture;
@@ -1120,6 +1125,9 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
     out.y_stride = out.width;
     out.uv_stride = out.width;
     out.nv12_bytes = nv12_bytes(out.width, out.height);
+    // Reported alongside the geometry rather than only on success, so a FrameTooSmall refusal still
+    // says which path produced the picture it is refusing to copy.
+    out.hardware = hardware;
 
     // Report the size mismatch as its OWN outcome. Collapsed into "no picture" it would read as a
     // decoder warming up, which is the benign case it most resembles and the one that hides it.
@@ -1144,6 +1152,35 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
         return AuResult::NoPicture;
     }
     return AuResult::Decoded;
+}
+
+// sceVideodec2Reset: discard the buffered state, keep the decoder (#2585).
+//
+// `avcodec_flush_buffers` is exactly this operation, and the two halves of what it does were
+// MEASURED against this build's libavcodec rather than read off its documentation, using the
+// committed Annex-B asset and a hand-built positive instance of each case:
+//
+//   parameter sets are KEPT   -- a flushed context fed AU6..11 with every SPS and PPS NAL stripped
+//                               out decodes 6 pictures; a FRESH context fed the same bytes decodes
+//                               0. That is #2585: close-and-reopen produces the second decoder, so
+//                               a title whose stream carries its parameter sets once cannot decode
+//                               after a reset until the next in-band SPS.
+//   the DPB is DROPPED        -- a flushed context fed AU7..11 (non-IDR slices, no IDR among them)
+//                               decodes 0 pictures because it has no references and waits for a
+//                               recovery point; an UNFLUSHED one decodes against the stale
+//                               pre-reset references. So this really does forget them. The control's
+//                               margin is ONE picture, not five -- the decoder errors out on the
+//                               rest once the references diverge -- which is why the test asserts
+//                               "> 0" rather than a fixed count.
+//
+// `checked_first_au` is deliberately NOT re-armed: it gates a once-per-decoder codec/bitstream
+// sanity warning, and a guest that resets per seek would otherwise reprint it on every cycle.
+bool VaapiBackend::reset_decoder(int id) {
+    std::lock_guard<std::mutex> lk(g_au_mutex);
+    auto it = g_au_decoders.find(id);
+    if (it == g_au_decoders.end() || !it->second.ctx) return false;
+    avcodec_flush_buffers(it->second.ctx);
+    return true;
 }
 
 void VaapiBackend::close_decoder(int id) {

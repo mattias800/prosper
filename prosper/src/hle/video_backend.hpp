@@ -137,6 +137,13 @@ public:
         // this project writes the exact form. The guest sizes its frame buffer from that same
         // expression, so any other one here disagrees with the buffer it is copying into.
         uint64_t nv12_bytes = 0;
+        // The OUTCOME of the hardware request, not the request (#2586). True only when the frame
+        // came back in the backend's hardware pixel format, which is the only moment hardware decode
+        // is actually knowable -- the backend's own open log says "requested" for exactly this
+        // reason. Without it a two-pass test that asks for hardware and then forces software cannot
+        // tell a host that gave it both paths from a host that quietly gave it the same path twice,
+        // which is the coverage claim the test exists to make.
+        bool hardware = false;
     };
 
     // Submit one access unit and, if it completes a picture, write the packed NV12 into `dst`.
@@ -146,6 +153,26 @@ public:
                                uint8_t* /*dst*/, uint64_t /*dst_bytes*/, AuPicture& /*out*/) {
         return AuResult::NoPicture;
     }
+
+    // Discard the decoder's buffered state IN PLACE, keeping the decoder itself (#2585,
+    // sceVideodec2Reset). Returns false if this backend has no such operation.
+    //
+    // Three lifecycle verbs, three different contracts, and the whole of #2585 was implementing one
+    // as another: `sceVideodec2Flush` DRAINS (it carries a VdecFrame/VdecOutput, so it hands
+    // pictures back), `sceVideodec2Reset` DISCARDS (it carries neither), and
+    // `sceVideodec2DeleteDecoder` DESTROYS. They are three separate exports of libSceVideodec2, and
+    // the library has no re-initialise entry point between Create and Delete -- so a Reset that
+    // destroyed the decoder would leave the guest no way to rebuild it except Delete + Create with
+    // the full VdecConfig, which is what DeleteDecoder is already for. Reset therefore has to leave
+    // the decoder usable. CONFIDENCE: HIGH on that, from the export list alone.
+    //
+    // Defaulted to `false` rather than to an empty body, because an empty body is the one answer
+    // that is wrong under EVERY reading of the contract: it would leave the pre-reset DPB live and
+    // decode the guest's next access units against references it just asked us to forget -- a
+    // corrupt picture rather than an error, which is silent. `false` lets the caller fall back to
+    // close-and-reopen and SAY it did, which forgets too much rather than too little.
+    virtual bool reset_decoder(int /*id*/) { return false; }
+
     virtual void close_decoder(int /*id*/) {}
 };
 

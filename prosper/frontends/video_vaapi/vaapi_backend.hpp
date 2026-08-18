@@ -28,14 +28,19 @@ public:
     bool seek(int id, uint64_t position_us) override;
     void close(int id) override;
 
-    // sceVideodec2's access-unit path (#2270). Software decode: the guest submits one compressed
-    // access unit and expects at most one picture, so there is no stream to bind a hardware surface
-    // pool to at open time, and a 1080p H.264 software decode is well inside budget for the movie
-    // playback these titles use it for. Hardware acceleration can be layered on later without
-    // changing this interface.
+    // sceVideodec2's access-unit path (#2270). The guest submits one compressed access unit and
+    // expects at most one picture back, which is libavcodec's send_packet/receive_frame contract --
+    // so this is a second entry point onto the same decoder, not a second decoder.
+    //
+    // VA-API is REQUESTED first and software is the fallback. (This comment used to say the path was
+    // software-only with "hardware acceleration can be layered on later"; it was layered on, and the
+    // comment was not updated. A stale claim about which path runs is the exact confusion #2586 is
+    // about, so note that neither this comment nor open_decoder's log establishes the outcome --
+    // only AuPicture::hardware does, because it is set from the pixel format a frame came back in.)
     int open_decoder(uint32_t codec) override;
     AuResult decode_au(int id, const uint8_t* au, size_t bytes,
                        uint8_t* dst, uint64_t dst_bytes, AuPicture& out) override;
+    bool reset_decoder(int id) override;
     void close_decoder(int id) override;
 
 private:
