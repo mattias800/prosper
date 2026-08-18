@@ -22765,8 +22765,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                        (in.opcode == 0x365 || in.opcode == 0x366) &&
                        !(in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1);
             });
-        const bool structured_compute_wave_cfg = exact_compute_wave_cfg && !cf_rejected &&
-            barriers_are_top_level && !structured_has_cross_lane_mbcnt &&
+        const bool structured_wave_forward_ifs_ok =
             std::all_of(Fs.begin(), Fs.end(), [&](const ForwardIf& branch) {
                 // An exact native guest-size subgroup performs the vote without synthesized
                 // workgroup barriers, so nested wave branches are safe. Portable scratch votes
@@ -22774,6 +22773,71 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return (!branch.on_exec && !branch.on_vcc) || b.native_subgroup_size ||
                        top_level_pc(branch.branch_pc);
             });
+        const bool structured_compute_wave_cfg = exact_compute_wave_cfg && !cf_rejected &&
+            barriers_are_top_level && !structured_has_cross_lane_mbcnt &&
+            structured_wave_forward_ifs_ok;
+        // PROSPER_DBG: name WHICH conjunct denied structured wave emission, and what that
+        // actually costs THIS stream.
+        //
+        // When `exact_compute_wave_cfg` holds and this conjunction does not, the stream loses
+        // structured wave emission. What happens instead is NOT one outcome, and an earlier revision
+        // of this reporter asserted the loop-emulating one unconditionally. That was wrong in a way
+        // worth recording, because the wrong case is not a corner:
+        //
+        //   `barriers_are_top_level == false` requires a barrier inside a ForwardIf/DivLoop region.
+        //   Any barrier before `is_end` also clears `cfg_dispatch_safe`, so the gate below always
+        //   takes its `!cfg_dispatch_safe` arm -- and `analyze_barrier_phased_compute` marks a
+        //   branch that crosses a barrier invalid, so the phased retry does not fire either and the
+        //   shader is REJECTED OUTRIGHT. A line claiming "emulates loops" would then describe loop
+        //   emulation for a program that emitted no SPIR-V at all.
+        //
+        // The census that accompanied that revision could not have caught it: the conjuncts it
+        // measured were the two that leave `cfg_dispatch_safe` alone, so every sampled line landed
+        // in the one arm where the sentence happened to be true. A control drawn from the arm that
+        // works cannot test the arm that does not.
+        //
+        // So the outcome is computed rather than assumed, and it is in the KEY as well as the
+        // message. `emit_body` reaches this point for one program address from the whole stream, the
+        // counted-loop prelude (dispatcher deliberately withheld), the post-loop suffix and per-phase
+        // sub-streams; keying on (program, conjunct) alone lets whichever ran first suppress the
+        // rest, so the line with the wrong consequence would win. That is the same shared-key
+        // suppression fixed on `divloop_reject` (#2684) and not inherited here until review.
+        //
+        // The neighbouring `[compute-cfg]` line prints `structured_wave=` as a single bool, which
+        // cannot name a conjunct at all.
+        if (b.is_compute && exact_compute_wave_cfg && !structured_compute_wave_cfg &&
+            getenv("PROSPER_DBG") && b.diagnostic.program_address != 0) {
+            const char* outcome =
+                !allow_cfg_dispatcher
+                    ? "dispatcher withheld for this sub-stream; emission continues here"
+                    : (!cfg_dispatch_safe
+                           ? "dispatcher unsafe (guest barrier): phased retry, else the whole "
+                             "program is rejected and emits nothing"
+                           : "stream goes to the CFG dispatcher, which emulates loops");
+            const std::pair<const char*, bool> conjuncts[] = {
+                {"cf-rejected",                  !cf_rejected},
+                {"barrier-not-top-level",        barriers_are_top_level},
+                {"cross-lane-mbcnt",             !structured_has_cross_lane_mbcnt},
+                {"nested-wave-forward-if",       structured_wave_forward_ifs_ok},
+            };
+            static std::mutex swr_mu;
+            static std::set<std::tuple<uint64_t, std::string, std::string>> swr_seen;
+            std::lock_guard<std::mutex> lk(swr_mu);
+            // Clearing, not refusing: past the cap the reporter degrades into REPEATING lines rather
+            // than dropping them. For a diagnostic, losing tidiness beats losing findings.
+            if (swr_seen.size() >= 4096u) swr_seen.clear();
+            for (const auto& c : conjuncts) {
+                // EVERY false conjunct is named, not just the first. They are independent, so
+                // fixing the first one reported can leave the decision unchanged -- a report that
+                // stopped at one would send a reader to widen a guard that changes nothing.
+                if (c.second) continue;
+                if (!swr_seen.emplace(b.diagnostic.program_address, c.first, outcome).second)
+                    continue;
+                std::fprintf(stderr,
+                             "[structured-wave-reject] program=0x%llx %s (%s)\n",
+                             (unsigned long long)b.diagnostic.program_address, c.first, outcome);
+            }
+        }
         if (b.is_compute && cfg_branches && getenv("PROSPER_DBG"))
             std::fprintf(stderr,
                          "[compute-cfg] branches=%zu backedge=%d dispatch_safe=%d complex=%d "
