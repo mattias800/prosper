@@ -11,6 +11,65 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## THE G-BUFFER IS THE FRAME'S BUSIEST TARGET, and the break is inside two stages (2026-08-18)
+
+`PROSPER_DRAW_CENSUS=1`, routed gameplay. This tool is **not** in the `live_gpu_targets` exclusion
+list, so unlike `PROSPER_DUMP_RTGROUPS` / `PROSPER_RTTLOG` / `PROSPER_DUMP_DRAWSTEPS` it measures the
+renderer in its real configuration rather than forcing CPU readback. Prefer it for any target
+question.
+
+```
+[draw-census] draws=262144 indirect=0 submit=26578
+[draw-census]   distinct colour targets (sampled): 95
+[draw-census]   target=0x2085de0000 slot=4 draws=7978
+[draw-census]   target=0x2081e20000 slot=3 draws=7275
+[draw-census]   target=0x2083e00000 slot=2 draws=6672
+[draw-census]   target=0x208e5a0000 slot=0 draws=4921
+[draw-census]   target=0x2081e20000 slot=1 draws=3262
+```
+
+**~24,000 draws across slots 1-4 of a multi-slot G-buffer**, whose surfaces are then sampled ~1,250
+times each by the lighting pass. The deferred pipeline exists and is wired end to end.
+
+### The pipeline, stage by stage, with what is known about each
+
+| stage | surface | state |
+| --- | --- | --- |
+| geometry -> G-buffer | `0x2085de0000` s4, `0x2081e20000` s3/s1, `0x2083e00000` s2 | ~24,000 draws; **contents unmeasured** |
+| lighting samples G-buffer | same | ~1,250 samples each, resolve `HIT-CPU` |
+| scene colour | `0x205f1a0000` 1920x1080 `Float10_11_11` | **one light blob, 0.88% non-zero** |
+| composite -> scanout | three 4K RGBA8 | runs, ~195 passes each |
+
+So the break is in one of the first two stages, and everything after them is exonerated.
+
+### Eliminated, each with a controlled experiment
+
+- **depth** — three levers, every one confirmed to have fired: `0.0f`, a confirmed `1.0f`
+  (`path=f32 filled=1f`), and serving the real retained depth despite `dvalid=0` (**73 overrides**).
+  No world at any. Note the earlier "both poles" falsification was **void** — the byte fill made the
+  far pole NaN on a Float32 depth (#2680).
+- **draw rejection** — zero `[render] skip draw` lines across six routed runs (unconditional
+  diagnostic). #2429's wave64 skip does not fire on AMD Radeon 8060S / RADV STRIX_HALO.
+- **`HIT-CPU`** — dominates in *Blue Prince*, which renders correctly, so it is the ordinary path.
+  What differs is the **miss shape**: GTA V misses the *same renderer-owned* surfaces repeatedly
+  (depth 161x, five shadow maps 110x each) where Blue Prince has 19 single first-sight misses on
+  guest textures.
+- **DCC decode (#2677)** — wrong signature; it produces noise, not black.
+- **the composite** — it carries faithfully what the scene buffer holds.
+
+### The measurement that is next, and the trap that blocked it
+
+Whether the G-buffer **contains** anything. `PROSPER_DUMP_RTGROUPS_ADDR` filters on the pass's
+**base**, which is the **slot-0** attachment — filtering by `0x2083e00000` (slot 2) matched exactly
+one pass in a full run for a target taking 6,672 draws. That is void by wrong key, not an empty
+G-buffer. Either find the G-buffer pass's slot-0 base from the same census, or extend the filter to
+match any slot.
+
+**Also correcting a claim this document carried:** `0x208e5a0000` is neither the dominant target
+(4,921 draws, not ~71,000 of them) nor a scene buffer — it is 1024x1536 `VK_FORMAT_R8_UNORM`, one
+byte per pixel, and renders empty across 1,755 passes. For a shadow pass that writes depth and masks
+colour, empty colour is **correct**. Its emptiness was never the anomaly it appeared to be.
+
 ## Gameplay frame characterised end to end, with the hang declined (2026-08-18)
 
 Two routed runs, Linux/RADV, `scripts/gta5/reach-story-mode.pad`, 4K, `tools/screenshot`, with
@@ -939,8 +998,25 @@ sampled 1 in 32 and ranked by busiest:
 
 **Two facts settle where the investigation goes next:**
 
-1. **A single dominant scene target takes ~71,000 draws** (`0x208e5a0000`). The world's geometry is
-   being drawn, in quantity, into one surface.
+1. **A single dominant target takes ~71,000 draws** (`0x208e5a0000`).
+
+   > **CORRECTED 2026-08-18 — this is almost certainly NOT the scene colour buffer, and calling it
+   > "the world's geometry" sent at least one investigation the wrong way.** Measured with
+   > `PROSPER_DUMP_RTGROUPS_RGBA`, which reports every pass regardless of content: prosper renders
+   > **1,755 passes into it at 1024x1536 with `format=9` (`VK_FORMAT_R8_UNORM`)**, and the byte count
+   > confirms one channel — `actual=1572864` = 1024*1536*1 against an RGBA8 `expected=6291456`.
+   > A single-channel 1024x1536 surface taking the most draws in the frame is the shape of a **shadow
+   > or AO atlas**, not a 4K scene colour target. An empty one gives wrong lighting, not an absent
+   > world.
+   >
+   > Those passes also render **empty**: at `PROSPER_DUMP_RTGROUPS=1` (dump if >= 1 non-zero byte)
+   > not one of them produced a file, while a small non-empty 128x1 minority did. **Beware that
+   > asymmetry** — a threshold-gated dump only writes for the class that passes the threshold, so
+   > reading "every dump is 128x1" as "every pass is 128x1" inverts the conclusion. The RGBA variant
+   > exists precisely because it is threshold-independent.
+   >
+   > What the original text got right is that draws are *issued* in quantity. What it did not
+   > establish is what they are issued *into*.
 2. **The scanout buffers each receive ~2,800 draws.** Those addresses are the ones the frame grab
    reported as `present_front_address()` (`0x215ed10000`, `0x2160cf0000`, `0x2162cd0000`), so the
    **composite runs and targets the presented surface**.
