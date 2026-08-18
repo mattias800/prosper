@@ -11,6 +11,59 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## RESOLVED CHAIN: the world IS rendered, and then lit by nothing (2026-08-18)
+
+**GTA V's world is not missing. It is drawn correctly, in full, and then receives almost no light.**
+
+| stage | surface | measured state |
+| --- | --- | --- |
+| geometry -> G-buffer | `0x207de60000` (slot 0), `0x2085de0000` s4, `0x2081e20000` s3/s1, `0x2083e00000` s2 | **the world, complete** — 474 of 521 dumps with content, richest **99.66% non-zero**, the prologue bank heist fully textured at 4K with legible signage |
+| lighting reads the G-buffer | same | **works** — the room's geometry resolves in the lighting output |
+| lighting applies light | `0x20431c0000` 3840x2160 `Float16` | **almost none** — 47% of pixels carry a value, essentially all black |
+| composite -> scanout | three 4K RGBA8 | **faithful** |
+
+So geometry, vertex fetch, texture decode, materials, rasterization and the recompiler's fragment
+output are all **correct**. The defect is one edge: the lighting stage's light input.
+
+### `0x413dc6700` measurably feeds the lighting
+
+With `PROSPER_CFG_TRIP_BOUND=4096 _PROGRAM=0x413dc6700 _PHASE=0` the program **completes** instead of
+hanging (17 `HIT` lines confirm the cap fired on that program), gameplay is reached, and the frame
+gains **~7x more distinct colours** (≈3,000 -> 22,117) with a visibly larger, brighter light source.
+
+**That is the only intervention that has ever changed this title's light content.** Depth (three
+levers), draw rejection, `HIT-CPU`, DCC decode and the composite all changed nothing.
+
+Raising the bound to 100,000 does **not** extend the trend — the run loses the device before
+gameplay and collapses to 2 colours. That is loss timing, not dose, and no dose conclusion may be
+drawn from the pair: while any dispatch can still hang, a higher bound merely trades truncated output
+for an earlier loss.
+
+### The frontier, as one question
+
+**Does a correctly-executing `0x413dc6700` light the world?** No configuration can answer it yet:
+unbounded it hangs at dispatch 40, bounded it truncates its own output. Fixing the hang is therefore
+the direct route to a lit world, and this is the first evidence tying the hang to the darkness by
+mechanism rather than by coincidence of timing.
+
+### Choose instruments by census, and beware what they perturb
+
+Two rules this pass paid for repeatedly:
+
+- **`PROSPER_DRAW_CENSUS` does not disable `live_gpu_targets`; `PROSPER_DUMP_RTGROUPS`,
+  `PROSPER_DUMP_RTGROUPS_RGBA`, `PROSPER_DUMP_DRAWSTEPS` and `PROSPER_RTTLOG` all do.** Those force
+  the CPU readback path, so every per-target pixel measurement carries an asterisk an on-screen
+  measurement does not.
+- **Identify a surface by draw census, never by shape or sample count.** `0x208e5a0000` was called
+  "the world's geometry" and is a 1024x1536 `R8_UNORM` shadow atlas; `0x205f1a0000` looks like a
+  scene buffer and takes 66 draws against `0x20431c0000`'s 647. Both misidentifications cost hours.
+- **A byte-wise fill is a value fill only on a byte-shaped surface.** `0xff` into a Float32 depth is
+  **NaN**, not 1.0 (#2680) — a two-pole experiment run that way tests `{0.0f, NaN}` and silently
+  never tests far.
+- **Scan a dump fully before believing a null.** BMP rows are stored **bottom-up**, so sampling the
+  first megabyte of a 4K dump samples the bottom strip: the lighting output read 0% that way and
+  47% on a full scan.
+
 ## THE G-BUFFER IS THE FRAME'S BUSIEST TARGET, and the break is inside two stages (2026-08-18)
 
 `PROSPER_DRAW_CENSUS=1`, routed gameplay. This tool is **not** in the `live_gpu_targets` exclusion
