@@ -624,6 +624,136 @@ cli("--baseline with several subjects is rejected",
     ["--ordered", "--baseline", "<FILE>", "<FILE>", "<FILE>"],
     want_rc=2, expect_text="exactly one subject")
 
+
+# STDOUT specifically, and the distinction is the whole point of these arms. cli() above searches
+# `stdout + stderr`, which cannot see the defect #2675 is about: this gate is quoted in CLAUDE.md as
+# a copy-pasteable recipe, recipes get pasted into pipelines, and `check ... | tail` keeps stdout
+# while discarding both stderr and the exit status. Every failure used to be written to stderr while
+# only SUCCESS went to stdout, so a piped run printed a green summary or -- on a real failure, and
+# on a refused flag -- nothing at all. Measured on master before this change: a document with two
+# out-of-order rows piped through `| tail -3` produced ZERO bytes on stdout and a pipeline status
+# of 0.
+def cli_stdout(name: str, args: list[str], body: str, *, want_rc: int,
+               present: str | None = None, absent: str | None = None) -> None:
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "case.md"
+        path.write_text(body, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(CHECKER)] + [a.replace("<FILE>", str(path)) for a in args],
+            capture_output=True, text=True,
+        )
+    if proc.returncode != want_rc:
+        FAILURES.append(f"{name}: expected rc={want_rc}, got {proc.returncode}. "
+                        f"stdout={proc.stdout[:200]!r} stderr={proc.stderr[:200]!r}")
+        return
+    if present is not None and present not in proc.stdout:
+        FAILURES.append(f"{name}: expected {present!r} on STDOUT, got {proc.stdout[:300]!r}")
+        return
+    if absent is not None and absent in proc.stdout:
+        FAILURES.append(f"{name}: {absent!r} must NOT be on STDOUT, got {proc.stdout[:300]!r}")
+        return
+    print(f"  ok  {name}")
+
+
+OUT_OF_ORDER = "| # | What |\n|---|---|\n| 3 | c |\n| 1 | a |\n| 2 | b |\n"
+
+# The pair. The must-not-match half is what stops the positive from being satisfied by a marker
+# printed unconditionally -- which would make every piped run look like a failure and get the line
+# deleted rather than heeded.
+cli_stdout("a real failure announces itself on stdout", ["--ordered", "<FILE>"], OUT_OF_ORDER,
+           want_rc=1, present="problem(s) found")
+cli_stdout("a clean run does NOT claim problems on stdout", ["--ordered", "<FILE>"], TABLE,
+           want_rc=0, absent="problem(s) found")
+
+# A refused flag is the sharper case: argparse writes usage to stderr and exits 2, so a stale recipe
+# pasted into a pipeline was silent AND green. It must name itself on the stream the caller kept.
+cli_stdout("a removed flag says on stdout that the check did not run",
+           ["--sequential", "<FILE>"], TABLE, want_rc=2, present="THE CHECK DID NOT RUN")
+cli_stdout("an unknown flag does too -- not only the one flag we happen to remember",
+           ["--gapless", "<FILE>"], TABLE, want_rc=2, present="THE CHECK DID NOT RUN")
+cli_stdout("a successful run does not claim it was refused",
+           ["--ordered", "<FILE>"], TABLE, want_rc=0, absent="THE CHECK DID NOT RUN")
+
+# --baseline takes a file path. Handed a git ref it fails with "cannot read", which reads as a
+# problem with the DOCUMENT rather than with the invocation -- several briefings propagated the ref
+# form (#2675). The message must name the flag's actual contract.
+cli("--baseline handed a git ref names the contract, not just 'cannot read'",
+    ["--ordered", "--baseline", "origin/master", "<FILE>"],
+    want_rc=1, expect_text="takes a FILE PATH, not a git ref")
+
+
+# ...and the hint must NOT appear for a baseline that EXISTS and is merely unusable, or it becomes
+# noise on the one path where it is actively wrong -- pointing the reader at their invocation when
+# the invocation was right and the FILE is the problem. Asserting the absence needs its own arm:
+# every helper above searches for presence, and a message that always carries the hint satisfies
+# the positive case above just as well as a correct one does.
+#
+# The baseline here is INVALID UTF-8, and that specific choice is what makes the arm able to fail.
+# The first draft used a baseline containing prose -- which exists AND reads cleanly, so it never
+# reaches the guarded branch at all: with the guard mutated to fire unconditionally the suite still
+# passed, i.e. the arm was testing nothing. Undecodable bytes are the reachable shape that both
+# exists and errors, and that is the only shape that separates "hint when the path is missing" from
+# "hint on every --baseline failure".
+def baseline_hint_absent(name: str, baseline_bytes: bytes) -> None:
+    with tempfile.TemporaryDirectory() as d:
+        s, b = Path(d) / "case.md", Path(d) / "base.md"
+        s.write_text(TABLE, encoding="utf-8")
+        b.write_bytes(baseline_bytes)
+        problems = check(s, True, None, b)
+    if not problems:
+        FAILURES.append(f"{name}: expected a --baseline problem, got clean")
+    elif any("not a git ref" in p for p in problems):
+        FAILURES.append(f"{name}: the git-ref hint fired on a baseline that exists: {problems}")
+    else:
+        print(f"  ok  {name}")
+
+
+baseline_hint_absent("an unreadable baseline that EXISTS gets no git-ref hint", b"\xff\xfe\x00bad")
+# A SECOND, deliberately weaker arm: this baseline reads cleanly, so it never reaches the guarded
+# branch and cannot fail mutation D. It is kept only to pin the no-numbered-table error path, and is
+# labelled so nobody later reads it as the arm that proves the guard.
+baseline_hint_absent("a baseline that exists but has no numbered table gets no git-ref hint",
+                     b"Not a table, just prose.\n")
+
+
+# A CLOSED STDOUT, which is what `check ... | head -1` leaves behind the moment head has its line.
+# Routing the verdict to stdout is only an improvement if the process still exits with a status that
+# MEANS something: an unguarded `print` raises BrokenPipeError, and the well-defined 1 or 2 becomes
+# **120 plus a traceback**, which is a worse answer than the silence it replaced. Measured on master:
+# the SUCCESS path already exited 120 this way while both failure paths exited cleanly, so without
+# `say()` this PR would have extended the crash to exactly the paths it set out to make visible.
+def cli_closed_stdout(name: str, args: list[str], body: str, *, want_rc: int) -> None:
+    import os
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "case.md"
+        path.write_text(body, encoding="utf-8")
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)                     # the reader is gone before the child writes a byte
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(CHECKER)] + [a.replace("<FILE>", str(path)) for a in args],
+                stdout=write_fd, stderr=subprocess.DEVNULL,
+            )
+        finally:
+            os.close(write_fd)
+    if proc.returncode != want_rc:
+        FAILURES.append(f"{name}: expected rc={want_rc} with stdout closed, got {proc.returncode}"
+                        + (" (BrokenPipeError -- the status no longer names the outcome)"
+                           if proc.returncode == 120 else ""))
+        return
+    print(f"  ok  {name}")
+
+
+OUT_OF_ORDER_2 = "| # | What |\n|---|---|\n| 3 | c |\n| 1 | a |\n"
+cli_closed_stdout("a clean run still exits 0 with stdout closed",
+                  ["--ordered", "<FILE>"], TABLE, want_rc=0)
+cli_closed_stdout("a real failure still exits 1 with stdout closed",
+                  ["--ordered", "<FILE>"], OUT_OF_ORDER_2, want_rc=1)
+cli_closed_stdout("a removed flag still exits 2 with stdout closed",
+                  ["--sequential", "<FILE>"], TABLE, want_rc=2)
+cli_closed_stdout("an unknown flag still exits 2 with stdout closed",
+                  ["--gapless", "<FILE>"], TABLE, want_rc=2)
+
 print()
 if FAILURES:
     for f in FAILURES:

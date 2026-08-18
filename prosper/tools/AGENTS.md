@@ -453,6 +453,16 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   `--baseline` does that job completely — interior, tail, whole-file revert, and renumber — and
   cannot be made to fire by another lane's timing. **Gaps are now legal**, so a collision is repaired
   by bumping to any higher number and merging.
+  **`--baseline` takes a FILE PATH, not a git ref** — materialise one with
+  `B=$(mktemp); git show "origin/master:<file>" > "$B"` (CI uses `git show HEAD^1:<file>`). Handed a
+  ref it used to fail with a bare `cannot read`, which reads as a problem with the document rather
+  than with the invocation; it now names the contract (#2675).
+  **Every failure is announced on stdout as well**, because this gate is quoted as a copy-pasteable
+  recipe and recipes get pasted into pipelines: `check … | tail` discards the exit status *and*
+  stderr, so a real failure — and a refused flag — used to print nothing at all and look green. The
+  detail still goes to stderr; stdout carries `N problem(s) found.` or
+  `THE CHECK DID NOT RUN -- usage error: <what>` (quoted as the tool actually spells it: its output
+  is ASCII, and a doc that prettifies a literal defeats a grep for the line the tool printed).
   **On arity, and why it is not optional:** GFM splits a row into cells on `|` *before* it parses
   inline content, so a pipe inside an inline `code span` is a cell boundary, and a row with more
   cells than the header has the excess **silently discarded** on the rendered page. Write `\|`

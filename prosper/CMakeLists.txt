@@ -284,6 +284,24 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME diag_gate_selftest
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_diag_gates.py"
                    --selftest)
+  # The same selftest with $TMPDIR pointed INSIDE a build tree, which is where this repository's
+  # own guidance puts it (`prosper/build-linux`). The selftest writes its fixtures into $TMPDIR, and
+  # collect_files used to exclude by substring on the ABSOLUTE path, so that TMPDIR discarded every
+  # fixture: twelve positive arms printed `got=[]` under the banner "the scanner's own signatures
+  # are broken" while the twelve must-not-match arms passed VACUOUSLY. Three lanes hit it inside
+  # five minutes and one read it as a real regression (#2658, #2660, #2661).
+  #
+  # --require-hostile-tmpdir is what keeps this case honest. `tempfile` falls back to /tmp without
+  # a word when $TMPDIR names a directory that does not exist, so a case that merely SETS the
+  # variable would go green on an environment it never had -- an arm that cannot show its lever
+  # moved. The flag asserts the temp root really is a build-tree path before any arm runs.
+  set(PROSPER_DIAG_GATE_HOSTILE_TMPDIR "${CMAKE_CURRENT_BINARY_DIR}/build-hostile-tmpdir")
+  file(MAKE_DIRECTORY "${PROSPER_DIAG_GATE_HOSTILE_TMPDIR}")
+  add_test(NAME diag_gate_selftest_hostile_tmpdir
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/env/check_diag_gates.py"
+                   --selftest --require-hostile-tmpdir)
+  set_tests_properties(diag_gate_selftest_hostile_tmpdir PROPERTIES
+                       ENVIRONMENT "TMPDIR=${PROSPER_DIAG_GATE_HOSTILE_TMPDIR}")
   # Most cases here assert on what must NOT appear (negative time, failed dispatches summed in, an
   # image share computed against a filtered denominator, a per-binding mean over aliased folds),
   # because each is a table this tool has already produced once. Note what this gate does NOT do: it

@@ -1111,6 +1111,43 @@ def split_call_findings(call_sites: dict[str, list[tuple[str, frozenset]]],
     return out
 
 
+def is_excluded_dir(name: str) -> bool:
+    """Is this ONE directory name a build tree or vendored code? Names only -- never a whole path.
+
+    The intent is "skip the build tree and third_party", and it is a statement about a directory
+    INSIDE the scan root. Applying it to the absolute path -- which `"build-" in str(path)` did --
+    cannot distinguish that from a scan root that merely SITS under such a directory, and the
+    difference is not academic: this scanner's own `--selftest` writes its fixtures into `$TMPDIR`,
+    so a `TMPDIR` under `prosper/build-linux/` (the build directory the charter names) excluded
+    every fixture and all twelve positive arms reported `got=[]` while the must-not-match arms
+    passed vacuously. Three lanes hit that within five minutes (#2658, #2660, #2661).
+
+    `build` is matched as a whole HYPHEN-SEPARATED WORD, not as a substring: `build`, `build-linux`,
+    `build-windows`, `cmake-build-debug` and `pre-build` are build trees; `builder/`, `build_utils/`
+    and `rebuild-cache/` are directories of real sources and are scanned. A bare `"build-" in name`
+    would drop `rebuild-cache/`, and dropping real sources is the SILENT direction: the scan then
+    reports a clean tree over a smaller one, which is exactly the failure mode
+    `prosper/CMakeLists.txt` says this checker must not have.
+
+    Stated exactly, because an earlier draft of this docstring claimed the word rule "keeps every
+    spelling the old rule caught" and that was FALSE in both directions (#2688 review). Against
+    master's `"build-" in <absolute path>`, per DIRECTORY component and with nothing above the root:
+
+        newly EXCLUDED   `build/`, `pre-build/`      -- no hyphen after `build`, so the old
+                                                        substring never matched them
+        newly SCANNED    `rebuild-cache/`            -- contains `build-`, so the old rule dropped it
+                         `third_party_shim.cpp`      -- a FILE, and files are no longer tested
+        unchanged        `build-linux/`, `cmake-build-debug/`, `third_party/` (excluded);
+                         `builder/`, `build_utils/`, `buildinfo.cpp` (scanned -- the old rule
+                         never matched these either, whatever the first draft said)
+
+    Both new exclusions are intended: a directory literally named `build` is a build tree, and
+    `CLAUDE.md`'s own recipe used exactly that name. Measured over the real
+    `prosper/{src,frontends,tools,tests}`, **zero** files differ between the two rules.
+    """
+    return name == "third_party" or "build" in name.split("-")
+
+
 def collect_files(root: Path) -> dict[Path, list[str]]:
     files = {}
     for d in SCAN_DIRS:
@@ -1120,7 +1157,10 @@ def collect_files(root: Path) -> dict[Path, list[str]]:
         for path in sorted(base.rglob("*")):
             if path.suffix not in SCAN_EXT or not path.is_file():
                 continue
-            if "build-" in str(path) or "third_party" in str(path):
+            # DIRECTORY components, RELATIVE to the scan root. Relative so nothing above the root
+            # participates; directories only so a source file named `third_party_shim.cpp` is
+            # scanned -- it is prosper's own code, and dropping it is the silent direction.
+            if any(is_excluded_dir(p) for p in path.relative_to(root).parts[:-1]):
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -1615,13 +1655,35 @@ _LONG_PREDICATE_TWO_GATE = _LONG_PREDICATE.replace(
     '        if (getenv("PROSPER_RTT")) {\n            hits = st.count;\n        }')
 
 
-def _keys_for(snippet: str) -> set:
+def _scan_fixture(snippet: str) -> tuple[int, list]:
+    """Scan one fixture in a temp tree. Returns (files collected, findings).
+
+    The file COUNT is returned so every caller can separate an apparatus failure from a
+    substantive one. A fixture the scanner never opened produces no findings, and "no findings"
+    is exactly what a broken signature produces too -- #2658 is the whole argument: twelve arms
+    printed `got=[]` under the banner "the scanner's own signatures are broken" when the real
+    cause was that `collect_files` had discarded the fixture before any signature ran.
+    """
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "src").mkdir()
         (root / "src" / "fixture.cpp").write_text(snippet, encoding="utf-8")
-        _files, _preds, findings = scan_tree(root)
+        files, _preds, findings = scan_tree(root)
+    return len(files), findings
+
+
+def _apparatus_failure(where: str) -> None:
+    import tempfile
+    print(f"  [FAIL] APPARATUS: {where}'s own fixture collected 0 file(s) -- the scanner never")
+    print("         opened the tree it had just written, so every arm below would report an")
+    print("         empty result for a reason that has nothing to do with what it tests.")
+    print(f"         TMPDIR={tempfile.gettempdir()}")
+    print("         (see #2658: a scan-root exclusion that reads the path ABOVE the root)")
+
+
+def _keys_for(snippet: str) -> set:
+    _n, findings = _scan_fixture(snippet)
     return {f.key() for f in findings}
 
 
@@ -1659,16 +1721,74 @@ def run_key_stability_test(verbose: bool = False) -> int:
     return bad
 
 
-def run_self_test(verbose: bool = False) -> int:
+def run_exclusion_test(verbose: bool = False) -> int:
+    """What `collect_files` skips, as a PAIR of arms. #2658.
+
+    The hostile root is constructed BY HAND rather than by pointing `TMPDIR` at a build directory
+    and hoping. `tempfile.gettempdir()` silently falls back when `TMPDIR` names a directory that
+    does not exist, so an arm built out of the environment reports a confident pass on a root that
+    was never hostile -- the same class of vacuum as the defect it is guarding.
+
+    Both directions matter and they pull opposite ways, which is why neither arm stands alone:
+    arm 1 fails on the absolute-path substring this replaced, arm 2 fails on simply deleting the
+    exclusion.
+    """
     import tempfile
 
     bad = 0
+    fixture = 'void f(void) { if (getenv("PROSPER_ZZ_EXCL")) fprintf(stderr, "x"); }\n'
+
+    with tempfile.TemporaryDirectory() as td:
+        # Arm 1: the scan root sits UNDER directories that look like a build tree. Every component
+        # above the root is the caller's business, not ours, and must not filter anything.
+        hostile = Path(td) / "build-linux" / "tmpdir" / "third_party" / "tree"
+        (hostile / "src").mkdir(parents=True)
+        (hostile / "src" / "fixture.cpp").write_text(fixture, encoding="utf-8")
+        got = collect_files(hostile)
+        if len(got) != 1:
+            bad += 1
+            print("  [FAIL] exclusion: a scan root beneath 'build-linux/tmpdir/third_party'")
+            print(f"         collected {len(got)} file(s), want 1 -- the exclusion is reading the")
+            print("         path ABOVE the root, so $TMPDIR decides what the scanner can see")
+        elif verbose:
+            print("  [ok]   exclusion: components above the scan root do not filter")
+
+        # Arm 2: inside the root the exclusion must still bite, or arm 1 is satisfied by deleting
+        # it. Both halves are named explicitly, because the dangerous direction here is the quiet
+        # one: a build tree kept produces noisy extra findings somebody will investigate, while a
+        # source directory dropped produces a CLEAN report over a smaller tree.
+        inner = Path(td) / "tree2"
+        excluded_dirs = ("src/build", "src/build-linux", "src/cmake-build-debug",
+                         "src/pre-build", "src/third_party")
+        scanned_dirs = ("src", "src/builder", "src/build_utils", "src/rebuild-cache")
+        for sub in excluded_dirs + scanned_dirs:
+            (inner / sub).mkdir(parents=True, exist_ok=True)
+        scanned_files = ["src/ok.cpp", "src/third_party_shim.cpp", "src/buildinfo.cpp"] + [
+            f"{d}/real.cpp" for d in scanned_dirs[1:]]
+        for rel in scanned_files + [f"{d}/generated.cpp" for d in excluded_dirs]:
+            (inner / rel).write_text(fixture, encoding="utf-8")
+        kept = {str(p.relative_to(inner)).replace("\\", "/") for p in collect_files(inner)}
+        want = set(scanned_files)
+        if kept != want:
+            bad += 1
+            print("  [FAIL] exclusion: the wrong files were kept inside the scan root")
+            print(f"         want={sorted(want)}")
+            print(f"         got ={sorted(kept)}")
+        elif verbose:
+            print("  [ok]   exclusion: build-linux/ and third_party/ inside the root are skipped")
+
+    if not bad:
+        print("  [ok]   scan-root exclusion: 2 arms (above the root ignored, inside it applied)")
+    return bad
+
+
+def run_self_test(verbose: bool = False) -> int:
+    bad = 0
     for label, snippet, want in SELF_TESTS:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / "src").mkdir()
-            (root / "src" / "fixture.cpp").write_text(snippet, encoding="utf-8")
-            _files, _preds, findings = scan_tree(root)
+        nfiles, findings = _scan_fixture(snippet)
+        if not nfiles:
+            _apparatus_failure("the scanner self-test")
+            return 1
         got = set()
         for f in findings:
             if f.kind == "TWO-GATE":
@@ -1887,11 +2007,25 @@ def main() -> int:
     ap.add_argument("--inventory", action="store_true", help="print the PROSPER_* read inventory")
     ap.add_argument("--emit-baseline", action="store_true",
                     help="print a baseline file for the current tree (classify the notes by hand)")
+    ap.add_argument("--require-hostile-tmpdir", action="store_true",
+                    help="fail unless $TMPDIR itself looks like a build tree -- so the ctest case "
+                         "that pins #2658 cannot pass on a TMPDIR that quietly fell back to /tmp")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     print("== check_diag_gates ==")
-    if (run_self_test(args.verbose) or run_key_stability_test(args.verbose)
+    if args.require_hostile_tmpdir:
+        import tempfile
+        tmp = Path(tempfile.gettempdir())
+        if not any(is_excluded_dir(p) for p in tmp.parts):
+            print("  [FAIL] --require-hostile-tmpdir: no component of the temp root looks like a")
+            print("         build tree. tempfile falls back silently when $TMPDIR names a")
+            print("         directory that does not exist, so this run would have pinned #2658")
+            print(f"         against an environment it never had. temp root: {tmp}")
+            return 1
+        print(f"  [ok]   temp root {tmp} is a build-tree path -- the #2658 arm is live")
+    if (run_exclusion_test(args.verbose) or run_self_test(args.verbose)
+            or run_key_stability_test(args.verbose)
             or run_baseline_integrity_test(args.verbose)):
         return 1
     if args.selftest:
