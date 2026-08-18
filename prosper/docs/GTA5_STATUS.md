@@ -4136,6 +4136,22 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **`0x413dc6700` computes on zeros because prosper cannot express its pointer-chase load, so GTA V's
+  world needs `PhysicalStorageBuffer` / `VK_KHR_buffer_device_address`.** *Solid.* Filed as #2709 and
+  argued further in its comments; also carried into #2711's Q1/Q2 answers as a premise. The emitted
+  SPIR-V really does contain **one** storage-buffer access chain for **41** MUBUF sites — verified
+  exhaustively, since across every op in the module only `OpVariable` and one `OpAccessChain` yield a
+  `StorageBuffer` pointer. The inference from that was wrong, because **a legal `NUM_RECORDS=0` fold
+  and a never-decoded instruction leave identical evidence**: both leave no access chain, no load, no
+  trace at all. This was the fold. The `[buf-op]` disposition line (#2712) says which — all 41 sites,
+  `zero-record` — and a live `[dyntrace]` census over **352 program folds** (14,432 buffer-op *site*
+  observations: 352 folds x 41 MUBUF sites) then showed **10,824 of those site observations resolve
+  concrete descriptors with real extents against 3,608 zero-record**. Per fold the split is clean:
+  `pc91` resolves a real V# in **264 of 352** folds and is zero-record in the other 88. Quoting 14,432
+  as a fold count conflates the two units and does not survive comparison with any dispatch count. Nothing about this program requires
+  address-based memory access; the translated-guest-address work in #2711 Q3 stands on its own merits
+  and must not be justified by this program. #2709, #2712.
+
 - **Sampled-depth invalidation is starving the deferred-lighting pass.** *Solid.* The lighting pass
   does read the scene depth `0x2052ac0000` through the bridge, and that bridge did decline — 826 times
   on `depth-invalid` — so the hypothesis was well-founded. It is still wrong. 730 of the 900
@@ -4848,6 +4864,81 @@ The pointer-chase loop is now *less* likely to be the hang: it is one of three d
 module, and it is the one just shown to be bounded at 11 iterations on the hanging dispatch's own
 data. The other two are unexamined.
 
+## The first 88 folds see an EMPTY SRT — and a capture taken during them is unrepresentative
+
+`0x413dc6700` declares **2 user SGPRs**: one SRT pointer, nothing else. It loads five 64-bit pointers
+out of that table at `+0x18/+0x20/+0x28/+0x30/+0x50` and builds all five of its V#s from them.
+
+For the program's first **88** folds those five slots read zero, so every V# decodes
+`{base=0, stride=<immediate>, NUM_RECORDS=0}` and all 41 of its buffer ops fold: 18 loads (49 dwords)
+to a constant zero, 23 stores (41 dwords) dropped — **none of the 41 MUBUF sites emits a memory
+access**. (The module is not access-free: it retains exactly one `StorageBuffer` access chain, from a
+non-MUBUF path.) After fold 88
+every fold resolves real descriptors. Measured in two runs whose submit numbering otherwise differs,
+and the boundary is **deterministic** in both: **88 zero-record folds** (3,608 buffer-op site
+observations = 88 folds x 41 sites), contiguous from fold 0, then none. No fold mixes the two states —
+0 of 352 are mixed — which is what makes 88 x 41 and 264 x 41 identities rather than coincidences.
+
+`PROSPER_COMPUTE_MEMPROBE=413dc6700:0:0:40` dumps that table and confirms both states are genuine: the
+bytes are **unchanged between its two sample points** for the empty ones too, so those dispatches are
+really handed an empty table rather than read too early — a genuine empty-SRT input state, not a
+fold-time staleness artifact. That is what refutes the emitter-drop reading; it is **not** by itself
+proof that no producer is missing, so the supported claim is "a startup phase, and not evidence of a
+recompiler defect", not "not a defect".
+
+**The capture trap this creates, which cost this investigation a night.**
+`PROSPER_GPU_CAPTURE_COMPUTE_ADDR` fires on the *first* submit containing the program — inside the
+startup window. A capture taken that way has all-empty descriptors, emits almost no memory traffic,
+replays with **zero** device losses, and reads as a program that does nothing on purpose. Which is
+exactly how the "prosper drops this program's entire memory interface" claim in the Ruled-out section
+above was reached. To get a representative submit, enumerate first:
+
+```
+PROSPER_GPU_CAPTURE=<path> PROSPER_GPU_CAPTURE_COMPUTE_ADDR=0x413dc6700 \
+PROSPER_GPU_CAPTURE_AT=99999 PROSPER_GPU_CAPTURE_LOG=1
+```
+
+`AT` beyond every candidate prints `[gpucap] candidate at=N submit=M ...` for each match and captures
+none; pick a later `at=` on the next run. **The at->submit mapping is not stable across runs** —
+capture overhead shifts it, so the index that coincided with the losing submit in one run will not in
+the next (measured: the loss landed on `at=2`'s submit in one run and ~400 submits past the captured
+one in the next). The capture is also pre-submit, so it holds the *inputs* to the submit, not its
+result.
+
+### What the descriptor shape establishes — and what it does not
+
+Every one of the five buffers carries **2063 records**, and the dispatch is `groups=9x1x1
+local=256x1x1` = 2304 threads. **The register→base assignment is NOT stable across folds** — the 264
+resolved folds split into two orientations, and only `s4` is fixed:
+
+| SGPR | stride | size | 144 folds | 120 folds |
+| --- | ---: | ---: | --- | --- |
+| `s4` | 64 | 132032 | `0x209cc76000` | `0x209cc76000` (stable) |
+| `s0` | 4 | 8252 | `0x20f848417c` | `0x20f848a240` |
+| `s8` | 4 | 8252 | `0x20f848a240` | `0x20f848417c` |
+| `s16` | 4 | 8252 | `0x20f8482140` | `0x20f849233c` |
+| `s12` | 4 | 8252 | `0x20f849233c` | `0x20f8482140` |
+
+The two input/output pairs **swap** between orientations, and they do so in a fixed repeating pattern —
+the resolved folds are one 11-fold block of 6 A and 5 B repeated 24 times, i.e. exactly 24 x (6,5) =
+144 / 120. It is not a strict A-B alternation: each period carries one A-A seam.
+That is the double-buffering `### The writer is the CONSUMER ITSELF` (above) documents, seen from the
+register side. Reading either column as "the" mapping is exactly the cross-dispatch attribution error
+that produced the retracted cyclic-table root cause.
+
+What the shape establishes: a **2063-record, per-item read/modify/write or traversal-shaped pass** — one
+64-byte record per item read and written, plus two u32 inputs and two u32 outputs per item. It is
+*consistent with* a scene traversal / visibility pass, and that is a **hypothesis, not a finding**: the
+descriptor shape does not identify the records as entities, does not identify the shader as visibility,
+and does not establish that it gates world content.
+
+**Read `## RETRACTED: the cyclic-table root cause` (above) before using any base address in that
+table.** Those are the
+bases resolved across a *whole run*, not one dispatch's. This program runs many times per submit with
+**different tables**, and attributing one dispatch's buffer to another is precisely the error that
+produced the retracted cyclic-table root cause. Re-deriving the link graph from `0x20f848417c` and
+finding it acyclic reproduces the *succeeding* dispatch's measurement, not the hanging one's.
+
 ## Other open defects
 
 - **#2445** — specific lowercase glyphs (`r`, `s`, `m`) dropped from UI text: "Ente ing Sto y Mode".
@@ -4861,6 +4952,24 @@ data. The other two are unexamined.
 
 ## Instruments worth knowing about here
 
+- **`[buf-op]` (`PROSPER_DBG`)** — the disposition of every buffer op the MUBUF/MTBUF handler sees:
+  `[buf-op] program=0x... pc=91 MUBUF op=0xc n=1 store=0 atomic=0 rt=1 zero-record`. It exists because
+  a **legal `NUM_RECORDS=0` fold and an instruction that never reached the emitter leave identical
+  evidence** in emitted SPIR-V — no access chain, no load, no trace — and telling them apart decides
+  whether a program with no memory traffic is a resource-state question or a translation bug. Reported
+  from a scope guard, so **every** exit path emits exactly one line and an unlabelled path prints
+  `unclassified` rather than nothing; that is what lets a census detect its own incompleteness. `rt=0`
+  marks `recompile_coverage()`'s table-less shell (it runs on the failed-draw path and at F9 capture),
+  so a genuine hole is `rt=1 ... unclassified`. Four rejects sit above the guard by design — `lds`,
+  `tfe`, MTBUF D16, and the opcode switch's `default:` — so "instructions in the stream == lines
+  emitted" is not an identity; it happened to hold for `0x413dc6700` (41 == 41). #2712.
+- **`[dyntrace]` + `PROSPER_DYNTRACE_ADDR` / `_ONCE`** — the live V# each MUBUF resolves, at fold time.
+  This is the only way to see what the front half actually built: the fold is **not** re-run during
+  offline replay (the resource table is replayed from the capture, so markers are baked in), so a
+  question about descriptor resolution cannot be answered from a `.prgcap` alone. Use `_ONCE` for one
+  fold, and **drop it when the question is about variation across dispatches** — a single traced fold
+  told this investigation all five pointers were null, which was true of that fold and false of 75% of
+  the run.
 - **`PROSPER_COMPUTE_SKIP_PROGRAM=0xADDR[,...]`** — decline named compute programs. A bisection tool,
   not a workaround. It announces itself at parse time and reports each skip through the decline census
   as `reason=skipped-by-selector`, so a diagnostic run can never be mistaken for a default one later.
