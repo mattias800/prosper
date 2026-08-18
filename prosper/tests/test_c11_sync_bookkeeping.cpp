@@ -97,6 +97,27 @@
 //                                    -> FAIL (4): the same four. §1, §2 and §3 pass.
 //   M7  make `guest_cond_waiter_leave` a no-op, so the count leaks
 //                                    -> FAIL (1): §4's last arm, and only that one.
+//   M8  restore the pre-#2626 `m_mtx_lock` body, `(void)guest_mutex_lock_slot(a0); return 0;`
+//                                    -> FAIL (2): §6's destroyed-slot arm and its EDEADLK arm.
+//                                       §1-§5 pass, which is the point of putting §6 here rather
+//                                       than folding it into an existing section.
+//   M9  `return guest_mutex_lock_slot(a0) ? 4 : 0` — every refusal becomes `_Thrd_error`
+//                                    -> FAIL (1): the EDEADLK arm ONLY.
+//   M10 `return guest_mutex_lock_slot(a0) ? 3 : 0` — every refusal becomes `_Thrd_busy`
+//                                    -> FAIL (1): the destroyed-slot arm ONLY.
+//   M11 give `m_mtx_unlock` the same transform, i.e. break the #1983/#2596 discard fence
+//                                    -> FAIL (1): §6's `_Mtx_unlock` arm, and only that one.
+//   M12 `(void)guest_mutex_lock_slot(a0); return 4;` — report an error on EVERY lock
+//                                    -> FAIL (3): §6's success control, the ERRORCHECK setup
+//                                       control, and the EDEADLK arm.
+//
+// M9/M10 ARE THE PAIR THAT MATTERS in §6, for the reason M3/M4 matter in §3: `_Mtx_lock`'s contract
+// is a two-way mapping, not "zero or error", and each of those mutations satisfies one half of it.
+// A suite asserting only that a failed lock is non-zero would pass under both. M8 fails both arms,
+// M9 and M10 fail exactly one each, and the arms they fail are different — so the two arms are
+// measurably independent rather than two spellings of one assertion. M11 and M12 exist for the M7
+// reason: without them §6's `_Mtx_unlock` arm and its success control would be rows no mutation
+// kills, and a row nothing kills has never been shown to test anything.
 //
 // M3/M4 are a deliberate pair, and the pair is the evidence: the first breaks the shared body so
 // BOTH spellings lose the behaviour, the second breaks only the C11 one. §3 separates them, so §3
@@ -111,6 +132,11 @@
 // M7 exists because every other arm in §4 survives it: without it, §4's closing arm would be a row
 // no mutation kills, which is a row that has never been shown to test anything.
 //
+// §6 IS A RETURN-VALUE SECTION, and it is in this file rather than in a new one because #2626 is
+// the same divergence as everything above it, one level further out: the C11 spelling and the Sony
+// spelling reach one shared body and must describe its refusals identically, each in its own
+// convention. See pthread_slot.hpp for the three conventions and the guest bytes that fix them.
+//
 // HANG SAFETY. §4 parks a real thread on a condvar. It is DETACHED and every wait is bounded: a
 // regression in this area is a thread that never wakes, and expressing that as a hang burns ctest's
 // timeout and gets misread as machine load on a box that routinely runs at load 30+.
@@ -122,6 +148,7 @@
 #include "../src/hle/sync_retire.hpp"
 
 #include <atomic>
+#include <cerrno>       // §6's construction control asserts EBUSY from a real trylock
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -393,6 +420,113 @@ int main() {
 #else
     printf("  [skip] Windows-only: the guest-mutex ownership map does not exist on this host, and "
            "an arm that cannot fail is not an arm\n");
+#endif
+
+    // ===== 6. _Mtx_lock REPORTS a failed lock, in the C11 convention (#2626) ====================
+    // The handler used to be `(void)guest_mutex_lock_slot(a0); return 0;` — every refusal the shared
+    // body computes was discarded and the guest's `std::mutex::lock()` was told it holds a lock it
+    // does not. The shipped wrapper does not discard: `_Mtx_lock` (0x5e80, 29 bytes) compares
+    // scePthreadMutexLock's ENCODED result against 0x8002000b and maps 0->0, EDEADLK->3, else->4.
+    // See pthread_slot.hpp for the decode and its two controls.
+    //
+    // THIS IS A DIVERGENCE ARM, not merely a return-value arm. linker.cpp resolves an import against
+    // sibling guest modules before falling to an HLE stub, so a title shipping `sce_module/libc.prx`
+    // got the mapping from its own wrapper and a title without one got the unconditional 0 — the
+    // same question answered differently depending on the title's packaging (#1873).
+    //
+    // THE TWO ARMS BELOW PUSH IN OPPOSITE DIRECTIONS ON PURPOSE, because "non-zero" is not the
+    // contract and an implementation that collapsed the two codes would pass a suite that only
+    // checked one of them:
+    //   * an implementation returning `_Thrd_error`(4) for every refusal fails the EDEADLK arm;
+    //   * an implementation returning `_Thrd_busy`(3) for every refusal fails the destroyed arm;
+    //   * the original unconditional 0 fails both;
+    //   * returning the Sony encoding (0x80020016) or the bare errno (22) fails both.
+    printf("-- _Mtx_lock maps a failed lock onto a _Thrd_* code instead of reporting success --\n");
+    {
+        void* slot = nullptr;
+        CHECK(mtx_init((uint64_t)(uintptr_t)&slot, 0, 0, 0, 0, 0) == 0 && slot != nullptr,
+              "control: _Mtx_init produces an object");
+        CHECK(call1(mtx_lock, &slot) == 0,
+              "control: a lock that SUCCEEDS still reports _Thrd_success(0) -- the fix must not turn "
+              "the ordinary path into an error, and this is the arm that would catch it");
+        call1(mtx_unlock, &slot);
+
+        call1(mtx_destroy, &slot);
+        // `ensure_mutex` refuses the destroyed poison, so the shared body answers EINVAL(22) and
+        // nothing is locked. 4, not 0: the guest is entitled to find out.
+        CHECK(call1(mtx_lock, &slot) == 4,
+              "_Mtx_lock on a DESTROYED slot reports _Thrd_error(4) -- it used to report success for "
+              "a lock that never happened, which is the #2626 false success");
+        // The parity half: the identical refusal, through the Sony door, in the Sony convention.
+        // Both spellings must describe the SAME condition — only the encoding differs.
+        CHECK(call1(sce_mtx_lock, &slot) == prosper::hle::kSceKernelErrorEINVAL,
+              "...and scePthreadMutexLock reports the encoded EINVAL for the same slot at the same "
+              "instant, so the two conventions disagree about the ENCODING and nothing else");
+        // The #1983/#2596 fence, asserted rather than assumed: `_Mtx_unlock` is 13 bytes ending
+        // `xor eax,eax`, so its unconditional 0 is the shipped contract and #2626 must not "fix" it
+        // by symmetry. This arm fails if someone gives unlock the same treatment.
+        CHECK(call1(mtx_unlock, &slot) == 0,
+              "...while _Mtx_unlock STILL returns 0 for the same destroyed slot -- its wrapper discards "
+              "the result, so an unconditional 0 is its contract and not an oversight");
+    }
+
+    // The EDEADLK -> _Thrd_busy(3) arm. It needs a mutex that actually answers EDEADLK, and the two
+    // hosts reach that condition through different code, so it is constructed twice rather than
+    // skipped on one of them — a mapping asserted in only one direction has never been shown to be
+    // a mapping. Both constructions assert the same thing: 3, and specifically NOT 4.
+    printf("-- ...and EDEADLK maps to _Thrd_busy(3), not to _Thrd_error(4) --\n");
+#ifdef _WIN32
+    {
+        // Windows: `ensure_mutex` forces ERRORCHECK and registers the object, so the shared body's
+        // own `guest_mutex_self_deadlock` fires BEFORE `interruptible_mutex_lock`. Taking that route
+        // is not an implementation detail here, it is hang safety: winpthreads' cooperative poller
+        // spins on trylock, and a same-thread relock that reached it would never return.
+        void* slot = nullptr;
+        CHECK(call1(mtx_lock, &slot) == 0, "control: the first _Mtx_lock on a static slot succeeds");
+        CHECK(call1(mtx_lock, &slot) == 3,
+              "a same-thread relock reports _Thrd_busy(3) -- the guest can distinguish 'would "
+              "deadlock' from 'invalid', and only 3 lets it");
+        CHECK(call1(sce_mtx_lock, &slot) == prosper::hle::kSceKernelErrorEDEADLK,
+              "...and the Sony spelling reports the encoded EDEADLK for the same relock");
+        call1(mtx_unlock, &slot);
+    }
+#else
+    {
+        // POSIX: `guest_mutex_self_deadlock` is a no-op here (#719/#793 — routing every guest lock
+        // through one process-global map throttles synchronisation-heavy titles), so the natural
+        // path above cannot produce EDEADLK on this host and an arm written that way would silently
+        // assert nothing. Construct the condition BY HAND instead: an ERRORCHECK mutex installed
+        // straight into the slot. `ensure_mutex` returns any non-sentinel value untouched, so the
+        // shared body reaches `pthread_mutex_lock`, which owes EDEADLK to the owner on relock.
+        pthread_mutex_t errorcheck;
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+        CHECK(pthread_mutex_init(&errorcheck, &attr) == 0,
+              "control: an ERRORCHECK mutex is constructible on this host");
+        pthread_mutexattr_destroy(&attr);
+
+        void* slot = &errorcheck;   // above 0x1000, so not a static sentinel — used as-is
+        CHECK(call1(mtx_lock, &slot) == 0,
+              "control: the first _Mtx_lock takes the hand-built ERRORCHECK mutex");
+        // The positive control for the CONSTRUCTION, not for the mapping: if this host's pthreads
+        // did not answer EDEADLK the arm below would be asserting against a condition that never
+        // occurred, and it would fail rather than pass vacuously.
+        CHECK(pthread_mutex_trylock(&errorcheck) == EBUSY,
+              "control: the mutex is genuinely held, so the relock below is a real self-deadlock");
+        CHECK(call1(mtx_lock, &slot) == 3,
+              "a same-thread relock of an ERRORCHECK mutex reports _Thrd_busy(3) -- an implementation "
+              "that answered _Thrd_error(4) for every refusal would turn a recoverable condition "
+              "into an uncaught std::system_error");
+        CHECK(call1(sce_mtx_lock, &slot) == prosper::hle::kSceKernelErrorEDEADLK,
+              "...and the Sony spelling reports the encoded EDEADLK for the same relock, which is the "
+              "constant the guest's own wrapper compares against");
+        CHECK(slot == (void*)&errorcheck,
+              "control: the slot still names the hand-built object, so every arm above operated on "
+              "it rather than on something ensure_mutex manufactured");
+        pthread_mutex_unlock(&errorcheck);
+        pthread_mutex_destroy(&errorcheck);
+    }
 #endif
 
     if (fails) printf("== FAIL (%d) ==\n", fails);

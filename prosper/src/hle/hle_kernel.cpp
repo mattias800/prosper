@@ -850,14 +850,12 @@ HLE(k_mutex_unlock)  { return guest_mutex_unlock_slot(a0); }
 // std::system_error("invalid argument") that terminates the process. A perfectly ordinary
 // "the mutex was busy" therefore killed the guest.
 // CONFIDENCE: HIGH (guest disassembly of the shipped libc.prx is the primary evidence).
-namespace {
-    inline uint64_t sce_pthread_rc(uint64_t posix_rc) {
-        // Pass through success, and anything a body already encoded or that is not an errno.
-        if (posix_rc == 0 || (posix_rc & ~0xffull) != 0) return posix_rc;
-        return prosper::hle::sce_kernel_error(
-            static_cast<prosper::hle::FreeBsdErrno>(static_cast<uint32_t>(posix_rc)));
-    }
-}
+//
+// `sce_pthread_rc` USED TO LIVE HERE, in a file-local anonymous namespace. #2626 moved it to
+// pthread_slot.hpp, beside the C11 `_Mtx_lock` transform that is defined in terms of it — because
+// the guest's own `_Mtx_lock` compares the ENCODED result against an encoded constant, a second
+// copy of this rule would be a copy of the thing the comparison depends on. One definition, both
+// conventions, and the #1873 divergence cannot reopen by drift.
 // One Sony-spelling alias per shared body: same behaviour, libkernel error encoding.
 #define SCE_PTHREAD_ALIAS(sce_name, posix_body) \
     HLE(sce_name) { return sce_pthread_rc(posix_body(a0, a1, a2, a3, a4, a5)); }
