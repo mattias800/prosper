@@ -278,9 +278,18 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   are large enough on their own to break a `-j8` build with
   `error writing to /tmp/ccXXXX.s: Disk quota exceeded`:
   ```bash
-  mkdir -p <worktree>/build/tmpdir
-  distrobox enter ps5ys -- bash -lc "cd <worktree> && TMPDIR=\$PWD/build/tmpdir cmake --build build -j6"
+  mkdir -p <worktree>/prosper/build-linux/tmpdir
+  distrobox enter ps5ys -- bash -lc "cd <worktree> && TMPDIR=\$PWD/prosper/build-linux/tmpdir \
+      cmake --build prosper/build-linux -j6"
   ```
+  This recipe used to name a build directory called plain `build`, which nothing else in this file
+  does — and the missing hyphen was load-bearing without anyone knowing it. `check_diag_gates.py`
+  excluded build trees by substring on the **absolute** path, so following the recipe's *intent*
+  ("`TMPDIR` next to the build") with the build directory the rest of this file names landed you on
+  `build-linux/tmpdir`, and the scanner then discarded its own test fixtures and reported that its
+  signatures were broken. Three lanes hit that inside five minutes (#2658). The scanner is fixed
+  and a ctest case now pins it, so `TMPDIR` may sit anywhere; the recipe is spelled consistently
+  here so nobody has to rediscover which spelling was safe.
   **Diagnosing an exhausted `/tmp`:** every Bash call returns exit 1 with no output — including `true`
   and `echo hello`, foreground or background — which looks identical to a dead working directory. The
   tell is the **Write tool returning `EDQUOT`** for a path under `/tmp` (if Write to `/tmp` succeeds, it

@@ -206,6 +206,7 @@ now fixed -- #1709: fence line numbers are recorded and a gap containing one is 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from functools import lru_cache
@@ -477,6 +478,17 @@ def load_baseline(baseline_path: str, table_header: str | None) -> tuple[tuple[i
     baseline = Path(baseline_path)
     lines, err = read_lines(baseline)
     if err:
+        # A git REF is the wrong-usage this actually receives -- `--baseline origin/master` and
+        # `--baseline HEAD^1` both propagated through briefings (#2675). Bare, the error reads as
+        # a problem with the DOCUMENT ("cannot read"), so the reader goes looking at the table. Say
+        # what the flag takes and how CI materialises it, on the one path that can be reached only
+        # by naming something that is not a readable file.
+        if not baseline.exists():
+            err += (
+                "\n  --baseline takes a FILE PATH, not a git ref. Materialise one first -- CI "
+                "uses `git show HEAD^1:<file>`, and by hand:"
+                '\n      B=$(mktemp); git show "origin/master:<file>" > "$B"'
+            )
         return None, f"--baseline {err}"
     tables, _, _ = parse_tables(lines or [])
     table, problems = select_numbered_table(baseline, tables, table_header)
@@ -713,8 +725,65 @@ def check(
     return problems
 
 
+
+_STDOUT_GONE = False
+
+
+def say(text: str = "") -> None:
+    """One line to stdout, tolerating a reader that has already gone away.
+
+    `check ... | head -1` closes stdout the moment head has what it wants, and a bare `print` then
+    raises BrokenPipeError -- replacing a well-defined exit 1 or 2 with **120 and a traceback**.
+    That is a strictly worse answer than the one it replaced: 120 says nothing about the table, and
+    it is the pipeline shapes trap 40 already names (`| head`, `| grep -m1`) that produce it.
+
+    Measured, master vs this file: on master the SUCCESS path already exited 120 this way, while
+    both failure paths exited cleanly (1 and 2). Routing the verdict to stdout would have extended
+    the crash to those failure paths -- so this helper is not incidental tidying, it is what keeps
+    the change from trading a silent green for a meaningless red.
+
+    The dup2 to /dev/null matters as much as the except: without it the interpreter's own flush at
+    shutdown raises again, and Python prints `Exception ignored in: <_io.TextIOWrapper ...>` to
+    stderr after main() has already returned its status.
+    """
+    global _STDOUT_GONE
+    if _STDOUT_GONE:
+        return
+    try:
+        print(text, flush=True)
+    except (BrokenPipeError, OSError):
+        _STDOUT_GONE = True
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+
+
+class LoudParser(argparse.ArgumentParser):
+    """A usage error announces itself on STDOUT too, because that is the stream callers keep.
+
+    This gate is quoted in CLAUDE.md as a copy-pasteable recipe, and recipes get pasted into
+    pipelines. Two of this repository's own standing rules collide there: **a pipeline's exit
+    status is its last stage's**, so `check ... | tail` reports 0 whatever the checker did, and
+    argparse writes usage errors to stderr, so a `2>/dev/null` or a log that keeps only stdout
+    shows *nothing*. A caller who pastes a stale flag then sees an empty, successful-looking run
+    from a gate that refused to start.
+
+    That is not hypothetical: CLAUDE.md carried `--sequential` for hours after the flag was
+    removed, and it was found by a reviewer reading the charter rather than by any of the people
+    who ran it, because a green exit is not something anyone investigates (#2675).
+
+    So the verdict goes where the caller is looking. stderr keeps the full usage message; stdout
+    gets one line that names what happened and why the check did not run.
+    """
+
+    def error(self, message: str):  # noqa: D102 -- argparse's own contract
+        say(f"{self.prog}: THE CHECK DID NOT RUN -- usage error: {message}")
+        super().error(message)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = LoudParser(description=__doc__.split("\n")[0])
     ap.add_argument("paths", nargs="+", type=Path, help="Markdown files to check")
     ap.add_argument(
         "--ordered",
@@ -773,12 +842,16 @@ def main() -> int:
         if args.github:
             # GitHub decodes these three in annotation text; leaving them raw truncates messages.
             escaped = problem.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-            print(f"::error::{escaped}")
+            say(f"::error::{escaped}")
         else:
             print(f"error: {problem}", file=sys.stderr)
 
     if problems:
-        print(f"\n{len(problems)} problem(s) found.", file=sys.stderr)
+        # The COUNT goes to stdout; the detail above stays on stderr. Same reason as LoudParser:
+        # the success path prints to stdout, so a caller who pipes stdout anywhere sees a green
+        # summary or nothing at all, and "nothing at all" is what a real failure looked like. One
+        # line on the same stream makes the two distinguishable without duplicating the detail.
+        say(f"\n{len(problems)} problem(s) found.")
         return 1
 
     for path in args.paths:
@@ -805,7 +878,7 @@ def main() -> int:
                     base_numbers, _ = load_baseline(str(args.baseline), args.table_header)
                     n = len(base_numbers) if base_numbers is not None else 0
                     summary += f"; none of the {n} rows in {args.baseline} has been deleted"
-        print(summary)
+        say(summary)
     return 0
 
 
