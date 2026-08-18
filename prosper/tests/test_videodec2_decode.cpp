@@ -113,14 +113,19 @@ public:
             dst[y_bytes + i] = static_cast<uint8_t>((last_au_first * 3u + i * 7u) & 0xFF);
         return AuResult::Decoded;
     }
+    // #2585. Reset must reach THIS, not close_decoder. `support_reset` models a backend that has no
+    // in-place reset, which is the fallback the HLE must still take -- and the only way to prove the
+    // fallback is a live path rather than dead code.
+    bool reset_decoder(int id) override { ++resets; last_reset = id; return support_reset; }
     void close_decoder(int id) override { ++closes; last_closed = id; }
 
     bool refuse_open = false;
     bool starve = false;
     bool zero_size = false;
+    bool support_reset = true;
     int  next_id = 7;
-    int  opens = 0, decodes = 0, closes = 0;
-    int  last_id = -1, last_closed = -1;
+    int  opens = 0, decodes = 0, closes = 0, resets = 0;
+    int  last_id = -1, last_closed = -1, last_reset = -1;
     uint32_t last_codec = 0;
     size_t last_au_bytes = 0;
     uint8_t last_au_first = 0;
@@ -142,6 +147,11 @@ private:
 // half: the value the variable names is what lands in the guest's struct. It says nothing about
 // whether a guest reads it, which is the open question.
 constexpr uint32_t kFormatProbe = 0x2a;
+
+// SCE_VIDEODEC2_ERROR_DECODER_INSTANCE, mirrored from the handler's own VDEC_ERR_DECODER. Written
+// out rather than included so a change to the handler's constant fails this test loudly instead of
+// following it silently -- the value is what the guest sees, so it is part of the ABI.
+constexpr uint64_t kVdecErrDecoder = 0x811d0103ull;
 
 // _putenv rather than _putenv_s on Windows: MinGW-w64 declares the _s form only for a new enough
 // CRT, and this test builds on every platform in CI.
@@ -355,18 +365,89 @@ int main(int argc, char** argv) {
             fake.zero_size = false;
         }
 
-        // Reset means "forget every decoded reference". Continuing to feed the same libavcodec
-        // context would decode the guest's next access units against references it just discarded,
-        // which yields a corrupt picture rather than an error.
-        const int before = fake.closes;
+        // ---- Reset DISCARDS the buffered state and KEEPS the decoder (#2585) -------------------
+        //
+        // These four assertions used to say the opposite -- that Reset closes the backend decoder
+        // and the next access unit goes to a fresh one. That was the defect: closing forgets the
+        // parsed SPS/PPS along with the DPB, and a title whose stream carries its parameter sets
+        // once then cannot decode at all. What is pinned here is the ROUTING (Reset reaches
+        // reset_decoder, and the decoder survives it); that the flush really keeps the sequence
+        // headers and really drops the DPB is measured against a real bitstream in test_video_vaapi,
+        // because a fake backend cannot establish a codec's semantics.
+        const int closes_before = fake.closes, opens_before_reset = fake.opens;
+        const int live_id = fake.last_id;
         CHECK(reset(handle, 0, 0, 0, 0, 0) == 0, "Reset succeeds");
-        CHECK(fake.closes == before + 1, "Reset drops the backend decoder rather than reusing it");
+        CHECK(fake.resets == 1 && fake.last_reset == live_id,
+              "Reset flushes the LIVE backend decoder in place (#2585)");
+        CHECK(fake.closes == closes_before,
+              "Reset does NOT close the backend decoder -- closing would discard the parsed "
+              "sequence headers along with the DPB (#2585)");
         VdecFrame again{sizeof(VdecFrame), (uint64_t)(uintptr_t)guest_frame.data(), nv12_bytes, 0, {}};
         VdecOutput again_out{}; again_out.size = sizeof again_out;
         CHECK(decode(handle, (uint64_t)(uintptr_t)&input, (uint64_t)(uintptr_t)&again,
                      (uint64_t)(uintptr_t)&again_out, 0, 0) == 0 && again_out.pictures == 1,
               "decoding resumes after Reset");
-        CHECK(fake.opens == 2, "the access unit after a Reset goes to a FRESH backend decoder");
+        CHECK(fake.opens == opens_before_reset && fake.last_id == live_id,
+              "the access unit after a Reset goes to the SAME decoder, not a fresh one");
+
+        // THE FALLBACK, as a live path. A backend with no in-place reset must still forget the DPB,
+        // and the only lifecycle left for that is close-and-reopen -- which is the old behaviour,
+        // now reached only where it is the best available answer rather than always. Without this
+        // arm the fallback is unexecuted code that reads as covered.
+        {
+            fake.support_reset = false;
+            const int closes_b = fake.closes, opens_b = fake.opens, resets_b = fake.resets;
+            // The fallback announces itself once, and the announcement is the whole reason the
+            // fallback is acceptable rather than a silent downgrade -- so it is asserted, not
+            // assumed. Captured the same way the NO DECODER banner is, and a FAILED capture fails
+            // the test rather than skipping the assertion (#2571 review D2).
+#if !defined(_WIN32)
+            const std::string warn_path =
+                prosper_test::test_scratch_file("vdec2-reset-fallback.log");
+            std::fflush(stderr);
+            const int saved = dup(fileno(stderr));
+            const bool redirected = saved >= 0 && std::freopen(warn_path.c_str(), "w", stderr);
+            const uint64_t frc = reset(handle, 0, 0, 0, 0, 0);
+            if (redirected) { std::fflush(stderr); dup2(saved, fileno(stderr)); clearerr(stderr); }
+            if (saved >= 0) close(saved);
+            CHECK(redirected, "the fallback-warning arm could capture stderr (a failed capture is a "
+                              "FAILURE, never a silent skip)");
+            if (redirected) {
+                int warnings = 0;
+                if (std::FILE* f = std::fopen(warn_path.c_str(), "rb")) {
+                    char line[512];
+                    while (std::fgets(line, sizeof line, f))
+                        if (std::strstr(line, "no in-place reset")) ++warnings;
+                    std::fclose(f);
+                } else {
+                    CHECK(false, "the captured fallback-warning log could be re-opened for reading");
+                }
+                std::remove(warn_path.c_str());
+                CHECK(warnings == 1,
+                      "the close-and-reopen fallback ANNOUNCES itself, exactly once (#2585)");
+            }
+            CHECK(frc == 0, "Reset succeeds against a backend with no in-place reset");
+#else
+            CHECK(reset(handle, 0, 0, 0, 0, 0) == 0, "Reset succeeds against a backend with no "
+                                                     "in-place reset");
+#endif
+            CHECK(fake.resets == resets_b + 1, "the HLE still ASKS the backend to reset first");
+            CHECK(fake.closes == closes_b + 1 && fake.last_closed == live_id,
+                  "a backend that refuses the in-place reset falls back to closing the decoder");
+            VdecFrame f3{sizeof(VdecFrame), (uint64_t)(uintptr_t)guest_frame.data(), nv12_bytes, 0, {}};
+            VdecOutput o3{}; o3.size = sizeof o3;
+            CHECK(decode(handle, (uint64_t)(uintptr_t)&input, (uint64_t)(uintptr_t)&f3,
+                         (uint64_t)(uintptr_t)&o3, 0, 0) == 0 && o3.pictures == 1,
+                  "decoding resumes after the fallback Reset");
+            CHECK(fake.opens == opens_b + 1 && fake.last_id != live_id,
+                  "the fallback re-arms the open, so the next unit gets a FRESH decoder");
+            fake.support_reset = true;
+        }
+
+        // An unknown handle is rejected rather than silently succeeding: Reset is a void-returning
+        // discard, so a wrong handle answering SCE_OK would look exactly like a completed reset.
+        CHECK(reset(handle + 0x99999, 0, 0, 0, 0, 0) == kVdecErrDecoder,
+              "Reset on an unknown decoder handle reports VDEC_ERR_DECODER");
     }
 
     // A backend that refuses the codec must not be mistaken for one that is warming up. The
