@@ -47,8 +47,9 @@ A fourth rule earned by the instance fixed in this document's own PR:
 
 ## The audit
 
-`prosper/tools/env/check_diag_gates.py` is a re-runnable scanner, registered as the ctest
-`diag_gate_selftest` and run over the tree in CI's `Docs` job. It checks three lexical signatures,
+`prosper/tools/env/check_diag_gates.py` is a re-runnable scanner, registered as **two** ctest
+cases -- `diag_gate_selftest`, and `diag_gate_selftest_hostile_tmpdir` which repeats it with
+`$TMPDIR` pointed inside a build tree -- and run over the tree in CI's `Docs` job. It checks three lexical signatures,
 each derived from a **measured** instance rather than invented:
 
 | Signature | What it means | Measured instance |
@@ -329,6 +330,21 @@ python3 prosper/tools/env/check_diag_gates.py --selftest      # signatures only,
 python3 prosper/tools/env/check_diag_gates.py prosper         # scan the tree against the baseline
 python3 prosper/tools/env/check_diag_gates.py prosper --list  # every finding, baselined or not
 python3 prosper/tools/env/check_diag_gates.py prosper --emit-baseline   # regenerate the key list
+```
+
+The selftest writes its fixtures into `$TMPDIR`, so the scanner's own file collection has to be
+independent of where that points. It was not: an exclusion applied as a substring of the
+**absolute** path meant a `TMPDIR` under `prosper/build-linux/` discarded every fixture, and the
+twelve positive arms then accused the signatures for a fault in the file collector while the
+twelve must-not-match arms passed vacuously (#2658). The exclusion now tests directory
+components **relative to the scan root**, a zero-file fixture reports `[FAIL] APPARATUS` rather
+than its arms, and the second ctest case pins it:
+
+```bash
+# the arm that the defect defeats -- --require-hostile-tmpdir refuses to run unless $TMPDIR
+# really is a build-tree path, because tempfile falls back to /tmp in SILENCE when it is not
+TMPDIR=<worktree>/prosper/build-linux/tmpdir \
+    python3 prosper/tools/env/check_diag_gates.py --selftest --require-hostile-tmpdir
 ```
 
 A finding not in `tools/env/diag_gate_baseline.txt` fails the check: fix it, or add the key with a
