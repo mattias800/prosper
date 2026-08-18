@@ -4303,13 +4303,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     // and reads 0 for a reason that has nothing to do with residency
                                     // -- on an `img_dim == 6` surface it is structurally 0.
                                     //
-                                    // `dim=` is printed because it, not the sample count, selects
-                                    // which helper runs: `dcc_metadata_footprint` routes to the HTILE
-                                    // sizer ONLY for `img_dim == 6 && Float32 && 1 component`, and
-                                    // otherwise to the DCC sizer, which fail-closes on tile mode and
-                                    // never looks at `sample_count`. Without `dim=` the two gate
-                                    // stories -- "the sample count blocked it" and "it was never
-                                    // routed to the HTILE sizer at all" -- are indistinguishable.
+                                    // `dim=` and `ncomp=` are printed because the ROUTING, not the
+                                    // sample count, decides which gate applies:
+                                    // `dcc_metadata_footprint` reaches the HTILE sizer only for
+                                    // `img_dim == 6 && Float32 && num_components == 1`, and
+                                    // otherwise uses the DCC sizer, which fail-closes on tile mode
+                                    // and never looks at `sample_count`. All three conjuncts must be
+                                    // visible: `fmt=` cannot stand in for `ncomp=`, because it
+                                    // prints the DataFormat enum and `Float32` is reached from raw
+                                    // IMG_FMT 22/64/74/77 with one, two, three or four components.
+                                    // With any conjunct missing, "the sample count blocked it" and
+                                    // "it was never routed to the HTILE sizer at all" stay
+                                    // indistinguishable -- which they were, and a gate analysis was
+                                    // written against the wrong gate because of it.
                                     const char* kind_name =
                                         kind == prosper::gpu::CompressionMetadataKind::Htile
                                             ? "HTILE"
@@ -4322,14 +4328,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                       metadata[0]);
                                     fprintf(stderr,
                                             "[render] compressed sampled image kind=%s addr=0x%llx "
-                                            "meta=0x%llx %ux%ux%u fmt=%u dim=%u tile=%u "
+                                            "meta=0x%llx %ux%ux%u fmt=%u ncomp=%u dim=%u tile=%u "
                                             "samples=%u pipe_aligned=%u ds_live=%u is unsupported; "
                                             "metadata=%zu/%llu first=%s\n",
                                             kind_name,
                                             (unsigned long long)r.gpu_addr,
                                             (unsigned long long)r.metadata_addr,
-                                            tw, th, r.depth, (unsigned)r.format, r.img_dim,
-                                            r.tile_mode, r.sample_count,
+                                            tw, th, r.depth, (unsigned)r.format, r.num_components,
+                                            r.img_dim, r.tile_mode, r.sample_count,
                                             r.meta_pipe_aligned ? 1u : 0u,
                                             has_ds_live ? 1u : 0u, metadata_got,
                                             (unsigned long long)metadata_bytes, first_text);

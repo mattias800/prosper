@@ -127,11 +127,17 @@ What survives is the narrower claim, and it is the one that matters: `has_ds_liv
 helper** and that helper returned zero.
 
 **Which helper, and therefore which gate, is still undetermined.** `dcc_metadata_footprint`
-(`gpu_capture.cpp`) routes to the HTILE sizer only for `img_dim == 6 && Float32 && 1 component`, and
-otherwise to the DCC sizer — which fail-closes on tile mode and **never looks at `sample_count`**. So
-"the 4xAA gate blocked it" and "it was never routed to the HTILE sizer at all" are both consistent
-with everything measured so far, and `img_dim` was the one field not printed. #2679 now prints
-`dim=`. Until that is read, no gate conclusion should be quoted from this section.
+(`gpu_capture.cpp`) reaches the HTILE sizer only when **all three** of `img_dim == 6`,
+`format == Float32` and `num_components == 1` hold, and otherwise uses the DCC sizer — which
+fail-closes on tile mode and **never looks at `sample_count`**. So "the 4xAA gate blocked it" and "it
+was never routed to the HTILE sizer at all" are both consistent with everything measured so far.
+
+Two of those three conjuncts were unprinted, not one. #2679 adds `dim=` **and `ncomp=`**, because
+`fmt=` cannot stand in for the component count: it prints the `DataFormat` enum, and `Float32` is
+reached from raw IMG_FMT 22/64/74/77 with one, two, three or four components
+(`agc_shader_layout.cpp`). Note the asymmetry that remains even so — `dim != 6` is **decisive** (the
+HTILE sizer cannot have run), while `dim == 6` alone is not. Until all three are read, no gate
+conclusion should be quoted from this section.
 
 That is the second withdrawal on this surface, and the pattern is worth naming: each time, a
 measurement narrowed the question without settling it, and each time the tempting move was to treat
@@ -139,10 +145,12 @@ the surviving hypothesis as confirmed because it was the last one standing. It w
 there was simply no instrument pointed at its rival.
 
 What is measured, in full: `kind=HTILE` (the correlator classifies it correctly on this path),
-`tile=24` matching `TileMode::Sw64KbZX`, `pipe_aligned=1`, `ds_live=0`, and `samples=1`. Note that
-these two readings of them are **mutually exclusive and not yet separated**: if `img_dim == 6` the
-HTILE sizer ran and the sample count is the failing gate; if not, the DCC sizer ran, fail-closed on
-tile mode, and the sample count was never consulted. `dim=` decides it and is printed as of #2679. The function's own comment records that the sample-count gate is conservatism rather than
+`tile=24` matching `TileMode::Sw64KbZX`, `pipe_aligned=1`, `ds_live=0`, and `samples=1`.
+
+Two readings of that set remain **mutually exclusive and not yet separated**. If the routing predicate
+held, the HTILE sizer ran and the sample count is the failing gate; if it did not, the DCC sizer ran,
+fail-closed on tile mode, and the sample count was never consulted at all. `dim=` and `ncomp=` are
+printed as of #2679 so the next routed run separates them. The function's own comment records that the sample-count gate is conservatism rather than
 arithmetic:
 
 > HTILE sizing is independent of the depth sample count, but this API deliberately retains the
