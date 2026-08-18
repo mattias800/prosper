@@ -17,6 +17,7 @@
 #include "sce_errno.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "../host/exec_image.hpp"      // describe_code_address (host frame naming)
+#include "../host/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
 #include "pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
 #include "sync_futex.hpp"
 #include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
@@ -72,6 +73,29 @@
 #endif
 
 namespace prosper {
+
+// #2613 static-destruction ordering canary. Declared BEFORE every registry in this file, so the
+// reverse-order static destruction pass destroys it AFTER all of them: once this flag reads true,
+// every object in this translation unit that still had a static destructor has already run it.
+// tests/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran after
+// this TU's destruction — without that check a probe that ran too early would pass vacuously.
+// The flag itself is a constant-initialized atomic, so it has neither dynamic initialization nor a
+// destructor and stays readable for the whole process lifetime.
+namespace {
+std::atomic<bool> g_hle_kernel_statics_destroyed{false};
+struct HleKernelDestructionCanary {
+    HleKernelDestructionCanary() noexcept {
+        g_hle_kernel_statics_destroyed.store(false, std::memory_order_relaxed);
+    }
+    ~HleKernelDestructionCanary() {
+        g_hle_kernel_statics_destroyed.store(true, std::memory_order_release);
+    }
+};
+HleKernelDestructionCanary g_hle_kernel_destruction_canary;
+}   // namespace
+bool hle_kernel_statics_destroyed() {
+    return g_hle_kernel_statics_destroyed.load(std::memory_order_acquire);
+}
 
 // #2215: is this OS thread inside a live submit-render callback right now? Defined weakly so
 // prosper_core keeps linking for every consumer that does not pull in the live renderer
@@ -145,8 +169,14 @@ namespace {
 #endif
     }
 #ifdef _WIN32
-    std::mutex g_thread_handle_mx;
-    std::unordered_map<uint64_t, HANDLE> g_thread_handles;
+    // #2613: immortal — win_thread_trampoline's tail calls unregister_current_thread_handle() while
+    // the process may already be running its exit handlers. See host/immortal.hpp.
+    Immortal<std::mutex> g_thread_handle_mx;
+    Immortal<std::unordered_map<uint64_t, HANDLE>> g_thread_handles;
+    static_assert(std::is_trivially_destructible_v<decltype(g_thread_handle_mx)> &&
+                  std::is_trivially_destructible_v<decltype(g_thread_handles)>,
+                  "#2613: the Windows guest-thread handle registry must register no static "
+                  "destructor -- the trampoline tail reaches it while the process is exiting");
     void register_current_thread_handle(uint64_t guest_thread) {
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &duplicate,
@@ -162,16 +192,16 @@ namespace {
                          (unsigned long long)guest_thread, (unsigned long)GetLastError());
             return;
         }
-        std::lock_guard<std::mutex> lk(g_thread_handle_mx);
-        auto [it, inserted] = g_thread_handles.emplace(guest_thread, duplicate);
+        std::lock_guard<std::mutex> lk(*g_thread_handle_mx);
+        auto [it, inserted] = g_thread_handles->emplace(guest_thread, duplicate);
         if (!inserted) { CloseHandle(it->second); it->second = duplicate; }
     }
     void unregister_current_thread_handle(uint64_t guest_thread) {
         HANDLE handle = nullptr;
         {
-            std::lock_guard<std::mutex> lk(g_thread_handle_mx);
-            auto it = g_thread_handles.find(guest_thread);
-            if (it != g_thread_handles.end()) { handle = it->second; g_thread_handles.erase(it); }
+            std::lock_guard<std::mutex> lk(*g_thread_handle_mx);
+            auto it = g_thread_handles->find(guest_thread);
+            if (it != g_thread_handles->end()) { handle = it->second; g_thread_handles->erase(it); }
         }
         if (handle) CloseHandle(handle);
     }
@@ -192,9 +222,9 @@ namespace {
     // name a foreign thread -- that was measured false. The registry no longer depends on it.
     HANDLE duplicate_registered_thread_handle(uint64_t guest_thread) {
         HANDLE duplicate = nullptr;
-        std::lock_guard<std::mutex> lk(g_thread_handle_mx);
-        auto it = g_thread_handles.find(guest_thread);
-        if (it != g_thread_handles.end())
+        std::lock_guard<std::mutex> lk(*g_thread_handle_mx);
+        auto it = g_thread_handles->find(guest_thread);
+        if (it != g_thread_handles->end())
             DuplicateHandle(GetCurrentProcess(), it->second, GetCurrentProcess(), &duplicate,
                             0, FALSE, DUPLICATE_SAME_ACCESS);
         return duplicate;
@@ -1783,8 +1813,15 @@ struct GuestThreadName {
     uint64_t generation = 0;
     std::array<char, kGuestThreadNameSize> value{};
 };
-std::mutex g_guest_thread_name_mutex;
-std::unordered_map<uint64_t, GuestThreadName> g_guest_thread_names;
+// #2613: immortal. retire_guest_thread_name() below is the LAST call in thread_trampoline's tail,
+// and nothing joins guest threads at shutdown, so it can run after this registry's static destructor
+// would have. See host/immortal.hpp.
+Immortal<std::mutex> g_guest_thread_name_mutex;
+Immortal<std::unordered_map<uint64_t, GuestThreadName>> g_guest_thread_names;
+static_assert(std::is_trivially_destructible_v<decltype(g_guest_thread_name_mutex)> &&
+              std::is_trivially_destructible_v<decltype(g_guest_thread_names)>,
+              "#2613: the guest thread-name registry must register no static destructor -- a guest "
+              "thread reaches it from the trampoline tail while the process is exiting");
 std::atomic<uint64_t> g_guest_thread_name_generation{1};
 
 uint64_t next_guest_thread_name_generation() {
@@ -1804,9 +1841,9 @@ std::array<char, kGuestThreadNameSize> bounded_guest_thread_name(const char* nam
 }
 
 bool publish_guest_thread_name(uint64_t thread, uint64_t generation, const char* name) noexcept {
-    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
+    std::lock_guard<std::mutex> lock(*g_guest_thread_name_mutex);
     try {
-        g_guest_thread_names[thread] = GuestThreadName{generation, bounded_guest_thread_name(name)};
+        (*g_guest_thread_names)[thread] = GuestThreadName{generation, bounded_guest_thread_name(name)};
         return true;
     } catch (...) {
         return false;
@@ -1814,16 +1851,16 @@ bool publish_guest_thread_name(uint64_t thread, uint64_t generation, const char*
 }
 
 void retire_guest_thread_name(uint64_t thread, uint64_t generation) {
-    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
-    const auto it = g_guest_thread_names.find(thread);
-    if (it != g_guest_thread_names.end() && (!generation || it->second.generation == generation))
-        g_guest_thread_names.erase(it);
+    std::lock_guard<std::mutex> lock(*g_guest_thread_name_mutex);
+    const auto it = g_guest_thread_names->find(thread);
+    if (it != g_guest_thread_names->end() && (!generation || it->second.generation == generation))
+        g_guest_thread_names->erase(it);
 }
 
 bool get_guest_thread_name(uint64_t thread, std::array<char, kGuestThreadNameSize>& name) {
-    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
-    const auto it = g_guest_thread_names.find(thread);
-    if (it != g_guest_thread_names.end()) {
+    std::lock_guard<std::mutex> lock(*g_guest_thread_name_mutex);
+    const auto it = g_guest_thread_names->find(thread);
+    if (it != g_guest_thread_names->end()) {
         name = it->second.value;
         return true;
     }
@@ -1852,12 +1889,12 @@ void set_host_thread_name(uint64_t thread, const char* name) {
 }
 
 bool set_guest_thread_name(uint64_t thread, const char* name) {
-    std::lock_guard<std::mutex> lock(g_guest_thread_name_mutex);
-    auto it = g_guest_thread_names.find(thread);
-    if (it == g_guest_thread_names.end()) {
+    std::lock_guard<std::mutex> lock(*g_guest_thread_name_mutex);
+    auto it = g_guest_thread_names->find(thread);
+    if (it == g_guest_thread_names->end()) {
         if (thread != (uint64_t)(uintptr_t)pthread_self()) return false;
         try {
-            it = g_guest_thread_names.emplace(thread, GuestThreadName{}).first;
+            it = g_guest_thread_names->emplace(thread, GuestThreadName{}).first;
         } catch (...) {
             return false;
         }
@@ -4694,9 +4731,12 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
 // the init image, tbss zeroed). This is the general-dynamic model — no %fs needed (that's only for
 // the main exe's initial-exec TLS, which the current boot already tolerates).
 namespace {
-std::vector<TlsModuleDesc> g_tls_mods;
-std::mutex g_tls_mods_mx;   // guards g_tls_mods: a runtime sceKernelLoadStartModule re-runs set_tls_modules
-                            // (assign, may realloc) while a worker is in k_tls_get_addr (#344).
+// #2613: immortal. k_tls_get_addr runs on guest threads that are still live at exit(), and
+// tls_dtv_purge_current_thread() below is called from thread_trampoline's tail — both reach these
+// after the static destructors that used to own them had run. See host/immortal.hpp.
+Immortal<std::vector<TlsModuleDesc>> g_tls_mods;
+Immortal<std::mutex> g_tls_mods_mx;   // guards g_tls_mods: a runtime sceKernelLoadStartModule re-runs
+                            // set_tls_modules (assign, may realloc) while a worker is in k_tls_get_addr (#344).
 // Per-thread DTV (thread -> module id -> TLS block). MUST NOT use a host `thread_local`: guest threads
 // run under the GUEST %fs, and host thread_local storage is %fs-relative, so it ALIASES guest memory —
 // reads come back as garbage (an unordered_map whose bucket_count reads 0 → `hash % 0` → SIGFPE).
@@ -4707,25 +4747,31 @@ std::mutex g_tls_mods_mx;   // guards g_tls_mods: a runtime sceKernelLoadStartMo
 // scePthreadExit/pthread_exit) via tls_dtv_purge_current_thread(): glibc recycles pthread ids, so a
 // stale entry would hand a NEW thread the dead thread's dirty TLS blocks instead of the fresh
 // zero/tdata-initialized state the ABI guarantees — and the blocks would leak per thread churn (#68).
-std::mutex g_dtv_mx;
-std::unordered_map<std::thread::id, std::unordered_map<uint64_t, void*>> g_dtv;
+Immortal<std::mutex> g_dtv_mx;
+Immortal<std::unordered_map<std::thread::id, std::unordered_map<uint64_t, void*>>> g_dtv;
+static_assert(std::is_trivially_destructible_v<decltype(g_tls_mods)> &&
+              std::is_trivially_destructible_v<decltype(g_tls_mods_mx)> &&
+              std::is_trivially_destructible_v<decltype(g_dtv_mx)> &&
+              std::is_trivially_destructible_v<decltype(g_dtv)>,
+              "#2613: the TLS module list and per-thread DTV must register no static destructor -- "
+              "guest threads reach both while the process is exiting");
 }
 void tls_dtv_purge_current_thread() {
     std::unordered_map<uint64_t, void*> mine;
-    { std::lock_guard<std::mutex> lk(g_dtv_mx);
-      auto it = g_dtv.find(std::this_thread::get_id());
-      if (it == g_dtv.end()) return;   // main/host threads may never have touched __tls_get_addr
+    { std::lock_guard<std::mutex> lk(*g_dtv_mx);
+      auto it = g_dtv->find(std::this_thread::get_id());
+      if (it == g_dtv->end()) return;   // main/host threads may never have touched __tls_get_addr
       mine = std::move(it->second);
-      g_dtv.erase(it);
+      g_dtv->erase(it);
     }
     for (auto& kv : mine) free(kv.second);   // free the blocks outside the lock
 }
 size_t tls_dtv_thread_count() {   // test/diagnostic introspection: threads with live DTV entries
-    std::lock_guard<std::mutex> lk(g_dtv_mx);
-    return g_dtv.size();
+    std::lock_guard<std::mutex> lk(*g_dtv_mx);
+    return g_dtv->size();
 }
 void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
-    { std::lock_guard<std::mutex> lk(g_tls_mods_mx); g_tls_mods.assign(descs, descs + count); }
+    { std::lock_guard<std::mutex> lk(*g_tls_mods_mx); g_tls_mods->assign(descs, descs + count); }
     if (getenv("PROSPER_TLSLOG"))
         for (size_t i = 0; i < count; i++)
             fprintf(stderr, "[tls] module %zu: init_va=0x%llx filesz=0x%llx memsz=0x%llx\n", i,
@@ -4737,21 +4783,21 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
     if (!ti) return 0;
     uint64_t modid = ti[0], off = ti[1];
     std::thread::id tid = std::this_thread::get_id();   // portable per-OS-thread key (no %fs, no syscall)
-    { std::lock_guard<std::mutex> lk(g_dtv_mx);
-      auto& dtv = g_dtv[tid];
+    { std::lock_guard<std::mutex> lk(*g_dtv_mx);
+      auto& dtv = (*g_dtv)[tid];
       auto it = dtv.find(modid);
       if (it != dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
     }
     size_t memsz = 64, filesz = 0; uint64_t init_va = 0;
-    { std::lock_guard<std::mutex> lk(g_tls_mods_mx);   // #344: safe vs a concurrent set_tls_modules realloc
-      if (modid < g_tls_mods.size()) {
-          memsz  = g_tls_mods[modid].memsz ? g_tls_mods[modid].memsz : 64;
-          filesz = g_tls_mods[modid].filesz;
-          init_va = g_tls_mods[modid].init_va;
+    { std::lock_guard<std::mutex> lk(*g_tls_mods_mx);   // #344: safe vs a concurrent set_tls_modules realloc
+      if (modid < g_tls_mods->size()) {
+          memsz  = (*g_tls_mods)[modid].memsz ? (*g_tls_mods)[modid].memsz : 64;
+          filesz = (*g_tls_mods)[modid].filesz;
+          init_va = (*g_tls_mods)[modid].init_va;
       } }
     void* blk = calloc(1, memsz);   // zero-init (tbss), then copy the tdata image
     if (init_va && filesz) memcpy(blk, (const void*)(uintptr_t)init_va, filesz);
-    { std::lock_guard<std::mutex> lk(g_dtv_mx); g_dtv[tid][modid] = blk; }
+    { std::lock_guard<std::mutex> lk(*g_dtv_mx); (*g_dtv)[tid][modid] = blk; }
     return (uint64_t)(uintptr_t)blk + off;
 }
 

@@ -91,7 +91,13 @@ std::string describe_code_address(uint64_t address);
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);
 // Remove a dead thread's entry. pthread ids are RECYCLED — a stale entry would serve the next
 // thread on the same id the old thread's bounds (#138). Called on every HLE thread-exit path.
+// The registry is process-lifetime (host/immortal.hpp): a guest thread reaches this from the
+// trampoline tail while the process is already running its exit handlers (#2613).
 void unregister_thread_stack(uint64_t tid);
+// #2613 test hook: true once this translation unit's static-storage objects have been destroyed.
+// A canary declared before every registry here flips it, so an exit-time probe can prove it really
+// ran after static destruction instead of passing vacuously. Always false while main() runs.
+bool exec_image_statics_destroyed();
 // Mark the calling host thread as about to execute guest code. Primary entry paths
 // (module init + run_entry) always arm PROSPER_HWBP; worker entry paths do so only when
 // PROSPER_HWBP_ALLTHREADS is set. Call while host TLS is active, before guest TLS/entry.
