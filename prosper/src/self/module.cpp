@@ -259,7 +259,13 @@ bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* 
     auto align_up = [](uint64_t v, uint64_t a){ return (v + a - 1) & ~(a-1); };
     img.min_vaddr = align_dn(lo, 0x4000);
     img.max_vaddr = align_up(hi, 0x4000);
-    if (img.max_vaddr < img.min_vaddr) img.max_vaddr = img.min_vaddr;  // degenerate (align_up wrap) -> empty
+    if (img.max_vaddr < img.min_vaddr) {
+        // align_up wrapped, so the declared PT_LOAD extent runs off the end of the 64-bit address
+        // space. Clamping it to an empty image (the pre-#2631 behaviour) reported SUCCESS for a
+        // module of which nothing at all was mapped - see the refusal rationale below.
+        if (err) *err = "PT_LOAD image extent overflows the 64-bit address space";
+        return false;
+    }
     const uint64_t image_size = img.max_vaddr - img.min_vaddr;
     if (image_size > kMaxLoadedImageBytes) {
         if (err) *err = "PT_LOAD image extent exceeds prosper's 1 GiB loader limit";
@@ -278,13 +284,76 @@ bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* 
         if (err) *err = "PT_LOAD image extent exceeds the host vector limit";
         return false;
     }
-    for (auto& s : m.segments) {
-        if (s.type != PT_LOAD || s.vaddr < img.min_vaddr) continue;   // outside the mapped window
-        uint64_t dst = s.vaddr - img.min_vaddr;
-        // Overflow-safe on BOTH the dest (img.mem) and source (m.file) — a malformed near-2^64
-        // filesz/file_off wraps the naive `a + b <= size` check and drives a huge OOB memcpy.
-        if (self_read_ok(dst, s.filesz, img.mem.size()) && self_read_ok(s.file_off, s.filesz, m.file.size()))
+    // Every PT_LOAD maps IN FULL or the load FAILS (#2631). A segment the copy below could not
+    // perform used to be skipped silently while build_image still returned `true`, so the image kept
+    // a zero-filled hole exactly where the file's own bytes belonged and the caller was told the load
+    // had succeeded. The first symptom was the guest executing a page of zeros at an address the
+    // fault handler attributes to a module that looks correctly loaded, arbitrarily far from the
+    // cause. Measured on a 0x1000-byte synthetic PRX physically cut to 0x400: Module::load accepted
+    // it, two symbols parsed, and the resulting 16 KiB image held ZERO nonzero bytes against a
+    // control of 79.
+    //
+    // Why refuse rather than map the surviving prefix and zero-fill the rest:
+    //   * the format says so. The gABI defines p_filesz as the number of bytes of the segment present
+    //     in the FILE image, so a file shorter than p_offset + p_filesz does not contain the segment;
+    //     there is no partial-segment reading to fall back on. A PS5 SELF states the same length a
+    //     second time in its own segment table, and the two agree in every module we hold.
+    //   * it costs nothing measurable. Across the 44 local dumps - 589 modules, 2,945 PT_LOAD
+    //     segments - every segment satisfies both conditions with room to spare: 0 whose file bytes
+    //     run past EOF (none even END at EOF), 0 that do not fit their own mapped image, 0 with
+    //     filesz > memsz, 0 excluded from the extent by an overflowing memsz, and 2,945 of 2,945 SELF
+    //     data segments whose own file_size equals the phdr's p_filesz exactly. No real module needs
+    //     the lenient reading, so refusing cannot reject content that exists.
+    //   * the refusal reaches the guest as a code it can act on: runtime_module_load turns a false
+    //     return into ENOEXEC out of sceKernelLoadStartModule, and link_program fails the boot naming
+    //     the path. A "successfully loaded" module of zeros offers neither.
+    // CONFIDENCE: HIGH.
+    char msg[256];
+    for (size_t i = 0; i < m.segments.size(); i++) {
+        const Segment& s = m.segments[i];
+        if (s.type != PT_LOAD) continue;
+        // `i` is the program header index: m.segments is filled in phdr order, one entry per header.
+        // Unsigned, so it wraps when vaddr is below the window - harmless, because the condition
+        // below rejects that case before the value is used for anything.
+        const uint64_t dst = s.vaddr - img.min_vaddr;
+        // (1) The segment must lie entirely inside the image the extent computation above sized. For
+        // a well-formed module this is free - the image IS max(vaddr+memsz) aligned up. It fails only
+        // for a segment the extent loop had to exclude (an overflowing vaddr+memsz) or one declaring
+        // filesz > memsz beyond the alignment slack; both are malformed. Note the overflowing-memsz
+        // case was NOT merely skipped before: the extent loop left it out of the sizing and the copy
+        // loop then took it anyway, pushing an img.prot record with size = 0xffffffffffffffff - a
+        // protection span covering the whole address space. Its one and only consumer
+        // (executable_end_for, host/exec_image_win.cpp:844 - the sole reader of LoadedImage::prot in
+        // the tree) clamps an oversized span against img.max_vaddr, so the practical damage was
+        // bounded, but the record was wrong and is a refusal now. Raised in review of #2689.
+        if (s.vaddr < img.min_vaddr || !self_read_ok(dst, s.memsz, image_size) ||
+            !self_read_ok(dst, s.filesz, image_size)) {
+            snprintf(msg, sizeof msg,
+                     "PT_LOAD (program header %zu) vaddr 0x%llx filesz 0x%llx memsz 0x%llx does not "
+                     "fit the mapped image [0x%llx, 0x%llx)",
+                     i, (unsigned long long)s.vaddr, (unsigned long long)s.filesz,
+                     (unsigned long long)s.memsz, (unsigned long long)img.min_vaddr,
+                     (unsigned long long)img.max_vaddr);
+            if (err) *err = msg;
+            return false;
+        }
+        // (2) The file must actually hold the bytes the segment declares. self_read_ok is
+        // overflow-safe, which the naive `file_off + filesz <= size` is not: a malformed near-2^64
+        // filesz wraps it, passes, and drives a huge OOB memcpy. A filesz of 0 is a pure-.bss
+        // PT_LOAD - it claims no file bytes, so a short file takes nothing from it and it is not a
+        // truncation.
+        if (s.filesz) {
+            if (!self_read_ok(s.file_off, s.filesz, m.file.size())) {
+                snprintf(msg, sizeof msg,
+                         "PT_LOAD (program header %zu) declares 0x%llx bytes at file offset 0x%llx "
+                         "but the file holds only 0x%llx bytes",
+                         i, (unsigned long long)s.filesz, (unsigned long long)s.file_off,
+                         (unsigned long long)m.file.size());
+                if (err) *err = msg;
+                return false;
+            }
             memcpy(img.mem.data() + dst, m.file.data() + s.file_off, s.filesz);
+        }
         img.prot.push_back({ s.vaddr, s.memsz, (s.flags & 4) != 0, (s.flags & 2) != 0, (s.flags & 1) != 0 });
     }
     img.entry = base + m.e_entry;
