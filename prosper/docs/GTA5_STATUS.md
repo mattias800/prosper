@@ -4136,26 +4136,20 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
-- **The eight `OpControlBarrier` in `0x413dc6700` are the guest's own `s_barrier`s rather than
-  emulation scaffolding.** *Solid.* They are not: the guest contains **zero** `s_barrier` (SOPP `0x0a`,
-  `kSoppOpcodeBarrier`), its loop exit is per-wave (`s_cbranch_execz`), and the emitted module votes
-  workgroup-wide — a 256-way OR of a per-lane pending bit into `LDS[260]`, with eight barriers around
-  it. Wave 64, workgroup 256, so four waves; the LDS array is 261 entries (256 lane slots + 4 wave
-  slots + the result) and the wave index is `%92 >> 6`. So the barriers are emulation scaffolding and
-  the scope is wider than the guest's. This falsifies the speculation recorded under "Void, not
-  falsified" below; it does **not** establish that the barriers cause anything. #2717.
-- **Whether that scope difference causes the corruption — still VOID, and for a known reason.** The
-  obvious A/B (`PROSPER_NATIVE_COMPUTE_MULTIWAVE=1`, two runs identical in every column: 11 trip HITs,
-  21 cyclic inputs, 22 cyclic outputs, same loss at `0x413d85e00` d55) **proves nothing**, because the
-  lever cannot move for this program. `PROSPER_NATIVE_COMPUTE_MULTIWAVE` sets only
-  `config.native_subgroup_size`; `rdna2_to_spirv.cpp:23668` then forces `b.native_subgroup_size = 0`
-  whenever `partial_barrier_phases || exact_partial_dispatcher`, and this dispatch is both
-  (`threads=2063`, `local=256`). Every wave-width lowering gates on `b.`, not `config.`. The
-  `[subgroup] … native=0 multiwave=0` line reports the **config**, not the emitted lowering, so it
-  cannot witness the arm either. This is instrument trap **164** — the same switch, the same program,
-  the same byte-identical module `d04fd09b13408f9b4da7287fae34f692` in both arms — and its rule
-  applies: hash the artefact the switch is supposed to change, **before** reading the outcome. A real
-  test needs a lever that reaches `b.native_subgroup_size`. #2717.
+- **`0x413dc6700` contains no guest barriers, so all eight emitted `OpControlBarrier` are emulation
+  scaffolding.** *Falsified — and it was a grep artifact, not a measurement.* The program contains
+  **two** `s_barrier` (SOPP `0x0a`, encoded `0xbf8a0000`), at **pc 116 and pc 129** — which are exactly
+  the phase boundaries this file already records (phase 0 = `pc 0..<116`, phase 1 = `117..129`). The
+  program is barrier-phased, as `:83` and `:4767` say. The "zero" came from a `grep` whose pattern had
+  three spaces after `fmt=SOPP` where `shader_inspect` prints four; the tool had reported the two
+  barriers all along. Counted from the raw dwords by encoding (`(w >> 23) == 0x17F`, op `0x0a`) rather
+  than from formatted text: 2. #2717.
+- **What the scope comparison actually shows.** *Solid, and narrower than the retracted version.* The
+  guest's loop exit is **per-wave** (`s_cbranch_execz`), while the emitted module votes
+  **workgroup-wide** — a 256-way OR of a per-lane pending bit into `LDS[260]`, four waves of 64 in a
+  261-entry array, wave index `%92 >> 6`. The module carries **eight** `OpControlBarrier` against the
+  guest's **two**, so six are the vote's and two correspond to the guest's own phase boundaries.
+  Whether that scope difference causes anything is untested — see the next row. #2717.
 - **`0x413dc6700` never corrupts a clean input.** *Falsified.* Eight consecutive submits do show 88
   dispatches running `0 -> 0` on all four link arrays, which is what suggested it — but with coverage
   widened to nine submits, **one dispatch with a clean input turns a clean 2063-entry array into 537
