@@ -1506,13 +1506,29 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     std::vector<uint8_t> final_pixels;
     prosper::gpu::replay_tool::OutputTarget selected_output_target;
     uint64_t temporal_resolved = 0, temporal_seeded = 0, temporal_bounded = 0, temporal_unresolved = 0;
+    // A named submit the window excludes must say so HERE, before a multi-gigabyte replay, and must
+    // not surface later as the generic "matched no draw" -- which would blame the selector for a
+    // window the caller set with --bundle-tail / --bundle-through-submit. Same wrong-reason class
+    // the probe exists to prevent.
+    if (resource_override_submit_no &&
+        std::none_of(bundle.submits.begin() + first_submit_index, bundle.submits.end(),
+                     [&](const auto& submit) {
+                         return submit.submit_index == resource_override_submit_no;
+                     })) {
+        std::fprintf(stderr,
+                     "gpu_replay: --override-submit %llu is not in the replayed window "
+                     "(submits %llu..%llu)\n",
+                     (unsigned long long)resource_override_submit_no,
+                     (unsigned long long)bundle.submits[first_submit_index].submit_index,
+                     (unsigned long long)bundle.submits.back().submit_index);
+        return 2;
+    }
     // A requested override that never matches any draw must FAIL, not replay unmodified: a silent
     // no-op reproduces exactly the void comparison this feature exists to make impossible.
     bool resource_override_applied = false;
     uint64_t resource_override_extra_matches = 0;   // submits the bare selector ALSO matched
     uint64_t resource_override_submit_applied = 0;
     uint64_t resource_override_draw_index = 0;
-    size_t resource_override_item_index = SIZE_MAX;
     size_t resource_override_output_bytes = SIZE_MAX;   // output of the submit it applied to
     for (size_t i = first_submit_index; i < bundle.submits.size(); ++i) {
         prosper::gpu::GpuCaptureFile capture;
@@ -1580,7 +1596,6 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                 resource_override_applied = true;
                 resource_override_submit_applied = capture.metadata.submit_index;
                 resource_override_draw_index = applied.selector.draw_index;
-                resource_override_item_index = applied.target.item_index;
                 // A sampled resource whose address has live-RTT/DS authority is bound from the
                 // renderer's own image and the host_data decode path is bypassed entirely
                 // (live_renderer.cpp has_live_rtt / has_ds_live), so rewriting the table entry
@@ -1593,6 +1608,13 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                 const bool seeded_rtt = std::any_of(
                     capture.rtt_seeds.begin(), capture.rtt_seeds.end(),
                     [&](const auto& seed) { return seed.guest_addr == overridden_addr; });
+                // Also consult targets EARLIER submits produced: the loop deliberately skips
+                // restoring a seed for an address already in prior_targets because the renderer
+                // owns the live version, so the capsule's own seed list alone understates which
+                // addresses resolve through renderer authority.
+                const bool renderer_produced = std::any_of(
+                    prior_targets.begin(), prior_targets.end(),
+                    [&](const auto& target) { return target.addr == overridden_addr; });
                 const bool seeded_ds = std::any_of(
                     capture.ds_seeds.begin(), capture.ds_seeds.end(),
                     [&](const auto& seed) {
@@ -1601,13 +1623,15 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                                seed.stencil_read_base == overridden_addr ||
                                seed.stencil_write_base == overridden_addr;
                     });
-                if (seeded_rtt || seeded_ds)
+                if (seeded_rtt || seeded_ds || renderer_produced)
                     std::fprintf(stderr,
-                                 "gpu_replay: WARNING 0x%llx is a seeded %s target, so the renderer "
-                                 "binds its own image and may never read the overridden bytes -- "
-                                 "an unchanged result here is NOT evidence about this resource\n",
+                                 "gpu_replay: WARNING 0x%llx is a %s target, so the renderer binds "
+                                 "its own image and may never read the overridden bytes -- an "
+                                 "unchanged result here is NOT evidence about this resource\n",
                                  (unsigned long long)overridden_addr,
-                                 seeded_rtt ? "RTT" : "depth/stencil");
+                                 seeded_rtt          ? "seeded RTT"
+                                 : seeded_ds         ? "seeded depth/stencil"
+                                                     : "renderer-produced");
                 std::fprintf(stderr,
                              "[resource-override] submit=%llu draw=%llu stage=%s binding=%u "
                              "addr=%016llx size=%llu original-hash=%016llx new-hash=%016llx\n",
@@ -1847,23 +1871,24 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
         // target-after, intermediate-target truncation on non-final submits). A run where the draw
         // never executes would otherwise report success with an unmodified image: exactly the void
         // comparison the match guard claims to make impossible.
-        if (resource_override_applied && resource_override_item_index != SIZE_MAX &&
+        if (resource_override_applied &&
             capture.metadata.submit_index == resource_override_submit_applied) {
-            size_t overridden_operation = SIZE_MAX;
-            for (size_t oi = 0; oi < replay.operations.size(); ++oi) {
-                const auto& operation = replay.operations[oi];
-                if (operation.kind == prosper::gpu::SubmitOperationKind::Draw &&
-                    operation.source_index == resource_override_item_index) {
-                    overridden_operation = oi;
-                    break;
-                }
-            }
+            // By DRAW index, not item index. An operation's source_index is the semantic draw
+            // ordinal; replay.items holds only REALIZED draws, so an unrealized draw leaves a hole
+            // and the two diverge. Matching on the item index silently resolved to an EARLIER
+            // draw's operation, so a truncated prefix looked executed and the guard never fired --
+            // reintroducing the void comparison it exists to prevent. Invisible in the GTA V
+            // evidence because that submit realized all 30 operations, where the two coincide.
+            // replay_operation_index_for_draw() also filters on `realized`, which the hand-rolled
+            // loop did not.
+            const size_t overridden_operation = prosper::tools::replay_operation_index_for_draw(
+                replay, resource_override_draw_index);
             if (overridden_operation == SIZE_MAX || overridden_operation >= operation_limit)
                 std::fprintf(stderr,
-                             "gpu_replay: WARNING the overridden draw (item %zu) is NOT in this "
+                             "gpu_replay: WARNING the overridden draw (%zu) is NOT in this "
                              "submit's executed prefix (%zu of %zu operations), so it cannot affect "
                              "the result -- any comparison against another arm is VOID\n",
-                             resource_override_item_index, operation_limit,
+                             (size_t)resource_override_draw_index, operation_limit,
                              replay.operations.size());
         }
         final_pixels = execute_frame(replay, false, operation_limit);
@@ -2363,7 +2388,8 @@ int main(int argc, char** argv) {
         !bundle_compact_path.empty() ||
         bundle_intermediate_target_width || !bundle_final_capsule_path.empty() ||
         bundle_output_target_width ||
-        !bundle_extract_submit_path.empty() || bundle_find_ds_addr || bundle_ds_summary) {
+        !bundle_extract_submit_path.empty() || bundle_find_ds_addr || bundle_ds_summary ||
+        resource_override_submit_no) {
         usage(argv[0]); return 2;
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
