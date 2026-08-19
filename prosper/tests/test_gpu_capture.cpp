@@ -2548,9 +2548,13 @@ int main(int argc, char** argv) {
         GpuCaptureFile merged_capture;
         const bool merged_ok = capture_submit_items({}, {merged_compute}, nullable_operations, meta,
                                                     merged_reader, merged_capture, error);
-        const auto& marker_resource = merged_capture.computes[0].resources.resources.back();
-        CHECK(merged_ok && merged_capture.computes.size() == 1u &&
-                  marker_resource.blob_offset != 0u,
+        // Bind AFTER proving the vector is non-empty. Reading .back() first is an out-of-bounds read
+        // when capture_submit_items fails -- so the arm whose whole purpose is to turn a crash into a
+        // reported failure would crash instead of reporting it.
+        const bool fixture_ok = merged_ok && merged_capture.computes.size() == 1u &&
+                                !merged_capture.computes[0].resources.resources.empty();
+        CHECK(fixture_ok &&
+                  merged_capture.computes[0].resources.resources.back().blob_offset != 0u,
               "the merged-interval fixture really does give the marker a non-zero blob offset");
 
         GpuCaptureBundle witness_bundle;
@@ -2574,6 +2578,25 @@ int main(int argc, char** argv) {
                   !witness_restored.blobs.empty() && !witness_restored.blobs[0].bytes.empty(),
               "and materialization restores it from the dictionary");
     }
+
+    // The same guard at the OTHER site the crash review named. Site 1 above covers the
+    // nullable-output validator; without this the cf9200 root-record guard has no coverage at all,
+    // and "mutation-verified" would be true of one of the two sites the blocking finding named.
+    // Uses the cf9200 capture built below in this same file, so it costs a bundle round trip only.
+    struct Cf9200BundleProbe {
+        static void run(const GpuCaptureFile& capture) {
+            GpuCaptureBundle bundle;
+            std::string error;
+            const bool appended = append_gpu_capture_bundle(bundle, capture, error);
+            CHECK(appended,
+                  ("a cf9200 root-record capture appends to a bundle: " + error).c_str());
+            GpuCaptureFile manifest;
+            CHECK(appended &&
+                      materialize_gpu_capture_bundle_manifest(bundle, 0, manifest, error) &&
+                      !manifest.blobs.empty() && manifest.blobs[0].bytes.empty(),
+                  "the cf9200 manifest strips its payload -- otherwise the arm above is vacuous");
+        }
+    };
     std::vector<uint8_t> nullable_capture_bytes;
     GpuCaptureFile nullable_loaded;
     GpuReplayFrame nullable_replay;
@@ -2696,6 +2719,7 @@ int main(int argc, char** argv) {
               capture_submit_items({}, {cf9200_compute}, cf9200_operations, meta,
                                    cf9200_reader, cf9200_capture, error),
           "capture retains the exact root-record program, launch, sites, and shared witness");
+    Cf9200BundleProbe::run(cf9200_capture);
     std::vector<uint8_t> cf9200_capture_bytes;
     GpuCaptureFile cf9200_loaded;
     GpuReplayFrame cf9200_replay;

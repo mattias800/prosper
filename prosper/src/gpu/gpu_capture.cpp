@@ -763,10 +763,12 @@ bool capture_blob_payload_omitted(const GpuCaptureBlob& blob) {
 // MANIFEST, not a capture.
 //
 // Capture-level and all_of, deliberately. make_capture_manifest() strips every blob, so that is the
-// manifest's signature; sampling a single resource instead would let one degenerate blob in a
+// manifest's signature; sampling a single resource instead would let ONE degenerate blob in a
 // hand-edited or corrupt .prgcap disable provenance validation for a whole compute -- including on
 // the materialize_gpu_replay() path, which is the gate standing between a bundle and a relocation
-// replayed without provenance.
+// replayed without provenance. Note the limit of that claim: a file in which EVERY blob is degenerate
+// is still accepted as a manifest. A .prgcap is a developer artifact rather than a trust boundary, so
+// that is a stated bound, not a defence.
 //
 // The proof still happens, just not against the projection. Every capture reaching
 // append_gpu_capture_bundle() is produced by capture_submit_items(), which runs
@@ -1685,16 +1687,12 @@ bool validate_captured_nullable_output_raw_buffer(
 
     // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
     // launch dimensions and recompile provenance in full, and on the deserialize side those are the
-    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
-    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
-    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    // only validation it ever receives. What it cannot carry is the witness BYTES. Not everything
+    // past this point needs them -- the sentinel and raw-shader checks below read descriptors and
+    // `internal_bytes`, which the manifest carries in full -- but the blob dereference does:
+    // `blob.bytes.data() + blob_offset` on an empty vector is `nullptr + offset`, declared as large
+    // as the witness, which the proof then reads through.
     if (capture_is_manifest(capture)) return true;
-
-    // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
-    // launch dimensions and recompile provenance in full, and on the deserialize side those are the
-    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
-    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
-    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
 
     ShaderResourceTable validated_resources;
     validated_resources.resources.reserve(compute.resources.resources.size());
@@ -1750,12 +1748,15 @@ bool validate_captured_gta5_cf9200_no_backing(
         return false;
     }
 
+    if (capture_is_manifest(capture)) return true;
+
     // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
     // launch dimensions and recompile provenance in full, and on the deserialize side those are the
-    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
-    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
-    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
-    if (capture_is_manifest(capture)) return true;
+    // only validation it ever receives. What it cannot carry is the witness BYTES. Not everything
+    // past this point needs them -- the sentinel and raw-shader checks below read descriptors and
+    // `internal_bytes`, which the manifest carries in full -- but the blob dereference does:
+    // `blob.bytes.data() + blob_offset` on an empty vector is `nullptr + offset`, declared as large
+    // as the witness, which the proof then reads through.
 
     ShaderResourceTable validated_resources;
     validated_resources.resources.reserve(compute.resources.resources.size());
@@ -1840,9 +1841,11 @@ bool validate_captured_gta5_packed_pointer(
 
     // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
     // launch dimensions and recompile provenance in full, and on the deserialize side those are the
-    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
-    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
-    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    // only validation it ever receives. What it cannot carry is the witness BYTES. Not everything
+    // past this point needs them -- the sentinel and raw-shader checks below read descriptors and
+    // `internal_bytes`, which the manifest carries in full -- but the blob dereference does:
+    // `blob.bytes.data() + blob_offset` on an empty vector is `nullptr + offset`, declared as large
+    // as the witness, which the proof then reads through.
     if (capture_is_manifest(capture)) return true;
 
     ShaderResourceTable validated_resources;
@@ -1942,9 +1945,11 @@ bool validate_captured_indirect_pointer_relocations(
 
     // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
     // launch dimensions and recompile provenance in full, and on the deserialize side those are the
-    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
-    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
-    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    // only validation it ever receives. What it cannot carry is the witness BYTES. Not everything
+    // past this point needs them -- the sentinel and raw-shader checks below read descriptors and
+    // `internal_bytes`, which the manifest carries in full -- but the blob dereference does:
+    // `blob.bytes.data() + blob_offset` on an empty vector is `nullptr + offset`, declared as large
+    // as the witness, which the proof then reads through.
     if (capture_is_manifest(capture)) return true;
 
     ShaderResourceTable validated_resources;
