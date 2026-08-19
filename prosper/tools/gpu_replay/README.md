@@ -610,12 +610,42 @@ item's `draw_index`, never as offsets into the compact draw vector.
 `--override-resource DRAW:vs|ps:BINDING PATH` replaces exactly one realized draw's captured
 resource span in memory. The file must have exactly the selected resource's captured byte count.
 The tool clones the selected stage table and owns the replacement separately, so other draws that
-share a table or content-deduplicated backing remain unchanged. It prints the draw, stage, binding,
-guest address, size, and stable original/replacement hashes. Combine it with `--inspect-only` to
-prove the replacement was installed without initializing Vulkan; the selected table's normal
-`hash=` field will equal the reported `new-hash`. A rendering replay still enforces the capture's
-output oracle, so add the explicit `--allow-mismatch` diagnostic option when an intentional input
-change is expected to alter the final image.
+share a table or content-deduplicated backing remain unchanged. The replacement is owned by the
+cloned table itself (`ShaderResourceTable::owned_host_data`), so it stays valid for as long as any
+copy of that table does. It prints the draw, stage, binding, guest address, size, and stable
+original/replacement hashes. Combine it with `--inspect-only` to prove the replacement was installed
+without initializing Vulkan; the selected table's normal `hash=` field will equal the reported
+`new-hash`. On a single capsule a rendering replay still enforces the capture's output oracle, so add
+the explicit `--allow-mismatch` diagnostic option when an intentional input change is expected to
+alter the final image.
+
+### With `--bundle`
+
+The override applies to the one submit that owns the selected draw; every other submit replays
+untouched. The bundle path skips the output oracle automatically once an override is applied, because
+the oracle describes the unmodified frame — without that, an override that genuinely changed the image
+would exit 1 while one that changed nothing exited 0.
+
+**`--override-submit N` should normally be passed.** Draw indices REPEAT across submits, so a bare
+`DRAW:stage:BINDING` selector matches several; without the flag the FIRST match wins and the tool
+reports how many others it saw. `--override-submit` names the submit, and a selector that fails to
+resolve there is then an error rather than a silent skip.
+
+The bundle path refuses to combine an override with a mode that returns before replay
+(`--bundle-ds-summary`, `--bundle-find-ds`, `--bundle-compact`, `--bundle-extract-submit`,
+`--bundle-final-capsule`), since the override would be silently ignored.
+
+**Read the warnings before comparing two arms.** An applied override is not the same as an override
+that could have mattered, and three separate conditions make a comparison void while still printing a
+confident `[resource-override]` line:
+
+| warning | meaning |
+| --- | --- |
+| `... is a seeded RTT/depth target` | the renderer binds its own image for that address and may never read the overridden bytes |
+| `submit N (draw M) produced 0 output bytes` | that submit emitted nothing, so there is no result to change |
+| `the overridden draw is NOT in this submit's executed prefix` | `operation_limit` truncated it out |
+
+Each of those makes an unchanged result **VOID, not negative**.
 
 `--override-compute-resource N:BINDING PATH` provides the matching dispatch-scoped operation for
 compute replay. The file must exactly match the selected captured span. The tool clones only compute

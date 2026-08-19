@@ -32,9 +32,11 @@ struct ResourceOverrideTarget {
     uint64_t captured_size = 0;
 };
 
-// Retain this object for as long as the replay may execute. The selected copied resource points at
-// replacement_bytes; keeping that ownership outside GpuReplayFrame avoids changing capture/runtime
-// data structures for a diagnostic-only operation.
+// The replay owns the replacement bytes: apply_resource_override() pushes them into the copied
+// table's `owned_host_data`, so the pointer stays valid for as long as any copy of that table does.
+// This struct is a REPORT (selector, target, hashes) and callers may discard it freely. It
+// previously carried sole ownership and the caller had to outlive execution -- an invariant a new
+// call site broke immediately, so the ownership now lives with the data.
 struct AppliedResourceOverride {
     ResourceOverrideSelector selector;
     ResourceOverrideTarget target;
@@ -232,6 +234,15 @@ inline bool apply_resource_override(gpu::GpuReplayFrame& replay,
     // point into one content-deduplicated capture instance. Clone the table and redirect only this
     // copied entry: mutating either original object would contaminate sibling draws/resources.
     auto copied_table = std::make_shared<gpu::ShaderResourceTable>(*selected_table);
+    // The TABLE owns the replacement, not the caller. ShaderResource keeps a raw pointer for the
+    // renderer ABI, so whoever owns the bytes must outlive execution -- and making that the
+    // caller's job is a contract every new call site can silently break. It was broken within a
+    // day: a bundle-replay caller declared its AppliedResourceOverride inside the loop iteration
+    // that applied the override, so the buffer was freed ~200 lines before execute_frame() ran and
+    // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_host_data exists for
+    // exactly this and survives table copies by shared ownership, so the pointer stays valid for
+    // as long as any copy of the table does.
+    copied_table->owned_host_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
     selected_table = std::move(copied_table);
     applied = std::move(result);
@@ -327,6 +338,15 @@ inline bool apply_compute_resource_override(
     result.replacement_hash = gpu::gpu_capture_hash(*result.replacement_bytes);
 
     auto copied_table = std::make_shared<gpu::ShaderResourceTable>(*selected_table);
+    // The TABLE owns the replacement, not the caller. ShaderResource keeps a raw pointer for the
+    // renderer ABI, so whoever owns the bytes must outlive execution -- and making that the
+    // caller's job is a contract every new call site can silently break. It was broken within a
+    // day: a bundle-replay caller declared its AppliedResourceOverride inside the loop iteration
+    // that applied the override, so the buffer was freed ~200 lines before execute_frame() ran and
+    // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_host_data exists for
+    // exactly this and survives table copies by shared ownership, so the pointer stays valid for
+    // as long as any copy of the table does.
+    copied_table->owned_host_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
     selected_table = std::move(copied_table);
     applied = std::move(result);
