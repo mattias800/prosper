@@ -90,10 +90,18 @@ conclusion; it sharpens what "essentially all black" looks like.
 - **37710 draw, `no-effect`** — `cwm=0`, `target-mask=00000000`. Writes nothing by construction.
   Correctly skipped, benign.
 - **37710 dispatch, `0x2042f49a00`** — 29 words, `unsupported=0`, an `image_load` x2 / `image_store` x2
-  full-screen 4K copy that rejects at pc 16 with `mode=unresolved-operand` **at a pc that HAS a
-  resource**. Its table offers four buffer-shaped entries and `descriptors=0` while the instruction
-  needs a T#. A descriptor-*kind* gap, distinct from the eight programs whose shared shape is "no
-  resource was offered". Filed as **#2719**.
+  full-screen 4K copy that rejects at pc 16 with `mode=unresolved-operand`. **Already analysed in this
+  document** (the reject table above; and binding 6 -> `0x204da00000`, `class=4` StorageImage, below);
+  it is also the reject census's *internal positive control*, its rejecting pc being a key. Its
+  offline resource table, now re-derivable from a bundle, is `pc16 -> 0x2052ac0000`,
+  `pc18 -> 0x2054aa0000`, `pc21 -> 0x204b1a0000`, `pc25 -> 0x204d180000`.
+
+  **A retraction belongs here.** I first wrote this up as a novel "descriptor-*kind* gap" on the
+  grounds that the table shows `descriptors=0` while the instruction needs a T#, and filed #2719.
+  That is wrong: `descriptors=` prints `stage.descriptor_issue_count` (`gpu_replay.cpp:1010`) — a
+  count of descriptor **issues** — so `descriptors=0` means *zero issues recorded*, the opposite of
+  the reading. #2719 is closed as a duplicate whose central claim was a field-name inference. Nothing
+  was changed on the back of it.
 - **37705 dispatch, `0x205b658800`** — 2935 words, 149 resources, LDS 3072, threads 1920x1080,
   **79 unsupported**, first blocker at pc 82: `s_mov_b32 s6, m0` (SOP1 op 0x03 reading `special:124`).
   M0 is modelled elsewhere in the recompiler (LDS base, ADDTID spill slots), so this is narrower than
