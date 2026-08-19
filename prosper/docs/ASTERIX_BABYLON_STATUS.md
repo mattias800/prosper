@@ -1,12 +1,15 @@
 # Asterix & Obelix: Babylon Mission status
 
-Tracking: [#1599](https://github.com/mattias800/prosper/issues/1599)
+Tracking: [#1884](https://github.com/mattias800/prosper/issues/1884) (game tracker),
+[#1599](https://github.com/mattias800/prosper/issues/1599) (first-boot triage — **its title is stale**;
+see below)
 
 Title ID: `PPSA30490`
 
 Engine: Unity 6000.1.5f1 / IL2CPP
 
-Current verified rung: **2 — title screen reached and rendered**
+Current verified rung: **3 — gameplay reached with real GPU draws** (demonstrated once and
+inspected frame by frame; **not yet reproducible — 1 of 4 runs**, see the run table below)
 
 > **The video-splash deadlock is FIXED (2026-08-05, #1949).** `sceAvPlayerJumpToTime` is implemented
 > over a real backend seek, and the title now plays both publisher logo movies, renders its narrated
@@ -15,6 +18,139 @@ Current verified rung: **2 — title screen reached and rendered**
 > read it as history, not as the current frontier. Its premise — that a black composite indicated a
 > renderer defect — is superseded, because the frames it examined were correct renders of a scene
 > whose only content had not arrived.
+
+## Rung 3 — gameplay, with the route that reaches it (2026-08-19)
+
+`prosper/scripts/asterix-babylon/reach-gameplay.pad` drives the title from boot into a rendering
+platformer level. The level scene is up at **t~172 s**; the level's own title card
+(`ON THE ROAD TO UGARIT!`) holds over it until **t~240 s**; from **t~250 s** the view is unobstructed
+gameplay, and it stays that way to the end of a 600-second capture. Nothing title-specific is needed
+beyond the route itself and a private save root.
+
+```bash
+PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_PAD_SCRIPT=@scripts/asterix-babylon/reach-gameplay.pad PROSPER_PAD_SCRIPT_LOG=1 \
+PROSPER_SAVE0=<PRIVATE_SAVE_ROOT> PROSPER_FILELOG=1 \
+  ./build-linux/screenshot <DUMP_ROOT>/PPSA30490-app0 \
+    --seconds 10 --count 60 --out <OUT> --timeout 700
+```
+
+`PROSPER_SAVE0` is **not optional discipline** — its default `/tmp/prosper-savedata0` is one flat
+directory shared by every title on the box, with no title id anywhere in the host path
+(`src/hle/hle_file.cpp:814`, `:879`). Another title's save can present as this title's corruption. #2734.
+
+### The progression oracle: Unity scene index == `Media/levelNN`
+
+`PROSPER_FILELOG=1` names every scene file the guest opens, and for this title that is a far better
+progress signal than pixels. A byte-level scan of `globalgamemanagers` finds exactly **76** build-settings
+scenes at contiguous offsets, and `Media/` holds exactly **76** `levelNN` files, so the mapping is
+index-for-index with no off-by-one:
+
+| file | scene | file | scene |
+| --- | --- | --- | --- |
+| `level0` | `videoLogos` | `level6` | `Loading` |
+| `level1` | `GlobalManager` | `level22` | `World_3_10` |
+| `level2` | `PauseManager` | `level37` | `World_Tuto` |
+| `level3` | `PlatformerLogic` | `level38`/`level39`/`level40` | `Cinematic_A1_Part_1` / `A1_Part_2` / `A2` |
+| `level4` | `Map` | `level57` | `World_3_10_Level` |
+| `level5` | `MainMenu` | `level75` | `World_Tuto_Level` |
+
+A level loads as a **pair** — its `World_X_Y` scene and its `World_X_Y_Level` content scene — plus
+`PlatformerLogic`. That pairing is itself the check that the index mapping is right: two independently
+derived indices (22 and 57) land on the two halves of the same level name.
+
+Measured sequence of the verified run (`--seconds 10`, native 1920x1080, hardware Vulkan on Linux):
+
+```text
+t=0-48s    level0                      logo movies (Logo_Microids.mp4, Logo_BalioStudio.mp4)
+t~50s      level1, level2, level5      GlobalManager, PauseManager, MainMenu
+t~55s      level38                     intro cinematics begin
+t~125s     level6 -> level4            Loading, then the world map ("Coastal Region")
+t~165s     level6 -> level22, level57  Loading, then World_3_10 + World_3_10_Level
+t~172s     level3                      PlatformerLogic
+t=180-240s                             the level's title card, "ON THE ROAD TO UGARIT!", over the level
+t=250s ->                              unobstructed gameplay, unbroken to t=600s
+```
+
+### Why the route presses Triangle — and why it must STOP pressing it
+
+Every cutscene frame draws its **Skip** prompt bound to **Triangle**. An exploratory Cross-only mash
+therefore crossed the logos and the title menu correctly and then sat through `Cinematic_A1_Part_1` →
+`A1_Part_2` → `A2` for 215 seconds without skipping one of them, ending the run still in a cutscene.
+
+**Stated exactly, because the stronger version is not measured:** what is established is that Cross
+does not *skip* a cutscene, and that Triangle shortens the path to the world map decisively. What is
+**not** established is whether the cinematics terminate on their own — the Cross-only run was bounded
+at 320 s and ended 105 s into `Cinematic_A2`, so a longer Cross-only run might reach gameplay by
+waiting. Nobody should read this as "Cross alone can never reach gameplay".
+
+**Triangle is bound to something else after the cinematics, and mashing it there breaks the route.**
+Once the `Map` scene loads, the title shows a character-select screen whose footer reads:
+
+```text
+(circle) BACK    (cross) START    (square) CUNEIFORM TABLET    (triangle) COSTUMES
+```
+
+Triangle there is **COSTUMES**. The first version of this route mashed Triangle to the end of the run,
+so it fought its own Cross on that screen and reaching `START` became timing luck. That is measured,
+not feared — see `## Ruled out`. The committed route therefore confines Triangle to a bounded
+cinematic window (46–149 s) and is **Cross-only from 152 s onward**.
+
+### Verification of the run itself
+
+Two bounded runs on `2703a6c3`, both `--allow-guest-fault`, both ending `status=ok` with `guest=running`
+and exit 0:
+
+| run | route | samples | pixel-distinct | status | reached |
+| --- | --- | --- | --- | --- | --- |
+| `explore1` | Cross only | 45/45 @ 6 s | 41 | ok | cinematics only (no skip) |
+| `skip2` | Triangle to the end | 60/60 @ 10 s | 58 | ok | **gameplay** — level at t~172 s, clear view t~250 s |
+| `repro3` | Triangle to the end (**same route as `skip2`**) | 60/60 @ 10 s | 58 | ok | character select only, 495 s |
+| `verify1` | Triangle bounded, Cross-only after 152 s | 45/45 @ 10 s | 41 | ok | character select only |
+| `verify2` | Triangle bounded, Cross-only after 152 s | 45/45 @ 10 s | 39 | ok | character select only |
+
+**The route reaches gameplay in 1 of 4 attempts, and the cause is NOT known.** State this way round
+because the obvious reading is wrong in two directions:
+
+- **It is not the route.** `skip2` and `repro3` ran the **identical** route file and diverged. Same
+  binary, same dump, same fresh private `PROSPER_SAVE0`, and all four runs wrote the identical save
+  artifact (`savedata/savemem_1_0.bin`). So the difference is nondeterminism somewhere below the
+  route, not a calibration error in it.
+- **It is not the Triangle/COSTUMES conflict either, and an earlier revision of this document said it
+  was.** That conflict is real — Triangle is `COSTUMES` on the character-select screen and is
+  demonstrably *consumed* there, since the costume changes from `LEGIONARY` to `PARTHIA` to `GOLD`
+  across a run. But it does not explain the failure: the route that succeeded mashed Triangle to the
+  end, and the two routes that **removed** Triangle after the cinematics still did not start.
+  Confining Triangle is defensible hygiene; it was **not** a fix, and it was recorded as one for
+  several hours.
+
+What separates the runs is *which screen the `Map` scene presents*. `skip2` showed the region map
+(footer `MAIN MENU (circle)  (cross) SELECTION`) and entered a level from it. The other three showed
+the `SoloCoopMenu` character-select screen (footer `(circle) BACK  (cross) START  (square) CUNEIFORM
+TABLET  (triangle) COSTUMES`) and never left it, while **60 Cross transitions were delivered and
+observed by the guest** — each `[pad-script]` line carries the guest's own advancing pad-read index,
+so this is a screen ignoring input prosper delivered, not input prosper failed to deliver.
+
+That probe has now run, and **no input advances the screen**. Over ~400 s it delivered 66 `cross`,
+8 `options`, 8 `right`, 8 `left-stick-right`, 8 `left-stick-left`, and 7 each of `up`, `down`,
+`left`, `l1`, `r1` — every one observed by the guest — and `level3` never loaded. So it is not a
+missing press. **Tracked as #2743**, with one lead: the guest opens *two* pad handles
+(`type=0` and `type=2`, same `userId`), and `poll_controller` at `hle_pad.cpp:415` ignores the handle
+and always polls backend index 0, so a port type prosper does not model answers as a second connected
+controller pressing player 1's buttons. That is a real defect on its own; it is `CONFIDENCE: LOW` as
+*this* cause, and #2743 carries the mutation arm that would settle it.
+
+## What #1599's three blockers do now
+
+- **"all frames black"** — no. 41 of 45 samples are pixel-distinct across a 270 s Cross-only run, and
+  58 of 60 across the 600 s gameplay run.
+- **"renderer stalls at ~138 s"** — no. Both runs publish new frames past 138 s; `skip2` reports
+  `max-source-stale=0.0s` over 600 seconds.
+- **"MSAA `image_load` rejects a fragment stage"** — no. **Zero** `[recompile-reject]` lines in either
+  run. The capability landed and the guest exercises it.
+
+One `[compute] skip invalid descriptor contract for program 0x2011734c00` occurs once per run and is
+tracked separately; it does not visibly affect the composite.
 
 ## The splash deadlock and what fixed it (2026-08-05)
 
@@ -426,6 +562,36 @@ HLE registration. #1599, #1884.
 
 ## Ruled out
 
+- **`prosper/scripts/asterix/reach-gameplay.pad` as this title's input route:** that file drives
+  *Asterix & Obelix: Slap Them All!* (`PPSA08576`, label `game:asterix`), a different game; its own
+  header says so. It presses only Cross, which cannot skip this title's cinematics. This title's route
+  is `prosper/scripts/asterix-babylon/reach-gameplay.pad`. #1884.
+- **A missing or wrong input as the reason the character-select screen never starts:** a probe route
+  delivered 66 `cross`, 8 `options`, 8 `right`, 8 `left-stick-right`, 8 `left-stick-left` and 7 each
+  of `up`/`down`/`left`/`l1`/`r1` over ~400 s — every one observed by the guest, on a screen whose own
+  footer reads `(cross) START` — and it never advanced. Only `circle` (BACK) and `square` (CUNEIFORM
+  TABLET) were withheld, because both leave the screen. The route is not short an input. #2743.
+- **The Triangle/COSTUMES conflict as the CAUSE of the route not reaching gameplay:** it is not,
+  and this section asserted that it was for several hours. Triangle *is* `COSTUMES` on the
+  character-select screen and *is* consumed there (the costume changes `LEGIONARY` → `PARTHIA` →
+  `GOLD` across a run), so confining it is reasonable hygiene. But the run that **succeeded** mashed
+  Triangle to the end, and the two runs that **removed** Triangle after the cinematics still never
+  started. A mechanism that is real, and demonstrably active, still has to be shown to be the one
+  producing the effect. #1884.
+- **Summary metrics as evidence that a route reached its target:** the successful and the stuck run
+  reported **identical** `60/60 samples, source-distinct 60, pixel-distinct 58, max-source-stale 0.0s,
+  guest=running, status=ok`. An animating menu is as source- and pixel-distinct as a level. Only the
+  scene-file sequence separated them (`level3` + a `World_X_Y`/`World_X_Y_Level` pair versus `level4`
+  alone). Assert the *scene*, not the pixel counters. #1884.
+- **Cross as a universal "advance" for this title:** Cross crosses the logos, the splash and the
+  `ADVENTURE` / `OPTIONS` menu, and it is `SELECTION` on the world map — but the cutscene **Skip**
+  prompt is bound to **Triangle**. A Cross-only mash sat through 215 s of `Cinematic_A1_Part_1` →
+  `A1_Part_2` → `A2` and never reached the map. #1884.
+- **#1599's three first-boot blockers, as of `2703a6c3`:** "all frames black" (41/45 and 58/60
+  pixel-distinct), "renderer stalls at ~138 s" (`max-source-stale=0.0s` over a 600 s run), and the
+  MSAA `image_load` fragment-stage rejection (**zero** `[recompile-reject]` in either run) are each
+  contradicted by a bounded current run. The issue's *title* still asserts all three. #1599.
+
 - **Registering `sceAvPlayerJumpToTime` without a real backend seek:** a returned `SCE_OK` is exactly
   what the unregistered NID already produced, and it is what deadlocked the title. Both halves of the
   seek are load-bearing and were each proved by mutation: forcing the requested position to zero, or
@@ -534,6 +700,14 @@ HLE registration. #1599, #1884.
   framebuffers. Video decode is working; the seek primitive is what is missing.
 
 ## Next discriminators
+
+> **Stale below (2026-08-19).** Item 0's frontier — `sceAvPlayerJumpToTime` — was implemented by
+> #1949, and items 1-4 belong to the superseded constant-buffer-writer investigation. Item 5's
+> precondition ("if output becomes non-black") is met, and item 6's 125-second regression check is
+> passed by every current run. The live frontier is now rungs 4-6: manual visual verification, a PS5
+> hardware oracle, and a snapshot guard over the gameplay window this route opens. Read items 0-6 as
+> the record of a closed frontier.
+
 
 0. **The frontier is `sceAvPlayerJumpToTime`, not the GPU.** The next step is a real seek: add a seek
    operation to `prosper::video::VideoBackend` (a defaulted virtual, so the Media Foundation and

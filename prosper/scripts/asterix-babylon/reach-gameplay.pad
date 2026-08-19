@@ -1,0 +1,199 @@
+# Asterix & Obelix: Babylon Mission (PPSA30490, Unity 6000.1.5f1 / IL2CPP)
+# Reach GAMEPLAY: logo movies -> splash -> title menu -> intro cinematics -> world map ->
+# character select -> a platformer level.
+#
+# NOT the same game as scripts/asterix/reach-gameplay.pad, which drives Asterix & Obelix:
+# Slap Them All! (PPSA08576, label game:asterix). That route does nothing here.
+#
+# THREE phases, and the third one exists because of a measured failure. Triangle is bound to
+# different things on different screens:
+#
+#   Phase A (5-44 s)   Cross only. Logo movies, SPLASH, and the ADVENTURE / OPTIONS title menu.
+#
+#   Phase B (46-149 s) Triangle, with Cross 3 s behind it. Every cutscene frame draws its Skip
+#     prompt bound to TRIANGLE. A Cross-only mash sits through the whole intro: an exploratory run
+#     watched Cinematic_A1_Part_1 -> A1_Part_2 -> A2 for 215 s and never left them. Triangle is held
+#     1.5 s so a hold-to-skip binding is covered too. Measured cinematic spans: 55-125 s and
+#     45-105 s in two runs, so this window covers both with margin at each end.
+#
+#   Phase C (152 s+)   Cross ONLY, and this is load-bearing. After the map loads, the title shows a
+#     character-select screen whose footer reads:
+#         (circle) BACK   (cross) START   (square) CUNEIFORM TABLET   (triangle) COSTUMES
+#     Triangle there is COSTUMES. A route that keeps mashing Triangle past the cinematics fights its
+#     own Cross: whether it ever reaches START becomes timing luck. That is not hypothetical - the
+#     first version of this route, which mashed Triangle to the end, reached gameplay in one run and
+#     sat on the character-select screen for 495 s in an independent rerun, with IDENTICAL summary
+#     numbers (60/60 samples, source-distinct 60, pixel-distinct 58, guest alive, status=ok) because
+#     the screen animates. The proof that Triangle was being consumed rather than ignored is that the
+#     costume itself changed between t=130 s ("LEGIONARY") and t=600 s ("GOLD").
+#
+# Progression oracle this was calibrated against - PROSPER_FILELOG=1 names the scene files, and
+# Media/levelNN is build-settings scene index NN (76 scenes, 76 files, verified by a byte-level scan
+# of globalgamemanagers):
+#
+#   level0  videoLogos     level1  GlobalManager   level2  PauseManager   level5  MainMenu
+#   level38 Cinematic_A1_Part_1    level39 Cinematic_A1_Part_2    level40 Cinematic_A2
+#   level6  Loading        level4  Map (incl. character select)   level3  PlatformerLogic
+#   level22 World_3_10     level57 World_3_10_Level
+#
+# Reaching level3 + a World_X_Y/World_X_Y_Level pair is the machine-checkable success condition;
+# stopping at level4 is the character-select failure above, and pixel metrics cannot tell them apart.
+#
+# ============================ RELIABILITY: READ THIS FIRST ============================
+# This route reaches gameplay in 1 of 5 measured runs. It is committed because it is the only known
+# way to get there and because its earlier phases are reliable (logos, splash, title menu, cinematics
+# and the world map are reached every time), NOT because it is a dependable gameplay route yet.
+#
+# The blocker is NOT this route and NOT input calibration: it is #2743. In 4 of 5 runs the title stops
+# on its SoloCoopMenu character-select screen and ignores every input, including 66 delivered Cross
+# presses on a screen whose own footer reads "(cross) START". Input delivery is confirmed, not assumed
+# -- each PROSPER_PAD_SCRIPT_LOG transition carries the guest's own advancing pad-read index. Two runs
+# of the IDENTICAL route diverged, so the variation is below the route.
+#
+# Assert success on the SCENE, never on pixels: Media/level3 plus a World_X_Y/World_X_Y_Level pair.
+# The stuck and the successful runs report identical source-distinct/pixel-distinct summaries, because
+# an animating menu is as pixel-distinct as a level.
+# =====================================================================================
+#
+# Bound the run at >= 400 s. Use a private PROSPER_SAVE0: the default save root is one flat directory
+# shared by every title on the box (#2734).
+5-5.5:cross
+9-9.5:cross
+13-13.5:cross
+17-17.5:cross
+21-21.5:cross
+25-25.5:cross
+29-29.5:cross
+33-33.5:cross
+37-37.5:cross
+41-41.5:cross
+46-47.5:triangle
+49-49.5:cross
+52-53.5:triangle
+55-55.5:cross
+58-59.5:triangle
+61-61.5:cross
+64-65.5:triangle
+67-67.5:cross
+70-71.5:triangle
+73-73.5:cross
+76-77.5:triangle
+79-79.5:cross
+82-83.5:triangle
+85-85.5:cross
+88-89.5:triangle
+91-91.5:cross
+94-95.5:triangle
+97-97.5:cross
+100-101.5:triangle
+103-103.5:cross
+106-107.5:triangle
+109-109.5:cross
+112-113.5:triangle
+115-115.5:cross
+118-119.5:triangle
+121-121.5:cross
+124-125.5:triangle
+127-127.5:cross
+130-131.5:triangle
+133-133.5:cross
+136-137.5:triangle
+139-139.5:cross
+142-143.5:triangle
+145-145.5:cross
+148-149.5:triangle
+151-151.5:cross
+152-152.5:cross
+157-157.5:cross
+162-162.5:cross
+167-167.5:cross
+172-172.5:cross
+177-177.5:cross
+182-182.5:cross
+187-187.5:cross
+192-192.5:cross
+197-197.5:cross
+202-202.5:cross
+207-207.5:cross
+212-212.5:cross
+217-217.5:cross
+222-222.5:cross
+227-227.5:cross
+232-232.5:cross
+237-237.5:cross
+242-242.5:cross
+247-247.5:cross
+252-252.5:cross
+257-257.5:cross
+262-262.5:cross
+267-267.5:cross
+272-272.5:cross
+277-277.5:cross
+282-282.5:cross
+287-287.5:cross
+292-292.5:cross
+297-297.5:cross
+302-302.5:cross
+307-307.5:cross
+312-312.5:cross
+317-317.5:cross
+322-322.5:cross
+327-327.5:cross
+332-332.5:cross
+337-337.5:cross
+342-342.5:cross
+347-347.5:cross
+352-352.5:cross
+357-357.5:cross
+362-362.5:cross
+367-367.5:cross
+372-372.5:cross
+377-377.5:cross
+382-382.5:cross
+387-387.5:cross
+392-392.5:cross
+397-397.5:cross
+402-402.5:cross
+407-407.5:cross
+412-412.5:cross
+417-417.5:cross
+422-422.5:cross
+427-427.5:cross
+432-432.5:cross
+437-437.5:cross
+442-442.5:cross
+447-447.5:cross
+452-452.5:cross
+457-457.5:cross
+462-462.5:cross
+467-467.5:cross
+472-472.5:cross
+477-477.5:cross
+482-482.5:cross
+487-487.5:cross
+492-492.5:cross
+497-497.5:cross
+502-502.5:cross
+507-507.5:cross
+512-512.5:cross
+517-517.5:cross
+522-522.5:cross
+527-527.5:cross
+532-532.5:cross
+537-537.5:cross
+542-542.5:cross
+547-547.5:cross
+552-552.5:cross
+557-557.5:cross
+562-562.5:cross
+567-567.5:cross
+572-572.5:cross
+577-577.5:cross
+582-582.5:cross
+587-587.5:cross
+592-592.5:cross
+597-597.5:cross
+602-602.5:cross
+607-607.5:cross
+612-612.5:cross
+617-617.5:cross
