@@ -4283,6 +4283,176 @@ const std::set<uint64_t>& compute_skip_programs() {
     return programs;
 }
 
+// PROSPER_COMPUTE_PARENTSCAN=0xADDR — CPU-side cyclicity census of a link/parent array, taken
+// PRE-dispatch from the exact bytes the dispatch is about to read.
+//
+// This exists because the obvious instrument does not work. Deciding whether a runaway dispatch's INPUT
+// is ALREADY cyclic needs the array and the runaway record from the SAME run, and arming
+// PROSPER_GPU_CAPTURE to obtain the array changes which dispatches run away — measured on GTA V's
+// 0x413dc6700: 11 dispatches of both parities without a capture, reproducibly, versus 5 odd-only
+// ordinals with one armed. An instrument that alters the phenomenon cannot establish its cause.
+//
+// A walk of bytes the front half has already materialized touches no GPU state, issues no submit and
+// cannot reorder one, so this can run alongside PROSPER_CFG_TRIP_BOUND's witness and be read against it.
+//
+// The link encoding is the title's own: next = (word >> 3) & 0x7FFFFFF, terminating on 0 or on an index
+// at/after the record count — an out-of-range RDNA2 buffer load returns zero, which is exactly what
+// exits the guest's pc88..97 walk. The line reports `records` and the encoding's shift/mask so a wrong
+// guess is visible rather than silent. CONFIDENCE: HIGH on the encoding (it is the guest's own
+// `v_bfe_u32 v1, v1, 3, 27` with NUM_RECORDS as the bound).
+struct ParentScanResult {
+    // `terminating + cyclic == records` -- index 0 is the terminator and is classified as
+    // terminating, not skipped. An earlier revision broke out of the walk before pushing it, so the
+    // two columns silently summed to records-1 on EVERY array (measured 400/400), which is the kind of
+    // off-by-one that reads as a rounding difference rather than a bug.
+    uint32_t records = 0, terminating = 0, cyclic = 0, cycle_nodes = 0;
+    // Longest terminating CHAIN, computed as a depth, not the longest walk this scan happened to take.
+    // The walk length depends on the order starts are visited -- memoisation truncates later walks --
+    // so a single 2047-link chain reports 1 or 2047 purely by link direction.
+    uint32_t longest = 0;
+    uint32_t sample_count = 0;
+    uint32_t sample_idx[6]{}, sample_word[6]{}, sample_next[6]{};
+};
+
+ParentScanResult scan_parent_array(const uint8_t* bytes, size_t byte_count) {
+    ParentScanResult out;
+    if (!bytes || byte_count < 4) return out;
+    const uint32_t records = static_cast<uint32_t>(byte_count / 4);
+    out.records = records;
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(bytes);
+    // 0 = unclassified, 1 = reaches a terminator, 2 = enters a cycle. Memoized so the whole array is
+    // classified in O(records) rather than O(records * path length).
+    std::vector<uint8_t> state(records, 0);
+    std::vector<uint32_t> path;
+    std::vector<uint32_t> seen_at(records, UINT32_MAX);
+    std::set<uint32_t> cycle_nodes;
+    for (uint32_t start = 0; start < records; ++start) {
+        if (state[start]) continue;
+        path.clear();
+        uint32_t i = start;
+        uint8_t verdict = 1;
+        while (true) {
+            if (i == 0 || i >= records) { verdict = 1; break; }         // terminator / OOB read -> 0
+            if (state[i]) { verdict = state[i]; break; }                // already classified
+            if (seen_at[i] != UINT32_MAX) {                             // revisited on THIS walk
+                for (size_t k = seen_at[i]; k < path.size(); ++k) cycle_nodes.insert(path[k]);
+                verdict = 2;
+                break;
+            }
+            seen_at[i] = static_cast<uint32_t>(path.size());
+            path.push_back(i);
+            i = (words[i] >> 3) & 0x7FFFFFFu;
+        }
+        for (uint32_t node : path) { state[node] = verdict; seen_at[node] = UINT32_MAX; }
+    }
+    state[0] = 1;   // the terminator itself terminates
+    // Depth of each terminating node, memoised: depth(i) = 1 + depth(next(i)), 0 for a cyclic node.
+    // Independent of visit order, unlike the walk length it replaces.
+    std::vector<uint32_t> depth(records, 0);
+    for (uint32_t start = 0; start < records; ++start) {
+        if (state[start] != 1 || depth[start]) continue;
+        std::vector<uint32_t> chain;
+        uint32_t i = start;
+        while (i != 0 && i < records && state[i] == 1 && !depth[i]) {
+            chain.push_back(i);
+            i = (words[i] >> 3) & 0x7FFFFFFu;
+        }
+        uint32_t d = (i < records) ? depth[i] : 0u;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) { d += 1u; depth[*it] = d; }
+        if (d > out.longest) out.longest = d;
+    }
+    for (uint32_t k = 0; k < records; ++k) {
+        if (state[k] == 1) ++out.terminating;
+        else if (state[k] == 2) ++out.cyclic;
+    }
+    out.cycle_nodes = static_cast<uint32_t>(cycle_nodes.size());
+    // Keep a few actual ring members. A count says corruption happened; the entries say what SHAPE it
+    // is, and the shape is usually the mechanism -- a self-loop (parent[i]==i), a 2-cycle, or a ring of
+    // stale generation are three different bugs and the count cannot tell them apart.
+    for (uint32_t node : cycle_nodes) {
+        if (out.sample_count >= 6u) break;
+        out.sample_idx[out.sample_count] = node;
+        out.sample_word[out.sample_count] = words[node];
+        out.sample_next[out.sample_count] = (words[node] >> 3) & 0x7FFFFFFu;
+        ++out.sample_count;
+    }
+    return out;
+}
+
+// Retained pre-dispatch copies for PROSPER_COMPUTE_PARENTSCAN, keyed by guest address. Small and
+// bounded: one 8 KiB array per link buffer, overwritten each dispatch.
+struct ParentScanStash {
+    std::vector<uint8_t> bytes;
+    uint64_t submit = 0, dispatch = 0;
+    uint32_t cyclic = 0;          // the pre-dispatch verdict, so the post half can prove a TRANSITION
+    bool valid = false;
+};
+std::map<uint64_t, ParentScanStash>& parent_scan_stash_map() {
+    static std::map<uint64_t, ParentScanStash> m;
+    return m;
+}
+std::mutex& parent_scan_stash_mutex() { static std::mutex m; return m; }
+
+void parent_scan_stash(uint64_t addr, const uint8_t* bytes, size_t count,
+                       uint64_t submit, uint64_t dispatch, uint32_t cyclic) {
+    if (!bytes || !count || count > (1u << 20)) return;
+    std::lock_guard<std::mutex> lk(parent_scan_stash_mutex());
+    auto& s = parent_scan_stash_map()[addr];
+    s.bytes.assign(bytes, bytes + count);
+    s.submit = submit; s.dispatch = dispatch; s.cyclic = cyclic; s.valid = true;
+}
+
+// Write the input and output of a dispatch that turned a clean link array cyclic. This is the artifact
+// the whole investigation has lacked: the exact bytes that provoke the defect, captured at the moment it
+// happens rather than sampled afterwards.
+void parent_scan_dump_pair(uint64_t addr, const uint8_t* after, size_t count,
+                           uint64_t code, uint64_t submit, uint64_t dispatch, uint32_t after_cyclic) {
+    const char* dir = std::getenv("PROSPER_COMPUTE_PARENTSCAN_DUMP");
+    if (!dir || !*dir) return;
+    ParentScanStash before;
+    {
+        std::lock_guard<std::mutex> lk(parent_scan_stash_mutex());
+        auto it = parent_scan_stash_map().find(addr);
+        if (it != parent_scan_stash_map().end()) before = it->second;
+    }
+    // Only a genuine CLEAN -> CYCLIC transition, and only when the retained input belongs to THIS
+    // dispatch. Firing on "the output is cyclic" instead would dump every dispatch downstream of the
+    // real writer, and pairing an output with whatever input was last stashed for that address would
+    // put two different dispatches in one filename that asserts a single one.
+    if (!before.valid || before.cyclic != 0 || after_cyclic == 0) return;
+    if (before.submit != submit || before.dispatch != dispatch) return;
+    char path[512];
+    for (int half = 0; half < 2; ++half) {
+        const uint8_t* data = half == 0 ? before.bytes.data() : after;
+        const size_t   size = half == 0 ? before.bytes.size() : count;
+        if (!data || !size) continue;
+        const int n = std::snprintf(path, sizeof(path), "%s/parent_%llx_s%llu_d%llu_%s.bin", dir,
+                                    (unsigned long long)addr, (unsigned long long)submit,
+                                    (unsigned long long)dispatch, half == 0 ? "in" : "out");
+        if (n < 0 || static_cast<size_t>(n) >= sizeof(path)) {
+            std::fprintf(stderr, "[parentscan-dump] path too long for %s -- not written\n", dir);
+            continue;
+        }
+        FILE* f = std::fopen(path, "wb");
+        if (!f) {
+            std::fprintf(stderr, "[parentscan-dump] could not open %s -- not written\n", path);
+            continue;
+        }
+        const size_t wrote = std::fwrite(data, 1, size, f);
+        const bool closed = std::fclose(f) == 0;
+        // Report what actually reached the file. An earlier revision printed the intended size
+        // unconditionally, so a short or failed write announced itself as a success.
+        if (wrote == size && closed)
+            std::fprintf(stderr, "[parentscan-dump] program=0x%llx wrote %s (%zu bytes)\n",
+                         (unsigned long long)code, path, wrote);
+        else
+            std::fprintf(stderr,
+                         "[parentscan-dump] program=0x%llx INCOMPLETE %s (%zu of %zu bytes%s)\n",
+                         (unsigned long long)code, path, wrote, size,
+                         closed ? "" : ", close failed");
+    }
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
     using ComputeClock = std::chrono::steady_clock;
@@ -4965,6 +5135,55 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     source = buffers[i].linear_seed.data();
                 }
                 if (trace) buffers[i].before_hash = fnv1a(source, buffers[i].bytes);
+                // getenv is read ONCE, not per buffer per dispatch: this half sits on the default
+                // (non-trace) path, which is exactly the pattern #2214/#2228 removed from the live
+                // renderer. `tools/getenv_probe` exists to catch its reappearance.
+                static const uint64_t pscan_addr = []() -> uint64_t {
+                    const char* e = std::getenv("PROSPER_COMPUTE_PARENTSCAN");
+                    if (!e || !*e) return 0u;
+                    const uint64_t v = static_cast<uint64_t>(std::strtoull(e, nullptr, 16));
+                    // This switch takes a PROGRAM ADDRESS, not the =1 that arms every other
+                    // PROSPER_* variable. Left silent, `=1` parses to 1, matches no program, and
+                    // reports nothing -- indistinguishable from "the program never ran".
+                    if (v && v < 0x1000u)
+                        std::fprintf(stderr,
+                                     "[parentscan] PROSPER_COMPUTE_PARENTSCAN=%s is not a program "
+                                     "address; this switch expects one (e.g. 413dc6700). Nothing "
+                                     "will be scanned.\n", e);
+                    return v;
+                }();
+                static const bool pscan_dump_armed =
+                    std::getenv("PROSPER_COMPUTE_PARENTSCAN_DUMP") != nullptr;
+                if (pscan_addr) {
+                    // Stride 4 restricts this to the per-entity u32 arrays; the 64-byte record buffer
+                    // is not a link array and scanning it would report noise as structure.
+                    if (pscan_addr == static_cast<uint64_t>(item.code_addr) &&
+                        resource->stride == 4u) {
+                        const ParentScanResult ps = scan_parent_array(source, buffers[i].bytes);
+                        // Stash the input so the post-dispatch half can dump BOTH halves the instant it
+                        // sees a clean->cyclic transition. Without this the corrupting dispatch is only
+                        // ever observable through six sampled ring members: the array that produced it is
+                        // gone by the time we know it mattered, and a capture cannot be aimed at it
+                        // (arming one changes which dispatches corrupt).
+                        // Only retain the input when a dump can consume it. Stashing unconditionally
+                        // grew a process-wide map on the very runs this instrument claims not to
+                        // perturb.
+                        if (pscan_dump_armed)
+                            parent_scan_stash(resource->gpu_addr, source, buffers[i].bytes,
+                                              item.submit_no, item.dispatch_index, ps.cyclic);
+                        std::fprintf(stderr,
+                                     "[parentscan] program=0x%llx submit=%llu dispatch=%llu "
+                                     "binding=%u addr=0x%llx records=%u terminating=%u cyclic=%u "
+                                     "cycle-nodes=%u longest=%u enc=(w>>3)&0x7ffffff\n",
+                                     (unsigned long long)item.code_addr,
+                                     (unsigned long long)item.submit_no,
+                                     (unsigned long long)item.dispatch_index,
+                                     resource->binding,
+                                     (unsigned long long)resource->gpu_addr,
+                                     ps.records, ps.terminating, ps.cyclic, ps.cycle_nodes,
+                                     ps.longest);
+                    }
+                }
                 buffers[i].cache_key = {
                     resource->gpu_addr, reinterpret_cast<uintptr_t>(resource->host_data),
                     static_cast<uint32_t>(buffers[i].bytes),
@@ -8671,6 +8890,35 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (const auto& buffer : buffers) {
             if (!buffer.resource || buffer.alias_of != SIZE_MAX) continue;
             const uint8_t* bytes = resource_bytes(buffer.resource);
+            // POST-dispatch half of PROSPER_COMPUTE_PARENTSCAN. The pre-dispatch scan says whether a
+            // dispatch's INPUT was cyclic; this says whether its OUTPUT is. A dispatch whose input was
+            // clean and whose output is cyclic is the one that INTRODUCED the cycle -- which is the
+            // whole question, and neither half answers it alone.
+            if (const char* pscan_after = std::getenv("PROSPER_COMPUTE_PARENTSCAN")) {
+                if (std::strtoull(pscan_after, nullptr, 16) ==
+                        static_cast<uint64_t>(item.code_addr) && buffer.resource->stride == 4u) {
+                    const ParentScanResult pa = scan_parent_array(bytes, buffer.resource->size);
+                    std::fprintf(stderr,
+                                 "[parentscan-after] program=0x%llx submit=%llu dispatch=%llu "
+                                 "binding=%u addr=0x%llx records=%u terminating=%u cyclic=%u "
+                                 "cycle-nodes=%u longest=%u changed=%llu\n",
+                                 (unsigned long long)item.code_addr,
+                                 (unsigned long long)item.submit_no,
+                                 (unsigned long long)item.dispatch_index,
+                                 buffer.resource->binding,
+                                 (unsigned long long)buffer.resource->gpu_addr,
+                                 pa.records, pa.terminating, pa.cyclic, pa.cycle_nodes, pa.longest,
+                                 (unsigned long long)buffer.changed_bytes);
+                    parent_scan_dump_pair(buffer.resource->gpu_addr, bytes,
+                                          buffer.resource->size, item.code_addr,
+                                          item.submit_no, item.dispatch_index, pa.cyclic);
+                    for (uint32_t s = 0; s < pa.sample_count; ++s)
+                        std::fprintf(stderr,
+                                     "[parentscan-ring]   idx=%u word=0x%08x -> next=%u%s\n",
+                                     pa.sample_idx[s], pa.sample_word[s], pa.sample_next[s],
+                                     pa.sample_next[s] == pa.sample_idx[s] ? "  SELF-LOOP" : "");
+                }
+            }
             std::fprintf(stderr,
                          "[compute]   writeback binding=%u addr=0x%llx size=%u changed=%llu "
                          "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
