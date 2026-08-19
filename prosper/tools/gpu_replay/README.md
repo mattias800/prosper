@@ -631,9 +631,13 @@ would exit 1 while one that changed nothing exited 0.
 reports how many others it saw. `--override-submit` names the submit, and a selector that fails to
 resolve there is then an error rather than a silent skip.
 
-The bundle path refuses to combine an override with a mode that returns before replay
-(`--bundle-ds-summary`, `--bundle-find-ds`, `--bundle-compact`, `--bundle-extract-submit`,
-`--bundle-final-capsule`), since the override would be silently ignored.
+The bundle path refuses two combinations, for two different reasons. `--bundle-ds-summary` and
+`--bundle-find-ds` always return before any submit is replayed, as do `--bundle-compact` and
+`--bundle-extract-submit` **when no output path is given** — there the override would be silently
+ignored. (With an output path those two replay normally and the override is honoured.)
+`--bundle-final-capsule` is refused on separate grounds: it exports a capsule later runs treat as an
+oracle, and baking a deliberately falsified input into an oracle would corrupt every future
+comparison against it.
 
 **Read the warnings before comparing two arms.** An applied override is not the same as an override
 that could have mattered, and three separate conditions make a comparison void while still printing a
@@ -641,8 +645,8 @@ confident `[resource-override]` line:
 
 | warning | meaning |
 | --- | --- |
-| `... is a seeded RTT/depth target` | the renderer binds its own image for that address and may never read the overridden bytes |
-| `submit N (draw M) produced 0 output bytes` | that submit emitted nothing, so there is no result to change |
+| `... is a seeded RTT / seeded depth-stencil / renderer-produced target` | the renderer binds its own image for that address and may never read the overridden bytes. `renderer-produced` means an earlier submit in this same bundle wrote it |
+| `submit N (draw M) produced 0 output bytes` | that submit emitted nothing **and** this run's result is that same channel, so there is nothing to change. It is deliberately NOT emitted under `--bundle-output-target` / `--output-target-after`, where the result is read from a live target after the loop and an earlier empty submit can still change it |
 | `the overridden draw is NOT in this submit's executed prefix` | `operation_limit` truncated it out |
 
 Each of those makes an unchanged result **VOID, not negative**.

@@ -1353,18 +1353,32 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                  static_cast<unsigned long long>(stats.resource_logical_bytes),
                  static_cast<unsigned long long>(stats.resource_unique_bytes),
                  static_cast<unsigned long long>(stats.manifest_unique_bytes));
-    // These modes return before the submit loop, so an override would be silently ignored and the
-    // tool would exit 0 having overridden nothing -- the exact silent no-op the match guard exists
-    // to abolish. `--bundle-extract-submit X out.prgcap --override-resource ...` ("extract me an
-    // overridden capsule") is a natural request that would otherwise write an unmodified capsule.
+    // Two DIFFERENT reasons, kept apart because a refusal that states the wrong one is a refusal
+    // the reader will go and disprove.
+    //
+    // (a) --bundle-ds-summary and --bundle-find-ds always return before the submit loop, so an
+    //     override would be silently ignored and the tool would exit 0 having overridden nothing.
+    //     --bundle-compact and --bundle-extract-submit return early ONLY when no output path was
+    //     given; with one they replay normally and the override is honoured, so they are refused
+    //     only in the early-return shape.
     if (resource_override_requested &&
-        (ds_summary || find_ds_addr || !compact_path.empty() || !extract_submit_path.empty() ||
-         !final_capsule_path.empty())) {
+        (ds_summary || find_ds_addr ||
+         (!compact_path.empty() && !output_path) ||
+         (!extract_submit_path.empty() && !output_path))) {
         std::fprintf(stderr,
-                     "gpu_replay: --override-resource cannot be combined with a bundle mode that "
-                     "returns before replay (--bundle-ds-summary, --bundle-find-ds, "
-                     "--bundle-compact, --bundle-extract-submit, --bundle-final-capsule): the "
-                     "override would be silently ignored\n");
+                     "gpu_replay: --override-resource has no effect in this mode -- it returns "
+                     "before any submit is replayed, so the override would be silently ignored\n");
+        return 2;
+    }
+    // (b) --bundle-final-capsule does NOT return early: it runs inside the loop's last iteration.
+    //     It is refused for a different reason -- it exports a capsule that later runs treat as an
+    //     oracle, and baking a deliberately falsified input into an oracle would make every future
+    //     comparison against it wrong, silently and permanently.
+    if (resource_override_requested && !final_capsule_path.empty()) {
+        std::fprintf(stderr,
+                     "gpu_replay: --override-resource cannot be combined with --bundle-final-capsule: "
+                     "the exported capsule is used as an oracle, and it would carry the overridden "
+                     "input\n");
         return 2;
     }
     if (ds_summary) return summarize_bundle_ds(bundle, first_submit_index, error);
@@ -1510,7 +1524,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     // not surface later as the generic "matched no draw" -- which would blame the selector for a
     // window the caller set with --bundle-tail / --bundle-through-submit. Same wrong-reason class
     // the probe exists to prevent.
-    if (resource_override_submit_no &&
+    if (resource_override_requested && resource_override_submit_no &&
         std::none_of(bundle.submits.begin() + first_submit_index, bundle.submits.end(),
                      [&](const auto& submit) {
                          return submit.submit_index == resource_override_submit_no;
@@ -1885,11 +1899,12 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                 replay, resource_override_draw_index);
             if (overridden_operation == SIZE_MAX || overridden_operation >= operation_limit)
                 std::fprintf(stderr,
-                             "gpu_replay: WARNING the overridden draw (%zu) is NOT in this "
-                             "submit's executed prefix (%zu of %zu operations), so it cannot affect "
-                             "the result -- any comparison against another arm is VOID\n",
-                             (size_t)resource_override_draw_index, operation_limit,
-                             replay.operations.size());
+                             "gpu_replay: WARNING the overridden draw (%llu) is NOT in this "
+                             "submit's executed prefix (%llu of %llu operations), so it cannot "
+                             "affect the result -- any comparison against another arm is VOID\n",
+                             (unsigned long long)resource_override_draw_index,
+                             (unsigned long long)operation_limit,
+                             (unsigned long long)replay.operations.size());
         }
         final_pixels = execute_frame(replay, false, operation_limit);
         if (exact_for_submit.applies_to_submit &&
@@ -1974,7 +1989,21 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     // reason that has nothing to do with the substituted resource -- and the "[resource-override]"
     // line above proves the lever moved, which is exactly the reassurance that stops a reader
     // asking whether there was anything for it to move.
-    if (resource_override_applied && resource_override_output_bytes == 0)
+    // BOTH properties are needed, and round 2 lost one while fixing the other.
+    //
+    // Per-submit (round 2): `final_pixels` is reassigned every iteration, so testing it after the
+    // loop asks about the LAST submit while the override may apply to any earlier one.
+    //
+    // ...and only when the run's result IS that empty channel (round 1, deleted in round 2 and
+    // restored here). With --bundle-output-target / --output-target-after the result is read from a
+    // live render target after the loop, so an earlier submit whose own image is empty can still
+    // change it -- and that is precisely the configuration this feature is used in. Claiming VOID
+    // there tells the user to discard a true positive, which is the failure this warning exists to
+    // prevent, inverted. It would also contradict the renderer-authority warning above, which
+    // asserts that earlier submits' targets are live for later ones.
+    const bool result_is_the_empty_channel = !output_target_width && !exact_bundle_output_target;
+    if (resource_override_applied && resource_override_output_bytes == 0 &&
+        result_is_the_empty_channel)
         std::fprintf(stderr,
                      "gpu_replay: WARNING submit %llu (draw %llu) produced 0 output bytes, so the "
                      "override cannot change this replay's result -- any comparison against another "
