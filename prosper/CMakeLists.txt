@@ -2042,6 +2042,12 @@ if(TARGET prosper_core)
       target_link_libraries(test_textured_interp_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME textured_interp_render COMMAND test_textured_interp_render)
 
+      # The sampled-depth bridge's miss classifier must name the reason belonging to the entry it
+      # rejected, not the first failing reason across every sibling at that address.
+      add_executable(test_dsbridge_miss_classifier tests/test_dsbridge_miss_classifier.cpp)
+      target_link_libraries(test_dsbridge_miss_classifier PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME dsbridge_miss_classifier COMMAND test_dsbridge_miss_classifier)
+
       # IMAGE_SAMPLE_C_LZ 2D (shadow-map compare, #1271): manual-dref lowering, end-to-end.
       add_executable(test_shadow_compare_render tests/test_shadow_compare_render.cpp)
       target_link_libraries(test_shadow_compare_render PRIVATE prosper_core Vulkan::Vulkan)
