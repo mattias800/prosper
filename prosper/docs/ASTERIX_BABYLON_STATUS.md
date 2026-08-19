@@ -8,7 +8,8 @@ Title ID: `PPSA30490`
 
 Engine: Unity 6000.1.5f1 / IL2CPP
 
-Current verified rung: **3 — gameplay reached with real GPU draws**
+Current verified rung: **3 — gameplay reached with real GPU draws** (demonstrated once and
+inspected frame by frame; **not yet reproducible — 1 of 4 runs**, see the run table below)
 
 > **The video-splash deadlock is FIXED (2026-08-05, #1949).** `sceAvPlayerJumpToTime` is implemented
 > over a real backend seek, and the title now plays both publisher logo movies, renders its narrated
@@ -100,26 +101,42 @@ cinematic window (46–149 s) and is **Cross-only from 152 s onward**.
 Two bounded runs on `2703a6c3`, both `--allow-guest-fault`, both ending `status=ok` with `guest=running`
 and exit 0:
 
-| run | route | samples | source-distinct | pixel-distinct | status | reached |
-| --- | --- | --- | --- | --- | --- | --- |
-| `explore1` | Cross only | 45/45 @ 6 s | 45 | 41 | ok | cinematics only (no skip) |
-| `skip2` | Triangle to the end | 60/60 @ 10 s | 60 | 58 | ok | **level at t~172 s, clear gameplay from t~250 s** |
-| `repro3` | Triangle to the end | 60/60 @ 10 s | 60 | 58 | ok | **character select only — never left it, 495 s** |
+| run | route | samples | pixel-distinct | status | reached |
+| --- | --- | --- | --- | --- | --- |
+| `explore1` | Cross only | 45/45 @ 6 s | 41 | ok | cinematics only (no skip) |
+| `skip2` | Triangle to the end | 60/60 @ 10 s | 58 | ok | **gameplay** — level at t~172 s, clear view t~250 s |
+| `repro3` | Triangle to the end (**same route as `skip2`**) | 60/60 @ 10 s | 58 | ok | character select only, 495 s |
+| `verify1` | Triangle bounded, Cross-only after 152 s | 45/45 @ 10 s | 41 | ok | character select only |
+| `verify2` | Triangle bounded, Cross-only after 152 s | 45/45 @ 10 s | 39 | ok | character select only |
 
-**Read the last two rows together: they are the same route and every summary number is identical.**
-`repro3` was *faster* to the map (105 s against 125 s) and still never started the level. Rung 3 rests
-on `skip2`, which is a real, inspected gameplay run; what `repro3` falsifies is the *reliability* of
-the first route, and the fix is the Cross-only third phase above.
+**The route reaches gameplay in 1 of 4 attempts, and the cause is NOT known.** State this way round
+because the obvious reading is wrong in two directions:
 
-The transition is sharp and is the number a rung-6 guard should key on: distinct colours per sample go
-**2,170 → 220,066 between t=240 s and t=250 s**, then hold at 214,981-220,066 across all 35 remaining
-samples with no black frame, no fade and no transition anywhere in that span. Sampling earlier than
-t~250 s captures the title card, not the level.
+- **It is not the route.** `skip2` and `repro3` ran the **identical** route file and diverged. Same
+  binary, same dump, same fresh private `PROSPER_SAVE0`, and all four runs wrote the identical save
+  artifact (`savedata/savemem_1_0.bin`). So the difference is nondeterminism somewhere below the
+  route, not a calibration error in it.
+- **It is not the Triangle/COSTUMES conflict either, and an earlier revision of this document said it
+  was.** That conflict is real — Triangle is `COSTUMES` on the character-select screen and is
+  demonstrably *consumed* there, since the costume changes from `LEGIONARY` to `PARTHIA` to `GOLD`
+  across a run. But it does not explain the failure: the route that succeeded mashed Triangle to the
+  end, and the two routes that **removed** Triangle after the cinematics still did not start.
+  Confining Triangle is defensible hygiene; it was **not** a fix, and it was recorded as one for
+  several hours.
 
-Input delivery is asserted, not inferred: `PROSPER_PAD_SCRIPT_LOG=1` printed 278 `[pad-script]`
-transitions, each carrying the guest's own advancing pad-read index, of which 63 were `buttons=triangle`.
+What separates the runs is *which screen the `Map` scene presents*. `skip2` showed the region map
+(footer `MAIN MENU (circle)  (cross) SELECTION`) and entered a level from it. The other three showed
+the `SoloCoopMenu` character-select screen (footer `(circle) BACK  (cross) START  (square) CUNEIFORM
+TABLET  (triangle) COSTUMES`) and never left it, while **60 Cross transitions were delivered and
+observed by the guest** — each `[pad-script]` line carries the guest's own advancing pad-read index,
+so this is a screen ignoring input prosper delivered, not input prosper failed to deliver.
 
-### What #1599's three blockers do now
+Whether that is a prosper defect or a missing input is **not yet established**. A probe run that
+cycles every plausible start input (`cross`, `options`, d-pad, stick, `l1`/`r1`, excluding `circle`
+and `square`, which leave the screen) under `PROSPER_PADLOG=1` is the discriminator, and it is the
+next step.
+
+## What #1599's three blockers do now
 
 - **"all frames black"** — no. 41 of 45 samples are pixel-distinct across a 270 s Cross-only run, and
   58 of 60 across the 600 s gameplay run.
@@ -545,13 +562,13 @@ HLE registration. #1599, #1884.
   *Asterix & Obelix: Slap Them All!* (`PPSA08576`, label `game:asterix`), a different game; its own
   header says so. It presses only Cross, which cannot skip this title's cinematics. This title's route
   is `prosper/scripts/asterix-babylon/reach-gameplay.pad`. #1884.
-- **A blanket Triangle mash as a safe "skip everything" for this title:** Triangle is the cutscene
-  **Skip**, but after the `Map` scene loads it is **COSTUMES** on the character-select screen
-  (footer: `(circle) BACK  (cross) START  (square) CUNEIFORM TABLET  (triangle) COSTUMES`). A route
-  that keeps pressing it fights its own Cross and reaching `START` becomes timing luck: two runs of
-  the identical Triangle-to-the-end route reached gameplay once and sat on that screen for 495 s the
-  other time. Triangle was being *consumed*, not ignored — the costume itself changed from
-  `LEGIONARY` at t=130 s to `GOLD` at t=600 s. Confine Triangle to the cinematic window. #1884.
+- **The Triangle/COSTUMES conflict as the CAUSE of the route not reaching gameplay:** it is not,
+  and this section asserted that it was for several hours. Triangle *is* `COSTUMES` on the
+  character-select screen and *is* consumed there (the costume changes `LEGIONARY` → `PARTHIA` →
+  `GOLD` across a run), so confining it is reasonable hygiene. But the run that **succeeded** mashed
+  Triangle to the end, and the two runs that **removed** Triangle after the cinematics still never
+  started. A mechanism that is real, and demonstrably active, still has to be shown to be the one
+  producing the effect. #1884.
 - **Summary metrics as evidence that a route reached its target:** the successful and the stuck run
   reported **identical** `60/60 samples, source-distinct 60, pixel-distinct 58, max-source-stale 0.0s,
   guest=running, status=ok`. An animating menu is as source- and pixel-distinct as a level. Only the
