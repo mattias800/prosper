@@ -131,10 +131,14 @@ TABLET  (triangle) COSTUMES`) and never left it, while **60 Cross transitions we
 observed by the guest** — each `[pad-script]` line carries the guest's own advancing pad-read index,
 so this is a screen ignoring input prosper delivered, not input prosper failed to deliver.
 
-Whether that is a prosper defect or a missing input is **not yet established**. A probe run that
-cycles every plausible start input (`cross`, `options`, d-pad, stick, `l1`/`r1`, excluding `circle`
-and `square`, which leave the screen) under `PROSPER_PADLOG=1` is the discriminator, and it is the
-next step.
+That probe has now run, and **no input advances the screen**. Over ~400 s it delivered 66 `cross`,
+8 `options`, 8 `right`, 8 `left-stick-right`, 8 `left-stick-left`, and 7 each of `up`, `down`,
+`left`, `l1`, `r1` — every one observed by the guest — and `level3` never loaded. So it is not a
+missing press. **Tracked as #2743**, with one lead: the guest opens *two* pad handles
+(`type=0` and `type=2`, same `userId`), and `poll_controller` at `hle_pad.cpp:415` ignores the handle
+and always polls backend index 0, so a port type prosper does not model answers as a second connected
+controller pressing player 1's buttons. That is a real defect on its own; it is `CONFIDENCE: LOW` as
+*this* cause, and #2743 carries the mutation arm that would settle it.
 
 ## What #1599's three blockers do now
 
@@ -562,6 +566,11 @@ HLE registration. #1599, #1884.
   *Asterix & Obelix: Slap Them All!* (`PPSA08576`, label `game:asterix`), a different game; its own
   header says so. It presses only Cross, which cannot skip this title's cinematics. This title's route
   is `prosper/scripts/asterix-babylon/reach-gameplay.pad`. #1884.
+- **A missing or wrong input as the reason the character-select screen never starts:** a probe route
+  delivered 66 `cross`, 8 `options`, 8 `right`, 8 `left-stick-right`, 8 `left-stick-left` and 7 each
+  of `up`/`down`/`left`/`l1`/`r1` over ~400 s — every one observed by the guest, on a screen whose own
+  footer reads `(cross) START` — and it never advanced. Only `circle` (BACK) and `square` (CUNEIFORM
+  TABLET) were withheld, because both leave the screen. The route is not short an input. #2743.
 - **The Triangle/COSTUMES conflict as the CAUSE of the route not reaching gameplay:** it is not,
   and this section asserted that it was for several hours. Triangle *is* `COSTUMES` on the
   character-select screen and *is* consumed there (the costume changes `LEGIONARY` → `PARTHIA` →

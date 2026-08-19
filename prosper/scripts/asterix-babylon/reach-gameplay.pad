@@ -39,6 +39,22 @@
 # Reaching level3 + a World_X_Y/World_X_Y_Level pair is the machine-checkable success condition;
 # stopping at level4 is the character-select failure above, and pixel metrics cannot tell them apart.
 #
+# ============================ RELIABILITY: READ THIS FIRST ============================
+# This route reaches gameplay in 1 of 5 measured runs. It is committed because it is the only known
+# way to get there and because its earlier phases are reliable (logos, splash, title menu, cinematics
+# and the world map are reached every time), NOT because it is a dependable gameplay route yet.
+#
+# The blocker is NOT this route and NOT input calibration: it is #2743. In 4 of 5 runs the title stops
+# on its SoloCoopMenu character-select screen and ignores every input, including 66 delivered Cross
+# presses on a screen whose own footer reads "(cross) START". Input delivery is confirmed, not assumed
+# -- each PROSPER_PAD_SCRIPT_LOG transition carries the guest's own advancing pad-read index. Two runs
+# of the IDENTICAL route diverged, so the variation is below the route.
+#
+# Assert success on the SCENE, never on pixels: Media/level3 plus a World_X_Y/World_X_Y_Level pair.
+# The stuck and the successful runs report identical source-distinct/pixel-distinct summaries, because
+# an animating menu is as pixel-distinct as a level.
+# =====================================================================================
+#
 # Bound the run at >= 400 s. Use a private PROSPER_SAVE0: the default save root is one flat directory
 # shared by every title on the box (#2734).
 5-5.5:cross
