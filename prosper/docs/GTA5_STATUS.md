@@ -52,10 +52,31 @@ and `live_renderer.cpp` warns about exactly this:
 
 ### This corroborates the resolved chain above, independently
 
-The lighting output `0x20431c0000` measures **1 distinct colour — pure black — after both 37705 and
-37710**, then carries content after 37725 (214 colours) and composites at 37731 (283 colours). That is
-the same "lighting applies almost none" result as the section above, reached offline from a bundle
-rather than from live dumps, and it agrees.
+The lighting output `0x20431c0000` converts to **1 distinct colour — pure black — after both 37705
+and 37710**, then carries content after 37725 (214 colours) and composites at 37731 (283 colours).
+That is the same "lighting applies almost none" result as the section above, reached offline from a
+bundle rather than from live dumps, and it agrees.
+
+**Read that "1 distinct colour" narrowly — it is not "nothing was written".** `0x20431c0000` is
+**`rgba16f`** (66,355,200 bytes = 3840x2160x8) and the dump emits 8-bit RGBA (33,177,600 bytes), so
+every HDR value below roughly 1/255 converts to 0 and an entire buffer of small-but-nonzero light
+collapses to one colour. That is exactly compatible with the section above measuring **47% of pixels
+carrying a value**: the two are the same buffer read through different conversions, and the honest
+joint statement is *"lit, at a level that does not survive 8-bit conversion"*. A BMP distinct-colour
+count is a **floor** on an HDR surface's content, never a measurement of it.
+
+### What actually writes the lighting buffer
+
+`0x20431c0000` is written by ordinary draws, not only by compute:
+
+| submit | draws | shape |
+| --- | --- | --- |
+| 37705 | `draw[3..9]`+ | `cwm=7`/`f`, **`blend=1`**, depth test on / depth write off, `topo=4`, vcounts 3, 192, 2016 — additive light volumes, `target1` a 1920x1080 surface with `cwm1=0` |
+| 37710 | `draw[2..7]`+ | `cwm=f`, `target1=0x2085de0000` (a G-buffer slot) with **`cwm1=3`**, indexed, 459-1650 indices, `depth=1/1/6` (depth **write** on) |
+
+So the accumulation buffer receives additive blended volumes in 37705 and depth-writing indexed
+geometry in 37710. Any account of "lighting applies almost none" has to explain these draws, which do
+run and are not among the frame's three failures.
 
 **One correction to the composite description.** The *"three point lights with lens-flare streaks"*
 recorded for the gameplay frame are not lights. Dumping `0x20431c0000` after submit 37725 shows a
