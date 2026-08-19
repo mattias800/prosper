@@ -146,6 +146,7 @@ The route reaches the native 1920×1080 desert tutorial combat scene with audio.
 ## Sonic Origins — `PPSA05325`
 
 <p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.png" alt="Sonic Origins — SEGA logo"></p>
+<p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo.png" alt="Sonic Origins — SONIC TEAM logo from the decoded intro"></p>
 
 The `scripts/sonic/reach-title-or-gameplay.pad` route reaches the game's SEGA logo, composited by the
 live renderer at 3840×2160. The title had previously produced nothing but black: its boot state
@@ -157,15 +158,25 @@ the frontend loads its menu resource set and opens its logo movie, and the SEGA 
 **No title screen is reached.** After the logo fades the composite goes to a flat white frame. That
 white state used to be terminal — one colour, static to the end of the run. It no longer is: since
 `sceVideodec2Decode` began decoding by default ([#2571](https://github.com/mattias800/prosper/pull/2571)),
-a default launch still shows the pure-white frame at 80 s and then continues, producing distinct
-multi-thousand-colour 4K frames to the end of a 180 s window. The white is **passed through, not
-eliminated**, and what follows the movie is unmeasured — no title screen has been observed. prosper
-authors none of these frames either way: 68 of 68 guest scanouts report no present source and no
+a default launch shows the pure-white frame and then continues into a decoded 4K animated intro. What
+follows the white is now measured rather than assumed: a 420 s default launch is **still inside that
+intro when the window ends**, and its last frame is the SONIC TEAM logo above. The white is **passed
+through, not eliminated**, and no title screen has been observed. prosper
+authors none of these frames either way: every guest scanout reports no present source and no
 renderer target, so every presented frame is raw guest memory published directly, and only its
-contents changed. See
+contents changed.
+
+The SONIC TEAM logo is **blue** in the game and renders purple here. That is the cross-title chroma
+collapse in [#2731](https://github.com/mattias800/prosper/issues/2731) — decoded video composites
+with its two chroma components equal — and it applies to every frame of this intro, not to the SEGA
+logo above it, which is not decoded video. See
 [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md),
 [#2267](https://github.com/mattias800/prosper/issues/2267) for the measured run, and the
 [tracker](https://github.com/mattias800/prosper/issues/1871).
+
+*The SONIC TEAM frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
+default launch, no input route, no render-scale or frame-skip acceleration, master `4c8b77c8`,
+native 3840×2160, sample 41 of a 420 s run at t=420.1 s.*
 
 ## Sonic Frontiers — `PPSA03831`
 
@@ -387,8 +398,15 @@ The validated route reaches the title screen and first playable scene with real 
 
 <p align="center"><img src="assets/screenshots/tales-graces-f-publisher.png" alt="Tales of Graces f Remastered — publisher logo"></p>
 <p align="center"><img src="assets/screenshots/tales-graces-f-criware.png" alt="Tales of Graces f Remastered — CRIWARE logo"></p>
-<p align="center"><img src="assets/screenshots/tales-graces-f-title.png" alt="Tales of Graces f Remastered — title screen"></p>
+<p align="center"><img src="assets/screenshots/tales-graces-f-title-no-input.png" alt="Tales of Graces f Remastered — title screen reached with no input"></p>
 <p align="center"><img src="assets/screenshots/tales-graces-f-options.png" alt="Tales of Graces f Remastered — options screen"></p>
+
+*The title-screen frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
+**default launch with no input route**, no render-scale or frame-skip acceleration, master
+`4c8b77c8`, native 1920×1080, t=260 s of a 300 s run. It supersedes the earlier
+`tales-graces-f-title.png`, which is the same screen captured on the pad route and is still on
+master; this one carries the `Press ✕` prompt and, more importantly, was reached with the pad
+unplugged.*
 
 The title, EULA, main menu, and new-game Options screen render at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1889).
 
@@ -423,7 +441,14 @@ logo, the player slot and the Start prompt all legible. The render-thread stall 
 before the title is gone.
 
 The title screen is still degraded: most composited frames arrive with the red and green channels forced
-to maximum, which reads as a flat yellow background under otherwise-correct content. See the
+to maximum, which reads as a flat yellow background under otherwise-correct content.
+
+**A default launch does not always get there, and the reason is ours.** prosper's `/savedata0` mount is a
+single host directory shared by every title, so this game can read an `OptionSettings` slot written by
+another Unreal title, declare it corrupt and delete it — and then hold on a modal
+`Your options save has corrupted and has been deleted` dialog that a run with no input cannot dismiss.
+Pointing `PROSPER_SAVE0` and `PROSPER_SAVEDATA_DIR` at an empty per-title directory restores the title
+screen. Tracked as [#2734](https://github.com/mattias800/prosper/issues/2734). See the
 [tracker](https://github.com/mattias800/prosper/issues/1893).
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
