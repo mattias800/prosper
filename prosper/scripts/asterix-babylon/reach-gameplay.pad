@@ -14,6 +14,10 @@
 #     "Skip" prompt bound to TRIANGLE, not Cross. A Cross-only mash therefore sits through the whole
 #     intro: the first exploratory run watched Cinematic_A1_Part_1 -> A1_Part_2 -> A2 for 215 s and
 #     never left them. Triangle is held 1.5 s so a hold-to-skip binding is covered as well.
+#     What that run establishes is that Cross does not SKIP a cutscene, not that the cutscenes never
+#     end on their own - it was bounded at 320 s and stopped 105 s into Cinematic_A2, so a longer
+#     Cross-only run might reach gameplay by waiting. Triangle is what makes the path short and
+#     bounded, which is what a route needs.
 #
 # Progression oracle, which is what this route was calibrated against - PROSPER_FILELOG=1 names the
 # Unity scene files, and Media/levelNN is build-settings scene index NN (76 scenes, 76 files,

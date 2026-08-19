@@ -73,7 +73,14 @@ t~175s ->  gameplay renders, and holds to t=600s
 Every cutscene frame draws its **Skip** prompt bound to **Triangle**. An exploratory Cross-only mash
 therefore crossed the logos and the title menu correctly and then sat through `Cinematic_A1_Part_1` →
 `A1_Part_2` → `A2` for 215 seconds without skipping one of them, ending the run still in a cutscene.
-Adding Triangle is what turns the same route into a gameplay route.
+
+**Stated exactly, because the stronger version is not measured:** what is established is that Cross
+does not *skip* a cutscene, and that Triangle shortens the path to the world map decisively — from
+"still in `Cinematic_A2` at t=270 s" to "on the map at t~125 s". What is **not** established is
+whether the cinematics terminate on their own: the Cross-only run was bounded at 320 s and ended
+105 s into `Cinematic_A2`, so a longer Cross-only run might still reach gameplay by simply waiting.
+Nobody should read this as "Cross alone can never reach gameplay" — it was not tested, and the one
+run that could have tested it was stopped first.
 
 The world map is a region-select screen whose own footer reads `MAIN MENU (circle)  (cross) SELECTION`;
 Cross enters the highlighted region. The level the route lands in is `World_3_10`, which the map
