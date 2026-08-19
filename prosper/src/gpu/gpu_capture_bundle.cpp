@@ -158,6 +158,15 @@ uint64_t resource_hash(const GpuCaptureBundle& bundle,
 
 GpuCaptureFile make_capture_manifest(const GpuCaptureFile& capture) {
     GpuCaptureFile manifest;
+    // Carry the source capture's format version. This is a field-by-field copy, and omitting this
+    // one field did NOT produce a wrong file -- serialize_gpu_capture() always writes kVersion --
+    // it produced a wrong VALIDATION: serialize validates `c.format_version`, which for a manifest
+    // stayed at GpuCaptureFile's default of 0. validate_captured_indirect_pointer_relocations()
+    // then read that 0 as "capture format older than v53" and refused a capture whose provenance was
+    // complete, aborting the whole frame bundle. Every Grand Theft Auto V (PPSA04263) F9 bundle died
+    // here (#2554 gate 2). Copying rather than forcing kVersion keeps the fail-safe direction: a
+    // genuinely old capture re-bundled still validates as the version it actually is.
+    manifest.format_version = capture.format_version;
     manifest.metadata = capture.metadata;
     manifest.expected_output_hash = capture.expected_output_hash;
     manifest.expected_output_bytes = capture.expected_output_bytes;
