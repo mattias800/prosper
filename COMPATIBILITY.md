@@ -8,6 +8,12 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
+This page is the **user-facing overview** and is written by hand. For the same titles as a
+machine-readable index — rung, ladder, snapshot guard, hardware-oracle record, open blockers —
+see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the tracker issues**
+and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
+a tracker disagree, the tracker wins.
+
 Last updated: 2026-08-17
 
 ## Summary
@@ -339,9 +345,7 @@ This is not yet counted as a title screen on a default launch, because it still 
 <p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.png" alt="Asterix &amp; Obelix: Babylon Mission — narrated intro cutscene"></p>
 <p align="center"><img src="assets/screenshots/asterix-babylon-title.png" alt="Asterix &amp; Obelix: Babylon Mission — title screen and main menu"></p>
 
-A direct, unmodified native 1920×1080 capture plays both publisher logo movies, renders the narrated
-intro cutscene, and reaches the title screen with its `ADVENTURE` / `OPTIONS` menu. Gameplay has not
-yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1884).
+Both publisher logo movies, the narrated intro cutscene and the title screen with its `ADVENTURE` / `OPTIONS` menu render at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1884).
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
@@ -371,7 +375,7 @@ The warning screen, publisher logo, title screen, and EULA render at native 3840
 <p align="center"><img src="assets/screenshots/oregon-trail-health-warning.png" alt="The Oregon Trail — health/epilepsy warning screen"></p>
 <p align="center"><img src="assets/screenshots/oregon-trail-title-screen.png" alt="The Oregon Trail — title screen"></p>
 
-The startup sequence renders at native 3840×2160 and now runs past the EULA stage: the legal popup, the Gameloft splash, then the health/epilepsy warning screen. It then reaches and renders the **title screen** with its "Press any button" prompt; the ordered-DMA submit that used to stall the boot there is fixed. The whole UI layer used to render unblended — text drew as solid blocks, the logo sat on an opaque black panel and the sky was a flat field — because the title's render-target-0 blend state never reached the GPU; with that fixed the title screen composites correctly, including its glyphs, gradient sky and publisher logos. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
+A default launch renders the legal popup, the Gameloft splash and the health warning at native 3840×2160, and reaches the **title screen** with its "Press any button" prompt, correctly composited. See the [tracker](https://github.com/mattias800/prosper/issues/1886).
 
 ## Greak: Memories of Azur — `PPSA02849`
 
@@ -488,11 +492,7 @@ The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, an
 <p align="center"><img src="assets/screenshots/bendy-dark-revival-title.png" alt="Bendy and the Dark Revival — title screen"></p>
 
 A default launch reaches the multi-language photosensitivity warning and then the title screen and its BEGIN menu at
-native 3840×2160. The title had previously stopped on Unity's empty transition scene, waiting on an opening movie
-that could not finish: the guest starts the clip and never collects a frame, and prosper's decode worker only
-advances when someone pulls, so playback never ended. The player now runs the source on its own media clock, the
-movie plays out, and the boot proceeds. The menu's background video decodes and is delivered to the guest but is not
-composited, so the menu sits on a flat grey background. See the
+native 3840×2160. The menu's background video is not composited, so the menu sits on a flat grey background. See the
 [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
