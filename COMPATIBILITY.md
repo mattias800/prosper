@@ -26,7 +26,7 @@ Last updated: 2026-08-17
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
 | *Space Adventure Cobra — The Awakening* | `PPSA17337` | Unity / IL2CPP | ✅ Tutorial combat | [#1870](https://github.com/mattias800/prosper/issues/1870) |
-| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then decoded 4K movie frames; no title screen observed | [#1871](https://github.com/mattias800/prosper/issues/1871) |
+| *Sonic Origins* | `PPSA05325` | Hedgehog Engine | 🔬 4K SEGA logo, then a decoded 4K animated intro still running at 420 s; no title screen observed; movie chroma is collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1871](https://github.com/mattias800/prosper/issues/1871) |
 | *Sonic Frontiers* | `PPSA03831` | Hedgehog Engine 2 (Needle) | 🚧 Full 4K opening sequence, title screen and main menu; the menu heading draws the wrong string | [#1891](https://github.com/mattias800/prosper/issues/1891) |
 | *Sonic Racing: CrossWorlds* | `PPSA08804` | Unreal Engine 5 | 🔬 4K title screen and menus with a pad route; needs input to advance past the logos | [#1895](https://github.com/mattias800/prosper/issues/1895) |
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
@@ -50,7 +50,7 @@ Last updated: 2026-08-17
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ First-level gameplay | [#1887](https://github.com/mattias800/prosper/issues/1887) |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ First nursery level | [#1888](https://github.com/mattias800/prosper/issues/1888) |
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 First playable scene | [#1811](https://github.com/mattias800/prosper/issues/1811) |
-| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Title, EULA, menu, and options | [#1889](https://github.com/mattias800/prosper/issues/1889) |
+| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Opening movie, title screen, EULA, menu, and options; the title screen needs no input, and movie frames render with collapsed chroma ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1889](https://github.com/mattias800/prosper/issues/1889) |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and title screen | [#1809](https://github.com/mattias800/prosper/issues/1809) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
@@ -413,7 +413,7 @@ The validated route reaches the title screen and first playable scene with real 
 master; this one carries the `Press ✕` prompt and, more importantly, was reached with the pad
 unplugged.*
 
-The title, EULA, main menu, and new-game Options screen render at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1889).
+A default launch with no input route renders the opening movie, then reaches the **title screen** on its own at roughly 220 s, and continues into the EULA, main menu and new-game Options screen at native 1920×1080. Movie frames composite with their chroma collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)). See the [tracker](https://github.com/mattias800/prosper/issues/1889).
 
 ## Astro Bot — `PPSA21564`
 
