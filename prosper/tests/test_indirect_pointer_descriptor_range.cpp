@@ -1,4 +1,5 @@
 #include "gpu/gpu_capture.hpp"
+#include "gpu/gpu_capture_bundle.hpp"
 #include "gpu/rdna2_decode.hpp"
 #include "gpu/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/rdna2_to_spirv.hpp"
@@ -522,6 +523,25 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
                   compute.spirv, used_oversized.spirv,
                   replay.computes[0].resources.get()),
           "raw replay rejects a newly-live binding whose capture backing was omitted");
+
+    // #2554 gate 2. A frame bundle does not serialize the capture it is handed: it serializes a
+    // MANIFEST built by a field-by-field copy, and that copy validates before it is written. The
+    // copy used to drop format_version, so the manifest presented itself as version 0 and the
+    // provenance validator refused it as "older than v53" -- a capture built moments earlier by
+    // capture_submit_items(), whose provenance is complete and which replays correctly two CHECKs
+    // above. The refusal aborted the entire grab, which is why this title has never produced an F9
+    // bundle. `captured` is the same object those CHECKs just proved sound, so a failure here is
+    // about the bundle path alone.
+    {
+        GpuCaptureBundle bundle;
+        std::string bundle_error;
+        const bool appended = append_gpu_capture_bundle(bundle, captured, bundle_error);
+        CHECK(appended,
+              ("a complete v53 indirect-pointer capture appends to a frame bundle: " +
+               bundle_error).c_str());
+        CHECK(appended && bundle.submits.size() == 1u,
+              "the appended bundle holds exactly the one captured submit");
+    }
 
     GpuCaptureFile q_mutation = loaded;
     GpuCapturedResource* q_source = captured_resource_at(q_mutation, shape.source_pc);
