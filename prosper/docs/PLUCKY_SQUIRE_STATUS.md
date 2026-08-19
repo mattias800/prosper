@@ -49,6 +49,40 @@ bound generously — a 420 s run is too short and reads as "never leaves loading
 
 Renderer throughput during the cutscene is about **5 fps** at native 4K.
 
+## Reproducibility
+
+The route reaches the intro cutscene **2 of 2** on the checked-in `.pad` file, same binary, same dump,
+fresh private save roots each time. Both runs completed 120/120 samples with `guest=running status=ok`
+and zero `VK_ERROR` / device-lost / worker faults, and world geometry was confirmed by **opening the
+frames**, not by aggregate metrics:
+
+| run | `FinishDeskLevelLoad` | `cam_cutscene_c01_intro` | world content |
+| --- | --- | --- | --- |
+| A | ~203 s | ~434 s | yes, frames 46-119 intermittently |
+| B | ~150 s | ~370 s | yes, frames 47-119 intermittently |
+
+Aggregate metrics cannot establish this and must not be quoted as if they could: an animating menu is
+exactly as `pixel-distinct` as a rendered level. The load-bearing check is the **scene sequence** —
+`SetTargetCamera(cam_cutscene_c01_intro)` in the guest log, plus an opened frame showing bedroom
+geometry.
+
+A third run using a locally-extended multi-button route **plus** `PROSPER_SHADER_DUMP` and
+`PROSPER_GPU_TIMELINE` ran roughly 3x slower (`FinishDeskLevelLoad` at ~670 s instead of ~200 s) and
+aborted at ~1016 s, so it never reached the cutscene. Instrument overhead, not a route difference, is
+the likely cause; either way, do not use a shader-dump run to judge progression.
+
+## Input
+
+The title opens **exactly one pad handle** — `[pad] OPEN userId=1 type=0 index=0 -> handle=1` under
+`PROSPER_PADLOG=1`, on a 60 s probe. It is therefore **not** exposed to the shared suspect that
+`poll_controller` ignores its handle argument (`src/hle/hle_pad.cpp:415`), which can make two handles
+mirror one controller. Recorded as a negative so the next lane does not re-probe it.
+
+Input is delivered and observed: `[pad-script]` lines carry the guest's own advancing pad-read index
+(`read=`), which tracks the frame counter across all 49 transitions of the route. So anywhere this
+title fails to advance, the correct statement is "the guest read the input and did not act on it", not
+"the input was not delivered".
+
 ## Open defects
 
 - [#2741](https://github.com/mattias800/prosper/issues/2741) — two UE4 volumetric-fog compute programs
