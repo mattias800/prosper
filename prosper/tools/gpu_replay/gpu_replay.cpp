@@ -15,6 +15,7 @@
 #include "render_runner.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -1353,6 +1354,17 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                  static_cast<unsigned long long>(stats.resource_logical_bytes),
                  static_cast<unsigned long long>(stats.resource_unique_bytes),
                  static_cast<unsigned long long>(stats.manifest_unique_bytes));
+    // (b) --bundle-final-capsule does NOT return early: it runs inside the loop's last iteration.
+    //     It is refused for a different reason -- it exports a capsule that later runs treat as an
+    //     oracle, and baking a deliberately falsified input into an oracle would make every future
+    //     comparison against it wrong, silently and permanently.
+    if (resource_override_requested && !final_capsule_path.empty()) {
+        std::fprintf(stderr,
+                     "gpu_replay: --override-resource cannot be combined with --bundle-final-capsule: "
+                     "the exported capsule is used as an oracle, and it would carry the overridden "
+                     "input\n");
+        return 2;
+    }
     // Two DIFFERENT reasons, kept apart because a refusal that states the wrong one is a refusal
     // the reader will go and disprove.
     //
@@ -1368,17 +1380,6 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
         std::fprintf(stderr,
                      "gpu_replay: --override-resource has no effect in this mode -- it returns "
                      "before any submit is replayed, so the override would be silently ignored\n");
-        return 2;
-    }
-    // (b) --bundle-final-capsule does NOT return early: it runs inside the loop's last iteration.
-    //     It is refused for a different reason -- it exports a capsule that later runs treat as an
-    //     oracle, and baking a deliberately falsified input into an oracle would make every future
-    //     comparison against it wrong, silently and permanently.
-    if (resource_override_requested && !final_capsule_path.empty()) {
-        std::fprintf(stderr,
-                     "gpu_replay: --override-resource cannot be combined with --bundle-final-capsule: "
-                     "the exported capsule is used as an oracle, and it would carry the overridden "
-                     "input\n");
         return 2;
     }
     if (ds_summary) return summarize_bundle_ds(bundle, first_submit_index, error);
@@ -1881,8 +1882,8 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             return 2;
         }
         // Guard 1 proves the selector MATCHED, not that the overridden draw RAN. operation_limit is
-        // computed above and can truncate that draw out of the executed prefix (--bundle-output-
-        // target-after, intermediate-target truncation on non-final submits). A run where the draw
+        // computed above and can truncate that draw out of the executed prefix (--output-target-after,
+        // intermediate-target truncation on non-final submits). A run where the draw
         // never executes would otherwise report success with an unmodified image: exactly the void
         // comparison the match guard claims to make impossible.
         if (resource_override_applied &&
@@ -1989,25 +1990,18 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     // reason that has nothing to do with the substituted resource -- and the "[resource-override]"
     // line above proves the lever moved, which is exactly the reassurance that stops a reader
     // asking whether there was anything for it to move.
-    // BOTH properties are needed, and round 2 lost one while fixing the other.
-    //
-    // Per-submit (round 2): `final_pixels` is reassigned every iteration, so testing it after the
-    // loop asks about the LAST submit while the override may apply to any earlier one.
-    //
-    // ...and only when the run's result IS that empty channel (round 1, deleted in round 2 and
-    // restored here). With --bundle-output-target / --output-target-after the result is read from a
-    // live render target after the loop, so an earlier submit whose own image is empty can still
-    // change it -- and that is precisely the configuration this feature is used in. Claiming VOID
-    // there tells the user to discard a true positive, which is the failure this warning exists to
-    // prevent, inverted. It would also contradict the renderer-authority warning above, which
-    // asserts that earlier submits' targets are live for later ones.
-    const bool result_is_the_empty_channel = !output_target_width && !exact_bundle_output_target;
-    if (resource_override_applied && resource_override_output_bytes == 0 &&
-        result_is_the_empty_channel)
+    // A NOTE, not a verdict. That the overridden submit emitted no image of its own does NOT mean it
+    // cannot affect the run: its draws write renderer-owned targets that later submits sample, which
+    // is the whole reason a bundle exists -- and is what this file's own seed-skip logic and the
+    // renderer-authority warning above both assert. Rounds 2 and 3 stated it as VOID and were wrong
+    // in the same way twice: the quantity measured here is the overridden SUBMIT's pixels, while the
+    // run's result is the LAST submit's, and those coincide only when the override lands on the last
+    // submit. The VOID verdict now lives below, on the run's actual result.
+    if (resource_override_applied && resource_override_output_bytes == 0)
         std::fprintf(stderr,
-                     "gpu_replay: WARNING submit %llu (draw %llu) produced 0 output bytes, so the "
-                     "override cannot change this replay's result -- any comparison against another "
-                     "arm is VOID, not negative\n",
+                     "[gpureplay] note: submit %llu (draw %llu) emitted 0 output bytes of its own; "
+                     "its contribution can reach the result only through live targets a later "
+                     "submit samples\n",
                      (unsigned long long)resource_override_submit_applied,
                      (unsigned long long)resource_override_draw_index);
     std::fprintf(stderr, "[gpureplay] closure temporal-resolved=%llu seeded=%llu bounded=%llu "
@@ -2056,6 +2050,14 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     const uint32_t dump_height = exact_bundle_output_target
         ? exact_bundle_output_target.height
         : output_target_height ? output_target_height : final_metadata.height;
+    // THE run's result, after every channel has resolved into final_pixels. Both target modes
+    // `return 2` when they cannot produce bytes, so an empty result here means the replay genuinely
+    // produced nothing and any comparison against another arm is void regardless of channel.
+    if (resource_override_applied && final_pixels.empty())
+        std::fprintf(stderr,
+                     "gpu_replay: WARNING the replay produced no result at all, so the override "
+                     "cannot have changed anything -- any comparison against another arm is VOID, "
+                     "not negative\n");
     if (output_path && !final_pixels.empty() &&
         !prosper::test::dump_bmp(output_path, final_pixels,
                                  dump_width, dump_height)) {
@@ -2346,10 +2348,15 @@ int main(int argc, char** argv) {
             // 18446744073709551615, matches no submit, and surfaces as the generic "matched no
             // draw" -- a reason that names the wrong problem. An empty string parses as 0, which
             // is the unset sentinel, so it would silently revert to matching any submit.
+            // std::strtoull, ERANGE-checked, and no leading sign or space: strtoull WRAPS a
+            // negative and skips leading whitespace, so "-1" and " -1" would both become an
+            // unmatchable id and surface as a window error rather than a parse error.
             const char* text = argv[++i];
             char* end = nullptr;
-            resource_override_submit_no = strtoull(text, &end, 0);
-            if (!text[0] || text[0] == '-' || !end || *end || !resource_override_submit_no) {
+            errno = 0;
+            resource_override_submit_no = std::strtoull(text, &end, 0);
+            if (!text[0] || text[0] == '-' || text[0] == '+' || std::isspace((unsigned char)text[0]) ||
+                !end || *end || errno == ERANGE || !resource_override_submit_no) {
                 std::fprintf(stderr,
                              "gpu_replay: --override-submit needs a positive submit index\n");
                 return 2;
@@ -2366,6 +2373,12 @@ int main(int argc, char** argv) {
     }
     if (legacy_htile_before_stencil)
         set_environment("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL", "1");
+    // An argument that silently does nothing is the class this PR spent three rounds removing.
+    if (resource_override_submit_no && !resource_override_requested) {
+        std::fprintf(stderr,
+                     "gpu_replay: --override-submit requires --override-resource\n");
+        return 2;
+    }
     if (!bundle_path.empty()) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
         if (output_target_after_operation != SIZE_MAX &&

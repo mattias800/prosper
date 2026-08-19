@@ -242,7 +242,7 @@ inline bool apply_resource_override(gpu::GpuReplayFrame& replay,
     // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_host_data exists for
     // exactly this and survives table copies by shared ownership, so the pointer stays valid for
     // as long as any copy of the table does.
-    copied_table->owned_host_data.push_back(result.replacement_bytes);
+    copied_table->owned_diagnostic_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
     selected_table = std::move(copied_table);
     applied = std::move(result);
@@ -346,7 +346,7 @@ inline bool apply_compute_resource_override(
     // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_host_data exists for
     // exactly this and survives table copies by shared ownership, so the pointer stays valid for
     // as long as any copy of the table does.
-    copied_table->owned_host_data.push_back(result.replacement_bytes);
+    copied_table->owned_diagnostic_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
     selected_table = std::move(copied_table);
     applied = std::move(result);

@@ -302,9 +302,9 @@ int main() {
         }   // the report dies here; under the old design so did the only owner
 
         const auto& table = *lifetime_replay.items[0].prt;
-        CHECK(table.owned_host_data.size() == 1 &&
-                  table.owned_host_data[0]->data() == installed,
-              "the TABLE owns the replacement, so the pointer survives the report");
+        CHECK(table.owned_diagnostic_data.size() == 1 &&
+                  table.owned_diagnostic_data[0]->data() == installed,
+              "the TABLE owns the replacement (in the DIAGNOSTIC vector), so it survives the report");
         CHECK(gpu::gpu_capture_hash(table.resources[0].host_data,
                                     static_cast<size_t>(table.resources[0].host_data_size)) ==
                   lifetime_hash,
@@ -313,8 +313,8 @@ int main() {
         // A copy of the table must retain ownership too: the renderer clones tables freely, and a
         // copy that dropped the shared_ptr would dangle exactly like the original bug.
         const gpu::ShaderResourceTable copied = table;
-        CHECK(copied.owned_host_data.size() == 1 &&
-                  copied.owned_host_data[0]->data() == installed &&
+        CHECK(copied.owned_diagnostic_data.size() == 1 &&
+                  copied.owned_diagnostic_data[0]->data() == installed &&
                   gpu::gpu_capture_hash(copied.resources[0].host_data,
                                         static_cast<size_t>(copied.resources[0].host_data_size)) ==
                       lifetime_hash,

@@ -646,10 +646,14 @@ confident `[resource-override]` line:
 | warning | meaning |
 | --- | --- |
 | `... is a seeded RTT / seeded depth-stencil / renderer-produced target` | the renderer binds its own image for that address and may never read the overridden bytes. `renderer-produced` means an earlier submit in this same bundle wrote it |
-| `submit N (draw M) produced 0 output bytes` | that submit emitted nothing **and** this run's result is that same channel, so there is nothing to change. It is deliberately NOT emitted under `--bundle-output-target` / `--output-target-after`, where the result is read from a live target after the loop and an earlier empty submit can still change it |
+| `the replay produced no result at all` | the run produced no image in any channel, so nothing could have changed |
 | `the overridden draw is NOT in this submit's executed prefix` | `operation_limit` truncated it out |
 
 Each of those makes an unchanged result **VOID, not negative**.
+
+A separate `[gpureplay] note: submit N (draw M) emitted 0 output bytes of its own` is a **note, not a
+verdict**. A submit with no image of its own can still reach the result through renderer-owned targets
+a later submit samples — that is what a bundle is for — so it does not make a comparison void.
 
 `--override-compute-resource N:BINDING PATH` provides the matching dispatch-scoped operation for
 compute replay. The file must exactly match the selected captured span. The tool clones only compute
