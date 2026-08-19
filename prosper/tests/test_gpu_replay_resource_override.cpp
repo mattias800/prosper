@@ -257,6 +257,70 @@ int main() {
               error.find("selected captured compute span is 4 bytes") != std::string::npos,
           "compute replacement size mismatch fails before changing replay state");
 
+    // The REPLAY owns the replacement bytes, not the caller's report.
+    //
+    // ShaderResource keeps a raw pointer for the renderer ABI, so whoever owns the bytes must
+    // outlive execution. That used to be the caller's AppliedResourceOverride, documented with a
+    // "retain this object" caveat -- and a new call site broke it within a day: gpu_replay's bundle
+    // loop declared the report inside the iteration that applied the override, so the buffer was
+    // freed ~200 lines before execute_frame() ran and the shader read reused heap (or SIGSEGV'd on
+    // an mmap'd span), while still printing a confident before/after hash.
+    //
+    // Destroying the report is now safe because the copied table holds its own shared_ptr. Asserting
+    // it here rather than reasoning about it: against the previous design every check below fails.
+    {
+        // Build an independent frame rather than reusing the one already overridden above, so the
+        // arm cannot pass on state another check installed.
+        std::vector<uint8_t> lifetime_captured = {0x00, 0x00, 0x00, 0x00};
+        auto lifetime_table = std::make_shared<gpu::ShaderResourceTable>();
+        gpu::ShaderResource lifetime_resource{};
+        lifetime_resource.cls = gpu::ResourceClass::ConstantBuffer;
+        lifetime_resource.binding = 32;
+        lifetime_resource.gpu_addr = 0x12345000;
+        lifetime_resource.size = 4;
+        lifetime_resource.host_data = lifetime_captured.data();
+        lifetime_resource.host_data_size = lifetime_captured.size();
+        lifetime_table->resources = {lifetime_resource};
+        gpu::GpuReplayFrame lifetime_replay;
+        gpu::DrawItem lifetime_draw;
+        lifetime_draw.draw_index = 1153;
+        lifetime_draw.prt = lifetime_table;
+        lifetime_replay.items = {lifetime_draw};
+
+        const std::vector<uint8_t> lifetime_replacement = {0x11, 0x22, 0x33, 0x44};
+        const uint64_t lifetime_hash = gpu::gpu_capture_hash(lifetime_replacement);
+        std::string lifetime_error;
+        const uint8_t* installed = nullptr;
+        {
+            tools::AppliedResourceOverride scoped;
+            CHECK(tools::apply_resource_override(lifetime_replay, selector, lifetime_replacement,
+                                                 scoped, lifetime_error),
+                  "lifetime arm installs the override");
+            installed = lifetime_replay.items[0].prt->resources[0].host_data;
+            CHECK(installed == scoped.replacement_bytes->data(),
+                  "the table points at the replacement while the report is alive");
+        }   // the report dies here; under the old design so did the only owner
+
+        const auto& table = *lifetime_replay.items[0].prt;
+        CHECK(table.owned_diagnostic_data.size() == 1 &&
+                  table.owned_diagnostic_data[0]->data() == installed,
+              "the TABLE owns the replacement (in the DIAGNOSTIC vector), so it survives the report");
+        CHECK(gpu::gpu_capture_hash(table.resources[0].host_data,
+                                    static_cast<size_t>(table.resources[0].host_data_size)) ==
+                  lifetime_hash,
+              "the bytes are still readable and unchanged after the report is destroyed");
+
+        // A copy of the table must retain ownership too: the renderer clones tables freely, and a
+        // copy that dropped the shared_ptr would dangle exactly like the original bug.
+        const gpu::ShaderResourceTable copied = table;
+        CHECK(copied.owned_diagnostic_data.size() == 1 &&
+                  copied.owned_diagnostic_data[0]->data() == installed &&
+                  gpu::gpu_capture_hash(copied.resources[0].host_data,
+                                        static_cast<size_t>(copied.resources[0].host_data_size)) ==
+                      lifetime_hash,
+              "a table copy retains the replacement by shared ownership");
+    }
+
     std::printf("%s\n", fails ? "FAILED" : "ALL TESTS PASSED");
     return fails ? 1 : 0;
 }
