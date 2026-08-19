@@ -729,6 +729,17 @@ One line per falsified hypothesis, with the evidence that killed it.
   and eight `sceVideodec2Decode` calls, and the A/B settles it: implementing VP9 decode (#2281)
   carries the title **through** the wall — intro video, Unreal Engine splash, auto-save notice, and
   the garage scene at 64,461 colours.
+  **Read that as a property of the ROUTED arm, not of the title** (qualified 2026-08-19, #2737). It
+  is easy to compose it with #2571, which later made that decode the default, and conclude that a
+  default launch now reaches the garage on its own. **It does not, and cannot.** Re-measured on
+  `4c8b77c8` with `tools/screenshot`, no pad script, 30 samples over 300 s: **3 pixel-distinct
+  frames** — black, a loading indicator at 20 s, then black unchanged for 270 s — with the guest
+  alive throughout (flips 1 → 970, `frame_seq` 4 → 2899, no fault). `grep -ciE 'videodec|vdec'` over
+  the whole run log is **0**: the title opens no decoder at all before the input edge, so the gate is
+  upstream of the movie and no decode work can move it. (Instrument control: the same build on
+  `PPSA19991` in the same session emits `[vdec2] access-unit H.264 decoder opened` and decodes
+  continuously, so the zero is the subject, not a broken grep.) This is the fifth independent no-pad
+  observation that the title stops before the title screen.
   **Why the census produced a false negative, which is the reusable part.** The control was
   `g_vo_flipstatus` at **236 calls** in the window; the Videodec2 traffic is **nine** calls, fired
   once when the movie starts. A 400-tick *sampling* histogram exists to show steady-state work, and
