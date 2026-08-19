@@ -13,6 +13,90 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## The F9 bundle works now, and the gameplay frame is dissectable offline (2026-08-19)
+
+`make_capture_manifest()` copied a `GpuCaptureFile` field by field and omitted `format_version`, so
+the manifest a frame bundle validates presented itself as version 0 and
+`validate_captured_indirect_pointer_relocations()` refused it as *"capture format older than v53"* —
+a capture whose provenance was complete. That is what aborted every F9 bundle on this title
+(#2554 gate 2, fixed in #2718). Nothing wrong ever reached disk; `serialize_gpu_capture()` always
+writes `kVersion`. It was a bad validation of an in-memory field.
+
+**A gameplay frame now captures in 896 MB and replays with `rc=0`**, so this title's frame can be
+taken apart offline and deterministically instead of chased live. Route
+`scripts/gta5/reach-story-mode.pad`, 4K, Linux/RADV, four runaway compute programs declined, grab
+armed at 420 s with `PROSPER_GRAB_BUNDLE_AFTER_MS`.
+
+### The frame
+
+**39 submits, 7 carrying work, 307 draws, 382 operations, and 3 realization failures.**
+
+| submit | draws | computes | realized | what it is |
+| ---: | ---: | ---: | ---: | --- |
+| 37700 | 185 | 30 | 215/215 | shadow / cubemap / env pre-passes |
+| 37705 | 20 | 9 | 29/30 | writes 4K slots |
+| 37707 | 15 | 7 | 22/22 | 2992x1496 target, 45 written slot-bindings |
+| 37710 | 18 | 4 | 22/24 | writes 4K slots |
+| 37725 | 5 | 2 | 7/7 | writes 4K slots |
+| 37727 | 62 | 20 | 82/82 | post chain |
+| 37731 | 2 | 0 | 2/2 | final 4K composite |
+
+Counting **every** MRT slot with its `cwm`, not slot 0 — a G-buffer names different surfaces per slot,
+and `live_renderer.cpp` warns about exactly this:
+
+- **submit 37700 binds a 3840x2160 surface 566 times and writes none of them** (`cwm=0` on every one).
+  All its colour lands on 1024x1024, 256x256, 32x32, 4096x2048 and 1024x512 — shadow maps, an
+  environment map, and six 256x256 `r11g11b10f` faces with the shape of a cubemap.
+- **submit 37727 is a downsample pyramid**: 1920x1080, 960x540, 480x270, 240x135, 80x60, 20x20, 10x10,
+  5x5, **1x1**. The 1x1 terminus is an auto-exposure luminance reduction.
+
+### This corroborates the resolved chain above, independently
+
+The lighting output `0x20431c0000` measures **1 distinct colour — pure black — after both 37705 and
+37710**, then carries content after 37725 (214 colours) and composites at 37731 (283 colours). That is
+the same "lighting applies almost none" result as the section above, reached offline from a bundle
+rather than from live dumps, and it agrees.
+
+**One correction to the composite description.** The *"three point lights with lens-flare streaks"*
+recorded for the gameplay frame are not lights. Dumping `0x20431c0000` after submit 37725 shows a
+**shaded 3D object** — an office water cooler, with body, banding and three specular highlights — and
+the post chain's bloom is what turns those highlights into the streaks seen on screen. The object is
+real geometry that is simply too dark to read after tonemapping. This does not change the chain's
+conclusion; it sharpens what "essentially all black" looks like.
+
+### The three failures, named
+
+- **37710 draw, `no-effect`** — `cwm=0`, `target-mask=00000000`. Writes nothing by construction.
+  Correctly skipped, benign.
+- **37710 dispatch, `0x2042f49a00`** — 29 words, `unsupported=0`, an `image_load` x2 / `image_store` x2
+  full-screen 4K copy that rejects at pc 16 with `mode=unresolved-operand` **at a pc that HAS a
+  resource**. Its table offers four buffer-shaped entries and `descriptors=0` while the instruction
+  needs a T#. A descriptor-*kind* gap, distinct from the eight programs whose shared shape is "no
+  resource was offered". Filed as **#2719**.
+- **37705 dispatch, `0x205b658800`** — 2935 words, 149 resources, LDS 3072, threads 1920x1080,
+  **79 unsupported**, first blocker at pc 82: `s_mov_b32 s6, m0` (SOP1 op 0x03 reading `special:124`).
+  M0 is modelled elsewhere in the recompiler (LDS base, ADDTID spill slots), so this is narrower than
+  "M0 unsupported"; the exact rejecting path is not located. M0 accounts for 20 of the shader's
+  instructions (6 reads, 14 writes); whether all 20 are among the 79 is **not** established.
+
+## Ruled out (2026-08-19)
+
+- **`0x205b658800` is NOT the lighting pass.** It is a rejected full-screen 1080p compute in the
+  submit whose 4K output is black, which made it an attractive candidate. Its 149 resources reference
+  **none** of the surfaces the resolved-chain table names — not `0x20431c0000`, not `0x207de60000`,
+  `0x2085de0000`, `0x2081e20000` or `0x2083e00000`, and not `0x2052ac0000` (0 hits each). It
+  references a 4K surface `0x215ed10000` ten times, so post or composite is the likelier role.
+  Hypothesis withdrawn before it was acted on.
+- **The `PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT` lever is not a workaround for the bundle gate.** A
+  bundle captured under it writes but cannot be reconstructed: `cannot reconstruct bundle submit 1:
+  indirect-pointer relocation has stale shader, launch, source, or proof state`. Its own
+  *NOT FAITHFUL REPLAY* warning understates it — the bundle is not replayable at all.
+- **The RT-group dumps that reported "no world in this target" sampled only menu frames.**
+  `PROSPER_DUMP_RTGROUPS` clears `live_gpu_targets` for the whole run (`live_renderer.cpp:1459`, a
+  `static const`), forcing CPU readback at every pass; under that load this route never leaves the
+  main menu, and the last screenshot of every such run is the menu. Any "target X does not contain the
+  world" conclusion from those runs is void — they never reached gameplay.
+
 ## Three hanging compute programs, not one — and the structurizer bypass behind them (2026-08-18)
 
 `0x413dc6700` is **not** the only program that hangs the GPU on this route. Declining it and re-running
@@ -915,6 +999,10 @@ since the capture was forced past provenance, and it means the later submits wer
 setting rather than an unusable tool.
 
 ## The F9 frame grab cannot be used on this title — diagnosed and filed (#2549)
+
+> **SUPERSEDED (2026-08-19).** The bundle grab works on this title since #2718; a gameplay
+> frame captures in 896 MB and replays. See the 2026-08-19 section at the top. The gates this
+> section records were real when written.
 
 The charter names the F9 grab the fastest loop for a graphical bug, and GTA V — a GPU-driven title
 whose world is absent — is exactly the case it exists for. It could not be run at all, and the
