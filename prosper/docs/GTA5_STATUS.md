@@ -4136,6 +4136,34 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **`0x413dc6700` contains no guest barriers, so all eight emitted `OpControlBarrier` are emulation
+  scaffolding.** *Falsified — and it was a grep artifact, not a measurement.* The program contains
+  **two** `s_barrier` (SOPP `0x0a`, encoded `0xbf8a0000`), at **pc 116 and pc 129** — which are exactly
+  the phase boundaries this file already records (phase 0 = `pc 0..<116`, phase 1 = `117..129`). The
+  program is barrier-phased, as `:83` and `:4767` say. The "zero" came from a `grep` whose pattern had
+  three spaces after `fmt=SOPP` where `shader_inspect` prints four; the tool had reported the two
+  barriers all along. Counted from the raw dwords by encoding (`(w >> 23) == 0x17F`, op `0x0a`) rather
+  than from formatted text: 2. #2717.
+- **What the scope comparison actually shows.** *Solid, and narrower than the retracted version.* The
+  guest's loop exit is **per-wave** (`s_cbranch_execz`), while the emitted module votes
+  **workgroup-wide** — a 256-way OR of a per-lane pending bit into `LDS[260]`, four waves of 64 in a
+  261-entry array, wave index `%92 >> 6`. The module carries **eight** `OpControlBarrier` against the
+  guest's **two**. Of the eight, **three** immediately follow a store to the vote word — one per
+  dispatcher phase, the write→barrier→read the vote needs. The remaining five are **not attributed**:
+  saying "six are the vote's and two are the guest's" would be arithmetic, not a measurement, and the
+  mapping from the guest's two `s_barrier` onto specific emitted ones has not been established.
+  Whether the scope difference causes anything is untested — see the next row. #2717.
+- **`0x413dc6700` never corrupts a clean input.** *Falsified.* Eight consecutive submits do show 88
+  dispatches running `0 -> 0` on all four link arrays, which is what suggested it — but with coverage
+  widened to nine submits, **one dispatch with a clean input turns a clean 2063-entry array into 537
+  cyclic entries while terminating normally**, and is not a runaway. So the consumer does corrupt clean
+  input, on one dispatch in nine submits. That also restores this file's own
+  `### The writer is the CONSUMER ITSELF` finding, which an earlier revision of this row contradicted.
+  #2711, #2717.
+- **Our own `PROSPER_COMPUTE_SKIP_PROGRAM` declines leave stale arrays that read as cyclic.** *Solid.*
+  A run declining **nothing** shows the same corruption (`0 -> 84` at the first runaway submit) before
+  dying at `0x413e14900`. The workaround is not manufacturing the defect. #2711, #2717.
+
 - **`0x413dc6700` computes on zeros because prosper cannot express its pointer-chase load, so GTA V's
   world needs `PhysicalStorageBuffer` / `VK_KHR_buffer_device_address`.** *Solid.* Filed as #2709 and
   argued further in its comments; also carried into #2711's Q1/Q2 answers as a premise. The emitted
