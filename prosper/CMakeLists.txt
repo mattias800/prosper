@@ -216,6 +216,15 @@ if(Python3_Interpreter_FOUND)
   # divergence would hand out a number the gate then rejects, on somebody else's PR, hours later.
   add_test(NAME trap_number
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/docs/test_trap_number.py")
+  # The PROGRESS_TRACKER.md generator's parser (#2730). Only the --selftest arm is registered, not
+  # the live regeneration: reading the trackers needs `gh` and authentication, and a test that
+  # needs credentials gets disabled -- CI runs the live --check itself, in the Docs job. What is
+  # registered is the half that can fail SILENTLY: the parser accepts a compliant tracker and
+  # rejects seven hand-written violations, so a regex that quietly widened (and would therefore
+  # emit a plausible WRONG file rather than an error) fails here instead of shipping.
+  add_test(NAME progress_tracker_generator
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/docs/gen_progress_tracker.py" --selftest)
   # The pre-merge merge-result check (#2211). Its cases build real throwaway git repositories and
   # run real merges: the git plumbing IS the tool, so a mocked merge would test nothing. The case
   # that earns its keep is the clean merge whose RESULT holds a duplicate -- the state no head-time

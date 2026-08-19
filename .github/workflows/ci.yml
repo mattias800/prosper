@@ -184,6 +184,13 @@ jobs:
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    # `issues: read` is what the PROGRESS_TRACKER.md staleness check needs, and it is declared
+    # explicitly rather than inherited: a repository whose default workflow permission is later
+    # tightened would otherwise turn that step from a check into a 403, and the step is written
+    # to fail rather than skip -- so the permission is part of the contract, not an accident.
+    permissions:
+      contents: read
+      issues: read
     steps:
       - name: Checkout
         # fetch-depth: 2 is LOAD-BEARING, not tidiness. The numbering gate's deleted-row check
@@ -321,6 +328,47 @@ jobs:
       - name: Verify every string literal a program can print is ASCII
         run: |
           python3 prosper/tools/output/check_ascii_output.py prosper
+
+      # PROGRESS_TRACKER.md is GENERATED from the `tracker:game` issues, and this is what stops it
+      # becoming the third hand-maintained copy of the per-title status -- which is precisely the
+      # drift #2730 documents, where nine trackers asserted a hardware-oracle comparison that had
+      # never happened and it took a scan of 6,224 issue comments to establish that.
+      #
+      # --selftest first and SEPARATELY (not piped -- a pipeline's exit status is its last stage's),
+      # for the reason every other gate in this job does it: this tool's own failure mode is
+      # silence. A parser whose regexes quietly widened would accept anything and emit a plausible
+      # wrong file. The selftest holds hand-written compliant AND violating trackers and asserts
+      # both verdicts, so a gate that has stopped discriminating fails here rather than certifying
+      # everything downstream. It needs no network, so it runs even if the step below cannot.
+      - name: Verify the progress-tracker generator still discriminates
+        run: python3 prosper/tools/docs/gen_progress_tracker.py --selftest
+
+      # The live half. This is the ONE step in this job that needs the network: it re-reads the
+      # trackers through `gh` and fails if the committed file no longer matches them.
+      #
+      # It really can run here, and that was checked rather than assumed: `gh` is preinstalled on
+      # GitHub-hosted ubuntu runners, `github.token` is the same mechanism the `release` job in
+      # this file already drives `gh` with, and the token carries `issues: read` for a public
+      # repository on both push and pull_request -- including pull_request from a fork, where the
+      # token is read-only but public issues are still readable. Two API calls total: one issue
+      # list, one batched GraphQL for the cited blockers' states.
+      #
+      # Deliberately NOT `continue-on-error`, NOT `|| true`, and NOT conditioned on the diff
+      # touching anything: a staleness check that can pass without reading the trackers is worse
+      # than no check, because the file then carries CI's endorsement while saying nothing (the
+      # #2149 class; #2658 is what a vacuously-passing selftest looks like).
+      #
+      # The honest cost, recorded so nobody is surprised by it: because the trackers are edited
+      # out of band, an unrelated PR CAN go red here when someone edits a tracker mid-flight.
+      # That is a real tradeoff, and it is accepted rather than designed away, because unlike the
+      # gaplessness rule that had to be dropped from --sequential, THE AUTHOR CAN ACTUALLY FIX IT:
+      # the repair is one command and one commit, printed by the failure itself, and it leaves the
+      # file more correct than it was. The alternative -- checking only when the PR happens to
+      # touch the file -- is exactly the drift this exists to prevent.
+      - name: Verify PROGRESS_TRACKER.md still matches the trackers it is generated from
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 prosper/tools/docs/gen_progress_tracker.py --check
 
   linux-app:
     name: Linux App
