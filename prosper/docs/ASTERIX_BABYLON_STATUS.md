@@ -68,7 +68,7 @@ t~172s     level3                      PlatformerLogic
 t~175s ->  gameplay renders, and holds to t=600s
 ```
 
-### Why the route needs Triangle, not just Cross
+### Why the route presses Triangle, not just Cross
 
 Every cutscene frame draws its **Skip** prompt bound to **Triangle**. An exploratory Cross-only mash
 therefore crossed the logos and the title menu correctly and then sat through `Cinematic_A1_Part_1` →
