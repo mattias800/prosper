@@ -479,6 +479,29 @@ that leaves the caller's output buffer untouched, so the guest reads whatever wa
 
 One line per falsified hypothesis, with the evidence that killed it.
 
+- **This title loses UE volumetric fog, the way *Plucky Squire*, *Dragon Quest VII*, *The Pathless*
+  and *Little Nightmares III* do (#2747).** **Falsified, and the near-miss is the point.** Skipped
+  compute program `0x25c0056e00` binds a `class=2` input of **8,294,400** bytes, which factors exactly
+  as `240 x 135 x 32 x 8` — a froxel volume at 3840x2160 — *and* exactly as `3840 x 2160 x 1`. The
+  dispatch settles it: a flat **1-D** 69,120-thread launch (`groups=1080x1x1 local=64x1`) whose two
+  `class=4` outputs are **512 bytes each**, i.e. a reduction over a full-screen image, not a fog
+  integration (which writes a volume of its own input size). **A froxel-sized buffer is not evidence
+  of volumetric fog on its own** — `16,588,800` is also `3840x2160x2` and `7,372,800` is also
+  `2560x1440x2`. Flagged by size, cleared by shape. #2747.
+- **The skipped compute programs here are a UE5-specific or title-specific problem.** **Falsified on
+  the instruction family, not on the pass.** Two of the three programs that never execute on a 323 s
+  default arm at `2703a6c3` (40/40 samples, `status=ok`; **131,072 dispatch decisions over 36
+  programs**) reject on wave-mask-as-scalar-data: `0x25c0056e00` on `beea160e`
+  = `s_flbit_i32_b64 vcc_lo, s[14:15]` and `0x2880002600` on `bf066a81` = `s_cmp_eq_u32 1, vcc_lo`.
+  That is the same family as #2741 (UE4) and #2420 (GTA V, not Unreal at all), so it is a compiler
+  artifact of high-register-pressure GFX10 codegen rather than an engine property. The third,
+  `0x2d8022f000`, is `v_illegal` at pc=0 — a bad `code_addr`, already recorded above. #2747.
+- **`PROSPER_DBG=1` is required to attribute a skipped compute program to an instruction.**
+  **Falsified — it has not been required since the `reason=` field landed.** The reason string on
+  `[compute] skip unsupported program` (`gpu_executor.cpp:2197`) and the whole `[compute-table]` block
+  (`:8243-8285`) are **ungated**. The 240 s `PROSPER_DBG` arm this document prescribes above can be
+  replaced by an ordinary routed run: the census arm behind these rows produced every pc, word and
+  binding in a **78 KB** log. #2747.
 - **RUNG 2 REACHED -- THE TITLE SCREEN RENDERS COMPLETELY, AND "THE COMPOSITE GOES UNIFORM" WAS NEVER
   THE RIGHT DESCRIPTION.** With denser pulses on the route above (`scripts/sonic-crossworlds/`), the
   full sequence is **black -> SEGA -> Unreal Engine -> CRIWARE -> licensor -> auto-save notice ->
