@@ -394,6 +394,15 @@ user-facing overview, and its markers are a chart, not a rung scale.
 > instead of leaving it to be rediscovered per reader, but it cannot repair it: the repair is
 > editing the tracker body. **Before quoting a rung from this table, read the tracker's last
 > comments**, and prefer the title's status doc when the two disagree.
+>
+> A dated instance, found the day this caveat was written. #2736 merged at `22:58:42Z` on
+> 2026-08-19, putting *Asterix & Obelix: Babylon Mission* gameplay on master. Tracker #1884's
+> `updatedAt` then moved to `23:16:55Z` -- **after** the merge -- while its ladder still read
+> rung 2, because what changed was a comment and nobody had re-read the body. It was ticked to
+> rung 3 at `23:29:19Z`, once a human opened the screenshot and confirmed the scene. For those
+> 31 minutes the tracker was demonstrably stale **and** demonstrably fresh-looking, and every
+> timestamp-based freshness audit would have passed it. That is the whole reason the rule above
+> is "read the comments", not "check the timestamp".
 
 ## How to read the columns
 

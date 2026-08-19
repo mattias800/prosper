@@ -30,6 +30,15 @@ user-facing overview, and its markers are a chart, not a rung scale.
 > instead of leaving it to be rediscovered per reader, but it cannot repair it: the repair is
 > editing the tracker body. **Before quoting a rung from this table, read the tracker's last
 > comments**, and prefer the title's status doc when the two disagree.
+>
+> A dated instance, found the day this caveat was written. #2736 merged at `22:58:42Z` on
+> 2026-08-19, putting *Asterix & Obelix: Babylon Mission* gameplay on master. Tracker #1884's
+> `updatedAt` then moved to `23:16:55Z` -- **after** the merge -- while its ladder still read
+> rung 2, because what changed was a comment and nobody had re-read the body. It was ticked to
+> rung 3 at `23:29:19Z`, once a human opened the screenshot and confirmed the scene. For those
+> 31 minutes the tracker was demonstrably stale **and** demonstrably fresh-looking, and every
+> timestamp-based freshness audit would have passed it. That is the whole reason the rule above
+> is "read the comments", not "check the timestamp".
 
 ## How to read the columns
 
@@ -62,12 +71,12 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | The Messenger | `PPSA24651` | 6 | `123456` | `messenger-scene` | [comment](https://github.com/mattias800/prosper/issues/530#issuecomment-4947961624) | [#298](https://github.com/mattias800/prosper/issues/298) | [#1865](https://github.com/mattias800/prosper/issues/1865) | [`MESSENGER_BLACK_RENDER.md`](prosper/docs/MESSENGER_BLACK_RENDER.md) |
 | Worms Armageddon: Anniversary Edition | `PPSA20052` | 6 | `1234-6` | `worms-armageddon-gameplay` | none | - | [#1879](https://github.com/mattias800/prosper/issues/1879) | - |
 | Terminator 2D: NO FATE | `PPSA25872` | 4 | `1234--` | `terminator-boot` | none | - | [#1872](https://github.com/mattias800/prosper/issues/1872) | - |
+| Asterix & Obelix - Babylon Mission | `PPSA30490` | 3 | `123---` | - | none | [#1599](https://github.com/mattias800/prosper/issues/1599) | [#1884](https://github.com/mattias800/prosper/issues/1884) | [`ASTERIX_BABYLON_STATUS.md`](prosper/docs/ASTERIX_BABYLON_STATUS.md) |
 | Bendy and the Ink Machine | `PPSA27616` | 3 | `123---` | - | none | [#1178](https://github.com/mattias800/prosper/issues/1178), [#1177](https://github.com/mattias800/prosper/issues/1177) | [#1881](https://github.com/mattias800/prosper/issues/1881) | - |
 | Grand Theft Auto V | `PPSA04263` | 3 | `123---` | - | none | [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Syberia: Remastered | `PPSA30140` | 3 | `123---` | - | none | [#1790](https://github.com/mattias800/prosper/issues/1790), [#1627](https://github.com/mattias800/prosper/issues/1627), [#1737](https://github.com/mattias800/prosper/issues/1737), [#1628](https://github.com/mattias800/prosper/issues/1628) | [#1811](https://github.com/mattias800/prosper/issues/1811) | [`SYBERIA_STATUS.md`](prosper/docs/SYBERIA_STATUS.md) |
 | Tactics Ogre: Reborn | `PPSA03839` | 3 | `123---` | - | none | [#1913](https://github.com/mattias800/prosper/issues/1913), [#1784](https://github.com/mattias800/prosper/issues/1784) | [#1892](https://github.com/mattias800/prosper/issues/1892) | - |
 | The House of the Dead 2: Remake | `PPSA24203` | 3 | `123---` | - | none | [#1907](https://github.com/mattias800/prosper/issues/1907) | [#1896](https://github.com/mattias800/prosper/issues/1896) | - |
-| Asterix & Obelix - Babylon Mission | `PPSA30490` | 2 | `12----` | - | none | [#1599](https://github.com/mattias800/prosper/issues/1599) | [#1884](https://github.com/mattias800/prosper/issues/1884) | [`ASTERIX_BABYLON_STATUS.md`](prosper/docs/ASTERIX_BABYLON_STATUS.md) |
 | Astro Bot | `PPSA21564` | 2 | `12----` | - | none | [#1732](https://github.com/mattias800/prosper/issues/1732), [#1459](https://github.com/mattias800/prosper/issues/1459), [#1730](https://github.com/mattias800/prosper/issues/1730), [#1731](https://github.com/mattias800/prosper/issues/1731) | [#1809](https://github.com/mattias800/prosper/issues/1809) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Bendy and the Dark Revival | `PPSA27624` | 2 | `12----` | - | none | [#1979](https://github.com/mattias800/prosper/issues/1979), [#1955](https://github.com/mattias800/prosper/issues/1955) | [#1897](https://github.com/mattias800/prosper/issues/1897) | - |
 | Beneath | `PPSA27640` | 2 | `12----` | - | none | - | [#1898](https://github.com/mattias800/prosper/issues/1898) | - |
@@ -93,8 +102,8 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | --- | --- |
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 1 |
-| 3 -- gameplay with real GPU draws | 5 |
-| 2 -- title screen | 17 |
+| 3 -- gameplay with real GPU draws | 6 |
+| 2 -- title screen | 16 |
 | 1 -- any real graphics | 1 |
 | 0 -- not started | 1 |
 
