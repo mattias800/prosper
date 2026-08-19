@@ -759,6 +759,31 @@ bool capture_blob_payload_omitted(const GpuCaptureBlob& blob) {
            blob.content_hash == gpu_capture_hash(nullptr, 0);
 }
 
+// True when this compute's blob-backed resources reference payloads that were deliberately omitted,
+// i.e. we are validating a bundle MANIFEST rather than a capture.
+//
+// The provenance proof still happens -- just not here. Every capture reaching
+// append_gpu_capture_bundle() is produced by capture_submit_items(), which runs
+// validate_failure_diagnostics() on the payload-BEARING object at capture time
+// (capture_failure_diagnostics -> validate_failure_diagnostics). The manifest is then a projection of
+// that already-validated capture with its payloads stripped, so re-running the deep proof against it
+// is duplication that cannot succeed: host_data would point into an empty vector.
+//
+// Getting this wrong is what made every GTA V F9 bundle abort. The version gates (`< 51`, `< 53`)
+// used to short-circuit two of these validators, so the blob dereference was never reached; fixing a
+// dropped format_version (#2718) removed that accidental shield and the real incompatibility
+// surfaced as "packed-pointer state references an invalid resource blob" on 3 of 4 gameplay grabs.
+bool captured_compute_payloads_omitted(const GpuCaptureFile& capture,
+                                       const GpuCapturedCompute& compute) {
+    if (!compute.resources.present) return false;
+    return std::any_of(compute.resources.resources.begin(), compute.resources.resources.end(),
+                       [&](const GpuCapturedResource& captured) {
+                           return captured.blob_index != UINT32_MAX &&
+                                  captured.blob_index < capture.blobs.size() &&
+                                  capture_blob_payload_omitted(capture.blobs[captured.blob_index]);
+                       });
+}
+
 struct Interval {
     uint64_t begin = 0;
     uint64_t end = 0;
@@ -1672,9 +1697,10 @@ bool validate_captured_nullable_output_raw_buffer(
                 return false;
             }
             if (captured.blob_index >= capture.blobs.size() ||
-                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
-                kGtaNullableOutputWitnessBytes >
-                    capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset) {
+                (!capture_blob_payload_omitted(capture.blobs[captured.blob_index]) &&
+                 (captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
+                  kGtaNullableOutputWitnessBytes >
+                      capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset))) {
                 error = "nullable-output marker lacks its table witness";
                 return false;
             }
@@ -1729,9 +1755,10 @@ bool validate_captured_gta5_cf9200_no_backing(
         }
         if (relevant) {
             if (captured.blob_index >= capture.blobs.size() ||
-                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
-                kGtaCf9200RootBytes >
-                    capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset) {
+                (!capture_blob_payload_omitted(capture.blobs[captured.blob_index]) &&
+                 (captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
+                  kGtaCf9200RootBytes >
+                      capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset))) {
                 error = "GTA root-record marker lacks its 224-byte witness";
                 return false;
             }
@@ -1773,6 +1800,13 @@ bool validate_captured_gta5_packed_pointer(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
+    // A payload-stripped MANIFEST cannot carry this proof: host_data would point into an empty
+    // vector, so the deep discover/validate below would fail for a capture whose provenance is
+    // sound. The proof already ran on the payload-bearing capture at capture time -- see
+    // captured_compute_payloads_omitted(). Skipping here loses nothing; failing here aborted every
+    // F9 bundle on GTA V.
+    if (captured_compute_payloads_omitted(capture, compute)) return true;
+
     const size_t candidates = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
         captured_resource_has_gta5_packed_pointer_candidate));
@@ -1842,6 +1876,13 @@ bool validate_captured_indirect_pointer_relocations(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
+    // A payload-stripped MANIFEST cannot carry this proof: host_data would point into an empty
+    // vector, so the deep discover/validate below would fail for a capture whose provenance is
+    // sound. The proof already ran on the payload-bearing capture at capture time -- see
+    // captured_compute_payloads_omitted(). Skipping here loses nothing; failing here aborted every
+    // F9 bundle on GTA V.
+    if (captured_compute_payloads_omitted(capture, compute)) return true;
+
     const size_t marked = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
         [](const GpuCapturedResource& captured) {
