@@ -33,8 +33,12 @@
 # save root is shared by every title on the box):
 #
 #   t~55 s   cinematics begin        t~125 s  cinematics done, world map ("Coastal Region")
-#   t~165 s  level load              t~172 s  PlatformerLogic; gameplay renders from t~175 s
-#   and holds unbroken to the end of a 600 s capture (60/60 samples, pixel-distinct 58, guest alive).
+#   t~165 s  level load              t~172 s  PlatformerLogic
+#   t=180-240 s  the level's own title card ("ON THE ROAD TO UGARIT!") holds over the level
+#   t=250 s -> unobstructed gameplay, unbroken to t=600 s (60/60 samples, pixel-distinct 58, guest
+#   alive). Distinct colours per sample jump 2,170 -> 220,066 between t=240 s and t=250 s and then
+#   hold at 214,981-220,066 for all 35 remaining samples: a snapshot guard should sample AFTER
+#   t~250 s, or it will capture the title card instead of the level.
 #
 # Bound the run at >= 300 s. Reaching the map alone takes ~125 s on this host, and a short run ends
 # inside the intro cinematics looking exactly like a title-menu stall.

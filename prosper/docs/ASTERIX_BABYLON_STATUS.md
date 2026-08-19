@@ -20,9 +20,11 @@ Current verified rung: **3 — gameplay reached with real GPU draws**
 
 ## Rung 3 — gameplay, with the route that reaches it (2026-08-19)
 
-`prosper/scripts/asterix-babylon/reach-gameplay.pad` drives the title from boot to a rendering
-platformer level in about **175 seconds**, and gameplay then holds unbroken to the end of a 600-second
-capture. Nothing title-specific is needed beyond the route itself and a private save root.
+`prosper/scripts/asterix-babylon/reach-gameplay.pad` drives the title from boot into a rendering
+platformer level. The level scene is up at **t~172 s**; the level's own title card
+(`ON THE ROAD TO UGARIT!`) holds over it until **t~240 s**; from **t~250 s** the view is unobstructed
+gameplay, and it stays that way to the end of a 600-second capture. Nothing title-specific is needed
+beyond the route itself and a private save root.
 
 ```bash
 PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
@@ -65,7 +67,8 @@ t~55s      level38                     intro cinematics begin
 t~125s     level6 -> level4            Loading, then the world map ("Coastal Region")
 t~165s     level6 -> level22, level57  Loading, then World_3_10 + World_3_10_Level
 t~172s     level3                      PlatformerLogic
-t~175s ->  gameplay renders, and holds to t=600s
+t=180-240s                             the level's title card, "ON THE ROAD TO UGARIT!", over the level
+t=250s ->                              unobstructed gameplay, unbroken to t=600s
 ```
 
 ### Why the route presses Triangle, not just Cross
@@ -95,7 +98,12 @@ and exit 0:
 | run | route | samples | source-distinct | pixel-distinct | reached |
 | --- | --- | --- | --- | --- | --- |
 | `explore1` | Cross only | 45/45 @ 6 s | 45 | 41 | cinematics only (no skip) |
-| `skip2` | Cross + Triangle | 60/60 @ 10 s | 60 | 58 | **gameplay from t~175 s** |
+| `skip2` | Cross + Triangle | 60/60 @ 10 s | 60 | 58 | **level at t~172 s, clear gameplay from t~250 s** |
+
+The transition is sharp and is the number a rung-6 guard should key on: distinct colours per sample go
+**2,170 → 220,066 between t=240 s and t=250 s**, then hold at 214,981-220,066 across all 35 remaining
+samples with no black frame, no fade and no transition anywhere in that span. Sampling earlier than
+t~250 s captures the title card, not the level.
 
 Input delivery is asserted, not inferred: `PROSPER_PAD_SCRIPT_LOG=1` printed 278 `[pad-script]`
 transitions, each carrying the guest's own advancing pad-read index, of which 63 were `buttons=triangle`.
