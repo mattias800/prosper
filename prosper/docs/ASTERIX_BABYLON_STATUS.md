@@ -1,12 +1,14 @@
 # Asterix & Obelix: Babylon Mission status
 
-Tracking: [#1599](https://github.com/mattias800/prosper/issues/1599)
+Tracking: [#1884](https://github.com/mattias800/prosper/issues/1884) (game tracker),
+[#1599](https://github.com/mattias800/prosper/issues/1599) (first-boot triage — **its title is stale**;
+see below)
 
 Title ID: `PPSA30490`
 
 Engine: Unity 6000.1.5f1 / IL2CPP
 
-Current verified rung: **2 — title screen reached and rendered**
+Current verified rung: **3 — gameplay reached with real GPU draws**
 
 > **The video-splash deadlock is FIXED (2026-08-05, #1949).** `sceAvPlayerJumpToTime` is implemented
 > over a real backend seek, and the title now plays both publisher logo movies, renders its narrated
@@ -15,6 +17,93 @@ Current verified rung: **2 — title screen reached and rendered**
 > read it as history, not as the current frontier. Its premise — that a black composite indicated a
 > renderer defect — is superseded, because the frames it examined were correct renders of a scene
 > whose only content had not arrived.
+
+## Rung 3 — gameplay, with the route that reaches it (2026-08-19)
+
+`prosper/scripts/asterix-babylon/reach-gameplay.pad` drives the title from boot to a rendering
+platformer level in about **175 seconds**, and gameplay then holds unbroken to the end of a 600-second
+capture. Nothing title-specific is needed beyond the route itself and a private save root.
+
+```bash
+PROSPER_RENDER=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_PAD_SCRIPT=@scripts/asterix-babylon/reach-gameplay.pad PROSPER_PAD_SCRIPT_LOG=1 \
+PROSPER_SAVE0=<PRIVATE_SAVE_ROOT> PROSPER_FILELOG=1 \
+  ./build-linux/screenshot <DUMP_ROOT>/PPSA30490-app0 \
+    --seconds 10 --count 60 --out <OUT> --timeout 700
+```
+
+`PROSPER_SAVE0` is **not optional discipline** — its default `/tmp/prosper-savedata0` is one flat
+directory shared by every title on the box, with no title id anywhere in the host path
+(`src/hle/hle_file.cpp:814`, `:879`). Another title's save can present as this title's corruption. #2734.
+
+### The progression oracle: Unity scene index == `Media/levelNN`
+
+`PROSPER_FILELOG=1` names every scene file the guest opens, and for this title that is a far better
+progress signal than pixels. A byte-level scan of `globalgamemanagers` finds exactly **76** build-settings
+scenes at contiguous offsets, and `Media/` holds exactly **76** `levelNN` files, so the mapping is
+index-for-index with no off-by-one:
+
+| file | scene | file | scene |
+| --- | --- | --- | --- |
+| `level0` | `videoLogos` | `level6` | `Loading` |
+| `level1` | `GlobalManager` | `level22` | `World_3_10` |
+| `level2` | `PauseManager` | `level37` | `World_Tuto` |
+| `level3` | `PlatformerLogic` | `level38`/`level39`/`level40` | `Cinematic_A1_Part_1` / `A1_Part_2` / `A2` |
+| `level4` | `Map` | `level57` | `World_3_10_Level` |
+| `level5` | `MainMenu` | `level75` | `World_Tuto_Level` |
+
+A level loads as a **pair** — its `World_X_Y` scene and its `World_X_Y_Level` content scene — plus
+`PlatformerLogic`. That pairing is itself the check that the index mapping is right: two independently
+derived indices (22 and 57) land on the two halves of the same level name.
+
+Measured sequence of the verified run (`--seconds 10`, native 1920x1080, hardware Vulkan on Linux):
+
+```text
+t=0-48s    level0                      logo movies (Logo_Microids.mp4, Logo_BalioStudio.mp4)
+t~50s      level1, level2, level5      GlobalManager, PauseManager, MainMenu
+t~55s      level38                     intro cinematics begin
+t~125s     level6 -> level4            Loading, then the world map ("Coastal Region")
+t~165s     level6 -> level22, level57  Loading, then World_3_10 + World_3_10_Level
+t~172s     level3                      PlatformerLogic
+t~175s ->  gameplay renders, and holds to t=600s
+```
+
+### Why the route needs Triangle, not just Cross
+
+Every cutscene frame draws its **Skip** prompt bound to **Triangle**. An exploratory Cross-only mash
+therefore crossed the logos and the title menu correctly and then sat through `Cinematic_A1_Part_1` →
+`A1_Part_2` → `A2` for 215 seconds without skipping one of them, ending the run still in a cutscene.
+Adding Triangle is what turns the same route into a gameplay route.
+
+The world map is a region-select screen whose own footer reads `MAIN MENU (circle)  (cross) SELECTION`;
+Cross enters the highlighted region. The level the route lands in is `World_3_10`, which the map
+labels **Coastal Region**. Whether that is also the level PS5 hardware enters first is **not**
+established here — that is rung-5 work.
+
+### Verification of the run itself
+
+Two bounded runs on `2703a6c3`, both `--allow-guest-fault`, both ending `status=ok` with `guest=running`
+and exit 0:
+
+| run | route | samples | source-distinct | pixel-distinct | reached |
+| --- | --- | --- | --- | --- | --- |
+| `explore1` | Cross only | 45/45 @ 6 s | 45 | 41 | cinematics only (no skip) |
+| `skip2` | Cross + Triangle | 60/60 @ 10 s | 60 | 58 | **gameplay from t~175 s** |
+
+Input delivery is asserted, not inferred: `PROSPER_PAD_SCRIPT_LOG=1` printed 278 `[pad-script]`
+transitions, each carrying the guest's own advancing pad-read index, of which 63 were `buttons=triangle`.
+
+### What #1599's three blockers do now
+
+- **"all frames black"** — no. 41 of 45 samples are pixel-distinct across a 270 s Cross-only run, and
+  58 of 60 across the 600 s gameplay run.
+- **"renderer stalls at ~138 s"** — no. Both runs publish new frames past 138 s; `skip2` reports
+  `max-source-stale=0.0s` over 600 seconds.
+- **"MSAA `image_load` rejects a fragment stage"** — no. **Zero** `[recompile-reject]` lines in either
+  run. The capability landed and the guest exercises it.
+
+One `[compute] skip invalid descriptor contract for program 0x2011734c00` occurs once per run and is
+tracked separately; it does not visibly affect the composite.
 
 ## The splash deadlock and what fixed it (2026-08-05)
 
@@ -426,6 +515,19 @@ HLE registration. #1599, #1884.
 
 ## Ruled out
 
+- **`prosper/scripts/asterix/reach-gameplay.pad` as this title's input route:** that file drives
+  *Asterix & Obelix: Slap Them All!* (`PPSA08576`, label `game:asterix`), a different game; its own
+  header says so. It presses only Cross, which cannot skip this title's cinematics. This title's route
+  is `prosper/scripts/asterix-babylon/reach-gameplay.pad`. #1884.
+- **Cross as a universal "advance" for this title:** Cross crosses the logos, the splash and the
+  `ADVENTURE` / `OPTIONS` menu, and it is `SELECTION` on the world map — but the cutscene **Skip**
+  prompt is bound to **Triangle**. A Cross-only mash sat through 215 s of `Cinematic_A1_Part_1` →
+  `A1_Part_2` → `A2` and never reached the map. #1884.
+- **#1599's three first-boot blockers, as of `2703a6c3`:** "all frames black" (41/45 and 58/60
+  pixel-distinct), "renderer stalls at ~138 s" (`max-source-stale=0.0s` over a 600 s run), and the
+  MSAA `image_load` fragment-stage rejection (**zero** `[recompile-reject]` in either run) are each
+  contradicted by a bounded current run. The issue's *title* still asserts all three. #1599.
+
 - **Registering `sceAvPlayerJumpToTime` without a real backend seek:** a returned `SCE_OK` is exactly
   what the unregistered NID already produced, and it is what deadlocked the title. Both halves of the
   seek are load-bearing and were each proved by mutation: forcing the requested position to zero, or
@@ -534,6 +636,14 @@ HLE registration. #1599, #1884.
   framebuffers. Video decode is working; the seek primitive is what is missing.
 
 ## Next discriminators
+
+> **Stale below (2026-08-19).** Item 0's frontier — `sceAvPlayerJumpToTime` — was implemented by
+> #1949, and items 1-4 belong to the superseded constant-buffer-writer investigation. Item 5's
+> precondition ("if output becomes non-black") is met, and item 6's 125-second regression check is
+> passed by every current run. The live frontier is now rungs 4-6: manual visual verification, a PS5
+> hardware oracle, and a snapshot guard over the gameplay window this route opens. Read items 0-6 as
+> the record of a closed frontier.
+
 
 0. **The frontier is `sceAvPlayerJumpToTime`, not the GPU.** The next step is a real seek: add a seek
    operation to `prosper::video::VideoBackend` (a defaulted virtual, so the Media Foundation and

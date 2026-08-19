@@ -1,0 +1,241 @@
+# Asterix & Obelix: Babylon Mission (PPSA30490, Unity 6000.1.5f1 / IL2CPP)
+# Reach GAMEPLAY: logo movies -> splash -> title menu -> intro cinematics -> world map -> a level.
+#
+# NOTE ON THE NAME. This is NOT the same game as scripts/asterix/reach-gameplay.pad, which drives
+# Asterix & Obelix: Slap Them All! (PPSA08576, label game:asterix). That route does nothing here.
+#
+# Two phases, and the split is load-bearing:
+#
+#   Phase 1 (5-58 s) - Cross. Crosses the two publisher logo movies, the SPLASH scene and the
+#     ADVENTURE / OPTIONS title menu. Cross is "Selection" throughout, including on the world map,
+#     whose own footer reads "MAIN MENU (circle)  (cross) SELECTION".
+#
+#   Phase 2 (60 s+) - Triangle, with Cross interleaved 3 s later. Every cutscene frame draws a
+#     "Skip" prompt bound to TRIANGLE, not Cross. A Cross-only mash therefore sits through the whole
+#     intro: the first exploratory run watched Cinematic_A1_Part_1 -> A1_Part_2 -> A2 for 215 s and
+#     never left them. Triangle is held 1.5 s so a hold-to-skip binding is covered as well.
+#
+# Progression oracle, which is what this route was calibrated against - PROSPER_FILELOG=1 names the
+# Unity scene files, and Media/levelNN is build-settings scene index NN (76 scenes, 76 files,
+# verified by a byte-level scan of globalgamemanagers):
+#
+#   level0  videoLogos     level1  GlobalManager   level2  PauseManager   level5  MainMenu
+#   level38 Cinematic_A1_Part_1    level39 Cinematic_A1_Part_2    level40 Cinematic_A2
+#   level6  Loading        level4  Map             level3  PlatformerLogic
+#   level22 World_3_10     level57 World_3_10_Level
+#
+# Measured on Linux/hardware Vulkan through tools/screenshot at PROSPER_RENDER_SCALE=1,
+# PROSPER_RENDER_EVERY=1, native 1920x1080, with a private PROSPER_SAVE0 (see #2734 - the default
+# save root is shared by every title on the box):
+#
+#   t~55 s   cinematics begin        t~125 s  cinematics done, world map ("Coastal Region")
+#   t~165 s  level load              t~172 s  PlatformerLogic; gameplay renders from t~175 s
+#   and holds unbroken to the end of a 600 s capture (60/60 samples, pixel-distinct 58, guest alive).
+#
+# Bound the run at >= 300 s. Reaching the map alone takes ~125 s on this host, and a short run ends
+# inside the intro cinematics looking exactly like a title-menu stall.
+#
+# The Phase-2 mash deliberately continues through gameplay: Cross and Triangle are jump/attack there,
+# which is harmless, and keeping it running is what makes the route tolerant of a slower host.
+5-5.5:cross
+9-9.5:cross
+13-13.5:cross
+17-17.5:cross
+21-21.5:cross
+25-25.5:cross
+29-29.5:cross
+33-33.5:cross
+37-37.5:cross
+41-41.5:cross
+45-45.5:cross
+49-49.5:cross
+53-53.5:cross
+57-57.5:cross
+60-61.5:triangle
+63-63.5:cross
+66-67.5:triangle
+69-69.5:cross
+72-73.5:triangle
+75-75.5:cross
+78-79.5:triangle
+81-81.5:cross
+84-85.5:triangle
+87-87.5:cross
+90-91.5:triangle
+93-93.5:cross
+96-97.5:triangle
+99-99.5:cross
+102-103.5:triangle
+105-105.5:cross
+108-109.5:triangle
+111-111.5:cross
+114-115.5:triangle
+117-117.5:cross
+120-121.5:triangle
+123-123.5:cross
+126-127.5:triangle
+129-129.5:cross
+132-133.5:triangle
+135-135.5:cross
+138-139.5:triangle
+141-141.5:cross
+144-145.5:triangle
+147-147.5:cross
+150-151.5:triangle
+153-153.5:cross
+156-157.5:triangle
+159-159.5:cross
+162-163.5:triangle
+165-165.5:cross
+168-169.5:triangle
+171-171.5:cross
+174-175.5:triangle
+177-177.5:cross
+180-181.5:triangle
+183-183.5:cross
+186-187.5:triangle
+189-189.5:cross
+192-193.5:triangle
+195-195.5:cross
+198-199.5:triangle
+201-201.5:cross
+204-205.5:triangle
+207-207.5:cross
+210-211.5:triangle
+213-213.5:cross
+216-217.5:triangle
+219-219.5:cross
+222-223.5:triangle
+225-225.5:cross
+228-229.5:triangle
+231-231.5:cross
+234-235.5:triangle
+237-237.5:cross
+240-241.5:triangle
+243-243.5:cross
+246-247.5:triangle
+249-249.5:cross
+252-253.5:triangle
+255-255.5:cross
+258-259.5:triangle
+261-261.5:cross
+264-265.5:triangle
+267-267.5:cross
+270-271.5:triangle
+273-273.5:cross
+276-277.5:triangle
+279-279.5:cross
+282-283.5:triangle
+285-285.5:cross
+288-289.5:triangle
+291-291.5:cross
+294-295.5:triangle
+297-297.5:cross
+300-301.5:triangle
+303-303.5:cross
+306-307.5:triangle
+309-309.5:cross
+312-313.5:triangle
+315-315.5:cross
+318-319.5:triangle
+321-321.5:cross
+324-325.5:triangle
+327-327.5:cross
+330-331.5:triangle
+333-333.5:cross
+336-337.5:triangle
+339-339.5:cross
+342-343.5:triangle
+345-345.5:cross
+348-349.5:triangle
+351-351.5:cross
+354-355.5:triangle
+357-357.5:cross
+360-361.5:triangle
+363-363.5:cross
+366-367.5:triangle
+369-369.5:cross
+372-373.5:triangle
+375-375.5:cross
+378-379.5:triangle
+381-381.5:cross
+384-385.5:triangle
+387-387.5:cross
+390-391.5:triangle
+393-393.5:cross
+396-397.5:triangle
+399-399.5:cross
+402-403.5:triangle
+405-405.5:cross
+408-409.5:triangle
+411-411.5:cross
+414-415.5:triangle
+417-417.5:cross
+420-421.5:triangle
+423-423.5:cross
+426-427.5:triangle
+429-429.5:cross
+432-433.5:triangle
+435-435.5:cross
+438-439.5:triangle
+441-441.5:cross
+444-445.5:triangle
+447-447.5:cross
+450-451.5:triangle
+453-453.5:cross
+456-457.5:triangle
+459-459.5:cross
+462-463.5:triangle
+465-465.5:cross
+468-469.5:triangle
+471-471.5:cross
+474-475.5:triangle
+477-477.5:cross
+480-481.5:triangle
+483-483.5:cross
+486-487.5:triangle
+489-489.5:cross
+492-493.5:triangle
+495-495.5:cross
+498-499.5:triangle
+501-501.5:cross
+504-505.5:triangle
+507-507.5:cross
+510-511.5:triangle
+513-513.5:cross
+516-517.5:triangle
+519-519.5:cross
+522-523.5:triangle
+525-525.5:cross
+528-529.5:triangle
+531-531.5:cross
+534-535.5:triangle
+537-537.5:cross
+540-541.5:triangle
+543-543.5:cross
+546-547.5:triangle
+549-549.5:cross
+552-553.5:triangle
+555-555.5:cross
+558-559.5:triangle
+561-561.5:cross
+564-565.5:triangle
+567-567.5:cross
+570-571.5:triangle
+573-573.5:cross
+576-577.5:triangle
+579-579.5:cross
+582-583.5:triangle
+585-585.5:cross
+588-589.5:triangle
+591-591.5:cross
+594-595.5:triangle
+597-597.5:cross
+600-601.5:triangle
+603-603.5:cross
+606-607.5:triangle
+609-609.5:cross
+612-613.5:triangle
+615-615.5:cross
+618-619.5:triangle
+621-621.5:cross
