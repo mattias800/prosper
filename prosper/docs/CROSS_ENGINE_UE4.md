@@ -1,5 +1,16 @@
 # Cross-engine check — Unreal Engine 4 title (PPSA17942)
 
+> **HISTORICAL (2026-07-05). Every "no" and "untested" in the table below has since been
+> answered, and this document must not be read as current status.** As of 2026-08-19 there are
+> **nine Unreal titles with dumps present**, of which eight reach a title screen; the boot harness
+> discovers modules generically; UE4 shaders reach the recompiler through the live command stream
+> rather than an eboot scan; and the runtime HLE is exercised well past module loading. For current
+> Unreal state read `COMPATIBILITY.md` and the per-title trackers, and for the cross-title compute
+> picture read #2747 — a census over eight of them showing that four lose the *same* UE
+> volumetric-fog compute pass to one recompiler gap (#2741), while each title's actual blocker is
+> different. What remains true here is the verdict in *The "Proton vs. shim" verdict* section: the
+> SELF/ELF core generalised, and the scaffolding around it was what needed work.
+
 **Date:** 2026-07-05. **Purpose:** a second, unrelated engine is the real test of whether prosper is a
 genuine compat layer or a Unity-specific shim. A UE4 4.27 title (`PPSA17942`, uses the CRIWARE UE4
 plugin; C++/no IL2CPP) was added alongside the Unity/IL2CPP first target (`PPSA24651`, The Messenger).

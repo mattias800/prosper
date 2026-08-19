@@ -526,6 +526,24 @@ invariants. A change in frames, draws or wave64 skips is **not** evidence of any
 
 ## Ruled out — eliminated, do not re-run these
 
+- **"Every compute program this title dispatches executes."** **Falsified 2026-08-19 on `2703a6c3`.**
+  A `reach-title-screen.pad` arm through `tools/screenshot` (60/60 samples at 3840x2160, 301 s,
+  `stop=request-satisfied guest=running status=ok`) with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports
+  **65,536 dispatch decisions over 19 programs**, of which **`0x3017400000` executes 0 times against
+  2,312 skips**. It is **UE volumetric fog**: two `class=2` sampled inputs (bindings 60, 61) and one
+  `class=4` storage output (binding 65) all of exactly **2,088,960** B = `120 x 68 x 32 x 8` — a
+  3840x2160 view at `GridPixelSize=32`, `GridSizeZ=32` — with two further bindings on the same
+  `120x68x32` grid at 4 and 32 B/cell, under a 3-D dispatch whose Z group count is 32. It rejects on
+  `pc=646 words=856a0f0e` = **`s_cselect_b32 vcc_lo, s14, s15`** (llvm-mc, gfx1030), the
+  `VCC_LO`-as-scalar-scratch shape `is_gtav_wave64_vcc_lo_scalar_cselect`
+  (`rdna2_to_spirv.cpp:4888`) declines because it requires inline-constant sources. The same class
+  stops the same pass in *Plucky Squire*, *The Pathless* and *Little Nightmares III*. #2747, #2741.
+- **"That missing fog is why this title has not reached gameplay."** **Not supported, and stated so
+  it is not assumed.** Volumetric fog is a lighting pass, not a progression gate; the title screen and
+  the first-run setup render with it absent, and the run above is clean end to end. The only other
+  rejected program, `0x3013e00000`, **executed 26,146 times against 1 skip** — the self-recovering
+  descriptor transient of #1581, not a wall. #2747.
+
 - **"The failing draws run with the previous pipeline's *user data*."** This title's own
   `[dynfail]`/`[drawpkt]` evidence founded #305 on that mechanism, and the **user-data half is now
   falsified**: measured on the louder Nikoderiko reproduction, the block is written by the

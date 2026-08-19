@@ -95,6 +95,18 @@ title fails to advance, the correct statement is "the guest read the input and d
 
 ## Ruled out
 
+- **"#2741 is this title's bug."** Falsified 2026-08-19 by a cross-title census on `2703a6c3`
+  (#2747). *Little Nightmares III* rejects `0x30114c0000` at the **byte-identical** dword `be8e037c`
+  (`s_mov_b32 s14, m0`) with the **byte-identical** dispatch `groups=30x17x64 local=8x8
+  threads=240x136` and the same 16,588,800-byte volume as `0x3015ab0000` here; *Dragon Quest VII*
+  (`0x3017400000`) and *The Pathless* (`0x200ea80000`, `0x200ead0000`) each lose a froxel program to
+  `s_cselect_b32 vcc_lo, sX, sY`, and *The Pathless*'s second volume is byte-for-byte the same
+  131,072 B as `0x3015fd0000` here. Four titles, one stock UE shader pair, one recompiler gap.
+- **"The route's dispatch geometry is fixed at `groups=30x17x64 / threads=240x136`."** Not falsified,
+  but **not stable either** — an independent 1,152 s arm of the same route on the same binary reports
+  `groups=27x15x64 local=8x8 threads=216x120` for `0x3015ab0000`, i.e. a 3456x1920 view. UE dynamic
+  resolution moves the froxel grid's XY between runs; `gz=64` and the 16,588,800 / 131,072 bindings do
+  not move. Do not use the XY extent as a run-to-run selector. #2747.
 - **"The three compute programs of #1554 are still skipped."** Falsified 2026-08-19 on `2703a6c3`:
   `PROSPER_COMPUTE_PROGRAM_CENSUS=1` over 131,072 dispatch decisions across 50 programs shows
   `0x3017d90000`, `0x3017450000` and `0x3017460000` with **no skip rows at all** — the census prints a
