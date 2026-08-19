@@ -2055,9 +2055,9 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     // produced nothing and any comparison against another arm is void regardless of channel.
     if (resource_override_applied && final_pixels.empty())
         std::fprintf(stderr,
-                     "gpu_replay: WARNING the replay produced no result at all, so the override "
-                     "cannot have changed anything -- any comparison against another arm is VOID, "
-                     "not negative\n");
+                     "gpu_replay: WARNING the replay produced no IMAGE result, so comparing this "
+                     "run's output against another arm is VOID, not negative (the per-submit "
+                     "bundle-submit hashes above are still comparable)\n");
     if (output_path && !final_pixels.empty() &&
         !prosper::test::dump_bmp(output_path, final_pixels,
                                  dump_width, dump_height)) {
@@ -2069,7 +2069,11 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     // "mismatch" while one that changes nothing exits 0. A scripted A/B would read the successful
     // case as a tool failure. `--allow-mismatch` is documented for intentional input changes
     // (tools/gpu_replay/README.md) but was accepted and ignored on this path.
-    const bool oracle_expected_to_differ = resource_override_applied || allow_mismatch;
+    // An EMPTY result is never explained by substituting bytes, so it must not be absorbed by the
+    // override waiver: that would turn a genuine replay failure (pre-PR rc=1) into a silent rc=0.
+    // The waiver covers "the image legitimately differs from the oracle", not "there is no image".
+    const bool oracle_expected_to_differ =
+        (resource_override_applied || allow_mismatch) && !final_pixels.empty();
     if (!output_target_width && !exact_bundle_output_target && expected_output_valid &&
         (final_pixels.size() != expected_output_bytes ||
          prosper::gpu::gpu_capture_hash(final_pixels) != expected_output_hash)) {

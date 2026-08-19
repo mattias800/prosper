@@ -611,7 +611,7 @@ item's `draw_index`, never as offsets into the compact draw vector.
 resource span in memory. The file must have exactly the selected resource's captured byte count.
 The tool clones the selected stage table and owns the replacement separately, so other draws that
 share a table or content-deduplicated backing remain unchanged. The replacement is owned by the
-cloned table itself (`ShaderResourceTable::owned_host_data`), so it stays valid for as long as any
+cloned table itself (`ShaderResourceTable::owned_diagnostic_data`), so it stays valid for as long as any
 copy of that table does. It prints the draw, stage, binding, guest address, size, and stable
 original/replacement hashes. Combine it with `--inspect-only` to prove the replacement was installed
 without initializing Vulkan; the selected table's normal `hash=` field will equal the reported
@@ -624,7 +624,13 @@ alter the final image.
 The override applies to the one submit that owns the selected draw; every other submit replays
 untouched. The bundle path skips the output oracle automatically once an override is applied, because
 the oracle describes the unmodified frame — without that, an override that genuinely changed the image
-would exit 1 while one that changed nothing exited 0.
+would exit 1 while one that changed nothing exited 0. `--allow-mismatch` now also takes effect here
+(it was previously accepted and ignored on this path), so it can be used to waive the oracle without
+an override.
+
+The waiver deliberately does **not** cover an empty result: a replay that produced no image at all is a
+genuine failure rather than an expected difference, so it still exits 1 and is not absorbed by the
+override.
 
 **`--override-submit N` should normally be passed.** Draw indices REPEAT across submits, so a bare
 `DRAW:stage:BINDING` selector matches several; without the flag the FIRST match wins and the tool
@@ -646,7 +652,7 @@ confident `[resource-override]` line:
 | warning | meaning |
 | --- | --- |
 | `... is a seeded RTT / seeded depth-stencil / renderer-produced target` | the renderer binds its own image for that address and may never read the overridden bytes. `renderer-produced` means an earlier submit in this same bundle wrote it |
-| `the replay produced no result at all` | the run produced no image in any channel, so nothing could have changed |
+| `the replay produced no IMAGE result` | the run produced no image in any channel. The per-submit `bundle-submit=… hash=` lines are still comparable |
 | `the overridden draw is NOT in this submit's executed prefix` | `operation_limit` truncated it out |
 
 Each of those makes an unchanged result **VOID, not negative**.

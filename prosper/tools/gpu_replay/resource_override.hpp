@@ -33,7 +33,9 @@ struct ResourceOverrideTarget {
 };
 
 // The replay owns the replacement bytes: apply_resource_override() pushes them into the copied
-// table's `owned_host_data`, so the pointer stays valid for as long as any copy of that table does.
+// table's `owned_diagnostic_data`, so the pointer stays valid for as long as any copy of that table
+// does. Deliberately NOT `owned_host_data` -- membership there is a semantic discriminator, not just
+// an ownership list; see the comment on the field itself.
 // This struct is a REPORT (selector, target, hashes) and callers may discard it freely. It
 // previously carried sole ownership and the caller had to outlive execution -- an invariant a new
 // call site broke immediately, so the ownership now lives with the data.
@@ -239,8 +241,8 @@ inline bool apply_resource_override(gpu::GpuReplayFrame& replay,
     // caller's job is a contract every new call site can silently break. It was broken within a
     // day: a bundle-replay caller declared its AppliedResourceOverride inside the loop iteration
     // that applied the override, so the buffer was freed ~200 lines before execute_frame() ran and
-    // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_host_data exists for
-    // exactly this and survives table copies by shared ownership, so the pointer stays valid for
+    // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_diagnostic_data exists
+    // for exactly this and survives table copies by shared ownership, so the pointer stays valid for
     // as long as any copy of the table does.
     copied_table->owned_diagnostic_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
@@ -343,8 +345,8 @@ inline bool apply_compute_resource_override(
     // caller's job is a contract every new call site can silently break. It was broken within a
     // day: a bundle-replay caller declared its AppliedResourceOverride inside the loop iteration
     // that applied the override, so the buffer was freed ~200 lines before execute_frame() ran and
-    // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_host_data exists for
-    // exactly this and survives table copies by shared ownership, so the pointer stays valid for
+    // the shader sampled reused heap (or SIGSEGV'd on an mmap'd span). owned_diagnostic_data exists
+    // for exactly this and survives table copies by shared ownership, so the pointer stays valid for
     // as long as any copy of the table does.
     copied_table->owned_diagnostic_data.push_back(result.replacement_bytes);
     copied_table->resources[target.resource_index].host_data = result.replacement_bytes->data();
