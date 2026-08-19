@@ -644,6 +644,36 @@ register write. Clean, compelling, and entirely false: the two instruments times
 pipeline stages (REGWATCH at command-processor *decode*, EXECLOG at *realization*) and the phases
 interleave per submit. See instrument-trap 12; #1633's `order=` is what makes the honest join possible.
 
+### Cross-title: aggregate frame metrics cannot tell an animating menu from gameplay
+
+A bring-up run that reports healthy frame statistics has not thereby reported that it reached
+anything. On *Asterix & Obelix: Babylon Mission* (2026-08-19) a run that reached the `World_3_10`
+harbour and a run that sat on the `SoloCoopMenu` character-select screen for 495 s were **identical**
+on every aggregate the capture tool produces — same route file, same binary, same dump:
+
+```
+skip2    60/60  source-distinct=60 pixel-distinct=58 stale=0.0s guest=running status=ok  -> gameplay
+repro3   60/60  source-distinct=60 pixel-distinct=58 stale=0.0s guest=running status=ok  -> character select
+```
+
+**An animating menu is exactly as pixel-distinct as a level**, and `status=ok` reports the harness's
+health rather than the guest's progress. Frame count, pixel-distinctness, staleness and liveness are
+each necessary, and not one of them is a discriminator. A route validated on those alone is validated
+against nothing.
+
+**So state a content-level success condition BEFORE the run** — a scene token, a level or map name, a
+HUD element that exists only in gameplay — and read the aggregates as a check that the run was *valid*,
+never as evidence of what it *reached*.
+
+**For Unity titles there is a cheap and self-checking one.** `Media/levelNN` is the Unity
+build-settings scene index: on that title, 76 scenes against 76 files, confirmed by a byte-level scan,
+and self-checking because each world level appears as a `World_X_Y` + `World_X_Y_Level` pair — so a
+mis-derived index surfaces as a broken pairing rather than as a plausible wrong answer. Twelve of the
+fourteen titles at gameplay are Unity/IL2CPP, so it generalises. The scene sequence was the **only**
+instrument that separated the two runs above; the successful one went Loading -> region map -> level,
+the others Loading -> `SoloCoopMenu` -> stuck. Full derivation in
+[`ASTERIX_BABYLON_STATUS.md`](ASTERIX_BABYLON_STATUS.md); the route-reliability defect it exposed is #2743.
+
 ## The orchestration contract
 
 ### Orchestrator responsibilities
