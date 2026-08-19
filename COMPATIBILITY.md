@@ -148,9 +148,14 @@ The route reaches the native 1920×1080 desert tutorial combat scene with audio.
 <p align="center"><img src="assets/screenshots/sonic-origins-sega-logo.png" alt="Sonic Origins — SEGA logo"></p>
 <p align="center"><img src="assets/screenshots/sonic-origins-sonic-team-logo.png" alt="Sonic Origins — SONIC TEAM logo from the decoded intro"></p>
 
+*The SONIC TEAM frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
+default launch with no input route, no render-scale or frame-skip acceleration, master `4c8b77c8`,
+native 3840×2160, sample 41 of a 420 s run at t=420.1 s.*
+
 The `scripts/sonic/reach-title-or-gameplay.pad` route reaches the game's SEGA logo, composited by the
-live renderer at 3840×2160. The title had previously produced nothing but black: its boot state
-machine waits for a save-data job that could never finish, because
+live renderer at 3840×2160; a default launch with no input reaches it too, and keeps going — which is
+why the second frame above is further along than the first. The title had previously produced nothing
+but black: its boot state machine waits for a save-data job that could never finish, because
 `sceSaveDataCreateTransactionResource` returned 0 when it must return the id of the transaction
 resource it creates. With a real id the boot advances,
 the frontend loads its menu resource set and opens its logo movie, and the SEGA logo renders.
@@ -173,10 +178,6 @@ logo above it, which is not decoded video. See
 [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md),
 [#2267](https://github.com/mattias800/prosper/issues/2267) for the measured run, and the
 [tracker](https://github.com/mattias800/prosper/issues/1871).
-
-*The SONIC TEAM frame is a direct, unmodified `tools/screenshot` capture — headless Linux/RADV,
-default launch, no input route, no render-scale or frame-skip acceleration, master `4c8b77c8`,
-native 3840×2160, sample 41 of a 420 s run at t=420.1 s.*
 
 ## Sonic Frontiers — `PPSA03831`
 
