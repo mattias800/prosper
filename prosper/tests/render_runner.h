@@ -2791,6 +2791,96 @@ inline bool is_retained_ds_plane(uint64_t addr, uint32_t* w = nullptr, uint32_t*
     }
     return false;
 }
+// Why a sampled-depth lookup missed, classified against the retained-DS cache.
+//
+// Pure and environment-free on purpose. The logging path that consumes it is gated on
+// PROSPER_DSBRIDGE_LOG, which is read into a function-local static — so a test that armed that
+// variable would both trip the cached-env-arming guard and depend on nothing having called the
+// bridge earlier in the process. Keeping the classification separate makes the reasoning testable
+// without either hazard, and the log becomes a thin consumer.
+struct DsBridgeMiss {
+    // An enum rather than a string, so a consumer cannot compare against a literal that no longer
+    // exists and cannot construct a string_view from a null reason. `None` is a real state: the
+    // address matched a plane and nothing disqualified it, which is what a SERVABLE address
+    // classifies as.
+    enum class Reason { None, NoEntry, Extent, Uninitialized, StencilInvalid, DepthInvalid };
+    Reason reason = Reason::NoEntry;
+    bool matched_plane = false;      // the address is a plane of SOME retained surface
+    bool extent_is_reason = false;   // ...and nothing at that address was the right size
+    uint32_t cached_w = 0, cached_h = 0;  // a mismatching sibling's extent, for the detail string
+};
+// The reason word the bridge log prints; empty for NoEntry (that bucket is unbounded and genuinely
+// "not ours") and for None.
+inline const char* ds_bridge_miss_reason_name(DsBridgeMiss::Reason reason) {
+    switch (reason) {
+        case DsBridgeMiss::Reason::Extent:         return "extent";
+        case DsBridgeMiss::Reason::Uninitialized:  return "uninitialized";
+        case DsBridgeMiss::Reason::StencilInvalid: return "stencil-invalid";
+        case DsBridgeMiss::Reason::DepthInvalid:   return "depth-invalid";
+        case DsBridgeMiss::Reason::NoEntry:
+        case DsBridgeMiss::Reason::None:           break;
+    }
+    return "";
+}
+inline DsBridgeMiss classify_ds_bridge_miss(uint64_t addr, uint32_t width, uint32_t height,
+                                            uint32_t render_scale = 1,
+                                            bool normalized_sampling = true) {
+    DsBridgeMiss out;
+    bool extent_bad = false, uninit = false, depth_req = false, stencil_req = false;
+    // Did ANY entry at this address have a usable extent? One address can hold several cache
+    // entries — a live surface plus a stale sibling retained at a different size — and only this
+    // flag separates "nothing here is the right size" from "the right size is here and failed for
+    // another reason". Without it a stale sibling sets extent_bad and, being tested first, masks
+    // the real reason permanently.
+    bool extent_ok_exists = false;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        const bool d = key.dr == addr || key.dw == addr;
+        const bool st = key.sr == addr || key.sw == addr;
+        if (!d && !st) continue;
+        out.matched_plane = true;
+        if (!prosper::frontend::rtt_sampled_extent_compatible(
+                width, height, key.w, key.h, render_scale, normalized_sampling)) {
+            extent_bad = true;
+            out.cached_w = key.w;
+            out.cached_h = key.h;
+            continue;
+        }
+        extent_ok_exists = true;
+        if (!image.layout_initialized || !image.image) { uninit = true; continue; }
+        if (d && !image.depth_valid) depth_req = true;
+        if (st && !image.stencil_valid) stencil_req = true;
+    }
+    // Extent is the reason ONLY when nothing at this address was the right size. Previously any
+    // single wrong-sized sibling won this branch outright, so a surface prosper held at exactly the
+    // requested size and declined for depth-invalid was reported as an extent mismatch against the
+    // sibling's dimensions — naming the wrong entry, the wrong problem, and a fix that does not
+    // exist. Measured on Grand Theft Auto V (PPSA04263): 0x20945c0000 reported
+    // "extent (T# wants 1024x1536, retained image is 3840x2160)" 1403 times on one route while the
+    // cache simultaneously held a 1024x1536 D32_SFLOAT entry at that very address.
+    out.extent_is_reason = extent_bad && !extent_ok_exists;
+    if (!out.matched_plane)          out.reason = DsBridgeMiss::Reason::NoEntry;
+    else if (out.extent_is_reason)   out.reason = DsBridgeMiss::Reason::Extent;
+    else if (uninit)                 out.reason = DsBridgeMiss::Reason::Uninitialized;
+    else if (stencil_req)            out.reason = DsBridgeMiss::Reason::StencilInvalid;
+    else if (depth_req)              out.reason = DsBridgeMiss::Reason::DepthInvalid;
+    else                             out.reason = DsBridgeMiss::Reason::None;
+    return out;
+}
+// The reason text the bridge log prints. Keyed off the CLASSIFIED reason, never off "some sibling
+// mismatched": those had drifted apart, so a surface declined for depth-invalid still printed the
+// extent sentence describing a stale sibling — text that contradicted the counter it was filed
+// under and described a mismatch that was not the reason for anything.
+inline std::string ds_bridge_miss_detail(const DsBridgeMiss& miss, uint32_t width, uint32_t height) {
+    if (miss.reason == DsBridgeMiss::Reason::None ||
+        miss.reason == DsBridgeMiss::Reason::NoEntry) return {};
+    char detail[96];
+    if (miss.extent_is_reason)
+        std::snprintf(detail, sizeof detail, "extent (T# wants %ux%u, retained image is %ux%u)",
+                      width, height, miss.cached_w, miss.cached_h);
+    else
+        std::snprintf(detail, sizeof detail, "%s", ds_bridge_miss_reason_name(miss.reason));
+    return detail;
+}
 inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t width,
                                                       uint32_t height,
                                                       uint32_t render_scale = 1,
@@ -2868,55 +2958,33 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
         } else {
             // Classify the miss against the cache, so "no such surface" is never confused with
             // "the surface is here and we declined it" -- they call for opposite fixes.
-            bool matched_plane = false, extent_bad = false, uninit = false;
-            bool depth_req = false, stencil_req = false;
-            uint32_t cached_w = 0, cached_h = 0;
-            for (const auto& [key, image] : persistent_ds_cache()) {
-                const bool d = key.dr == addr || key.dw == addr;
-                const bool st = key.sr == addr || key.sw == addr;
-                if (!d && !st) continue;
-                matched_plane = true;
-                if (!prosper::frontend::rtt_sampled_extent_compatible(
-                        width, height, key.w, key.h, render_scale, normalized_sampling)) {
-                    extent_bad = true;
-                    cached_w = key.w;
-                    cached_h = key.h;
-                    continue;
-                }
-                if (!image.layout_initialized || !image.image) { uninit = true; continue; }
-                if (d && !image.depth_valid) depth_req = true;
-                if (st && !image.stencil_valid) stencil_req = true;
+            const DsBridgeMiss miss = classify_ds_bridge_miss(
+                addr, width, height, render_scale, normalized_sampling);
+            switch (miss.reason) {
+                case DsBridgeMiss::Reason::NoEntry:
+                    stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::Extent:
+                    stats.miss_extent.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::Uninitialized:
+                    stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::StencilInvalid:
+                    stats.miss_stencil_invalid.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::DepthInvalid:
+                    stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::None: break;  // servable; the selector, not this, decides
             }
-            const char* why = nullptr;
-            if (!matched_plane) { stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed); }
-            else if (extent_bad) { stats.miss_extent.fetch_add(1, std::memory_order_relaxed);
-                                   why = "extent"; }
-            else if (uninit) { stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed);
-                               why = "uninitialized"; }
-            else if (stencil_req) {
-                stats.miss_stencil_invalid.fetch_add(1, std::memory_order_relaxed);
-                why = "stencil-invalid"; }
-            else if (depth_req) { stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed);
-                                  why = "depth-invalid"; }
             // Per-ADDRESS, because an aggregate cannot name the fix. A run reporting
             // "depth-invalid=1089" says a thousand bindings declined; it does not say whether that
             // is one surface declining a thousand times or a thousand surfaces declining once, and
             // those are different defects. Only addresses that DID match a live surface are kept --
             // the no-entry bucket is unbounded and is genuinely just "not ours".
-            if (why) {
+            if (!ds_bridge_miss_detail(miss, width, height).empty()) {
                 static std::mutex reason_mutex;
                 std::lock_guard lock(reason_mutex);
                 auto& per = per_address_misses();
                 if (per.size() < 256 || per.count(addr)) {
                     auto& row = per[addr];
-                    char detail[96];
-                    if (extent_bad)
-                        std::snprintf(detail, sizeof detail,
-                                      "extent (T# wants %ux%u, retained image is %ux%u)",
-                                      width, height, cached_w, cached_h);
-                    else
-                        std::snprintf(detail, sizeof detail, "%s", why);
-                    row.first = detail;
+                    row.first = ds_bridge_miss_detail(miss, width, height);
                     ++row.second;
                 }
             }
