@@ -759,29 +759,25 @@ bool capture_blob_payload_omitted(const GpuCaptureBlob& blob) {
            blob.content_hash == gpu_capture_hash(nullptr, 0);
 }
 
-// True when this compute's blob-backed resources reference payloads that were deliberately omitted,
-// i.e. we are validating a bundle MANIFEST rather than a capture.
+// True when EVERY blob in this capture had its payload deliberately omitted -- i.e. this is a bundle
+// MANIFEST, not a capture.
 //
-// The provenance proof still happens -- just not here. Every capture reaching
+// Capture-level and all_of, deliberately. make_capture_manifest() strips every blob, so that is the
+// manifest's signature; sampling a single resource instead would let one degenerate blob in a
+// hand-edited or corrupt .prgcap disable provenance validation for a whole compute -- including on
+// the materialize_gpu_replay() path, which is the gate standing between a bundle and a relocation
+// replayed without provenance.
+//
+// The proof still happens, just not against the projection. Every capture reaching
 // append_gpu_capture_bundle() is produced by capture_submit_items(), which runs
-// validate_failure_diagnostics() on the payload-BEARING object at capture time
-// (capture_failure_diagnostics -> validate_failure_diagnostics). The manifest is then a projection of
-// that already-validated capture with its payloads stripped, so re-running the deep proof against it
-// is duplication that cannot succeed: host_data would point into an empty vector.
-//
-// Getting this wrong is what made every GTA V F9 bundle abort. The version gates (`< 51`, `< 53`)
-// used to short-circuit two of these validators, so the blob dereference was never reached; fixing a
-// dropped format_version (#2718) removed that accidental shield and the real incompatibility
-// surfaced as "packed-pointer state references an invalid resource blob" on 3 of 4 gameplay grabs.
-bool captured_compute_payloads_omitted(const GpuCaptureFile& capture,
-                                       const GpuCapturedCompute& compute) {
-    if (!compute.resources.present) return false;
-    return std::any_of(compute.resources.resources.begin(), compute.resources.resources.end(),
-                       [&](const GpuCapturedResource& captured) {
-                           return captured.blob_index != UINT32_MAX &&
-                                  captured.blob_index < capture.blobs.size() &&
-                                  capture_blob_payload_omitted(capture.blobs[captured.blob_index]);
-                       });
+// validate_failure_diagnostics() on the payload-BEARING object at capture time. That is an invariant
+// of its two callers (gpu_timeline.cpp's append_runtime_capture_bundle and
+// append_capture_to_frame_bundle, both fed by capture_gpustate_submit /
+// capture_gpustate_target_submit) and is enforced nowhere else: a third caller must preserve it, or
+// restore validation by another route.
+bool capture_is_manifest(const GpuCaptureFile& capture) {
+    return !capture.blobs.empty() &&
+           std::all_of(capture.blobs.begin(), capture.blobs.end(), capture_blob_payload_omitted);
 }
 
 struct Interval {
@@ -1687,6 +1683,19 @@ bool validate_captured_nullable_output_raw_buffer(
         return false;
     }
 
+    // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
+    // launch dimensions and recompile provenance in full, and on the deserialize side those are the
+    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
+    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
+    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    if (capture_is_manifest(capture)) return true;
+
+    // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
+    // launch dimensions and recompile provenance in full, and on the deserialize side those are the
+    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
+    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
+    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+
     ShaderResourceTable validated_resources;
     validated_resources.resources.reserve(compute.resources.resources.size());
     for (const GpuCapturedResource& captured : compute.resources.resources) {
@@ -1697,10 +1706,9 @@ bool validate_captured_nullable_output_raw_buffer(
                 return false;
             }
             if (captured.blob_index >= capture.blobs.size() ||
-                (!capture_blob_payload_omitted(capture.blobs[captured.blob_index]) &&
-                 (captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
-                  kGtaNullableOutputWitnessBytes >
-                      capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset))) {
+                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
+                kGtaNullableOutputWitnessBytes >
+                    capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset) {
                 error = "nullable-output marker lacks its table witness";
                 return false;
             }
@@ -1742,6 +1750,13 @@ bool validate_captured_gta5_cf9200_no_backing(
         return false;
     }
 
+    // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
+    // launch dimensions and recompile provenance in full, and on the deserialize side those are the
+    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
+    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
+    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    if (capture_is_manifest(capture)) return true;
+
     ShaderResourceTable validated_resources;
     validated_resources.resources.reserve(compute.resources.resources.size());
     for (const GpuCapturedResource& captured : compute.resources.resources) {
@@ -1755,10 +1770,9 @@ bool validate_captured_gta5_cf9200_no_backing(
         }
         if (relevant) {
             if (captured.blob_index >= capture.blobs.size() ||
-                (!capture_blob_payload_omitted(capture.blobs[captured.blob_index]) &&
-                 (captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
-                  kGtaCf9200RootBytes >
-                      capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset))) {
+                captured.blob_offset > capture.blobs[captured.blob_index].bytes.size() ||
+                kGtaCf9200RootBytes >
+                    capture.blobs[captured.blob_index].bytes.size() - captured.blob_offset) {
                 error = "GTA root-record marker lacks its 224-byte witness";
                 return false;
             }
@@ -1800,12 +1814,6 @@ bool validate_captured_gta5_packed_pointer(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
-    // A payload-stripped MANIFEST cannot carry this proof: host_data would point into an empty
-    // vector, so the deep discover/validate below would fail for a capture whose provenance is
-    // sound. The proof already ran on the payload-bearing capture at capture time -- see
-    // captured_compute_payloads_omitted(). Skipping here loses nothing; failing here aborted every
-    // F9 bundle on GTA V.
-    if (captured_compute_payloads_omitted(capture, compute)) return true;
 
     const size_t candidates = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
@@ -1829,6 +1837,13 @@ bool validate_captured_gta5_packed_pointer(
         error = "packed-pointer state has stale captured launch provenance";
         return false;
     }
+
+    // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
+    // launch dimensions and recompile provenance in full, and on the deserialize side those are the
+    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
+    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
+    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    if (capture_is_manifest(capture)) return true;
 
     ShaderResourceTable validated_resources;
     validated_resources.resources.reserve(compute.resources.resources.size());
@@ -1876,12 +1891,6 @@ bool validate_captured_indirect_pointer_relocations(
         const GpuCaptureFile& capture, const GpuCapturedCompute& compute,
         std::string& error) {
     if (!compute.resources.present) return true;
-    // A payload-stripped MANIFEST cannot carry this proof: host_data would point into an empty
-    // vector, so the deep discover/validate below would fail for a capture whose provenance is
-    // sound. The proof already ran on the payload-bearing capture at capture time -- see
-    // captured_compute_payloads_omitted(). Skipping here loses nothing; failing here aborted every
-    // F9 bundle on GTA V.
-    if (captured_compute_payloads_omitted(capture, compute)) return true;
 
     const size_t marked = static_cast<size_t>(std::count_if(
         compute.resources.resources.begin(), compute.resources.resources.end(),
@@ -1930,6 +1939,13 @@ bool validate_captured_indirect_pointer_relocations(
         error = "indirect-pointer relocation has stale captured launch provenance";
         return false;
     }
+
+    // Below the payload-INDEPENDENT checks above on purpose: a manifest carries markers, counts,
+    // launch dimensions and recompile provenance in full, and on the deserialize side those are the
+    // only validation it ever receives. What it cannot carry is the witness BYTES, and everything
+    // past this point dereferences them -- `blob.bytes.data() + blob_offset` on an empty vector is
+    // `nullptr + offset`, declared as large as the witness, which the proof then reads through.
+    if (capture_is_manifest(capture)) return true;
 
     ShaderResourceTable validated_resources;
     validated_resources.resources.reserve(compute.resources.resources.size());

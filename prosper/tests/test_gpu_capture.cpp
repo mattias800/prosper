@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/gpu_capture_bundle.hpp"
 #include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/guest_texture_layout.hpp"
 #include "../src/gpu/pm4_registers.hpp"
@@ -2504,6 +2505,75 @@ int main(int argc, char** argv) {
               nullable_capture.computes[0].resources.resources[0].captured_size ==
                   kGtaNullableOutputWitnessBytes,
           "capture retains the exact nullable-output shader, launch, marker, and table witness");
+
+    // A bundle MANIFEST must not be asked to re-prove provenance whose witness bytes it strips.
+    //
+    // make_capture_manifest() empties every blob deliberately (the bytes live in the bundle's dedup
+    // dictionary), while this validator bounds-checks the witness and then forms
+    // `blob.bytes.data() + blob_offset`, declaring it as large as the witness. On a manifest that is
+    // `nullptr + blob_offset`, and the downstream proof reads through it. Before this was guarded, a
+    // GTA V F9 grab either reported a misleading witness error or SEGFAULTED mid-capture.
+    //
+    // The filler resource below the marker is load-bearing: it makes the two intervals MERGE, so the
+    // marker's blob_offset is non-zero. At offset 0 the same defect only mis-reports; the crash needs
+    // a non-zero offset, which is the ordinary case in a real capture.
+    {
+        constexpr uint64_t filler_addr = nullable_table_addr - 64u;
+        std::array<uint8_t, 64> filler_bytes{};
+        ShaderResource filler;
+        filler.cls = ResourceClass::ConstantBuffer;
+        filler.format = DataFormat::Unknown;
+        filler.num_components = 0u;
+        filler.gpu_addr = filler_addr;
+        filler.size = static_cast<uint32_t>(filler_bytes.size());
+        filler.fetch_pc = 12u;
+        filler.host_data = filler_bytes.data();
+        filler.host_data_size = filler_bytes.size();
+
+        ComputeItem merged_compute = nullable_compute;
+        merged_compute.resources = std::make_shared<ShaderResourceTable>();
+        merged_compute.resources->resources.push_back(filler);
+        merged_compute.resources->resources.push_back(nullable_marker);
+
+        auto merged_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+            if (addr >= filler_addr && addr < filler_addr + filler_bytes.size()) {
+                const size_t offset = static_cast<size_t>(addr - filler_addr);
+                const size_t take = std::min(n, filler_bytes.size() - offset);
+                std::memcpy(dst, filler_bytes.data() + offset, take);
+                return take;
+            }
+            return nullable_reader(addr, dst, n);
+        };
+
+        GpuCaptureFile merged_capture;
+        const bool merged_ok = capture_submit_items({}, {merged_compute}, nullable_operations, meta,
+                                                    merged_reader, merged_capture, error);
+        const auto& marker_resource = merged_capture.computes[0].resources.resources.back();
+        CHECK(merged_ok && merged_capture.computes.size() == 1u &&
+                  marker_resource.blob_offset != 0u,
+              "the merged-interval fixture really does give the marker a non-zero blob offset");
+
+        GpuCaptureBundle witness_bundle;
+        std::string bundle_error;
+        const bool appended =
+            merged_ok && append_gpu_capture_bundle(witness_bundle, merged_capture, bundle_error);
+        CHECK(appended,
+              ("a capture whose witness is blob-backed at a non-zero offset appends to a bundle: " +
+               bundle_error).c_str());
+
+        GpuCaptureFile witness_manifest;
+        CHECK(appended &&
+                  materialize_gpu_capture_bundle_manifest(witness_bundle, 0, witness_manifest,
+                                                          bundle_error) &&
+                  !witness_manifest.blobs.empty() && witness_manifest.blobs[0].bytes.empty(),
+              "the manifest really did strip the payload -- otherwise the arm above is vacuous");
+        GpuCaptureFile witness_restored;
+        CHECK(appended &&
+                  materialize_gpu_capture_bundle_submit(witness_bundle, 0, witness_restored,
+                                                        bundle_error) &&
+                  !witness_restored.blobs.empty() && !witness_restored.blobs[0].bytes.empty(),
+              "and materialization restores it from the dictionary");
+    }
     std::vector<uint8_t> nullable_capture_bytes;
     GpuCaptureFile nullable_loaded;
     GpuReplayFrame nullable_replay;
