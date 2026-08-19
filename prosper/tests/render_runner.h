@@ -2799,11 +2799,29 @@ inline bool is_retained_ds_plane(uint64_t addr, uint32_t* w = nullptr, uint32_t*
 // bridge earlier in the process. Keeping the classification separate makes the reasoning testable
 // without either hazard, and the log becomes a thin consumer.
 struct DsBridgeMiss {
+    // An enum rather than a string, so a consumer cannot compare against a literal that no longer
+    // exists and cannot construct a string_view from a null reason. `None` is a real state: the
+    // address matched a plane and nothing disqualified it, which is what a SERVABLE address
+    // classifies as.
+    enum class Reason { None, NoEntry, Extent, Uninitialized, StencilInvalid, DepthInvalid };
+    Reason reason = Reason::NoEntry;
     bool matched_plane = false;      // the address is a plane of SOME retained surface
     bool extent_is_reason = false;   // ...and nothing at that address was the right size
-    const char* why = nullptr;       // nullptr when the address matched nothing at all
     uint32_t cached_w = 0, cached_h = 0;  // a mismatching sibling's extent, for the detail string
 };
+// The reason word the bridge log prints; empty for NoEntry (that bucket is unbounded and genuinely
+// "not ours") and for None.
+inline const char* ds_bridge_miss_reason_name(DsBridgeMiss::Reason reason) {
+    switch (reason) {
+        case DsBridgeMiss::Reason::Extent:         return "extent";
+        case DsBridgeMiss::Reason::Uninitialized:  return "uninitialized";
+        case DsBridgeMiss::Reason::StencilInvalid: return "stencil-invalid";
+        case DsBridgeMiss::Reason::DepthInvalid:   return "depth-invalid";
+        case DsBridgeMiss::Reason::NoEntry:
+        case DsBridgeMiss::Reason::None:           break;
+    }
+    return "";
+}
 inline DsBridgeMiss classify_ds_bridge_miss(uint64_t addr, uint32_t width, uint32_t height,
                                             uint32_t render_scale = 1,
                                             bool normalized_sampling = true) {
@@ -2840,11 +2858,12 @@ inline DsBridgeMiss classify_ds_bridge_miss(uint64_t addr, uint32_t width, uint3
     // "extent (T# wants 1024x1536, retained image is 3840x2160)" 1403 times on one route while the
     // cache simultaneously held a 1024x1536 D32_SFLOAT entry at that very address.
     out.extent_is_reason = extent_bad && !extent_ok_exists;
-    if (!out.matched_plane)          out.why = nullptr;
-    else if (out.extent_is_reason)   out.why = "extent";
-    else if (uninit)                 out.why = "uninitialized";
-    else if (stencil_req)            out.why = "stencil-invalid";
-    else if (depth_req)              out.why = "depth-invalid";
+    if (!out.matched_plane)          out.reason = DsBridgeMiss::Reason::NoEntry;
+    else if (out.extent_is_reason)   out.reason = DsBridgeMiss::Reason::Extent;
+    else if (uninit)                 out.reason = DsBridgeMiss::Reason::Uninitialized;
+    else if (stencil_req)            out.reason = DsBridgeMiss::Reason::StencilInvalid;
+    else if (depth_req)              out.reason = DsBridgeMiss::Reason::DepthInvalid;
+    else                             out.reason = DsBridgeMiss::Reason::None;
     return out;
 }
 // The reason text the bridge log prints. Keyed off the CLASSIFIED reason, never off "some sibling
@@ -2852,13 +2871,14 @@ inline DsBridgeMiss classify_ds_bridge_miss(uint64_t addr, uint32_t width, uint3
 // extent sentence describing a stale sibling — text that contradicted the counter it was filed
 // under and described a mismatch that was not the reason for anything.
 inline std::string ds_bridge_miss_detail(const DsBridgeMiss& miss, uint32_t width, uint32_t height) {
-    if (!miss.why) return {};
+    if (miss.reason == DsBridgeMiss::Reason::None ||
+        miss.reason == DsBridgeMiss::Reason::NoEntry) return {};
     char detail[96];
     if (miss.extent_is_reason)
         std::snprintf(detail, sizeof detail, "extent (T# wants %ux%u, retained image is %ux%u)",
                       width, height, miss.cached_w, miss.cached_h);
     else
-        std::snprintf(detail, sizeof detail, "%s", miss.why);
+        std::snprintf(detail, sizeof detail, "%s", ds_bridge_miss_reason_name(miss.reason));
     return detail;
 }
 inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t width,
@@ -2940,20 +2960,25 @@ inline PersistentDsSampled find_persistent_ds_sampled(uint64_t addr, uint32_t wi
             // "the surface is here and we declined it" -- they call for opposite fixes.
             const DsBridgeMiss miss = classify_ds_bridge_miss(
                 addr, width, height, render_scale, normalized_sampling);
-            if (!miss.matched_plane) { stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed); }
-            else if (miss.extent_is_reason) { stats.miss_extent.fetch_add(1, std::memory_order_relaxed); }
-            else if (miss.why == std::string_view("uninitialized")) {
-                stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed); }
-            else if (miss.why == std::string_view("stencil-invalid")) {
-                stats.miss_stencil_invalid.fetch_add(1, std::memory_order_relaxed); }
-            else if (miss.why == std::string_view("depth-invalid")) {
-                stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed); }
+            switch (miss.reason) {
+                case DsBridgeMiss::Reason::NoEntry:
+                    stats.miss_no_entry.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::Extent:
+                    stats.miss_extent.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::Uninitialized:
+                    stats.miss_uninitialized.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::StencilInvalid:
+                    stats.miss_stencil_invalid.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::DepthInvalid:
+                    stats.miss_depth_invalid.fetch_add(1, std::memory_order_relaxed); break;
+                case DsBridgeMiss::Reason::None: break;  // servable; the selector, not this, decides
+            }
             // Per-ADDRESS, because an aggregate cannot name the fix. A run reporting
             // "depth-invalid=1089" says a thousand bindings declined; it does not say whether that
             // is one surface declining a thousand times or a thousand surfaces declining once, and
             // those are different defects. Only addresses that DID match a live surface are kept --
             // the no-entry bucket is unbounded and is genuinely just "not ours".
-            if (miss.why) {
+            if (!ds_bridge_miss_detail(miss, width, height).empty()) {
                 static std::mutex reason_mutex;
                 std::lock_guard lock(reason_mutex);
                 auto& per = per_address_misses();

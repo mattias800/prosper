@@ -124,7 +124,7 @@ int main() {
         CHECK(found.width == kWantW && found.height == kWantH,
               "the served view reports the retained entry's own extent");
         const auto miss = prosper::test::classify_ds_bridge_miss(kAddr, kWantW, kWantH);
-        CHECK(miss.why == nullptr || std::string(miss.why).empty(),
+        CHECK(miss.reason == prosper::test::DsBridgeMiss::Reason::None,
               "a servable address classifies with no miss reason");
 
         cache.erase(stale);
@@ -135,8 +135,11 @@ int main() {
     // reason.
     {
         const auto miss = prosper::test::classify_ds_bridge_miss(0x20dead0000ull, kWantW, kWantH);
-        CHECK(!miss.matched_plane && miss.why == nullptr,
-              "an unknown address matches no plane and is given no reason");
+        CHECK(!miss.matched_plane &&
+                  miss.reason == prosper::test::DsBridgeMiss::Reason::NoEntry,
+              "an unknown address matches no plane and is classified as no-entry");
+        CHECK(reason_of(miss).empty(),
+              "no-entry prints no reason text: that bucket is unbounded and genuinely not ours");
     }
 
     if (failures) {
