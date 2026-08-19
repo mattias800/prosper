@@ -78,14 +78,14 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | Nikoderiko: The Magical World | `PPSA23760` | 2 | `12----` | - | none | [#1607](https://github.com/mattias800/prosper/issues/1607) | [#1885](https://github.com/mattias800/prosper/issues/1885) | [`NIKODERIKO_STATUS.md`](prosper/docs/NIKODERIKO_STATUS.md) |
 | R-Type Delta: HD Boosted | `PPSA26414` | 2 | `12----` | - | none | [#1746](https://github.com/mattias800/prosper/issues/1746), [#1591](https://github.com/mattias800/prosper/issues/1591) | [#1810](https://github.com/mattias800/prosper/issues/1810) | [`R_TYPE_DELTA_STATUS.md`](prosper/docs/R_TYPE_DELTA_STATUS.md) |
 | Sonic Frontiers | `PPSA03831` | 2 | `12----` | - | none | [#2206](https://github.com/mattias800/prosper/issues/2206), [#657](https://github.com/mattias800/prosper/issues/657) | [#1891](https://github.com/mattias800/prosper/issues/1891) | [`SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) |
-| Tales of Graces f Remastered | `PPSA19991` | 2 | `12----` | - | none | [#1688](https://github.com/mattias800/prosper/issues/1688), [#1673](https://github.com/mattias800/prosper/issues/1673) | [#1889](https://github.com/mattias800/prosper/issues/1889) | - |
+| Sonic Racing: CrossWorlds | `PPSA08804` | 2 | `12----` | - | none | [#2361](https://github.com/mattias800/prosper/issues/2361), [#2362](https://github.com/mattias800/prosper/issues/2362), [#2363](https://github.com/mattias800/prosper/issues/2363), [#2309](https://github.com/mattias800/prosper/issues/2309), [#2303](https://github.com/mattias800/prosper/issues/2303) | [#1895](https://github.com/mattias800/prosper/issues/1895) | [`SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md) |
+| Tales of Graces f Remastered | `PPSA19991` | 2 | `12----` | - | none | [#1688](https://github.com/mattias800/prosper/issues/1688), [#1673](https://github.com/mattias800/prosper/issues/1673), [#2731](https://github.com/mattias800/prosper/issues/2731) | [#1889](https://github.com/mattias800/prosper/issues/1889) | - |
 | The Forgotten City | `PPSA03026` | 2 | `12----` | - | none | [#1961](https://github.com/mattias800/prosper/issues/1961), [#1945](https://github.com/mattias800/prosper/issues/1945), [#1226](https://github.com/mattias800/prosper/issues/1226) | [#1890](https://github.com/mattias800/prosper/issues/1890) | - |
 | The Oregon Trail | `PPSA19244` | 2 | `12----` | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#1606](https://github.com/mattias800/prosper/issues/1606), [#1641](https://github.com/mattias800/prosper/issues/1641), [#1634](https://github.com/mattias800/prosper/issues/1634) | [#1886](https://github.com/mattias800/prosper/issues/1886) | [`OREGON_TRAIL_STATUS.md`](prosper/docs/OREGON_TRAIL_STATUS.md) |
 | The Pathless | `PPSA01826` | 2 | `12----` | - | none | [#1570](https://github.com/mattias800/prosper/issues/1570), [#1213](https://github.com/mattias800/prosper/issues/1213) | [#1883](https://github.com/mattias800/prosper/issues/1883) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | The Plucky Squire | `PPSA15319` | 2 | `12----` | - | none | [#1390](https://github.com/mattias800/prosper/issues/1390), [#1554](https://github.com/mattias800/prosper/issues/1554) | [#1882](https://github.com/mattias800/prosper/issues/1882) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
+| Sonic Origins | `PPSA05325` | 1 | `1-----` | - | none | [#2267](https://github.com/mattias800/prosper/issues/2267), [#2731](https://github.com/mattias800/prosper/issues/2731), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) |
 | ArcRunner | `PPSA21406` | 0 | `------` | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/ARCRUNNER_STATUS.md) |
-| Sonic Origins | `PPSA05325` | 0 | `------` | - | none | [#1905](https://github.com/mattias800/prosper/issues/1905) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) |
-| Sonic Racing: CrossWorlds | `PPSA08804` | 0 | `------` | - | none | - | [#1895](https://github.com/mattias800/prosper/issues/1895) | - |
 
 ## Counts
 
@@ -94,8 +94,9 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 1 |
 | 3 -- gameplay with real GPU draws | 5 |
-| 2 -- title screen | 16 |
-| 0 -- not started | 3 |
+| 2 -- title screen | 17 |
+| 1 -- any real graphics | 1 |
+| 0 -- not started | 1 |
 
 **4 of 39** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
