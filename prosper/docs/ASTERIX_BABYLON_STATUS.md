@@ -71,34 +71,45 @@ t=180-240s                             the level's title card, "ON THE ROAD TO U
 t=250s ->                              unobstructed gameplay, unbroken to t=600s
 ```
 
-### Why the route presses Triangle, not just Cross
+### Why the route presses Triangle — and why it must STOP pressing it
 
 Every cutscene frame draws its **Skip** prompt bound to **Triangle**. An exploratory Cross-only mash
 therefore crossed the logos and the title menu correctly and then sat through `Cinematic_A1_Part_1` →
 `A1_Part_2` → `A2` for 215 seconds without skipping one of them, ending the run still in a cutscene.
 
 **Stated exactly, because the stronger version is not measured:** what is established is that Cross
-does not *skip* a cutscene, and that Triangle shortens the path to the world map decisively — from
-"still in `Cinematic_A2` at t=270 s" to "on the map at t~125 s". What is **not** established is
-whether the cinematics terminate on their own: the Cross-only run was bounded at 320 s and ended
-105 s into `Cinematic_A2`, so a longer Cross-only run might still reach gameplay by simply waiting.
-Nobody should read this as "Cross alone can never reach gameplay" — it was not tested, and the one
-run that could have tested it was stopped first.
+does not *skip* a cutscene, and that Triangle shortens the path to the world map decisively. What is
+**not** established is whether the cinematics terminate on their own — the Cross-only run was bounded
+at 320 s and ended 105 s into `Cinematic_A2`, so a longer Cross-only run might reach gameplay by
+waiting. Nobody should read this as "Cross alone can never reach gameplay".
 
-The world map is a region-select screen whose own footer reads `MAIN MENU (circle)  (cross) SELECTION`;
-Cross enters the highlighted region. The level the route lands in is `World_3_10`, which the map
-labels **Coastal Region**. Whether that is also the level PS5 hardware enters first is **not**
-established here — that is rung-5 work.
+**Triangle is bound to something else after the cinematics, and mashing it there breaks the route.**
+Once the `Map` scene loads, the title shows a character-select screen whose footer reads:
+
+```text
+(circle) BACK    (cross) START    (square) CUNEIFORM TABLET    (triangle) COSTUMES
+```
+
+Triangle there is **COSTUMES**. The first version of this route mashed Triangle to the end of the run,
+so it fought its own Cross on that screen and reaching `START` became timing luck. That is measured,
+not feared — see `## Ruled out`. The committed route therefore confines Triangle to a bounded
+cinematic window (46–149 s) and is **Cross-only from 152 s onward**.
 
 ### Verification of the run itself
 
 Two bounded runs on `2703a6c3`, both `--allow-guest-fault`, both ending `status=ok` with `guest=running`
 and exit 0:
 
-| run | route | samples | source-distinct | pixel-distinct | reached |
-| --- | --- | --- | --- | --- | --- |
-| `explore1` | Cross only | 45/45 @ 6 s | 45 | 41 | cinematics only (no skip) |
-| `skip2` | Cross + Triangle | 60/60 @ 10 s | 60 | 58 | **level at t~172 s, clear gameplay from t~250 s** |
+| run | route | samples | source-distinct | pixel-distinct | status | reached |
+| --- | --- | --- | --- | --- | --- | --- |
+| `explore1` | Cross only | 45/45 @ 6 s | 45 | 41 | ok | cinematics only (no skip) |
+| `skip2` | Triangle to the end | 60/60 @ 10 s | 60 | 58 | ok | **level at t~172 s, clear gameplay from t~250 s** |
+| `repro3` | Triangle to the end | 60/60 @ 10 s | 60 | 58 | ok | **character select only — never left it, 495 s** |
+
+**Read the last two rows together: they are the same route and every summary number is identical.**
+`repro3` was *faster* to the map (105 s against 125 s) and still never started the level. Rung 3 rests
+on `skip2`, which is a real, inspected gameplay run; what `repro3` falsifies is the *reliability* of
+the first route, and the fix is the Cross-only third phase above.
 
 The transition is sharp and is the number a rung-6 guard should key on: distinct colours per sample go
 **2,170 → 220,066 between t=240 s and t=250 s**, then hold at 214,981-220,066 across all 35 remaining
@@ -534,6 +545,18 @@ HLE registration. #1599, #1884.
   *Asterix & Obelix: Slap Them All!* (`PPSA08576`, label `game:asterix`), a different game; its own
   header says so. It presses only Cross, which cannot skip this title's cinematics. This title's route
   is `prosper/scripts/asterix-babylon/reach-gameplay.pad`. #1884.
+- **A blanket Triangle mash as a safe "skip everything" for this title:** Triangle is the cutscene
+  **Skip**, but after the `Map` scene loads it is **COSTUMES** on the character-select screen
+  (footer: `(circle) BACK  (cross) START  (square) CUNEIFORM TABLET  (triangle) COSTUMES`). A route
+  that keeps pressing it fights its own Cross and reaching `START` becomes timing luck: two runs of
+  the identical Triangle-to-the-end route reached gameplay once and sat on that screen for 495 s the
+  other time. Triangle was being *consumed*, not ignored — the costume itself changed from
+  `LEGIONARY` at t=130 s to `GOLD` at t=600 s. Confine Triangle to the cinematic window. #1884.
+- **Summary metrics as evidence that a route reached its target:** the successful and the stuck run
+  reported **identical** `60/60 samples, source-distinct 60, pixel-distinct 58, max-source-stale 0.0s,
+  guest=running, status=ok`. An animating menu is as source- and pixel-distinct as a level. Only the
+  scene-file sequence separated them (`level3` + a `World_X_Y`/`World_X_Y_Level` pair versus `level4`
+  alone). Assert the *scene*, not the pixel counters. #1884.
 - **Cross as a universal "advance" for this title:** Cross crosses the logos, the splash and the
   `ADVENTURE` / `OPTIONS` menu, and it is `SELECTION` on the world map — but the cutscene **Skip**
   prompt is bound to **Triangle**. A Cross-only mash sat through 215 s of `Cinematic_A1_Part_1` →
