@@ -30,7 +30,14 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
+// `checks` counts assertions ACTUALLY EXECUTED, which `fails` cannot. Without it, deleting a block
+// of this file -- or failing to carry one across when someone eventually breaks these 12,787 lines
+// into several translation units -- leaves the suite green with fewer assertions running, and
+// nothing anywhere reports the difference. A silently smaller test is indistinguishable from a
+// passing one, which is the failure mode this project's charter names most often.
+static int checks = 0;
+#define CHECK(c, m) do { ++checks; \
+                         if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 // IEEE float32 -> float16 for NORMAL, in-range, exactly-representable inputs (chosen in the tests so
@@ -12781,7 +12788,7 @@ int main() {
               "64-byte IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
+    if (fails) { printf("== FAIL: %d of %d checks ==\n", fails, checks); return 1; }
+    printf("== PASS: %d checks ==\n", checks);
     return 0;
 }
