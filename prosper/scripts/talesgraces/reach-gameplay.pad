@@ -1,0 +1,109 @@
+# Tales of Graces f Remastered (PPSA19991) — boot to gameplay (the Lhant Hill prologue).
+#
+# VALIDATED on Linux with hardware Vulkan (RADV, AMD Radeon 8060S / STRIX_HALO), native
+# 1920x1080, headless `tools/screenshot` frontend, PROSPER_RENDER=1, no render acceleration.
+#
+# WHY reach-options.pad stops at the settings screen, and why Cross alone can never leave it:
+# two screens in the new-game flow bind their "go" action to the **OPTIONS button**, and each
+# one then raises a Yes/No dialog whose default selection is **No**.
+#
+#   new-game settings screen   footer: "[options] Confirm Settings   [left stick] Change"
+#                              -> dialog "Confirm settings?"  Yes / [No]
+#   Grade Shop                 footer: "(cross) Select   [options] Start Game   L2 R2 Scroll"
+#                              -> dialog "Start the game?"   Yes / [No]
+#
+# So each gate is OPTIONS -> move up to Yes -> Cross. Cross alone answers No and returns to the
+# same screen, which is exactly the loop reach-options.pad sits in.
+#
+# The directional taps are 0.15 s ON PURPOSE. A whole-second hold auto-repeats inside a
+# two-entry list and lands back on No: three separate 1 s `up` windows left "Confirm settings?"
+# reading No, and the same window shortened to 0.15 s moved it to Yes on the first try.
+#
+# Cross is safe to repeat everywhere before the first gate, which is what lets the opening
+# ladder self-synchronise instead of depending on how fast the host booted: it dismisses the
+# autosave dialog, skips the logos and the opening movie, advances the title screen, agrees to
+# the privacy policy, selects New Game (already the default entry), and dismisses the settings
+# tutorial popup — and it is unbound on the settings screen itself, so surplus presses simply
+# wait there.
+#
+# Phases 5-6 repeat the two gates ~170 s later. Boot depth on this host varies by more than
+# 200 s with machine load (the settings screen has been observed at t=90 s and at t=441 s on
+# the same binary and route), so the second pass is what covers a slow boot. On a fast boot the
+# game is already running when it fires; OPTIONS during the prologue raises a "[triangle] Skip"
+# overlay, which the following `up` and Cross do NOT accept (the skip is bound to Triangle), so
+# the overlay closes on its own and the scene carries on. Measured on both verification runs.
+
+# --- phase 1: opening ladder — autosave dialog, logos, movie, title, privacy policy, New Game
+4-5:cross
+6-7:cross
+8-9:cross
+10-11:cross
+12-13:cross
+20-21:cross
+30-31:cross
+40-41:cross
+50-51:cross
+60-61:cross
+70-71:cross
+80-81:cross
+90-91:cross
+100-101:cross
+110-111:cross
+120-121:cross
+
+# --- phase 2: gate 1 — "Confirm Settings" (OPTIONS), then Yes
+130-131:options
+140-140.15:up
+148-149:cross
+
+# --- phase 3: dismiss "Settings can be adjusted at any time in the Options menu." and enter
+#     the Grade Shop. Cross on the Grade Shop buys the highlighted bonus, which is harmless.
+160-161:cross
+170-171:cross
+180-181:cross
+190-191:cross
+
+# --- phase 4: gate 2 — "Start Game" (OPTIONS), then Yes
+200-201:options
+210-210.15:up
+218-219:cross
+
+# --- phase 5: second pass over gate 1, for a slow boot
+300-301:options
+310-310.15:up
+318-319:cross
+330-331:cross
+340-341:cross
+350-351:cross
+
+# --- phase 6: second pass over gate 2, for a slow boot
+360-361:options
+370-370.15:up
+378-379:cross
+
+# --- phase 7: advance the prologue dialogue
+400-401:cross
+420-421:cross
+440-441:cross
+460-461:cross
+480-481:cross
+500-501:cross
+520-521:cross
+540-541:cross
+560-561:cross
+580-581:cross
+600-601:cross
+620-621:cross
+640-641:cross
+660-661:cross
+680-681:cross
+700-701:cross
+720-721:cross
+740-741:cross
+760-761:cross
+780-781:cross
+800-801:cross
+820-821:cross
+840-841:cross
+860-861:cross
+880-881:cross
