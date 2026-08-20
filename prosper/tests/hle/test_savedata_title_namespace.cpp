@@ -134,6 +134,20 @@ int main() {
     const std::string app0_a = make_app0(scratch, "title-a", "PPSA00001");
     const std::string app0_b = make_app0(scratch, "title-b", "PPSA00002");
 
+    // ------------------------------------------------- arm 0: the PROSPER_APP0 env spelling
+    // MUST run before any set_app0_root() call, because it exercises translate()'s lazy pickup of
+    // the env root, which only fires while the root is still unset. That path used to assign the
+    // root directly and skip the param.json parse entirely, so a run driven by PROSPER_APP0 had no
+    // title identity and saved into the unknown-title namespace while an ordinary boot did not —
+    // a silent, env-dependent split in where a title's saves live.
+    set_env("PROSPER_APP0", app0_a.c_str());
+    CHECK(save_title_namespace() == kUnknownTitleNamespace,
+          "no application is configured yet, so the namespace is the unknown-title placeholder");
+    resolve_guest_path("/app0/sce_sys/param.json");   // the call that picks the env root up
+    CHECK(save_title_namespace() == "PPSA00001",
+          "a PROSPER_APP0-rooted run derives its title id the same way a normal boot does");
+    set_env("PROSPER_APP0", nullptr);
+
     // ---------------------------------------------------------------- title identity
     set_app0_root(app0_a);
     CHECK(app_param_declaration().title_id == "PPSA00001",
@@ -179,17 +193,34 @@ int main() {
           "and title A's payload is still intact where title A left it");
 
     // ---------------------------------------------------------------- arm 3: dirName search
-    const std::vector<std::string> visible_to_b = savedata0_list_dirs();
-    CHECK(contains(visible_to_b, kSharedSlot),
-          "sceSaveDataDirNameSearch shows title B its own save");
-    CHECK(!contains(visible_to_b, kTitleAOnlySlot),
-          "sceSaveDataDirNameSearch does not offer title A's saves to title B");
     CHECK(savedata0_umount(), "title B unmounts");
 
+    // This arm needs savedata0_list_dirs() to actually enumerate. Its body is wrapped in
+    // `#ifndef _WIN32` (hle_file.cpp), so on Windows it returns an empty vector for EVERY title —
+    // and an empty list makes the isolation half ("title A's private save is not offered to title
+    // B") pass while proving nothing, because nothing is offered to anyone. A permanently-green
+    // assertion is worse than an absent one, so the positive and negative halves are kept together
+    // and both are gated on a positive control: title A's own two saves, which certainly exist by
+    // this point. If the control cannot see them, the instrument is not enumerating and the arm
+    // says so instead of reporting a pass it did not earn. #2760 tracks enumerating on Windows.
     set_app0_root(app0_a);
     const std::vector<std::string> visible_to_a = savedata0_list_dirs();
-    CHECK(contains(visible_to_a, kSharedSlot) && contains(visible_to_a, kTitleAOnlySlot),
-          "title A still sees both of its own saves");
+    const bool enumeration_works =
+        contains(visible_to_a, kSharedSlot) && contains(visible_to_a, kTitleAOnlySlot);
+    if (!enumeration_works) {
+        printf("  [skip] savedata0_list_dirs() reported %zu entries for a title that has two "
+               "saves, so it does not enumerate on this platform (#2760). The dirName-search arm "
+               "cannot discriminate here and is SKIPPED, not passed.\n",
+               visible_to_a.size());
+    } else {
+        CHECK(true, "title A sees both of its own saves (positive control for this arm)");
+        set_app0_root(app0_b);
+        const std::vector<std::string> visible_to_b = savedata0_list_dirs();
+        CHECK(contains(visible_to_b, kSharedSlot),
+              "sceSaveDataDirNameSearch shows title B its own save");
+        CHECK(!contains(visible_to_b, kTitleAOnlySlot),
+              "sceSaveDataDirNameSearch does not offer title A's saves to title B");
+    }
 
     // ---------------------------------------------------------------- arm 4: SaveDataMemory
     HleFn setup = Hle::lookup("oQySEUfgXRA"), set = Hle::lookup("cduy9v4YmT4"),

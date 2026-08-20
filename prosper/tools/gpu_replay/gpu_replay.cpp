@@ -3466,7 +3466,8 @@ int main(int argc, char** argv) {
             return entry.first == prosper::gpu::kGpuCaptureSave0Env;
         });
     if (save0 != m.renderer_env.end() || !m.savedata_dir.empty())
-        std::fprintf(stderr, "[gpureplay] capture save roots: save0=%s savedata-memory=%s\n",
+        std::fprintf(stderr, "[gpureplay] capture save roots (saves sit in a per-title <root>/"
+                             "<TITLE_ID>/ subdirectory, #2734): save0=%s savedata-memory=%s\n",
                      save0 == m.renderer_env.end() ? "unknown" : save0->second.c_str(),
                      m.savedata_dir.empty() ? "unknown" : m.savedata_dir.c_str());
     if (inspect) inspect_frame(replay, capture.format_version);

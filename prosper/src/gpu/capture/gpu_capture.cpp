@@ -2241,7 +2241,7 @@ void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata) {
 }
 
 void annotate_gpu_capture_save_roots(GpuCaptureMetadata& metadata) {
-    const std::string effective = savedata0_dir();
+    const std::string effective = savedata0_root();
     const auto existing = std::find_if(metadata.renderer_env.begin(), metadata.renderer_env.end(),
         [](const auto& entry) { return entry.first == kGpuCaptureSave0Env; });
     if (existing == metadata.renderer_env.end())

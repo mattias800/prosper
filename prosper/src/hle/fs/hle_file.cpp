@@ -484,8 +484,9 @@ namespace {
     // subdirectory below it is the GUEST's own dirName and several titles pick the same one
     // (#2734). It is deliberately NOT cached in a static here: the title component comes from
     // set_app0_root()'s param.json parse, so a cached base would freeze whichever title happened to
-    // resolve it first, and a test (or a frontend that loads a second title) would silently write
-    // one title's saves into another's directory — the exact defect.
+    // resolve it first, and any later application switch — which today means a test, since
+    // prosper-app boots one title per process — would silently write one title's saves into
+    // another's directory, the exact defect.
     std::mutex g_save0_mx;
     std::string g_save0;   // host dir for the CURRENT /savedata0 mount ("" = nothing mounted)
     // Never creates anything. A UE4 title probes open-mode several times before it ever creates a
@@ -577,7 +578,13 @@ namespace {
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
-        if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) g_app0 = e; }
+        // The documented env spelling of the /app0 root. Route it through set_app0_root() rather
+        // than assigning g_app0 here: that is what runs the single sce_sys/param.json parse, and
+        // everything derived from the application's own declaration hangs off it — the app-param
+        // SKU answers, the add-content inventory, and (since #2734) the per-title save namespace.
+        // Assigning directly left all three unconfigured, so this path silently saved into the
+        // unknown-title namespace while the normal boot path did not.
+        if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) set_app0_root(e); }
         if (deny_path(p)) {
             if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
             return "/prosper-denied" + p;

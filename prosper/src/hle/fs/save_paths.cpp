@@ -82,6 +82,16 @@ void announce_legacy_flat_saves(const std::string& active_root, const char* hist
     if (active_root != historic_root) roots.emplace_back(historic_root);
 
     for (const std::string& root : roots) {
+        // Deduped on the directory being REPORTED, not on the caller's active root: the same
+        // stranded legacy directory must not be printed again just because something re-resolved
+        // the active root to a different value (a test does; so would any future frontend that
+        // changed it). Reporting 34 directories twice reads as two separate problems.
+        {
+            static std::mutex reported_mx;
+            static std::set<std::string> reported;
+            std::lock_guard<std::mutex> lock(reported_mx);
+            if (!reported.insert(std::string(memory_store ? "m:" : "f:") + root).second) continue;
+        }
         std::error_code ec;
         fs::directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
         if (ec) continue;
@@ -124,36 +134,38 @@ void announce_legacy_flat_saves(const std::string& active_root, const char* hist
     }
 }
 
-// At most one report per distinct root, so a guest that polls sceSaveDataDirNameSearch does not
-// repeat it, while a process that legitimately changes root (a frontend loading a second title,
-// a test) still gets the report for the new one.
-void announce_once(const std::string& root, const char* historic_root, bool memory_store) {
-    static std::mutex reported_mx;
-    static std::set<std::string> reported;
-    {
-        std::lock_guard<std::mutex> lock(reported_mx);
-        if (!reported.insert(std::string(memory_store ? "m:" : "f:") + root).second) return;
-    }
-    announce_legacy_flat_saves(root, historic_root, memory_store);
-}
-
 }   // namespace
 
 std::string save_title_namespace() {
     const std::string id = app_param_declaration().title_id;
     if (!id.empty() && valid_title_id(id)) return id;
+    // Announced HERE rather than at the param.json parse, so it covers every route to the fallback
+    // with one line: no sce_sys/param.json at all, a param.json prosper cannot parse, one that
+    // parses but declares no titleId, and one whose titleId is malformed. Warning only in the
+    // branch that happened to be noticed leaves the quietest case — a well-formed param.json with
+    // the key simply absent — silent, and that is the one residual class where #2734's collision is
+    // still live. Once per process: this is a property of the run, not of the call.
+    static std::once_flag announced;
+    std::call_once(announced, [] {
+        std::fprintf(stderr,
+                     "[savedata] this application declares no usable titleId, so its saves go to "
+                     "the shared \"%s\" namespace and CAN still collide with another such "
+                     "application's (#2734). A dump with a valid sce_sys/param.json does not hit "
+                     "this.\n",
+                     kUnknownTitleNamespace);
+    });
     return kUnknownTitleNamespace;
 }
 
 std::string savedata0_root() {
     std::string root = resolve_root("PROSPER_SAVE0", "savedata0", kLegacyFlatSave0Root);
-    announce_once(root, kLegacyFlatSave0Root, /*memory_store=*/false);
+    announce_legacy_flat_saves(root, kLegacyFlatSave0Root, /*memory_store=*/false);
     return root;
 }
 
 std::string savedata_mem_root() {
     std::string root = resolve_root("PROSPER_SAVEDATA_DIR", "savedata-mem", kLegacyFlatMemRoot);
-    announce_once(root, kLegacyFlatMemRoot, /*memory_store=*/true);
+    announce_legacy_flat_saves(root, kLegacyFlatMemRoot, /*memory_store=*/true);
     return root;
 }
 

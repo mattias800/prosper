@@ -651,14 +651,15 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
         // Who is running. Published only when it is well formed, so a malformed declaration cannot
         // become a save-directory name -- an unvalidated titleId is a guest-influenced string that
         // would land in a host path (save_paths.cpp). An absent or rejected id leaves this empty and
-        // the save namespace falls back to its explicit unknown-title placeholder.
+        // the save namespace falls back to its explicit unknown-title placeholder, which announces
+        // itself from save_title_namespace() -- one line covering every route to the fallback,
+        // including a well-formed param.json that simply omits the key.
         if (doc.title_id && valid_title_id(*doc.title_id)) {
             params.title_id = *doc.title_id;
         } else if (doc.title_id) {
             std::fprintf(stderr,
                          "[appparam] sce_sys/param.json declares a titleId prosper does not "
-                         "recognise as one; this application has no title identity, so its saves "
-                         "share the unknown-title namespace with any other such application\n");
+                         "recognise as one; this application has no title identity\n");
         }
         if (doc.drm_type) {
             params.declared_drm_type = *doc.drm_type;

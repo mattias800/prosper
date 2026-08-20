@@ -14,8 +14,12 @@ cost real time before (`GAME_COMPAT_ORCHESTRATION.md` instrument trap 124).
 plus five digits. It is derived in exactly one place — the single param.json parse in
 `src/hle/service/hle_addcontent.cpp`, published as `AppParamDeclaration::title_id` — so the
 add-content authorization check and the save namespace cannot disagree about which title is running.
-An application with no usable declaration (an eboot-only dump has no `param.json`) gets the explicit
-placeholder `_unknown-title`, which no valid title id can spell; that case is announced on stderr.
+An application with no usable declaration gets the explicit placeholder `_unknown-title`, which no
+valid title id can spell. That is announced on stderr from `save_title_namespace()` itself, so the
+line covers every route to the fallback with one message — no `param.json` at all (an eboot-only dump
+has none), a `param.json` prosper cannot parse, one that parses but simply omits `titleId`, and one
+whose `titleId` is malformed. **Two such applications still share that namespace and can still
+collide**; it is the one residual class of #2734, and it is loud rather than silent.
 
 Default roots, when the override is unset:
 

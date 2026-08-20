@@ -103,33 +103,27 @@ int main(int argc, char** argv) {
     const bool had_original_save0 = original_save0_value != nullptr;
     const std::string original_save0 = original_save0_value ? original_save0_value : "";
     GpuCaptureMetadata save_roots;
-    // What a capture records is the effective per-title DIRECTORY, <PROSPER_SAVE0>/<TITLE_ID>, not
-    // the bare root: the field exists to say which save state produced the frame, and since #2734
-    // two titles sharing a root no longer share a save state.
+    // The entry is keyed by the literal env-var name PROSPER_SAVE0, so its value must be one that
+    // variable could have held: the ROOT, not the per-title <root>/<TITLE_ID> the guest wrote into
+    // (#2734). Recording the directory under that key would name a path that, fed back in, would
+    // namespace a second time.
     static constexpr const char* kTestSave0Root = "/tmp/prosper-test-effective-save0";
     set_test_env(kGpuCaptureSave0Env, kTestSave0Root);
     annotate_gpu_capture_save_roots(save_roots);
     const std::string overridden = save_roots.renderer_env.size() == 1
         ? save_roots.renderer_env[0].second : std::string();
-    const std::string title_ns = prosper::save_title_namespace();
     CHECK(save_roots.renderer_env.size() == 1 &&
               save_roots.renderer_env[0].first == kGpuCaptureSave0Env &&
-              overridden.rfind(kTestSave0Root, 0) == 0 &&
-              overridden.size() > std::strlen(kTestSave0Root) + title_ns.size() &&
-              overridden.compare(overridden.size() - title_ns.size(), title_ns.size(),
-                                 title_ns) == 0,
-          "capture diagnostics retain the effective per-title /savedata0 host directory");
-    // Kills a regression to the pre-#2734 shape: recording the root alone cannot distinguish two
-    // titles' save states, which is exactly what made them collide.
-    CHECK(overridden != kTestSave0Root,
-          "the recorded /savedata0 directory is namespaced by title, not the bare root");
+              overridden == kTestSave0Root,
+          "capture diagnostics retain the effective /savedata0 host root, verbatim as the variable "
+          "was set");
     set_test_env(kGpuCaptureSave0Env, nullptr);
     annotate_gpu_capture_save_roots(save_roots);
-    CHECK(save_roots.renderer_env.size() == 1 &&
-              !save_roots.renderer_env[0].second.empty() &&
-              save_roots.renderer_env[0].second != overridden,
-          "capture diagnostics make the default /savedata0 directory explicit, and follow the "
-          "override rather than a value frozen at first use");
+    const std::string defaulted = save_roots.renderer_env.size() == 1
+        ? save_roots.renderer_env[0].second : std::string();
+    CHECK(save_roots.renderer_env.size() == 1 && !defaulted.empty() && defaulted != overridden,
+          "capture diagnostics make the default /savedata0 root explicit, and follow the override "
+          "rather than a value frozen at first use");
     set_test_env(kGpuCaptureSave0Env,
                  had_original_save0 ? original_save0.c_str() : nullptr);
     std::vector<uint8_t> memory(32);

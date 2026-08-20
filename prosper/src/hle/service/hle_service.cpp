@@ -3865,12 +3865,17 @@ HLE(s_savedata_txres_del) {
 //   OrbisSaveDataMemoryGet2:  userId@0 [pad@4] data@8(ptr) param@16 icon@24 slotId@32
 namespace {
     std::mutex g_savemem_mx;
-    // The in-process view of the SaveDataMemory slots. Keyed by TITLE as well as (userId, slotId):
-    // (userId, slotId) is not unique across titles — every Unity title uses user 1, slot 0 — so a
-    // key without the title would let a process that loads a second title (the prosper-app launcher
-    // can) hand it the first title's block straight out of the cache, exactly the #2734 collision
-    // the on-disk namespace removes. The two views must partition the same way or the cache becomes
-    // a second, disagreeing source of truth.
+    // The in-process view of the SaveDataMemory slots. Keyed by TITLE as well as (userId, slotId),
+    // because (userId, slotId) is not unique across titles — every Unity title uses user 1, slot 0.
+    //
+    // No shipping frontend boots two titles in one process today: prosper-app's start_guest()
+    // latches g_boot_attempted on the ATTEMPT and routes the second title through
+    // relaunch_with_dump(), i.e. a new process. So this is not fixing a reachable collision; it is
+    // keeping the cache and the on-disk layout partitioned the SAME way, so the cache cannot become
+    // a second source of truth that disagrees with the files. What does exercise it is
+    // test_savedata_title_namespace, which drives two application roots through one process — and a
+    // cache that outlived the title switch would hand title B title A's block while the files were
+    // correctly separated, which is a harder bug to see than the one being fixed.
     std::unordered_map<std::string, std::vector<uint8_t>> g_savemem;
     std::string savemem_key(int32_t userId, uint32_t slotId) {
         char suffix[48];
