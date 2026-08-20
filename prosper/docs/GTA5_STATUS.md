@@ -141,12 +141,33 @@ conclusion; it sharpens what "essentially all black" looks like.
   per-instruction coverage.
 
   **Two limits, because this census is easy to over-read.** (a) *Scalar* arithmetic is NOT zero — the
-  nine SOP1 sites are data-path ops, and a VALU may consume an SGPR one of them produced, so a scalar
-  contribution to a wrong link value is possible and unexamined. "No VALU" is not "no arithmetic".
-  (b) The shell's classification is **context-free**: it runs table-less, so a site it calls blocked
-  may be handled by the real emitter given a resource table, and conversely this census cannot see a
-  program that recompiles but emits something wrong. It bounds where a *translation gap* could be; it
-  does not certify the emitted values. (2026-08-21, #2798.)
+  nine SOP1 sites are data-path ops, and a VALU may consume an SGPR one of them produced, so "no
+  VALU" is not "no arithmetic". (b) The shell's classification is **context-free**: it runs
+  table-less, so a site it calls blocked may be handled by the real emitter given a resource table.
+  It bounds where a *translation gap* could be; by itself it does not certify the emitted values.
+  (2026-08-21, #2798.)
+
+- **CLOSING both of those limits: no translation gap can SILENTLY produce a wrong link value, in any
+  of the eight.** The residual left open above is closed by the recompiler's own contract plus one
+  measurement, and neither step depends on reading the census.
+
+  The contract: an instruction the emitter cannot handle sets `ok = false`, and the caller in
+  `rdna2_emit_cfg.cpp` then **returns false for the whole program** — it does not emit a wrong value
+  and continue. So a translation gap costs you the entire shader, which surfaces as a skipped
+  dispatch and a `[recompile-reject]` line. It is *fail-visible by construction*.
+
+  The measurement: **all eight writers emitted SPIR-V** — 435, 3481, 5375, 9969, 15230, 15361, 55221
+  and 58649 bytes respectively, read from the `shader=` field of `gpu_replay --inspect-only`. None
+  was rejected. Therefore no instruction in any of them reached the reject path, and every one of the
+  102 sites the table-less shell called blocked is in fact handled by the real emitter with context —
+  including all nine SOP1 sites (`s_bitset1_b32`, `s_ff1_i32_b64` and `s_bcnt1_i32_b64` each have
+  emitter paths in `rdna2_emit_alu.cpp` / `rdna2_emit_cfg.cpp`).
+
+  **So the two failure modes are disjoint and only one is live.** A translation defect in these
+  programs would present as *content that never draws*; it cannot present as *a table that cycles*.
+  The cyclic table is therefore produced by something other than a missing instruction — the guest's
+  own computation over inputs prosper supplied, or a defect outside the recompiler. That is where the
+  remaining work is, and it needs a live route. (2026-08-21, #2798.)
 
 - **The offline dissection of `0x413dc6700` describes the EMPTY-SRT startup variant, not the hanging
   one.** `dc6700.prgcap` was taken with `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` and **no**
