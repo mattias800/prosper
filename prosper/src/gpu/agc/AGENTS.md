@@ -4,8 +4,9 @@ Reads the PS5-specific shader header and turns a stage's *declared* resources in
 `ShaderResourceTable`.
 
 `agc_shader_layout` is the whole folder. It parses `AgcShaderUserData` — the sharp arrays, the
-Extended User Data (EUD), the direct-resource offsets — and decodes individual descriptors
-(`decode_buffer_descriptor` for a V#, and the T#/S#/BVH equivalents).
+Extended User Data (EUD), the direct-resource offsets — and decodes individual descriptors —
+`decode_buffer_descriptor` for a V#, with named decoders for the T# and BVH forms. There is no
+`decode_sampler_descriptor`: an S# is decoded inline.
 
 Two things to know before working here:
 

@@ -42,6 +42,14 @@ not an oversight, and it was bought expensively during the review of the commit 
 
 A folder map is exactly the document that outlives the line numbers in it. A symbol survives a
 restructure, a `grep -rn` finds it in a second, and a wrong one is obvious rather than plausible.
+
+**When the citation is a log string rather than a symbol, quote only as much as fits on ONE source
+line.** C++ literals are wrapped by the formatter, so a message that reads as one sentence in the
+output does not exist as one token in the source — cite the longer form and the document becomes
+the string's only occurrence, which is the exact failure a grep-able citation was meant to avoid.
+It happened to this very paragraph's flagship example. `tools/AGENTS.md` records the same class
+from the other direction: a doc that prettifies a literal defeats a grep for the line the tool
+actually printed.
 The two `CMakeLists.txt` line numbers below are the deliberate exception, and even those should be
 confirmed by grepping the construct rather than trusted.
 
