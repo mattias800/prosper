@@ -171,8 +171,24 @@ conclusion; it sharpens what "essentially all black" looks like.
   index — and *both* work. So `0x413dc6700` can only spin on a table whose links form a cycle **inside**
   `[0, 2063)`, which is what the parent-walk census independently reports (`cyclic-roots=2062,
   oob-roots=0`). That makes the frontier a **data-production** question — what writes those values —
-  and not a translation or bounds question. Still untested end-to-end (#2795 stands as a coverage gap,
-  not as a suspected defect). (2026-08-21.)
+  and not a translation or bounds question. (2026-08-21.)
+
+  **UPGRADED from a source trace to an EXECUTED measurement the same day (#2800).** The claim above
+  was reasoned through the code; it is now run. `tests/gpu/recompiler/test_traversal_chase.cpp` is a
+  hand-built kernel carrying this exact shape — the EXEC-narrowing loop plus a real MUBUF load through
+  a V#, with encodings derived from the RDNA2 field layouts rather than lifted from the capture — and
+  it executes on real Vulkan over link arrays the test supplies, so the data is known-acyclic by
+  construction and only the lowering is on trial. Four arms pass: a descending chain gives each lane
+  its own chain length (distinct per lane, so a mask-ignoring lowering fails); all-zero links give
+  depth 1, proving depths follow the DATA and not the loop shape; **all-out-of-range links give depth
+  exactly 2** — step one hands back the out-of-range successor, step two reads the zero
+  robustBufferAccess supplies (measured `0, 2, 2, …, 2`); and the emitted module is checked to contain
+  a real access chain, without which every arm would pass for the wrong reason on a folded load.
+  So this shape is lowered correctly end to end and the translation is **not** the hang's cause.
+  Scope, stated so the pass is not over-read: the buffer is bound by the test harness, so this pins
+  the recompiler's half. It does **not** exercise `live_compute.cpp`'s `binding_bytes` computation,
+  which is what makes the bound range equal `num_records x stride` on a real dispatch — that remains
+  the open coverage gap on #2795. (2026-08-21, #2800.)
 
 - **Any predicate over `num_records` or `size_bytes` is UNFALSIFIABLE on the `reach-story-mode`
   route — the run cannot contain a counterexample.** Four successive attempts to classify a
