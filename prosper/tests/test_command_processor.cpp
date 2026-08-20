@@ -5,11 +5,11 @@
 // emitters; independent of the (SDK-gated) boot.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
-#include "../src/gpu/command_processor.hpp"
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/gpu_timeline.hpp"
-#include "../src/gpu/pm4_decode.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>

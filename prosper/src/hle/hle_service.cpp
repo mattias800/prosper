@@ -12,7 +12,7 @@
 #include "ime_input.hpp"
 #include "platform_ui.hpp"
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
-#include "../gpu/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
+#include "gpu/texture/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
 #include "../host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
 #include "../host/boot_program.hpp"  // guest_module_name: is a callback target guest code?
 #include <cinttypes>

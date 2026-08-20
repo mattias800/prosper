@@ -1,6 +1,6 @@
 #include "../tools/gpu_replay/realized_shader_dump.hpp"
 #include "../tools/gpu_replay/compute_recompile.hpp"
-#include "../src/gpu/diagnostic_selectors.hpp"
+#include "gpu/diagnostics/diagnostic_selectors.hpp"
 
 #include <cstdio>
 

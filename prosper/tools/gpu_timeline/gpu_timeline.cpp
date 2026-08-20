@@ -1,4 +1,4 @@
-#include "gpu/gpu_timeline.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
 
 #include <algorithm>
 #include <cstdio>

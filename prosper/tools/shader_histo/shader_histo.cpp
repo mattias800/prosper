@@ -9,8 +9,8 @@
 //
 // Optional 2nd arg: write the largest shader's .shader_text to a file (for offline disassembly).
 #include "../../src/self/module.hpp"
-#include "../../src/gpu/rdna2_decode.hpp"
-#include "../../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstring>
 #include <map>

@@ -3,7 +3,7 @@
 // by llvm-mc) recompiled to SPIR-V by recompile_fragment: it exports green via EXP MRT0. We render
 // and assert the triangle is GREEN (not the placeholder's red), proving RDNA2->SPIR-V works for an
 // actual graphics-stage shader wired into a real pipeline.
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "render_runner.h"
 #include "spirv_triangle.h"     // kTriVertSpv: placeholder vertex shader (positions)
 #include <algorithm>

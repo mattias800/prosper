@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../src/gpu/diagnostic_selectors.hpp"
-#include "../../src/gpu/gpu_capture.hpp"
+#include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/capture/gpu_capture.hpp"
 #include "realized_shader_dump.hpp"
 
 #include <cstdint>

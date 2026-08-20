@@ -5,7 +5,7 @@
 // nothing, and produced a confident zero-hit result about an address nobody asked about. It was already
 // an instrument trap for PROSPER_TARGET_WATCH, then reproduced by a diagnostic whose own comment claimed
 // `0x` was required. Nothing checked the prefix. So the rule is tested, not restated.
-#include "gpu/watch_list.hpp"
+#include "gpu/diagnostics/watch_list.hpp"
 
 #include <cstdio>
 #include <vector>

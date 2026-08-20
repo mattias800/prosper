@@ -17,7 +17,7 @@
 // test_agc_getsize (#1143) is a different guard: it checks GetSize == builder, i.e. that the two
 // agree. It passes for ANY common size and therefore cannot see this defect.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/pm4_decode.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

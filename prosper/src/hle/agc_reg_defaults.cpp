@@ -17,8 +17,8 @@
 #include <cstdio>
 #include <iterator>
 
-#include "../gpu/command_processor.hpp"
-#include "../gpu/pm4_registers.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 
 namespace prosper { namespace agc {
 

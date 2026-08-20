@@ -474,13 +474,13 @@ def self_test() -> int:
 # fixed cannot stay, because the gate refuses to be silently over-broad. A stale allowlist is how a
 # gate keeps passing a tree it no longer describes.
 QUARANTINE = {
-    "src/gpu/command_processor.cpp": 17,
-    "src/gpu/gpu_capture_bundle.cpp": 1,
-    "src/gpu/gpu_execute.hpp": 3,
-    "src/gpu/gpu_executor.cpp": 4,
-    "src/gpu/gpu_timeline.cpp": 4,
-    "src/gpu/mb3_freelist.cpp": 4,
-    "src/gpu/render_state.cpp": 1,
+    "src/gpu/pm4/command_processor.cpp": 17,
+    "src/gpu/capture/gpu_capture_bundle.cpp": 1,
+    "src/gpu/execute/gpu_execute.hpp": 3,
+    "src/gpu/execute/gpu_executor.cpp": 4,
+    "src/gpu/timeline/gpu_timeline.cpp": 4,
+    "src/gpu/execute/mb3_freelist.cpp": 4,
+    "src/gpu/state/render_state.cpp": 1,
     "frontends/shared/live_compute.cpp": 2,
     "frontends/shared/live_renderer.cpp": 6,
     "tests/render_runner.h": 2,
@@ -524,12 +524,12 @@ def classify(rel: str, kind: str) -> str:
 # enumerated, it is a proof.
 CLASSIFY_TESTS = [
     # (relpath, kind, expected bucket)
-    ("src/gpu/render_state.cpp", "byte",    "note"),    # quarantined AND a byte escape -> a note
+    ("src/gpu/state/render_state.cpp", "byte",    "note"),    # quarantined AND a byte escape -> a note
     ("src/hle/other.cpp",        "byte",    "note"),    # ... identical outcome anywhere else
-    ("src/gpu/render_state.cpp", "char",    "ledger"),  # quarantined, a real character -> ledger
+    ("src/gpu/state/render_state.cpp", "char",    "ledger"),  # quarantined, a real character -> ledger
     ("src/hle/other.cpp",        "char",    "fail"),    # the ordinary case
     ("src/hle/other.cpp",        "unicode", "fail"),    # the \u tier is a failure, not a note
-    ("src/gpu/render_state.cpp", "unicode", "ledger"),  # ... and inside the quarantine, the ledger
+    ("src/gpu/state/render_state.cpp", "unicode", "ledger"),  # ... and inside the quarantine, the ledger
 ]
 
 

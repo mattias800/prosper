@@ -32,9 +32,9 @@
 //   Case C  arity 1 baseline (no table_entries)                -> byte-identical to Case A
 //           Proves routing element 0 through the array path delivers exactly what the
 //           single-descriptor path always delivered, rather than something merely also green.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
-#include "../src/gpu/render_state.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/state/render_state.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>

@@ -2,11 +2,11 @@
 // Dcb into) -> execute_gpustate() [recompile shaders from their PGM addresses + resolve pipeline] ->
 // a caller-supplied Vulkan render -> present_write_frame -> present_readback. Proves the executor entry
 // point that agc_driver_submit_dcb will call, and the scanout round-trip, end to end on llvmpipe.
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/gpu_capture.hpp"
-#include "../src/gpu/videoout_present.hpp"
-#include "../src/gpu/pm4_registers.hpp"
-#include "../src/gpu/vk_translate.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/present/videoout_present.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/state/vk_translate.hpp"
 #include "../src/hle/dispatch.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"

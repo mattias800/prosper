@@ -1,7 +1,7 @@
 // test_tile — the GPU surface de-swizzle (tile.hpp). Verifies the standard-swizzle detilers are exact
 // inverses of tiling (round-trip identity for arbitrary sizes), that linear mode is a passthrough, and
 // that tiled layouts are genuine permutations (no texel dropped/duplicated).
-#include "../src/gpu/tile.hpp"
+#include "gpu/texture/tile.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>

@@ -1,6 +1,6 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>

@@ -9,7 +9,7 @@
 #include "nid.hpp"
 #include "sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
-#include "../gpu/gpu_timeline.hpp" // optional exact guest-stdout capture gate
+#include "gpu/timeline/gpu_timeline.hpp" // optional exact guest-stdout capture gate
 #include "../host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
 #include "../host/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
 #include <cctype>        // #1237: case-insensitive PROSPER_DENY_SUBSTR matching

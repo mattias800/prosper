@@ -59,7 +59,7 @@ void pad_set_backend(PadBackend*);   // nullptr restores the neutral (no-device)
 Frontend supplies an **SDL3 `GameController` backend**, mapping SDL buttons/axes → `HostPadState`.
 The pad header already documents frontends installing this from the harness.
 
-### 3. Video — rendered-frame ownership (exists, `src/gpu/videoout_present.hpp`)
+### 3. Video — rendered-frame ownership (exists, `src/gpu/present/videoout_present.hpp`)
 ```cpp
 struct PresentFrameLease {
     uint64_t frame_seq;

@@ -7,8 +7,8 @@
 // BLUE clear. With CB_TARGET_MASK=0xF the triangle is visible (center pixel red); with CB_TARGET_MASK=0
 // no channels are written, so the triangle is invisible (center stays blue). Both masks are produced
 // by resolve_pipeline_state from a real register value — not hand-set — so this exercises the whole path.
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include "render_runner.h"
 #include "spirv_triangle.h"
 #include <cstdio>

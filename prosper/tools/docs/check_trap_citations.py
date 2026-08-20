@@ -3,7 +3,7 @@
 
 WHY. The instrument-trap table's whole value is that other documents, source comments and tests
 point AT it by number -- `// instrument trap 104 records that a read-only probe's DURATION can
-decide...` in `src/gpu/command_processor.cpp`, `See instrument-trap 41` in `CLAUDE.md`,
+decide...` in `src/gpu/pm4/command_processor.cpp`, `See instrument-trap 41` in `CLAUDE.md`,
 `Recorded as instrument trap 114` in a status doc. Roughly half of them are `.cpp`/`.hpp`/test
 comments rather than prose, so this is a contract compiled files depend on, not a documentation
 nicety. **This file deliberately quotes no total**: it PRINTS the live figure on every run, and an

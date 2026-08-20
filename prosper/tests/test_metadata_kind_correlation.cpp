@@ -10,7 +10,7 @@
 //
 // The rule is tested here rather than through the renderer's registration, because mutating that lambda
 // to answer DCC unconditionally left the forwarding test green — plumbing coverage, not rule coverage.
-#include "gpu/metadata_kind_correlation.hpp"
+#include "gpu/resources/metadata_kind_correlation.hpp"
 
 #include <cstdio>
 #include <vector>

@@ -1,9 +1,9 @@
-#include "gpu/gpu_execute.hpp"
-#include "gpu/gpu_capture.hpp"
-#include "gpu/gpu_dependency_graph.hpp"
-#include "gpu/rdna2_gta5_packed_pointer.hpp"
-#include "gpu/rdna2_to_spirv.hpp"
-#include "gpu/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/execute/gpu_dependency_graph.hpp"
+#include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <algorithm>
 #include <array>

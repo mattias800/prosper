@@ -36,11 +36,11 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #include "vaapi_backend.hpp"              // native Linux FFmpeg demux + VA-API hardware decode
 #endif
 #ifdef PROSPER_HAVE_VULKAN
-#include "gpu/gpu_execute.hpp"
-#include "gpu/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
-#include "gpu/bc_decode.hpp"              // BC1/2/3 block decompression -> RGBA8 (#121)
-#include "gpu/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
-#include "gpu/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/texture/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
+#include "gpu/texture/bc_decode.hpp"              // BC1/2/3 block decompression -> RGBA8 (#121)
+#include "gpu/resources/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
+#include "gpu/recompiler/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
 #include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
 #include "../../frontends/shared/frame_dump_policy.hpp" // explicit periodic-BMP policy
 #include "../../frontends/shared/live_renderer.hpp"   // shared live renderer (also used by prosper-app)

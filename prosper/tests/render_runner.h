@@ -5,10 +5,10 @@
 #pragma once
 #include "../frontends/shared/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
-#include "../src/gpu/gpu_capture.hpp"
-#include "../src/gpu/diagnostic_selectors.hpp"
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "../frontends/shared/rtt_scale.hpp"
 #include "../frontends/shared/vulkan_device_select.hpp"
 #include "../frontends/shared/performance_timing_gate.hpp"
@@ -3896,7 +3896,7 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
 //
 // Memoized on fs_identity -- the same key, and for the same reason, as the subgroup-scan memo
 // (#2259) further down: DrawItem identities come from the shader-recompile cache as
-// `cache.next_identity++` (src/gpu/gpu_executor.cpp), a monotonic counter that is never reset,
+// `cache.next_identity++` (src/gpu/execute/gpu_executor.cpp), a monotonic counter that is never reset,
 // never decremented and untouched by eviction. So an identity denotes one module for the life of
 // the process -- an evicted shader recompiles to a NEW identity, which misses here and refills,
 // and the stale entry is simply never looked up again. The counter starts at 1, so identity 0 is
@@ -5327,7 +5327,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         //
         // Memoized on fs_identity, the same key and the same argument as #2259: DrawItem identities
         // come from the shader-recompile cache as `cache.next_identity++`
-        // (src/gpu/gpu_executor.cpp:1255 graphics, :1441 compute; sole assignment at :437), a
+        // (src/gpu/execute/gpu_executor.cpp:1255 graphics, :1441 compute; sole assignment at :437), a
         // monotonic counter that is never reset, never decremented and untouched by eviction. So an
         // identity denotes one module for the life of the process -- an evicted shader recompiles to
         // a NEW identity, which misses here and refills, and the stale entry is simply never looked

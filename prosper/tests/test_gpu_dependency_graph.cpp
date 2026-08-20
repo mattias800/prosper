@@ -1,6 +1,6 @@
-#include "../src/gpu/agc_shader_layout.hpp"
-#include "../src/gpu/gpu_dependency_graph.hpp"
-#include "../src/gpu/vk_translate.hpp"
+#include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/execute/gpu_dependency_graph.hpp"
+#include "gpu/state/vk_translate.hpp"
 
 #include <cstdio>
 #include <initializer_list>

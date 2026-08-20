@@ -28,10 +28,10 @@
 // Then, with the shape proven, the same kernel exercises PROSPER_CFG_TRIP_BOUND — the diagnostic
 // that caps an emitted back edge. Bounding a loop that terminates ANYWAY is what makes this test
 // safe to run in CI: a broken bound yields wrong depths, never a hung queue.
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "../frontends/shared/trip_bound_witness.hpp"
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "compute_runner.h"
 
 #include <algorithm>

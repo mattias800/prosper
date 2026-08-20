@@ -1,8 +1,8 @@
 // test_recompile_coverage — recompile_coverage() reports per-instruction recompiler support without
 // requiring a complete vertex/fragment. Pure (no Vulkan), so it runs in CI. It also drives the
 // data-driven coverage report over the real game shaders (shader_histo).
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>

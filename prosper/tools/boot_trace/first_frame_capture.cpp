@@ -12,7 +12,7 @@
 // If the existing renderer produces a real frame with meaningful content, we capture it.
 // If no frame is produced, or if the frame is uniform/empty, we honestly report failure.
 #include "first_frame_capture.hpp"
-#include "gpu/videoout_present.hpp"   // present_snapshot, present_has_frame, etc.
+#include "gpu/present/videoout_present.hpp"   // present_snapshot, present_has_frame, etc.
 #include <chrono>
 #include <thread>
 #include <cstring>

@@ -11,7 +11,7 @@
 #include "../src/host/exec_image.hpp"
 #include "../src/host/boot_program.hpp"   // BOOT_EBOOT / BOOT_STUB: the apertures the mprotect cases use
 #include "../src/host/guest_memory_map.hpp"
-#include "../src/gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include <windows.h>
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
 extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t len);

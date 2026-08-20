@@ -1,10 +1,10 @@
-// test_pm4_decode — validates the PM4 command-stream decoder (src/gpu/pm4_decode.cpp), the front of
+// test_pm4_decode — validates the PM4 command-stream decoder (src/gpu/pm4/pm4_decode.cpp), the front of
 // the CommandProcessor. It builds a real Draw Command Buffer by driving the AGC Dcb functions (via
 // the NID registry, exactly as the guest would), then decodes the resulting dword stream and asserts
 // every packet is recognized with the correct operands. This exercises the decoder end-to-end against
 // the real emitters (hle_agc.cpp) with no fabricated data, independent of the (SDK-gated) boot.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/pm4_decode.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

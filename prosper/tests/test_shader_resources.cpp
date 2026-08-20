@@ -1,7 +1,7 @@
 // test_shader_resources — fixes the resource-binding contract (shader_resources.hpp): format sizing
 // and the recompiler/pipeline lookups both halves rely on. Pure (no Vulkan), runs in CI.
-#include "../src/gpu/shader_resources.hpp"
-#include "../src/gpu/gpu_execute.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include "../frontends/shared/live_compute.hpp"
 #include <cstdio>
 #include <cstdlib>

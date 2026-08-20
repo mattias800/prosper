@@ -7,8 +7,8 @@
 // framebuffer shows the corresponding texel color — proving MIMG decode, OpImageSampleImplicitLod,
 // coordinate assembly (VADDR VGPRs -> u,v), the combined-image-sampler binding, and dmask->VDATA all
 // work end to end. A broken path would leave the frame blue (clear) or the wrong texel.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdlib>

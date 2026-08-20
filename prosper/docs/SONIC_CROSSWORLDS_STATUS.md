@@ -608,9 +608,9 @@ One line per falsified hypothesis, with the evidence that killed it.
 
   | site | where | 2D_ARRAY accepted? |
   | --- | --- | --- |
-  | coverage predicate | `src/gpu/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
-  | lowering gate | `src/gpu/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
-  | validator carve-out | `src/gpu/shader_resources.cpp:1031` (`r.img_dim == 1 && r.depth == 1`) | no |
+  | coverage predicate | `src/gpu/recompiler/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
+  | lowering gate | `src/gpu/recompiler/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
+  | validator carve-out | `src/gpu/resources/shader_resources.cpp:1031` (`r.img_dim == 1 && r.depth == 1`) | no |
   | backend materialization | `frontends/shared/live_compute.cpp:4304` (same clause) | no |
 
   So the lowering emits the buffer-backed binding for a 2D_ARRAY atomic and the validator then
@@ -630,7 +630,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   and bound to match the layout it produces, **then** widen the predicates. Note the backing
   allocation is **already** large enough -- the resource reports `available=66355200` and
   `3840*2160*2*4 = 66,355,200` exactly -- so sizing is not the obstacle; the **layout** is.
-  `tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel)` (`src/gpu/tile.hpp:81`) takes
+  `tiled_surface_bytes(width, height, tile_mode, pitch, bytes_per_texel)` (`src/gpu/texture/tile.hpp:81`) takes
   no depth or layer argument, so the detile behind the atomic buffer view is inherently 2D and the
   tiled **array slice pitch** is the open unknown that needs evidence rather than an assumed
   `width*height`. Tracked on **#2265**,

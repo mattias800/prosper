@@ -9,8 +9,8 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/hle/video_backend.hpp"
-#include "../src/gpu/guest_texture_layout.hpp"
-#include "../src/gpu/tile.hpp"
+#include "gpu/texture/guest_texture_layout.hpp"
+#include "gpu/texture/tile.hpp"
 #include <cstdio>
 #include <algorithm>
 #include <chrono>

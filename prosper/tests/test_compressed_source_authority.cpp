@@ -9,10 +9,10 @@
 //     colour-DCC sizing.
 //   * an imported image only counts when it is the representation ACTUALLY SELECTED. An import a
 //     recovery switch has chosen to bypass is the opposite of permission to read guest bytes.
-#include "gpu/compressed_source_authority.hpp"
+#include "gpu/resources/compressed_source_authority.hpp"
 
-#include "gpu/tile.hpp"
-#include "gpu/gpu_execute.hpp"
+#include "gpu/texture/tile.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 
 #include <cstdint>
 #include <cstdio>

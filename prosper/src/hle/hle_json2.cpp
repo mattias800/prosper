@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include "gpu/gpu_execute.hpp"   // gpu::guest_readable — validate the guest C string (#1967)
+#include "gpu/execute/gpu_execute.hpp"   // gpu::guest_readable — validate the guest C string (#1967)
 #include <map>
 #include <limits>
 #include <string>

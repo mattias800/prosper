@@ -1,6 +1,6 @@
-#include "../src/gpu/gpu_timeline.hpp"
-#include "../src/gpu/gpu_capture_bundle.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
+#include "gpu/capture/gpu_capture_bundle.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 
 #include <chrono>
 #include <cstdio>

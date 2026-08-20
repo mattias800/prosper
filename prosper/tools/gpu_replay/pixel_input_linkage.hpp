@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <cstdint>
 

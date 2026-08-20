@@ -50,7 +50,7 @@ At the time this handoff was written:
 - active issue: #1054, labeled `bug`, `area:infra`, `in-progress`, and `agent:astro-title`
 - no other open PR carries the `agent:astro-title` label
 - open PR #1052 (`perf(executor): reuse analyzed shader content hashes`) is green and clean, and touches:
-  - `prosper/src/gpu/gpu_executor.cpp`
+  - `prosper/src/gpu/execute/gpu_executor.cpp`
   - `prosper/tests/test_shader_recompile_cache.cpp`
 
 The branch was rebased onto that exact master tip immediately before publication. Fetch again before
@@ -306,7 +306,7 @@ code, tests, comments, or prose from another emulator.
 
 The existing implementation is deliberately fail-closed:
 
-- `detect_pcrel_tables` in `src/gpu/rdna2_to_spirv.cpp` recognizes a proven
+- `detect_pcrel_tables` in `src/gpu/recompiler/rdna2_to_spirv.cpp` recognizes a proven
   `s_getpc_b64 -> add/addc -> V# -> MUBUF raw load` embedded-table idiom.
 - It records `MUBUF instruction PC -> copied table dwords` in
   `RegState::mubuf_pcrel_tables`.

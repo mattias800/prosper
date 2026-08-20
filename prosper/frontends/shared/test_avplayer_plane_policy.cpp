@@ -7,7 +7,7 @@
 // The descriptor-level classification is therefore what has to be asserted.
 #include "avplayer_plane_policy.hpp"
 
-#include "gpu/guest_texture_layout.hpp"
+#include "gpu/texture/guest_texture_layout.hpp"
 
 #include <cstdio>
 #include <vector>

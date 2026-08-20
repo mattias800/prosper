@@ -6,8 +6,8 @@
 // This is the class the game's 9 "barefoot" blit/copy compute shaders belong to (image_load v[0:3],
 // vN, s[0:7] dim:1D ; image_store v[0:3], vN, s[8:15] dim:1D). Needs Vulkan, so CMake only builds it
 // when Vulkan is present.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "image_compute_runner.h"
 #include <cstdio>
 #include <cstdint>

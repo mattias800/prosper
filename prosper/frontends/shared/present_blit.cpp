@@ -2,7 +2,7 @@
 #include "present_blit.hpp"
 #include "present_blit_policy.hpp"
 #include "render_runner.h"            // render_vk_ctx()
-#include "gpu/gpu_execute.hpp"        // shared_present_submit_mutex / shared_present_active
+#include "gpu/execute/gpu_execute.hpp"        // shared_present_submit_mutex / shared_present_active
 #include <mutex>
 #include <cstdio>
 #include <cstring>

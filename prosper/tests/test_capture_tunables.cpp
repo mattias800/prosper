@@ -14,7 +14,7 @@
 //   * child-process arms spawn this same binary and let it merely return from main (or, for
 //     PROSPER_CAPTURE_MAX_SUBMITS, never reach main at all). Only these can see a missing
 //     registration or a missing load-time refusal, which is what #1684's arm C proved the hard way.
-#include "../src/gpu/gpu_timeline.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
 
 #include <chrono>
 #include <cstdint>

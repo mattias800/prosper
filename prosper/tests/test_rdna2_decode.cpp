@@ -1,8 +1,8 @@
-// test_rdna2_decode — validates the RDNA2 instruction-stream walker (src/gpu/rdna2_decode.cpp)
+// test_rdna2_decode — validates the RDNA2 instruction-stream walker (src/gpu/recompiler/rdna2_decode.cpp)
 // against instructions assembled by llvm-mc for gfx1030 (authoritative encodings, not hand-rolled).
 // The stream mixes every major encoding class + inline literals + S_ENDPGM; the walker must classify
 // each instruction's format, compute its length (incl. literals), and terminate at S_ENDPGM.
-#include "../src/gpu/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <array>
 #include <cstdio>
 #include <cstdint>

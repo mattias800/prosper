@@ -1,8 +1,8 @@
 #pragma once
 #include <cstdint>
 
-#include "../../src/gpu/gpu_execute.hpp"
-#include "../../src/gpu/render_state.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/state/render_state.hpp"
 #include "mrt_extent.hpp"
 
 // THE definition of an active colour binding.

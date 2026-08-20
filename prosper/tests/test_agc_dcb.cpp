@@ -4,7 +4,7 @@
 // the indirect-register patch helpers modify a previously-returned packet. This validates the port
 // independently of the (locale-blocked) boot.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/pm4_decode.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

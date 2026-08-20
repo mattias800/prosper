@@ -3,8 +3,8 @@
 // buffer cbufs. A shader whose FIRST resource is a texture used to land it on binding 2, declaring two
 // descriptor types at one binding -> layout-creation failure, the draw disappears (#157). Constant/
 // vertex buffers are assigned first (2/3+), matching the common cbufs-first shaders byte-for-byte.
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <set>

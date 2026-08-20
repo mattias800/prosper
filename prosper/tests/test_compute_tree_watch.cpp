@@ -1,4 +1,4 @@
-// Pure-analysis arms for the address-keyed tree watch (src/gpu/compute_tree_watch.hpp).
+// Pure-analysis arms for the address-keyed tree watch (src/gpu/diagnostics/compute_tree_watch.hpp).
 //
 // Every arm here is written so that it FAILS if the property it names stops holding. That is not
 // a truism in this file's history: three earlier diagnostics in this investigation shipped with
@@ -11,7 +11,7 @@
 #include <span>
 #include <vector>
 
-#include "gpu/compute_tree_watch.hpp"
+#include "gpu/diagnostics/compute_tree_watch.hpp"
 
 using namespace prosper::gpu;
 

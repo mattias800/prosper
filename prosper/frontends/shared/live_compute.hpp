@@ -1,5 +1,5 @@
 #pragma once
-#include "gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 
 #include <cstddef>
 #include <cstdint>

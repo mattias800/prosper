@@ -1242,7 +1242,7 @@ the *texel content* is scrambled). It is NOT scattered geometry (positions are f
 (draws execute + sample).
 
 **Root cause — the detiler only knows SW_4KB_S (tile_mode 5); DOLL's textures are 64KB-tiled.**
-`prosper::gpu::tile_mode_is_tiled` (src/gpu/tile.cpp) returns true ONLY for `tile_mode == 5`
+`prosper::gpu::tile_mode_is_tiled` (src/gpu/texture/tile.cpp) returns true ONLY for `tile_mode == 5`
 (`TileMode::Sw4KbS`, the one mode The Messenger uses). Tile-mode histogram over a full DOLL boot
 (`[t#] tile_mode=` counts):
 
@@ -1261,7 +1261,7 @@ swizzle (the fullscreen post/deferred composites); mode 9 (SW_64KB_S) is regular
 (BC1/BC4/BC7).
 
 **Derivation attempt (offline, coherence scoring) — 64KB_S is NOT a flat x/y bit-interleave.** Added a
-gated diagnostic `PROSPER_DUMP_TILERAW` (src/gpu/agc_shader_layout.cpp) that dumps a tiled texture's raw
+gated diagnostic `PROSPER_DUMP_TILERAW` (src/gpu/agc/agc_shader_layout.cpp) that dumps a tiled texture's raw
 guest texel bytes at T#-decode time (fires every draw's stage build, so it captures textures even on the
 intermittent boots whose content never reaches the render backend — 75 textures captured in one 120 s
 run). For a 512×256 BC1 (exactly one 64KB tile = 128×64 blocks × 8 B) and a content-rich 512×512 BC1

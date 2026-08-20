@@ -9,8 +9,8 @@
 // These are the cases where a range test misbehaves quietly rather than loudly: the exclusive end,
 // an empty range, and arithmetic near the top of the address space, where a subtraction in the wrong
 // order wraps and reports a match for an address nowhere near the allocation.
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <cstdint>
 #include <cstdio>

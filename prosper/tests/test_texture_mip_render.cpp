@@ -4,8 +4,8 @@
 // as purple (the red/blue average) — impossible from any level-0 texel — while the default
 // declared_mip_levels=1 keeps the historical single-level behavior (LOD clamps to 0) and level 0
 // stays byte-intact through the chain upload. Fails without the mip-chain generation.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>

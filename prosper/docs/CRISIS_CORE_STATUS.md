@@ -139,7 +139,7 @@ independently brought-up titles, both outside one unarmed contract, both rescued
   threshold. The write path is prompt; whatever the race is, it is not the pend queue holding
   writes. (2026-08-06, this lane.)
 - **"Suppressing both prosper-authored halves of the forged pointer stops the corruption."** The
-  combined arm named as unrun in `src/gpu/command_processor.cpp` (§forge_trip) and in
+  combined arm named as unrun in `src/gpu/pm4/command_processor.cpp` (§forge_trip) and in
   `ARCRUNNER_STATUS.md` was run here: `PROSPER_REL1_FORGE_SUPPRESS_ALL=1 PROSPER_INIT_SUPPRESS=ptr`,
   a **valid** arm by its own criterion (`FORGE-DECISION-TOTALS candidates=127 suppressed=127
   landed=0`, `INIT-SUPPRESS` reaching #4096). The title still faults at the same pop, with
