@@ -1,0 +1,35 @@
+# Host execution -- where guest code actually runs -- as folders. Consumed by move_module.py.
+#
+# Format: `folder: module module module` -- module is the basename, without extension; the .cpp,
+# .hpp and .h of a module always travel together.
+#
+# The ordering principle is THE LIFE OF A GUEST PROCESS: an image is mapped (image/), its
+# thread-local storage is established (tls/), it runs and occasionally traps (fault/), it reads and
+# writes guest memory (memory/), and some of what it executes has to be decoded instruction by
+# instruction (x86/). platform/ is the host substrate all of that stands on, and symbols/ names
+# what a live PC belongs to.
+#
+# fs_emu sits with guest_tls rather than with the x86 decoders even though it IS one: it decodes
+# %fs-prefixed instructions, and it exists only to emulate guest thread-local storage on
+# macOS/Rosetta. It changes when guest TLS changes, which is the coupling that matters here.
+
+# --- mapping a built guest image into host memory ----------------------------------------------
+image: exec_image exec_image_linux exec_image_win runtime_module_load boot_program
+
+# --- guest thread-local storage and the %fs segment --------------------------------------------
+tls: guest_tls fs_emu
+
+# --- faults and the in-process debug instruments that arbitrate them ---------------------------
+fault: fault_context trap_arbitration
+
+# --- guest memory: what is mapped, and who wrote it --------------------------------------------
+memory: guest_memory_map guest_write_watch
+
+# --- x86-64 decode, for the instructions the host must interpret rather than run ---------------
+x86: x86_read_decode sse4a
+
+# --- the host substrate ------------------------------------------------------------------------
+platform: posix_shim raw_syscall precise_sleep immortal lifecycle
+
+# --- naming a live guest PC --------------------------------------------------------------------
+symbols: il2cpp_symbols

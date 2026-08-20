@@ -3,8 +3,8 @@
 // out-param with a valid value (never the caller's garbage — the bug the generic stub caused), inputs
 // are validated, and a batch reports started->complete so the guest's audio pipeline proceeds. Names
 // hash to the game's import NIDs, so R()-registration reaches the guest.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

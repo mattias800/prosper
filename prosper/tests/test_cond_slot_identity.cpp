@@ -20,7 +20,7 @@
 //  * It does not join a waiter it failed to wake. On the unfixed path the missed signal is
 //    unrecoverable from inside the test -- a rescue broadcast resolves to the same wrong slot -- so
 //    joining would hang the suite instead of reporting a failure.
-#include "../src/hle/sync_futex.hpp"
+#include "hle/sync/sync_futex.hpp"
 
 #include <pthread.h>
 #include <cstdio>

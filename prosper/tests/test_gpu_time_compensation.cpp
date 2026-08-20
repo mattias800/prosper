@@ -1,7 +1,7 @@
 // test_gpu_time_compensation - discount synchronous host-GPU overhead from guest monotonic time.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/hle_kernel_time.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/kernel/hle_kernel_time.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>

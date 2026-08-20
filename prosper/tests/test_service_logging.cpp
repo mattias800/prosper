@@ -1,5 +1,5 @@
-#include "hle/dispatch.hpp"
-#include "hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <cstdio>
 #include <cstdlib>

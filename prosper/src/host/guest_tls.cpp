@@ -12,7 +12,7 @@
 // swap %fs back to the host TCB for the duration of the call — done in the emitted import stubs
 // (exec_image_linux.cpp), which read the stashed host %fs from [guestTP + GUEST_TCB_HOSTFS_OFF].
 #if defined(__linux__) || defined(__APPLE__)
-#include "../hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "../loader/tls_layout.hpp"
 #include <cstdint>
 #include <cstdlib>
@@ -210,7 +210,7 @@ uint64_t guest_tls_total_below() { return g_total_below; }
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "../hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "../loader/tls_layout.hpp"
 #include <windows.h>
 #include <cstdint>

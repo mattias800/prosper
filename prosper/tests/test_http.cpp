@@ -1,5 +1,5 @@
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/hle_http.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/net/hle_http.hpp"
 
 #include <array>
 #include <cstdio>

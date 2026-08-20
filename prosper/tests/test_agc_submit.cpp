@@ -5,7 +5,7 @@
 // milestone programmatically (previously only observed in a boot log line, which VERIFICATION.md
 // says not to rely on). It exercises the exact front-half -> back-half handoff: Dcb build -> PM4 ->
 // decode -> GpuState.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include <cstdio>
 #include <cstdint>

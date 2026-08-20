@@ -26,8 +26,8 @@
 // satisfies every other check here, INCLUDING `distinct-ids-independent` — which never held two ids
 // at the same time and so did not test what its name claims. Holding two simultaneously is the only
 // arrangement that separates a per-id map from a single slot.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
 

@@ -11,9 +11,9 @@
 // its `_Mtx_trylock` compares the result against 0x80020010 and its `_Mtx_lock` against 0x8002000b,
 // and maps anything else non-zero to Dinkumware `_Thrd_error`, which raises an uncaught
 // std::system_error. Both halves are asserted below so neither can drift into the other.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sce_errno.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/kernel/sce_errno.hpp"
 #include <cstdio>
 #include <cstdint>
 

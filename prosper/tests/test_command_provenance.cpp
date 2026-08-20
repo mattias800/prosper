@@ -7,7 +7,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <algorithm>
 #include <array>
 #include <condition_variable>

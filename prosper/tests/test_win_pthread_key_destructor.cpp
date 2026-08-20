@@ -2,8 +2,8 @@
 // Drive the real HLE key and thread lifecycle and verify both the callback argument and POSIX
 // destructor retry when the callback installs another non-null value. Also cover clearing a value:
 // winpthreads calls its destructor with nullptr in that case, while POSIX requires no callback.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <pthread.h>
 #include <atomic>
 #include <chrono>

@@ -444,7 +444,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
     initial-exec TLS is **enabled by default** there; the environment variable actually read is the
     **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/guest_tls.cpp:58`,
-    `:240`; `src/hle/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
+    `:240`; `src/hle/dispatch/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
     platforms — setting it is harmless but does nothing, and *believing* it is required is not: it
     turns a default-on path into one people think they are enabling, so nobody checks it when a guest
     TLS problem is the actual cause. On **macOS/Rosetta** `PROSPER_GUEST_FS` does remain the opt-in for
@@ -472,7 +472,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   lines from the live backend, then implement it with a round-trip/execution test — do not leave it skipped.
 - **Entitlement and add-content APIs answer from LOCAL INVENTORY — never blanket-approve.** When a
   title asks whether an add-on or entitlement is owned, prosper answers from the content actually
-  declared and present locally (`src/hle/hle_addcontent.cpp` parses real entitlement labels and keys
+  declared and present locally (`src/hle/service/hle_addcontent.cpp` parses real entitlement labels and keys
   and rejects malformed or duplicated ones). That is the right design for a preservation tool, and it
   is deliberate: a compatibility layer must keep working when the licensing service it would
   otherwise consult no longer exists, so the answer has to be derivable offline.

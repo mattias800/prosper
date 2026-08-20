@@ -4,8 +4,8 @@
 // physAddrOut/sizeOut uninitialized (a caller sizing an allocation from *sizeOut read stack garbage).
 // Drives the handlers through the NID registry exactly as the guest does. Each ctest binary is its
 // own process, so the process-global direct-memory pool starts empty here.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"

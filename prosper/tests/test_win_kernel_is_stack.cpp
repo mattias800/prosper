@@ -2,8 +2,8 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 #include "../src/host/exec_image.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <windows.h>
 #include <pthread.h>
 #include <cstdint>

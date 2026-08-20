@@ -2,8 +2,8 @@
 // keyboard, so it reports a consistent "none connected" state (empty resource array, disconnected
 // info) rather than leaving the caller's structs uninitialized. Struct layouts mirror shadPS4
 // src/core/libraries/ime/ime_common.h (offsets asserted below).
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/platform_ui.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/service/platform_ui.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>

@@ -4,8 +4,8 @@
 // timer events (e.g. Unity's Frame Timing Manager registers a user event id=999 and blocks WaitEqueue
 // on it). This verifies the real backend: a triggered user event and an expired timer both post a
 // SceKernelEvent that WaitEqueue then returns, with the FreeBSD-style filter ids and udata intact.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>

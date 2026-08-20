@@ -3,9 +3,9 @@
 // output pointer (accessibility off = 0, age level = adult) rather than leave it uninitialized; the
 // libkernel registration/hook calls must resolve to a benign OK-returning no-op. Registered by raw
 // NID, so this looks them up by NID and exercises the output contract.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/callback_fs.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/dispatch/callback_fs.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>

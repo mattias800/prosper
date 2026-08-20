@@ -1,7 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
-#include "hle/dispatch.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
+#include "hle/dispatch/dispatch.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
 #include "rtt_authority.hpp"

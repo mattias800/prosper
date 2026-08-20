@@ -22,7 +22,7 @@
 //     returned 129), and
 //   - the cb the global was actually recorded against must still get 129 (this FAILS if the fix is
 //     over-applied and drops the legacy path altogether).
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdint>
 #include <cstdio>
 

@@ -1,6 +1,6 @@
 // libSceJson2 parsing and value access. Astro Bot parses configuration JSON during level startup
 // and asserts that values reported as booleans have the matching Json2 type.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstddef>
 #include <cstdint>

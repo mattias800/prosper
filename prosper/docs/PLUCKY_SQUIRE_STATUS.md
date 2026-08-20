@@ -75,7 +75,7 @@ the likely cause; either way, do not use a shader-dump run to judge progression.
 
 The title opens **exactly one pad handle** — `[pad] OPEN userId=1 type=0 index=0 -> handle=1` under
 `PROSPER_PADLOG=1`, on a 60 s probe. It is therefore **not** exposed to the shared suspect that
-`poll_controller` ignores its handle argument (`src/hle/hle_pad.cpp:415`), which can make two handles
+`poll_controller` ignores its handle argument (`src/hle/input/hle_pad.cpp:415`), which can make two handles
 mirror one controller. Recorded as a negative so the next lane does not re-probe it.
 
 Input is delivered and observed: `[pad-script]` lines carry the guest's own advancing pad-read index

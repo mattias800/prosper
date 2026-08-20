@@ -288,7 +288,7 @@ recognising them: `guest_write_watch.cpp:1372` and `gpu_timeline.cpp:2288`/`:274
 | --- | --- | --- | --- |
 | `src/gpu/execute/gpu_executor.cpp` (`[udtail]`) | the whole report | `PROSPER_UD_TAIL_ALIGN` **and** one of `PROSPER_GFXLOG` / `PROSPER_DYNTRACE_FAIL` / `PROSPER_DYNTRACE_FAIL_ADDR` | **open, #2146** — the charter requires `PROSPER_UD_TAIL_ALIGN` stay off, so the one report answering the #305 question is available only on runs the project disqualifies |
 | `src/gpu/execute/gpu_executor.cpp` (`[udcand]`) | `fresh_extent` | filled only under `PROSPER_UDPROV` / `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE`, printed regardless | **open, #2149 inst. 3** — `fresh_extent=0` reads as *"the bind programmed nothing"* |
-| `src/hle/hle_agc.cpp` | unimplemented-NID call-count table | needed `PROSPER_PROGRESS` as well as `PROSPER_PROGRESS_UNIMPL` | **fixed** — the dump now has its own cadence |
+| `src/hle/graphics/hle_agc.cpp` | unimplemented-NID call-count table | needed `PROSPER_PROGRESS` as well as `PROSPER_PROGRESS_UNIMPL` | **fixed** — the dump now has its own cadence |
 | `src/gpu/execute/gpu_executor.cpp` (`record_guest_write`) | `color=…` | the `ColorTarget` recorder sat behind `PROSPER_PROVENANCE_DIM` | **fixed by #2143** — the scanner agrees: the post-fix shape produces no finding |
 
 ### The baseline key, and the two churn doors shut in it

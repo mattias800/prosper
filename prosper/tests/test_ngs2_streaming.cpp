@@ -20,8 +20,8 @@
 #include <sys/mman.h>
 #endif
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 using namespace prosper;
 
 static int fails = 0;

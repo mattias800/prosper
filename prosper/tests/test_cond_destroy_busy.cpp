@@ -9,8 +9,8 @@
 // the libkernel form (0x80020010). Both are asserted, because the whole point of the #1984 split is
 // that the answer must not depend on which spelling the guest happened to call.
 
-#include "hle/dispatch.hpp"
-#include "hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <atomic>
 #include <chrono>

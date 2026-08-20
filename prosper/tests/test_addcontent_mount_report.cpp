@@ -22,9 +22,9 @@
 // this project keeps a list of phantom defects that came from the apparatus rather than the
 // subject — so the log line is asserted against the bytes the guest actually received, not merely
 // asserted to exist.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/hle_addcontent.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/service/hle_addcontent.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "test_scratch.h"
 
 #include <cstdint>

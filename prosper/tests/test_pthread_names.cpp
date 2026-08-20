@@ -1,7 +1,7 @@
 // test_pthread_names -- guest-visible names must round-trip instead of returning success with an
 // untouched output buffer. The contract is intentionally independent of host name limits/APIs.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>

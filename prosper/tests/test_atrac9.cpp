@@ -3,7 +3,7 @@
 // the CRC32 of its reference PCM (produced by LibAtrac9 itself, the canonical PS ATRAC9 decoder). This
 // guards the glue wiring (config parse, per-frame superframe iteration, output layout) and the vendored
 // build integration; pure and self-contained (no game dump), so it runs in CI.
-#include "../src/hle/atrac9_decode.hpp"
+#include "hle/audio/atrac9_decode.hpp"
 #include "at9_testvec.h"
 #include <cstdio>
 #include <cstdint>

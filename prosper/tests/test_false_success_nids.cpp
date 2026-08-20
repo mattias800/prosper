@@ -9,8 +9,8 @@
 // of the right one. The mutation each arm kills is named on the arm, because an assertion that
 // passes for the wrong reason is the recurring failure in this project: a `CHECK(ret == 0)` on a
 // fill contract passes against the very stub the change exists to remove.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

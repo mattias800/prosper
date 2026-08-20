@@ -75,7 +75,7 @@ in-bounds, rule out upstream guards). All CLEAN on current master except the edg
 | Multi-module linker | `src/loader/linker.cpp` | CLEAN; **#1198** init-array `p+8` guard |
 | Loader bounds primitives | `src/self/module.{hpp,cpp}` | **#1198** `self_read_ok` (replaces wrap-prone `off+need<=size`) |
 | Host image map + ABI stubs | `src/host/exec_image_linux.cpp` `map_image`/`install_stubs` | CLEAN — `img.mem`-sized copy; stub region = import-count×stub_size (count clamped by #1219) |
-| Guest memory-management HLE | `src/hle/hle_kernel_mem.cpp` | CLEAN — WriteAddress fixed-8B `process_vm_writev`, VirtualQuery clamped, dmem allocator pool-bounded, every `addr+len` guarded |
+| Guest memory-management HLE | `src/hle/memory/hle_kernel_mem.cpp` | CLEAN — WriteAddress fixed-8B `process_vm_writev`, VirtualQuery clamped, dmem allocator pool-bounded, every `addr+len` guarded |
 | GPU command processor / PM4 | `src/gpu/pm4/command_processor.cpp` | **#1200** SetRegsIndirect `guest_readable` guard; **#1202** WriteData null-src stale-tail `memset` |
 | GPU executor / shader decode | `src/gpu/execute/gpu_executor.cpp` | CLEAN (canonical wrap-safe form throughout); **#1210** diagnostic-dump OOB clamp |
 | Compute dispatch sizing | `frontends/shared/live_compute.cpp` | CLEAN |
@@ -84,8 +84,8 @@ in-bounds, rule out upstream guards). All CLEAN on current master except the edg
 | Descriptor decode | `src/gpu/agc/agc_shader_layout.cpp` | CLEAN — see the dimension-clamp section above |
 | Resource/descriptor layer, GPU capture parser | `src/gpu/*` | CLEAN |
 | HLE getters (audio/service/http/json) | `src/hle/*` | CLEAN — output params fully initialized |
-| SELF/save path traversal | `src/hle/hle_file.cpp` | **#1204** savedata `dirName` guard; **#1206** `translate()` `..` normalization |
-| `__cxa_guard`/`call_once` recursion | `src/hle/hle_libc.cpp` | **#1196** recursion self-deadlock break |
+| SELF/save path traversal | `src/hle/fs/hle_file.cpp` | **#1204** savedata `dirName` guard; **#1206** `translate()` `..` normalization |
+| `__cxa_guard`/`call_once` recursion | `src/hle/libc/hle_libc.cpp` | **#1196** recursion self-deadlock break |
 
 ## Adding a new guest-input parser?
 

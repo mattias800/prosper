@@ -24,7 +24,7 @@
 //   * arm 6 below links a module built BY HAND (`handmade_prx.h`) whose file offsets and vaddrs
 //     diverge — a geometry `synth_prx.h` cannot express. A positive control drawn from the same
 //     source as the null it validates tests the discriminator, never the domain.
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "../src/loader/linker.hpp"
 #include "../src/self/module.hpp"
 #include "handmade_prx.h"

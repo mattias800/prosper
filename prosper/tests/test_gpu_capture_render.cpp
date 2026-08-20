@@ -4,7 +4,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/present/videoout_present.hpp"
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "../frontends/shared/live_compute.hpp"
 #include "../frontends/shared/live_renderer.hpp"
 #include "render_runner.h"

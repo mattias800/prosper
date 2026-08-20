@@ -3,8 +3,8 @@
 // the old global first-definition-wins table aliased it to the first (wrong plugin initialized).
 // LoadStartModule resolves a linked-module path (basename match) to a real handle; an unknown path
 // returns ENOENT (#146) — dlsym against a non-module handle still falls back to the global table.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <unordered_map>

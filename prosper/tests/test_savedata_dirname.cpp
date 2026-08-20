@@ -2,7 +2,7 @@
 // save root. savedata_dirname_ok is the shared guard for savedata0_mount and savedata0_dir_mtime, so
 // a crafted/garbled name (empty, "." / "..", or one with an embedded separator) can never traverse
 // out of the sandbox to stat/create a directory elsewhere. Pure predicate — no filesystem.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 
 using namespace prosper;

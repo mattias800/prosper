@@ -16,7 +16,7 @@
 // 64-bit argument, and the shapes they pass are recorded. Asserting over those shapes is the only
 // check that can run here and the only one that would fail if the widening leaked.
 
-#include "hle/guest_memory_topology.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
 
 #include <cstdint>
 #include <cstdio>

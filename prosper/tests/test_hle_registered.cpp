@@ -2,8 +2,8 @@
 // register_builtin_hle() binds handlers by NID; a typo'd name or a forgotten registration would
 // silently leave an import as an unimplemented stub (returns 0) and regress the boot. This checks
 // a representative set across every HLE module (libc, math, file, kernel, time, service, graphics).
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <atomic>
 #include <array>
 #include <cstdio>

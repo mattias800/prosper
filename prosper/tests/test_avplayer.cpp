@@ -6,9 +6,9 @@
 // ("[PS5VideoPlayback] ERROR: sceAvPlayerInitEx() failed"). Astro Bot also pulls frames without ever
 // polling IsActive, so synthetic EOF must be driven by GetVideoData[Ex] and fire STOP outside the
 // player mutex. This locks both contracts.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/video_backend.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/video/video_backend.hpp"
 #include "gpu/texture/guest_texture_layout.hpp"
 #include "gpu/texture/tile.hpp"
 #include <cstdio>

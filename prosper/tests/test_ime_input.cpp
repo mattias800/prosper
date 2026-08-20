@@ -4,9 +4,9 @@
 //   handler(rdi=arg, rsi=SceImeEvent*); event +0x00 u32 id (0x101=down, 0x102=up), +0x08 u16 keycode.
 // A no-event stub (the old behavior) delivered no input, so titles reading input through the IME
 // keyboard path never saw a keypress. Drives the real HLE via the NID registry.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/ime_input.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/input/ime_input.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>

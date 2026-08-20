@@ -13,10 +13,10 @@
 // they fail against the pre-#1612 code and pass after it. On a BSD-numbered host (macOS) several
 // were already correct; the contract they pin is the same either way.
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sce_errno.hpp"
-#include "../src/hle/sync_retire.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/kernel/sce_errno.hpp"
+#include "hle/sync/sync_retire.hpp"
 
 #include <cerrno>
 #include <chrono>

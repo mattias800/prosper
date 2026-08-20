@@ -2,7 +2,7 @@
 // build a command buffer that sets real RDNA2 registers (shader program addresses, color target,
 // primitive type, depth/blend state) via the AGC Dcb builders, replay it into a GpuState, then
 // extract the semantic RenderState and assert every field (addresses use the RDNA2 <<8|<<40 rule).
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/state/render_state.hpp"
 #include "gpu/state/vk_translate.hpp"

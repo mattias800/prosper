@@ -1,4 +1,4 @@
-#include "../src/hle/dmem_caller_chain.hpp"
+#include "hle/memory/dmem_caller_chain.hpp"
 
 #include <algorithm>
 #include <array>

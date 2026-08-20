@@ -1,0 +1,55 @@
+# The reimplemented Sony library surface, as folders. Consumed by move_module.py.
+#
+# Format: `folder: module module module` -- module is the basename, without extension; the .cpp,
+# .hpp and .h of a module always travel together.
+#
+# The ordering principle is HOW A GUEST CALL IS SERVED: it arrives through the dispatcher, which
+# resolves a NID to one of these implementations, and the implementation is grouped by the Sony
+# library surface it reimplements. A folder is a claim about coupling -- things in one folder are
+# expected to change together.
+#
+# Two names are not what they look like, which is why these were read rather than sorted by prefix:
+#   * callback_fs is the guest %fs segment register recovered when the HOST calls back INTO the
+#     guest -- ABI machinery belonging with the dispatcher, not a filesystem.
+#   * hle_json2 is libSceJson2, a general-purpose JSON parser. It sits with font as a leaf utility
+#     library rather than with http, because "both are used by web-facing code" is a claim about
+#     callers, not about what changes together.
+
+# --- how a guest call reaches an implementation ------------------------------------------------
+dispatch: dispatch nid callback_fs
+
+# --- libkernel ---------------------------------------------------------------------------------
+kernel: hle_kernel hle_kernel_time sce_errno
+
+# --- guest memory: dmem, virtual ranges, the heap ----------------------------------------------
+memory: hle_kernel_mem guest_memory_topology dmem_caller_chain heap_mutex
+
+# --- threads, fibers and synchronization primitives --------------------------------------------
+sync: sync_futex sync_retire pthread_slot hle_fiber hle_ult
+
+# --- libc ---------------------------------------------------------------------------------------
+libc: hle_libc
+
+# --- filesystem ---------------------------------------------------------------------------------
+fs: hle_file
+
+# --- graphics: AGC and the video-out surface ----------------------------------------------------
+graphics: hle_agc hle_graphics agc_reg_defaults
+
+# --- audio: sceAudioOut, AJM, ATRAC9 ------------------------------------------------------------
+audio: hle_audio audio ajm_decoder atrac9_decode
+
+# --- video playback: sceAvPlayer ----------------------------------------------------------------
+video: video_backend
+
+# --- pad and IME --------------------------------------------------------------------------------
+input: hle_pad ime_input
+
+# --- system/user service, app content, and the host-registered dialog seam ----------------------
+service: hle_service hle_addcontent platform_ui
+
+# --- leaf utility libraries ---------------------------------------------------------------------
+util: hle_font hle_json2
+
+# --- network ------------------------------------------------------------------------------------
+net: hle_http

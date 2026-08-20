@@ -8,7 +8,7 @@
 //
 // This file owns the REGISTRATION and RETURN-POLICY contract. The implemented semantics (mutual
 // exclusion, work areas, object identity) are tested in test_ult_semantics.cpp.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
 #include <cstdio>

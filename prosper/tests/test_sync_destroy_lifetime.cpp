@@ -28,9 +28,9 @@
 // retirement census below still passes under the counter-arm, and should: the objects really are
 // handed over, the window is simply zero, so they are reclaimed on the spot. Rebuilding this file
 // against pre-#2042 handlers instead fails 11 — the census too, since nothing is handed over at all.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sync_retire.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/sync/sync_retire.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>

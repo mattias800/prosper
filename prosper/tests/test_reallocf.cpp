@@ -30,8 +30,8 @@
 //
 // The mutation was run: replacing the body with plain `guest_realloc_portable` turns
 // "the failed resize RELEASED the original block" red while every other arm stays green.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

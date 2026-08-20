@@ -25,8 +25,8 @@
 // unperturbed, glibc grew the block in place and the alignment survived by luck; perturbed, it
 // relocated to 16- but not 256-aligned. Sony ships `reallocalign` beside `realloc` for this
 // reason, and pairs sceLibcMspaceRealloc with sceLibcMspaceReallocalign.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>

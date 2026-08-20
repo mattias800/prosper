@@ -22,8 +22,8 @@
 #include <string>
 #include <sys/stat.h>
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "test_scratch.h"
 
 namespace prosper {

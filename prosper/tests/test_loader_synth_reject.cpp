@@ -22,7 +22,7 @@
 // One arm is built BY HAND, outside `synth_prx.h`, for the reason recorded in `handmade_prx.h`: a
 // corrupted variant produced by the same generator as the control inherits that generator's geometry,
 // so a malformation it cannot express would read as a clean pass.
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "../src/loader/linker.hpp"
 #include "../src/self/module.hpp"
 #include "handmade_prx.h"

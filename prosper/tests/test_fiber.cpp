@@ -1,4 +1,4 @@
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
 #include <cstdio>

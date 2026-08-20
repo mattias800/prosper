@@ -75,9 +75,9 @@
 // skipped. The M4 arm guards the opposite error — `scePthreadBarrierWait` returns -1 for the serial
 // thread, which is not an errno at all, and over-applying the encoding would corrupt it.
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sce_errno.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/kernel/sce_errno.hpp"
 #include <atomic>
 #include <cerrno>
 #include <chrono>

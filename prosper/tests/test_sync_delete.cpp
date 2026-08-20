@@ -4,9 +4,9 @@
 // with waiters is UB). The fix marks the object deleted, wakes waiters (which return EACCES), and
 // defers the free to the last waiter leaving. This drives it through the NID registry: park a
 // waiter, delete from the main thread, and assert the waiter wakes with EACCES and nothing crashes.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sce_errno.hpp"   // kSceKernelErrorEINVAL (#1963)
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/kernel/sce_errno.hpp"   // kSceKernelErrorEINVAL (#1963)
 #include <cstdio>
 #include <cstdint>
 #include <cinttypes>

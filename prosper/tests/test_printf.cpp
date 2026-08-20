@@ -3,8 +3,8 @@
 // produced garbage or crashed. The fix makes them real C variadic functions. This looks up the
 // registered function pointer and calls it through its TRUE variadic signature (same SysV ABI the
 // guest uses via the tail-jump stub), exercising the register + XMM + stack capture end to end.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

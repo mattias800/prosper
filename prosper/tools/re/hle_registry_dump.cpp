@@ -29,7 +29,7 @@
 // never make shared handlers look distinct. Grouping by address is therefore an upper bound on the
 // collapse, while the NID column is exact — see `test_hle_registry_reconcile.py`, which relies on
 // exactly that asymmetry and reports folding rather than tripping over it.
-#include "../../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <algorithm>
 #include <cstdio>

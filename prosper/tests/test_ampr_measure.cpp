@@ -2,8 +2,8 @@
 // Pathless. Size queries return byte counts, not status codes. A sizing-only call must remain pure,
 // while DOLL's older SDK wrapper passes a registered APR id and relies on its legacy entry point to
 // fill the destination.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "test_scratch.h"
 #include <array>
 #include <cstdint>

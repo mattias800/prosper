@@ -11,8 +11,8 @@
 // the shared auto-map window (the widened-window approach re-admitted the PS5-libc-rejected
 // 1-8 TiB gap and was rejected in #982 review). Smaller and MAP_FIXED reservations keep their
 // existing hint semantics, and the vacated low hint stays available for the metadata pool.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #ifdef _WIN32

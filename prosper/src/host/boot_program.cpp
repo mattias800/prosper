@@ -95,7 +95,7 @@ std::vector<std::string> discover_extra_plugin_modules(
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #include "host/exec_image.hpp"
 #include "host/runtime_module_load.hpp"
-#include "hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "self/module.hpp"     // PT_SCE_PROCPARAM
 #include <cstdio>
 #include <cstdlib>

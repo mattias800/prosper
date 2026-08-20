@@ -3,7 +3,7 @@
 // known pixel patterns, drives SubmitFlip through the NID registry, and asserts that the present
 // layer scans out the flipped buffer and reads back exactly its pixels. This proves the present
 // plumbing end-to-end headlessly — the surface the renderer will present real frames to.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "../src/host/lifecycle.hpp"
 #include <chrono>

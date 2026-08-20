@@ -8,8 +8,8 @@
 // normal-return exit path purges, (4) the scePthreadExit path (host pthread_exit — never returns
 // through the trampoline) purges, (5) main/host threads with no DTV entries purge as a no-op,
 // (6) a normal-return thread leaves guest %fs before returning to the host pthread runtime (#644).
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>

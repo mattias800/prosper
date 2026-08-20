@@ -22,8 +22,8 @@
 
 #include "../src/host/exec_image.hpp"
 #include "../src/host/guest_write_watch.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 namespace prosper {
     uint32_t    prosper_apr_register(const std::string& path, uint64_t size);

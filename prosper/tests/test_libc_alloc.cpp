@@ -1,8 +1,8 @@
 // Guest libc allocation entry points must use one mutually compatible allocator family. On
 // Windows, _aligned_malloc pointers cannot be passed to plain free; Astro exercises that path when
 // aligned mesh buffers are destroyed during its world-map load.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>

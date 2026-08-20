@@ -4,8 +4,8 @@
 // MAP_FIXED_NOREPLACE, upgraded to MAP_FIXED only when the hint is entirely our own uncommitted
 // reservation. This drives the real HLE handlers and asserts a non-fixed collision relocates, a
 // fixed collision fails without clobbering, and committing an OWN reservation still works.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <sys/mman.h>

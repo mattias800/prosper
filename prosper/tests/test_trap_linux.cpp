@@ -4,7 +4,7 @@
 #include "../src/self/module.hpp"
 #include "../src/loader/linker.hpp"
 #include "../src/host/exec_image.hpp"
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <string>
 

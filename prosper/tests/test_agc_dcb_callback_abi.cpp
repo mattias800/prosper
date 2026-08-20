@@ -11,7 +11,7 @@
 // way real guest code does. A plain host callback would be given the host convention on both sides
 // and would pass whether or not the trampoline is used -- i.e. it could not fail, which is the trap
 // this test exists to avoid.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
 #include <cstdio>

@@ -3,8 +3,8 @@
 // pointing at a real {offset,value} array, then replays the stream into a GpuState and asserts the
 // register files, index type, and draw list. Exercises decode+apply end-to-end against the real
 // emitters; independent of the (SDK-gated) boot.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"

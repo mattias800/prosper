@@ -2,7 +2,7 @@
 // its REAL PT_TLS p_align (#143), not a hardcoded 16. Otherwise a module with p_align > 16 gets its
 // block at the wrong distance below the thread pointer and every initial-exec %fs:-N access resolves
 // off. Drives guest_tls_set_templates and reads back the per-module offsets. Linux-only.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "../src/loader/tls_layout.hpp"
 #include <cstdio>
 #include <cstdint>

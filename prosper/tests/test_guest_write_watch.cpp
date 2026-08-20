@@ -1,6 +1,6 @@
 #include "host/guest_write_watch.hpp"
 #include "host/exec_image.hpp"
-#include "hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
 #include <cstdlib>

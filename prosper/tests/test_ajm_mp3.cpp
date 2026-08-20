@@ -3,9 +3,9 @@
 // The project-owned input is four constant-bitrate MPEG-1 Layer III frames generated from a 1 kHz
 // sine wave (FFmpeg lavfi + libmp3lame, 48 kHz mono, 80 kbps, no container/tag). Its dimensions
 // mirror GTA V's live jobs exactly: 960 compressed bytes -> 4 * 1152 mono S16 samples = 9216 bytes.
-#include "hle/dispatch.hpp"
-#include "hle/ajm_decoder.hpp"
-#include "hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/audio/ajm_decoder.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "ajm_ffmpeg.hpp"
 
 #include <algorithm>

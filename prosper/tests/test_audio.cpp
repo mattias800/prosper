@@ -4,9 +4,9 @@
 // entrypoints through the dispatch table (so registration + arg decoding + forwarding are all
 // exercised), and asserts the port lifecycle, format decoding, PCM forwarding, volume and error
 // paths. Exit code is truth.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/audio.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/audio/audio.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>

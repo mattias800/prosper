@@ -6,7 +6,7 @@
 // with ENVIRONMENT "PROSPER_SYNC_RING=64" -- a deliberately tiny ring, because the property that
 // matters most is what the dump says when it has DROPPED events. A diagnostic that silently
 // truncates is worse than no diagnostic: it reads as "this is everything that happened".
-#include "../src/hle/sync_futex.hpp"
+#include "hle/sync/sync_futex.hpp"
 
 #include <cstdio>
 #include <cstring>

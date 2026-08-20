@@ -141,11 +141,11 @@
 // regression in this area is a thread that never wakes, and expressing that as a hang burns ctest's
 // timeout and gets misread as machine load on a box that routinely runs at load 30+.
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/pthread_slot.hpp"
-#include "../src/hle/sce_errno.hpp"
-#include "../src/hle/sync_retire.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/sync/pthread_slot.hpp"
+#include "hle/kernel/sce_errno.hpp"
+#include "hle/sync/sync_retire.hpp"
 
 #include <atomic>
 #include <cerrno>       // §6's construction control asserts EBUSY from a real trylock

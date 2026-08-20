@@ -66,8 +66,8 @@
 // timeout and gets reported as an infrastructure problem — on a box that regularly runs at load 30+
 // a real regression would then be blamed on machine load. Each arm fails and the process exits.
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>

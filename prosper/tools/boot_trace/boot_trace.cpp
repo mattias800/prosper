@@ -6,7 +6,7 @@
 #include "host/exec_image.hpp"
 #include "host/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
 #include "first_frame_capture.hpp"         // --capture-first-frame observer (isolated)
-#include "hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <string>
 #include <cstdint>

@@ -6,8 +6,8 @@
 // out-param). register_fn now records every collision where the handler CHANGED; this test asserts
 // there are none left. If an intentional override is ever added, list its NID in kAllowed with a
 // justification — silence here is the healthy state.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <string>
 #include <unordered_map>

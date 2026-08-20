@@ -1,11 +1,11 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
-#include "hle/guest_memory_topology.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/capture/writer_provenance.hpp"
-#include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
+#include "hle/sync/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
 
 // hle_graphics.cpp: perform the videoout flip for an in-stream SetFlip packet — advances the flip
 // status (count/flipArg/currentBuffer) that sceVideoOutGetFlipStatus reports, exactly like the API

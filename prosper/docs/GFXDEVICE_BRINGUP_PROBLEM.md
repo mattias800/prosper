@@ -217,7 +217,7 @@ shifted across probes — treat offsets as observations, not confirmed semantics
   register state + module-classified rbp backtrace on fault.
 - `shader_histo` / `recompile_coverage` — RDNA2 recompiler coverage over the real shaders.
 - Source of most of the above: `src/host/exec_image_linux.cpp` (fault handler + probes),
-  `src/hle/hle_agc.cpp` + `hle_graphics.cpp` (AGC/graphics HLE). See also `docs/GRAPHICS.md` (the
+  `src/hle/graphics/hle_agc.cpp` + `hle_graphics.cpp` (AGC/graphics HLE). See also `docs/GRAPHICS.md` (the
   full front-half RE log) and `docs/ROADMAP.md` §"Current status".
 
 ---

@@ -8,8 +8,8 @@
 // This test MEASURES each builder's actual cursor advance (the real emitted size) and asserts its GetSize
 // == that × 4, so any drift fails here. Rewind has no builder (reserve-only); its GetSize is asserted
 // against the documented 2-dword contract that a future REWIND builder must honor.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

@@ -1,7 +1,7 @@
 // tls_layout.hpp — pure x86-64 Variant-II static-TLS layout shared by the linker and allocator.
 #pragma once
 
-#include "../hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <vector>

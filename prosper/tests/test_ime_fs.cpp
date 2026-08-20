@@ -14,8 +14,8 @@
 // The %fs swap is Linux-only (Windows/macOS never swap hardware %fs at the import boundary), so the
 // test is a no-op pass elsewhere.
 #include "../src/host/exec_image.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/ime_input.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/input/ime_input.hpp"
 
 #include <cstdint>
 #include <cstdio>

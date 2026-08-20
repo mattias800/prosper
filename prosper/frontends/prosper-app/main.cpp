@@ -21,7 +21,7 @@
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
-#include "hle/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
+#include "hle/sync/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
 #include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
@@ -30,7 +30,7 @@
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
 #include "keyboard_pad_map.hpp"         // which key is which pad control (#2234)
-#include "hle/ime_input.hpp"           // #1093: forward host keyboard keys to the guest IME path
+#include "hle/input/ime_input.hpp"           // #1093: forward host keyboard keys to the guest IME path
 #include "present_mode.hpp"             // explicit swapchain latency/vsync policy, pure regression seam
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam

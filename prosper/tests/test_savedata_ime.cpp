@@ -2,7 +2,7 @@
 // The ImeDialog auto-completes (no keyboard UI) so a poll loop can't hang; the SaveData memory API is
 // a real per-(user,slot) block: Setup allocates, Set writes guest->block, Get reads block->guest,
 // Sync commits. Struct layouts mirror shadPS4 save_data/savedata.cpp (offsets asserted below).
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <cstdlib>   // setenv (test-private save dir)
 #include <cstdint>

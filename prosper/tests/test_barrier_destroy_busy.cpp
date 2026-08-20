@@ -9,8 +9,8 @@
 // ALL of them, not one. That means a regression here HANGS rather than fails, which is why the joins
 // below are watchdogged — a CI timeout with no message is strictly worse than a failure.
 
-#include "hle/dispatch.hpp"
-#include "hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <atomic>
 #include <chrono>

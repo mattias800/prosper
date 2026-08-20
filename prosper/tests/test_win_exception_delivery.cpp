@@ -1,8 +1,8 @@
 // Windows must run sceKernelRaiseException's guest handler on the requested target thread,
 // then restore the exact interrupted host context so that thread continues normally.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sync_futex.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/sync/sync_futex.hpp"
 #include "../src/host/exec_image.hpp"
 #include "../src/host/sse4a.hpp"
 #include "test_scratch.h"

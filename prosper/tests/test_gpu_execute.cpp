@@ -7,7 +7,7 @@
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/state/vk_translate.hpp"
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "../src/host/guest_write_watch.hpp"
 #include "render_runner.h"
 #include "test_scratch.h"

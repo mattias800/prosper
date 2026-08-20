@@ -22,8 +22,8 @@
 #include "guest_write_watch.hpp"
 #include "sse4a.hpp"
 #include "x86_read_decode.hpp"
-#include "../hle/nid.hpp"
-#include "../hle/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
 #include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 

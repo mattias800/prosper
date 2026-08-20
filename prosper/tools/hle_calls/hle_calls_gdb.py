@@ -144,7 +144,7 @@ AT_ENTRY = 9                    # auxv key: the entry point the kernel actually 
 SYMBOL_CHECK_N = 8
 
 # The built-in control for the value-capture mechanism, and the two values it can answer.
-# src/hle/hle_service.cpp `HLE(s_user_getevent)`: a function-local `static` flag makes the
+# src/hle/service/hle_service.cpp `HLE(s_user_getevent)`: a function-local `static` flag makes the
 # initial LOGIN event (return 0) a once-per-PROCESS delivery, and every later call answers
 # SCE_USER_SERVICE_ERROR_NO_EVENT. Everything in _positive_control() follows from that.
 CONTROL = "s_user_getevent"

@@ -13,7 +13,7 @@
 // The app0 root is a real temp tree: translate() probes the host FS for the case-corrected
 // fallback. It returns composed paths unchanged whenever the exact-case entry exists (or nothing
 // matches), which keeps the byte-exact checks below valid on case-insensitive filesystems too.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>

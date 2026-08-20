@@ -10,8 +10,8 @@ recorder, a network sink, …) be swapped in at runtime.
 
 | Layer | File | In `prosper_core`? |
 |---|---|---|
-| Backend interface | `src/hle/audio.hpp` (`AudioSink`, `AudioPortInfo`, format decode) | yes (header) |
-| HLE + default sink | `src/hle/hle_audio.cpp` | yes |
+| Backend interface | `src/hle/audio/audio.hpp` (`AudioSink`, `AudioPortInfo`, format decode) | yes (header) |
+| HLE + default sink | `src/hle/audio/hle_audio.cpp` | yes |
 | SDL3 frontend (optional) | `frontends/audio_sdl3/` | **no** (separate target) |
 
 ### HLE coverage (`hle_audio.cpp`)
@@ -107,7 +107,7 @@ Read the counters, not just presence:
 - **`nonzero=N/M` is the measure that decides silent vs quiet.** Peak is raised by a single stray
   sample and RMS needs a threshold that will call some genuinely-mixed quiet passage silent; only an
   exact `nonzero=0/M` proves the guest submitted a cleared buffer. The rule lives in
-  `AudioSignalStats` (`src/hle/audio.hpp`) and is unit-tested against both alternatives.
+  `AudioSignalStats` (`src/hle/audio/audio.hpp`) and is unit-tested against both alternatives.
 - **Judge a port by its `LIFE:` totals, never by one interval.** Per-interval counters reset every
   second and real playback has gaps, so any single line can read `nonzero=0/M` on a port carrying
   strong signal over the run. The never-reset totals are what make one line sufficient — reading
@@ -148,7 +148,7 @@ Read the counters, not just presence:
 ## Multichannel MAIN beds and the stereo fold — `PROSPER_AUDIO_LAYOUT=1`
 
 prosper's host sink is stereo, so a MAIN port wider than two channels has to be folded down. The
-fold is a pure function, `audio_stereo_downmix(channels, out, capacity)` in `src/hle/audio.hpp`,
+fold is a pure function, `audio_stereo_downmix(channels, out, capacity)` in `src/hle/audio/audio.hpp`,
 returning one `{left, right}` gain per **source** channel plus a count of channels it could **not**
 place. The mix loop does nothing but apply it, so the whole correctness surface of multichannel
 output is unit-tested in `test_audio` without a device or a guest.

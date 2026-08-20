@@ -1,10 +1,10 @@
 // Condition attributes retain the PS5 clock identity and absolute waits use that selected clock.
 // Before #386/F8, CondInit discarded the attribute, so a MONOTONIC/CPU-clock deadline was treated
 // as CLOCK_REALTIME and normally appeared decades in the past.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/sce_errno.hpp"   // #2178: the Sony spellings report the libkernel encoding
-#include "../src/hle/sync_futex.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/kernel/sce_errno.hpp"   // #2178: the Sony spellings report the libkernel encoding
+#include "hle/sync/sync_futex.hpp"
 
 #include <cerrno>
 #include <chrono>

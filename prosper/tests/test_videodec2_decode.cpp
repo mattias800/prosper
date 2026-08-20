@@ -25,9 +25,9 @@
 // hashes taken from an independent decoder. Splitting them that way is the point: a fake picture
 // cannot accidentally pass the decode test, and a broken decoder cannot accidentally pass this one.
 
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/video_backend.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/video/video_backend.hpp"
 
 #include <cstdint>
 #include <cstdio>

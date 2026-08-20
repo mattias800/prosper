@@ -18,8 +18,8 @@
 // The module is a synthetic ET_SCE_DYNAMIC ELF written by this test, so the check is hermetic:
 // no game dump, no network, and the "guest" code is bytes this file emits and can therefore
 // assert on exactly.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "../src/host/boot_program.hpp"
 #include "../src/host/exec_image.hpp"
 #include "../src/host/runtime_module_load.hpp"

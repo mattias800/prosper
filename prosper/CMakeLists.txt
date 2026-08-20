@@ -1182,6 +1182,8 @@ if(TARGET prosper_core)
   # caller identity while every MEMLOG allocation can carry the same stable run-local ID. Pure,
   # including explicit unknown/overflow states and concurrent interning.
   add_executable(test_dmem_caller_chain tests/test_dmem_caller_chain.cpp)
+  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+  target_include_directories(test_dmem_caller_chain PRIVATE src)
   add_test(NAME dmem_caller_chain COMMAND test_dmem_caller_chain)
 
   # Capped-diagnostic rate limit (issue #1761): a print budget must never be readable as a
@@ -2142,6 +2144,8 @@ if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
                           PkgConfig::PROSPER_AJM_FFMPEG)
 
     add_executable(test_ajm_mp3 tests/test_ajm_mp3.cpp)
+    # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+    target_include_directories(test_ajm_mp3 PRIVATE src)
     target_link_libraries(test_ajm_mp3 PRIVATE prosper_ajm_ffmpeg)
     add_test(NAME ajm_mp3_decode COMMAND test_ajm_mp3)
 
@@ -2367,7 +2371,7 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
 endif()
 
 # --- optional SDL3 audio frontend (headless core stays dependency-free) ---------------------
-# The sceAudioOut HLE is backend-agnostic (src/hle/audio.hpp). This builds an SDL3-backed sink,
+# The sceAudioOut HLE is backend-agnostic (src/hle/audio/audio.hpp). This builds an SDL3-backed sink,
 # entirely OUTSIDE prosper_core, so the guest's audio plays on the host.
 if(PROSPER_AUDIO_SDL3 AND TARGET SDL3::SDL3)
   add_library(prosper_audio_sdl3 STATIC frontends/audio_sdl3/audio_sink_sdl3.cpp)
@@ -2378,6 +2382,8 @@ if(PROSPER_AUDIO_SDL3 AND TARGET SDL3::SDL3)
   # Headless self-test of the full SDL3 path (run under the SDL "dummy" audio driver in CI):
   # install the sink, drive the sceAudioOut HLE, assert grains flow through SDL with no device.
   add_executable(test_audio_sdl3 frontends/audio_sdl3/test_audio_sdl3.cpp)
+  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+  target_include_directories(test_audio_sdl3 PRIVATE src)
   target_link_libraries(test_audio_sdl3 PRIVATE prosper_audio_sdl3)
   add_test(NAME audio_sdl3 COMMAND test_audio_sdl3)
   set_tests_properties(audio_sdl3 PROPERTIES ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")

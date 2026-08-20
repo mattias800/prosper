@@ -2,7 +2,7 @@
 // SysV call across the host ABI boundary. Windows needs a SysV->Microsoft-x64 conversion; Linux's
 // guest-FS path interposes a call while swapping FS. Both paths must forward stack args 7-10.
 #include "../src/host/exec_image.hpp"
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
 #include <cstdio>

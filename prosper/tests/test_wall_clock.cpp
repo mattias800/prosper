@@ -9,8 +9,8 @@
 // the FreeBSD clockid families map correctly, LocalTime is a valid calendar date, and the
 // monotonic sources (ptc/tsc/MONOTONIC) still count uptime and never go backwards.
 // Deliberately no exact-time asserts — everything is tolerance-based.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>

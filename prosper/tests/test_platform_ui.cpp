@@ -2,9 +2,9 @@
 // with real UI, while the headless default (auto-complete) stays the behavior when none is registered.
 // This drives the sceImeDialog* HLE handlers both ways: no backend -> headless FINISHED; a registered
 // backend -> Init/Status/Result/Close route to it (a real dialog's timing + outcome).
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/platform_ui.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/service/platform_ui.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

@@ -6,7 +6,7 @@ Videodec2's caller (CRI's `criMvPly`, and the CRI Mana backends built on it) dem
 submits one compressed access unit at a time, expecting at most one picture back per unit.
 
 Both now run on the same host decoder. `prosper::video::VideoBackend` carries two entry points onto
-it (`src/hle/video_backend.hpp`):
+it (`src/hle/video/video_backend.hpp`):
 
 | shape | entry points | used by |
 | --- | --- | --- |

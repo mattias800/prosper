@@ -420,7 +420,7 @@ frame-for-frame or timing-comparable with a default run — so use it to compare
 A `blend=1` count of zero is only evidence when a **positive control** on the same binary produces a
 non-zero one: *Dragon Quest VII* (`PPSA17942`) is the calibrated control used here — 2,069 against
 Oregon Trail's 0. And to attribute a register value to prosper rather than to the guest, change the
-value in `src/hle/agc_reg_defaults.cpp` to a marker and re-run `PROSPER_REGWATCH`: if the marker
+value in `src/hle/graphics/agc_reg_defaults.cpp` to a marker and re-run `PROSPER_REGWATCH`: if the marker
 appears in the register, prosper's table is the source. That is what proved this one.
 
 **Whether a title searches for the key at all is a static question**, answerable without booting it:

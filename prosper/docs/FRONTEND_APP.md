@@ -36,7 +36,7 @@ core; the core never depends on the frontend. Delete `frontends/` and CI is unaf
 The core already exposes exactly the injection points a frontend needs. The frontend *supplies*
 implementations; the core calls them.
 
-### 1. Audio — `AudioSink` (exists, `src/hle/audio.hpp`)
+### 1. Audio — `AudioSink` (exists, `src/hle/audio/audio.hpp`)
 ```cpp
 struct AudioSink {
     virtual bool open(int port, const AudioPortInfo& info);        // configure a port

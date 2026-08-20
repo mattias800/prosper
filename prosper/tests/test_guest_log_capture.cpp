@@ -1,8 +1,8 @@
 // Exact guest-log phase gate for whole-frame captures. Pure/offline: no guest or Vulkan device.
 #include "gpu/capture/gpu_capture_bundle.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <chrono>
 #include <cstdio>

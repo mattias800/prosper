@@ -4,8 +4,8 @@
 // (3) axis normalization + dead-zone math, and (4) the HLE functions are registered and fill the
 // FULL 120-byte struct (the old stub only wrote 48 bytes, leaving connected/timestamp garbage).
 #include "../src/input/pad.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

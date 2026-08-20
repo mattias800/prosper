@@ -3,8 +3,8 @@
 // writable and an overrun never faulted. This drives the real sceKernelMprotect HLE and probes the page
 // with a SIGSEGV handler: after prot 0 a read must fault; after prot RW it must be writable again (so
 // the common non-zero path is unbroken). Linux-only (mmap/mprotect/signals).
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <csetjmp>

@@ -1,7 +1,7 @@
 // Guest fd I/O must preserve every byte of binary game content on every host.
 // In particular, Windows CRT text mode treats 0x1a as EOF and translates CRLF.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "test_scratch.h"
 #include <array>
 #include <cerrno>

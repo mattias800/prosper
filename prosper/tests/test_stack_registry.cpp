@@ -2,8 +2,8 @@
 // GC_get_stack_base rely on (and that the k_pthread_create trampoline populates). A regression
 // here reintroduces "Bad stack base in GC_register_my_thread" during the boot.
 #include "../src/host/exec_image.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>

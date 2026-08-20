@@ -2,8 +2,8 @@
 // must not make the tracking layer report that the pages were committed. Guests use
 // VirtualQuery to decide whether a later commit is necessary; a false committed result skips that
 // commit and leaves the first access faulting.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

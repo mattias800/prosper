@@ -10,8 +10,8 @@
 //
 // P() in hle_libc.cpp is the identity map (guest addr == host addr), so a test can hand these HLEs
 // real host pointers via the registry (Hle::lookup) and call them directly.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <atomic>
 #include <chrono>

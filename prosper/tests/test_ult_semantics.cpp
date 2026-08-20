@@ -16,7 +16,7 @@
 //
 // The Ult object the guest owns is a 256-byte caller-allocated blob; these tests allocate the same
 // shape so prosper's 16-byte header lands where it does in the guest.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <atomic>
 #include <chrono>

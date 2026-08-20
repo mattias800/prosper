@@ -5,7 +5,7 @@
 // grains. output() blocks while the device's queue is full, reproducing the pacing that
 // sceAudioOutOutput has on real hardware (it blocks until the audio ring has room).
 #include "audio_sdl3.hpp"
-#include "../../src/hle/audio.hpp"
+#include "hle/audio/audio.hpp"
 #include "../../src/host/lifecycle.hpp"
 
 #include <SDL3/SDL.h>

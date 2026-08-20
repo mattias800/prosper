@@ -25,8 +25,8 @@
 // PROSPER_AMPRLOG=1 PROSPER_EVLOG=1): ONE equeue 0x318b75c0, 471 bound submits, of which 437 bind
 // id=0 (pointer dialect) and 34 bind a nonzero id — 22 of those on id=1 alone — every one of the
 // 34 posting `AprTagComplete token=0x0 (ring=0)`. Same equeue, same ident, constant zero tag.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>

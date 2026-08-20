@@ -8,9 +8,9 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/guest_memory_topology.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test

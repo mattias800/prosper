@@ -3,8 +3,8 @@
 // hashes to the exact import NID the game uses (so the import resolves to our impl), that all five are
 // registered, and the real behavior: the UTC<->localtime pair round-trips and fills its out-param,
 // and pthread_setcancelstate reports the previous state + rejects a bad state.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 

@@ -10,9 +10,9 @@
 // The load-bearing arm is therefore the THIRD call in the cycle, not the second: an unmount that
 // returns 0 proves nothing on its own, because the unregistered stub returned 0 too. Only the
 // re-mount separates "released the claim" from "said it did".
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/hle_addcontent.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/service/hle_addcontent.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "test_scratch.h"
 
 #include <cstdint>

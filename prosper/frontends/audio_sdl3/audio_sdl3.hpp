@@ -1,7 +1,7 @@
 // audio_sdl3.hpp — optional SDL3 audio frontend for the headless sceAudioOut HLE.
 //
 // Built only when -DPROSPER_AUDIO_SDL3=ON. Installs an SDL3-backed AudioSink so the guest's
-// audio actually plays out of the host's default device. The core HLE (src/hle/hle_audio.cpp)
+// audio actually plays out of the host's default device. The core HLE (src/hle/audio/hle_audio.cpp)
 // has no knowledge of SDL — this frontend lives outside prosper_core and plugs in at runtime.
 #pragma once
 

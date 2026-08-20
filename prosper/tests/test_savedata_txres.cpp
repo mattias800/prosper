@@ -10,7 +10,7 @@
 // against a fake that hands out a constant: the positivity check kills `return 0`, the distinctness
 // check kills a constant, and the destroy-twice check proves the registry actually records ids
 // rather than answering true unconditionally.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 
 using namespace prosper;

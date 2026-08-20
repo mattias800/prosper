@@ -459,7 +459,7 @@ two extractions that appeared to disagree (13 vs 37) were the same rows, differi
 uses — the first `libSceXxx.c` in sorted order that exports the NID — so the two tools cannot
 disagree about a library. Note this is a *Sony* attribution, not a prosper-file one:
 `sceSysmoduleIsLoaded` is `libSceSysmodule` even though prosper registers it in
-`src/hle/hle_kernel_time.cpp`.
+`src/hle/kernel/hle_kernel_time.cpp`.
 
 ## `pak_index.py` — turn a UE4 `.pak` byte offset into an asset name
 

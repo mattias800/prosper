@@ -22,7 +22,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
-#include "../src/hle/hle_kernel_time.hpp"
+#include "hle/kernel/hle_kernel_time.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

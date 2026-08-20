@@ -11,9 +11,9 @@
 // Drives the real HLE handlers (host pointers stand in for guest addresses, as in test_ajm) over
 // the shared 16-superframe test vector, with reference PCM built by the same Atrac9Decoder glue
 // that test_atrac9 proves bit-exact against LibAtrac9.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
-#include "../src/hle/atrac9_decode.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/audio/atrac9_decode.hpp"
 #include "at9_testvec.h"
 #include <cstdio>
 #include <cstdint>

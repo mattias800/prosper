@@ -11,8 +11,8 @@
 // non-zero must have the libkernel prefix; what the errno IS is the POSIX body's business and is
 // tested elsewhere.
 
-#include "hle/dispatch.hpp"
-#include "hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
 #include <cstdio>

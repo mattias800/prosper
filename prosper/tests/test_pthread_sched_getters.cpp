@@ -7,8 +7,8 @@
 // writing its out-param, handing the caller uninitialized stack memory (the exact harmful-stub class
 // the hle_kernel.cpp comment says was already fixed). This locks the shadowing out: a Get* that
 // returns OK MUST have written its out-param. Fails if the no-op registration ever wins again.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 

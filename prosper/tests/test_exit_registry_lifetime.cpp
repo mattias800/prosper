@@ -35,8 +35,8 @@
 // Without the fix the map/vector destructors have run by then, so every one of those touches is a
 // use-after-destruction: the observed failures are a SIGSEGV or a registry that reports its live
 // rows as missing. Either way the test fails; it cannot pass.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "../src/host/exec_image.hpp"
 
 #include <atomic>

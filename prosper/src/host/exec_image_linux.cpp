@@ -11,8 +11,8 @@
 #include "raw_syscall.hpp"
 #include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
 #include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
-#include "../hle/nid.hpp"
-#include "../hle/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include "posix_shim.hpp"

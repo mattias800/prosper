@@ -1,5 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>

@@ -1,5 +1,5 @@
 // test_sync_on_address -- basic behavior for the raw wait/wake-by-address HLE NIDs.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <atomic>
 #include <climits>
 #include <chrono>

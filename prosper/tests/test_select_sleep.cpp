@@ -16,9 +16,9 @@
 //
 // Both halves fail without the fix: (1) elapses ~0 ms against the unimplemented stub, and (2)
 // returns 0 rather than -1.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/sce_errno.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/kernel/sce_errno.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <chrono>
 #include <cerrno>
 #include <cstdint>

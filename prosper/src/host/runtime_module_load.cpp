@@ -6,7 +6,7 @@
 #include "host/boot_program.hpp"
 #include "host/exec_image.hpp"
 #include "loader/linker.hpp"
-#include "hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 
 #include <cstdio>
 #include <cstdlib>

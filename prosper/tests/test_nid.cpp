@@ -3,7 +3,7 @@
 // libc.prx exports: memcpy -> "Q3VBxCXhUHs". A dictionary match count against the
 // loaded module guards the whole pipeline (hash + symbol extraction).
 #include "../src/self/module.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <set>
 #include <string>

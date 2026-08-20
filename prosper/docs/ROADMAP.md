@@ -141,7 +141,7 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] Real HLE **dispatch**: per-import executable stubs — implemented imports
       tail-jump to a C handler (args intact); unimplemented ones log + return 0 so the
       boot advances (`src/hle/dispatch.*`, stubs in `exec_image_linux.cpp`).
-- [x] First HLE module: `src/hle/hle_libc.cpp` — libc thunks (mem/str/heap) + CRT
+- [x] First HLE module: `src/hle/libc/hle_libc.cpp` — libc thunks (mem/str/heap) + CRT
       no-ops, registered by NID. Boot trace now shows the real startup call order.
 - [x] Stack alignment fixed (Sony crt wants entry rsp ≡ 8 mod 16); boot clears
       C++ static init.
@@ -168,7 +168,7 @@ Turn the file into a resident, relocated guest image in host memory.
       targets or dedup'd HLE stub slots. (3 modules, 914 imports, 11 cross-module.)
 - [x] C++ runtime: `operator new`/`delete` (all variants) → host heap.
 - [x] stdio: `printf`/`puts`/`snprintf`/`v*` (va_list forwarded) → host.
-- [x] File I/O (`src/hle/hle_file.cpp`): stdio `FILE*` + POSIX fd + `sceKernelOpen/…`,
+- [x] File I/O (`src/hle/fs/hle_file.cpp`): stdio `FILE*` + POSIX fd + `sceKernelOpen/…`,
       with **`/app0` → dump-dir path translation** (real asset loading).
 - [x] The historical `eboot+0x3b5ea6` blocker was not a null `std::ctype` facet. It was inside the
       statically linked AGC DCB path; the authoritative symbol map identifies the nearby import
@@ -195,7 +195,7 @@ Turn the file into a resident, relocated guest image in host memory.
 - **The game's `main()` runs and prints output** (`"Argument Count = 1 … /app0/eboot.bin"`),
   then initializes PS5 services: user (accessibility), NP/online state, **controller
   (`scePadOpen`)**, mouse, AppContent, CommonDialog.
-- [x] PS5 system services (`src/hle/hle_service.cpp`): user (initial user, name, accessibility),
+- [x] PS5 system services (`src/hle/service/hle_service.cpp`): user (initial user, name, accessibility),
       NP/online (signed-out state, account), pad/mouse (open→handle, zeroed state), app content,
       dialogs — openers return handles, queries zero their output + report sane state.
 - [x] pthread TLS **keys** (`pthread_key_create`/`get`/`setspecific`) → host pthread keys (IL2CPP TLS).

@@ -160,7 +160,7 @@ This mirrors how real drivers stage a fetch shader. Needs the draw's vertex-buff
 | Descriptor decode + table build | `src/gpu/agc/agc_shader_layout.cpp` `build_shader_resources`, `decode_buffer_descriptor`, `decode_image_descriptor` |
 | Recompiler SRT/SGPR provenance (extend here) | `src/gpu/recompiler/rdna2_to_spirv.cpp` SMEM/`MUBUF` cases (`sreg_srt`, `by_srt_offset`, `by_sgpr_base`) |
 | Register-state fold (SET_SH_REG range fix) | `src/gpu/pm4/pm4_decode.cpp` (`IT_SET_SH_REG`), `command_processor.cpp` (`SetShRegDirect`) |
-| Shader-header lookup by code addr | `src/hle/hle_agc.cpp` `prosper_agc_shader_header_for_code` |
+| Shader-header lookup by code addr | `src/hle/graphics/hle_agc.cpp` `prosper_agc_shader_header_for_code` |
 | Live renderer + BMP dump | `tools/boot_trace/boot_trace.cpp` (`PROSPER_RENDER`), `tests/render_runner.h` |
 | Independent evidence | Captured shader headers/ISA, guest wrapper disassembly, AMD RDNA2 documentation |
 | Repro switches | `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_RESDUMP=1 PROSPER_SHADER_DUMP=/tmp PROSPER_FRAME_DIR=/tmp/frames` |

@@ -1,6 +1,6 @@
 // test_det_clock - opt-in flip-paced guest monotonic time (#240).
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>

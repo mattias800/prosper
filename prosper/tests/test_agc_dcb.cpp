@@ -3,7 +3,7 @@
 // they build the correct PM4 packets, advance the write cursor, return the packet pointer, and that
 // the indirect-register patch helpers modify a previously-returned packet. This validates the port
 // independently of the (locale-blocked) boot.
-#include "../src/hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>

@@ -3,8 +3,8 @@
 // the multithreaded IL2CPP pool (data races). This calls the handlers through the NID registry and
 // asserts REAL semantics: a write-lock actually excludes (trywrlock fails while held), and once runs
 // its init exactly once.
-#include "../src/hle/dispatch.hpp"
-#include "../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
