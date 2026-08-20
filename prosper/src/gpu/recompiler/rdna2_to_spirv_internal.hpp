@@ -4,7 +4,9 @@
 // operate on them can live in their own translation units. These are INTERNAL to the
 // recompiler: nothing outside src/gpu/recompiler/ should include this header.
 
-// rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
+// rdna2_to_spirv_internal.hpp — SpirvCompute and the recompiler's shared internals. Lifted out
+// of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions can live in their own
+// translation units. INTERNAL to src/gpu/recompiler/; nothing outside it should include this.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"

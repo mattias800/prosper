@@ -54,7 +54,14 @@ def anon_map(regions: list[dict]) -> dict[int, bool]:
     return out
 
 
-ALREADY_LINKED = ("static", "inline", "constexpr", "template", "//", "/*", "*")
+# `static` is NOT in this list, and that is the correction. A static function definition is fine in
+# a .cpp and is an ODR hazard in a .hpp: it has internal linkage, so each including translation unit
+# gets its own copy, and the moment an `inline` function in the same header odr-uses it the program
+# is ill-formed (no diagnostic required) -- [basic.def.odr]/14 exempts const objects, not functions.
+# The first promotion left one such function alone under the old policy and produced exactly that
+# pairing; `nm` showed the inline caller as a COMDAT weak symbol in both objects. Promoted statics
+# become `inline` instead.
+ALREADY_LINKED = ("inline", "constexpr", "template", "//", "/*", "*")
 
 
 def needs_inline(region: dict, decl_text: str) -> bool:
@@ -75,8 +82,23 @@ def needs_inline(region: dict, decl_text: str) -> bool:
     return not decl_text.lstrip().startswith(ALREADY_LINKED)
 
 
+def canonical_include(source_rel: str, header_name: str) -> str:
+    """The include spelling every other tool in this repo expects.
+
+    A bare `#include "x.hpp"` compiles -- the header is beside the source -- and it is still wrong
+    here: map_symbols.py finds the TU for a header by searching for the CANONICAL `gpu/recompiler/x.hpp`
+    form, so a bare include makes the new headers unmappable, and the next split of them impossible.
+    The tool would have been unable to read its own output.
+    """
+    parts = pathlib.Path(source_rel).parts
+    if "src" in parts:
+        sub = parts[parts.index("src") + 1:-1]
+        return "/".join((*sub, header_name))
+    return header_name
+
+
 def build(map_data: dict, original: str, promote: list[int], header_rel: str,
-          namespace: str, guard_note: str) -> tuple[str, str, list[str]]:
+          namespace: str, guard_note: str, include_spelling: str = "") -> tuple[str, str, list[str]]:
     """Returns (header_text, new_source_text, inlined). Pure, so --selftest can drive it."""
     regions = {r["index"]: r for r in map_data["regions"]}
     lines = original.splitlines(keepends=True)
@@ -96,7 +118,15 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
         decl_offset = r["decl_line"] - r["start"]
         body_lines = text.splitlines(keepends=True)
         if 0 <= decl_offset < len(body_lines) and needs_inline(r, body_lines[decl_offset]):
-            body_lines[decl_offset] = "inline " + body_lines[decl_offset]
+            line = body_lines[decl_offset]
+            stripped = line.lstrip()
+            if stripped.startswith("static "):
+                # REPLACE rather than prepend: `inline static` keeps the internal linkage that is
+                # the hazard.
+                indent = line[:len(line) - len(stripped)]
+                body_lines[decl_offset] = indent + "inline " + stripped[len("static "):]
+            else:
+                body_lines[decl_offset] = "inline " + line
             inlined.append(r["name"])
             text = "".join(body_lines)
         head.append(text)
@@ -114,7 +144,7 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
     for i in sorted(promote):
         if regions[i]["start"] - 1 < insert_at:
             insert_at -= (regions[i]["end"] - regions[i]["start"] + 1)
-    out_lines.insert(insert_at, f'#include "{header_rel}"\n')
+    out_lines.insert(insert_at, f'#include "{include_spelling}"\n')
     return header_text, "".join(out_lines), inlined
 
 
@@ -133,9 +163,22 @@ def verify(original: str, map_data: dict, promote: list[int], header_text: str,
             decl_offset = r["decl_line"] - r["start"]
             body = text.splitlines(keepends=True)
             if 0 <= decl_offset < len(body):
-                body[decl_offset] = "inline " + body[decl_offset]
-                if "".join(body) in header_text:
-                    continue
+                line = body[decl_offset]
+                stripped = line.lstrip()
+                indent = line[:len(line) - len(stripped)]
+                for candidate in ("inline " + line,
+                                  indent + "inline " + stripped[len("static "):]
+                                  if stripped.startswith("static ") else None):
+                    if candidate is None:
+                        continue
+                    probe = list(body)
+                    probe[decl_offset] = candidate
+                    if "".join(probe) in header_text:
+                        break
+                else:
+                    problems.append(f"region {i} ({r['name']}) is not present in the header, "
+                                    f"verbatim or with a single inline adjustment")
+                continue
             problems.append(f"region {i} ({r['name']}) is not present in the header, verbatim or "
                             f"with a single inserted `inline`")
     # The source must be the original with exactly those spans removed, plus one include line.
@@ -199,7 +242,8 @@ def selftest() -> int:
     check(anon[3] and anon[4], "regions inside `namespace {` are detected as internal")
     check(not anon[6], "a region outside it is not")
 
-    hdr, src, inl = build(SELF_MAP, SELF_SRC, [3, 4], "s_internal.hpp", "ns", "// note\n")
+    hdr, src, inl = build(SELF_MAP, SELF_SRC, [3, 4], "s_internal.hpp", "ns", "// note\n",
+                          "s_internal.hpp")
     check(inl == ["helper"], f"the free function definition gains `inline` (got {inl})")
     check("inline int helper()" in hdr, "and it is spelled at the declaration")
     check("struct Shared" in hdr and "inline struct" not in hdr,
@@ -309,9 +353,11 @@ def main() -> int:
     note = ("// Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that\n"
             "// operate on them can live in their own translation units. These are INTERNAL to the\n"
             "// recompiler: nothing outside src/gpu/recompiler/ should include this header.\n")
+    spelling = canonical_include(map_data["file"], args.header)
     header_text, new_source, inlined = build(map_data, original, promote, args.header,
-                                            args.namespace, note)
-    problems = verify(original, map_data, promote, header_text, new_source, args.header)
+                                             args.namespace, note, spelling)
+    print(f"  [ok]   include written as \"{spelling}\" (the canonical form the other tools read)")
+    problems = verify(original, map_data, promote, header_text, new_source, spelling)
     if problems:
         for p in problems:
             print(f"  [FAIL] {p}")

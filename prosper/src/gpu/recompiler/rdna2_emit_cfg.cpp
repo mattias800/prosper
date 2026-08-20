@@ -1,4 +1,5 @@
-// rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
+// rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
+// rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
@@ -24,9 +25,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "rdna2_to_spirv_internal.hpp"
-#include "rdna2_alu_support.hpp"
-#include "rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 
 namespace prosper::gpu {
 

@@ -4,7 +4,8 @@
 // operate on them can live in their own translation units. These are INTERNAL to the
 // recompiler: nothing outside src/gpu/recompiler/ should include this header.
 
-// rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
+// rdna2_cfg_support.hpp — helpers shared by rdna2_emit_cfg.cpp and rdna2_to_spirv.cpp.
+// INTERNAL to src/gpu/recompiler/.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
@@ -30,8 +31,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "rdna2_to_spirv_internal.hpp"
-#include "rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
 
 namespace prosper::gpu {
 
@@ -504,7 +505,7 @@ struct DivLoop {
 // 0x28-0x2a), VOP3 windows that may carry a scalar dest (VOPC-as-VOP3 sdst at 0x000-0x13f, VOP3B
 // carry-out / v_readlane at 0x300+ — the decoder does not expose their sdst), and any scalar or
 // SMEM write whose dest range could cover SGPR 106/107 (the shaders use s106/s107 as scratch).
-static bool cannot_write_vcc(const Rdna2Inst& in) {
+inline bool cannot_write_vcc(const Rdna2Inst& in) {
     auto sgpr_dst_misses_vcc = [&](uint32_t n_dwords) {
         if (in.dst.kind != OperandKind::SGPR && in.dst.kind != OperandKind::Special) return true;
         const int lo = in.dst.value, hi = in.dst.value + (int)n_dwords - 1;

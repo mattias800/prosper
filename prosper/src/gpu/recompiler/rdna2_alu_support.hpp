@@ -4,7 +4,8 @@
 // operate on them can live in their own translation units. These are INTERNAL to the
 // recompiler: nothing outside src/gpu/recompiler/ should include this header.
 
-// rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
+// rdna2_alu_support.hpp — helpers shared by rdna2_emit_alu.cpp and rdna2_to_spirv.cpp.
+// INTERNAL to src/gpu/recompiler/.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
@@ -30,7 +31,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 namespace prosper::gpu {
 

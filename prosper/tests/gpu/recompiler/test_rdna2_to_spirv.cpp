@@ -29,13 +29,13 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
+int fails = 0;
 // `checks` counts assertions ACTUALLY EXECUTED, which `fails` cannot. Without it, deleting a block
 // of this file -- or failing to carry one across when someone eventually breaks these 12,787 lines
 // into several translation units -- leaves the suite green with fewer assertions running, and
 // nothing anywhere reports the difference. A silently smaller test is indistinguishable from a
 // passing one, which is the failure mode this project's charter names most often.
-static int checks = 0;
+int checks = 0;
 #define CHECK(c, m) do { ++checks; \
                          if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
@@ -236,6 +236,8 @@ static bool spirv_has_device_uniform_release_barrier(const std::vector<uint32_t>
     }
     return false;
 }
+
+void run_bvh_checks();
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -12594,201 +12596,18 @@ int main() {
     // first fixture intersects child 0 of an FP32 box node and misses the other three. The second
     // uses triangle node type 1 (V1,V3,V2), which catches the compressed-pair vertex mapping as well
     // as the mode-1 numerator/denominator result contract.
-    {
-        const uint32_t bvh_code[] = {
-            0xf1989f07u, 0x00040303u, 0x43440d3fu, 0x46424140u, 0x00004847u,
-            0xbf810000u,
-        };
-        ShaderResourceTable bvh_rt;
-        ShaderResource bvh{};
-        bvh.cls = ResourceClass::ConstantBuffer;
-        bvh.format = DataFormat::Uint32;
-        bvh.num_components = 1;
-        bvh.binding = 2;
-        bvh.size = 128;
-        bvh.fetch_pc = 0;
-        bvh_rt.resources.push_back(bvh);
-
-        constexpr uint32_t lanes = 64;
-        constexpr uint32_t inputs_per_lane = 73;
-        std::vector<float> bvh_inputs(lanes * inputs_per_lane, 0.0f);
-        auto set_input_bits = [&](uint32_t lane, uint32_t vgpr, uint32_t bits) {
-            bvh_inputs[lane * inputs_per_lane + vgpr] = std::bit_cast<float>(bits);
-        };
-        auto set_ray = [&](uint32_t lane, uint32_t node, float ox, float oy, float oz) {
-            set_input_bits(lane, 3, node);
-            bvh_inputs[lane * inputs_per_lane + 63] = 100.0f; // ray extent
-            bvh_inputs[lane * inputs_per_lane + 13] = ox;
-            bvh_inputs[lane * inputs_per_lane + 68] = oy;
-            bvh_inputs[lane * inputs_per_lane + 67] = oz;
-            bvh_inputs[lane * inputs_per_lane + 64] = 0.0f;
-            bvh_inputs[lane * inputs_per_lane + 65] = 0.0f;
-            bvh_inputs[lane * inputs_per_lane + 66] = 1.0f;
-            bvh_inputs[lane * inputs_per_lane + 70] = std::numeric_limits<float>::infinity();
-            bvh_inputs[lane * inputs_per_lane + 71] = std::numeric_limits<float>::infinity();
-            bvh_inputs[lane * inputs_per_lane + 72] = 1.0f;
-        };
-        for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 5u, 0.0f, 0.0f, -5.0f);
-
-        alignas(256) static std::array<uint8_t, 256> null_bvh_bytes{};
-        ShaderResourceTable null_bvh_rt = bvh_rt;
-        null_bvh_rt.resources[0].gpu_addr = 0;
-        null_bvh_rt.resources[0].size = static_cast<uint32_t>(null_bvh_bytes.size());
-        null_bvh_rt.resources[0].host_data = null_bvh_bytes.data();
-        null_bvh_rt.resources[0].host_data_size = null_bvh_bytes.size();
-        const std::vector<uint32_t> null_bvh_module = recompile_valu(
-            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &null_bvh_rt);
-        const std::vector<float> null_bvh_output = prosper::test::run_compute(
-            null_bvh_module, bvh_inputs, lanes, lanes,
-            std::vector<uint32_t>(null_bvh_bytes.size() / sizeof(uint32_t)));
-        bool null_bvh_ok = !null_bvh_module.empty() && null_bvh_output.size() == lanes;
-        for (float value : null_bvh_output)
-            null_bvh_ok &= bits_of(value) == 0xffffffffu;
-        CHECK(null_bvh_ok,
-              "proven guarded null BVH returns architectural no-hit child IDs");
-
-        std::vector<uint32_t> box_words(32, 0u);
-        box_words[0] = 0x100u; box_words[1] = 0x200u;
-        box_words[2] = 0x300u; box_words[3] = 0x400u;
-        for (uint32_t child = 0; child < 4; ++child) {
-            const float lo = child == 0 ? -1.0f : 10.0f + static_cast<float>(child);
-            const float hi = child == 0 ?  1.0f : 11.0f + static_cast<float>(child);
-            const uint32_t base = 4u + child * 6u;
-            box_words[base + 0] = bits_of(lo); box_words[base + 1] = bits_of(lo);
-            box_words[base + 2] = bits_of(lo); box_words[base + 3] = bits_of(hi);
-            box_words[base + 4] = bits_of(hi); box_words[base + 5] = bits_of(hi);
-        }
-        const uint32_t box_expect[4] = {0x100u, 0xffffffffu, 0xffffffffu, 0xffffffffu};
-        bool box_ok = true;
-        for (uint32_t component = 0; component < 4; ++component) {
-            const std::vector<uint32_t> module = recompile_valu(
-                bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh_rt);
-            const std::vector<float> output = prosper::test::run_compute(
-                module, bvh_inputs, lanes, lanes, box_words);
-            box_ok &= output.size() == lanes;
-            for (uint32_t lane = 0; lane < output.size(); ++lane)
-                box_ok &= bits_of(output[lane]) == box_expect[component];
-        }
-        CHECK(box_ok, "IMAGE_BVH_INTERSECT_RAY returns the four unsorted FP32-box child hits");
-
-        // GTA V sets BOX_SORT_EN. Keep the same live instruction and node-production site, but make
-        // every child hit at a deliberately shuffled distance. The false arm proves physical order;
-        // toggling only descriptor semantics proves the production compare-swap path.
-        const float shuffled_near[4] = {4.0f, 1.0f, 3.0f, 2.0f};
-        for (uint32_t child = 0; child < 4; ++child) {
-            const uint32_t base = 4u + child * 6u;
-            box_words[base + 0] = bits_of(-1.0f);
-            box_words[base + 1] = bits_of(-1.0f);
-            box_words[base + 2] = bits_of(-5.0f + shuffled_near[child]);
-            box_words[base + 3] = bits_of(1.0f);
-            box_words[base + 4] = bits_of(1.0f);
-            box_words[base + 5] = bits_of(-4.5f + shuffled_near[child]);
-        }
-        const uint32_t physical_expect[4] = {0x100u, 0x200u, 0x300u, 0x400u};
-        const uint32_t sorted_expect[4] = {0x200u, 0x400u, 0x300u, 0x100u};
-        auto box_order_matches = [&](const uint32_t expected[4]) {
-            bool matches = true;
-            for (uint32_t component = 0; component < 4; ++component) {
-                const std::vector<uint32_t> module = recompile_valu(
-                    bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh_rt);
-                const std::vector<float> output = prosper::test::run_compute(
-                    module, bvh_inputs, lanes, lanes, box_words);
-                matches &= !module.empty() && output.size() == lanes;
-                for (uint32_t lane = 0; lane < output.size(); ++lane)
-                    matches &= bits_of(output[lane]) == expected[component];
-            }
-            return matches;
-        };
-        CHECK(box_order_matches(physical_expect),
-              "BOX_SORT_EN=0 preserves physical box-child order");
-        bvh_rt.resources[0].bvh_sort_enabled = true;
-        CHECK(box_order_matches(sorted_expect),
-              "BOX_SORT_EN=1 stably returns box children from nearest to furthest");
-        bvh_rt.resources[0].bvh_sort_enabled = false;
-
-        // Make the X near edge one float ULP beyond the Y far edge. BOX_GROW=0 must miss;
-        // BOX_GROW=6 expands the far edge by six 2^-24 increments and retains the child.
-        for (uint32_t lane = 0; lane < lanes; ++lane) {
-            set_ray(lane, 5u, 0.0f, 0.0f, 0.0f);
-            bvh_inputs[lane * inputs_per_lane + 64] = 1.0f;
-            bvh_inputs[lane * inputs_per_lane + 65] = 1.0f;
-            bvh_inputs[lane * inputs_per_lane + 66] = 1.0f;
-            bvh_inputs[lane * inputs_per_lane + 70] = 1.0f;
-            bvh_inputs[lane * inputs_per_lane + 71] = 1.0f;
-            bvh_inputs[lane * inputs_per_lane + 72] = 1.0f;
-        }
-        box_words[4] = 0x3f800001u; box_words[5] = bits_of(0.0f);
-        box_words[6] = bits_of(0.0f); box_words[7] = bits_of(2.0f);
-        box_words[8] = bits_of(1.0f); box_words[9] = bits_of(2.0f);
-        const std::vector<uint32_t> edge_module = recompile_valu(
-            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
-        const std::vector<float> edge_output = prosper::test::run_compute(
-            edge_module, bvh_inputs, lanes, lanes, box_words);
-        bool edge_zero_ok = edge_output.size() == lanes;
-        for (uint32_t lane = 0; lane < edge_output.size(); ++lane)
-            edge_zero_ok &= bits_of(edge_output[lane]) == 0xffffffffu;
-        CHECK(edge_zero_ok, "IMAGE_BVH_INTERSECT_RAY honors zero box growth");
-
-        bvh_rt.resources[0].bvh_box_grow = 6u;
-        const std::vector<uint32_t> grown_edge_module = recompile_valu(
-            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh_rt);
-        const std::vector<float> grown_edge_output = prosper::test::run_compute(
-            grown_edge_module, bvh_inputs, lanes, lanes, box_words);
-        bool edge_grown_ok = grown_edge_output.size() == lanes;
-        for (uint32_t lane = 0; lane < grown_edge_output.size(); ++lane)
-            edge_grown_ok &= bits_of(grown_edge_output[lane]) == 0x100u;
-        CHECK(edge_grown_ok,
-              "IMAGE_BVH_INTERSECT_RAY applies descriptor-selected box growth");
-
-        ShaderResourceTable bvh64_rt = bvh_rt;
-        bvh64_rt.resources[0].size = 64u;
-        bvh64_rt.resources[0].bvh_box_grow = 0u;
-
-        // A 64-byte allocation cannot contain a complete FP32 box node. It must therefore return
-        // no-hit even though the first child's ID and six bounds fit in the allocation and describe
-        // a hit. This catches unsigned underflow in the 128-byte node bound: (64-128)/8 would make
-        // every node offset appear valid while the individually-clamped loads conceal the OOB read.
-        std::vector<uint32_t> short_box_words(16, 0u);
-        short_box_words[0] = 0x100u;
-        short_box_words[4] = bits_of(-1.0f); short_box_words[5] = bits_of(-1.0f);
-        short_box_words[6] = bits_of(-1.0f); short_box_words[7] = bits_of( 1.0f);
-        short_box_words[8] = bits_of( 1.0f); short_box_words[9] = bits_of( 1.0f);
-        for (uint32_t lane = 0; lane < lanes; ++lane)
-            set_ray(lane, 5u, 0.0f, 0.0f, -5.0f);
-        bool short_box_ok = true;
-        for (uint32_t component = 0; component < 4; ++component) {
-            const std::vector<uint32_t> module = recompile_valu(
-                bvh_code, std::size(bvh_code), inputs_per_lane, 3u + component, &bvh64_rt);
-            const std::vector<float> output = module.empty() ? std::vector<float>{} :
-                prosper::test::run_compute(
-                    module, bvh_inputs, lanes, lanes, short_box_words);
-            short_box_ok &= !module.empty() && output.size() == lanes;
-            for (uint32_t lane = 0; lane < output.size(); ++lane)
-                short_box_ok &= bits_of(output[lane]) == 0xffffffffu;
-        }
-        CHECK(short_box_ok,
-              "64-byte IMAGE_BVH_INTERSECT_RAY rejects an incomplete FP32 box node");
-
-        std::vector<uint32_t> tri_words(16, 0u);
-        tri_words[0] = bits_of(9.0f); tri_words[1] = bits_of(9.0f); tri_words[2] = bits_of(9.0f);
-        tri_words[3] = bits_of(0.0f); tri_words[4] = bits_of(0.0f); tri_words[5] = bits_of(0.0f); // V1
-        tri_words[6] = bits_of(0.0f); tri_words[7] = bits_of(1.0f); tri_words[8] = bits_of(0.0f); // V2
-        tri_words[9] = bits_of(1.0f); tri_words[10] = bits_of(0.0f); tri_words[11] = bits_of(0.0f); // V3
-        tri_words[15] = 0x00000900u; // type-1 I=vertex1, J=vertex2
-        for (uint32_t lane = 0; lane < lanes; ++lane) set_ray(lane, 1u, 0.25f, 0.25f, -1.0f);
-        const std::vector<uint32_t> tri_module = recompile_valu(
-            bvh_code, std::size(bvh_code), inputs_per_lane, 3, &bvh64_rt);
-        const std::vector<float> tri_output = tri_module.empty() ? std::vector<float>{} :
-            prosper::test::run_compute(
-                tri_module, bvh_inputs, lanes, lanes, tri_words);
-        bool tri_ok = tri_output.size() == lanes;
-        for (uint32_t lane = 0; lane < tri_output.size(); ++lane)
-            tri_ok &= bits_of(tri_output[lane]) == bits_of(-1.0f);
-        CHECK(!tri_module.empty() && tri_ok,
-              "64-byte IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
-    }
+    run_bvh_checks();
 
     if (fails) { printf("== FAIL: %d of %d checks ==\n", fails, checks); return 1; }
+    // A FLOOR, because the counter alone does not close the hole it was added for: printing a
+    // smaller number still exits 0, and ctest reads the exit code. 1068 assertions run today; the
+    // floor sits just under that, so deleting a block -- or losing one while breaking this file
+    // apart -- fails the test instead of quietly shrinking it. Raise it when the count grows.
+    if (checks < 1060) {
+        printf("== FAIL: only %d checks ran, expected at least 1060 -- assertions went missing ==\n",
+               checks);
+        return 1;
+    }
     printf("== PASS: %d checks ==\n", checks);
     return 0;
 }

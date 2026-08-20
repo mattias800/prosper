@@ -27,11 +27,22 @@ So the checks here are arranged so that each one can actually fail:
   4. PREPROCESSOR SAFETY. A region boundary inside an `#if` block would split a conditional across
      files. Refused, with the line reported.
 
-  5. RECONSTRUCTION, after writing. Each output is read BACK FROM DISK, its replicated prologue
-     stripped, and the remainder concatenated in region order. That must equal the original bytes,
-     which are hashed before anything is deleted. This is the check that would have caught the
-     unbalanced braces, because it compares what is actually on disk against what was actually
-     there before.
+  5. RECONSTRUCTION, after writing -- and it is worth being exact about what this does and does not
+     establish, because the first version of this file overclaimed and was rejected for it.
+     It has two halves:
+       (a) every output is read BACK FROM DISK and compared against its assigned regions. The
+           expected value is re-derived by the SAME expression that produced the file, so this
+           half catches a bad write -- truncation, an encoding change, a file that never landed --
+           and NOT a bad formula. A mistake in which regions belong where appears identically on
+           both sides and passes.
+       (b) the regions, concatenated in index order, must equal the original bytes, which are
+           hashed before anything is deleted. This one is independent of the outputs: it establishes
+           that the map tiles the original exactly, so no source line is unaccounted for.
+     Together they mean no BYTES were lost. They do not mean the result COMPILES: brace balance
+     depends on which regions went where, and only the compiler establishes that. An earlier
+     docstring here claimed this check "would have caught the unbalanced braces" that the rejected
+     version shipped. It would not have. The build is what catches those, and the tool says so at
+     the end of every run.
 
 Replicated regions (`open`/`close`) are copied into every output so each one re-opens and re-closes
 the same namespaces. That is the single place this tool writes a line that was not in the original,
