@@ -810,8 +810,11 @@ while #2783 was suppressing the rest of the frame.
 **Attract mode loads the stage PRXs.** This is the trap on this title, and it defeats every frame-based
 discriminator: the attract loop *is* gameplay, played by the title. A neutral-input control arm
 (`neutral.pad`, same command, same build, no input) loaded `title_Release.prx`,
-`select_Release.prx`, `st1r9_Release.prx`, `st2_Release.prx` and `st5_Release.prx` — demos of stages
-1, 2 and 5, plus the Force-device screen — with the pad untouched. So **a stage module load, a high
+`select_Release.prx`, `st1r9_Release.prx`, `st2_Release.prx` and `st5_Release.prx` — with the pad
+untouched. Those are module loads, not frames: #2783 had frozen that arm's composite before any of
+them, so what the attract loop *looked* like there was not observed. That the Force-device scene
+belongs to the attract loop is corroborated separately by
+`assets/screenshots/rtype-delta-force-select.png`, captured on a default, unrouted run. So **a stage module load, a high
 draw count, or a frame full of ships is not evidence of player-driven play here.**
 
 What the neutral arm never did, and every routed run does: load **`loadsel_Release.prx`** and

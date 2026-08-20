@@ -53,8 +53,11 @@ even when the rest of the menu does not draw, so it reads a run's menu state str
 **A stage PRX load is NOT evidence of player-driven play on this title.** Measured 2026-08-20 with
 `neutral.pad` (same command, same build, no input at all): the attract loop loaded
 `title_Release.prx`, `select_Release.prx`, `st1r9_Release.prx`, `st2_Release.prx` and
-`st5_Release.prx` — it plays demos of stages 1, 2 and 5 and shows the Force-device screen, so the
-scene modules a real playthrough loads are loaded with the pad untouched.
+`st5_Release.prx` — so the scene modules a real playthrough loads are loaded with the pad untouched.
+(That arm's own frames could not show what those scenes looked like, because #2783 had frozen the
+composite by then; that the Force-device scene is part of the attract loop is corroborated
+independently by `assets/screenshots/rtype-delta-force-select.png`, captured on a **default,
+unrouted** run.)
 
 What the neutral arm never did: load **`loadsel_Release.prx`** or **`loads1_Release.prx`** — the
 title's own two loading-screen modules, which only the menu → select → stage path goes through — and
