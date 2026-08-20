@@ -6,7 +6,10 @@
 #
 #   t~1    OPTIONS answers the title screen's own "PRESS <glyph>" prompt. The glyph is the PS5
 #          OPTIONS icon (a filled vertical pill with three horizontal lines above it), read off
-#          assets/screenshots/rtype-delta-title.png. It is NOT Cross.
+#          assets/screenshots/rtype-delta-title.png -- so that is the button the prompt NAMES. No
+#          Cross-only arm was run, so whether the title would also accept Cross here is untested;
+#          what is measured is that a route containing OPTIONS clears the title by t~12 s and a
+#          no-input arm never clears it.
 #   t~14   main menu. The title draws a one-line English description of the highlighted entry at the
 #          bottom of the frame ("Start Game"), which is the state oracle this route was built against.
 #   t~14-50  Cross walks Start Game -> Select Slot to Create -> Enter Name -> back to Start Game, and

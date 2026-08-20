@@ -63,14 +63,14 @@ unrouted** run.)
 
 What the neutral arm never did: load **`loadsel_Release.prx`** or **`loads1_Release.prx`** — the
 title's own two loading-screen modules, which only the menu → select → stage path goes through — and
-never wrote **`<PROSPER_SAVE0>/PPSA26414/SaveData.dat`**. Both appear in every `reach-gameplay.pad`
-run. Use those three, not the stage module and not the look of the frame.
+never wrote **`<PROSPER_SAVE0>/PPSA26414/SaveData.dat`**. All three appear in every routed run.
+Use them, not the stage module and not the look of the frame.
 
 ## Ruled out
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
-| Cross answers the title screen's `PRESS` prompt | **Falsified.** The prompt's glyph is the PS5 **OPTIONS** icon — a filled vertical pill with three horizontal lines above it (`assets/screenshots/rtype-delta-title.png`, region 1060,740–1180,870 at 4x). A Cross-only arm never leaves the title; OPTIONS leaves it on the first press. |
-| OPTIONS is a general "confirm" for this title's menus | **Falsified.** Inside the menu OPTIONS is **back**: arm v1 alternated OPTIONS and Cross every 2.5 s and oscillated between `Start Game` and `Select Slot to Create` with exactly the route's own 15 s period. OPTIONS must stop after the title. |
+| The title screen's `PRESS` prompt names Cross, as most titles' do | **Falsified by the rendered prompt itself.** Its glyph is the PS5 **OPTIONS** icon — a filled vertical pill with three horizontal lines above it (`assets/screenshots/rtype-delta-title.png`, region 1060,740–1180,870 at 4×). *Limit of this row:* no Cross-only arm was run, so this falsifies what the prompt **names**, not what the title would accept. What is measured about behaviour is that a route containing OPTIONS clears the title by t≈12 s, and that a no-input arm never clears it at all. |
+| OPTIONS also confirms inside the menus, so it is safe to keep pressing it | **Falsified by a two-arm A/B.** `explore-v1.pad` (OPTIONS and Cross alternating, 5 s apart) never advanced past the first two menu states — it oscillated between `Start Game` and `Select Slot to Create` with a 15 s period, three times its own 5 s cycle. `explore-v2.pad` is the same file with OPTIONS removed after t=7 s and it walks the whole flow into stage 1. So OPTIONS **undoes** menu progress; whether it is *back* or *cancel* specifically is not distinguished here, and does not need to be — it must stop after the title either way. |
 | Configuring `PROSPER_PAD_SCRIPT` is what makes a routed run behave differently from an unrouted one, because the route reports a connected controller | **Falsified.** prosper's default pad backend already reports **one connected controller with neutral input** when no route is set (`src/hle/input/hle_pad.cpp`, `poll_controller`). A route changes the buttons, not the connection — so `neutral.pad` is a matched control and an unrouted run is not a different controller state. |
 | The name-entry screen needs a non-Cross "decide" button | **Falsified.** Cross alone completes it: it types `A` into the grid repeatedly and the flow returns to `Start Game` with `SaveData.dat` written. The eboot imports no `libSceImeDialog`, so the grid is the title's own. |

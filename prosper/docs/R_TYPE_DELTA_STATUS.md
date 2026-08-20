@@ -797,10 +797,13 @@ belong here because they are about the title rather than about the route file.
 
 **The title screen's prompt is OPTIONS.** The `PRESS <glyph>` prompt renders the PS5 **OPTIONS**
 glyph — a filled vertical pill with three horizontal lines above it — visible at 1060,740–1180,870 in
-`assets/screenshots/rtype-delta-title.png` under 4× magnification. A Cross-only arm never leaves the
-title screen. Inside the menu OPTIONS then becomes **back**: an arm that alternated OPTIONS and Cross
-every 2.5 s oscillated between the `Start Game` and `Select Slot to Create` states with exactly that
-arm's own 15 s period, so the route presses OPTIONS only until the title is cleared.
+`assets/screenshots/rtype-delta-title.png` under 4× magnification. That is what the prompt **names**;
+no Cross-only arm was run, so it is not a claim about what the title would accept. What is measured
+about behaviour is a two-arm A/B on the menus: an arm that alternated OPTIONS and Cross 5 s apart
+never advanced past the first two states — it oscillated between `Start Game` and
+`Select Slot to Create` with a 15 s period, three times its own cycle — while the same file with
+OPTIONS removed after t=7 s walked the whole flow into stage 1. OPTIONS therefore **undoes** menu
+progress and the route presses it only until the title is cleared.
 
 **The title reads out its own menu state.** It draws a one-line English description of the highlighted
 entry at the bottom centre of the frame (`Start Game`, `Select Slot to Create`, `Enter Name`). That

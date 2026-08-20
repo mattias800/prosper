@@ -1,10 +1,10 @@
 # R-Type Delta: HD Boosted (PPSA26414) -- EXPLORATORY arm v2 (OPTIONS to leave the title, then Cross only).
 #
-# MEASURED on arm v1 (options+cross mash, 2026-08-20): OPTIONS answers the title screen's own
-# "PRESS <OPTIONS glyph>" prompt and the boot reaches the menu system by t=12 s. Cross then confirms.
-# v1 also showed OPTIONS acts as BACK once inside the menu: the run oscillated between the
-# "Start Game" and "Select Slot to Create" states with a 15 s period, exactly the options/cross
-# alternation of that route. So OPTIONS must stop after the title.
+# MEASURED on arm v1 (options+cross mash, 2026-08-20): with OPTIONS in the route the boot reaches the
+# menu system by t=12 s, and v1 then never advanced past the first two menu states -- it oscillated
+# between "Start Game" and "Select Slot to Create" with a 15 s period, three times its own 5 s cycle.
+# This file is v1 with OPTIONS removed after t=7 s; it walks the whole flow into stage 1. Those two
+# arms together are the evidence that OPTIONS UNDOES menu progress and must stop after the title.
 #
 # Anchors are SECONDS from the FIRST PAD POLL (prosper/src/input/pad.cpp: a bare number is seconds,
 # 'f' is flips, 'p' is pad reads).
