@@ -4,15 +4,15 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
-#include "live_renderer.hpp"
-#include "live_target_format.hpp"
+#include "shared/live/live_renderer.hpp"
+#include "shared/live/live_target_format.hpp"
 #include "replay_output_extent.hpp"
 #include "compute_recompile.hpp"
 #include "realized_shader_dump.hpp"
 #include "pixel_input_linkage.hpp"
 #include "post_compute_resource.hpp"
 #include "resource_override.hpp"
-#include "render_runner.h"
+#include "fixtures/render_runner.h"
 
 #include <algorithm>
 #include <cctype>

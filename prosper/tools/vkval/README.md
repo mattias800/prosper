@@ -204,7 +204,7 @@ control built into the probe (provoke one known violation and require the scanne
 which proves the parser rather than only the loader. Tracked in **#1725**.
 
 `#1704` also fixed a Vulkan-teardown-from-a-static-destructor defect in
-`frontends/shared/live_compute.cpp` that the layer exposed. **CI would not catch a regression of
+`frontends/shared/live/live_compute.cpp` that the layer exposed. **CI would not catch a regression of
 it.** That crash reproduces on validation layers 1.4.341; the runner carries 1.3.275, where the
 suite passes with the defect present. Reverting the lifetime change would leave this step green.
 Running the guard on a recent layer version locally is what covers it — one more reason not to treat

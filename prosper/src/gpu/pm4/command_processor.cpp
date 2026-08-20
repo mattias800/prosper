@@ -1,11 +1,11 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
-#include "hle/guest_memory_topology.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/capture/writer_provenance.hpp"
-#include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
+#include "hle/sync/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
 
 // hle_graphics.cpp: perform the videoout flip for an in-stream SetFlip packet — advances the flip
 // status (count/flipArg/currentBuffer) that sceVideoOutGetFlipStatus reports, exactly like the API
@@ -1018,7 +1018,7 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
 // dword of a live `0x20xxxxxxxx` link. So the fence is the SECOND half of the damage and the init
 // is the first; guarding the fence alone cannot help, and the discriminator has to be the guest's
 // actual freelist MEMBERSHIP at write time (mb3_freelist_guard) rather than either write's content.
-// Do not "fix" this by widening a value-shape predicate; tests/test_eop_write.cpp pins both arms.
+// Do not "fix" this by widening a value-shape predicate; tests/gpu/test_eop_write.cpp pins both arms.
 //
 // #1226 UPDATE — the init experiment was run. It does NOT support the paragraph above's second
 // half, and it does not support the opposite either. Whole-run totals (PROSPER_INIT_TRIP=1, one

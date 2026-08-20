@@ -127,7 +127,7 @@ direction that discards good data.
 
 `s_user_getevent` delivers the initial LOGIN event exactly once (returning `0`) and reports
 `SCE_USER_SERVICE_ERROR_NO_EVENT` (`0x80960007`) forever after. The "exactly once" is a function-local
-`static` in `src/hle/hle_service.cpp` — it is **once per process**, not once per window:
+`static` in `src/hle/service/hle_service.cpp` — it is **once per process**, not once per window:
 
 | mode | correct capture | what would be wrong |
 |---|---|---|
@@ -223,7 +223,7 @@ again at its return**, and reports what changed. Live on *Sonic Origins* (`PPSA0
               @4 3f->00 @6 00->01 @7 80->00  x1
 ```
 
-`src/hle/hle_service.cpp` says, before any run: `memset(st, 0, 12)` then `st[6] = 1`. The diff shows
+`src/hle/service/hle_service.cpp` says, before any run: `memset(st, 0, 12)` then `st[6] = 1`. The diff shows
 exactly that — byte 6 becomes 1, the other changed bytes are the memset clearing what was there, and
 **nothing at offsets 12–15 moved even though 16 bytes were sampled**, which re-derives the struct's
 width from the observation.

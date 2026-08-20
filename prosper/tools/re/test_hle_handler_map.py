@@ -88,7 +88,7 @@ def test_nid_hash():
 
     These four pairs were read out of the PS5 3.20 firmware library dump
     (`sprx_dlsym(__handle, "<NID>", &__ptr_<name>)`), which was produced by neither this file nor
-    `src/hle/nid.cpp`. Pinning them here keeps the test self-contained — a port that agreed with
+    `src/hle/dispatch/nid.cpp`. Pinning them here keeps the test self-contained — a port that agreed with
     nid.cpp but with nothing else would satisfy a round-trip and still be wrong.
     """
     print("nid_hash against the PS5 3.20 firmware dump:")
@@ -162,7 +162,7 @@ void register_demo_hle() {
 def test_cross_shape_collapse():
     """A collapse spanning TWO shapes — the positive control constructed by hand.
 
-    Modelled on a real pair read out of `src/hle/hle_kernel_mem.cpp` (Linux arm, lines 2615-2617):
+    Modelled on a real pair read out of `src/hle/memory/hle_kernel_mem.cpp` (Linux arm, lines 2615-2617):
     `k_map_flexible_noname` answers `sceKernelMapFlexibleMemory` through the `R` macro AND
     `4h6F1LLbTiw` (`sceKernelMapFlexibleMemoryInternal`) through a direct raw-NID call. It can only
     be found if BOTH shapes are parsed, so a parser that handles either one alone reports "no

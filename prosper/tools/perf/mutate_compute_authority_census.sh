@@ -10,12 +10,18 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/var/tmp}/compute-authority-mutate-XXXXXX") || exit 2
 trap 'rm -rf "$WORK"' EXIT
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" \
-   "$ROOT/frontends/shared/compute_authority_live_census.hpp" \
-   "$ROOT/frontends/shared/compute_timing_selector.hpp" \
-   "$ROOT/tests/test_compute_authority_census.cpp" "$WORK/" || exit 2
-HEADER="$WORK/compute_authority_census.hpp"
-LIVE_HEADER="$WORK/compute_authority_live_census.hpp"
+# The headers are staged under their CANONICAL sub-path, not flattened. The sources spell
+# `#include "shared/compute/<name>.hpp"` since the shared frontend was foldered, so a flat
+# $WORK with -I"$WORK" cannot resolve them -- the harness would fail to compile and exit 2,
+# which reads as "the mutation was not detected" rather than "the harness is broken".
+mkdir -p "$WORK/shared/compute" || exit 2
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" \
+   "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" \
+   "$ROOT/frontends/shared/compute/compute_timing_selector.hpp" \
+   "$WORK/shared/compute/" || exit 2
+cp "$ROOT/tests/shared/compute/test_compute_authority_census.cpp" "$WORK/" || exit 2
+HEADER="$WORK/shared/compute/compute_authority_census.hpp"
+LIVE_HEADER="$WORK/shared/compute/compute_authority_live_census.hpp"
 CXX_BIN=${CXX:-c++}
 
 python3 - "$HEADER" <<'PY' || exit 1
@@ -60,8 +66,8 @@ printf 'raw overlap mutation: killed by: %s\n' "$expected"
 # bookkeeping. Misattributing it as capture has the historical defect's shape: pending authority is
 # still closed, so a weak pending=0-only test would stay green. The exact named attribution check
 # must be the sole kill.
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
-cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" "$LIVE_HEADER"
 python3 - "$LIVE_HEADER" <<'PY' || exit 1
 import sys
 
@@ -103,8 +109,8 @@ printf 'submit-end attribution mutation: killed by: %s\n' "$expected"
 # A hash match is not evidence that the proposed deferred-authority lever ever moved. Remove both
 # retained/admitted requirements while keeping exact selection intact; only the zero-output fixture
 # may kill this defect-shaped false-positive verdict.
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
-cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" "$LIVE_HEADER"
 python3 - "$LIVE_HEADER" <<'PY' || exit 1
 import sys
 
@@ -146,8 +152,8 @@ printf 'zero-authority-lever mutation: killed by: %s\n' "$expected"
 # The full-submit draw probe exists specifically because the first exact realized draw did not name
 # Syberia's hot atlas. Recreate the old probe's defect shape by dropping the retained range after
 # its first draw while leaving the epoch otherwise healthy; only the later-draw canary may kill it.
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
-cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" "$LIVE_HEADER"
 python3 - "$HEADER" <<'PY' || exit 1
 import sys
 
@@ -197,8 +203,8 @@ printf 'later-draw retention mutation: killed by: %s\n' "$expected"
 # A resource row is provisional until DrawResourceEnd proves the draw realized. Recreate the review
 # defect by promoting a staged overlap from an unrealized draw into the epoch totals; only the exact
 # unrealized-overlap check may kill it.
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
-cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" "$LIVE_HEADER"
 python3 - "$HEADER" <<'PY' || exit 1
 import sys
 
@@ -242,8 +248,8 @@ printf 'unrealized-overlap mutation: killed by: %s\n' "$expected"
 
 # An unknown resource range can conceal the selected atlas. Remove only that fail-closed validity
 # term; the exact invalid-footprint fixture must be the sole kill.
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
-cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" "$LIVE_HEADER"
 python3 - "$HEADER" <<'PY' || exit 1
 import sys
 
@@ -281,8 +287,8 @@ if [ "$failed" != "$expected" ]; then
 fi
 printf 'invalid-footprint mutation: killed by: %s\n' "$expected"
 
-cp "$ROOT/frontends/shared/compute_authority_census.hpp" "$HEADER"
-cp "$ROOT/frontends/shared/compute_authority_live_census.hpp" "$LIVE_HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_census.hpp" "$HEADER"
+cp "$ROOT/frontends/shared/compute/compute_authority_live_census.hpp" "$LIVE_HEADER"
 if "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -I"$WORK" \
        "$WORK/test_compute_authority_census.cpp" -o "$WORK/test-authority" && \
    "$WORK/test-authority" >/dev/null

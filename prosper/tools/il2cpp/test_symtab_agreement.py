@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """il2cpp_symtab_agreement — prosper's RUNTIME resolver must answer exactly what resolve.py answers.
 
-#2551 added in-process IL2CPP symbolication (src/host/il2cpp_symbols.cpp). It deliberately does not
+#2551 added in-process IL2CPP symbolication (src/host/symbols/il2cpp_symbols.cpp). It deliberately does not
 re-derive resolve.py's mapping: resolve.py emits the symbol table (--emit-symtab) and the runtime
 side looks up in it. But "shares the input" is not "gives the same answer" — the two sides still
 have independent implementations of the nearest-preceding rule, its window, and its tie handling,

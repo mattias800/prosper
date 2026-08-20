@@ -623,7 +623,7 @@ jobs:
     # GitHub's macos-latest runners are Apple Silicon (arm64). prosper has no ARM CPU backend — it
     # runs the guest's x86-64 code natively — so the whole app is built x86_64 (CMAKE_OSX_ARCHITECTURES)
     # and its tests run under Rosetta 2, exactly the supported macOS configuration (see docs/PORTING.md).
-    # This exercises the Darwin guest-execution substrate (src/host/posix_shim.hpp), not just a compile.
+    # This exercises the Darwin guest-execution substrate (src/host/platform/posix_shim.hpp), not just a compile.
     steps:
       - name: Checkout
         uses: actions/checkout@v4

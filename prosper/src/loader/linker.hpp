@@ -4,7 +4,7 @@
 // or an HLE stub slot (implemented handler or unimplemented logger). Host-agnostic.
 #pragma once
 #include "../self/module.hpp"
-#include "../hle/dispatch.hpp"   // ImportSlot
+#include "hle/dispatch/dispatch.hpp"   // ImportSlot
 #include <cstdint>
 #include <memory>
 #include <string>

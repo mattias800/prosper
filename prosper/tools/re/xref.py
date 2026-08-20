@@ -20,7 +20,7 @@ Three things a caller must know before believing an answer:
         python3 tools/il2cpp/prx_to_elf.py <DUMP>/eboot.bin <out.elf>
     Handing this tool an `eboot.bin` is refused, not answered (#2346).
   * Addresses are IMAGE-RELATIVE. A runtime address is module_load_base + VA (the eboot base is
-    0x410000000 — see prosper/src/host/boot_program.hpp for the authoritative set), so subtract the
+    0x410000000 — see prosper/src/host/image/boot_program.hpp for the authoritative set), so subtract the
     base before querying an address taken from a live backtrace or a diagnostic (#1659).
   * `to` returning 0 for a string of 22 bytes or fewer is VOID until `imm` has been run: clang
     materialises a short std::string from immediates, leaving the .rodata copy with no reference of
@@ -65,7 +65,7 @@ exit status is a contract, because the failure this tool must never have is a ze
 # investigation. Flatten first:
 #     python3 tools/il2cpp/prx_to_elf.py <DUMP>/eboot.bin /tmp/eboot.elf
 # Runtime address = module_load_base + VA (e.g. eboot base 0x410000000; it moved from
-# 0x400000000 in #825 — see prosper/src/host/boot_program.hpp for the authoritative set).
+# 0x400000000 in #825 — see prosper/src/host/image/boot_program.hpp for the authoritative set).
 #
 # A SHORT string has no address to reference at all. Clang materialises a std::string built from a
 # literal of <= 22 bytes into the small-buffer with `movabs`/`mov` IMMEDIATES, and then the .rodata

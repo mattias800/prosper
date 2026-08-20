@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
     return 0;
 }
 EOF
-g++ -O1 -std=c++17 -Isrc /tmp/nidhash.cpp src/hle/nid.cpp -o /tmp/nidhash 2>/tmp/nidhash.err || { cat /tmp/nidhash.err | head -5; exit 1; }
+g++ -O1 -std=c++17 -Isrc /tmp/nidhash.cpp src/hle/dispatch/nid.cpp -o /tmp/nidhash 2>/tmp/nidhash.err || { cat /tmp/nidhash.err | head -5; exit 1; }
 /tmp/nidhash \
   sceNpTrophy2GetTrophySetInfo sceNpTrophy2GetTrophySetInfoInGroup \
   sceNpTrophy2GetTrophyInfo sceNpTrophy2GetTrophyInfoList sceNpTrophy2GetTrophyInfos \

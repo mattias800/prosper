@@ -1,6 +1,6 @@
 #include "ajm_ffmpeg.hpp"
 
-#include "hle/ajm_decoder.hpp"
+#include "hle/audio/ajm_decoder.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>

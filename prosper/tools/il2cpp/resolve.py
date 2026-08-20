@@ -11,7 +11,7 @@ usage:
   python3 resolve.py <script.json> --emit-symtab out.symtab   # for RUNTIME symbolication
 
 The IL2CPP PRX loads at a fixed guest base (0x440000000 for both PPSA24651 and PPSA02664 —
-src/host/boot_program.hpp BOOT_IL2CPP), so a method's runtime address = base + RVA, and
+src/host/image/boot_program.hpp BOOT_IL2CPP), so a method's runtime address = base + RVA, and
 script.json's "Address" field == RVA (the flattened ELF has p_offset == p_vaddr). A prosper
 [btrace] chain prints frames as "il+0x<offset>", where <offset> is already the RVA — feed those
 straight in.

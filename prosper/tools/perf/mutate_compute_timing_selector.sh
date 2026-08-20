@@ -13,11 +13,17 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/var/tmp}/compute-timing-selector-mutate-XXXXXX") || exit 2
 trap 'rm -rf "$WORK"' EXIT
-cp "$ROOT/frontends/shared/compute_timing_selector.hpp" \
-   "$ROOT/frontends/shared/compute_transfer_gate_census.hpp" \
-   "$ROOT/tests/test_compute_timing_selector.cpp" "$WORK/" || exit 2
-TIMING_HEADER="$WORK/compute_timing_selector.hpp"
-TRANSFER_HEADER="$WORK/compute_transfer_gate_census.hpp"
+# The headers are staged under their CANONICAL sub-path, not flattened. The sources spell
+# `#include "shared/compute/<name>.hpp"` since the shared frontend was foldered, so a flat
+# $WORK with -I"$WORK" cannot resolve them -- the harness would fail to compile and exit 2,
+# which reads as "the mutation was not detected" rather than "the harness is broken".
+mkdir -p "$WORK/shared/compute" || exit 2
+cp "$ROOT/frontends/shared/compute/compute_timing_selector.hpp" \
+   "$ROOT/frontends/shared/compute/compute_transfer_gate_census.hpp" \
+   "$WORK/shared/compute/" || exit 2
+cp "$ROOT/tests/shared/compute/test_compute_timing_selector.cpp" "$WORK/" || exit 2
+TIMING_HEADER="$WORK/shared/compute/compute_timing_selector.hpp"
+TRANSFER_HEADER="$WORK/shared/compute/compute_transfer_gate_census.hpp"
 TIMING_PRISTINE="$WORK/compute_timing_selector.pristine.hpp"
 TRANSFER_PRISTINE="$WORK/compute_transfer_gate_census.pristine.hpp"
 cp "$TIMING_HEADER" "$TIMING_PRISTINE"

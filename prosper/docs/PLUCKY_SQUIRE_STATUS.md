@@ -75,7 +75,7 @@ the likely cause; either way, do not use a shader-dump run to judge progression.
 
 The title opens **exactly one pad handle** — `[pad] OPEN userId=1 type=0 index=0 -> handle=1` under
 `PROSPER_PADLOG=1`, on a 60 s probe. It is therefore **not** exposed to the shared suspect that
-`poll_controller` ignores its handle argument (`src/hle/hle_pad.cpp:415`), which can make two handles
+`poll_controller` ignores its handle argument (`src/hle/input/hle_pad.cpp:415`), which can make two handles
 mirror one controller. Recorded as a negative so the next lane does not re-probe it.
 
 Input is delivered and observed: `[pad-script]` lines carry the guest's own advancing pad-read index
@@ -124,7 +124,7 @@ title fails to advance, the correct statement is "the guest read the input and d
   wave the operand resolves through `native_wave_ballot_half` before reaching the reject. Use `TTMP0`
   (operand 108), which has no such alternative path (#2741).
 - **"Reading an unwritten M0 as 0 is a safe generic fix."** Rejected 2026-08-19, deliberately: it
-  reverts #134, whose guard is `tests/test_rdna2_to_spirv.cpp:9483`
+  reverts #134, whose guard is `tests/gpu/recompiler/test_rdna2_to_spirv.cpp:9483`
   (`"kernel X2 (m0 read as ALU data) is REJECTED"`). A silent 0 cannot be distinguished from a *decoder*
   gap that lost an M0 write. The narrower liveness-proved form remains open in #2741.
 

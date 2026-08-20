@@ -72,13 +72,13 @@ export PROSPER_IL2CPP_SYMBOLS=~/PPSA24651.symtab                          # then
 ```
 
 `--emit-symtab` writes a flat `<hex-rva> <name>` table from resolve.py's **own** loader, and
-`src/host/il2cpp_symbols.cpp` reads that. script.json itself is deliberately *not* parsed at
+`src/host/symbols/il2cpp_symbols.cpp` reads that. script.json itself is deliberately *not* parsed at
 runtime — it is 36.8 MB for PPSA24651 against 5.6 MB for the symtab, and a second JSON parser
 would be a re-derivation of a mapping resolve.py already gets right. The ctest case
 `il2cpp_symtab_agreement` drives both CLIs over one synthesized corpus and requires them to agree
 address-for-address.
 
-**Coverage is exactly one function: `describe_code_address()`** (`src/host/exec_image_linux.cpp`,
+**Coverage is exactly one function: `describe_code_address()`** (`src/host/image/exec_image_linux.cpp`,
 `exec_image_win.cpp`). That is the shared guest-address label, so every consumer of it is
 symbolicated at once — the app's `[app] guest backtrace` after a fault, `tools/screenshot`'s, and
 the Windows `[thread-trace]`. Diagnostics that call `guest_module_name()`/`guest_module_offset()`

@@ -2,7 +2,7 @@
 // and must not drift from (#1630).
 #include "library_media.hpp"
 
-#include "hle/atrac9_decode.hpp"
+#include "hle/audio/atrac9_decode.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"

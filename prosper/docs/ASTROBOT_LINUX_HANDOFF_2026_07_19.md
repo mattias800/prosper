@@ -51,7 +51,7 @@ At the time this handoff was written:
 - no other open PR carries the `agent:astro-title` label
 - open PR #1052 (`perf(executor): reuse analyzed shader content hashes`) is green and clean, and touches:
   - `prosper/src/gpu/execute/gpu_executor.cpp`
-  - `prosper/tests/test_shader_recompile_cache.cpp`
+  - `prosper/tests/gpu/execute/test_shader_recompile_cache.cpp`
 
 The branch was rebased onto that exact master tip immediately before publication. Fetch again before
 editing because this repository moves frequently. If #1052 has merged, rebase the handoff branch and
@@ -378,7 +378,7 @@ This is a proposed design, not yet code. Preserve fail-visible behavior outside 
    - changing a table word must invalidate/recompile rather than hit stale SPIR-V
 
 7. Do **not** broaden `registered_shader_dwords` or the dynamic descriptor fold to scan arbitrary bytes
-   after AGC `shader_size`. `tests/test_agc_shader.cpp` intentionally proves that descriptor discovery
+   after AGC `shader_size`. `tests/gpu/test_agc_shader.cpp` intentionally proves that descriptor discovery
    cannot inspect a valid-looking fetch outside the registered header size. The graphics recompiler is
    already called with a bounded readable maximum window and its span analysis can retain a narrowly
    proven tail. Keep the generic AGC metadata safety contract intact.

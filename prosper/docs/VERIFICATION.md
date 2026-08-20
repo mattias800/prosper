@@ -191,8 +191,8 @@ tables, not on any title's content. Two ctest cases now exercise it everywhere:
 | `loader_synth_link` | the export table, first-wins and its alias record, the collision guard and its skip record, cross-module import binding and stub-slot fallback |
 | `loader_synth_reject` | the corrupted variants the loader must refuse, and the relocations it must decline to apply |
 
-The fixtures are minimal `ET_SCE_DYNAMIC` PRX modules emitted at test time by `tests/synth_prx.h` and
-`tests/handmade_prx.h`. **Every byte is synthesized from the published ELF64 layout; none is carved
+The fixtures are minimal `ET_SCE_DYNAMIC` PRX modules emitted at test time by `tests/fixtures/synth_prx.h` and
+`tests/fixtures/handmade_prx.h`. **Every byte is synthesized from the published ELF64 layout; none is carved
 out of a dump**, and none may ever be — this repository is public, and a dump-derived fixture would
 put Sony-built code in it however small it was. Nothing is committed as a binary, so there is no
 opaque asset to regenerate: the generator *is* the provenance record (#2587's convention, applied to
