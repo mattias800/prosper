@@ -785,3 +785,83 @@ distinguishable from a winning one by exit status alone.
 
 Rung 3 (gameplay with real GPU draws) is the next step and needs an input route: the title screen
 waits on a button press.
+
+## The nine-day blank after the title screen was a recompiler regression (2026-08-21, #2783)
+
+From `904e05ad` (2026-08-11) until the fix, this title rendered its publisher logo, its opening movie
+and its title screen and then published nothing else: the guest kept flipping, kept loading its
+per-scene PRXs and reached stage 1, while every presented frame was the retained one and every flip
+reported `[rtt] PRESENT SOURCE EXTENT MISMATCH … px_front=none px_vo=none px_last=none, offered 0
+bytes`.
+
+### The frame diagnostics named the shader in one run
+
+`PROSPER_DBG=1` on the matched neutral-input arm prints, once:
+
+```
+[recompile-reject] sh=bfa00003/476 mode=unresolved-operand pc=304 words=800000ff,00000000
+                   fmt=0 op=0x0 dst=0(kind1) src=0(k5),0(k1),0(k0) stage=vertex
+[vertex-recompile-reject] body or export lowering failed
+[exec-recompile-reject] es=0x2011c03100 … ps=0x2011c04400 vs=0 gs=0 fs=903 …
+```
+
+`vs=0 fs=903` is the whole story: the fragment stage compiles, the vertex stage does not, so the draw
+is dropped before the renderer sees it. The rejected program is byte-identical to
+**`shader/sprite_i_vv.ags`** — the title's sprite vertex shader, i.e. its menus, its HUD and its
+gameplay. `PROSPER_SHADER_DUMP=<dir>` writes it as `exec_vs_2011c03100.bin`, and `cmp` against the
+dump's own `shader/` directory identifies it: there are only **17 `.ags` files in the whole title**,
+so that corpus is small enough to match exhaustively.
+
+The rejected instruction is `s_add_u32 s0, 0x230, s0`, the middle of an ordinary PC-relative table
+address:
+
+```
+pc=0038  s_cselect_b64 s[0:1], exec, 0     ; NGG fetch prologue saves a wave mask in s[0:1]
+...
+pc=0303  s_getpc_b64   s[0:1]              ; the SAME pair is recycled for a table address
+pc=0304  s_add_u32     s0, 0x230, s0       ; <- rejected, "unresolved operand"
+pc=0306  s_addc_u32    s1, 0, s1
+pc=0307  buffer_load_dwordx4 v[0:3], v4, s[0:3], 0 offen
+```
+
+`RegState::sreg_bool` recorded a saved B64 mask keyed on s0 at pc 38 and never ended that lifetime,
+because `record_scalar_write` expired only the Wave32 B32 spelling. #2481's `operand_bits` reject then
+read the stale alias as proof that s0 still held ballot bits and refused to read it as data. The
+cross-title mechanism and the three scoping decisions the fix needed are in
+`docs/RECOMPILER_REMAINING.md` § *A saved wave-mask alias is not permanent provenance*.
+
+### A/B: one binary, one variable
+
+`tools/screenshot`, `scripts/rtype-delta-PPSA26414/reach-gameplay.pad`, 60 samples 2 s apart, page
+cache evicted with `tools/dropcache.py`, unmodified binary and unmodified guest, native 1920×1080.
+Both arms are the **same executable**; the second sets a temporary local switch that skips only the
+new lifetime call (not committed).
+
+| arm | peak non-black (t ≥ 30 s) | distinct late `pixel_crc32` | `PRESENT SOURCE EXTENT MISMATCH` | verdict |
+| --- | --- | --- | --- | --- |
+| fix active | **2,073,434** | **46 of 46** | 0 | renders |
+| lifetime call skipped | 1,637 | 2 | 70 | frozen |
+
+The frozen arm reproduces the issue's recorded signature exactly — `crc=9e16e1a3`, 1,571 non-black
+pixels, one line of menu description text on black. **Both arms reach the identical guest state**:
+`title_Release.prx` → `loadsel_Release.prx` → `select_Release.prx` → `loads1_Release.prx` →
+`st1r9_Release.prx`, and both write `<PROSPER_SAVE0>/PPSA26414/SaveData.dat`. Only the rendering
+differs, which is the control the defect needed.
+
+<p align="center">
+  <img src="../../assets/screenshots/rtype-delta-stage1-restored.png" alt="R-Type Delta stage 1: the R-9 and its Force device over the city, with enemy formations and the BEAM/score HUD, rendered live at 1920x1080"><br>
+  <sub>Stage 1 with the fix — <code>tools/screenshot</code>, <code>reach-gameplay.pad</code>, page cache
+  evicted, unmodified binary and guest. Sample 60 of 60, t = 120.2 s, 132,613 distinct colours.</sub>
+</p>
+
+### Two apparatus rules this cost, both reusable
+
+- **The freeze is not a stall, so a peak-brightness discriminator over late samples cannot fall.** A
+  run frozen during the opening movie scores **1,167,360** non-black pixels forever, which is how the
+  first bisect of this defect produced a confident, precise, wrong culprit. The corrected rule is
+  **peak ≥ 1.2 M non-black AND ≥ 3 distinct late `pixel_crc32`**, over samples at t ≥ 30 s. Both
+  halves are needed.
+- **A stage-module load proves nothing about player control on this title.** The attract loop loads
+  `st1r9_Release.prx`, `st2_Release.prx` and `st5_Release.prx` with the pad untouched. The
+  discriminators are `loadsel_Release.prx` + `loads1_Release.prx` + `SaveData.dat`
+  (`scripts/rtype-delta-PPSA26414/README.md`).
