@@ -28,7 +28,6 @@ struct GpuCaptureMetadata {
 inline constexpr const char* kGpuReplayScanoutAddressEnv =
     "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
 inline constexpr const char* kGpuCaptureSave0Env = "PROSPER_SAVE0";
-inline constexpr const char* kGpuCaptureDefaultSave0Root = "/tmp/prosper-savedata0";
 inline constexpr const char* kGpuCaptureResourceProvenanceEnv =
     "PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE";
 
@@ -36,8 +35,13 @@ inline constexpr const char* kGpuCaptureResourceProvenanceEnv =
 // live VideoOut registry, so extent alone cannot distinguish scanout from same-sized intermediates.
 void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata);
 
-// Capture the effective host root behind guest /savedata0. This is distinct from savedata_dir,
+// Capture the effective host directory behind guest /savedata0. This is distinct from savedata_dir,
 // which describes the SaveDataMemory API, and is cached independently by the HLE runtime.
+//
+// It records the EFFECTIVE per-title directory (<root>/<TITLE_ID>), not the PROSPER_SAVE0 root, and
+// deliberately re-derives it through hle/fs/save_paths.hpp rather than restating the default here:
+// the value's whole purpose is to say which save state produced this frame, and a second copy of the
+// default in this header could disagree with the one the guest actually wrote to (#2734).
 void annotate_gpu_capture_save_roots(GpuCaptureMetadata& metadata);
 
 // Parse the replay-only front-buffer identity. Bundle replay updates this value at each captured

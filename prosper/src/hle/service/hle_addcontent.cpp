@@ -90,11 +90,6 @@ bool ascii_digit(char ch) { return ch >= '0' && ch <= '9'; }
 bool ascii_upper(char ch) { return ch >= 'A' && ch <= 'Z'; }
 bool ascii_alpha(char ch) { return ascii_upper(ch) || (ch >= 'a' && ch <= 'z'); }
 
-bool valid_title_id(std::string_view value) {
-    return value.size() == 9 && value.substr(0, 4) == "PPSA" &&
-           std::all_of(value.begin() + 4, value.end(), ascii_digit);
-}
-
 bool valid_entitlement_label(std::string_view value) {
     if (value.empty() || value.size() > 16) return false;
     return std::all_of(value.begin(), value.end(), [](char ch) {
@@ -626,6 +621,13 @@ ParseResult parse_inventory(const std::filesystem::path& root, std::string_view 
 
 } // namespace
 
+// Declared in hle_addcontent.hpp: the add-content authorization check and the per-title save
+// namespace (save_paths.cpp) must agree byte for byte on what a title id is.
+bool valid_title_id(std::string_view value) {
+    return value.size() == 9 && value.substr(0, 4) == "PPSA" &&
+           std::all_of(value.begin() + 4, value.end(), ascii_digit);
+}
+
 void addcontent_configure_for_app0(const std::string& app0_root) {
     AddcontentInventorySnapshot next;
     AppParamDeclaration params;
@@ -646,6 +648,18 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
         ? ParamJsonReader(param.data).read() : ParamJsonDocument{};
     if (doc.valid) {
         params.declared = true;
+        // Who is running. Published only when it is well formed, so a malformed declaration cannot
+        // become a save-directory name -- an unvalidated titleId is a guest-influenced string that
+        // would land in a host path (save_paths.cpp). An absent or rejected id leaves this empty and
+        // the save namespace falls back to its explicit unknown-title placeholder.
+        if (doc.title_id && valid_title_id(*doc.title_id)) {
+            params.title_id = *doc.title_id;
+        } else if (doc.title_id) {
+            std::fprintf(stderr,
+                         "[appparam] sce_sys/param.json declares a titleId prosper does not "
+                         "recognise as one; this application has no title identity, so its saves "
+                         "share the unknown-title namespace with any other such application\n");
+        }
         if (doc.drm_type) {
             params.declared_drm_type = *doc.drm_type;
             params.sku_flag = derive_sku_flag(params.declared_drm_type);
@@ -678,13 +692,15 @@ void addcontent_configure_for_app0(const std::string& app0_root) {
         next.state = AddcontentInventoryState::Invalid;
         std::fprintf(stderr, "[addcontent] invalid install manifest: unreadable or oversized\n");
     } else {
-        const std::optional<std::string> title_id = doc.valid ? doc.title_id : std::nullopt;
-        if (!title_id || !valid_title_id(*title_id)) {
+        // Exactly the id published above: the manifest's content_id authorization and the save
+        // namespace must not be able to disagree about which title this is.
+        const std::string& title_id = params.title_id;
+        if (title_id.empty()) {
             next.state = AddcontentInventoryState::Invalid;
             std::fprintf(stderr,
                          "[addcontent] invalid install manifest: app metadata has no valid titleId\n");
         } else {
-            ParseResult parsed = parse_inventory(root, manifest.data, *title_id);
+            ParseResult parsed = parse_inventory(root, manifest.data, title_id);
             next = std::move(parsed.inventory);
             if (next.state == AddcontentInventoryState::Invalid)
                 std::fprintf(stderr, "[addcontent] invalid install manifest: %s\n",

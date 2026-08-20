@@ -452,13 +452,15 @@ before the title is gone.
 The title screen is still degraded: most composited frames arrive with the red and green channels forced
 to maximum, which reads as a flat yellow background under otherwise-correct content.
 
-**A default launch does not always get there, and the reason is ours.** prosper's `/savedata0` mount is a
-single host directory shared by every title, so this game can read an `OptionSettings` slot written by
-another Unreal title, declare it corrupt and delete it — and then hold on a modal
-`Your options save has corrupted and has been deleted` dialog that a run with no input cannot dismiss.
-Pointing `PROSPER_SAVE0` and `PROSPER_SAVEDATA_DIR` at an empty per-title directory restores the title
-screen. Tracked as [#2734](https://github.com/mattias800/prosper/issues/2734). See the
-[tracker](https://github.com/mattias800/prosper/issues/1893).
+**A default launch used to be blocked by a defect of ours, now fixed.** prosper's `/savedata0` mount
+was a single host directory shared by every title, so this game read an `OptionSettings` slot written
+by another Unreal title, declared it corrupt and deleted it — and then held on a modal
+`Your options save has corrupted and has been deleted` dialog that a run with no input cannot
+dismiss. Save data is now namespaced by title id
+([#2734](https://github.com/mattias800/prosper/issues/2734),
+`prosper/docs/SAVE_DATA_LAYOUT.md`), so a default launch no longer meets another title's save. Saves
+written before that change stay in the old flat directory, untouched and unread; prosper reports
+where they are on first use. See the [tracker](https://github.com/mattias800/prosper/issues/1893).
 
 ## Crisis Core –Final Fantasy VII– Reunion — `PPSA07809`
 

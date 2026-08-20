@@ -7,6 +7,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 
 #include <mutex>
+#include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "build_revision.hpp"
@@ -2240,8 +2241,7 @@ void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata) {
 }
 
 void annotate_gpu_capture_save_roots(GpuCaptureMetadata& metadata) {
-    const char* configured = std::getenv(kGpuCaptureSave0Env);
-    const std::string effective = configured ? configured : kGpuCaptureDefaultSave0Root;
+    const std::string effective = savedata0_dir();
     const auto existing = std::find_if(metadata.renderer_env.begin(), metadata.renderer_env.end(),
         [](const auto& entry) { return entry.first == kGpuCaptureSave0Env; });
     if (existing == metadata.renderer_env.end())
