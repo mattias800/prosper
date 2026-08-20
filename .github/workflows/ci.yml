@@ -370,6 +370,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 prosper/tools/docs/gen_progress_tracker.py --check
 
+      # SCREENSHOTS.md is GENERATED from git history -- the reverse-chronological index of every
+      # checked-in screenshot, so "what is new since I last looked" is answerable by reading down
+      # from the top instead of diffing a 500-line chart against memory.
+      #
+      # --selftest first and SEPARATELY (not piped -- a pipeline's exit status is its last stage's).
+      # Its two arms assert BOTH verdicts: a complete input renders, and an image with no
+      # add-commit ABORTS. That second arm is the whole point. A feed that silently drops entries
+      # reads as "nothing new happened", which is the one wrong answer indistinguishable from the
+      # truth, and it is exactly what `git log --diff-filter=A --follow` would have produced --
+      # measured returning EMPTY for two images added the same day the tool was written.
+      - name: Verify the screenshot-feed generator still discriminates
+        run: python3 prosper/tools/docs/gen_screenshot_feed.py --selftest
+
+      # The feed describes MASTER, and is regenerated after a screenshot merge -- so the check
+      # regenerates from `origin/master` too, and both sides agree on a PR branch that has not
+      # merged yet. This job checks out at fetch-depth 2 (load-bearing for the numbering gate
+      # above), which is far too shallow for a history scan, so deepen here rather than widening
+      # the whole job: --filter=blob:none fetches commit metadata without file contents, which is
+      # all this tool reads (log metadata plus ls-tree NAMES).
+      - name: Verify SCREENSHOTS.md still matches the tree
+        run: |
+          git fetch --unshallow --filter=blob:none origin master 2>/dev/null \
+            || git fetch --deepen=2147483647 --filter=blob:none origin master
+          python3 prosper/tools/docs/gen_screenshot_feed.py --check --ref origin/master
+
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest
