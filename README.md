@@ -11,6 +11,7 @@ console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
 > ⚠️ **Experimental research project.** It is not a general-purpose game runner yet. Tested retail
 > titles currently reach different milestones and still expose substantial compatibility gaps. See
 > [Game compatibility](COMPATIBILITY.md) for title-by-title results and known blockers.
+Newest screenshots first: [`SCREENSHOTS.md`](SCREENSHOTS.md).
 
 ## Screenshots
 

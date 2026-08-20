@@ -8,6 +8,10 @@ bugs. Different title revisions may behave differently.
 Detailed investigation notes, measurements, known defects, and next steps live in the linked
 [game-tracker issues](https://github.com/mattias800/prosper/issues?q=is%3Aissue+%22%5BGame+tracker%5D%22).
 
+**Looking for what is new?** [`SCREENSHOTS.md`](SCREENSHOTS.md) is every checked-in screenshot in
+reverse-chronological order — read down from the top and stop at one you have seen. This file is
+organised by title instead, so it answers "how far does X get" rather than "what changed lately".
+
 This page is the **user-facing overview** and is written by hand. For the same titles as a
 machine-readable index — rung, ladder, snapshot guard, hardware-oracle record, open blockers —
 see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the tracker issues**
