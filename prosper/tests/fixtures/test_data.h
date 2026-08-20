@@ -17,11 +17,20 @@
 namespace prosper::test {
 
 inline std::filesystem::path tests_root(const std::filesystem::path& source_file) {
+    // Terminate on a FIXED POINT, not on emptiness. `path("/").parent_path()` is "/" on libstdc++,
+    // not "" -- so an emptiness condition never fires at the filesystem root and the loop spins
+    // forever. A missing tests/data would then HANG the test instead of failing it, which is the
+    // opposite of what this helper exists to do.
     std::error_code ec;
-    for (auto dir = source_file.parent_path(); !dir.empty(); dir = dir.parent_path()) {
+    for (auto dir = source_file.parent_path(); ; ) {
         if (std::filesystem::is_directory(dir / "data", ec)) {
             return dir;
         }
+        const auto parent = dir.parent_path();
+        if (parent == dir || parent.empty()) {
+            break;
+        }
+        dir = parent;
     }
     // Preserve the old behaviour's failure path rather than inventing one: callers already report a
     // readable-fixture check, and that message is more useful than an exception from here.

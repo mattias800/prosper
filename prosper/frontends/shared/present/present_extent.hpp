@@ -21,7 +21,7 @@ namespace prosper::frontend {
 // `want_bytes == 0` means "no extent contract applies", which is a real and load-bearing case, not a
 // degenerate one: gpu_replay's ordered-prefix inspection (--draw / --draw-steps /
 // --through-operation) and the render_submit_items tests consume the last pass AT ITS OWN EXTENT and
-// infer the extent from the byte count afterwards. tests/test_gpu_capture_render.cpp asserts exactly
+// infer the extent from the byte count afterwards. tests/misc/test_gpu_capture_render.cpp asserts exactly
 // that ("per-target chain returns the last pass at its declared 16x16 extent"). Neither goes through
 // the publish gate, which is what tells the two apart — see PresentSubmitScope in gpu_execute.hpp.
 

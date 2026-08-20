@@ -35,11 +35,29 @@ import re
 import subprocess
 import sys
 
-# Which include ROOT makes each canonical prefix resolve. Encoded here rather than in a reader's
-# head: the wrong one produces a suggestion that looks right and does not work.
-PREFIX_ROOT = {"hle": "src", "gpu": "src", "host": "src", "self": "src", "loader": "src",
-               "shared": "frontends", "fixtures": "tests"}
+# Which include ROOT makes each canonical prefix resolve. DERIVED from the tree, not listed: a
+# hand-written list silently omitted `src/diagnostics` and `src/input`, so every include of those
+# returned "no roots needed" and their targets were never checked at all. A list that must be
+# updated whenever a directory is added fails in the direction that reports success.
+#
+# `fixtures` is the one entry that cannot be derived this way. prosper/tests now has subdirectories
+# named gpu/, hle/ and host/ that MIRROR the source tree, so deriving prefixes from tests/ would
+# claim `gpu/...` resolves from `tests`, which it does not. Only `fixtures` is genuinely rooted
+# there.
 ROOT_DIR = {"src": "src", "frontends": "frontends", "tests": "tests"}
+
+
+def derive_prefix_roots(base: pathlib.Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for root in ("src", "frontends"):
+        for child in sorted((base / root).iterdir()):
+            if child.is_dir():
+                out.setdefault(child.name, root)
+    out["fixtures"] = "tests"
+    return out
+
+
+PREFIX_ROOT: dict[str, str] = {}   # filled in main() once the repo root is known
 # Libraries that publish a root PUBLIC, so every dependent inherits it.
 PUBLISHERS = {"prosper_core": "src", "prosper_performance_capture": "frontends"}
 
@@ -86,6 +104,8 @@ def main() -> int:
     root = pathlib.Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                        capture_output=True, text=True, check=True).stdout.strip())
     base = root / "prosper"
+    global PREFIX_ROOT
+    PREFIX_ROOT = derive_prefix_roots(base)
     text = (base / "CMakeLists.txt").read_text()
 
     # A target may be declared more than once under different if() arms -- test_game_compute is.
@@ -95,10 +115,30 @@ def main() -> int:
         targets.setdefault(m.group(1), []).append(m.group(2))
 
     # link graph, then propagate the published roots to a fixed point
+    def scoped(args: str) -> dict[str, str]:
+        """dep -> the visibility keyword actually governing it.
+
+        `target_link_libraries(X PUBLIC a PRIVATE b)` makes only `a` public. Searching the whole
+        argument list for the word PUBLIC treats `b` as public too, which would re-export a root
+        CMake does not -- the same class of error as ignoring visibility entirely, just quieter.
+        """
+        out: dict[str, str] = {}
+        visibility = "PRIVATE"
+        for word in re.findall(r"[A-Za-z0-9_:]+", args):
+            if word in ("PRIVATE", "PUBLIC", "INTERFACE"):
+                visibility = word
+            else:
+                out[word] = visibility
+        return out
+
     links: dict[str, set[str]] = {}
+    link_visibility: dict[tuple[str, str], str] = {}
     for m in re.finditer(r"target_link_libraries\(\s*([A-Za-z0-9_]+)([^)]*)\)", text, re.S):
-        deps = set(re.findall(r"[A-Za-z0-9_:]+", m.group(2))) - {"PRIVATE", "PUBLIC", "INTERFACE"}
-        links.setdefault(m.group(1), set()).update(deps)
+        for dep, vis in scoped(m.group(2)).items():
+            links.setdefault(m.group(1), set()).add(dep)
+            # A dep linked PUBLIC anywhere is publicly linked; keep the strongest seen.
+            if link_visibility.get((m.group(1), dep)) != "PUBLIC":
+                link_visibility[(m.group(1), dep)] = vis
 
     # VISIBILITY IS LOAD-BEARING, and getting it wrong is silent in the direction that hurts.
     # `target_include_directories(X PRIVATE tests)` lets X compile against the tests root and gives
@@ -130,8 +170,7 @@ def main() -> int:
                 gained = exported.get(dep, set()) - exported.get(name, set())
                 # Only re-export what this target itself links PUBLIC-ly; CMake's own rule. Being
                 # conservative here can only over-report, which is the safe direction.
-                if gained and re.search(r"target_link_libraries\(\s*" + re.escape(name)
-                                        + r"[^)]*PUBLIC[^)]*" + re.escape(dep), text, re.S):
+                if gained and link_visibility.get((name, dep)) in ("PUBLIC", "INTERFACE"):
                     exported.setdefault(name, set()).update(gained)
                     changed = True
     have: dict[str, set[str]] = {k: set(v) for k, v in own.items()}

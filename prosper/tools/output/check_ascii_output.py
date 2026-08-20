@@ -486,7 +486,7 @@ QUARANTINE = {
     "tests/fixtures/render_runner.h": 2,
     "tests/gpu/test_descriptor_array_emit.cpp": 1,
     "tests/gpu/state/test_descriptor_array_render.cpp": 1,
-    "tests/gpu/agc/test_rdna2_to_spirv.cpp": 2,
+    "tests/gpu/recompiler/test_rdna2_to_spirv.cpp": 2,
 }
 
 

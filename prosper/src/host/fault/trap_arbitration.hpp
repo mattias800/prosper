@@ -30,7 +30,7 @@
 // CPU, not by the delivery path, so they hold wherever the handler runs.
 //
 // CONFIDENCE: HIGH — every clause is decided by state this process itself set, and the regression
-// test tests/host/fault/test_trap_arbitration.cpp drives the real production shape (a live perf execute
+// test tests/host/test_trap_arbitration.cpp drives the real production shape (a live perf execute
 // breakpoint plus a real int3) through both this predicate and the pre-fix condition it replaces.
 
 #include <cstdint>

@@ -110,7 +110,7 @@ int main() {
           "explicit opt-out retains the portable compute shell");
 
     // Nothing published before the renderer initializes: headless compute-only use must keep
-    // creating its own device (tests/shared/texture/test_game_compute.cpp depends on this).
+    // creating its own device (tests/gpu/recompiler/test_game_compute.cpp depends on this).
     CHECK(!prosper::gpu::shared_vulkan_context().valid(),
           "no shared context is published before the renderer initializes");
 

@@ -17,7 +17,7 @@
 //      outside the image it had just sized - and returned true anyway, so the module mapped a
 //      zero-filled hole where its own bytes belonged and the caller was told it had loaded (#2631).
 //      Every such segment is now a refusal with a message naming the program header and the
-//      shortfall. The arms below are the malformed-input half; tests/hle/test_loader_synth_reject.cpp
+//      shortfall. The arms below are the malformed-input half; tests/misc/test_loader_synth_reject.cpp
 //      carries the truncated-module half, where the module otherwise parses perfectly.
 // No game dump needed: pure in-memory construction.
 #include "../src/self/module.hpp"

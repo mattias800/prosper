@@ -46,6 +46,24 @@ import sys
 SUFFIXES = (".cpp", ".hpp", ".h")
 
 
+def read_exact(path: pathlib.Path) -> str:
+    """Read without newline translation.
+
+    `Path.read_text()` opens in universal-newline mode, which turns every CRLF into LF in the string
+    it returns; writing that back produces LF. So merely LOADING a CRLF file to rewrite one include
+    rewrites every line in it. Measured: docs/ROADMAP.md came back as 312 insertions and 312
+    deletions for a one-line path citation, and the resulting diff is unreviewable -- which is
+    exactly when a real change hides.
+    """
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def write_exact(path: pathlib.Path, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
 def repo_root() -> pathlib.Path:
     out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                          capture_output=True, text=True, check=True)
@@ -78,7 +96,8 @@ def tracked_text_files(root: pathlib.Path, keep: tuple[str, ...]) -> list[pathli
 SOURCE_SUFFIXES = (".cpp", ".hpp", ".h")
 # The path pass reaches further than the include pass on purpose: the ledgers it must keep honest
 # are .txt and .py, and the citations it must keep resolvable are .md.
-CITING_SUFFIXES = SOURCE_SUFFIXES + (".txt", ".cmake", ".md", ".py", ".ps1", ".json", ".yml", ".yaml")
+CITING_SUFFIXES = SOURCE_SUFFIXES + (".txt", ".cmake", ".md", ".py", ".ps1", ".sh", ".json",
+                                    ".yml", ".yaml")
 
 
 def main() -> int:
@@ -110,14 +129,27 @@ def main() -> int:
     missing: list[str] = []
     for name, folder in sorted(assignment.items()):
         found = False
-        for s in SUFFIXES:
-            here, there = src_root / f"{name}{s}", src_root / folder / f"{name}{s}"
-            if here.exists():
+        for suffix in SUFFIXES:
+            # Search the WHOLE subtree, not just its top level. A plan is re-run after it is edited
+            # -- a test placed in the wrong folder has to move from where it IS, not from where it
+            # started -- and a top-level-only lookup reports every already-moved module as missing,
+            # which prints as a warning and then does nothing.
+            here = src_root / f"{name}{suffix}"
+            if not here.exists():
+                matches = sorted(src_root.rglob(f"{name}{suffix}"))
+                if len(matches) > 1:
+                    sys.exit(f"{name}{suffix} exists at {len(matches)} paths under {src_root}: "
+                             f"{', '.join(str(m) for m in matches)}; the plan is keyed by module "
+                             f"name and cannot express that")
+                if not matches:
+                    continue
+                here = matches[0]
+            there = src_root / folder / f"{name}{suffix}"
+            found = True
+            if here.resolve() != there.resolve():
                 moves.append((here, there))
-                found = True
-            elif args.paths_only and there.exists():
-                moves.append((here, there))   # already moved; the pair is still what rewrites need
-                found = True
+            elif args.paths_only:
+                moves.append((src_root / f"{name}{suffix}", there))
         if not found:
             missing.append(name)
     if missing:
@@ -176,7 +208,7 @@ def main() -> int:
     rewritten_lines = 0
     for path in tracked_text_files(root, SOURCE_SUFFIXES):
         try:
-            text = path.read_text()
+            text = read_exact(path)
         except UnicodeDecodeError:
             continue
 
@@ -195,7 +227,7 @@ def main() -> int:
         if new_text != text:
             rewritten_files += 1
             if not args.dry_run:
-                path.write_text(new_text)
+                write_exact(path, new_text)
     print(f"  {rewritten_lines} include(s) rewritten across {rewritten_files} file(s)")
 
     # --- 2b. relative includes inside the moved files -------------------------------------------
@@ -216,7 +248,7 @@ def main() -> int:
     for old, new_path in moves:
         if new_path.suffix not in SOURCE_SUFFIXES or args.dry_run or not new_path.exists():
             continue
-        text = new_path.read_text()
+        text = read_exact(new_path)
 
         def fix(m: re.Match) -> str:
             nonlocal fixed_rel
@@ -239,7 +271,7 @@ def main() -> int:
 
         new_text = rel_re.sub(fix, text)
         if new_text != text:
-            new_path.write_text(new_text)
+            new_write_exact(path, new_text)
     print(f"  {fixed_rel} relative include(s) inside moved files re-anchored to src")
     if unresolved:
         print(f"  WARNING {len(unresolved)} relative include(s) could not be resolved and were left "
@@ -266,7 +298,7 @@ def main() -> int:
     path_edits = 0
     for path in tracked_text_files(root, CITING_SUFFIXES):
         try:
-            text = path.read_text()
+            text = read_exact(path)
         except UnicodeDecodeError:
             continue
         new_text, edits = text, 0
@@ -277,7 +309,7 @@ def main() -> int:
             path_files += 1
             path_edits += edits
             if not args.dry_run:
-                path.write_text(new_text)
+                write_exact(path, new_text)
     print(f"  {path_edits} path citation(s) rewritten across {path_files} file(s)")
 
     if args.dry_run:

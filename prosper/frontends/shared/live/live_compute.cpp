@@ -2210,7 +2210,7 @@ struct VulkanComputeContext {
         // makes it possible for a dispatch to bind a renderer-owned image at all; without it every
         // such binding must round-trip through host memory. Declined when the renderer's device
         // lacks the storage-image features this backend needs, and absent entirely in headless
-        // compute-only use (tests/shared/texture/test_game_compute.cpp), where the private device below is created
+        // compute-only use (tests/gpu/recompiler/test_game_compute.cpp), where the private device below is created
         // exactly as before.
         const prosper::gpu::SharedVulkanContext shared = prosper::gpu::shared_vulkan_context();
         if (shared.valid() && shared.storage_image_read_without_format &&

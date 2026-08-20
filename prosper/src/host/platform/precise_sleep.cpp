@@ -12,7 +12,7 @@
 //     import, `__imp_Sleep`, and `__sleep_for` tail-calls it.
 //  3. Windows quantizes `::Sleep` to the system timer period, and nothing in this tree raises it
 //     (`timeBeginPeriod` / `NtSetTimerResolution` appear nowhere outside `third_party/`). prosper's
-//     own measurement on a Windows host — recorded in `tests/host/x86/test_win_exception_delivery.cpp` for
+//     own measurement on a Windows host — recorded in `tests/misc/test_win_exception_delivery.cpp` for
 //     #2242 — is `Sleep(1)` = 15.554 ms by default against 1.930 ms after `timeBeginPeriod(1)`.
 //
 // So a ~16.68 ms display-pacing wait became `::Sleep(17)`, which cannot complete before the second

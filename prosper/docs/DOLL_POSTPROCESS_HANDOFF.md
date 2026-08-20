@@ -43,7 +43,7 @@ not a silent skip.* And the split "opcode coverage vs CFG structurizing" is now 
   it is the one remaining gap.
 
 Each recompiler PR shipped with a real-Vulkan **execution** test in
-`tests/gpu/agc/test_rdna2_to_spirv.cpp` (e.g. the atomic accumulates 128×3=384; the sub-dword store lands two
+`tests/gpu/recompiler/test_rdna2_to_spirv.cpp` (e.g. the atomic accumulates 128×3=384; the sub-dword store lands two
 disjoint 16-bit fields into a shared dword). Each was independently code-reviewed.
 
 ---
@@ -238,7 +238,7 @@ All gated, off by default. Names are `PROSPER_*` env vars unless noted.
   (~1964), the compute dispatch path + the `PROSPER_DYNTRACE_FAIL` dump (~2942).
 - `prosper/src/gpu/agc/agc_shader_layout.cpp` — `decode_buffer_descriptor` (~116), `rdna2_buffer_format`
   (the V# format-field → `DataFormat` table), `gen5_image_format`.
-- `prosper/tests/gpu/agc/test_rdna2_to_spirv.cpp` — recompiler execution-differential tests (the atomic +
+- `prosper/tests/gpu/recompiler/test_rdna2_to_spirv.cpp` — recompiler execution-differential tests (the atomic +
   sub-dword store cases added this session are near the "kernel 24" block).
 - `prosper/tools/shader_inspect/` — the offline RDNA2 decoder.
 

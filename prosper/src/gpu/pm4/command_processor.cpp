@@ -1018,7 +1018,7 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
 // dword of a live `0x20xxxxxxxx` link. So the fence is the SECOND half of the damage and the init
 // is the first; guarding the fence alone cannot help, and the discriminator has to be the guest's
 // actual freelist MEMBERSHIP at write time (mb3_freelist_guard) rather than either write's content.
-// Do not "fix" this by widening a value-shape predicate; tests/hle/memory/test_eop_write.cpp pins both arms.
+// Do not "fix" this by widening a value-shape predicate; tests/gpu/test_eop_write.cpp pins both arms.
 //
 // #1226 UPDATE — the init experiment was run. It does NOT support the paragraph above's second
 // half, and it does not support the opposite either. Whole-run totals (PROSPER_INIT_TRIP=1, one
