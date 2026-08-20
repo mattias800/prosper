@@ -31,7 +31,7 @@ correct timing, no sound. This is the right default for headless bring-up.
 
 ### Installing a frontend
 ```cpp
-#include "hle/audio.hpp"
+#include "hle/audio/audio.hpp"
 prosper::audio_set_sink(&my_sink);   // AudioSink*; pass nullptr to restore the silent default
 ```
 
