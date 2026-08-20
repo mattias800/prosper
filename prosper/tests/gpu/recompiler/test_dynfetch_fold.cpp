@@ -215,6 +215,61 @@ int main() {
     CHECK(saved_exec_vertex.size() == 1 &&
               saved_exec_vertex[0].index_mode == VertexFetchIndexMode::Vertex,
           "a saved-EXEC copy still identifies a vertex_id fetch through s_cselect_b64");
+
+    // #2790: SCC must be readable as a SCALAR SOURCE, not merely maintained. The fold tracks `scc`
+    // through every modelled SOP2/SOPC/SOPK and consumes it in s_cselect, but `srcval` admitted only
+    // VCC_LO/VCC_HI among the Special operands -- so an instruction reading SCC gave up on a value
+    // the fold had in hand. Sonic Frontiers' most-repeated compute blocker is exactly that shape:
+    // `s_or_b32 vcc_lo, scc, vcc_hi`, word 886a6bfd, on three separate programs, with the OPCODE
+    // fully modelled.
+    //
+    // The fixture builds a V# whose NUM_RECORDS word is computed FROM SCC, so the descriptor
+    // resolves only if SCC was readable:
+    //     pc0  s_cmp_eq_u32 0, 0        -> SCC = 1
+    //     pc1  s_or_b32 s10, scc, s4    -> s10 = 1 | 2 = 3   (NUM_RECORDS)
+    //     pc2  buffer_load_dword v0, v0, s[8:11], 0
+    // s8/s9/s11 are seeded user data; only s10 depends on SCC.
+    //
+    // MUTATION: remove the `o.value == 253` arm from srcval in gpu_executor.cpp and this goes red --
+    // s10 becomes unknown, the SRSRC is incomplete and no resource is published. Nothing else in the
+    // suite detects it, because no other fixture reads SCC as a source.
+    alignas(16) static uint32_t scc_src_backing[64]{};
+    const uint64_t scc_src_base = reinterpret_cast<uint64_t>(scc_src_backing);
+    uint32_t scc_src_seed[16]{};
+    scc_src_seed[4]  = 2u;                                   // s4  -> the OR's other operand
+    scc_src_seed[8]  = static_cast<uint32_t>(scc_src_base);  // s8  -> V# base lo
+    scc_src_seed[9]  = (static_cast<uint32_t>(scc_src_base >> 32) & 0xffffu) | (16u << 16);
+    scc_src_seed[11] = 0xfacu | (20u << 12u);                // s11 -> DST_SEL identity, Uint32
+    const std::array<uint32_t, 5> scc_src_shader = {
+        0xBF068080u,               // pc0: s_cmp_eq_u32 0, 0        -> SCC = 1
+        0x880A04FDu,               // pc1: s_or_b32 s10, scc, s4    -> NUM_RECORDS = 3
+        0xE0301000u, 0x80020000u,  // pc2: buffer_load_dword v0, v0, s[8:11], 0
+        0xBF810000u,               // pc4: s_endpgm
+    };
+    ShaderResourceTable scc_src_rt;
+    add_compute_buffer_resources(scc_src_rt, scc_src_shader.data(), scc_src_shader.size(),
+                                 scc_src_seed, std::size(scc_src_seed));
+    assign_convention_bindings(scc_src_rt, 2);
+    const ShaderResource* scc_src_resource = scc_src_rt.by_fetch_pc(2u);
+    CHECK(scc_src_resource && scc_src_resource->gpu_addr == scc_src_base &&
+              scc_src_resource->stride == 16u && scc_src_resource->size == 3u * 16u,
+          "SCC is readable as a scalar source, so a descriptor word computed from it resolves");
+
+    // NEGATIVE ARM: with SCC UNKNOWN the same shader must still fail closed. Without this, the fix
+    // is indistinguishable from "always report SCC as 0" -- which would fold a wrong NUM_RECORDS
+    // and bind a descriptor the guest never described. `s_cbranch_scc0` is not modelled, so SCC is
+    // -1 at the OR; the only difference from the arm above is the missing s_cmp.
+    const std::array<uint32_t, 4> scc_unknown_shader = {
+        0x880A04FDu,               // pc0: s_or_b32 s10, scc, s4   -- SCC never set: unknown
+        0xE0301000u, 0x80020000u,  // pc1: buffer_load_dword v0, v0, s[8:11], 0
+        0xBF810000u,               // pc3: s_endpgm
+    };
+    ShaderResourceTable scc_unknown_rt;
+    add_compute_buffer_resources(scc_unknown_rt, scc_unknown_shader.data(),
+                                 scc_unknown_shader.size(), scc_src_seed, std::size(scc_src_seed));
+    assign_convention_bindings(scc_unknown_rt, 2);
+    CHECK(scc_unknown_rt.by_fetch_pc(1u) == nullptr,
+          "an UNKNOWN SCC still fails closed rather than folding to zero");
     ngg_seed[106 - 8] = 1u;                  // SCC=false -> select v8 (instance_id)
     auto saved_exec_instance = resolve_dynamic_fetch(
         ngg_saved_exec_fetch, std::size(ngg_saved_exec_fetch), ngg_seed.data(), ngg_seed.size(), 8);

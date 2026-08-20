@@ -3405,7 +3405,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         switch (o.kind) {
             case OperandKind::SGPR:      return known(o.value, v);
             case OperandKind::InlineInt: v = (uint32_t)o.value; return true;
-            case OperandKind::Special:   return (o.value == 106 || o.value == 107) ? known(o.value, v) : false;
+            case OperandKind::Special:
+                if (o.value == 106 || o.value == 107) return known(o.value, v);
+                // SCC (source field 253) is the one architectural bit this fold already MAINTAINS:
+                // `scc` is written by every modelled SOP2/SOPC/SOPK above and consumed by
+                // s_cselect. Reading it as a SOURCE was simply never wired up, so an instruction
+                // whose operand the fold holds in hand still gave up. Measured cost: Sonic
+                // Frontiers' most-repeated compute blocker is `s_or_b32 vcc_lo, scc, vcc_hi`
+                // (word 886a6bfd) on three separate programs -- the OPCODE is modelled, and the
+                // fold failed on the operand (#2790).
+                //
+                // -1 means unknown and must stay unreadable; SCC is a single bit, so a known value
+                // is exactly 0 or 1.
+                if (o.value == 253) {
+                    if (scc < 0) return false;
+                    v = static_cast<uint32_t>(scc);
+                    return true;
+                }
+                return false;
             case OperandKind::Literal:   v = 0; return false;   // literal is in in.literal; handled per-op
             default: return false;
         }
