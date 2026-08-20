@@ -29,7 +29,7 @@ stream and independent platform evidence agree.
   `gpu::run_command_buffer` into a persistent `GpuState` (register files + draw list). The Dcb builders
   (`hle_agc.cpp`) capture the real packet args incl. ReleaseMem `dstGpuAddr`+value and the Flip.
 - **Back half (done, offscreen):** `render_state`/`vk_translate` resolve a `GpuState` → Vulkan pipeline
-  state; the recompiler turns the real shaders → SPIR-V (38/41, ~95%); `tests/render_runner.h` renders a
+  state; the recompiler turns the real shaders → SPIR-V (38/41, ~95%); `tests/fixtures/render_runner.h` renders a
   `GpuState` to pixels on llvmpipe. `videoout_present.cpp` has `present_write_frame`/`present_readback`.
 - **Missing:** a *live, persistent* device that executes the accumulated draws at submit time and presents,
   plus the **completion signaling** required by that model.

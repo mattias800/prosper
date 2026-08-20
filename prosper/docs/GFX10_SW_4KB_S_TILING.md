@@ -110,7 +110,7 @@ term. Mixing the two sent this investigation down a long detour.
 
 ## Where it lives
 
-`src/gpu/texture/tile.cpp` → `sw4kb_morton()`. Golden asserts in `tests/test_tile.cpp` (`gpu_surface_detile`).
+`src/gpu/texture/tile.cpp` → `sw4kb_morton()`. Golden asserts in `tests/gpu/texture/test_tile.cpp` (`gpu_surface_detile`).
 Diagnostics: `PROSPER_DUMP_RAWTILE`, `PROSPER_DUMP_ATLAS`, and `deswizzle_sweep.py` (offline order sweep).
 
 Refs: #118 (dither), #102 (missing text — same root).

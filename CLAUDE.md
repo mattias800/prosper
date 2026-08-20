@@ -426,7 +426,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     wrong, and this line kept publishing it for a day after it was retracted.** The capture predated
     #2243's backend sub-buckets, so the only buffer figure in it was the *frontend* materializer's,
     while the leaf two lanes were actually optimising — `res_buffer_copy_ms`, the backend memcpy at
-    `tests/render_runner.h:5199` — was invisible to it. Re-captured with the sub-buckets live and the
+    `tests/fixtures/render_runner.h:5199` — was invisible to it. Re-captured with the sub-buckets live and the
     collapse confirmed by flip rate (1.59/s): `setup_resources 801.9ms [buffer=673.4 (copy=539.2) …]`,
     i.e. **~67%**, not 2.4%. Two independent instruments agree it is large in the collapsed regime and
     on both platforms — `PROSPER_RENDER_TIMING` gives copy/backend **15.7%** on Linux and **18.5%** on

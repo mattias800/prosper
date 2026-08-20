@@ -124,7 +124,7 @@ title fails to advance, the correct statement is "the guest read the input and d
   wave the operand resolves through `native_wave_ballot_half` before reaching the reject. Use `TTMP0`
   (operand 108), which has no such alternative path (#2741).
 - **"Reading an unwritten M0 as 0 is a safe generic fix."** Rejected 2026-08-19, deliberately: it
-  reverts #134, whose guard is `tests/test_rdna2_to_spirv.cpp:9483`
+  reverts #134, whose guard is `tests/gpu/agc/test_rdna2_to_spirv.cpp:9483`
   (`"kernel X2 (m0 read as ALU data) is REJECTED"`). A silent 0 cannot be distinguished from a *decoder*
   gap that lost an M0 write. The narrower liveness-proved form remains open in #2741.
 

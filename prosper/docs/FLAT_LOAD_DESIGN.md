@@ -184,7 +184,7 @@ representation (`table_index_count`, merged as 48d978ab) and stage 1's enabled f
 056edd10), not the SPIR-V emitter. Every line number below was read, not recalled.
 
 **1. The descriptor POOL is sized one entry per resource, and this is the site that fails furthest from
-its cause.** `tests/render_runner.h` counts demand with `++storage_buffers` / `++storage_images` /
+its cause.** `tests/fixtures/render_runner.h` counts demand with `++storage_buffers` / `++storage_images` /
 `++sampled_images` — once per `FrameResource`, whatever its arity — and passes those counts as the
 `VkDescriptorPoolSize` values. An array of N descriptors consumes **N** pool entries while 1 was
 reserved, so allocation fails with `VK_ERROR_OUT_OF_POOL_MEMORY` at a `vkAllocateDescriptorSets` that

@@ -61,7 +61,7 @@ width/height are 14-bit fields `+1` → **≤ 16384**, depth 13-bit `+1` → **�
 9 bits, `num_components ∈ {0..4}`, buffer `size_bytes` computed in `uint64_t` and clamped to
 `0xFFFFFFFF`. Downstream code multiplies these into host allocation/copy/detile bounds and rejects
 `> UINT32_MAX` / `> kMaxComputeImageBytes` — sound **only** because the dimensions can't exceed those
-masks. `tests/test_descriptor_clamp.cpp` pins these ceilings so a mask-widening refactor fails loudly.
+masks. `tests/gpu/agc/test_descriptor_clamp.cpp` pins these ceilings so a mask-widening refactor fails loudly.
 
 ## Swept surfaces (systematic adversarial hunts)
 

@@ -414,7 +414,7 @@ Note that the first two fall silent in cases 1 **and** 2, which is why `PROSPER_
   `CONFIDENCE: LOW`.
 
 ## Tests (`ctest`)
-- **`audio_hle`** (`tests/test_audio.cpp`) — always built. Drives the real HLE entrypoints through the
+- **`audio_hle`** (`tests/hle/audio/test_audio.cpp`) — always built. Drives the real HLE entrypoints through the
   dispatch table with a capturing sink: format decode (all 8 formats + unknown), port open/close,
   byte-exact PCM forwarding, `Output`/`Outputs`, volume, port state, exhaustion, and error paths.
   It also carries **`test_bed_routing_matrix`**, which measures the fold end to end: one unit impulse

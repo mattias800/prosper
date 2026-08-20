@@ -1108,7 +1108,7 @@ void notify_live_render_target_image_written(const LiveTargetImageWrite& write);
 // so a renderer-owned image could never be bound to a dispatch and had to round-trip through host
 // memory. The live renderer publishes its already-created device here; the compute backend ADOPTS it
 // when it is present and feature-adequate, and otherwise creates its own exactly as before (compute
-// must keep working with no renderer at all -- see tests/test_game_compute.cpp).
+// must keep working with no renderer at all -- see tests/shared/texture/test_game_compute.cpp).
 //
 // Handles are opaque so this layer keeps no Vulkan dependency; both sides cast to the real types.
 // An adopted context is BORROWED: the consumer owns none of these objects and must not destroy them.

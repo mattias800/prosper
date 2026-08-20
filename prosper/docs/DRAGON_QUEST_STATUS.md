@@ -238,7 +238,7 @@ title-visibility blocker.
 > its draw loop (`gpu_capture.cpp`, line 3405 as of `37768edc`; grep the assignment rather than the line
 > number, it drifts) — so replay never re-runs `resolve_pipeline_state` and a change there is invisible to it.
 > That is why #1695's A/B lever had to sit in `gpu_replay`'s `main()`. Verify in a live run or in
-> `tests/test_pipeline_render.cpp`, not by replaying an artifact.
+> `tests/gpu/test_pipeline_render.cpp`, not by replaying an artifact.
 
 **Read this before any further work on this title's composition.** It supersedes the "final Slate quad"
 line of investigation below, which was chasing an ordinary draw that is not ordinary.
@@ -294,7 +294,7 @@ frame — and the title double-buffers its scanout. In the white grab the two bu
 are one correct System Settings screen (7,410 distinct colours) and one **single-colour pure white** plane,
 which is the buffer that submit renders into. That is the flashing.
 
-`tests/test_render_state.cpp` used to assert `occurrence_count(..., "MODE=2 ") == 1` under the message
+`tests/gpu/test_render_state.cpp` used to assert `occurrence_count(..., "MODE=2 ") == 1` under the message
 "unmodeled CB modes log once per distinct value while retaining fallback behavior". That asserted the
 **log-dedupe mechanism**, never the draw behaviour, and its "retaining fallback behavior" clause was not
 tested at all. The history settles the intent: #919 introduced the block over modes **2 and 3** as

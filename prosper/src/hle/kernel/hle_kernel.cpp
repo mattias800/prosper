@@ -77,7 +77,7 @@ namespace prosper {
 // #2613 static-destruction ordering canary. Declared BEFORE every registry in this file, so the
 // reverse-order static destruction pass destroys it AFTER all of them: once this flag reads true,
 // every object in this translation unit that still had a static destructor has already run it.
-// tests/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran after
+// tests/host/image/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran after
 // this TU's destruction — without that check a probe that ran too early would pass vacuously.
 // The flag itself is a constant-initialized atomic, so it has neither dynamic initialization nor a
 // destructor and stays readable for the whole process lifetime.
@@ -1143,7 +1143,7 @@ uint64_t guest_cond_generation_for_test(pthread_cond_t* cond) {
 // THESE TWO CONSEQUENTLY HAVE NO CALLERS LEFT, and that is stated rather than dressed up, because
 // the tempting justification ("_Mtx_init/_Cnd_init still need them") is simply false — those two
 // handlers allocate and initialise directly. They are kept for one checkable reason: the measured
-// mutation table in tests/test_c11_thread_slots.cpp names `guest_cond_from_slot` as the lever its
+// mutation table in tests/hle/test_c11_thread_slots.cpp names `guest_cond_from_slot` as the lever its
 // N4 arm pulls, so deleting them would silently retire a recorded, reproducible arm in a sibling
 // suite. If that table is ever re-derived against `ensure_cond` instead, delete these.
 pthread_mutex_t* guest_mutex_from_slot(uint64_t slot_addr) { return ensure_mutex(slot_addr); }
@@ -1996,7 +1996,7 @@ HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam*
 // was also made there.
 //
 // So the bare form here is the older default surviving, at CONFIDENCE: MED — not a measurement, and
-// not "unsettleable". It is not swept in #2573 because doing so moves `tests/test_pthread_names.cpp`'s
+// not "unsettleable". It is not swept in #2573 because doing so moves `tests/hle/test_pthread_names.cpp`'s
 // `== 3` / `== 14` pins, and editing a passing test so it agrees with a change is exactly what #2365
 // declined to do; that edit needs a reviewer looking at it as the primary artefact. #2595 carries it,
 // with the disassembly above and what would actually settle it.
@@ -3481,7 +3481,7 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
             // snprintf returns the length it WOULD have written, so handing it to write() reads
             // past the end of this stack buffer whenever the line truncates -- #2050's class, and
             // instrument trap 109's. raw_fmt_len() is the clamp #2050 introduced for exactly this,
-            // already unit-tested (tests/test_raw_syscall.cpp), and it encodes the right choice for
+            // already unit-tested (tests/host/platform/test_raw_syscall.cpp), and it encodes the right choice for
             // the truncated case: write the cap-1 bytes that really landed, so the shortening stays
             // visible rather than being papered over.
             //

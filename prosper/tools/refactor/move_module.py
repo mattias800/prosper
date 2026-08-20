@@ -124,7 +124,13 @@ def main() -> int:
         print(f"  WARNING {len(missing)} module(s) in the plan do not exist: {' '.join(missing)}")
 
     header_names = {p.name for p, _ in moves if p.suffix in (".hpp", ".h")}
-    include_target = {p.name: f"{args.include_prefix}/{assignment[p.stem]}/{p.name}"
+    # An EMPTY prefix is meaningful, not a mistake: prosper/tests is itself the include root (it is
+    # already one for 8 targets), so its canonical form is `fixtures/render_runner.h` with no
+    # subsystem component. Joining unconditionally produced a leading slash and an absolute path.
+    def canonical(name: str, folder: str) -> str:
+        return "/".join(x for x in (args.include_prefix, folder, name) if x)
+
+    include_target = {p.name: canonical(p.name, assignment[p.stem])
                       for p, _ in moves if p.suffix in (".hpp", ".h")}
 
     print(f"  {len(moves)} file(s) to move into {len(set(assignment.values()))} folder(s)")

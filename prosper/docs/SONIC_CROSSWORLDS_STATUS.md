@@ -617,7 +617,7 @@ One line per falsified hypothesis, with the evidence that killed it.
   rejects that exact binding as `WrongType`. That is why the capture shows `recompiled=yes` with
   `descriptors=20` **and** a descriptor-contract failure -- a pair that reads as contradictory until
   the three sites are read together. Buffer-flattening is the **designed** path for
-  `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483` requires
+  `image_atomic_add`, not a fallback (`tests/gpu/test_rdna2_spirv_struct.cpp:3483` requires
   `kind == StorageBuffer` with `atomic_access` and `report.ok()`); it exists as the RADV
   image-atomic workaround. **This is #2293's defect one iteration later** -- that PR is titled *"the
   image-atomic opcode list existed in THREE places and all three had to agree"*, and the same triple

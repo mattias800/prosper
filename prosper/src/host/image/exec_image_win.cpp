@@ -152,7 +152,7 @@ namespace {
 // #2613 static-destruction ordering canary. Declared BEFORE every registry in this file, so the
 // reverse-order static destruction pass destroys it AFTER all of them: once this flag reads true,
 // every object in this translation unit that still had a static destructor has already run it.
-// tests/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran after
+// tests/host/image/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran after
 // this TU's destruction. Constant-initialized atomic: no dynamic init, no destructor.
 std::atomic<bool> g_exec_image_statics_destroyed{false};
 struct ExecImageDestructionCanary {

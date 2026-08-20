@@ -3194,7 +3194,7 @@ As of 2026-08-14, established and each measured rather than inferred:
    in which 1,805–2,062 of 2,063 roots lead into a cycle. The guest loop cannot terminate on that.
 4. **Our lowering of that loop shape is correct.** A hand-built kernel with the same
    `v_cmpx` / `s_cbranch_execz` / back-edge shape runs correctly on real Vulkan
-   (`tests/test_cfg_trip_bound.cpp`), so the recompiler is not what fails to exit.
+   (`tests/shared/diagnostics/test_cfg_trip_bound.cpp`), so the recompiler is not what fails to exit.
 
 **So the open question is why the table is cyclic** — not whether the loop spins, and not whether we
 lower it correctly.
@@ -3413,7 +3413,7 @@ Two consequences worth having:
 2. The program is lowered through `emit_cfg_state_machine` (it is on the `role=terminal` list), where
    EXEC is emulated per invocation and `s_cbranch_execz` needs a cross-lane vote. That is the same
    machinery the consumer's loop exercised — and a hand-built kernel proved it correct for *that*
-   shape (`tests/test_cfg_trip_bound.cpp`), which does not extend to `s_and_saveexec_b64` feeding a
+   shape (`tests/shared/diagnostics/test_cfg_trip_bound.cpp`), which does not extend to `s_and_saveexec_b64` feeding a
    predicated store.
 
 This is a hypothesis, not a result: no measurement yet shows a lane storing when it should not, or
@@ -4428,7 +4428,7 @@ falsification.
   and **not** for this one, where the unresolved operand is a register, not a descriptor.
 - **`no-entry` at 81% of DS-bridge calls is a defect.** *Instrument.* `find_persistent_ds_sampled` is
   consulted for **every sampled binding**, so `no-entry` counts every ordinary colour texture in the
-  frame; the code says so at `tests/render_runner.h:2796` ("the no-entry bucket is unbounded and is
+  frame; the code says so at `tests/fixtures/render_runner.h:2796` ("the no-entry bucket is unbounded and is
   genuinely just 'not ours'"). Of the ~45,700 decisions that concern a real DS plane, ~92% hit. Read
   the *ranked per-address* declines, never the bucket total.
 - **The 72 direct draws are failing / are culled / have colour writes masked.** They execute at full
@@ -4443,7 +4443,7 @@ falsification.
   blue gradient with a horizon band is prosper's **seed-miss placeholder**: already 100% non-black at
   step 4, before most draws run, and unchanged through step 78. Instrument trap 161.
 - **The whole-frame abort on an unsupported storage image.** `render_draw_pass_rgba`
-  (`tests/render_runner.h:3309`) does abandon an entire 4K frame on the first invalid storage-image
+  (`tests/fixtures/render_runner.h:3309`) does abandon an entire 4K frame on the first invalid storage-image
   contract, which is a real disproportionality — but gating it so only the offending draw is dropped
   left the black window unchanged. Reverted rather than landed. #2481.
 - **A dark frame containing a dim scene.** Frames measuring 0.00% non-black at threshold 8/255 while
@@ -4510,7 +4510,7 @@ falsification.
   loop writes EXEC, so if `v_cmpx` narrowed VCC instead of EXEC — plausible, because the e32
   encoding's destination field still reads as VCC and `shader_inspect` prints it as `special:106` —
   the loop could never end. **Falsified by a hand-built kernel of the identical shape**
-  (`tests/test_cfg_trip_bound.cpp`): built by hand rather than derived from the capture or the
+  (`tests/shared/diagnostics/test_cfg_trip_bound.cpp`): built by hand rather than derived from the capture or the
   recompiler, its body decrements the index instead of chasing a buffer, so only the control flow is
   on trial. On real Vulkan, lane *i* walks exactly *i* steps for all 128 lanes — per-lane EXEC
   narrowing and the cross-lane `execz` vote are both correct. #2542.

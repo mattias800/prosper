@@ -7,7 +7,7 @@
 // (try_emulate_fs_access in exec_image_linux.cpp). Rosetta keeps the CPU fs base at 0 and rejects
 // wrfsbase, so guest `%fs:disp` accesses fault at linear address == the raw offset; the signal
 // handler redirects the access to guest_TP + offset. Extracted as a pure function (same pattern as
-// sse4a.hpp) so the decode/register semantics are unit-testable on Linux (tests/test_fs_emu.cpp),
+// sse4a.hpp) so the decode/register semantics are unit-testable on Linux (tests/host/tls/test_fs_emu.cpp),
 // where the __APPLE__ handler itself never compiles.
 //
 // Handles the mov family observed in real boots: reg loads/stores (8A/8B/88/89), imm stores

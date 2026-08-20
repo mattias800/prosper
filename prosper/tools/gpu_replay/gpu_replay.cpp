@@ -12,7 +12,7 @@
 #include "pixel_input_linkage.hpp"
 #include "post_compute_resource.hpp"
 #include "resource_override.hpp"
-#include "render_runner.h"
+#include "fixtures/render_runner.h"
 
 #include <algorithm>
 #include <cctype>

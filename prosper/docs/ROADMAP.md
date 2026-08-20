@@ -276,8 +276,8 @@ Turn the file into a resident, relocated guest image in host memory.
 - [ ] Enough `libSceAgc`/`AgcDriver` + video-out for the engine's graphics device to init and
       register its rendering internal calls (unblocks the IL2CPP abort).
 ### M5 — AGC → Vulkan + shader recompiler → first frame
-- **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
-  representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
+- **Verify (programmatic, GREEN):** `tests/host/image/test_trap_linux.cpp` (map + identify 4
+  representative imports) and `tests/host/image/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.
 
 ### M3 — Kernel + libc/posix (reach Unity init)

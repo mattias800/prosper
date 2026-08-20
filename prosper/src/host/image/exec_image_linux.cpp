@@ -67,7 +67,7 @@ namespace {
     // #2613 static-destruction ordering canary. Declared BEFORE every registry in this file, so the
     // reverse-order static destruction pass destroys it AFTER all of them: once this flag reads
     // true, every object in this translation unit that still had a static destructor has already run
-    // it. tests/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran
+    // it. tests/host/image/test_exit_registry_lifetime.cpp reads it to prove its own exit-time probe really ran
     // after this TU's destruction — without that check a probe that ran too early would pass
     // vacuously. The flag is a constant-initialized atomic: no dynamic initialization, no destructor.
     std::atomic<bool> g_exec_image_statics_destroyed{false};
@@ -1166,7 +1166,7 @@ namespace {
         volatile uint8_t* mem = (volatile uint8_t*)(uintptr_t)(tp + fault_addr);
 
         // Decode + execute via the platform-neutral core (fs_emu.hpp — unit-tested on Linux,
-        // tests/test_fs_emu.cpp, incl. the #727 AH/CH/DH/BH byte-register rules).
+        // tests/host/tls/test_fs_emu.cpp, incl. the #727 AH/CH/DH/BH byte-register rules).
         uint64_t regs[16];
         for (int k = 0; k < 16; k++) regs[k] = (uint64_t)g[kX86ToReg[k]];
         FsEmuResult res = fs_emulate_access(p, mem, regs);

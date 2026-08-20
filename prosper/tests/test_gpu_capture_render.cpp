@@ -7,7 +7,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
-#include "render_runner.h"
+#include "fixtures/render_runner.h"
 
 #include <algorithm>
 #include <array>
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 #include <vulkan/vulkan.h>
-#include "test_scratch.h"
+#include "fixtures/test_scratch.h"
 
 using namespace prosper::gpu;
 

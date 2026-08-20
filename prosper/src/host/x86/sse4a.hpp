@@ -2,7 +2,7 @@
 #include <cstdint>
 
 // AMD SSE4a bitfield semantics (INSERTQ / EXTRQ), extracted as pure functions so the signal-handler
-// emulator in exec_image_linux.cpp can be unit-tested (tests/test_sse4a.cpp). PS5 guest code is
+// emulator in exec_image_linux.cpp can be unit-tested (tests/host/x86/test_sse4a.cpp). PS5 guest code is
 // compiled for Zen2 and emits these; they #UD (SIGILL) on Intel hosts, so we emulate them.
 // Reference: AMD64 Architecture Programmer's Manual, Volume 4, publication 26568
 // (INSERTQ/EXTRQ). Length/index are 6-bit fields; length 0 means 64; results with

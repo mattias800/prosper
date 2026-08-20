@@ -53,7 +53,7 @@ namespace prosper {
 // saturates too: fail-visible beats a line that silently drops an append it could not format.
 // Async-signal-safe: integer arithmetic only — no allocation, no lock, no errno, no TLS.
 // Defined above the platform guard because it is pure arithmetic: Windows/MinGW-clean, and
-// unit-testable on any host (see tests/test_raw_syscall.cpp).
+// unit-testable on any host (see tests/host/platform/test_raw_syscall.cpp).
 inline int raw_fmt_advance(int cursor, int written, uint64_t cap) {
     const uint64_t lim = cap > (uint64_t)INT_MAX ? (uint64_t)INT_MAX : cap;
     if (lim == 0) return 0;
@@ -81,7 +81,7 @@ namespace prosper {
 // plus the terminating NUL, so cap-1 is the readable content.
 // Async-signal-safe: integer arithmetic only — no allocation, no lock, no errno, no TLS.
 // Defined above the platform guard because it is pure arithmetic: Windows/MinGW-clean, and
-// unit-testable on any host (see tests/test_raw_syscall.cpp).
+// unit-testable on any host (see tests/host/platform/test_raw_syscall.cpp).
 inline uint64_t raw_fmt_len(int n, uint64_t cap) {
     if (n < 0 || cap == 0) return 0;              // encoding error, or nowhere to have written
     const uint64_t un = (uint64_t)n;

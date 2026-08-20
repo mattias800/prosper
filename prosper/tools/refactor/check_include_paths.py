@@ -38,8 +38,8 @@ import sys
 # Which include ROOT makes each canonical prefix resolve. Encoded here rather than in a reader's
 # head: the wrong one produces a suggestion that looks right and does not work.
 PREFIX_ROOT = {"hle": "src", "gpu": "src", "host": "src", "self": "src", "loader": "src",
-               "shared": "frontends"}
-ROOT_DIR = {"src": "src", "frontends": "frontends"}
+               "shared": "frontends", "fixtures": "tests"}
+ROOT_DIR = {"src": "src", "frontends": "frontends", "tests": "tests"}
 # Libraries that publish a root PUBLIC, so every dependent inherits it.
 PUBLISHERS = {"prosper_core": "src", "prosper_performance_capture": "frontends"}
 
@@ -100,24 +100,44 @@ def main() -> int:
         deps = set(re.findall(r"[A-Za-z0-9_:]+", m.group(2))) - {"PRIVATE", "PUBLIC", "INTERFACE"}
         links.setdefault(m.group(1), set()).update(deps)
 
-    have: dict[str, set[str]] = {}
+    # VISIBILITY IS LOAD-BEARING, and getting it wrong is silent in the direction that hurts.
+    # `target_include_directories(X PRIVATE tests)` lets X compile against the tests root and gives
+    # its dependents NOTHING. A closure that ignores the keyword propagates it anyway, and every
+    # dependent then looks satisfied -- which is how test_shared_vulkan_device passed this check and
+    # failed the build on `fixtures/render_runner.h`: it links prosper_live_renderer, whose `tests`
+    # entry is PRIVATE (prosper/CMakeLists.txt:1755). So two sets per target: what it can USE, and
+    # the strictly smaller set it EXPORTS.
+    own: dict[str, set[str]] = {}        # usable when compiling this target
+    exported: dict[str, set[str]] = {}   # inherited by anything linking it
     for m in re.finditer(r"target_include_directories\(\s*([A-Za-z0-9_]+)([^)]*)\)", text, re.S):
+        visibility = "PRIVATE"
         for word in re.findall(r"[A-Za-z0-9_/\.\-]+", m.group(2)):
+            if word in ("PRIVATE", "PUBLIC", "INTERFACE"):
+                visibility = word
+                continue
             if word in ROOT_DIR:
-                have.setdefault(m.group(1), set()).add(word)
-    for name, deps in links.items():
-        for dep in deps:
-            if dep in PUBLISHERS:
-                have.setdefault(name, set()).add(PUBLISHERS[dep])
+                own.setdefault(m.group(1), set()).add(word)
+                if visibility in ("PUBLIC", "INTERFACE"):
+                    exported.setdefault(m.group(1), set()).add(word)
+    for lib, rootname in PUBLISHERS.items():
+        exported.setdefault(lib, set()).add(rootname)
+
     changed = True
-    while changed:                      # transitive closure over PUBLIC-publishing libraries
+    while changed:      # a PUBLIC root travels through any number of PUBLIC links
         changed = False
         for name, deps in links.items():
             for dep in deps:
-                gained = have.get(dep, set()) - have.get(name, set())
-                if gained:
-                    have.setdefault(name, set()).update(gained)
+                gained = exported.get(dep, set()) - exported.get(name, set())
+                # Only re-export what this target itself links PUBLIC-ly; CMake's own rule. Being
+                # conservative here can only over-report, which is the safe direction.
+                if gained and re.search(r"target_link_libraries\(\s*" + re.escape(name)
+                                        + r"[^)]*PUBLIC[^)]*" + re.escape(dep), text, re.S):
+                    exported.setdefault(name, set()).update(gained)
                     changed = True
+    have: dict[str, set[str]] = {k: set(v) for k, v in own.items()}
+    for name, deps in links.items():
+        for dep in deps:
+            have.setdefault(name, set()).update(exported.get(dep, set()))
 
     cache: dict[pathlib.Path, frozenset[str]] = {}
     findings: list[tuple[str, str, str]] = []

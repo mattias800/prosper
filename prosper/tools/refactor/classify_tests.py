@@ -42,6 +42,10 @@ def main() -> int:
                                        capture_output=True, text=True, check=True).stdout.strip())
     tdir = root / args.dir
     inc = re.compile(r'#include\s+"(' + "|".join(PREFIXES) + r')/([^/"]+)/[^"]+"')
+    # Subsystems that are still flat have no folder component; classify those at depth 1.
+    flat = re.compile(r'#include\s+"(' + "|".join(PREFIXES) + r')/([^/"]+)"')
+    global INCLUDE_NAMES
+    INCLUDE_NAMES = re.compile(r'#include\s+"([^"/]+)"')
 
     # --- weight each include by how RARE it is -------------------------------------------------
     # The first version of this counted includes directly, and put 76 of 228 tests in hle/dispatch --
@@ -64,10 +68,35 @@ def main() -> int:
     ambiguous: list[tuple[str, list[tuple[str, int]]]] = []
     unclassified: list[str] = []
 
+    # Fixtures and harnesses are not tests OF anything -- they are what tests are built on, and
+    # every one of them would otherwise classify as whatever it happens to include most.
+    FIXTURES = {"render_runner.h", "compute_runner.h", "image_compute_runner.h", "spirv_compute.h",
+                "spirv_triangle.h", "synth_prx.h", "handmade_prx.h", "at9_testvec.h",
+                "test_scratch.h"}
+    RUNNERS = {"render_runner.h", "compute_runner.h", "image_compute_runner.h"}
+    # A header included by more than a fifth of the tree separates nothing. idf already shrinks its
+    # weight, but a test whose ONLY project include is such a header still gets classified by it --
+    # and "every HLE test includes dispatch.hpp to register a stub" is exactly that case, which put
+    # 54 unrelated tests in hle/dispatch. Where all the evidence is ubiquitous, the honest answer is
+    # the subsystem, not the folder.
+    UBIQUITOUS = {k for k, v in df.items() if v > 0.20 * total}
+
     for path in files:
+        is_fixture = (path.name in FIXTURES or path.name.endswith("_fixture.hpp")
+                      or (path.suffix in (".h", ".hpp") and not path.name.startswith("test_")))
+        if is_fixture:
+            assignment[path.stem] = "fixtures"
+            continue
         seen = set(inc.findall(texts[path]))
+        seen |= {(sub, "") for sub, _f in flat.findall(texts[path])}
         if not seen:
-            unclassified.append(path.name)
+            # No project include at all. If it drives one of the Vulkan/compute harnesses it is an
+            # execution test, which is a real category; otherwise it is genuinely unclassifiable
+            # from includes and a person should look at it.
+            if RUNNERS & set(INCLUDE_NAMES.findall(texts[path])):
+                assignment[path.stem] = "render"
+            else:
+                unclassified.append(path.name)
             continue
         score: dict[tuple[str, str], float] = collections.defaultdict(float)
         for key in seen:
@@ -82,7 +111,10 @@ def main() -> int:
             subs = {s for (s, _f), n in ranked if n >= top * 0.85}
             assignment[path.stem] = (sub if len(subs) == 1 else "misc")
             continue
-        assignment[path.stem] = f"{sub}/{folder}" if args.depth >= 2 else sub
+        if all(k in UBIQUITOUS for k in seen):
+            assignment[path.stem] = sub
+            continue
+        assignment[path.stem] = (f"{sub}/{folder}" if (args.depth >= 2 and folder) else sub)
 
     counts = collections.Counter(assignment.values())
     print(f"== {len(assignment)} classified, {len(unclassified)} unclassified, "

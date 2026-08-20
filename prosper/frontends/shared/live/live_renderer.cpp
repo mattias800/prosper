@@ -36,7 +36,7 @@
 #include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
-#include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
+#include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>
 #include <chrono>
@@ -1009,7 +1009,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
     // the two would never share. Only reached when the live renderer is registered, so headless
-    // compute-only use (tests/test_game_compute.cpp) still creates its own device.
+    // compute-only use (tests/shared/texture/test_game_compute.cpp) still creates its own device.
     (void)prosper::test::render_vk_ctx();
     static RttCache g_rtt;   // render-to-texture cache (#167)
     // Shared final-callback ordinal for PROSPER_PASS_LOG (increments where dp_submit does).

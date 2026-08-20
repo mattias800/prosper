@@ -74,7 +74,7 @@ std::unordered_map<uint64_t, AmprCbState> g_ampr_cb_state;
 // working -- but the reason is the ORDER, not the `count != 0` guard, and I had that backwards until
 // mutation testing corrected it. The plain arm runs first and returns true for every a2 it accepts,
 // so no currently-accepted value ever reaches the packed arm at all. DOLL's a2 = 0 and a2 = 1 are
-// rejected by both arms. tests/test_ampr_tracks_offset.cpp asserts this over a SWEEP rather than
+// rejected by both arms. tests/hle/memory/test_ampr_tracks_offset.cpp asserts this over a SWEEP rather than
 // over examples, because examples cannot establish a disjointness claim.
 //
 // `count != 0` is therefore REDUNDANT and deliberately kept: when count is zero, a2 IS cap, so the

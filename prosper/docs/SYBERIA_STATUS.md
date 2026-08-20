@@ -455,7 +455,7 @@ Same class as Dead Cells #773 (native-format loss): RGBA16F was plumbed through 
 was not. Map all three enumerators and fail closed on an unknown one, the way the importer at
 `live_renderer.cpp:757-764` already does; prefer a shared helper over a third inline ternary.
 
-`tests/test_game_compute.cpp` already drives `LiveTargetPixelFormat::R11G11B10Float` (lines 301, 358,
+`tests/shared/texture/test_game_compute.cpp` already drives `LiveTargetPixelFormat::R11G11B10Float` (lines 301, 358,
 2156). A regression should assert that a mirrored compute write to an R11G11B10F live target
 republishes the RTT entry and that the following sample reads the written pixels — and that it **fails**
 on current master while the RGBA8/RGBA16F equivalents pass, so the test proves the format gap rather

@@ -1027,7 +1027,7 @@ struct VulkanComputeContext {
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
-    // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
+    // tests/fixtures/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
     // the features, image-binding dispatches are skipped loudly instead of creating an invalid device.
     bool image_support = false;
     // Stage 1 of the descriptor lift (#2412): true when this compute device can express an indexed
@@ -2210,7 +2210,7 @@ struct VulkanComputeContext {
         // makes it possible for a dispatch to bind a renderer-owned image at all; without it every
         // such binding must round-trip through host memory. Declined when the renderer's device
         // lacks the storage-image features this backend needs, and absent entirely in headless
-        // compute-only use (tests/test_game_compute.cpp), where the private device below is created
+        // compute-only use (tests/shared/texture/test_game_compute.cpp), where the private device below is created
         // exactly as before.
         const prosper::gpu::SharedVulkanContext shared = prosper::gpu::shared_vulkan_context();
         if (shared.valid() && shared.storage_image_read_without_format &&
