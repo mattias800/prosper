@@ -158,12 +158,25 @@ def split(map_data: dict, plan: dict[str, list[int]], source_text: str,
     if missing:
         problems.append(f"{len(missing)} body region(s) unassigned: {missing[:20]}")
 
+    # A boundary inside an `#if` is only a problem when the two sides go to DIFFERENT files -- then
+    # the directive and its `#endif` are separated. Refusing every such boundary was over-strict and
+    # rejected a valid plan: gpu_executor.cpp has conditionals spanning several consecutive regions
+    # that all belong to the same output, where splitting "there" splits nothing.
     depth = conditional_depth([ln.rstrip("\n") for ln in lines])
+    where = dict(seen)
     for r in regions:
-        if depth[r["start"]] != 0:
-            problems.append(f"region {r['index']} starts at line {r['start']} inside an #if "
-                            f"(depth {depth[r['start']]}); splitting there would divide a "
-                            f"conditional across files")
+        if r["index"] in replicated_idx:
+            where[r["index"]] = "<replicated>"
+    ordered = sorted(regions, key=lambda r: r["index"])
+    for prev, cur in zip(ordered, ordered[1:]):
+        if depth[cur["start"]] == 0:
+            continue
+        a, b = where.get(prev["index"]), where.get(cur["index"])
+        if a != b:
+            problems.append(f"line {cur['start']} is inside an #if (depth {depth[cur['start']]}) "
+                            f"and regions {prev['index']} and {cur['index']} go to different "
+                            f"files ({a} and {b}); that would separate the directive from its "
+                            f"#endif")
 
     if problems:
         return {}, problems
@@ -302,7 +315,11 @@ def selftest() -> int:
     check(any("gap or overlap" in x for x in p), "a non-tiling map is refused")
 
     _o, p = split(COND_MAP, {"a.cpp": [1], "b.cpp": [2]}, COND_SRC)
-    check(any("#if" in x for x in p), "a boundary inside an #if is refused")
+    check(any("#if" in x for x in p),
+          "an #if boundary is refused when the two sides go to DIFFERENT files")
+    _o, p2 = split(COND_MAP, {"a.cpp": [1, 2]}, COND_SRC)
+    check(not any("#if" in x for x in p2),
+          "and allowed when they go to the same file -- splitting there splits nothing")
 
     # and the reconstruction check must be able to FAIL
     tampered = dict(outputs)
