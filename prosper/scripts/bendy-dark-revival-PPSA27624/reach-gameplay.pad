@@ -28,8 +28,9 @@
 #
 # Progress oracle is the Unity scene index, not pixels: Media/levelNN is the build-settings
 # scene index (37 scene paths in Media/globalgamemanagers against 37 Media/levelNN files).
-# level2 = Core/2_General/Game is the persistent menu/game scene and is reached at the title
-# screen, so it is NOT a gameplay signal; any levelN with N >= 4 is a Section_S1xx_* scene.
+# level2 = Core/2_General/Game is the persistent game scene. MEASURED: it first opens at t=65-70 s,
+# with level4 -- not at the title screen, which runs on level0/level1 alone. It would have served as
+# a signal here; N >= 4 is used instead because Section_S1xx_* names the thing being claimed.
 3-4:cross
 6-7:cross
 9-10:cross

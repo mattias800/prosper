@@ -5,8 +5,14 @@
 #
 # Progress oracle for this title is the Unity scene index, not pixels. Media/levelNN is the
 # build-settings scene index -- 37 scene paths in Media/globalgamemanagers against 37 Media/levelNN
-# files. level2 = Core/2_General/Game (reached at the title screen already); level4..level36 are
-# the Core/3_Sections/Section_S1xx_* scenes, level4 = Section_S101_JoeyDrewApartment.
+# files. level2 = Core/2_General/Game is the persistent game scene -- MEASURED to first open at
+# t=65-70 s together with level4, NOT at the title screen, which runs on level0/level1 alone.
+# level4..level36 are the Core/3_Sections/Section_S1xx_* scenes, level4 =
+# Section_S101_JoeyDrewApartment, and N >= 4 is the discriminator this route is read against.
+#
+# This route reaches the sections and then HOLDS at the first in-world prompt, which is bound to
+# SQUARE and is a hold; this route only presses Cross. That is a route limit, not a blocker --
+# reach-gameplay.pad is the one that advances. Kept as the Cross-only arm that demonstrates it.
 3-4:cross
 6-7:cross
 9-10:cross

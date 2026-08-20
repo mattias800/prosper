@@ -24,13 +24,24 @@ Derived offline from the dump, with no prosper involved, and self-checking:
 | --- | --- | --- | --- |
 | `level0` | `Core/1_Initialize/InitializeGame` | `level4` | `Core/3_Sections/Section_S101_JoeyDrewApartment` |
 | `level1` | `Core/2_General/Empty` | `level5` | `Section_S102_ArchGateOffices` |
-| `level2` | `Core/2_General/Game` | ... | ... |
+| `level2` | `Core/2_General/Game` (persistent game scene; opens with `level4`, not at the title screen) | ... | ... |
 | `level3` | `Core/2_General/Reset` | `level36` | `Section_S133_Archives` |
 
-**`level2` is NOT a gameplay signal.** `Core/2_General/Game` is the persistent scene that carries the
-menu UI, and the title screen already reaches it. The gameplay discriminator is **any `levelN` with
-N >= 4**, i.e. a `Core/3_Sections/Section_S1xx_*` scene; `level4`
-(`Section_S101_JoeyDrewApartment`) is the one a new game loads first.
+**`level2` is not used as the signal, and the reason is not the one first written here.**
+`Core/2_General/Game` is the persistent game scene. *Measured* across three fresh-save runs, it
+first opens at **t=65-70 s, essentially simultaneously with `level4`** — i.e. when the game starts,
+not while the title screen is up, which runs on `level0`/`level1` alone (`draws_last` 3-12 from
+t~50 s). So `level2` would in fact have served as a gameplay signal in these runs. It is still not
+used as one: `Game.unity` is a persistent container the title keeps loaded afterwards, whereas
+`Section_S1xx_*` names the thing being claimed, so N >= 4 is the stronger and self-describing token.
+This is recorded because the first draft of this document asserted that the title screen already
+reaches `level2` — an inference, not a measurement, and the measurement contradicts it. (The
+pre-#1981 stalled boot on #1897 agrees: it reached `level0`/`level1` only, and the open question
+there was whether `BEGIN` advances to `Game.unity`.)
+
+The gameplay discriminator is therefore **any `levelN` with N >= 4**, i.e. a
+`Core/3_Sections/Section_S1xx_*` scene; `level4` (`Section_S101_JoeyDrewApartment`) is the one a new
+game loads first.
 
 This matters because aggregate frame metrics cannot separate this title's animated menu from a level
 — see `GAME_COMPAT_ORCHESTRATION.md`, "Cross-title: aggregate frame metrics cannot tell an animating
@@ -134,5 +145,11 @@ stalled-boot falsifications are recorded on tracker #1897 and are not repeated h
 - **"The sibling's scene layout transfers."** Falsified by the two dumps' own bytes: *Bendy and the
   Ink Machine* (`PPSA27616`) has 11 scenes and puts a chapter in one scene, so `level1` is its
   gameplay signal; Dark Revival has 37 and streams 33 sections onto a persistent `Game.unity`.
-  Reusing the sibling's discriminator here marks `level1` (`Empty`) as gameplay and `level2`
-  (`Game`, reached at the title screen) as a level. See the sibling section above.
+  Reusing the sibling's discriminator here marks `level1` (`Empty`) as gameplay. See the sibling
+  section above.
+
+- **"The title screen already reaches `level2`."** Falsified by this lane's own runs, and it is
+  recorded because *this document asserted it first, from inference*: `level2` first opens at
+  t=65-70 s alongside `level4` in three fresh-save runs, while the title screen is up from t~50 s on
+  `level0`/`level1` alone. The N >= 4 discriminator was unaffected — it is strictly stronger — but
+  the justification printed under it was a claim nobody had measured. See the oracle section.
