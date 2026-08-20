@@ -110,6 +110,47 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **The adjacent-program attribution for the cyclic table is DEAD, now with the negative case the
+  earlier retraction demanded.** Routed run, Linux/RADV, `reach-story-mode`, 800 s, two other hanging
+  programs declined, `PROSPER_COMPUTE_PARENT_WALK` armed on `0x413dc6700` — **1,507 walk
+  measurements**, the largest sample this question has had.
+
+  Reads at `fetch-pc=91` land on exactly two addresses, the ping-pong pair. Splitting each read by
+  **which program ran immediately before it**:
+
+  | read address | previous program | cyclic | clean |
+  | --- | --- | ---: | ---: |
+  | `0x20f848417c` | `0x413dc6700` | 670 | 15 |
+  | `0x20f848417c` | `0x413dc3400` | 134 | 3 |
+  | `0x20f848a240` | `0x413dc6700` | **0** | 685 |
+
+  `0x20f848417c` is **97.8% cyclic when `0x413dc6700` ran before it and 97.8% cyclic when
+  `0x413dc3400` did.** The predecessor does not move the outcome at all, so no program in that
+  position explains it — which is precisely the control the 2026-08-14 retraction said was missing,
+  now run and now negative. `0x413dc3400`'s section header above still calls it "THE CORRUPTING
+  PROGRAM"; on this evidence it is not, and neither is `0x413dc6700`.
+
+  **What DOES separate the two populations is the address itself** — 804/822 cyclic on `…417c`
+  against 0/685 on `…a240`, which also differ in shape (`max-depth` 42-68 versus a shallow 11-13, at
+  identical `records=2063 roots=2063`). So the question is no longer *"which program corrupts the
+  table"* but *"why is one of the two ping-pong buffers persistently cyclic while the other never
+  is"*.
+
+  Two soundness checks on the instrument, both passed, because a 97% rate is worthless if the walk is
+  not a function of what it reads: across **614** distinct content hashes on `…417c` and **42** on
+  `…a240`, **zero hashes produced both verdicts**; and there were **zero** clean->cyclic transitions
+  with an unchanged content hash. The walk is deterministic in its input and the table never flips
+  without being written.
+
+  **The caveat, which bounds the `…a240` half specifically.** `PROSPER_COMPUTE_PARENT_WALK` is not
+  passive: it **declined 882 dispatches** in this run ("DIAGNOSTIC-ONLY skip suspicious dispatch"),
+  which is also why the run took zero device losses. 670 of `…a240`'s 685 reads follow a predecessor
+  with `previous-executed=0`, i.e. one the instrument itself skipped — so its perfect cleanliness is
+  partly "not recently written" and must not be read as "this buffer is healthy". The **417c
+  comparison is unaffected**: both of its predecessor populations are equally subject to the skip, so
+  the negative result above stands on its own. A control that separates them needs a run where the
+  skip is off, which costs a device loss. (2026-08-21.)
+
 - **Every one of the EIGHT programs that write the traversal table has a fully-covered VECTOR data
   path — the link values cannot be wrong through a dropped VALU or a dropped memory op.** First
   census of the whole writer set rather than of `0x413dc6700` alone, made possible by the
