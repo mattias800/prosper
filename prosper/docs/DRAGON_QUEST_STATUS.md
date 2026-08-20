@@ -652,6 +652,15 @@ invariants. A change in frames, draws or wave64 skips is **not** evidence of any
 
 ## Ruled out — eliminated, do not re-run these
 
+- **"Reading a `Map/Product/World/**.umap` package means the run reached the world."** **Falsified
+  2026-08-20** over two runs: two World maps are read at **0.0 s**, before the title map, and the
+  whole Estard sub-level cluster at **57-58 s**, while the run is still on the save-slot screen and
+  roughly ten minutes before the world is entered. This title front-loads, so package *residency* is
+  not *activation* and the membership form of the oracle reports gameplay on a menu. The form that
+  discriminates — bytes per minute by content directory, plus the persistent level and the
+  level-sequence package appearing only in the load window — and the derivation are in
+  *Residency is not activation* above. #1874, #2779.
+
 - **"Every compute program this title dispatches executes."** **Falsified 2026-08-19 on `2703a6c3`.**
   A `reach-title-screen.pad` arm through `tools/screenshot` (60/60 samples at 3840x2160, 301 s,
   `stop=request-satisfied guest=running status=ok`) with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` reports

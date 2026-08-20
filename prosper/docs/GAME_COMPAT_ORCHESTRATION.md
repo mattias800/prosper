@@ -676,14 +676,17 @@ instrument that separated the two runs above; the successful one went Loading ->
 the others Loading -> `SoloCoopMenu` -> stuck. Full derivation in
 [`ASTERIX_BABYLON_STATUS.md`](ASTERIX_BABYLON_STATUS.md); the route-reliability defect it exposed is #2743.
 
-**For Unreal titles the equivalent is the IoStore package stream, and it is now tooled.** Ten of the
-fifteen titles still at rung 2 are Unreal, so the Unity oracle covers none of them. The Unreal
+**For Unreal titles the equivalent is the IoStore package stream, and it is now tooled.** A large
+share of the titles still short of gameplay are Unreal — read `COMPATIBILITY.md` for the current
+split rather than a number restated here — and the Unity oracle covers none of them. The Unreal
 analogue is *which package the guest read*, decoded from a `PROSPER_FILELOG=1` stream by
 `tools/re/iostore_index.py` (`--maps` for just the `.umap` sequence). It is self-checking in the same
 way: Unreal cooked package paths are semantic, so on `PPSA17942` the title screen reads
 `Map/Product/Title/Title_PL.umap` — which `DefaultEngine.ini`'s own `GameDefaultMap` names as the
-startup map — and a town reads a cluster of `Map/Product/World/Field/F001/C001/C001_M_Env_*.umap`
-sub-levels. A mis-derived mapping produces nonsense rather than a plausible wrong answer.
+startup map — and a town reads a cluster of
+`Map/Product/World/Field/F001/C001/Modern/C001_M_Env_*.umap` sub-levels. (Note the era folder:
+the path without `Modern/` matches **nothing** in the container, and a glob that quietly returns
+zero is the easiest way to mistake a working oracle for a broken one.) A mis-derived mapping produces nonsense rather than a plausible wrong answer.
 
 Two things make this different from just pointing `pak_index.py` at the container. First, an
 IoStore title's `.pak` holds **no packages at all** — only configs, fonts and localization — so

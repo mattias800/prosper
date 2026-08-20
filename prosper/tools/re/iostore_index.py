@@ -31,6 +31,13 @@ the same number. Logical block `k` spans `[k*CompressionBlockSize, …)` and its
 On this project's first IoStore title the two spaces differ by 5.3 GB over a 17.8 GB container, so
 skipping the block step silently misnames most of the stream.
 
+The physical->logical step treats an offset's position **within** a block as the same in both
+spaces, which is exact only for an uncompressed block. Every container this tool can parse today
+has `CompressionMethodNameCount == 0`, i.e. no block is compressed, so the step is exact rather
+than approximate on all of them. If that ever stops holding, the within-block delta would need the
+block's own compressed/uncompressed sizes; the chunk a read lands in would still be right, because
+that is decided by the block index alone.
+
 Usage
 -----
     # what package lives at these .ucas byte offsets?
@@ -175,6 +182,12 @@ class IoStoreToc:
         (self.header_size, self.entry_count, self.block_count, self.block_entry_size,
          self.method_count, self.method_length, self.compression_block_size,
          self.dir_index_size, self.partition_count) = struct.unpack_from('<9I', d, 20)
+        if self.partition_count > 1:
+            # A multi-partition container splits its payload across `.ucas` files and an offset
+            # carries its partition in `offset / PartitionSize`. Nothing here models that, and the
+            # failure would be a silently wrong package name rather than an error, so refuse.
+            raise TocError(f'{self.path}: {self.partition_count} partitions; this tool resolves '
+                           f'single-partition containers only')
         off = 20 + 36
         (self.container_id,) = struct.unpack_from('<Q', d, off)
         off += 8
@@ -320,6 +333,22 @@ _FD_READ_RE = re.compile(
     r"off=(?P<off>0x[0-9a-fA-F]+) count=(?P<size>0x[0-9a-fA-F]+) -> (?P<got>-?\d+)")
 
 
+def container_read_filter(utoc_path: str) -> str:
+    """The substring a read line must contain to belong to this container.
+
+    Deliberately the container's own **`.ucas`**, not merely its stem: a title normally ships
+    `pakchunk0-ps5.pak` beside `pakchunk0-ps5.ucas`, and a stem filter would feed the pak's own
+    offsets -- a completely different offset space -- to this index and name them confidently and
+    wrongly. This is a function rather than an expression inside `main()` so the self-test can pin
+    the value `main()` actually uses; asserting the correct string in the test while `main()`
+    computes its own would test nothing.
+    """
+    base = os.path.basename(utoc_path)
+    if base.endswith('.utoc'):
+        base = base[:-len('.utoc')]
+    return base + '.ucas'
+
+
 def parse_read_log(path: str, container_stem: str = None):
     """Yield (offset, size, got, status) for read lines that name this container.
 
@@ -380,10 +409,11 @@ def _self_test():
     assert f.resolve(20) == ('B.umap', True)
     # A naive "physical == logical" reading would call offset 20 part of chunk 0; it must not.
     assert f.chunk_at_logical(20)[0] == 0 and f.resolve(20)[0] == 'B.umap'
-    # Past the last chunk's payload: named, but not exact.
+    # The last byte still inside B's 32-byte payload (physical 16..47 -> logical 65536..65567).
     assert f.resolve(47) == ('B.umap', True)
+    # One byte past it: still named, because the nearest chunk start is B's, but NOT exact.
     assert f.physical_to_logical(48) == 65568
-    assert f.resolve(48)[1] is False
+    assert f.resolve(48) == ('B.umap', False)
 
     # The directory walk. First a well-formed index — root with one child directory, two files —
     # so the guards below are shown NOT to fire on a valid tree.
@@ -439,7 +469,10 @@ def _self_test():
         fh.write("[apr] read-submit id=2 /d/pakchunk0-ps5.pak -> dst=0x30(guest) "
                  "off=0x5000 size=8 got=8 OK method=id requested=8\n")
         log = fh.name
-    got = list(parse_read_log(log, 'pakchunk0-ps5.ucas'))
+    # Drive the filter main() uses, not a hand-written copy of it: with the stem form the
+    # `.pak` line below is admitted and its offsets are named against the IoStore index.
+    assert container_read_filter('/d/pakchunk0-ps5.utoc') == 'pakchunk0-ps5.ucas'
+    got = list(parse_read_log(log, container_read_filter('/d/pakchunk0-ps5.utoc')))
     assert got == [(0x1000, 64, 64, 'OK'), (0x3000, 64, 64, 'OK')], got
     assert len(list(parse_read_log(log))) == 5
     os.unlink(log)
@@ -505,14 +538,17 @@ def main(argv=None):
         return 0
 
     if args.log:
-        # Match the container's own `.ucas`, not merely its stem: a title normally ships
-        # `pakchunk0-ps5.pak` beside `pakchunk0-ps5.ucas`, and a stem filter would feed the pak's
-        # own offsets to this index and name them confidently and wrongly.
-        stem = None if args.all_containers else os.path.basename(args.utoc)[:-len('.utoc')] + '.ucas'
+        stem = None if args.all_containers else container_read_filter(args.utoc)
         reads = list(parse_read_log(args.log, stem))
         if not reads:
-            print('no [apr] read-submit result lines matched — was PROSPER_FILELOG=1 set, and does '
-                  'this title stream through APR?', file=sys.stderr)
+            # State the most likely cause first, and name it concretely. A zero that blames the
+            # wrong thing sends the reader to re-run a capture when the filter is what excluded
+            # every line -- and `[file] pread` lines are accepted too, so APR is not required.
+            print(f'no read lines in {args.log} name {stem!r}. Most likely this run streams from a '
+                  f'different container -- check which .ucas the log mentions and point --utoc at '
+                  f'its .utoc, or pass --all-containers to drop the filter. If the log has no '
+                  f'[apr] read-submit and no [file] pread/read lines at all, PROSPER_FILELOG=1 was '
+                  f'not set.', file=sys.stderr)
             return 1
         names = []
         for offset, size, got, status in reads:
