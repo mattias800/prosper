@@ -95,6 +95,18 @@ Treat `undetermined-no-resource-table` as "no verdict", never as a missing opcod
 corpus of 114 shaders that had provably recompiled and rendered live, the pre-fix tool called **109 of
 them `rejected`** — 33/35 compute, 27/29 fragment, 49/50 vertex. Agents acted on those false leads.
 
+**And a reject that IS reported here can still name a different PC than the live one.** The missing
+table is not only a missing descriptor set: with no launch state there are no seeded scalar inputs
+either, so the Wave64 MUST dataflow starts with an empty `scalar_words` and `scalar_scc = false`, and
+every proof that depends on a user-data SGPR fails offline that would hold live. Worked example
+(#2790): Sonic Frontiers' `0x2005a0ca00` writes the same VCC pair twice, at pc64 (`886afd6b`) and
+pc76 (`886a6bfd`) — **12 dwords / 9 instructions apart** in the same program (`pc` is a dword offset:
+`rdna2_walk` does `i.pc = pc; pc += i.len_dwords`). It rejects **live at pc76** and **offline at
+pc64**, because offline the *first* of the two already lacks its scalar sources. The offline PC was a
+real reject of a real defect, and it was still the wrong PC to reason from: the two sites carry
+different words and have different causes. Use the offline run to iterate quickly once you know the shape, and
+take the PC itself from the live `[compute] skip unsupported program …` line.
+
 **For a table-accurate verdict, use `gpu_replay`**, which has the real descriptors from a capture:
 
 ```bash

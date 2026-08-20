@@ -1875,6 +1875,100 @@ int main() {
                             native_linear_cfg17d).empty(),
           "Wave64 dispatcher rejects an SCC placeholder after a mask-domain producer");
 
+    // Sonic Frontiers' Cyber Space stage kernels (#2790) write the SAME dual-domain VCC_LO twice --
+    // 12 dwords / 9 instructions apart, identically in all four -- and the second write used to be
+    // uncertifiable. The shape below is the guest's, minimally SYNTHESIZED from it rather than
+    // copied, with the intervening VALU dropped. The live spans are 0x2005a13f00 pc33..49,
+    // 0x2005a11600 pc50..66, 0x2005a0ca00 pc60..76 and 0x2005821500 pc190..206; each of those runs
+    // from the OPENING s_cselect_b32 (16 dwords) and ends on the rejecting site, which is why the
+    // end PCs are exactly #2790's census reject PCs. `pc` is a dword offset, not an instruction
+    // index (rdna2_walk: `i.pc = pc; pc += i.len_dwords`).
+    //
+    //   s_cselect_b32 vcc_hi,1,0     scalar high word
+    //   s_cmp_eq_u32  1,s18          exact scalar SCC
+    //   s_or_b32 vcc_lo,vcc_hi,scc   BOTH dwords proved scalar -> b32_vcc_complete_scalar_pair,
+    //                                so this is classified as a mask write (mask_write=106) even
+    //                                though emit_alu takes its SCALAR path here and publishes
+    //                                SCC=(complete 32-bit result != 0)
+    //   v_cmp_* vcc,...              ends both physical words' scalar lifetimes
+    //   s_cselect_b32 vcc_hi,1,0     must re-publish the high word -- and reads SCC to do it
+    //   s_cmp_eq_u32  3,s18          re-arms a perfectly ordinary scalar SCC
+    //   s_or_b32 vcc_lo,scc,vcc_hi   the exact consumer, after a dispatcher reload
+    //
+    // The MUST transfer charged the first `s_or_b32` an SCC loss purely on its mask
+    // classification. That made the following S_CSELECT's `valid_scc_read` false, which denied
+    // VCC_HI its scalar-word fact, which left the second `s_or_b32` without a certificate and
+    // rejected it -- three hops from the instruction whose transfer was wrong, and at a site whose
+    // own SCC is exactly known. Five stage programs stopped there.
+    const std::vector<uint32_t> frontiers_dual_domain_vcc_scc = {
+        0xbe920381u,              // s_mov_b32 s18,1: one proved scalar word for both compares
+        0xbf061281u,              // s_cmp_eq_u32 1,s18 -> exact scalar SCC
+        0x856b8081u,              // exact site: s_cselect_b32 vcc_hi,1,0
+        0xbf061281u,              // s_cmp_eq_u32 1,s18 -> re-arm the scalar SCC
+        0x886afd6bu,              // exact site: s_or_b32 vcc_lo,vcc_hi,scc (complete scalar pair)
+        0x7d8800a1u,              // VOPC on VCC ends BOTH words' scalar lifetimes, as the guest's
+        0x856b8081u,              // s_cselect_b32 vcc_hi,1,0 re-publishes the scalar high word
+        0xbf061283u,              // s_cmp_eq_u32 3,s18 -> the SCC the exact consumer reads
+        0xbf880000u,              // force a dispatcher save/load before that consumer
+        0x886a6bfdu,              // exact consumer: s_or_b32 vcc_lo,scc,vcc_hi
+        0x7d840100u,              // complete VCC replacement before any pair consumer
+    };
+    std::vector<uint32_t> frontiers_dual_domain_accept = frontiers_dual_domain_vcc_scc;
+    frontiers_dual_domain_accept.insert(
+        frontiers_dual_domain_accept.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(frontiers_dual_domain_accept.data(),
+                             frontiers_dual_domain_accept.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 dual-domain VCC_LO write keeps its scalar SCC for the next pair rebuild");
+
+    // The next two arms are CONTROLS, not discriminators for the transfer rule, and are labelled
+    // that way deliberately: neither can fail under a mutation of `scalar_scc`'s guard, so their
+    // staying green carries no information about it (review of #2801, and the same shape as the
+    // charter's instrument-trap 122). They pin the surrounding behaviour instead.
+    //
+    // Replacing only the first write with a genuine 64-bit mask logical must leave the sequence
+    // rejected. Note WHERE it dies: `s_or_b64` poisons rs.scc in emit_alu, and the following
+    // `s_cselect_b32 vcc_hi,1,0` -- still in the same basic block -- rejects on that sentinel, so
+    // this never reaches the consumer at all. That is emit_alu's cross-lane poison doing its job,
+    // which is worth pinning, but it is not this rule.
+    // The arm that WOULD pin this rule's boundary needs a mask write whose sources are MUST scalar
+    // words, with the SCC consumer past a dispatcher edge, so an over-permissive rule hands it the
+    // `false` placeholder instead of rejecting. Tracked as #2806.
+    std::vector<uint32_t> frontiers_dual_domain_b64_mask = frontiers_dual_domain_vcc_scc;
+    frontiers_dual_domain_b64_mask[4] = 0x88ea6a6au;   // s_or_b64 vcc,vcc,vcc
+    frontiers_dual_domain_b64_mask.insert(
+        frontiers_dual_domain_b64_mask.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(frontiers_dual_domain_b64_mask.data(),
+                            frontiers_dual_domain_b64_mask.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "control: a B64 mask logical at the same site keeps the sequence rejected");
+
+    // Second control. The high word's scalar proof is still load-bearing at the consumer: same
+    // consumer site, reading an SGPR that no instruction in the stream ever defines. `s4` is not a
+    // MUST scalar word whatever the SCC rule does, so this exercises the consumer's own source
+    // proof rather than the transfer.
+    std::vector<uint32_t> frontiers_dual_domain_unproved_word = frontiers_dual_domain_vcc_scc;
+    frontiers_dual_domain_unproved_word[9] = 0x886a6b04u;  // s_or_b32 vcc_lo,s4,vcc_hi
+    frontiers_dual_domain_unproved_word.insert(
+        frontiers_dual_domain_unproved_word.end(), std::begin(code17d), std::end(code17d));
+    CHECK(recompile_compute(frontiers_dual_domain_unproved_word.data(),
+                            frontiers_dual_domain_unproved_word.size(), nullptr,
+                            native_linear_cfg17d).empty(),
+          "control: the consumer site cannot certify an unproved scalar word");
+
+    // And the SCC half independently: drop the re-arming compare before the consumer, so the only
+    // SCC reaching it is the one the first write published. That value is exact, so this arm
+    // ACCEPTS -- which is what proves the first write's SCC is what the fix restored, rather than
+    // the compare at index 7 having masked the defect all along.
+    std::vector<uint32_t> frontiers_dual_domain_no_rearm = frontiers_dual_domain_vcc_scc;
+    frontiers_dual_domain_no_rearm[7] = 0xbf800000u;       // s_nop 0 in place of the compare
+    frontiers_dual_domain_no_rearm.insert(
+        frontiers_dual_domain_no_rearm.end(), std::begin(code17d), std::end(code17d));
+    CHECK(!recompile_compute(frontiers_dual_domain_no_rearm.data(),
+                             frontiers_dual_domain_no_rearm.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "the dual-domain write's own SCC carries to the consumer without a re-arming compare");
+
     // An invalid SCC must not regain scalar provenance indirectly. S_CSELECT publishes its chosen
     // dword and ADDC/SUBB publish both a dword and a new SCC, but all three first consume the old
     // SCC. A dispatcher placeholder at that read makes the instruction itself unrepresentable;
