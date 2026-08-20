@@ -10,9 +10,10 @@ Where a decoded draw or dispatch becomes real GPU work.
   see a descriptor channel.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `mb3_freelist` — answers "is this guest pointer a free MallocBinned3 block". **Its callers are
-  elsewhere**: `pm4/command_processor.cpp`, `hle/hle_kernel.cpp`, `hle/hle_agc.cpp` and
-  `host/exec_image_linux.cpp` (the last through the weak `prosper_mb3_is_pool_candidate`) —
-  `gpu_executor.cpp` does not reference it. Note `hle/dispatch.cpp` is **not** a caller: its only
+  elsewhere**: `src/gpu/pm4/command_processor.cpp` (21 references), `src/hle/graphics/hle_agc.cpp`
+  (4), `src/hle/kernel/hle_kernel.cpp` (3) and `src/host/image/exec_image_linux.cpp` (1, through
+  the weak `prosper_mb3_is_pool_candidate`) —
+  `gpu_executor.cpp` does not reference it. Note `src/hle/dispatch/dispatch.cpp` is **not** a caller: its only
   `mb3` token is `g_mb3_arm_hook`, the `PROSPER_MB3WATCH` write-watch hook, which is a different
   mechanism and catches a loose `mb3_` grep. So
   its placement here is historical rather than a coupling claim, and it is a candidate for moving.

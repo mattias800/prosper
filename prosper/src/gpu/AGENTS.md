@@ -30,6 +30,13 @@ does this frame look wrong", the split matters: a wrong *descriptor* is usually 
 Build note: `CMakeLists.txt:71` globs `src/*.cpp` recursively with `CONFIGURE_DEPENDS`, so a new
 subfolder here needs no source-list edit.
 
+**Line citations in these files are as-of-a-commit, not invariants.** They were correct when
+written and this tree gets restructured; re-derive with `grep` rather than trusting one that does
+not resolve. Recorded because it has already happened here: three citations in
+`resources/AGENTS.md` pointed past EOF within a day, because they named line numbers in
+`rdna2_to_spirv.cpp` from before it was split from 25,448 lines to 4,070 — the author verified
+them in a worktree that was 13 commits behind master.
+
 **Do not confuse `src/gpu/diagnostics/` with `src/diagnostics/`.** They are different folders with
 opposite build treatment: `CMakeLists.txt:75-77` excludes `src/diagnostics/` unless
 `PROSPER_DIAGNOSTICS` is on (default OFF at `:21`), and that exclusion's pattern does **not** match
