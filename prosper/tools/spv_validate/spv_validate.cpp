@@ -117,6 +117,18 @@ static const std::vector<KnownGap> kKnownGaps = {};
 // deliberate entry here can exempt one, and it has to say why.
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
+    // Two SpirvCompute members became visible to this scan when the recompiler's shared internals
+    // moved into rdna2_to_spirv_internal.hpp so the emit functions could be split into their own
+    // translation units. Neither is a new code path -- both were always reached through the entry
+    // points validated below; they were simply inside a .cpp, and this gate reads headers.
+    {"build_interpolation_geometry",
+     "the body of recompile_interpolation_geometry, which IS validated here: that entry point is "
+     "`SpirvCompute builder; return builder.build_interpolation_geometry(layout, capture_position);` "
+     "and nothing else, so every word this gate validates for it is emitted by this member"},
+    {"finish",
+     "SpirvCompute's module-assembly tail, not an entry point. It is the last call of every emitter "
+     "validated here, so it is exercised by all of them; a module it broke would fail spirv-val "
+     "under whichever emitter produced it"},
     {"safe_execz_branches_for_test", "returns a transformed RDNA2 instruction stream, not SPIR-V"},
     {"structured_execz_branches_for_test", "returns analyzed RDNA2 branch PCs, not SPIR-V"},
     {"mask_test_branches_for_test",  "returns a transformed RDNA2 instruction stream, not SPIR-V"},
