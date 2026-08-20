@@ -88,6 +88,11 @@ title fails to advance, the correct statement is "the guest read the input and d
 - [#2741](https://github.com/mattias800/prosper/issues/2741) — two UE4 volumetric-fog compute programs
   never execute (`0x3015ab0000` 0/72, `0x3015fd0000` 0/6). Exact rejects: an entry `s_mov_b32 s14, m0`
   and an `s_cselect_b32 vcc_lo, s37, s36` where LLVM has recycled both VCC words as scalar data.
+  **The VCC half is fixed** — a live env-gated A/B moved `0x3015fd0000` from `executed=0 skipped=6` to
+  `executed=6 skipped=0` with nothing rejecting behind it, and the widened predicate has landed. The
+  **M0** half (`0x3015ab0000`, pc151, this title's *main-view* 240x135x64 volume) is untouched and
+  still blocked on the narrower liveness-proved form, so this title's main froxel pass remains absent
+  and **no image change is claimed here**.
 - [#1581](https://github.com/mattias800/prosper/issues/1581) — the rare self-recovering descriptor
   transient; measured here at 1 skip in 46,667 and 2 in 4,488.
 - The world renders very dark with large fully-black regions, and one sampled frame shows blown-out

@@ -694,7 +694,8 @@ the three routes (fetch pc, SRT offset, SGPR base).
 as an ordinary scalar register** — GTA V's compiler recycles it, which this file already documents
 elsewhere. prosper's VCC-as-scalar recognition is
 `is_wave64_vcc_lo_scalar_b32_candidate`, and it covers exactly two shapes: `s_cselect_b32` with
-inline operands, and SOP2 B32 logicals. **`s_mulk_i32` is SOPK and is in neither set**, so the write
+scalar-data operands (inline constants, SGPRs, or VCC_LO itself since #2741 — it was inline-only when
+this was written), and SOP2 B32 logicals. **`s_mulk_i32` is SOPK and is in neither set**, so the write
 at pc149 is not recognised as a scalar-scratch definition. That matches the failure exactly, but the
 alternative — that the const-fold breaks somewhere else along `s106`'s chain — has not been
 separately excluded, so this is a lead and not a conclusion. Verify before building on it.
@@ -913,12 +914,12 @@ That is the same obstacle as everywhere else in this title:
 | `0x205b654a00` pc1174/1177 | the BVH descriptor's dword3 | `image_bvh_intersect_ray` rejects, the ray-tracing pass never compiles |
 | `0x413ce6000` pc149 | `s_mulk_i32 s106, 120`, the descriptor-array selector | `buffer_load_dwordx3` at pc156 rejects |
 | `0x413ce6000` pc84/90 | integer scratch inside an execz arm | the structurizer's VCC-half liveness guard rejects (cleared on this branch) |
-| GTA V generally | `is_gtav_wave64_vcc_lo_scalar_cselect` exists precisely for this | already a known pattern in the code |
+| GTA V generally | `is_wave64_vcc_lo_scalar_cselect` exists precisely for this | already a known pattern in the code |
 
 **prosper models VCC specially in each place independently — the liveness proof, the scalar-scratch
 recogniser, the descriptor const-fold — and each place has its own, narrower notion of which VCC
 writes count as data.** `is_wave64_vcc_lo_scalar_b32_candidate` admits exactly `s_cselect_b32` with
-inline operands and SOP2 B32 logicals. `s_mulk_i32` (SOPK) is not in it. Neither is the
+scalar-data operands and SOP2 B32 logicals. `s_mulk_i32` (SOPK) is not in it. Neither is the
 `s_and_b32`/`s_or_b32` pair above being tracked *through* to a descriptor.
 
 **This is the frontier.** Not the tree builder, whose lowering is proven correct by eleven perfect
