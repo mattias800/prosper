@@ -4497,4 +4497,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
               const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false,
               const ShaderResourceTable* rt = nullptr, bool allow_wave = false);
 
+// emit_body and the CFG state machine it drives live in rdna2_emit_cfg.cpp. As with emit_alu, the
+// default arguments are stated here and nowhere else.
+bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
+               const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
+               bool allow_exec_update, bool allow_smem,
+               const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+               const uint32_t* code = nullptr, size_t dwords = 0,
+               const std::unordered_set<uint32_t>* inherited_dead_masks = nullptr,
+               bool allow_cfg_dispatcher = true,
+               uint32_t initial_dispatch_active = 0,
+               bool force_barrier_phases = false,
+               bool force_lds_fminmax_dispatcher = false);
+
 }  // namespace prosper::gpu

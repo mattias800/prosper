@@ -34,6 +34,7 @@ import argparse
 import bisect
 import json
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -267,6 +268,27 @@ def cross_refs(tu, target: pathlib.Path, regions: list[dict]) -> dict[int, dict[
             if src is None or src == dst:
                 continue
             edges[src][dst] += 1
+
+    # TEMPLATES NEED A TEXTUAL FALLBACK, and this is not a nicety. A call to a function template
+    # from a dependent context has no resolved `referenced` cursor, so the AST walk above cannot see
+    # it -- the edge simply is not there. Twice in one file that produced a "complete" dependency
+    # closure that did not compile, each time discovered only when the header referenced a name
+    # nothing declared (`for_each_scalar_write`, then `must_fact_at`).
+    #
+    # So for template regions only, add an edge from any region whose text mentions the name as a
+    # whole word. That over-connects -- a mention in a comment counts -- and over-connecting is the
+    # safe direction here: a spurious edge drags an extra helper along, while a missing one produces
+    # a broken split.
+    lines = target.read_text(errors="ignore").splitlines(keepends=True)
+    templates = [r for r in regions if r["kind"] == "FUNCTION_TEMPLATE" and r["name"]]
+    for tmpl in templates:
+        word = re.compile(r"\b" + re.escape(tmpl["name"]) + r"\b")
+        for r in regions:
+            if r["index"] == tmpl["index"] or r["role"] != "body":
+                continue
+            text = "".join(lines[r["start"] - 1:r["end"]])
+            if word.search(text) and tmpl["index"] not in edges.get(r["index"], {}):
+                edges[r["index"]][tmpl["index"]] += 1
     return {k: dict(v) for k, v in edges.items()}
 
 
