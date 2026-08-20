@@ -36,7 +36,7 @@ Last updated: 2026-08-17
 | *Terminator 2D: NO FATE* | `PPSA25872` | Unity / IL2CPP | ✅ Main menu and attract-mode gameplay | [#1872](https://github.com/mattias800/prosper/issues/1872) |
 | *Blue Prince* | `PPSA25009` | Unity | 🚧 Manor entrance-hall gameplay | [#1808](https://github.com/mattias800/prosper/issues/1808) |
 | *Grand Theft Auto V* | `PPSA04263` | RAGE | 🚧 Gameplay entry: HUD and radar render; 3D world absent | [#1873](https://github.com/mattias800/prosper/issues/1873) |
-| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Title and first-run setup | [#1874](https://github.com/mattias800/prosper/issues/1874) |
+| *Dragon Quest VII Reimagined* | `PPSA17942` | Unreal Engine 4 | 🚧 Opening chapter in Estard — the game writes a save and renders the world; free player control not yet demonstrated, composite severely degraded | [#1874](https://github.com/mattias800/prosper/issues/1874) |
 | *Alex Kidd in Miracle World DX* | `PPSA02664` | Unity / IL2CPP | ✅ First-level gameplay | [#1875](https://github.com/mattias800/prosper/issues/1875) |
 | *New Joe &amp; Mac: Caveman Ninja* | `PPSA02801` | Unity / IL2CPP | ✅ Level 1 gameplay | [#1876](https://github.com/mattias800/prosper/issues/1876) |
 | *Asterix &amp; Obelix: Slap Them All!* | `PPSA08576` | Unity / IL2CPP | ✅ First forest level | [#1877](https://github.com/mattias800/prosper/issues/1877) |
@@ -268,7 +268,9 @@ the HUD, radar and tutorial text are visible, but the 3D world is still black. S
 <p align="center"><img src="assets/screenshots/dragon-quest-vii-name-confirmation.png" alt="Dragon Quest VII Reimagined — name confirmation"></p>
 <p align="center"><img src="assets/screenshots/dragon-quest-vii-onboarding.png" alt="Dragon Quest VII Reimagined — first-run setup"></p>
 
-The title, new-save flow, and first-run setup render at native 3840×2160 with audio. Gameplay is not yet validated. See the [tracker](https://github.com/mattias800/prosper/issues/1874).
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.png" alt="Dragon Quest VII Reimagined — the Estard coast in the opening chapter"></p>
+
+The title, new-save flow, and first-run setup render at native 3840×2160 with audio. A scripted route now continues past them: the game creates a real adventure log (`GameSaveData000.dat`), loads Estard’s persistent level and the chapter-1 sequence, and runs the opening story with named-character dialogue over a rendered 3D world. **Free player control has not been demonstrated**, and the composite in that phase is severely degraded — flat black surfaces, rainbow-noise ground, and whole frames flashing uniform white or blue. See the [tracker](https://github.com/mattias800/prosper/issues/1874).
 
 ## Alex Kidd in Miracle World DX — `PPSA02664`
 

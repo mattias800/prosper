@@ -676,6 +676,43 @@ instrument that separated the two runs above; the successful one went Loading ->
 the others Loading -> `SoloCoopMenu` -> stuck. Full derivation in
 [`ASTERIX_BABYLON_STATUS.md`](ASTERIX_BABYLON_STATUS.md); the route-reliability defect it exposed is #2743.
 
+**For Unreal titles the equivalent is the IoStore package stream, and it is now tooled.** A large
+share of the titles still short of gameplay are Unreal — read `COMPATIBILITY.md` for the current
+split rather than a number restated here — and the Unity oracle covers none of them. The Unreal
+analogue is *which package the guest read*, decoded from a `PROSPER_FILELOG=1` stream by
+`tools/re/iostore_index.py` (`--maps` for just the `.umap` sequence). It is self-checking in the same
+way: Unreal cooked package paths are semantic, so on `PPSA17942` the title screen reads
+`Map/Product/Title/Title_PL.umap` — which `DefaultEngine.ini`'s own `GameDefaultMap` names as the
+startup map — and a town reads a cluster of
+`Map/Product/World/Field/F001/C001/Modern/C001_M_Env_*.umap` sub-levels. (Note the era folder:
+the path without `Modern/` matches **nothing** in the container, and a glob that quietly returns
+zero is the easiest way to mistake a working oracle for a broken one.) A mis-derived mapping produces nonsense rather than a plausible wrong answer.
+
+Two things make this different from just pointing `pak_index.py` at the container. First, an
+IoStore title's `.pak` holds **no packages at all** — only configs, fonts and localization — so
+`pak_index.py` correctly reports zero maps and names nothing; the packages are in the `.ucas`.
+Second, a chunk's offset in the `.utoc` is in the container's **logical** space while a read syscall
+carries a **physical** offset into the packed `.ucas`, and on `PPSA17942` the two differ by 4.1 GB at
+the startup map alone — so a one-step lookup misnames most of a stream while still looking plausible.
+`iostore_index.py --self-test` pins that mapping and is registered in ctest.
+
+**And test the phase, not the membership — a front-loading title reads its first world's packages
+before you ever leave the menus.** Measured on `PPSA17942` (2026-08-20): the town sub-levels
+`T001_M_Env_GOut`, `T001_M_Gmk_GOut` and `T001_M_PartyTalk_GIns` are all read at **58 s**, while the
+run is still on the save-slot screen and roughly ten minutes before the world is entered; two
+further World maps are read at 0.0 s, *before* the title map. A "did it read a World map" predicate
+would have reported gameplay on a run that never left a menu — the exact failure the oracle exists
+to prevent, arrived at through the oracle. What separates the states is **bytes per minute by
+content directory**: 0.25 MB of Environment while the setup menus are up against 285 MB in the
+minute the world loads, and a persistent level (`T001_M_PL.umap`) plus a level-sequence package
+appearing only in that window. On a title that streams on demand the membership form is enough;
+check which kind you have before quoting it.
+
+Validate it the way the `## Ruled out` rule requires: build a positive instance **by hand from the
+container index**, outside any run — compute a known package's physical offset and check that
+`--resolve` names it back — rather than trusting that the instrument fires because a run produced
+some output.
+
 ## The orchestration contract
 
 ### Orchestrator responsibilities

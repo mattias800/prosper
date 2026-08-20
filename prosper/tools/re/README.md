@@ -500,8 +500,46 @@ count was never the defect. Use this before concluding anything about missing ge
 which content is actually resident first.
 
 Limits: unencrypted index only, pak index versions 10-11 (the v10+ encoded-entry + full-directory
-layout). IoStore `.utoc`/`.ucas` containers are a different format and are not handled. Run
-`--self-test` to check the entry decoder, the offset lookup, and the log parser without a pak.
+layout). IoStore `.utoc`/`.ucas` containers are a different format — use `iostore_index.py` below.
+Run `--self-test` to check the entry decoder, the offset lookup, and the log parser without a pak.
+
+## `iostore_index.py` — the same thing for IoStore, and the Unreal answer to "menu or gameplay?"
+
+Modern Unreal titles do not put their packages in the `.pak` at all. With `bUseIoStore=True` the
+`.pak` keeps only configs, fonts and localization, and every `.uasset`/`.umap`/`.ubulk` moves into
+a `.ucas` addressed through a `.utoc` directory — so on those titles `pak_index.py` correctly
+reports that the container holds no maps, and the read stream names nothing.
+
+`iostore_index.py` parses the `.utoc` and resolves `.ucas` offsets to package paths, giving Unreal
+titles the equivalent of Unity's `Media/levelNN` scene oracle:
+
+```bash
+# what does this title ship, and what is its startup map?
+python3 tools/re/iostore_index.py GAME.utoc --list '*/Map/*_PL.umap'
+
+# decode a PROSPER_FILELOG=1 run into the packages it loaded, in order
+python3 tools/re/iostore_index.py GAME.utoc --log run.log --maps
+python3 tools/re/iostore_index.py GAME.utoc --log run.log --summary
+```
+
+**Why it is worth reaching for.** `GAME_COMPAT_ORCHESTRATION.md` records that no aggregate frame
+metric can tell an animating menu from gameplay — frame count, pixel-distinctness, staleness and
+`status=ok` are identical for both. On a Unity title the scene sequence settles it. On an Unreal
+title this is that instrument: the map sequence is semantic (`Map/Product/Title/Title_PL.umap` vs
+`Map/Product/World/Field/F001/T001/T001_M_PL.umap`), so a route that never leaves the title screen
+and one that reached a town are trivially distinguishable, and a mis-derived mapping shows up as
+nonsense rather than as a plausible wrong answer.
+
+**The offset mapping is two steps, and skipping the first one silently misnames most of a stream.**
+A chunk's `FIoOffsetAndLength` is an offset in the container's *logical* (uncompressed) space with
+chunks aligned up to `CompressionBlockSize`, while a read syscall carries a *physical* file offset
+into the packed `.ucas`. Logical block `k` starts at `k * CompressionBlockSize` and its bytes live
+at `CompressionBlocks[k].Offset`. On `PPSA17942` the two spaces differ by 5.3 GB over a 17.8 GB
+container. `--self-test` pins exactly this on a fixture where the two disagree.
+
+Limits: `.utoc` versions 1-5 with an **unencrypted** directory index; an encrypted container is
+refused loudly rather than guessed at. A container written without a directory index resolves
+offsets to chunk indices only, and says so.
 
 ## `gstr.py` — name a stripped function by the strings it references
 

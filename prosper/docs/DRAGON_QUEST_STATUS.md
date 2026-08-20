@@ -36,6 +36,132 @@ by #1486; the earlier recompiler gap was fixed by #1483.
 > interpolant registers) was fixed by #1411. The old mostly-white `MENUNAME_Title_001` screenshot is
 > historical; the current capture renders the localized Dragon Quest VII logo, sky, and ocean.
 
+## The content oracle for this title: which UE package the guest read
+
+`GAME_COMPAT_ORCHESTRATION.md` records that no aggregate frame metric separates an animating menu
+from gameplay, and that the Unity answer is the `Media/levelNN` scene sequence. This is an Unreal
+title, so that oracle does not apply. The Unreal equivalent is the **IoStore package stream**,
+decoded from a `PROSPER_FILELOG=1` run by `tools/re/iostore_index.py`:
+
+```bash
+python3 tools/re/iostore_index.py \
+    <DUMP_ROOT>/PPSA17942-app0/doll/content/paks/pakchunk0-ps5.utoc --log <run>.log --maps
+```
+
+Why it works here, and why `pak_index.py` does not: `DefaultGame.ini` in this dump sets
+`bUseIoStore=True`, so `pakchunk0-ps5.pak` holds **only** configs, fonts, localization and CRI audio
+banks — 3,967 entries, **zero** `.umap` — while the 17.8 GB `pakchunk0-ps5.ucas` holds 103,274
+packages including all 5,314 maps. The `.utoc` directory index is unencrypted
+(`ContainerFlags = 0x08`, Indexed only), so every read offset resolves to a package path.
+
+The map namespace is semantic, which is what makes it self-checking:
+
+| package prefix | count | what it is |
+| --- | --- | --- |
+| `Map/Product/Title/` | 3 | the title screen — `Title_PL.umap` is the guest's own `GameDefaultMap` in `DefaultEngine.ini` |
+| `Map/Product/World/Field/` | 4,729 | towns (`TNNN`), castles (`CNNN`) and dungeons (`DNNN`), each `_M_` (modern) or `_P_` (past) |
+| `Map/Product/World/Battle/` | 474 | battle arenas |
+| `Map/Product/World/*_PL.umap` | 4 | the per-era persistent levels, e.g. `World_M_PL.umap` |
+
+So "still on the title" and "in a town" are different package prefixes, not different frame
+statistics.
+
+**The instrument was validated outside any run**, by computing a known package's physical `.ucas`
+offset by hand from the container index and checking that the tool names it back — the discipline
+CLAUDE.md requires, because a same-source control tests the discriminator and not the domain:
+
+| package | logical offset | physical offset | resolves |
+| --- | --- | --- | --- |
+| `Map/Product/Title/Title_PL.umap` | `0x248ab0000` | `0x154ebf1e0` | yes, exact |
+| `Map/Product/World/World_M_PL.umap` | `0x249060000` | `0x1550ee210` | yes, exact |
+| `Map/Product/World/Field/F001/T001/T001_M_PL.umap` | `0x299be0000` | `0x18cd2ba30` | yes, exact |
+
+Note the 4.1 GB gap between the two offset spaces at the startup map. A chunk's
+`FIoOffsetAndLength` is a **logical** (uncompressed) offset; a read syscall carries a **physical**
+offset into the packed `.ucas`. Resolving one against the other produces a confident wrong package
+name, which is why the tool goes physical -> compression block -> logical -> chunk and its
+registered self-test pins exactly that step.
+
+### Residency is not activation — this title front-loads, and the naive form of the oracle fires on a menu
+
+**Do not test "did the guest read a `Map/Product/World/**.umap`".** Measured 2026-08-20 over an
+800-sample run: this title reads `Title_PL.umap` at 2 s and then a cluster of
+`Map/Product/World/Field/F001/T001/Modern/T001_M_Env_*`, `T001_M_Gmk_GOut`, `T001_M_PartyTalk_GIns`
+and `F001_M_Monster_Random_GOut` at **57-58 s** — while the player is still on the
+adventure-log/slot-selection screen, roughly ten minutes before any world is entered. Two more
+World maps (`D048_M_PL`, `C001_T_M_Npc_GIns`) are read at **0.0 s**, before the title map. A
+membership test would have reported "gameplay" on a run that never left the menus, which is exactly
+the failure the oracle exists to prevent.
+
+**The form that discriminates is the phase profile, not the membership.** Bytes read per minute,
+resolved to the top-level content directory, separate the two states by two orders of magnitude:
+
+| window | Environment | Character | Map/Product | UserInterface |
+| --- | --- | --- | --- | --- |
+| 0-60 s (boot + front-load) | 133 MB | 118 MB | 11.6 MB | 331 MB |
+| 360-420 s (first-run setup menus) | 0.25 MB | 5.1 MB | **0 MB** | 0 MB |
+| 600-660 s (entering the world) | **285 MB** | **109 MB** | **9.8 MB** | 4.9 MB |
+
+and the packages that appear *only* in the third window name the event: `T001_M_PL.umap` — the
+persistent level, as opposed to the sub-levels touched at 58 s — together with
+`World_P_Streaming.umap` and `SkitSystem/LevelSequence/CS_CP1_001_010/CS_CP1_001_010_GEvt.umap`,
+the opening chapter's cutscene sequence.
+
+So on a front-loading Unreal title the oracle answers **"which package the engine opened, and
+when"**, and the gameplay claim rests on the *when* plus the volume, never on the set. On a title
+that streams on demand the membership form is enough — that is what made it decisive on
+`PPSA19244`. Check which kind of title you have before quoting it.
+
+## 2026-08-20: the route reaches the opening chapter in Estard, and the game writes a save
+
+**Two independent runs on a branch off `82baa409`**, Linux, AMD Radeon 8060S (RADV STRIX_HALO),
+native 3840x2160 through `tools/screenshot`, UE4 recipe, native cadence, isolated `PROSPER_SAVE0`
+and `PROSPER_SAVEDATA_DIR`, `PROSPER_FILELOG=1`. Run A 800/800 samples in 802 s
+(`stop=request-satisfied guest=running status=ok`); run B 1400 samples with the route steered live
+through `PROSPER_PAD_SCRIPT_RELOAD=1`. Both reach the same content state.
+
+| what | run A | run B |
+| --- | --- | --- |
+| title screen | 34 s | 76 s |
+| slot list, `1: Unused` | 63 s | 124 s |
+| player-name keyboard | 84 s | 144 s |
+| name accepted, System Settings 1/4 | 369 s | 299 s |
+| "Adventure log successfully created." | 622 s | 428 s |
+| `GameSaveData000.dat` written | 127,224 B | 127,224 B |
+| `T001_M_PL.umap` + `CS_CP1_001_010_GEvt.umap` loaded | 650.7 s | 443.1 s |
+| first 3D world frames | 662 s | 451 s |
+
+**What is established.** The guest creates a real adventure log — `GameSaveData000.dat`, byte-count
+identical across the two runs, alongside the `SystemSaveData999`/`LanguageSaveData998` that the
+title screen alone produces — then loads Estard's persistent level and the chapter-1 level sequence
+and renders the world: the coastal cliffs, the shrine interior with its standing stones, the harbour
+with its moored boat and palms, a night sky with a correctly rendered moon and stars. The opening
+chapter's script runs: named-character dialogue boxes ("Maribel"), and story lines including
+*"Right, that's enough for one day. Time for me to head back to the castle..."* and *"There's more
+to the world than this island... And we're going to prove it!"*
+
+**What is NOT established: free player control.** Both runs stay inside the scripted opening —
+cinematic letterbox bars are present on most world frames, and a long-window control probe
+(30 s of full left-stick deflection against 30 s neutral, repeated, with confirms confined to the
+neutral gaps) did not produce a clean separation, because by that point the composite had degraded
+to mostly uniform frames and the measurement had nothing to measure. **So this is progress past
+rung 2 without a demonstrated rung 3**; whoever picks this up next should aim the probe at the
+first frames after the chapter script hands over, not at an arbitrary later window.
+
+**Run B ended in a guest fault (#2778).** Its primary thread SIGSEGVs on a null address
+(`rip=0x5c00048e0 addr=0x0`, `rbp == rsp`) at roughly **965 s**, about 530 s after the level load
+and well into the chapter; presentation freezes on one frame from sample 945. Run A's clean
+`guest=running` finish is **not** a negative arm — its 800-sample budget ran out at 802 s, before
+the moment where run B died. A reproduction needs a run of at least ~1100 s.
+
+**The composite is severely degraded throughout the world phase, and it gets worse as the chapter
+runs.** Over run A's world window, 98 of 140 samples carry structured content, 15 are near-white and
+0 near-black; over run B's later window (610-860) it is 99 structured, 19 near-white and **78
+near-black**. Surfaces render as flat black silhouettes or as rainbow-checkerboard noise, water and
+sand read as saturated orange, and whole frames flash uniform white or blue. That is #1486 and
+#1588 in the world rather than in the menus; none of it blocks the progression above, and all of it
+needs its own investigation.
+
 ## Reproduction recipe
 
 Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with unique
@@ -525,6 +651,15 @@ Re-run the same command, discard any run that fails the acceptance rule, and com
 invariants. A change in frames, draws or wave64 skips is **not** evidence of anything on its own.
 
 ## Ruled out — eliminated, do not re-run these
+
+- **"Reading a `Map/Product/World/**.umap` package means the run reached the world."** **Falsified
+  2026-08-20** over two runs: two World maps are read at **0.0 s**, before the title map, and the
+  whole Estard sub-level cluster at **57-58 s**, while the run is still on the save-slot screen and
+  roughly ten minutes before the world is entered. This title front-loads, so package *residency* is
+  not *activation* and the membership form of the oracle reports gameplay on a menu. The form that
+  discriminates — bytes per minute by content directory, plus the persistent level and the
+  level-sequence package appearing only in the load window — and the derivation are in
+  *Residency is not activation* above. #1874, #2779.
 
 - **"Every compute program this title dispatches executes."** **Falsified 2026-08-19 on `2703a6c3`.**
   A `reach-title-screen.pad` arm through `tools/screenshot` (60/60 samples at 3840x2160, 301 s,

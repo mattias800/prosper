@@ -128,6 +128,14 @@ if(Python3_Interpreter_FOUND)
                    "$<TARGET_FILE:self_dump>")
   add_test(NAME re_xref_decoder
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+  # iostore_index turns a .ucas read offset into a package name, which is the only instrument that
+  # separates "reached gameplay" from "sat on an animating menu" on an Unreal title. Its failure
+  # mode is a plausible WRONG name rather than an error, so the self-test pins the two-step
+  # physical->logical->chunk mapping on a fixture where the two offset spaces genuinely differ --
+  # a naive "physical == logical" reading passes every other check and misnames most of a stream.
+  add_test(NAME re_iostore_index
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/iostore_index.py"
+                   "--self-test")
   # worktree_reclaim deletes directories, so its tests are mutation arms first: each builds a tree
   # that MUST NOT be removed (dirty, untracked-only, unmerged, held by a live process, recently
   # touched, locked, nested) and asserts both the refusal and which guard produced it. It also
