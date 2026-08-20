@@ -38,7 +38,9 @@ So the checks here are arranged so that each one can actually fail:
        (b) the regions, concatenated in index order, must equal the original bytes, which are
            hashed before anything is deleted. This one is independent of the outputs: it establishes
            that the map tiles the original exactly, so no source line is unaccounted for.
-     Together they mean no BYTES were lost. They do not mean the result COMPILES: brace balance
+     Together with check 3 (the partition) they mean no BYTES were lost -- check 5 alone does
+     not, since (a) is self-referential and (b) says nothing about the outputs. They do not
+     mean the result COMPILES: brace balance
      depends on which regions went where, and only the compiler establishes that. An earlier
      docstring here claimed this check "would have caught the unbalanced braces" that the rejected
      version shipped. It would not have. The build is what catches those, and the tool says so at

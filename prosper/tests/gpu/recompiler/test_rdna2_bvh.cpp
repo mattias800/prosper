@@ -1,21 +1,16 @@
-// test_rdna2_bvh.cpp -- the IMAGE_BVH_INTERSECT_RAY assertions, moved verbatim out of
-// test_rdna2_to_spirv.cpp's main(). The block was self-contained: it referenced no
-// declaration from main's scope, which is what made it movable without a rewrite.
+// test_rdna2_bvh.cpp -- the IMAGE_BVH_INTERSECT_RAY assertions, moved VERBATIM out of
+// test_rdna2_to_spirv.cpp's main(). The block was self-contained: it referenced no declaration from
+// main's scope, which is what made it movable without a rewrite.
 //
-// The invariant that makes this safe is the executed-assertion count. main() prints it and
-// refuses to pass below a floor, so a block that failed to arrive here would fail the test
-// rather than quietly shrink it. It was 1068 before this move and must be 1068 after.
-// test_rdna2_to_spirv — the payoff: recompile REAL RDNA2 instructions to SPIR-V and prove the
-// result is numerically correct by execution (verification layer 4, end to end). We recompile a
-// straight-line float-VALU kernel (assembled by llvm-mc for gfx1030), run it on real Vulkan compute
-// with known per-invocation inputs, and assert the outputs equal what the RDNA2 ops compute.
+// The invariant that makes the move checkable is the executed-assertion count. main() records the
+// count before calling run_bvh_checks() and requires the delta to be exactly 8, so a block that
+// failed to arrive fails the test instead of quietly shrinking the suite. Verified by mutation: an
+// empty run_bvh_checks() exits 1 with "contributed 0 checks, expected 8".
 //
-// Kernel (v0..v3 = 4 inputs per invocation):
-//   v_add_f32 v0, v0, v1      ; v0 = a0 + a1
-//   v_mul_f32 v0, v0, v2      ; v0 = (a0+a1) * a2
-//   v_fma_f32 v0, v0, v3, v1  ; v0 = v0*a3 + a1
-//   s_endpgm
-// => out = ((a0+a1)*a2)*a3 + a1
+// The declarations below this comment are the original file's preamble, replicated so this
+// translation unit compiles. Most of it is unused here and is kept identical rather than pruned,
+// so the two files' shared prologue stays comparable.
+
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"
@@ -438,4 +433,3 @@ void run_bvh_checks() {
         CHECK(!tri_module.empty() && tri_ok,
               "64-byte IMAGE_BVH_INTERSECT_RAY type-1 triangle returns its exact t numerator");
     }
-

@@ -12596,18 +12596,27 @@ int main() {
     // first fixture intersects child 0 of an FP32 box node and misses the other three. The second
     // uses triangle node type 1 (V1,V3,V2), which catches the compressed-pair vertex mapping as well
     // as the mode-1 numerator/denominator result contract.
+    // Assert what the MOVED BLOCK contributes, not what the whole file totals. A global floor
+    // fails both ways, and this one did: set from a machine whose subgroup size is 32, it read
+    // 1068 and rejected CI's subgroup-8 host at 1044, where 24 capability-gated assertions
+    // legitimately do not run -- while being useless for its actual purpose, since the block is
+    // exactly 8 checks and `1068 - 8 < 1060` is false. A relink against an empty run_bvh_checks()
+    // passed at 1060, green, which is precisely the loss the guard was added to catch.
+    //
+    // The block's own delta has neither problem: all 8 of its checks are unconditional, so the
+    // number is the same on every host, and it goes to zero the moment the block stops running.
+    const int before_bvh = checks;
     run_bvh_checks();
-
-    if (fails) { printf("== FAIL: %d of %d checks ==\n", fails, checks); return 1; }
-    // A FLOOR, because the counter alone does not close the hole it was added for: printing a
-    // smaller number still exits 0, and ctest reads the exit code. 1068 assertions run today; the
-    // floor sits just under that, so deleting a block -- or losing one while breaking this file
-    // apart -- fails the test instead of quietly shrinking it. Raise it when the count grows.
-    if (checks < 1060) {
-        printf("== FAIL: only %d checks ran, expected at least 1060 -- assertions went missing ==\n",
-               checks);
+    if (checks - before_bvh != 8) {
+        printf("== FAIL: the BVH block contributed %d checks, expected 8 -- it did not run ==\n",
+               checks - before_bvh);
         return 1;
     }
+
+    if (fails) { printf("== FAIL: %d of %d checks ==\n", fails, checks); return 1; }
+    // NOTE: there is deliberately no global floor on `checks`. The count is host-dependent --
+    // subgroup size gates 24 of these assertions -- so any single number is either wrong on some
+    // machine or too low to detect anything. Per-block deltas are the guard; see the BVH call above.
     printf("== PASS: %d checks ==\n", checks);
     return 0;
 }

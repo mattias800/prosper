@@ -65,15 +65,21 @@ ALREADY_LINKED = ("inline", "constexpr", "template", "//", "/*", "*")
 
 
 def needs_inline(region: dict, decl_text: str) -> bool:
-    """A promoted function DEFINITION needs `inline` once more than one TU includes the header.
+    """A promoted function DEFINITION needs `inline`, and a promoted `static` one needs it MORE.
 
-    This is the one edit the promotion makes to the code itself, and it is forced: a function that
-    had internal linkage inside `namespace { }` acquires external linkage in a named one, so every
-    translation unit including the header would emit its own definition and the link would fail with
-    duplicate symbols. `static` and `constexpr` already carry the right linkage and are left alone.
+    Two distinct reasons, and the second was learned from an ODR violation this tool shipped:
 
-    It does NOT apply to struct or enum declarations, or to member functions defined inside a class
-    body -- those are already implicitly inline.
+    * A function that had internal linkage inside `namespace { }` acquires external linkage in a
+      named one, so every translation unit including the header emits its own definition and the
+      link fails on duplicate symbols.
+    * A `static` definition in a header avoids that and has a worse problem. Each TU gets its own
+      copy, so the moment an `inline` function in the same header odr-uses it the program is
+      ill-formed, no diagnostic required. `static` is therefore CONVERTED to `inline` -- the
+      opposite of the policy this function originally implemented, which was correct for a .cpp and
+      wrong for a .hpp.
+
+    `constexpr` already implies inline. Struct and enum declarations need nothing, and member
+    functions defined inside a class body are implicitly inline.
     """
     if region["kind"] not in ("FUNCTION_DECL", "FUNCTION_TEMPLATE"):
         return False
@@ -158,29 +164,38 @@ def verify(original: str, map_data: dict, promote: list[int], header_text: str,
         r = regions[i]
         text = "".join(lines[r["start"] - 1:r["end"]])
         spans.append(text)
-        if text not in header_text:
-            # The only permitted difference is one `inline ` inserted at the declaration line.
-            decl_offset = r["decl_line"] - r["start"]
-            body = text.splitlines(keepends=True)
-            if 0 <= decl_offset < len(body):
-                line = body[decl_offset]
-                stripped = line.lstrip()
-                indent = line[:len(line) - len(stripped)]
-                for candidate in ("inline " + line,
-                                  indent + "inline " + stripped[len("static "):]
-                                  if stripped.startswith("static ") else None):
-                    if candidate is None:
-                        continue
-                    probe = list(body)
-                    probe[decl_offset] = candidate
-                    if "".join(probe) in header_text:
-                        break
-                else:
-                    problems.append(f"region {i} ({r['name']}) is not present in the header, "
-                                    f"verbatim or with a single inline adjustment")
+
+        # ORDER MATTERS. When a region's declaration is its first line, the verbatim text is a
+        # SUBSTRING of the adjusted text ("int f()" inside "inline int f()"), so testing for the
+        # verbatim form first reports a correctly-adjusted header as unchanged. Look for the
+        # adjusted form first, then decide what a verbatim match means.
+        body = text.splitlines(keepends=True)
+        decl_offset = r["decl_line"] - r["start"]
+        adjusted: list[str] = []
+        if 0 <= decl_offset < len(body) and needs_inline(r, body[decl_offset]):
+            line = body[decl_offset]
+            stripped = line.lstrip()
+            indent = line[:len(line) - len(stripped)]
+            variant = (indent + "inline " + stripped[len("static "):]
+                       if stripped.startswith("static ") else "inline " + line)
+            probe = list(body)
+            probe[decl_offset] = variant
+            adjusted.append("".join(probe))
+
+        if adjusted:
+            if any(a in header_text for a in adjusted):
                 continue
-            problems.append(f"region {i} ({r['name']}) is not present in the header, verbatim or "
-                            f"with a single inserted `inline`")
+            # The tool should have adjusted this and the header does not show it. Naming the
+            # unchanged case specifically matters: that is what a `static` free function looks like
+            # after being left alone in a header, odr-used by an inline caller.
+            problems.append(f"region {i} ({r['name']}) needed an `inline` adjustment and the header "
+                            f"does not have it" +
+                            (" -- it is present unchanged" if text in header_text
+                             else " -- it is not present at all"))
+            continue
+        if text not in header_text:
+            problems.append(f"region {i} ({r['name']}) is not present verbatim in the header")
+
     # The source must be the original with exactly those spans removed, plus one include line.
     rebuilt = new_source.replace(f'#include "{header_rel}"\n', "", 1)
     expected = original
@@ -255,6 +270,19 @@ def selftest() -> int:
     check("void user()" in src, "unpromoted code stays put")
     check(not verify(SELF_SRC, SELF_MAP, [3, 4], hdr, src, "s_internal.hpp"),
           "verification passes on a correct promotion")
+
+    # the static -> inline conversion, and the must-fail arm that makes the new policy checkable
+    static_map = json.loads(json.dumps(SELF_MAP))
+    static_src = SELF_SRC.replace("int helper() { return 1; }", "static int helper() { return 1; }")
+    hdr_s, src_s, _inl = build(static_map, static_src, [3, 4], "s_internal.hpp", "ns", "// n\n",
+                               "s_internal.hpp")
+    check("inline int helper()" in hdr_s, "a promoted `static` definition is CONVERTED to inline")
+    check("static int helper()" not in hdr_s and "inline static" not in hdr_s,
+          "the keyword is replaced, not prefixed -- `inline static` keeps the internal linkage")
+    check(verify(static_src, static_map, [3, 4],
+                 hdr_s.replace("inline int helper()", "static int helper()"), src_s,
+                 "s_internal.hpp"),
+          "verification FAILS on a header that kept `static`, so the guard sees its own regression")
 
     # must-fail: verification has to notice a header that dropped something
     check(verify(SELF_SRC, SELF_MAP, [3, 4], hdr.replace("int helper() { return 1; }", ""),
