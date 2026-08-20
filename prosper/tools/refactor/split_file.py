@@ -128,7 +128,7 @@ def split(map_data: dict, plan: dict[str, list[int]], source_text: str,
     problems = check_structure(regions, len(lines))
 
     replicated = [r for r in regions if r.get("role") in REPLICATED_ROLES]
-    bodies = {r["index"] for r in regions if r.get("role") not in ("open", "close")}
+    bodies = {r["index"] for r in regions if r.get("role") not in REPLICATED_ROLES}
     replicated_idx = {r["index"] for r in replicated}
 
     seen: dict[int, str] = {}
@@ -371,7 +371,11 @@ def main() -> int:
     print(f"  [ok]   reconstruction: {len(on_disk)} file(s) read back from disk rebuild the "
           f"original {len(original)} bytes exactly")
 
-    subprocess.run(["git", "rm", "-q", str(source.relative_to(root))], cwd=root, check=True)
+    # One output usually KEEPS the original's name -- a split is "this file, minus what moved out".
+    # Removing the source then would delete the file just written, so the rm applies only when the
+    # original name is genuinely absent from the plan.
+    if not any((source.parent / o).resolve() == source.resolve() for o in plan):
+        subprocess.run(["git", "rm", "-q", str(source.relative_to(root))], cwd=root, check=True)
     subprocess.run(["git", "add"] + [str((source.parent / o).relative_to(root)) for o in plan],
                    cwd=root, check=True)
     print("  now BUILD and run ctest; this tool does not verify its own work")

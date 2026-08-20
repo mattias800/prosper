@@ -291,12 +291,17 @@ def main() -> int:
     # the tool ran for no reason and said so approvingly.
     internal = [i for i in promote if anon.get(i)]
     external = [i for i in promote if not anon.get(i)]
-    if not internal:
-        print("  [FAIL] no region in this set has internal linkage; there is nothing to promote "
-              "and this would report success for doing nothing")
+    # An earlier version of this guard refused a set with no internal-linkage regions, reasoning
+    # that promoting an already-external one is "a no-op reported as success". That is wrong, and it
+    # blocked a legitimate use: moving an external definition into a header is not a no-op -- it
+    # changes which translation units can see it, which is the entire point once a second .cpp needs
+    # the same helper. The only genuinely empty case is an empty set.
+    if not promote:
+        print("  [FAIL] nothing to promote")
         return 1
     print(f"  [ok]   {len(internal)} region(s) change linkage (internal -> external); "
-          f"{len(external)} move only because the header sits above their definitions")
+          f"{len(external)} were already external and move so a second translation unit can see "
+          f"them, or because the header sits above their definitions")
     if external:
         for i in sorted(external):
             print(f"           moved for ordering: {regions[i]['kind']:<16s} {regions[i]['name']}")

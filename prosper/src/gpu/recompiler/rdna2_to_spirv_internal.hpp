@@ -4489,4 +4489,12 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
     }, vopc_b32_write || vop3_b32_mask);
 }
 
+// emit_alu lives in rdna2_emit_alu.cpp -- 7,676 lines of instruction-family translation that is
+// the single largest thing in the recompiler. Its callers stayed behind, so the declaration lives
+// here. The DEFAULT ARGUMENTS are stated here and nowhere else: C++ permits them once per scope,
+// so the definition carries the same parameters without them.
+bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
+              const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false,
+              const ShaderResourceTable* rt = nullptr, bool allow_wave = false);
+
 }  // namespace prosper::gpu
