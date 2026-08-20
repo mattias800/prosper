@@ -10,8 +10,11 @@ Where a decoded draw or dispatch becomes real GPU work.
   see a descriptor channel.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `mb3_freelist` — answers "is this guest pointer a free MallocBinned3 block". **Its callers are
-  elsewhere**: `pm4/command_processor.cpp`, `hle/hle_kernel.cpp`, `hle/hle_agc.cpp`,
-  `hle/dispatch.cpp`, `host/exec_image_linux.cpp` — `gpu_executor.cpp` does not reference it. So
+  elsewhere**: `pm4/command_processor.cpp`, `hle/hle_kernel.cpp`, `hle/hle_agc.cpp` and
+  `host/exec_image_linux.cpp` (the last through the weak `prosper_mb3_is_pool_candidate`) —
+  `gpu_executor.cpp` does not reference it. Note `hle/dispatch.cpp` is **not** a caller: its only
+  `mb3` token is `g_mb3_arm_hook`, the `PROSPER_MB3WATCH` write-watch hook, which is a different
+  mechanism and catches a loose `mb3_` grep. So
   its placement here is historical rather than a coupling claim, and it is a candidate for moving.
 
 The const-fold is the part most often mistaken for absent. It resolves descriptors loaded with

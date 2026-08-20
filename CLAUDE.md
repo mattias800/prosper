@@ -303,8 +303,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     Why this is spelled out rather than left to the sweeper: measured 2026-08-20, **49 registered
     worktrees**, from which `worktree_reclaim.py` could reclaim exactly **one** — blocked on **35
     trees classified DIRTY**, i.e. holding uncommitted or untracked files. Disk, and note the
-    scoping: **101 GB under `.claude/worktrees/`**, plus **13 registered trees living outside that
-    subtree** carrying roughly 33 GB more, so about **141 GB** in total. Automation cannot
+    scoping: `du` reports **101 GiB under `.claude/worktrees/`**, and **13 registered trees live
+    outside that subtree** carrying roughly 33 GB more — so the total is well over 100 GB either way,
+    which is the point. (Do not add the two figures as printed: one is binary and one decimal.) Automation cannot
     fix that and never will, because refusing a dirty tree is the guard that stops it destroying
     someone's work. **So commit, stash or discard before you leave a tree**, or you are the only one
     who will ever be able to clean it up.
