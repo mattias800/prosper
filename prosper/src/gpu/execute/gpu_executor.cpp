@@ -8451,7 +8451,13 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     const char* enabled = getenv("PROSPER_COMPUTELOG");
     const char* dim_env = getenv("PROSPER_COMPUTELOG_DIM");
-    if ((!enabled || !*enabled) && (!dim_env || !*dim_env)) return;
+    // PROSPER_SRTDUMP arms only the shader-resource-table dump below. It needs the same per-dispatch
+    // walk, but not COMPUTELOG's per-dispatch prose: COMPUTELOG on this title's gameplay route
+    // produces a log measured in gigabytes, and the SRT question needs 1,074 lines of the 96,557
+    // registrations. Separating the switches keeps the run small enough to read.
+    const char* srt_env = getenv("PROSPER_SRTDUMP");
+    const bool srt_only = srt_env && *srt_env;
+    if ((!enabled || !*enabled) && (!dim_env || !*dim_env) && !srt_only) return;
 
     uint32_t want_w = 0, want_h = 0;
     if (dim_env && *dim_env && sscanf(dim_env, "%ux%u", &want_w, &want_h) != 2) {
@@ -8489,6 +8495,53 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
             read_user_sgprs(ds.sh, P::COMPUTE_USER_DATA_0 + range_start, sgprs);
             table = build_shader_resources(*hdr, sgprs, kUserSgprs, 0);
             assign_convention_bindings(table, 2);
+
+            // SRT CONTENTS. `srt_size_dw` is the one user-data field prosper parses and never
+            // resolves: build_shader_resources reads sharps and the EUD and has no
+            // shader-resource-table path at all (#2705). The GTA V compute programs that hang the
+            // GPU each declare an SRT while declaring NO sharps and no EUD, so both implemented
+            // paths have nothing to resolve for them -- everything they need is described by a field
+            // that is only ever printed.
+            //
+            // Deciding that needs the table's own bytes, and nothing dumps them. This does, and
+            // deliberately dumps CANDIDATES rather than naming one pointer as the SRT: its position
+            // in the user-data block is not established, and a diagnostic that picks one and labels
+            // it "the SRT" would manufacture the fact it exists to measure. Every readable dword
+            // pair in the window is shown with the first `srt_size_dw` dwords behind it. Whichever
+            // holds descriptors will be evident; if none does, that is equally the answer.
+            if (const AgcShaderUserData* ud = hdr->user_data;
+                    srt_env && *srt_env && ud && ud->srt_size_dw) {
+                const uint32_t want = ud->srt_size_dw;
+                const uint32_t shown = want < 64 ? want : 64;   // srt_size_dw is a uint16
+                fprintf(stderr, "[srtdump] code=0x%llx srt_size_dw=%u (showing %u) "
+                                "sharps={%u,%u,%u,%u} eud=%u\n",
+                        (unsigned long long)code_addr, want, shown,
+                        ud->sharp_resource_count[0], ud->sharp_resource_count[1],
+                        ud->sharp_resource_count[2], ud->sharp_resource_count[3], ud->eud_size_dw);
+                bool any = false;
+                for (uint32_t k = 0; k + 1 < kUserSgprs; k++) {
+                    const uint64_t raw = (uint64_t)sgprs[k] | ((uint64_t)sgprs[k + 1] << 32);
+                    if (raw <= 0x10000) continue;
+                    uint64_t addr = 0;
+                    for (uint64_t mask : {~uint64_t{0}, uint64_t{0xFFFFFFFFFFFF},
+                                          uint64_t{0xFFFFFFFFFF}}) {
+                        const uint64_t cand = raw & mask;
+                        if (cand > 0x10000 && guest_readable(cand, shown * 4u)) { addr = cand; break; }
+                    }
+                    if (!addr) continue;
+                    any = true;
+                    fprintf(stderr, "[srtdump]   dw%u -> 0x%llx:", k, (unsigned long long)addr);
+                    const uint32_t* words = reinterpret_cast<const uint32_t*>(addr);
+                    uint32_t nonzero = 0;
+                    for (uint32_t w = 0; w < shown; w++) {
+                        fprintf(stderr, " %08x", words[w]);
+                        nonzero += words[w] != 0;
+                    }
+                    fprintf(stderr, "  (nz=%u/%u)\n", nonzero, shown);
+                }
+                if (!any)
+                    fprintf(stderr, "[srtdump]   no readable pointer in the user-data window\n");
+            }
         }
 
         // A compute shader can carry only an inline direct type-1 V# and no sharp descriptors. Dump
