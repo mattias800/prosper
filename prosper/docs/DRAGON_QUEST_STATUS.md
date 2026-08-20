@@ -148,6 +148,12 @@ to mostly uniform frames and the measurement had nothing to measure. **So this i
 rung 2 without a demonstrated rung 3**; whoever picks this up next should aim the probe at the
 first frames after the chapter script hands over, not at an arbitrary later window.
 
+**Run B ended in a guest fault (#2778).** Its primary thread SIGSEGVs on a null address
+(`rip=0x5c00048e0 addr=0x0`, `rbp == rsp`) at roughly **965 s**, about 530 s after the level load
+and well into the chapter; presentation freezes on one frame from sample 945. Run A's clean
+`guest=running` finish is **not** a negative arm — its 800-sample budget ran out at 802 s, before
+the moment where run B died. A reproduction needs a run of at least ~1100 s.
+
 **The composite is severely degraded throughout the world phase, and it gets worse as the chapter
 runs.** Over run A's world window, 98 of 140 samples carry structured content, 15 are near-white and
 0 near-black; over run B's later window (610-860) it is 99 structured, 19 near-white and **78
