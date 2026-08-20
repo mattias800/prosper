@@ -6,7 +6,7 @@
 // On a case-INSENSITIVE filesystem (NTFS / default APFS) the wrong-case probes below open the real
 // file directly, so resolution legitimately returns the input unchanged — both outcomes are accepted
 // where they are equivalent, and the "present either way" checks are the cross-platform contract.
-#include "../src/host/boot_program.hpp"
+#include "host/image/boot_program.hpp"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>

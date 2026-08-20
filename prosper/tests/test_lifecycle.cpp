@@ -1,6 +1,6 @@
-// test_lifecycle — the cooperative stop signal (src/host/lifecycle.hpp) a long-running frontend
+// test_lifecycle — the cooperative stop signal (src/host/platform/lifecycle.hpp) a long-running frontend
 // uses to wind the guest run-loop down on window-close. Pure, no deps.
-#include "../src/host/lifecycle.hpp"
+#include "host/platform/lifecycle.hpp"
 #include <cstdio>
 #include <thread>
 #include <atomic>

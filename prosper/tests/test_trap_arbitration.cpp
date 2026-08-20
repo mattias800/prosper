@@ -38,7 +38,7 @@
 #include <cstring>
 #include <string>
 
-#include "../src/host/trap_arbitration.hpp"
+#include "host/fault/trap_arbitration.hpp"
 
 #if defined(__linux__)
 
@@ -53,7 +53,7 @@
 #include <ucontext.h>
 #include <unistd.h>
 
-#include "../src/host/posix_shim.hpp"   // PROSPER_GREGS + the REG_* indices
+#include "host/platform/posix_shim.hpp"   // PROSPER_GREGS + the REG_* indices
 
 namespace {
 

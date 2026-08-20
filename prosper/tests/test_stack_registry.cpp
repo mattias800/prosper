@@ -1,7 +1,7 @@
 // test_stack_registry — guards the per-thread stack registry that scePthreadAttrGet /
 // GC_get_stack_base rely on (and that the k_pthread_create trampoline populates). A regression
 // here reintroduces "Bad stack base in GC_register_my_thread" during the boot.
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>

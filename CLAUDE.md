@@ -443,7 +443,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
   - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
     initial-exec TLS is **enabled by default** there; the environment variable actually read is the
-    **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/guest_tls.cpp:58`,
+    **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/tls/guest_tls.cpp:58`,
     `:240`; `src/hle/dispatch/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
     platforms — setting it is harmless but does nothing, and *believing* it is required is not: it
     turns a default-on path into one people think they are enabling, so nobody checks it when a guest

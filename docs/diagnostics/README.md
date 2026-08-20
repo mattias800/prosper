@@ -92,7 +92,7 @@ Run with: `ctest --test-dir build -R diagnostics`
 
 ## Integration Point
 
-The **only modification to existing code** is in `src/host/boot_program.cpp`, which includes `diagnostics/diagnostics.hpp` and calls `record_boot_phase()` at each boot milestone. When diagnostics are disabled, these calls are inlined no-ops with zero runtime cost.
+The **only modification to existing code** is in `src/host/image/boot_program.cpp`, which includes `diagnostics/diagnostics.hpp` and calls `record_boot_phase()` at each boot milestone. When diagnostics are disabled, these calls are inlined no-ops with zero runtime cost.
 
 ## Design Principles
 

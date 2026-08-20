@@ -13,7 +13,7 @@
 // the regression guard for #1286: revert the ime_deliver swap and the handler observes the host %fs.
 // The %fs swap is Linux-only (Windows/macOS never swap hardware %fs at the import boundary), so the
 // test is a no-op pass elsewhere.
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/input/ime_input.hpp"
 

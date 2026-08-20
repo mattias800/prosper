@@ -37,7 +37,7 @@
 // rows as missing. Either way the test fails; it cannot pass.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 
 #include <atomic>
 #include <chrono>

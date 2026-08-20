@@ -6,7 +6,7 @@
 // sceAudioOutOutput has on real hardware (it blocks until the audio ring has room).
 #include "audio_sdl3.hpp"
 #include "hle/audio/audio.hpp"
-#include "../../src/host/lifecycle.hpp"
+#include "host/platform/lifecycle.hpp"
 
 #include <SDL3/SDL.h>
 

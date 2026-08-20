@@ -29,7 +29,7 @@
 // on macOS. posix_shim.hpp's Darwin branch already pulls in <sys/ucontext.h>, which is where
 // ucontext_t/mcontext_t come from there.
 
-#include "posix_shim.hpp"   // PROSPER_GREGS + the REG_* indices (Linux gregs[] / Darwin __ss)
+#include "host/platform/posix_shim.hpp"   // PROSPER_GREGS + the REG_* indices (Linux gregs[] / Darwin __ss)
 
 namespace prosper::host {
 

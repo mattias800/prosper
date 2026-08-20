@@ -8,7 +8,7 @@ partial `_WIN32` compilation of the pure subsystems.*
 prosper has two independent porting problems, and they have different answers:
 
 1. **The OS problem** (POSIX/Linux → Win32 / Darwin / Bionic). Small and bounded: the Linux
-   coupling is concentrated in `src/host/exec_image_linux.cpp` plus a handful of HLE spots, and
+   coupling is concentrated in `src/host/image/exec_image_linux.cpp` plus a handful of HLE spots, and
    the actually-used POSIX surface is ~15 primitives. Answer: a **thin per-OS substrate**
    (`exec_image_<os>.cpp` + small shims), not Cygwin and not a full POSIX reimplementation.
 2. **The CPU problem** (x86-64 guest code on ARM hosts). prosper executes the guest's x86-64
@@ -42,7 +42,7 @@ A full sweep of the tree (2026-07-13) found the coupling is much narrower than "
 suggests:
 
 **The guest-execution substrate — the real port surface.** All of it in
-`src/host/exec_image_linux.cpp` (one 144 KB file, entirely `#ifdef __linux__`), plus
+`src/host/image/exec_image_linux.cpp` (one 144 KB file, entirely `#ifdef __linux__`), plus
 `boot_program.cpp` and `guest_tls.cpp`:
 
 - `mmap` with `MAP_FIXED` / `MAP_FIXED_NOREPLACE` at fixed guest bases (eboot `0x400000000`,
@@ -92,7 +92,7 @@ fixed guest layout. Every serious emulator on Windows (RPCS3, shadPS4, Dolphin) 
 **Not a POSIX implementation.** We don't use POSIX; we use ~15 primitives. Reimplementing POSIX
 means reimplementing the 95% nobody calls.
 
-**Yes: one cross-platform core with a thin host-substrate layer.** `src/host/exec_image.hpp` is
+**Yes: one cross-platform core with a thin host-substrate layer.** `src/host/image/exec_image.hpp` is
 already the interface and the Linux file is already named `exec_image_linux.cpp` — the seam
 exists. Add `exec_image_darwin.cpp` and `exec_image_win.cpp`, and factor four tiny shims used by
 both substrate and HLE:
@@ -259,7 +259,7 @@ The debugging toolbox (`tools/`, see `tools/AGENTS.md`) splits cleanly:
 
 The macOS x86_64/Rosetta path is now real, not theoretical:
 
-- **Substrate ported.** `src/host/posix_shim.hpp` supplies the Darwin equivalents of the ~15
+- **Substrate ported.** `src/host/platform/posix_shim.hpp` supplies the Darwin equivalents of the ~15
   Linux/glibc primitives the emulator uses (mach `process_vm_*`, `os_sync_wait_on_address` futex,
   `shm_open` memfd, `MAP_FIXED_NOREPLACE` emulation, timed locks, real semaphore/barrier, an
   indexable mcontext register view, Mach-O global-asm). `exec_image_linux.cpp`, `boot_program.cpp`,

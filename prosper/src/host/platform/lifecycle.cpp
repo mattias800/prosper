@@ -1,5 +1,5 @@
 // lifecycle.cpp — see lifecycle.hpp.
-#include "lifecycle.hpp"
+#include "host/platform/lifecycle.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <mutex>

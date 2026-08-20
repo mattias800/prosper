@@ -322,7 +322,7 @@ the same thing, and do not treat either as superseding the other until that is c
   skipped the software-breakpoint restore/step state machine, and the subject then aborted with heap
   corruption. Therefore the first pre-int3 HWBP owner record is valid, but the int3 record and every
   progression outcome are void. Tracked as #1932 and instrument trap 84. That routing defect is
-  now fixed — the handler arbitrates `SIGTRAP` through `src/host/trap_arbitration.hpp` and leaves
+  now fixed — the handler arbitrates `SIGTRAP` through `src/host/fault/trap_arbitration.hpp` and leaves
   BP's traps to BP — so the two instruments may be combined again; the records above stay void
   because they predate the fix, and re-running the arm is what would replace them.
 * The replacement account pair used **one instrument at a time** on the exact same executable.

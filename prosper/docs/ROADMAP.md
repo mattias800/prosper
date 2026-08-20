@@ -130,7 +130,7 @@ Turn the file into a resident, relocated guest image in host memory.
 ### M2 — First execution  🟢 (core done; readable names + real dispatch next)
 - [x] Real host backing: `mmap(MAP_FIXED_NOREPLACE)` maps the relocated image at
       its guest base as executable; import stub region mapped `PROT_NONE`
-      (`src/host/exec_image_linux.cpp`).
+      (`src/host/image/exec_image_linux.cpp`).
 - [x] Import trap: `SIGSEGV` handler identifies the faulting stub → `lib::NID`.
 - [x] Minimal bootstrap: SysV initial stack + `argc/argv` block; jump to entry.
 - [x] **Guest executes**: `eboot` crt runs and traps at its **first Sony call**

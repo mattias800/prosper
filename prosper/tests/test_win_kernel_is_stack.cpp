@@ -1,7 +1,7 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <windows.h>

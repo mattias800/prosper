@@ -1,5 +1,5 @@
-#include "host/guest_write_watch.hpp"
-#include "host/exec_image.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>

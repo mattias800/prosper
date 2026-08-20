@@ -17,10 +17,10 @@
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
-#include "host/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle/sync/sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
-#include "host/guest_memory_map.hpp"
-#include "host/guest_write_watch.hpp"
+#include "host/memory/guest_memory_map.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -537,7 +537,7 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
 }  // namespace prosper — end of the shared APR completion block
 
 #if defined(__linux__) || defined(__APPLE__)
-#include "host/posix_shim.hpp"
+#include "host/platform/posix_shim.hpp"
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>   // process_vm_writev — fault-safe APR completion write (#1149)

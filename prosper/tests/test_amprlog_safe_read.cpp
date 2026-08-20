@@ -10,7 +10,7 @@
 // hle_kernel_mem.cpp, and process_vm_readv is the POSIX fault-safe primitive (Darwin via mach in
 // posix_shim.hpp). The Windows half has no equivalent diagnostic.
 
-#include "../src/host/posix_shim.hpp"   // process_vm_readv (Linux native / Darwin mach)
+#include "host/platform/posix_shim.hpp"   // process_vm_readv (Linux native / Darwin mach)
 
 #include <sys/mman.h>
 #include <sys/uio.h>

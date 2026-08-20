@@ -15,18 +15,18 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
-#include "host/boot_program.hpp"   // #1659: shared guest-module labelling
-#include "host/exec_image.hpp"      // describe_code_address (host frame naming)
-#include "host/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/image/exec_image.hpp"      // describe_code_address (host frame naming)
+#include "host/platform/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
 #include "hle/sync/pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/gpu_execute.hpp"   // gpu::guest_writable — validate guest out-pointers (#1963)
-#include "host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t
-#include "host/posix_shim.hpp"   // Darwin: sem/barrier/timedlock/getattr_np/sigqueue compat
+#include "host/platform/posix_shim.hpp"   // Darwin: sem/barrier/timedlock/getattr_np/sigqueue compat
 // raw_fmt_len: snprintf's would-be length clamped to what actually landed (#2050), used by the
 // [exc2] handler below.
 //
@@ -41,7 +41,7 @@
 //     "'guest_module_name' is not a member of 'prosper::{anonymous}::prosper'". A header that opens
 //     a namespace can only be included where that namespace means what the file expects.
 #if defined(__linux__) || defined(__APPLE__)
-#include "host/raw_syscall.hpp"
+#include "host/platform/raw_syscall.hpp"
 #endif
 #include <cerrno>
 #include <cctype>

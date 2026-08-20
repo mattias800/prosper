@@ -1,7 +1,7 @@
 // videoout_present.cpp — see videoout_present.hpp.
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
-#include "host/lifecycle.hpp"
+#include "host/platform/lifecycle.hpp"
 #include <atomic>
 #include <cstring>
 #include <cstdio>

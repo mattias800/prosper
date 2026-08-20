@@ -11,7 +11,7 @@
 //
 // The contract under test: everything in <dump>/Media/Plugins/*.prx that the caller did not already
 // name (case-insensitively) is returned, in a deterministic order, and nothing else is.
-#include "../src/host/boot_program.hpp"
+#include "host/image/boot_program.hpp"
 #include "../src/loader/linker.hpp"
 #include "test_scratch.h"
 #include <cstdio>

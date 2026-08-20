@@ -681,7 +681,7 @@ Vulkan device + display, which CI may lack).
 The chosen path was **(b): extract a shared `boot_program()` helper** both `boot_trace` and the
 frontend call, rather than duplicate the boot glue.
 
-- `src/host/boot_program.hpp/.cpp` (in `prosper_core`, Linux and Windows): links the fixed module set
+- `src/host/image/boot_program.hpp/.cpp` (in `prosper_core`, Linux and Windows): links the fixed module set
   (honoring `PROSPER_NO_PSN`, dropping absent modules), registers the built-in HLE, maps images, sets
   up TLS/unwind/procparam, installs the import stubs + trap handler, registers the PSN/SaveData
   module-start ranges, and runs the dependent-module init_arrays. An `after_hle_registered` hook lets

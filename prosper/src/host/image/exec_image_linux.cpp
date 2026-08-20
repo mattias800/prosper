@@ -1,22 +1,22 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
-#include "exec_image.hpp"
-#include "immortal.hpp"   // #2613: registries a guest thread can reach after exit()
-#include "sse4a.hpp"
-#include "x86_read_decode.hpp"
-#include "guest_write_watch.hpp"
-#include "guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
-#include "trap_arbitration.hpp"   // #1932: which instrument owns an incoming SIGTRAP
-#include "fs_emu.hpp"
-#include "raw_syscall.hpp"
-#include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
-#include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
+#include "host/image/exec_image.hpp"
+#include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
+#include "host/x86/sse4a.hpp"
+#include "host/x86/x86_read_decode.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#include "host/memory/guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
+#include "host/fault/trap_arbitration.hpp"   // #1932: which instrument owns an incoming SIGTRAP
+#include "host/tls/fs_emu.hpp"
+#include "host/platform/raw_syscall.hpp"
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
+#include "host/symbols/il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 #include "hle/dispatch/nid.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #if defined(__linux__) || defined(__APPLE__)
-#include "posix_shim.hpp"
-#include "fault_context.hpp"   // #2018: one fault's own registers, snapshotted from ITS ucontext
+#include "host/platform/posix_shim.hpp"
+#include "host/fault/fault_context.hpp"   // #2018: one fault's own registers, snapshotted from ITS ucontext
 #include <sys/mman.h>
 #include <signal.h>
 #include <setjmp.h>

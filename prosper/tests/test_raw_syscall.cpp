@@ -16,7 +16,7 @@
 // end of the buffer and handed the NEXT call `sizeof b - n` (size_t: underflows to ~2^64) at
 // `b + n` (already past the end) — an out-of-bounds write onto the signal stack. Those arms put
 // the buffer against a PROT_NONE page so an overflowing append faults the test.
-#include "../src/host/raw_syscall.hpp"
+#include "host/platform/raw_syscall.hpp"
 
 #include <cerrno>
 #include <cstdint>
@@ -88,7 +88,7 @@ static char* guard_backed(size_t cap, void** region) {
 }
 
 // The chain under test, lifted from the [mb3watch] guest-stack dump in
-// src/host/exec_image_linux.cpp: no cursor guard at all, and its append embeds a variable-length
+// src/host/image/exec_image_linux.cpp: no cursor guard at all, and its append embeds a variable-length
 // %s (guest_module_name returns names up to 25 characters), so ten captured frames format to
 // ~470 characters into 320 bytes. `cap` stands in for the `sizeof sb` of the real array; the
 // arithmetic is otherwise identical, including `cap - (size_t)sn` — which is exactly what

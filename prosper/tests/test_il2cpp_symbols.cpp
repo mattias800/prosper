@@ -12,9 +12,9 @@
 // Every assertion below is paired with a MUTATION ARM — an input differing in exactly the property
 // under test, whose expected answer differs. An arm is only worth having if no other branch of the
 // resolver could produce it, so each one names what it excludes.
-#include "host/il2cpp_symbols.hpp"
-#include "host/boot_program.hpp"
-#include "host/exec_image.hpp"   // describe_code_address: the production label being symbolicated
+#include "host/symbols/il2cpp_symbols.hpp"
+#include "host/image/boot_program.hpp"
+#include "host/image/exec_image.hpp"   // describe_code_address: the production label being symbolicated
 
 #include <cstdint>
 #include <cstdio>

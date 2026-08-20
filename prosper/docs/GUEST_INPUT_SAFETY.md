@@ -74,7 +74,7 @@ in-bounds, rule out upstream guards). All CLEAN on current master except the edg
 | Relocation-apply write path | `src/self/module.cpp` `apply_relocations` | CLEAN write path (double-bounded `img.at` + `p+8` guard); **#1219** clamped unbounded table sizes (OOM) |
 | Multi-module linker | `src/loader/linker.cpp` | CLEAN; **#1198** init-array `p+8` guard |
 | Loader bounds primitives | `src/self/module.{hpp,cpp}` | **#1198** `self_read_ok` (replaces wrap-prone `off+need<=size`) |
-| Host image map + ABI stubs | `src/host/exec_image_linux.cpp` `map_image`/`install_stubs` | CLEAN — `img.mem`-sized copy; stub region = import-count×stub_size (count clamped by #1219) |
+| Host image map + ABI stubs | `src/host/image/exec_image_linux.cpp` `map_image`/`install_stubs` | CLEAN — `img.mem`-sized copy; stub region = import-count×stub_size (count clamped by #1219) |
 | Guest memory-management HLE | `src/hle/memory/hle_kernel_mem.cpp` | CLEAN — WriteAddress fixed-8B `process_vm_writev`, VirtualQuery clamped, dmem allocator pool-bounded, every `addr+len` guarded |
 | GPU command processor / PM4 | `src/gpu/pm4/command_processor.cpp` | **#1200** SetRegsIndirect `guest_readable` guard; **#1202** WriteData null-src stale-tail `memset` |
 | GPU executor / shader decode | `src/gpu/execute/gpu_executor.cpp` | CLEAN (canonical wrap-safe form throughout); **#1210** diagnostic-dump OOB clamp |

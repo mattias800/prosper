@@ -6,7 +6,7 @@
 // rejects jumps to a lower stack and the Windows CRT tries to unwind SEH frames.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/callback_fs.hpp"
-#include "host/posix_shim.hpp"
+#include "host/platform/posix_shim.hpp"
 
 #include <atomic>
 #include <cstdlib>

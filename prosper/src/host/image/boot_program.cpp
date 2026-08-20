@@ -1,7 +1,7 @@
 // boot_program.cpp — see boot_program.hpp. Extracted verbatim from boot_trace's boot sequence
 // (behavior-preserving); backed by whichever exec_image_<os> substrate the platform provides
 // (Linux/macOS: exec_image_linux.cpp; Windows: exec_image_win.cpp).
-#include "boot_program.hpp"
+#include "host/image/boot_program.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -93,8 +93,8 @@ std::vector<std::string> discover_extra_plugin_modules(
 } // namespace prosper
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-#include "host/exec_image.hpp"
-#include "host/runtime_module_load.hpp"
+#include "host/image/exec_image.hpp"
+#include "host/image/runtime_module_load.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "self/module.hpp"     // PT_SCE_PROCPARAM
 #include <cstdio>

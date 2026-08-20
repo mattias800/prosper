@@ -21,7 +21,7 @@
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
-#include "host/guest_write_watch.hpp"
+#include "host/memory/guest_write_watch.hpp"
 
 #include <vulkan/vulkan.h>
 

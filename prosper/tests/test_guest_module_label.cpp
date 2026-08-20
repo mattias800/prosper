@@ -11,7 +11,7 @@
 // eboot+0xN" — not against whichever constant the code currently holds, so they stay meaningful if a
 // base moves again.
 
-#include "../src/host/boot_program.hpp"
+#include "host/image/boot_program.hpp"
 
 #include <cstdint>
 #include <cstdio>

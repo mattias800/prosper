@@ -1,6 +1,6 @@
 #include "gpu/execute/mb3_freelist.hpp"
 #include "gpu/execute/gpu_execute.hpp"
-#include "host/boot_program.hpp"   // #1659: BOOT_EBOOT (the real mapped base)
+#include "host/image/boot_program.hpp"   // #1659: BOOT_EBOOT (the real mapped base)
 
 #include <atomic>
 #include <cstdlib>

@@ -3,7 +3,7 @@
 // then "calls" representative slots and checks each is identified by lib::nid and returns 0.
 #include "../src/self/module.hpp"
 #include "../src/loader/linker.hpp"
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <string>

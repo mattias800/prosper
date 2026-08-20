@@ -1,5 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
-#include "host/guest_memory_map.hpp"
+#include "host/memory/guest_memory_map.hpp"
 
 #include <cstdint>
 #include <cstdio>

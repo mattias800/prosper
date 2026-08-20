@@ -6,11 +6,11 @@
 // own process, so the process-global direct-memory pool starts empty here.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
-#include "../src/host/guest_write_watch.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #ifdef _WIN32
-#include "../src/host/exec_image.hpp"
-#include "../src/host/boot_program.hpp"   // BOOT_EBOOT / BOOT_STUB: the apertures the mprotect cases use
-#include "../src/host/guest_memory_map.hpp"
+#include "host/image/exec_image.hpp"
+#include "host/image/boot_program.hpp"   // BOOT_EBOOT / BOOT_STUB: the apertures the mprotect cases use
+#include "host/memory/guest_memory_map.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include <windows.h>
 extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);

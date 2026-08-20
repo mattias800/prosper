@@ -33,7 +33,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "../src/host/fault_context.hpp"
+#include "host/fault/fault_context.hpp"
 
 using prosper::host::FaultContext;
 using prosper::host::capture_fault_context;

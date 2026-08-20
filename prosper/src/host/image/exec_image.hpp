@@ -6,7 +6,7 @@
 // the boot advances and reveals the next call. A SIGSEGV handler still catches genuine
 // guest faults (null derefs from stubbed-out returns, etc.) and reports RIP.
 #pragma once
-#include "../self/module.hpp"
+#include "self/module.hpp"
 #include "hle/dispatch/dispatch.hpp"   // ImportSlot
 #include <string>
 #include <vector>

@@ -20,9 +20,9 @@
 // assert on exactly.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
-#include "../src/host/boot_program.hpp"
-#include "../src/host/exec_image.hpp"
-#include "../src/host/runtime_module_load.hpp"
+#include "host/image/boot_program.hpp"
+#include "host/image/exec_image.hpp"
+#include "host/image/runtime_module_load.hpp"
 #include "../src/loader/linker.hpp"
 #include "test_scratch.h"
 

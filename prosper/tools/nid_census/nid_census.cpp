@@ -42,7 +42,7 @@
 // pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
 // any disagreement: the name table is the instrument this tool reads the census through, so it
 // gets a control of its own rather than being trusted.
-#include "host/boot_program.hpp"
+#include "host/image/boot_program.hpp"
 #include "../common/nid_stub_names.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"

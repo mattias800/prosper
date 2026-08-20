@@ -5,7 +5,7 @@
 // bring-up, so we run it in a forked child and measure depth via shared memory.
 #include "../src/self/module.hpp"
 #include "../src/loader/linker.hpp"
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <cstdlib>

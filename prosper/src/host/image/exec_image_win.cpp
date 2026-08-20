@@ -17,15 +17,15 @@
 #define _WIN32_WINNT 0x0A00   // GetCurrentThreadStackLimits (Windows 8+)
 #endif
 
-#include "exec_image.hpp"
-#include "immortal.hpp"   // #2613: registries a guest thread can reach after exit()
-#include "guest_write_watch.hpp"
-#include "sse4a.hpp"
-#include "x86_read_decode.hpp"
+#include "host/image/exec_image.hpp"
+#include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
+#include "host/memory/guest_write_watch.hpp"
+#include "host/x86/sse4a.hpp"
+#include "host/x86/x86_read_decode.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/dispatch/dispatch.hpp"
-#include "boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
-#include "il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling (BOOT_* bases)
+#include "host/symbols/il2cpp_symbols.hpp" // #2551: name the C# method containing an IL2CPP address
 
 #include <windows.h>
 #include <bcrypt.h>

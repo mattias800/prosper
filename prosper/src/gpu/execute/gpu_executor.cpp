@@ -21,8 +21,8 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
 #include "gpu/capture/writer_provenance.hpp"
-#include "host/guest_memory_map.hpp"
-#include "host/guest_write_watch.hpp"
+#include "host/memory/guest_memory_map.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>

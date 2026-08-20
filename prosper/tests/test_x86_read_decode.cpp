@@ -3,7 +3,7 @@
 // therefore (a) recognize exactly the forms where zeroing the FULL 64-bit dest is correct, (b) report the
 // right destination register and instruction length, and (c) REJECT every other form so the caller falls
 // through to the real fault path. A wrong length or register would silently corrupt guest state.
-#include "../src/host/x86_read_decode.hpp"
+#include "host/x86/x86_read_decode.hpp"
 
 #include <cstdint>
 #include <cstdio>

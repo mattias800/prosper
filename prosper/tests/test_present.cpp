@@ -5,7 +5,7 @@
 // plumbing end-to-end headlessly — the surface the renderer will present real frames to.
 #include "hle/dispatch/dispatch.hpp"
 #include "gpu/present/videoout_present.hpp"
-#include "../src/host/lifecycle.hpp"
+#include "host/platform/lifecycle.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdint>

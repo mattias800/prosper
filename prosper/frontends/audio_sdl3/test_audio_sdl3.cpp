@@ -5,7 +5,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/audio/audio.hpp"
-#include "../../src/host/lifecycle.hpp"
+#include "host/platform/lifecycle.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>

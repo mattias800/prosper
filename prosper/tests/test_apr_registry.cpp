@@ -20,8 +20,8 @@
 #endif
 #include "test_scratch.h"
 
-#include "../src/host/exec_image.hpp"
-#include "../src/host/guest_write_watch.hpp"
+#include "host/image/exec_image.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 

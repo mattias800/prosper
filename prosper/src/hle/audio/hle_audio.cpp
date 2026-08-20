@@ -5,14 +5,14 @@
 // prosper_core stays dependency-free; a concrete output frontend (SDL3, ...) installs itself via
 // audio_set_sink() from outside the core.
 #include "hle/dispatch/dispatch.hpp"
-#include "host/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle/dispatch/nid.hpp"
 #include "hle/audio/audio.hpp"
 #include "hle/audio/ajm_decoder.hpp"     // optional host codecs (MP3); core retains AJM ABI + guest copies
 #include "hle/audio/atrac9_decode.hpp"    // vendored LibAtrac9 glue — AJM ATRAC9 batch decode (Blasphemous 2)
 #include "hle/dispatch/callback_fs.hpp"      // recover the caller's guest %fs for firing guest callbacks
 #include <memory>
-#include "host/posix_shim.hpp" // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
+#include "host/platform/posix_shim.hpp" // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -38,7 +38,7 @@
 #endif
 #include <windows.h>
 #endif
-#include "host/posix_shim.hpp"   // Darwin: process_vm_readv/writev
+#include "host/platform/posix_shim.hpp"   // Darwin: process_vm_readv/writev
 
 namespace prosper {
 

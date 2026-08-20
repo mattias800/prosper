@@ -35,7 +35,7 @@
 #include "guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
 #include "diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
-#include "host/guest_write_watch.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>

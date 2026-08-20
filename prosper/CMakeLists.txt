@@ -534,18 +534,24 @@ if(TARGET prosper_core)
   # AMD SSE4a INSERTQ/EXTRQ emulation (the SIGILL handler emulates these Zen2-only ops on Intel
   # hosts). Golden bit-math vectors — header-only, no game dump required.
   add_executable(test_sse4a tests/test_sse4a.cpp)
+  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+  target_include_directories(test_sse4a PRIVATE src)
   add_test(NAME sse4a_insertq_extrq COMMAND test_sse4a)
 
   # macOS/Rosetta %fs trap-emulation decode core (guest-TLS access redirection). Golden
   # instruction vectors incl. the #727 no-REX AH/CH/DH/BH byte-register rules — header-only,
   # runs on Linux where the __APPLE__ handler itself never compiles.
   add_executable(test_fs_emu tests/test_fs_emu.cpp)
+  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+  target_include_directories(test_fs_emu PRIVATE src)
   add_test(NAME fs_emu_decode COMMAND test_fs_emu)
 
-  # Signal-handler-safe raw syscalls (src/host/raw_syscall.hpp): the fault_handler's
+  # Signal-handler-safe raw syscalls (src/host/platform/raw_syscall.hpp): the fault_handler's
   # PROSPER_NULL_PAGE backing must not touch errno/TLS on guest-%fs threads (issue #1071).
   if(UNIX AND NOT APPLE)
     add_executable(test_raw_syscall tests/test_raw_syscall.cpp)
+    # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+    target_include_directories(test_raw_syscall PRIVATE src)
     add_test(NAME raw_syscall COMMAND test_raw_syscall)
   endif()
 
@@ -752,6 +758,8 @@ if(TARGET prosper_core)
   # though the SDL_ShowMessageBox glue is display-only. Verifies the MsgDialog/ErrorDialog layouts.
   add_executable(test_dialog_helpers frontends/dialog_sdl3/test_dialog_helpers.cpp
                                      frontends/dialog_sdl3/dialog_helpers.cpp)
+                                     # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+                                     target_include_directories(test_dialog_helpers PRIVATE src)
   add_test(NAME dialog_helpers COMMAND test_dialog_helpers)
 
   # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
@@ -875,6 +883,8 @@ if(TARGET prosper_core)
   # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
   if(NOT WIN32)
     add_executable(test_amprlog_safe_read tests/test_amprlog_safe_read.cpp)
+    # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+    target_include_directories(test_amprlog_safe_read PRIVATE src)
     add_test(NAME amprlog_safe_read COMMAND test_amprlog_safe_read)
   endif()
 
@@ -1407,9 +1417,9 @@ if(TARGET prosper_core)
     add_executable(test_watch_mapping_generation tests/test_watch_mapping_generation.cpp)
     target_link_libraries(test_watch_mapping_generation PRIVATE prosper_core)
     target_compile_definitions(test_watch_mapping_generation PRIVATE
-      PROSPER_EXEC_IMAGE_LINUX_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/exec_image_linux.cpp"
-      PROSPER_GUEST_MEMORY_MAP_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/guest_memory_map.hpp"
-      PROSPER_GUEST_WRITE_WATCH_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/guest_write_watch.cpp")
+      PROSPER_EXEC_IMAGE_LINUX_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/image/exec_image_linux.cpp"
+      PROSPER_GUEST_MEMORY_MAP_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/memory/guest_memory_map.hpp"
+      PROSPER_GUEST_WRITE_WATCH_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/memory/guest_write_watch.cpp")
     add_test(NAME watch_mapping_generation COMMAND test_watch_mapping_generation)
   endif()
 
@@ -1426,13 +1436,15 @@ if(TARGET prosper_core)
 
   # #1932: SIGTRAP arbitration between PROSPER_HWBP/PROSPER_HWWATCH and PROSPER_BP. Linux-only --
   # the live arm opens a real per-task perf execute breakpoint and patches a real int3 into this
-  # test's own hand-assembled stubs. Links nothing: src/host/trap_arbitration.hpp is header-only,
+  # test's own hand-assembled stubs. Links nothing: src/host/fault/trap_arbitration.hpp is header-only,
   # so the decision table also builds where the handler does not. The source path is handed to the
   # wiring check, which confirms the production handler still calls the shared predicate.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_trap_arbitration tests/test_trap_arbitration.cpp)
+    # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+    target_include_directories(test_trap_arbitration PRIVATE src)
     target_compile_definitions(test_trap_arbitration PRIVATE
-      PROSPER_EXEC_IMAGE_LINUX_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/exec_image_linux.cpp")
+      PROSPER_EXEC_IMAGE_LINUX_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/host/image/exec_image_linux.cpp")
     add_test(NAME trap_arbitration COMMAND test_trap_arbitration)
   endif()
 
@@ -1614,11 +1626,15 @@ if(TARGET prosper_core)
   # x86-64 low-address READ decoder used by the Windows PROSPER_NULL_PAGE emulation. Header-only, so the
   # decode logic is verified on every platform even though the VEH caller is Windows-only.
   add_executable(test_x86_read_decode tests/test_x86_read_decode.cpp)
+  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+  target_include_directories(test_x86_read_decode PRIVATE src)
   add_test(NAME x86_read_decode COMMAND test_x86_read_decode)
 
   # #2018: a fatal worker-thread fault report must describe one fault. Header-only snapshot of the
   # handler's own siginfo/ucontext; POSIX signal contexts only (the test self-skips elsewhere).
   add_executable(test_fault_context tests/test_fault_context.cpp)
+  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
+  target_include_directories(test_fault_context PRIVATE src)
   # The contention arm spawns real threads. This target links no library, so unlike every other
   # thread-using test here it inherits -pthread from nothing; name Threads::Threads explicitly
   # (found above with prosper_core, whose existence gates this block).
@@ -1836,7 +1852,7 @@ if(TARGET prosper_core)
 
     # #2613: nothing joins guest threads at shutdown, so thread_trampoline's tail runs while the
     # process is already inside __run_exit_handlers and touches the thread-name / thread-stack / DTV
-    # registries. They must be process-lifetime (src/host/immortal.hpp), i.e. register no static
+    # registries. They must be process-lifetime (src/host/platform/immortal.hpp), i.e. register no static
     # destructor. The test parks a guest worker and drives the whole tail from an exit-time probe, so
     # the post-destruction access happens on EVERY run instead of 1-in-300 — and the probe checks the
     # two library canaries first, so a broken ordering assumption fails instead of passing vacuously.

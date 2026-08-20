@@ -3,10 +3,10 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
-#include "host/boot_program.hpp"   // #1659: shared guest-module labelling
-#include "host/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
-#include "host/runtime_module_load.hpp"   // #639: real runtime PRX loading
-#include "host/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/platform/posix_shim.hpp"     // PROSPER_ASM_TRAMPOLINE (pass entry %rsp as 7th arg)
+#include "host/image/runtime_module_load.hpp"   // #639: real runtime PRX loading
+#include "host/memory/guest_write_watch.hpp"     // flush dmem writer diagnostic before guest _Exit
 #include "hle/dispatch/callback_fs.hpp"            // recover the caller's guest %fs from the import-stub frame
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA

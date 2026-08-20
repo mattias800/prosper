@@ -1,8 +1,8 @@
-// Golden vectors for the %fs trap-emulation decode core (src/host/fs_emu.hpp) — the macOS/Rosetta
+// Golden vectors for the %fs trap-emulation decode core (src/host/tls/fs_emu.hpp) — the macOS/Rosetta
 // guest-TLS emulator's instruction semantics, unit-tested on Linux where the handler itself never
 // compiles. Includes the issue #727 regression: no-REX byte forms with reg 4-7 are AH/CH/DH/BH,
 // not SPL/BPL/SIL/DIL (`mov ah, fs:[x]` must set AH, not clobber RSP's low byte).
-#include "../src/host/fs_emu.hpp"
+#include "host/tls/fs_emu.hpp"
 #include <cstdio>
 #include <cstring>
 

@@ -60,7 +60,7 @@
 #include <unistd.h>
 
 #include "gpu/execute/gpu_execute.hpp"
-#include "host/guest_memory_map.hpp"
+#include "host/memory/guest_memory_map.hpp"
 
 // Armed by the AGC fence builder in production; called directly here because the arm's mprotect is
 // one of the thirteen protection changes the invariant covers, and the only one reachable without

@@ -1,10 +1,10 @@
 // runtime_module_load.cpp — see runtime_module_load.hpp (#639).
-#include "host/runtime_module_load.hpp"
+#include "host/image/runtime_module_load.hpp"
 
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 
-#include "host/boot_program.hpp"
-#include "host/exec_image.hpp"
+#include "host/image/boot_program.hpp"
+#include "host/image/exec_image.hpp"
 #include "loader/linker.hpp"
 #include "hle/dispatch/dispatch.hpp"
 

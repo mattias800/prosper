@@ -3,8 +3,8 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/sync/sync_futex.hpp"
-#include "../src/host/exec_image.hpp"
-#include "../src/host/sse4a.hpp"
+#include "host/image/exec_image.hpp"
+#include "host/x86/sse4a.hpp"
 #include "test_scratch.h"
 #include <pthread.h>
 #include <windows.h>

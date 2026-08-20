@@ -8,7 +8,7 @@
 > 2026. Guest TLS became **on by default** in #825 (`4fd585ac`, 2026-07-17), with
 > `PROSPER_NO_GUEST_FS=1` as the opt-out, so the reproduction recipe no longer carries it. On current
 > master the token is inert on Linux and Windows; `PROSPER_GUEST_FS` is read only on macOS/Rosetta
-> (`src/host/guest_tls.cpp:46`, inside `#ifdef __APPLE__`). See #2095.
+> (`src/host/tls/guest_tls.cpp:46`, inside `#ifdef __APPLE__`). See #2095.
 
 ## What was fixed — `sceSystemServiceParamGetString` (committed)
 

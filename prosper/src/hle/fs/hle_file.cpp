@@ -10,8 +10,8 @@
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "gpu/timeline/gpu_timeline.hpp" // optional exact guest-stdout capture gate
-#include "host/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
-#include "host/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
+#include "host/memory/guest_write_watch.hpp"   // #1144 B5: disarm texture watches before reading into guest mem
+#include "host/image/boot_program.hpp"        // #1226: resolve_host_path_case (PS5 FS namespace is case-insensitive)
 #include <cctype>        // #1237: case-insensitive PROSPER_DENY_SUBSTR matching
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +48,7 @@
 #endif
 #include <windows.h>   // ReadFile/WriteFile + OVERLAPPED for positioned IO (pread/pwrite equivalents)
 #endif
-#include "host/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
+#include "host/platform/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
 
 // #2371: a 64-bit stat, portably. MinGW's `struct stat::st_size` is FOUR BYTES and `::stat()`
 // fails outright with EOVERFLOW (errno 132) on any file larger than 2 GiB -- measured on GTA V's

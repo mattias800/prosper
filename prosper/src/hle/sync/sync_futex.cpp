@@ -12,7 +12,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #include <sys/syscall.h>
-#include "host/posix_shim.hpp"
+#include "host/platform/posix_shim.hpp"
 #elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

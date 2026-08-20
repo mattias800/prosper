@@ -12,7 +12,7 @@
 > When these runs were made it really was the Linux opt-in gate for guest `%fs` TLS — this document
 > is where that gate was introduced. Guest TLS became **on by default** in #825 (`4fd585ac`,
 > 2026-07-17), with `PROSPER_NO_GUEST_FS=1` as the opt-out. On current master the token is inert on
-> Linux and Windows; `PROSPER_GUEST_FS` is read only on macOS/Rosetta (`src/host/guest_tls.cpp:46`,
+> Linux and Windows; `PROSPER_GUEST_FS` is read only on macOS/Rosetta (`src/host/tls/guest_tls.cpp:46`,
 > inside `#ifdef __APPLE__`). Do not copy it into a new recipe (#2095).
 
 **Status:** open (the next big frontier). The GfxDevice boot wall is RESOLVED (see
@@ -381,7 +381,7 @@ divergence.
 
 ## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
 The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
-(`src/host/guest_tls.cpp` + `exec_image_linux.cpp` swap stubs, all default-off):
+(`src/host/tls/guest_tls.cpp` + `exec_image_linux.cpp` swap stubs, all default-off):
 - Give each guest thread its own **guest TCB + Variant-II static TLS** laid out below the thread pointer
   (main exe/eboot closest to TP), tdata copied + tbss zeroed, `[TP]`=self, and run guest code with
   `%fs = guest TP` (`guest_tls_activate_thread()` at `run_entry`). Total static TLS below TP = 0x6c0 bytes
@@ -445,7 +445,7 @@ Both are the recurring landmine the project beat case-by-case before (`k_tls_get
 stack-local). `-force-gfx-direct` newly runs Unity's GfxDevice/telemetry code that uses **initial-exec**
 guest TLS (direct `%fs`-relative, NOT `__tls_get_addr`), which our host-`%fs` model doesn't back.
 
-**FIXED (gated `PROSPER_GUEST_FS`, `src/host/guest_tls.cpp`).** Give each guest thread its own guest TCB
+**FIXED (gated `PROSPER_GUEST_FS`, `src/host/tls/guest_tls.cpp`).** Give each guest thread its own guest TCB
 with the modules' static TLS laid out below the thread pointer (Variant II) and run guest code with `%fs` =
 guest TP. `guest_tls_activate_thread()` is called on the main thread (as the last step before entering the
 guest, in `run_entry`) and on each worker (`thread_trampoline`). HLE import stubs (`exec_image_linux.cpp`)

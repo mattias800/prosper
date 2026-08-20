@@ -1,5 +1,5 @@
-#include "guest_write_watch.hpp"
-#include "guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
+#include "host/memory/guest_write_watch.hpp"
+#include "host/memory/guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
 
 #include <algorithm>
 #include <atomic>

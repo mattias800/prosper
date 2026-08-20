@@ -3,8 +3,8 @@
 // plus, on a fault, the register state and an rbp-chain backtrace classified by module. The primary bring-up debugging
 // tool. Linux only. Usage: boot_trace <dump-root> [--capture-first-frame [output.bmp]]
 #include "loader/linker.hpp"
-#include "host/exec_image.hpp"
-#include "host/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
+#include "host/image/exec_image.hpp"
+#include "host/image/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
 #include "first_frame_capture.hpp"         // --capture-first-frame observer (isolated)
 #include "hle/dispatch/dispatch.hpp"
 #include <cstdio>

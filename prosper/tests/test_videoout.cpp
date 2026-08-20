@@ -5,8 +5,8 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/texture/tile.hpp"              // tile/detile round trip for the flipped-buffer image
-#include "../src/host/guest_memory_map.hpp" // the registered-mapping proof for the padded read
-#include "../src/host/precise_sleep.hpp"    // #1765: which primitive WaitVblank actually waited on
+#include "host/memory/guest_memory_map.hpp" // the registered-mapping proof for the padded read
+#include "host/platform/precise_sleep.hpp"    // #1765: which primitive WaitVblank actually waited on
 #include <algorithm>
 #include <vector>
 #include <cstdio>

@@ -13,8 +13,8 @@
 #include "hle/service/platform_ui.hpp"
 #include "hle/video/video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
 #include "gpu/texture/guest_texture_layout.hpp" // exact HLE-produced sampled-linear layouts
-#include "host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
-#include "host/boot_program.hpp"  // guest_module_name: is a callback target guest code?
+#include "host/platform/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
+#include "host/image/boot_program.hpp"  // guest_module_name: is a callback target guest code?
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>

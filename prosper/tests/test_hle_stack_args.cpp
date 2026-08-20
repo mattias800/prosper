@@ -1,7 +1,7 @@
 // test_hle_stack_args - the generated import stub must preserve the guest's complete fixed-arity
 // SysV call across the host ABI boundary. Windows needs a SysV->Microsoft-x64 conversion; Linux's
 // guest-FS path interposes a call while swapping FS. Both paths must forward stack args 7-10.
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>

@@ -8,7 +8,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/state/vk_translate.hpp"
 #include "hle/dispatch/dispatch.hpp"
-#include "../src/host/guest_write_watch.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include "render_runner.h"
 #include "test_scratch.h"
 

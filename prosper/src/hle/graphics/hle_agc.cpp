@@ -9,7 +9,7 @@
 // reverse-engineered the real libSceAgc ABI. A later CommandProcessor will decode this PM4 stream to
 // Vulkan (see docs/AGC_IMPL_PLAN.md). Registered by raw NID (AGC lib is undocumented).
 #include "hle/dispatch/dispatch.hpp"
-#include "host/boot_program.hpp"   // #1659: shared guest-module labelling
+#include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/pm4/command_processor.hpp"

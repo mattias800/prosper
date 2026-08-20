@@ -8,7 +8,7 @@
 // mprotect'd it unchecked and deref'd it with the recovery guard already disarmed, turning a
 // tolerated, logged failure into hard process death. Exit code is truth: merely surviving both
 // calls proves the reporter is fault-safe (the dump prints unmapped markers instead).
-#include "../src/host/exec_image.hpp"
+#include "host/image/exec_image.hpp"
 #include <cstdio>
 
 #ifndef _WIN32

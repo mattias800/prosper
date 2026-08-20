@@ -22,10 +22,10 @@
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
 #include "hle/sync/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
-#include "host/lifecycle.hpp"          // frontend-owned stop/pause gates
-#include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
-#include "host/exec_image.hpp"         // run_entry
-#include "host/guest_write_watch.hpp"  // flush dmem writer diagnostic before deliberate _Exit
+#include "host/platform/lifecycle.hpp"          // frontend-owned stop/pause gates
+#include "host/image/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
+#include "host/image/exec_image.hpp"         // run_entry
+#include "host/memory/guest_write_watch.hpp"  // flush dmem writer diagnostic before deliberate _Exit
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend

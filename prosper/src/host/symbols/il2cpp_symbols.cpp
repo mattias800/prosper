@@ -1,7 +1,7 @@
 // il2cpp_symbols.cpp — see il2cpp_symbols.hpp for the format and for what this deliberately omits.
-#include "il2cpp_symbols.hpp"
+#include "host/symbols/il2cpp_symbols.hpp"
 
-#include "boot_program.hpp"   // BOOT_IL2CPP / BOOT_PSNCORE: the IL2CPP module's guest aperture
+#include "host/image/boot_program.hpp"   // BOOT_IL2CPP / BOOT_PSNCORE: the IL2CPP module's guest aperture
 
 #include <algorithm>
 #include <cerrno>

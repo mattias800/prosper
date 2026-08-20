@@ -6,7 +6,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/tile.hpp"
-#include "../src/host/guest_write_watch.hpp"
+#include "host/memory/guest_write_watch.hpp"
 #include "live_compute.hpp"
 #include "seed_reprove.hpp"
 #include "gta5_cf9200_fixture.hpp"

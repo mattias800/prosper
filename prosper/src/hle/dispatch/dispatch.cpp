@@ -1,5 +1,5 @@
 #include "hle/dispatch/dispatch.hpp"
-#include "host/boot_program.hpp"   // #1659
+#include "host/image/boot_program.hpp"   // #1659
 #include <cstdlib>
 #include <unordered_map>
 #include <mutex>
