@@ -73,12 +73,13 @@ For anything that does not need pixels, a CPU-only `boot_trace` arm with `PROSPE
 PROSPER_FILELOG=1` reaches `ui_gamemodetitle_en.pac` in about 25 s and is the fast iteration loop —
 the guest's file sequence is the progression oracle for this title.
 
-**Save state changes the route.** The mounted `/savedata0` area is `PROSPER_SAVE0` (default
-`/tmp/prosper-savedata0`, *shared by every lane and every title on the box*) — **not**
+**Save state changes the route.** The mounted `/savedata0` area is `PROSPER_SAVE0` — **not**
 `PROSPER_SAVEDATA_DIR`, which controls only the save-data-*memory* store. Frontiers writes
 `option/`, `arcade/` and `challenge/` there on first boot and reads them on every later boot, so a
-run inherits whatever a peer's run left behind. Pass `PROSPER_SAVE0=<private dir>` for a
-first-boot arm; both routes reach the title screen (measured), but they are not the same route.
+run inherits whatever an earlier run left. Since #2734 that root is namespaced by title id, so it is
+no longer shared with *other titles* — but it is still shared with every earlier run of Frontiers
+itself, including a peer lane's. Pass `PROSPER_SAVE0=<private dir>` for a first-boot arm; both routes
+reach the title screen (measured), but they are not the same route.
 
 ### The errno is `CONFIDENCE: MED`, and two other titles disagree with the guess — a lead, not a finding
 

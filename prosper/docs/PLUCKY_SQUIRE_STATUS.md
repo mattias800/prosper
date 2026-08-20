@@ -30,10 +30,12 @@ PROSPER_SAVE0=<RUN>/save0 PROSPER_SAVEDATA_DIR=<RUN>/savedata \
   ./build/screenshot <DUMP_ROOT>/PPSA15319-app0 --seconds 10 --count 120 --out <RUN>/shots --timeout 1400
 ```
 
-**Use isolated save roots.** `PROSPER_SAVE0` defaults to a single flat `/tmp/prosper-savedata0` shared
-by every title (#2734), and the per-save host directory is that root plus the *guest-chosen* directory
-name — so two UE4 titles picking a generic name collide. `PROSPER_SAVEDATA_DIR` is the separate
-SaveDataMemory root; the launcher `scripts/plucky-squire/run-first-gameplay.sh` sets both.
+**Use isolated save roots for a first-boot arm.** Since #2734 both roots are namespaced by title id
+(`<root>/<TITLE_ID>/…`, `prosper/docs/SAVE_DATA_LAYOUT.md`), so two UE4 titles picking the same
+guest-chosen directory name no longer collide. Setting the roots still matters here for a different
+reason: it makes the arm start from an *empty* save state rather than from whatever an earlier run of
+**this** title left. `PROSPER_SAVEDATA_DIR` is the separate SaveDataMemory root; the launcher
+`scripts/plucky-squire/run-first-gameplay.sh` sets both.
 
 Observed phase timings on one reference machine (they vary by well over a minute between hosts, so
 bound generously — a 420 s run is too short and reads as "never leaves loading"):

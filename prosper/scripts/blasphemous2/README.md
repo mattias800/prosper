@@ -14,8 +14,10 @@ scene.
 
 It requires save data to exist. A reference copy of the first-station save is kept in
 `saves/savedata0-backup-2026-07-20/` (`slot1/segmentSlot` plus `slot0/segmentGlobal`); restore it
-into the `PROSPER_SAVE0` root (default `/tmp/prosper-savedata0`) before running if that root has
-been cleared. Note the save root is SHARED across titles, not per-game.
+into **this title's** save directory before running if it has been cleared. Since #2734 that is
+`<PROSPER_SAVE0 or the per-user default>/PPSA13579/`, not the root itself — see
+`prosper/docs/SAVE_DATA_LAYOUT.md` for the defaults. Restoring into the root instead leaves the
+directories where no title will look for them.
 
 The route presses Cross once per five seconds rather than at three fixed offsets. The wall time at
 which each screen becomes ready swings widely with the rendering policy -- the same route reaches

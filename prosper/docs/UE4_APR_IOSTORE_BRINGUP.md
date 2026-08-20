@@ -1138,7 +1138,8 @@ cross-checked against public platform contracts and independent tests):
   char* dirName@8; u64 blocks@0x10; u32 mode@0x20; u32 txResourceId@0x28}`. Real fresh-console
   semantics: open-mode (mode&4==0) of a missing save → NOT_FOUND(0x809F0008); CREATE-mode
   (mode 4 or 0x20) makes the host save dir and mounts guest **/savedata0** onto it (new hle_file
-  translation, PROSPER_SAVE0, default `/tmp/prosper-savedata0/<dirName>`). MountResult filled with
+  translation, `<PROSPER_SAVE0 or the per-user default>/<TITLE_ID>/<dirName>` — the title component
+  landed with #2734, see `prosper/docs/SAVE_DATA_LAYOUT.md`). MountResult filled with
   the PS4 shape (mountPoint "/savedata0"@0, requiredBlocks@0x10=0, mountStatus@0x1c). **Live: the
   full flow now runs clean** — `Book` open→NOT_FOUND ×3, then CREATE→OK, remount(open)→OK,
   Prepare, Commit, Umount2; the game writes `SystemSaveData999.dat`/`LanguageSaveData998.dat` into

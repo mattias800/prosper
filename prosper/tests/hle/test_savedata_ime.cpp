@@ -3,6 +3,7 @@
 // a real per-(user,slot) block: Setup allocates, Set writes guest->block, Get reads block->guest,
 // Sync commits. Struct layouts mirror shadPS4 save_data/savedata.cpp (offsets asserted below).
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/fs/save_paths.hpp"
 #include <cstdio>
 #include <cstdlib>   // setenv (test-private save dir)
 #include <cstdint>
@@ -197,7 +198,12 @@ int main() {
                   "Mount2 zero-initializes the complete result body");
             CHECK(all_bytes_are(guarded.canary, sizeof guarded.canary, 0xAB),
                   "Mount2 writes exactly the 0x40-byte result");
-            const auto expected2 = (mount_root / "LegacyMount2" / "probe.bin").lexically_normal();
+            // PROSPER_SAVE0 is the ROOT the per-title directory sits under, not the save directory
+            // itself (#2734). This test never sets an /app0 root, so the namespace is the explicit
+            // unknown-title placeholder; test_savedata_title_namespace is what guards the namespace
+            // being right, and this assertion only cares that translation reaches the mounted save.
+            const auto expected2 =
+                (mount_root / save_title_namespace() / "LegacyMount2" / "probe.bin").lexically_normal();
             CHECK(std::filesystem::path(resolve_guest_path("/savedata0/probe.bin")).lexically_normal() == expected2,
                   "Mount2 activates /savedata0 path translation");
 
@@ -251,7 +257,8 @@ int main() {
             CHECK(mount((uint64_t)(uintptr_t)&input1, (uint64_t)(uintptr_t)&guarded.result,
                         0,0,0,0) == 0 && guarded.result.status == 1,
                   "legacy Mount decodes its distinct dirName/mode offsets and creates the save");
-            const auto expected1 = (mount_root / "LegacyMount1" / "probe.bin").lexically_normal();
+            const auto expected1 =
+                (mount_root / save_title_namespace() / "LegacyMount1" / "probe.bin").lexically_normal();
             CHECK(std::filesystem::path(resolve_guest_path("/savedata0/probe.bin")).lexically_normal() == expected1,
                   "legacy Mount activates the same /savedata0 backend");
             CHECK(umount((uint64_t)(uintptr_t)guarded.result.mountPoint, 0,0,0,0,0) == 0,
