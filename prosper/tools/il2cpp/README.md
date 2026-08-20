@@ -3,6 +3,27 @@
 Recover C# method names + addresses from an IL2CPP title so you can breakpoint
 managed logic (scene load, boot state machines) during emulator debugging.
 
+## Overview
+
+These tools turn a PlayStation 5 SELF/PRX module into a form
+[Il2CppDumper](https://github.com/Perfare/Il2CppDumper) accepts, then map addresses back to C#
+method names — offline from a shell, or in-process while prosper runs (see *Runtime symbolication*
+below).
+
+    PRX module -> prx_to_elf.py -> flattened ELF -> Il2CppDumper -> script.json -> resolve.py -> method names
+
+| Tool | Purpose | Input | Output |
+| --- | --- | --- | --- |
+| `prx_to_elf.py` | Flatten a PRX into a loadable ELF | `*.prx` | `*.elf` |
+| `resolve.py` | Name an address, or emit prosper's runtime symbol table | `script.json` + addresses | Method names / `*.symtab` |
+
+## Prerequisites
+
+- Python 3, standard library only (`struct`, `json`, `bisect`, `re`) — no pip dependencies.
+- Il2CppDumper and a dotnet runtime. It is not preinstalled; step 2 below fetches it.
+- An **unencrypted** dump carrying `Media/Modules/` and `Media/Metadata/`. These tools do not
+  decrypt anything: an encrypted PRX cannot be flattened, and that is out of scope by design.
+
 ## Recipe
 1. Flatten the compiled-C# PRX (unencrypted in the dump) into a loadable ELF:
 
@@ -138,6 +159,58 @@ one.
 - IL2CPP layout is version-dependent; a symtab is only valid for the exact module it was dumped
   from. Nothing detects a mismatched pair, so a stale symtab yields confident wrong names.
 
+## Tool reference
+
+### prx_to_elf.py
+
+    python3 prx_to_elf.py <in.prx> <out.elf> [--sections]
+
+Flattens an unencrypted PS5 SELF/PRX into an `ET_DYN` ELF whose `p_offset == p_vaddr`, which is
+what makes an RVA and a file offset the same number downstream.
+
+1. Read the SELF segment table; data segments are the ones carrying flag bit `0x800`, and a
+   segment's program-header index is `flags >> 20`.
+2. Copy each `PT_LOAD`'s bytes to `p_vaddr` in a flat buffer, then copy the embedded ELF's 64-byte
+   header over the front.
+3. Rewrite `e_type = ET_DYN`, `e_phoff = 0x40`, and clear `e_shoff` / `e_shnum` / `e_shstrndx`.
+4. Rewrite every program header with `p_offset := p_vaddr`.
+
+| Field | In the module | Flattened | Why |
+| --- | --- | --- | --- |
+| `e_type` | varies | `ET_DYN` (3) | position-independent image |
+| `e_phoff` | embedded offset | `0x40` | header is copied to the front |
+| `e_shoff` | past-EOF offset | `0` | the table it describes is not in this file |
+| `e_shnum` | `0`, or `43`–`48` | `0` | ditto |
+| `e_shstrndx` | `41`–`46` | `SHN_UNDEF` (0) | ditto |
+
+Those stale ranges are what stripped PS5 modules actually carry, measured across 22 title modules.
+**All three must be cleared together** — either survivor makes binutils reject the whole file with
+`file format not recognized`. `--sections` is covered in the next section.
+
+### resolve.py
+
+    python3 resolve.py <script.json> [--base <addr>] [--emit-symtab <out>] <address...>
+    python3 resolve.py <script.json> -            # read addresses from stdin
+
+| Option | Effect |
+| --- | --- |
+| `--base <addr>` | Subtract `<addr>` from bare-hex inputs, so absolute runtime addresses resolve |
+| `--emit-symtab <out>` | Write the flat runtime symbol table prosper reads via `PROSPER_IL2CPP_SYMBOLS` |
+| `-` | Read tokens from stdin; scrapes `il+0x…` / `eb+0x…` / `0x…` out of a pasted log line |
+
+| Address form | Example | Read as |
+| --- | --- | --- |
+| bare hex | `0x2140d0` | an RVA, or an absolute address when `--base` is given |
+| `il+0x…` | `il+0x1764ce2` | an RVA in the IL2CPP module (already what `[btrace]` prints) |
+| `eb+0x…` | `eb+0xada254` | the Unity eboot — reported as native, never guessed at |
+
+Lookup is **nearest-preceding within `NEAREST_WINDOW` (`0x8000`)**: sort the `script.json` records by
+address, binary-search for the last method start at or below the query, and report it only if the
+query is strictly less than `0x8000` past that start. script.json gives starts but never lengths, so
+some bound is unavoidable; anything further out is reported as no managed method rather than
+attributed to a method it is probably not in. The window is written into the emitted symtab header
+so prosper reads it from here instead of keeping a second copy that can drift.
+
 ## What binutils can and cannot do with the flattened ELF
 
 The image has program headers but **no section header table**, so `e_shoff`, `e_shnum` and
@@ -173,6 +246,38 @@ them on some paths and that has not been re-run end to end, so the dump path is 
   `(0, 0)` ACCEPT — and `(0, 0)` with OSABI cleared is also ACCEPT, i.e. OSABI changes nothing.
   Zeroing only `e_shnum`, as #2016 suggested, would not have made binutils accept the file. No
   `--gnu-compat` flag is needed (#2016 / PR #2155).
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `objdump`: `file format not recognized` | Reading the raw `.prx`, whose stale `e_shoff`/`e_shnum`/`e_shstrndx` describe a table that is not there | Flatten it with `prx_to_elf.py` first |
+| `objdump -d` prints nothing | No section header table in the default output — it disassembles sections and finds none | Regenerate with `--sections` |
+| Il2CppDumper throws `Cannot read keys` | Headless run with no console, thrown after every output is written | Ignore it; check `/tmp/out` for `dump.cs` and `script.json` |
+| Il2CppDumper finds no methods | Wrong or mismatched `global-metadata.dat`, or a dumper too old for this title's IL2CPP generation | Check the metadata path; try a newer Il2CppDumper release |
+| Every address resolves to nothing | Absolute addresses fed in without `--base`, so each one lands far past the last method | Pass `--base 0x440000000`, or subtract the base yourself and feed RVAs |
+| A known-good method reports no managed method | The query is more than `0x8000` past the nearest start, or it is genuinely in the il2cpp runtime's own native C++ below the managed region | Confirm against `dump.cs`; see *Limits* above |
+| Runtime symbolication prints `<il2cpp-symbols-unavailable>` | `PROSPER_IL2CPP_SYMBOLS` is set but the file could not be read, or points at a raw `script.json` | Read the `[il2cpp-sym]` stderr line — it names the reason; regenerate with `--emit-symtab` |
+
+Two quick checks that the flattened ELF is sound:
+
+    objdump -f out.elf     # ELF64, ET_DYN
+    objdump -p out.elf     # program headers, with p_offset == p_vaddr
+    python3 -c "import json;print(len(json.load(open('/tmp/out/script.json'))['ScriptMethod']),'methods')"
+
+## Testing
+
+    python3 test_prx_to_elf.py         # ctest: il2cpp_prx_to_elf_header
+    python3 test_il2cpp_tools.py       # ctest: il2cpp_resolve_lookup
+    python3 test_symtab_agreement.py   # ctest: il2cpp_symtab_agreement
+
+| Suite | What it pins |
+| --- | --- |
+| `test_prx_to_elf.py` | The written ELF header read back at its gABI offsets, `--sections` synthesis, and byte-identity of the default output |
+| `test_il2cpp_tools.py` | `resolve.py`'s loader and nearest-preceding lookup: exact and interior hits, both sides of the `0x8000` window edge, empty and field-missing `script.json` |
+| `test_symtab_agreement.py` | `--emit-symtab` against prosper's in-process resolver, address-for-address, with a planted-disagreement arm |
+
+All three are pure Python over synthesized fixtures — no game dump, no build artifacts, no network.
 
 ## gdb caveat (prosper)
 prosper installs a SIGSEGV handler for lazy memory commit. Under gdb, ALWAYS use
