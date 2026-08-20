@@ -9,7 +9,7 @@
 
 **Every screenshot checked into this repository, most recent first.** Read down from the top and stop when you reach one you have already seen.
 
-**136 images**, most recent **2026-08-20**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
+**137 images**, most recent **2026-08-20**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
 
 This file is generated from git history by [`prosper/tools/docs/gen_screenshot_feed.py`](prosper/tools/docs/gen_screenshot_feed.py) and is regenerated and diffed in CI, so it cannot drift from the tree. [`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table; this is only a reverse-chronological index of the images themselves.
 
@@ -19,6 +19,14 @@ This file is generated from git history by [`prosper/tools/docs/gen_screenshot_f
 > a record of *when* things happened.
 
 ## 2026-08-20
+
+### dragon-quest-vii-opening-chapter.png
+
+<p align="center"><img src="assets/screenshots/dragon-quest-vii-opening-chapter.png" alt="dragon quest vii opening chapter"></p>
+
+feat(dq7): the route reaches the opening chapter in Estard, and Unreal titles get an IoStore package oracle (#2779)
+
+`0ea7868c` · [`assets/screenshots/dragon-quest-vii-opening-chapter.png`](assets/screenshots/dragon-quest-vii-opening-chapter.png)
 
 ### bendy-dark-revival-gameplay.png
 
