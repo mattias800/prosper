@@ -2700,6 +2700,56 @@ int main() {
                          std::size(guarded_counted_loop_inner_save), 0, 0).empty(),
           "guarded counted loop rejects an uncarried inner EXEC mutation");
 
+    // --- The unsupported-site ENUMERATION, not just the first site -------------------------------
+    //
+    // `first_bad_*` answers "does this shader recompile?". It cannot answer "which instructions are
+    // blocked", which is the question an investigation asks once a program is known to be blocked --
+    // GTA V's 0x413dc6700 reports unsupported=27 behind a single `first=SMEM/0x1`, and deciding
+    // whether any of the 27 feeds a particular value needs all of them. The optional out-parameter
+    // exists so that census costs nothing on the failed-draw and F9-capture paths that call this.
+    //
+    // Composed from the two single-unsupported MTBUF kernels asserted above, so each half is
+    // independently pinned: whichever arm breaks, the cause is already localized.
+    {
+        const uint32_t two_bad[] = {
+            0xe8682000u, 0x80220000u,   // MTBUF D16   -> unsupported, op 8
+            0xe8b02000u, 0x80820100u,   // MTBUF TFE   -> unsupported, op 0
+            0xBF810000u,
+        };
+        std::vector<RecompileUnsupportedSite> sites;
+        const RecompileCoverage cov =
+            recompile_coverage(two_bad, std::size(two_bad), &sites);
+
+        CHECK(cov.unsupported == 2, "the composed kernel really does carry two unsupported sites");
+        CHECK(sites.size() == cov.unsupported,
+              "the enumeration reports exactly as many sites as the counter counts");
+        // The point of the feature: the SECOND site is reachable at all. Before this, op 0 at pc 2
+        // was invisible behind op 8 at pc 0.
+        CHECK(sites.size() == 2 && sites[1].opcode == 0u && sites[1].pc == 2u,
+              "the second unsupported site is enumerated, not hidden behind the first");
+        CHECK(!sites.empty() && sites[0].opcode == 8u && sites[0].pc == 0u,
+              "the first enumerated site is the first blocker in stream order");
+        // Agreement, so the two reports can never drift into describing the same shader differently.
+        CHECK(!sites.empty() && sites[0].fmt == cov.first_bad_fmt &&
+                  sites[0].opcode == cov.first_bad_op && sites[0].pc == cov.first_bad_pc,
+              "sites[0] agrees with first_bad_* on fmt, opcode and pc");
+
+        // Passing no vector must not change what is REPORTED -- every existing caller relies on that.
+        const RecompileCoverage without = recompile_coverage(two_bad, std::size(two_bad));
+        CHECK(without.unsupported == cov.unsupported && without.total == cov.total &&
+                  without.first_bad_op == cov.first_bad_op && without.alu == cov.alu,
+              "omitting the out-parameter leaves the coverage numbers identical");
+
+        // Negative arm. Without it, every assertion above is also satisfied by an implementation that
+        // unconditionally appends, so this is what makes the others mean anything.
+        std::vector<RecompileUnsupportedSite> clean_sites{{0, 7u, 7u}};  // pre-dirtied on purpose
+        const uint32_t clean[] = { 0x06000300u, 0x10000500u, 0xBF810000u };
+        const RecompileCoverage clean_cov =
+            recompile_coverage(clean, std::size(clean), &clean_sites);
+        CHECK(clean_cov.unsupported == 0 && clean_sites.empty(),
+              "a fully-supported kernel enumerates NO sites, and clears a dirty caller vector");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
