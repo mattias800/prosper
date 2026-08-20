@@ -57,7 +57,7 @@ Last updated: 2026-08-17
 | *Little Nightmares III* | `PPSA05143` | Unreal Engine 4 | 🚧 Boot splash sequence and title screen; most title frames carry a yellow tint | [#1893](https://github.com/mattias800/prosper/issues/1893) |
 | *Crisis Core –Final Fantasy VII– Reunion* | `PPSA07809` | Unreal Engine 4 | 🚧 Title screen, on a throttled route — a default run still dies in the guest allocator within seconds | [#1894](https://github.com/mattias800/prosper/issues/1894) |
 | *The House of the Dead 2: Remake* | `PPSA24203` | — | 🚧 Training 1 gameplay | [#1896](https://github.com/mattias800/prosper/issues/1896) |
-| *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Health warning and title screen; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
+| *Bendy and the Dark Revival* | `PPSA27624` | Unity / IL2CPP | 🚧 Chapter 1 gameplay; the menu's background video is not composited | [#1897](https://github.com/mattias800/prosper/issues/1897) |
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Title screen | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 
 ## At a glance
@@ -495,10 +495,17 @@ The route reaches Training 1 with a live rail-shooter camera, HUD, crosshair, an
 
 ## Bendy and the Dark Revival — `PPSA27624`
 
+<p align="center"><img src="assets/screenshots/bendy-dark-revival-gameplay.png" alt="Bendy and the Dark Revival — Chapter 1 gameplay with the NEW OBJECTIVE HUD"></p>
 <p align="center"><img src="assets/screenshots/bendy-dark-revival-title.png" alt="Bendy and the Dark Revival — title screen"></p>
 
-A default launch reaches the multi-language photosensitivity warning and then the title screen and its BEGIN menu at
-native 3840×2160. The menu's background video is not composited, so the menu sits on a flat grey background. See the
+The route [`prosper/scripts/bendy-dark-revival-PPSA27624/reach-gameplay.pad`](prosper/scripts/bendy-dark-revival-PPSA27624/reach-gameplay.pad)
+crosses the multi-language photosensitivity warning, the title screen and the BEGIN menu into **Chapter 1** at native
+3840×2160 — Audrey's opening dialogue, the hold-to-interact prompt, a first-person reticle and the `NEW OBJECTIVE`
+banner. **No prosper code change was required**; the title was one input route away. Reproduced across five bounded
+runs, two of which share 5 of 8 byte-identical frame CRCs.
+
+The menu's background video is still not composited, so the BEGIN menu sits on a flat grey background. See
+[`prosper/docs/BENDY_DARK_REVIVAL_STATUS.md`](prosper/docs/BENDY_DARK_REVIVAL_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
