@@ -9,7 +9,7 @@
 
 **Every screenshot checked into this repository, most recent first.** Read down from the top and stop when you reach one you have already seen.
 
-**138 images**, most recent **2026-08-20**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
+**137 images**, most recent **2026-08-20**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
 
 This file is generated from git history by [`prosper/tools/docs/gen_screenshot_feed.py`](prosper/tools/docs/gen_screenshot_feed.py) and is regenerated and diffed in CI, so it cannot drift from the tree. [`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table; this is only a reverse-chronological index of the images themselves.
 
@@ -19,14 +19,6 @@ This file is generated from git history by [`prosper/tools/docs/gen_screenshot_f
 > a record of *when* things happened.
 
 ## 2026-08-20
-
-### rtype-delta-stage1-gameplay.png
-
-<p align="center"><img src="assets/screenshots/rtype-delta-stage1-gameplay.png" alt="rtype delta stage1 gameplay"></p>
-
-screenshot(rtype-delta): stage 1 gameplay renders at 83e3383a and NOT on current master (#2783)
-
-`6fe7d80c` · [`assets/screenshots/rtype-delta-stage1-gameplay.png`](assets/screenshots/rtype-delta-stage1-gameplay.png)
 
 ### dragon-quest-vii-opening-chapter.png
 
