@@ -2622,7 +2622,9 @@ std::vector<uint32_t> mask_test_branches_for_test(const uint32_t* code, size_t d
     return std::vector<uint32_t>(branches.begin(), branches.end());
 }
 
-RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
+RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
+                                     std::vector<RecompileUnsupportedSite>* sites) {
+    if (sites) sites->clear();
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     uint32_t synthetic_branch_pc = UINT32_MAX;
@@ -2789,6 +2791,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                 cov.first_bad_op = in.opcode;
                 cov.first_bad_pc = in.pc;
             }
+            // Recorded from the SAME branch that increments the counter, so the enumeration cannot
+            // disagree with `unsupported` about which instructions are in the class.
+            if (sites) sites->push_back({(int)in.fmt, in.opcode, in.pc});
         }
     }
     return cov;

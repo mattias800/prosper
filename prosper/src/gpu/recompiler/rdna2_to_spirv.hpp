@@ -518,7 +518,24 @@ struct RecompileCoverage {
     uint32_t first_bad_op  = 0;
     uint32_t first_bad_pc  = 0xFFFFFFFFu; // dword offset of that instruction (-1 if none)
 };
-RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);
+
+// One truly-unsupported instruction, for callers that need the WHOLE census rather than the first
+// site. `first_bad_*` above answers "does this shader recompile?"; it cannot answer "which of these
+// 27 instructions feeds the value that comes out wrong?", which is the question an investigation
+// actually asks once a program is known to be blocked.
+struct RecompileUnsupportedSite {
+    int      fmt = -1;      // Rdna2Format
+    uint32_t opcode = 0;
+    uint32_t pc = 0;        // dword offset
+};
+
+// `sites` is OPTIONAL and defaults to nullptr, which is what every existing caller passes
+// implicitly. That matters: this runs on the failed-draw path and at F9 capture, so the enumeration
+// must cost nothing unless a diagnostic asks for it. Passing a vector fills it with every
+// unsupported instruction in stream order; sites[0] always agrees with `first_bad_*`, and a test
+// pins that agreement so the two can never drift into disagreeing about the same shader.
+RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
+                                     std::vector<RecompileUnsupportedSite>* sites = nullptr);
 
 // Test seam for the whole-stream liveness gate on GTA V's incomplete S_CSELECT_B64 source pair.
 // A returned PC is admitted at the select itself; later failure to materialize VCC_HI cannot make

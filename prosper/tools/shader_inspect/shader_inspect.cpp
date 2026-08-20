@@ -124,7 +124,9 @@ int main(int argc, char** argv) {
     std::memcpy(words.data(), bytes.data(), bytes.size());
     std::vector<Rdna2Inst> instructions;
     const size_t consumed = rdna2_walk(words.data(), words.size(), instructions);
-    const RecompileCoverage coverage = recompile_coverage(words.data(), words.size());
+    std::vector<RecompileUnsupportedSite> unsupported_sites;
+    const RecompileCoverage coverage =
+        recompile_coverage(words.data(), words.size(), &unsupported_sites);
     const bool ended = !instructions.empty() && instructions.back().is_end;
     std::printf("file=%s bytes=%zu dwords=%zu consumed=%zu instructions=%zu endpgm=%d\n",
                 argv[1], bytes.size(), words.size(), consumed, instructions.size(), ended);
@@ -133,6 +135,19 @@ int main(int argc, char** argv) {
                 coverage.unsupported,
                 coverage.first_bad_fmt < 0 ? "none" : format_name(static_cast<Rdna2Format>(coverage.first_bad_fmt)),
                 coverage.first_bad_op);
+    // Every unsupported site, not just the first. `first=` above answers "does this recompile?";
+    // this answers "which instructions are blocked", which is what you need to decide whether any of
+    // them feeds a particular value. Printed one per line so it greps and diffs.
+    for (const RecompileUnsupportedSite& site : unsupported_sites) {
+        std::printf("generic-unsupported pc=%04u fmt=%s op=0x%x\n", site.pc,
+                    format_name(static_cast<Rdna2Format>(site.fmt)), site.opcode);
+    }
+    if (unsupported_sites.size() != coverage.unsupported) {
+        // Cannot happen -- both come from one branch -- so say so loudly rather than print a census
+        // that silently disagrees with its own total.
+        std::printf("generic-unsupported WARNING enumerated=%zu but counted=%u\n",
+                    unsupported_sites.size(), coverage.unsupported);
+    }
     bool stage_ok = true;
     bool stage_undetermined = false;
     if (!stage.empty()) {
