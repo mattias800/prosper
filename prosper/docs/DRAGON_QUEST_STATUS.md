@@ -82,6 +82,36 @@ offset into the packed `.ucas`. Resolving one against the other produces a confi
 name, which is why the tool goes physical -> compression block -> logical -> chunk and its
 registered self-test pins exactly that step.
 
+### Residency is not activation — this title front-loads, and the naive form of the oracle fires on a menu
+
+**Do not test "did the guest read a `Map/Product/World/**.umap`".** Measured 2026-08-20 over an
+800-sample run: this title reads `Title_PL.umap` at 2 s and then a cluster of
+`Map/Product/World/Field/F001/T001/Modern/T001_M_Env_*`, `T001_M_Gmk_GOut`, `T001_M_PartyTalk_GIns`
+and `F001_M_Monster_Random_GOut` at **57-58 s** — while the player is still on the
+adventure-log/slot-selection screen, roughly ten minutes before any world is entered. Two more
+World maps (`D048_M_PL`, `C001_T_M_Npc_GIns`) are read at **0.0 s**, before the title map. A
+membership test would have reported "gameplay" on a run that never left the menus, which is exactly
+the failure the oracle exists to prevent.
+
+**The form that discriminates is the phase profile, not the membership.** Bytes read per minute,
+resolved to the top-level content directory, separate the two states by two orders of magnitude:
+
+| window | Environment | Character | Map/Product | UserInterface |
+| --- | --- | --- | --- | --- |
+| 0-60 s (boot + front-load) | 133 MB | 118 MB | 11.6 MB | 331 MB |
+| 360-420 s (first-run setup menus) | 0.25 MB | 5.1 MB | **0 MB** | 0 MB |
+| 600-660 s (entering the world) | **285 MB** | **109 MB** | **9.8 MB** | 4.9 MB |
+
+and the packages that appear *only* in the third window name the event: `T001_M_PL.umap` — the
+persistent level, as opposed to the sub-levels touched at 58 s — together with
+`World_P_Streaming.umap` and `SkitSystem/LevelSequence/CS_CP1_001_010/CS_CP1_001_010_GEvt.umap`,
+the opening chapter's cutscene sequence.
+
+So on a front-loading Unreal title the oracle answers **"which package the engine opened, and
+when"**, and the gameplay claim rests on the *when* plus the volume, never on the set. On a title
+that streams on demand the membership form is enough — that is what made it decisive on
+`PPSA19244`. Check which kind of title you have before quoting it.
+
 ## Reproduction recipe
 
 Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with unique

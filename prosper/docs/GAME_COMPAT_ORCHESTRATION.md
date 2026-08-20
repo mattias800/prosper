@@ -693,6 +693,18 @@ carries a **physical** offset into the packed `.ucas`, and on `PPSA17942` the tw
 the startup map alone — so a one-step lookup misnames most of a stream while still looking plausible.
 `iostore_index.py --self-test` pins that mapping and is registered in ctest.
 
+**And test the phase, not the membership — a front-loading title reads its first world's packages
+before you ever leave the menus.** Measured on `PPSA17942` (2026-08-20): the town sub-levels
+`T001_M_Env_GOut`, `T001_M_Gmk_GOut` and `T001_M_PartyTalk_GIns` are all read at **58 s**, while the
+run is still on the save-slot screen and roughly ten minutes before the world is entered; two
+further World maps are read at 0.0 s, *before* the title map. A "did it read a World map" predicate
+would have reported gameplay on a run that never left a menu — the exact failure the oracle exists
+to prevent, arrived at through the oracle. What separates the states is **bytes per minute by
+content directory**: 0.25 MB of Environment while the setup menus are up against 285 MB in the
+minute the world loads, and a persistent level (`T001_M_PL.umap`) plus a level-sequence package
+appearing only in that window. On a title that streams on demand the membership form is enough;
+check which kind you have before quoting it.
+
 Validate it the way the `## Ruled out` rule requires: build a positive instance **by hand from the
 container index**, outside any run — compute a known package's physical offset and check that
 `--resolve` names it back — rather than trusting that the instrument fires because a run produced
