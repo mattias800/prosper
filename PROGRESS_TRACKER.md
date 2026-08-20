@@ -70,13 +70,13 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | Summer Sports Games | `PPSA03416` | 6 | `1234-6` | `summer-sports-gameplay` | none | - | [#1878](https://github.com/mattias800/prosper/issues/1878) | - |
 | The Messenger | `PPSA24651` | 6 | `123456` | `messenger-scene` | [comment](https://github.com/mattias800/prosper/issues/530#issuecomment-4947961624) | [#298](https://github.com/mattias800/prosper/issues/298) | [#1865](https://github.com/mattias800/prosper/issues/1865) | [`MESSENGER_BLACK_RENDER.md`](prosper/docs/MESSENGER_BLACK_RENDER.md) |
 | Worms Armageddon: Anniversary Edition | `PPSA20052` | 6 | `1234-6` | `worms-armageddon-gameplay` | none | - | [#1879](https://github.com/mattias800/prosper/issues/1879) | - |
+| Tales of Graces f Remastered | `PPSA19991` | 4 | `1234--` | - | none | [#1688](https://github.com/mattias800/prosper/issues/1688), [#1673](https://github.com/mattias800/prosper/issues/1673), [#2731](https://github.com/mattias800/prosper/issues/2731) | [#1889](https://github.com/mattias800/prosper/issues/1889) | - |
 | Terminator 2D: NO FATE | `PPSA25872` | 4 | `1234--` | `terminator-boot` | none | - | [#1872](https://github.com/mattias800/prosper/issues/1872) | - |
 | Asterix & Obelix - Babylon Mission | `PPSA30490` | 3 | `123---` | - | none | [#1599](https://github.com/mattias800/prosper/issues/1599), [#2743](https://github.com/mattias800/prosper/issues/2743), [#2738](https://github.com/mattias800/prosper/issues/2738) | [#1884](https://github.com/mattias800/prosper/issues/1884) | [`ASTERIX_BABYLON_STATUS.md`](prosper/docs/ASTERIX_BABYLON_STATUS.md) |
 | Bendy and the Ink Machine | `PPSA27616` | 3 | `123---` | - | none | [#1178](https://github.com/mattias800/prosper/issues/1178), [#1177](https://github.com/mattias800/prosper/issues/1177) | [#1881](https://github.com/mattias800/prosper/issues/1881) | - |
 | Grand Theft Auto V | `PPSA04263` | 3 | `123---` | - | none | [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Syberia: Remastered | `PPSA30140` | 3 | `123---` | - | none | [#1790](https://github.com/mattias800/prosper/issues/1790), [#1627](https://github.com/mattias800/prosper/issues/1627), [#1737](https://github.com/mattias800/prosper/issues/1737), [#1628](https://github.com/mattias800/prosper/issues/1628) | [#1811](https://github.com/mattias800/prosper/issues/1811) | [`SYBERIA_STATUS.md`](prosper/docs/SYBERIA_STATUS.md) |
 | Tactics Ogre: Reborn | `PPSA03839` | 3 | `123---` | - | none | [#1913](https://github.com/mattias800/prosper/issues/1913), [#1784](https://github.com/mattias800/prosper/issues/1784) | [#1892](https://github.com/mattias800/prosper/issues/1892) | - |
-| Tales of Graces f Remastered | `PPSA19991` | 3 | `123---` | - | none | [#1688](https://github.com/mattias800/prosper/issues/1688), [#1673](https://github.com/mattias800/prosper/issues/1673), [#2731](https://github.com/mattias800/prosper/issues/2731) | [#1889](https://github.com/mattias800/prosper/issues/1889) | - |
 | The House of the Dead 2: Remake | `PPSA24203` | 3 | `123---` | - | none | [#1907](https://github.com/mattias800/prosper/issues/1907) | [#1896](https://github.com/mattias800/prosper/issues/1896) | - |
 | Astro Bot | `PPSA21564` | 2 | `12----` | - | none | [#1732](https://github.com/mattias800/prosper/issues/1732), [#1459](https://github.com/mattias800/prosper/issues/1459), [#1730](https://github.com/mattias800/prosper/issues/1730), [#1731](https://github.com/mattias800/prosper/issues/1731) | [#1809](https://github.com/mattias800/prosper/issues/1809) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Bendy and the Dark Revival | `PPSA27624` | 2 | `12----` | - | none | [#1979](https://github.com/mattias800/prosper/issues/1979), [#1955](https://github.com/mattias800/prosper/issues/1955) | [#1897](https://github.com/mattias800/prosper/issues/1897) | - |
@@ -101,8 +101,8 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | Highest rung reached | Titles |
 | --- | --- |
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
-| 4 -- manual visual verification | 1 |
-| 3 -- gameplay with real GPU draws | 7 |
+| 4 -- manual visual verification | 2 |
+| 3 -- gameplay with real GPU draws | 6 |
 | 2 -- title screen | 15 |
 | 1 -- any real graphics | 1 |
 | 0 -- not started | 1 |
