@@ -9516,6 +9516,67 @@ int main() {
     printf("  kernelX4(vcc scratch) mismatches=%u\n", badX4);
     CHECK(gotX4.size()==N && badX4==0, "kernel X4 computes bits(a0) + vcc_lo(5) via the tracked scalar write");
 
+    // Kernels X4b/X4c/X4d: the same VCC-as-scalar-scratch model reached through S_CSELECT_B32 with
+    // NON-CONSTANT scalar sources (#2741). The stock Unreal volumetric-fog kernel
+    // (The Plucky Squire 0x3015fd0000, byte-identical in Little Nightmares III and The Pathless)
+    // loads four floats with s_buffer_load_dwordx4, keeps its loop counter in VCC_HI, and selects
+    // one of them into VCC_LO with a four-wide cascade whose later members chain through VCC_LO
+    // itself. Every word below is llvm-mc gfx1030 verified; the pc217 select is the title's exact
+    // dword 0x856a2425. VCC_HI is written as ordinary scalar data first, so acceptance runs through
+    // the complete_scalar_pair reconstruction (the dead-high proof does NOT apply to this shape —
+    // in the real shader VCC_HI stays live as the loop counter past the select).
+    //   X4b: s_mov s36,7 ; s_mov s37,9 ; s_mov vcc_hi,0 ; s_cmp_eq_u32 vcc_hi,0 (SCC=1)
+    //        s_cselect_b32 vcc_lo, s37, s36 ; v_add_nc_u32 v1, vcc_lo, v0   => bits(a0) + 9
+    const uint32_t codeX4b[] = {
+        0xBEA40387u, 0xBEA50389u, 0xBEEB0380u, 0xBF06806Bu,
+        0x856A2425u, 0x4A02006Au, 0xBF810000u };
+    std::vector<uint32_t> spvX4b = recompile_valu(codeX4b, std::size(codeX4b), 1, /*out_vgpr*/1);
+    CHECK(!spvX4b.empty(), "kernel X4b (s_cselect_b32 vcc_lo from two SGPRs) recompiles");
+    // Guard the execution arm: with the widening absent this module is empty, and the
+    // CHECK above is the finding — running an empty module would abort the suite instead.
+    std::vector<float> gotX4b = spvX4b.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spvX4b, inX, N, N);
+    uint32_t badX4b = 0;
+    for (uint32_t i = 0; i < N && gotX4b.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotX4b[i], 4);
+        if (gb != bits_of(inX[i]) + 9u) badX4b++;
+    }
+    printf("  kernelX4b(vcc cselect sgpr) mismatches=%u\n", badX4b);
+    CHECK(gotX4b.size()==N && badX4b==0,
+          "kernel X4b selects the SCC-true SGPR source (9, not 7) into vcc_lo and reads it as data");
+
+    //   X4c: the cascade's chained member, whose src1 is VCC_LO itself (decodes as Special 106).
+    //        ... s_cmp_eq_u32 vcc_hi,1 (SCC=0) ; s_cselect_b32 vcc_lo, s38, vcc_lo
+    //        The SCC-false arm is the chained VCC_LO, so the answer stays 9: reading s38 would give
+    //        11 and dropping the chained read would give 0. An SGPR-only widening rejects here.
+    const uint32_t codeX4c[] = {
+        0xBEA40387u, 0xBEA50389u, 0xBEA6038Bu, 0xBEEB0380u, 0xBF06806Bu,
+        0x856A2425u, 0xBF06816Bu, 0x856A6A26u, 0x4A02006Au, 0xBF810000u };
+    std::vector<uint32_t> spvX4c = recompile_valu(codeX4c, std::size(codeX4c), 1, /*out_vgpr*/1);
+    CHECK(!spvX4c.empty(), "kernel X4c (s_cselect_b32 vcc_lo chaining through vcc_lo) recompiles");
+    // Guard the execution arm: with the widening absent this module is empty, and the
+    // CHECK above is the finding — running an empty module would abort the suite instead.
+    std::vector<float> gotX4c = spvX4c.empty()
+        ? std::vector<float>() : prosper::test::run_compute(spvX4c, inX, N, N);
+    uint32_t badX4c = 0;
+    for (uint32_t i = 0; i < N && gotX4c.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotX4c[i], 4);
+        if (gb != bits_of(inX[i]) + 9u) badX4c++;
+    }
+    printf("  kernelX4c(vcc cselect chain) mismatches=%u\n", badX4c);
+    CHECK(gotX4c.size()==N && badX4c==0,
+          "kernel X4c round-trips the chained vcc_lo source (9, not 11 and not 0)");
+
+    //   X4d: same-site source mutation to VCC_HI (Special 107) stays REJECTED. This is a real
+    //        discriminator at this shape: VCC_HI holds tracked scalar data here, so operand_bits
+    //        would resolve it and a Special 106..125 widening would ACCEPT. The narrow
+    //        Special == 106 form is what keeps the two GTA packet-drift guards above passing.
+    const uint32_t codeX4d[] = {
+        0xBEA40387u, 0xBEA50389u, 0xBEEB0380u, 0xBF06806Bu,
+        0x856A6B25u, 0x4A02006Au, 0xBF810000u };
+    CHECK(recompile_valu(codeX4d, std::size(codeX4d), 1, /*out_vgpr*/1).empty(),
+          "kernel X4d (same-site vcc_hi source) remains REJECTED");
+
     // Kernel O: VOP2 v_mul_f32 in SDWA form with OMOD ×2 output modifier. This was a #121 blocker —
     // PPSA02664's pixel shaders emit `v_mul_f32 v,v,v mul:2` (full-DWORD selects, omod=×2), which the
     // decoder rejected as an unhandled modifier, failing the whole PS. Now the ×2 is applied.

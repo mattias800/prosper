@@ -310,7 +310,7 @@ inline std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
 // word. The scalar-data-vs-mask decision remains path-local in emit_alu; this predicate only names
 // B32 packets for which a dead-high proof can make that scalar path discard the old predicate.
 inline bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
-    return is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
+    return is_wave64_vcc_lo_scalar_cselect(in) ||
         (in.fmt == Rdna2Format::SOP2 && sop2_is_b32_logical(in.opcode) &&
          in.dst.kind == OperandKind::SGPR && in.dst.value == 106);
 }
@@ -322,7 +322,7 @@ inline std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
         if (in.is_end) break;
         const bool candidate = include_logical
             ? is_wave64_vcc_lo_scalar_b32_candidate(in)
-            : is_gtav_wave64_vcc_lo_scalar_cselect(in);
+            : is_wave64_vcc_lo_scalar_cselect(in);
         if (candidate &&
             sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
             result.insert(in.pc);

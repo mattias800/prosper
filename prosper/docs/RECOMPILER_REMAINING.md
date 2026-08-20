@@ -223,6 +223,47 @@ earlier revision excluded it so an identity result could not be mistaken for a d
 excluding it does not fail visibly either — it falls through to the generic reject and names a
 defined control as unsupported, which is the worse signal of the two.
 
+## VCC_LO as scalar scratch: `S_CSELECT_B32` with non-constant sources — **LANDED** (2026-08-20)
+
+`is_wave64_vcc_lo_scalar_cselect` (`rdna2_alu_support.hpp`) used to require **both** sources to be
+inline constants, because an inline operand is an exact dword independent of its value. LLVM also
+emits the same recycling with ordinary SGPR sources, and chains it through VCC_LO itself, so the
+predicate now admits any **scalar-DATA operand kind**: `InlineInt`, `InlineFloat`, `SGPR`, and
+`Special` **only for value 106 (VCC_LO)**.
+
+Three facts make that narrower than it reads, and all three are load-bearing:
+
+* **`Special` is admitted for 106 alone.** The stock Unreal froxel kernel rejects as a *four-wide
+  cascade* — `s_cselect_b32 vcc_lo, s37, s36` at pc217, then `s_cselect_b32 vcc_lo, s38, vcc_lo` at
+  pc220/223, whose second source decodes as `Special` 106. An SGPR-only widening fixes the first
+  reject and re-rejects at the second, which looks like success in a log. Admitting `Special`
+  106..125 wholesale instead breaks two VCC_HI packet-drift guards
+  (`test_rdna2_to_spirv.cpp`, "rejects packet drift and a live high-half mask" and "rejects pc232
+  packet drift into the killed VCC_HI word"); 106 alone restores both.
+* **The predicate decides SHAPE, never whether a source HOLDS scalar data.** That stays with the
+  whole-stream pre-pass (`source_is_scalar_word`) and `operand_bits`, which rejects any source whose
+  dword is not representable in the per-invocation model.
+* **Acceptance still needs the separate per-PC proof** — `complete_scalar_pair` *or*
+  `vcc_b32_low_only_pcs`. For the Unreal kernel it is `complete_scalar_pair`: the dead-high proof
+  does **not** apply, since VCC_HI is that shader's loop counter and stays live past the select.
+  `complete_scalar_pair` proves strictly more (it reconstructs the architectural predicate from both
+  physical words rather than discarding the high one).
+
+**What this established and what it did not.** Measured by a live env-gated A/B on *The Plucky
+Squire* `0x3015fd0000` (control vs arm in one binary, same route, back to back): `executed=0
+skipped=6` → `executed=6 skipped=0`, with no further reject behind it. That is a claim about
+**programs executing**, which is the contract. It is **not** a claim that any image changed — see the
+#2481 row in *Ruled out*, where widening this same family for GTA V left the terminal byte-identical.
+#2747's own prediction is that this restores a lighting pass and moves **no** title off its rung.
+
+Scope, precisely: of the six froxel programs #2747 names, this predicate unblocks **four, across three
+titles** — `PPSA15319` `0x3015fd0000`, `PPSA17942` `0x3017400000`, `PPSA01826` `0x200ea80000` and
+`0x200ead0000`. The other two, `PPSA15319` `0x3015ab0000` and `PPSA05143` `0x30114c0000`, reject on the
+byte-identical `s_mov_b32 s14, m0` (`be8e037c`) and are **not** touched: that half of #2741 needs a
+narrower liveness-proved form, and #134's `kernel X2 … is REJECTED` must not be reverted wholesale.
+Both of those are their titles' *main-view* volumes, so *Plucky Squire* and *Little Nightmares III*
+keep their main froxel pass absent. #2741, #2747.
+
 ## Ruled out
 
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
@@ -231,7 +272,7 @@ without contradictory new evidence.
 
 | Hypothesis | Verdict and evidence | Source |
 |---|---|---|
-| GTA V's `unresolved-operand` rejects at **VCC reads** (`v_mov_b32 v1, vcc_lo`, `v_add_nc_u32 v0, vcc_lo, v0`) mean prosper's **VCC-as-scalar-scratch model is too narrow** — it admits VCC_LO scalar writes only through an enumerated packet list (`is_gtav_wave64_vcc_lo_scalar_cselect`, `is_wave64_vcc_lo_scalar_b32_candidate`, `b32_vcc_scalar_write`), and GTA V also writes VCC_LO with `s_lshl_b32`, `s_mulk_i32`, `s_add_i32`, `s_min_i32` and `v_readfirstlane_b32` | **Falsified — the reject is a symptom three instructions downstream of an unrelated cause.** Widening the write predicate to admit `s_lshl_b32`, extending it in the wave64 MUST dataflow, and adding a dual-domain admission all leave the terminal byte-identical, tested one at a time and then together. `operand_bits` was never the gap either: its `Special` case already reads `rs.sreg[106]` for 106..124. Instrumenting the dataflow gave the actual chain for `0x413d88400`: pc47 `s_mov_b32 s6, s14` makes s6 a MUST scalar word; pc337 **`s_bcnt1_i32_b64 s6, exec`** erases that fact, because `wave64_mask_reduction_source` deliberately returned −1 for architectural EXEC ("already resolved from architectural state by emit_alu"); pc351 `s_lshl_b32 vcc_lo, s6, 2` therefore has a non-scalar source, so VCC_LO's own scalar lifetime is dropped at the pc353 block boundary, and the failure finally surfaces at pc354 in a different register file. emit_alu *can* materialize the reduction, which is why the same packets compile fine inside one block — the coverage arm proving that had passed throughout. **A reject PC names where a fact was consumed, not where it was lost; instrument the MUST dataflow before widening any predicate at the reject site.** | #2481 |
+| GTA V's `unresolved-operand` rejects at **VCC reads** (`v_mov_b32 v1, vcc_lo`, `v_add_nc_u32 v0, vcc_lo, v0`) mean prosper's **VCC-as-scalar-scratch model is too narrow** — it admits VCC_LO scalar writes only through an enumerated packet list (`is_wave64_vcc_lo_scalar_cselect` (then named `is_gtav_…`), `is_wave64_vcc_lo_scalar_b32_candidate`, `b32_vcc_scalar_write`), and GTA V also writes VCC_LO with `s_lshl_b32`, `s_mulk_i32`, `s_add_i32`, `s_min_i32` and `v_readfirstlane_b32` | **Falsified — the reject is a symptom three instructions downstream of an unrelated cause.** Widening the write predicate to admit `s_lshl_b32`, extending it in the wave64 MUST dataflow, and adding a dual-domain admission all leave the terminal byte-identical, tested one at a time and then together. `operand_bits` was never the gap either: its `Special` case already reads `rs.sreg[106]` for 106..124. Instrumenting the dataflow gave the actual chain for `0x413d88400`: pc47 `s_mov_b32 s6, s14` makes s6 a MUST scalar word; pc337 **`s_bcnt1_i32_b64 s6, exec`** erases that fact, because `wave64_mask_reduction_source` deliberately returned −1 for architectural EXEC ("already resolved from architectural state by emit_alu"); pc351 `s_lshl_b32 vcc_lo, s6, 2` therefore has a non-scalar source, so VCC_LO's own scalar lifetime is dropped at the pc353 block boundary, and the failure finally surfaces at pc354 in a different register file. emit_alu *can* materialize the reduction, which is why the same packets compile fine inside one block — the coverage arm proving that had passed throughout. **A reject PC names where a fact was consumed, not where it was lost; instrument the MUST dataflow before widening any predicate at the reject site.** | #2481 |
 | A synthetic kernel reproducing that shape (EXEC popcount, a guard, a consume past the merge) is enough to regression-test it | **Falsified.** Three synthetic shapes were built, including one whose guarded block contains an unpredicated scalar write live at the merge specifically to defeat `safe_execz_branches`. All three compiled on **both** sides of the fix: the structured/linearizing routes claim them before the CFG dispatcher — whose block-entry filter is the defect — ever runs. The exact production kernel plus its exact routed resource table **does** discriminate, and that is what `test_exec_population_count` pins; whether some smaller synthetic could also discriminate was not established, so read this row as "three attempts failed" rather than as a proof of minimality. | #2481 |
 | GTA V's counted **`structured emission stopped` sites are an independent CFG family** that needs 28 separate structurizer fixes | **Falsified by program-tagged terminals and offline retries.** The message is a wrapper emitted after compact structured emission has already stopped at an earlier instruction/resource rejection. In the phase-anchored 28-tuple census every wrapper's `next-pc` matched the same invocation's earlier terminal PC; later exact fixes at `0x413cf6100`, `0x413cf5400`, `0x413e19200`, `0x413e1ac00`, and `0x413cf9200` removed the wrapper without any structurizer change. `0x413ce2a00` is the complementary positive control: compact route selection declines on a bottom-tested EXEC loop, but the generic dispatcher compiles it successfully, so its `backward else` line is route-selection noise rather than a skip. Attribute only program-tagged terminal records; stderr from concurrent shader compilations interleaves. | #2481 |
 | GTA V `0x413dc6700` should receive a **fixed traversal-loop cap** to prevent the recurring RADV device loss | **Falsified as guest semantics.** Its sole backedge is the pc88..97 parent-link traversal and exits when `(parent_word >> 3) & 0x07ffffff` becomes zero; the shader contains no intrinsic numeric trip bound. Captured healthy `0x413ce6000 -> 0x413dc3400 -> 11 x 0x413dc6700` chains replay with an acyclic parent graph (observed maximum depth 6). The live guilty recovery follows a skipped/rejected `0x413ce6000` producer state, so a cap would conceal bad upstream data and truncate a valid deeper graph rather than implement RDNA2. Repair the producer/resource gap; keep the consumer loop exact. | #2481 |

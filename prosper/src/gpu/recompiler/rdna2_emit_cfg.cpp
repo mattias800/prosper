@@ -2266,7 +2266,7 @@ bool emit_cfg_state_machine(
             };
             const bool valid_scc_read = !reads_scc(in) || scalar_scc;
             const bool b32_vcc_scalar_write =
-                is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
+                is_wave64_vcc_lo_scalar_cselect(in) ||
                 (in.fmt == Rdna2Format::SOP2 &&
                  (in.dst.value == 106 || in.dst.value == 107) &&
                  in.opcode >= 0x0e && in.opcode <= 0x1c &&
