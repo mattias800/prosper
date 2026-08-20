@@ -254,8 +254,15 @@ Squire* `0x3015fd0000` (control vs arm in one binary, same route, back to back):
 skipped=6` → `executed=6 skipped=0`, with no further reject behind it. That is a claim about
 **programs executing**, which is the contract. It is **not** a claim that any image changed — see the
 #2481 row in *Ruled out*, where widening this same family for GTA V left the terminal byte-identical.
-#2747's own prediction is that this restores a lighting pass in four titles and moves **none** of
-them off its rung. #2741, #2747.
+#2747's own prediction is that this restores a lighting pass and moves **no** title off its rung.
+
+Scope, precisely: of the six froxel programs #2747 names, this predicate unblocks **four, across three
+titles** — `PPSA15319` `0x3015fd0000`, `PPSA17942` `0x3017400000`, `PPSA01826` `0x200ea80000` and
+`0x200ead0000`. The other two, `PPSA15319` `0x3015ab0000` and `PPSA05143` `0x30114c0000`, reject on the
+byte-identical `s_mov_b32 s14, m0` (`be8e037c`) and are **not** touched: that half of #2741 needs a
+narrower liveness-proved form, and #134's `kernel X2 … is REJECTED` must not be reverted wholesale.
+Both of those are their titles' *main-view* volumes, so *Plucky Squire* and *Little Nightmares III*
+keep their main froxel pass absent. #2741, #2747.
 
 ## Ruled out
 
