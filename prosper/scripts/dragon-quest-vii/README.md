@@ -69,3 +69,35 @@ The title is animated. Some retained frames currently show a dark/purple
 background behind the stable logo while adjacent frames show the expected sky
 and ocean. Treat that as a separate flicker/animation investigation; do not
 suppress the final opaque-black Slate background draw, which is authored state.
+
+## Opening chapter — `reach-gameplay.pad`
+
+`reach-gameplay.pad` continues past the title: new adventure log, save slot, name entry, the four
+first-run System Settings screens, and into the opening chapter in Estard. Run it with the same
+recipe as the title route.
+
+**Read the control model before editing it — three of these are not guessable from the screen.**
+
+- **`OPTIONS` is the jump-to-OK shortcut on the player-name keyboard.** The cursor starts on `A`,
+  cross types the highlighted letter, and cross alone never leaves the letter grid. One `options`
+  press moves the cursor straight to the on-screen `OK` cell. (`options` does nothing on any other
+  screen in this flow, so a stray one is harmless.)
+- **Cross on `OK` with an empty field raises a "No name has been entered." modal**, which then eats
+  the next press. Type at least one character first.
+- **Cross on `Back` cancels the whole name entry** back to the slot list. `Back` sits directly above
+  `OK` in the same column and the column wraps vertically, so an extra `down` lands on it.
+- **The two System Settings menus have different row counts.** 3/4 (camera) has four rows — vertical
+  axis, horizontal axis, revert, confirm — so three `down`s reach Confirm. 4/4 (brightness) has
+  three, so two do; a third wraps back to the bar. Cross on a value row only toggles that value, so
+  a route that only presses cross sits on these two screens forever.
+
+**Wall-clock anchors are not load-robust on this title, and this route uses them anyway.** Two runs
+of the same binary and the same route reached the title screen at **34 s** and at **76 s**, and the
+whole sequence shifts with it — a second instance of #2764. Every screen in the flow waits
+indefinitely for input, so a late press still advances; what breaks is a press that lands one screen
+early. Drive exploratory work with `PROSPER_PAD_SCRIPT_RELOAD=1` and watch the samples rather than
+trusting the timings, and re-anchor the route if you extend it.
+
+Two independent runs reach Estard, write `GameSaveData000.dat` and render the world. Neither
+demonstrates free player control — see `docs/DRAGON_QUEST_STATUS.md` for exactly what is and is not
+established, and for the state of the composite in that phase.

@@ -112,6 +112,50 @@ when"**, and the gameplay claim rests on the *when* plus the volume, never on th
 that streams on demand the membership form is enough — that is what made it decisive on
 `PPSA19244`. Check which kind of title you have before quoting it.
 
+## 2026-08-20: the route reaches the opening chapter in Estard, and the game writes a save
+
+**Two independent runs on a branch off `82baa409`**, Linux, AMD Radeon 8060S (RADV STRIX_HALO),
+native 3840x2160 through `tools/screenshot`, UE4 recipe, native cadence, isolated `PROSPER_SAVE0`
+and `PROSPER_SAVEDATA_DIR`, `PROSPER_FILELOG=1`. Run A 800/800 samples in 802 s
+(`stop=request-satisfied guest=running status=ok`); run B 1400 samples with the route steered live
+through `PROSPER_PAD_SCRIPT_RELOAD=1`. Both reach the same content state.
+
+| what | run A | run B |
+| --- | --- | --- |
+| title screen | 34 s | 76 s |
+| slot list, `1: Unused` | 63 s | 124 s |
+| player-name keyboard | 84 s | 144 s |
+| name accepted, System Settings 1/4 | 369 s | 299 s |
+| "Adventure log successfully created." | 622 s | 428 s |
+| `GameSaveData000.dat` written | 127,224 B | 127,224 B |
+| `T001_M_PL.umap` + `CS_CP1_001_010_GEvt.umap` loaded | 650.7 s | 443.1 s |
+| first 3D world frames | 662 s | 451 s |
+
+**What is established.** The guest creates a real adventure log — `GameSaveData000.dat`, byte-count
+identical across the two runs, alongside the `SystemSaveData999`/`LanguageSaveData998` that the
+title screen alone produces — then loads Estard's persistent level and the chapter-1 level sequence
+and renders the world: the coastal cliffs, the shrine interior with its standing stones, the harbour
+with its moored boat and palms, a night sky with a correctly rendered moon and stars. The opening
+chapter's script runs: named-character dialogue boxes ("Maribel"), and story lines including
+*"Right, that's enough for one day. Time for me to head back to the castle..."* and *"There's more
+to the world than this island... And we're going to prove it!"*
+
+**What is NOT established: free player control.** Both runs stay inside the scripted opening —
+cinematic letterbox bars are present on most world frames, and a long-window control probe
+(30 s of full left-stick deflection against 30 s neutral, repeated, with confirms confined to the
+neutral gaps) did not produce a clean separation, because by that point the composite had degraded
+to mostly uniform frames and the measurement had nothing to measure. **So this is progress past
+rung 2 without a demonstrated rung 3**; whoever picks this up next should aim the probe at the
+first frames after the chapter script hands over, not at an arbitrary later window.
+
+**The composite is severely degraded throughout the world phase, and it gets worse as the chapter
+runs.** Over run A's world window, 98 of 140 samples carry structured content, 15 are near-white and
+0 near-black; over run B's later window (610-860) it is 99 structured, 19 near-white and **78
+near-black**. Surfaces render as flat black silhouettes or as rainbow-checkerboard noise, water and
+sand read as saturated orange, and whole frames flash uniform white or blue. That is #1486 and
+#1588 in the world rather than in the menus; none of it blocks the progression above, and all of it
+needs its own investigation.
+
 ## Reproduction recipe
 
 Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with unique
