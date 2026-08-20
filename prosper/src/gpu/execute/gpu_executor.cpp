@@ -8510,12 +8510,25 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
             table = build_shader_resources(*hdr, sgprs, kUserSgprs, 0);
             assign_convention_bindings(table, 2);
 
-            // SRT CONTENTS. `srt_size_dw` is the one user-data field prosper parses and never
-            // resolves: build_shader_resources reads sharps and the EUD and has no
-            // shader-resource-table path at all (#2705). The GTA V compute programs that hang the
-            // GPU each declare an SRT while declaring NO sharps and no EUD, so both implemented
-            // paths have nothing to resolve for them -- everything they need is described by a field
-            // that is only ever printed.
+            // SRT CONTENTS. `build_shader_resources` reads sharps and the EUD and has no
+            // shader-resource-table path, and every SRT-declaring header in a routed GTA V gameplay
+            // run declares neither -- `sharps={0,0,0,0} eud=0` on 138,034 of 138,034 headers across
+            // 88 of 88 programs (#2705). So the AGC-header path resolves nothing for them and the
+            // table's own bytes are the only way to see what they describe. Nothing dumps them; this
+            // does.
+            //
+            // WHAT THIS DOES NOT MEAN, because an earlier version of this comment said it and it is
+            // false: prosper is NOT blind to this channel. `add_compute_buffer_resources` (:5665,
+            // called :7570) const-folds descriptors loaded with `s_load_dwordx4/x8 sN, s[ptr:ptr+1],
+            // <imm>` from a user-data table -- see the SrtUse contract in gpu_execute.hpp -- and it
+            // fires on these very programs, e.g. `[compute-table] program 0x205b657200 …
+            // addr=0x20037cf620 stride=32 srt=0x10`. The gap is narrower and stranger than "no path
+            // exists": the recovered key set starts at 0x10 and byte offset 0 never appears in it,
+            // while the shaders do load descriptors there (#2757).
+            //
+            // Recorded at this length because the false version travelled: it was written here, then
+            // into a PR body, and would have been the wording the next agent inherited -- from code,
+            // which outlives the PR that a correction lives in.
             //
             // Deciding that needs the table's own bytes, and nothing dumps them. This does, and
             // deliberately dumps CANDIDATES rather than naming one pointer as the SRT: its position
