@@ -36,6 +36,52 @@ by #1486; the earlier recompiler gap was fixed by #1483.
 > interpolant registers) was fixed by #1411. The old mostly-white `MENUNAME_Title_001` screenshot is
 > historical; the current capture renders the localized Dragon Quest VII logo, sky, and ocean.
 
+## The content oracle for this title: which UE package the guest read
+
+`GAME_COMPAT_ORCHESTRATION.md` records that no aggregate frame metric separates an animating menu
+from gameplay, and that the Unity answer is the `Media/levelNN` scene sequence. This is an Unreal
+title, so that oracle does not apply. The Unreal equivalent is the **IoStore package stream**,
+decoded from a `PROSPER_FILELOG=1` run by `tools/re/iostore_index.py`:
+
+```bash
+python3 tools/re/iostore_index.py \
+    <DUMP_ROOT>/PPSA17942-app0/doll/content/paks/pakchunk0-ps5.utoc --log <run>.log --maps
+```
+
+Why it works here, and why `pak_index.py` does not: `DefaultGame.ini` in this dump sets
+`bUseIoStore=True`, so `pakchunk0-ps5.pak` holds **only** configs, fonts, localization and CRI audio
+banks — 3,967 entries, **zero** `.umap` — while the 17.8 GB `pakchunk0-ps5.ucas` holds 103,274
+packages including all 5,314 maps. The `.utoc` directory index is unencrypted
+(`ContainerFlags = 0x08`, Indexed only), so every read offset resolves to a package path.
+
+The map namespace is semantic, which is what makes it self-checking:
+
+| package prefix | count | what it is |
+| --- | --- | --- |
+| `Map/Product/Title/` | 3 | the title screen — `Title_PL.umap` is the guest's own `GameDefaultMap` in `DefaultEngine.ini` |
+| `Map/Product/World/Field/` | 4,729 | towns (`TNNN`), castles (`CNNN`) and dungeons (`DNNN`), each `_M_` (modern) or `_P_` (past) |
+| `Map/Product/World/Battle/` | 474 | battle arenas |
+| `Map/Product/World/*_PL.umap` | 4 | the per-era persistent levels, e.g. `World_M_PL.umap` |
+
+So "still on the title" and "in a town" are different package prefixes, not different frame
+statistics.
+
+**The instrument was validated outside any run**, by computing a known package's physical `.ucas`
+offset by hand from the container index and checking that the tool names it back — the discipline
+CLAUDE.md requires, because a same-source control tests the discriminator and not the domain:
+
+| package | logical offset | physical offset | resolves |
+| --- | --- | --- | --- |
+| `Map/Product/Title/Title_PL.umap` | `0x248ab0000` | `0x154ebf1e0` | yes, exact |
+| `Map/Product/World/World_M_PL.umap` | `0x249060000` | `0x1550ee210` | yes, exact |
+| `Map/Product/World/Field/F001/T001/T001_M_PL.umap` | `0x299be0000` | `0x18cd2ba30` | yes, exact |
+
+Note the 4.1 GB gap between the two offset spaces at the startup map. A chunk's
+`FIoOffsetAndLength` is a **logical** (uncompressed) offset; a read syscall carries a **physical**
+offset into the packed `.ucas`. Resolving one against the other produces a confident wrong package
+name, which is why the tool goes physical -> compression block -> logical -> chunk and its
+registered self-test pins exactly that step.
+
 ## Reproduction recipe
 
 Direct native Vulkan frontend capture, no diagnostic substitution. Run from `prosper/` with unique
