@@ -182,6 +182,15 @@ class IoStoreToc:
         (self.header_size, self.entry_count, self.block_count, self.block_entry_size,
          self.method_count, self.method_length, self.compression_block_size,
          self.dir_index_size, self.partition_count) = struct.unpack_from('<9I', d, 20)
+        if self.version < 3:
+            # `PartitionCount` arrived with EIoStoreTocVersion::PartitionSize (v3). In v1/v2 those
+            # bytes are reserved and read as **zero**, and UE's own reader normalizes them to one
+            # rather than treating the field as a count -- three local v2 containers report 0.
+            # Normalizing here rather than widening the test below keeps `self.partition_count`
+            # honest for anything that reads it later, and keeps the refusal a simple `> 1`:
+            # tightening that to `!= 1` looks like an obvious cleanup and would silently reject
+            # every v2 container.
+            self.partition_count = 1
         if self.partition_count > 1:
             # A multi-partition container splits its payload across `.ucas` files and an offset
             # carries its partition in `offset / PartitionSize`. Nothing here models that, and the
@@ -377,6 +386,8 @@ def parse_read_log(path: str, container_stem: str = None):
 
 
 def _self_test():
+    import tempfile
+
     # FString round-trips, both encodings.
     assert _read_fstring(struct.pack('<i', 0), 0) == ('', 4)
     blob = struct.pack('<i', 4) + b'abc\0'
@@ -414,6 +425,35 @@ def _self_test():
     # One byte past it: still named, because the nearest chunk start is B's, but NOT exact.
     assert f.physical_to_logical(48) == 65568
     assert f.resolve(48) == ('B.umap', False)
+
+    # Partitions. A 144-byte header with no chunks, no blocks and no directory index is a
+    # complete, layout-exact container, so these exercise the real parser rather than a fake.
+    def _header(version, partition_count):
+        blob = TOC_MAGIC + bytes([version, 0, 0, 0]) + struct.pack(
+            '<9I', 144, 0, 0, 12, 0, 32, 65536, 0, partition_count)
+        return blob + b'\0' * (144 - len(blob))
+
+    with tempfile.NamedTemporaryFile('wb', suffix='.utoc', delete=False) as fh:
+        fh.write(_header(3, 2))
+        multi = fh.name
+    try:
+        IoStoreToc(multi)
+        raise AssertionError('a multi-partition container must be refused, not mis-resolved')
+    except TocError as exc:
+        assert '2 partitions' in str(exc), exc
+    os.unlink(multi)
+
+    # v1/v2 report PartitionCount == 0 because the field did not exist yet. That is NOT zero
+    # partitions and must not be refused -- this arm is what stops the guard above being
+    # "tidied" from `> 1` to `!= 1`, which would reject every v2 container in the local set.
+    for version, declared in ((2, 0), (3, 1)):
+        with tempfile.NamedTemporaryFile('wb', suffix='.utoc', delete=False) as fh:
+            fh.write(_header(version, declared))
+            single = fh.name
+        toc = IoStoreToc(single)
+        assert toc.partition_count == 1, (version, declared, toc.partition_count)
+        assert toc.entry_count == 0 and toc.paths == {}
+        os.unlink(single)
 
     # The directory walk. First a well-formed index — root with one child directory, two files —
     # so the guards below are shown NOT to fire on a valid tree.
@@ -455,7 +495,6 @@ def _self_test():
         assert 'file entry 9 out of range' in str(exc), exc
 
     # Both read-log dialects decode, and the container filter uses the host path from each.
-    import tempfile
     with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as fh:
         fh.write("[apr] read-submit id=1 /d/pakchunk0-ps5.ucas -> dst=0x30(guest) "
                  "off=0x1000 size=64 got=64 OK method=id requested=64\n")
