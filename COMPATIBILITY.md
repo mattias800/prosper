@@ -243,6 +243,7 @@ The main menu and attract-mode gameplay are verified. See the [tracker](https://
 ## Blue Prince — `PPSA25009`
 
 <p align="center"><img src="assets/screenshots/blue-prince-title.png" alt="Blue Prince — title screen"></p>
+<p align="center"><img src="assets/screenshots/blue-prince-hall.png" alt="Blue Prince — Mount Holly entrance-hall gameplay"></p>
 
 The manor entrance hall renders with real 3D gameplay content. See the [tracker](https://github.com/mattias800/prosper/issues/1808).
 
