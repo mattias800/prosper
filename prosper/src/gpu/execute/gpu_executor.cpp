@@ -5845,6 +5845,15 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
         }
         if (u.kind != 1) continue;
         if (u.table_record_count) {
+            // PROSPER_SRTTABLE_LOG=1 -- report why a runtime-selected descriptor table was declined.
+            // The three decline paths below already logged, but only under PROSPER_DBG, which this
+            // project records as producing a ~1.5 GB log and desyncing the pad script badly enough
+            // that the route never reaches the phase being diagnosed. A diagnostic reachable only by
+            // a switch that destroys the repro is not reachable -- the same reasoning that ungated
+            // the `[compute-table]` block in this file. This switch costs nothing when unset and is
+            // bounded by the table count, not by the dispatch count.
+            const bool table_log =
+                std::getenv("PROSPER_SRTTABLE_LOG") || std::getenv("PROSPER_DBG");
             // #2481: a runtime-selected descriptor table. The element is chosen on the GPU, so the
             // binding declares every entry and the emitter indexes it. Re-derive the whole contract
             // from guest memory here rather than trusting the use: a forged SrtUse must not be able
@@ -5856,8 +5865,19 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 u.table_record_count > kMaxSelectedTableRecords ||
                 static_cast<uint64_t>(u.table_element_offset) + 16u > u.table_entry_stride ||
                 (u.table_element_offset % 4u) != 0u || u.table_base <= 0x10000u ||
-                u.table_load_pc == 0xFFFFFFFFu || u.table_load_pc >= dwords)
+                u.table_load_pc == 0xFFFFFFFFu || u.table_load_pc >= dwords) {
+                // Previously a silent `continue`, which is indistinguishable from the table never
+                // having been published at all -- the two have completely different causes and the
+                // log could not tell them apart.
+                if (table_log)
+                    std::fprintf(stderr,
+                                 "[srt] selected-table pc=%u REJECTED shape fmt=%u zero_record=%d "
+                                 "stride=%u records=%u element=%u base=0x%llx load_pc=%u dwords=%zu\n",
+                                 u.use_pc, u.instruction_format, (int)u.zero_record_raw,
+                                 u.table_entry_stride, u.table_record_count, u.table_element_offset,
+                                 (unsigned long long)u.table_base, u.table_load_pc, dwords);
                 continue;
+            }
             // Every element must be a readable, individually valid V#. One malformed entry rejects
             // the whole table: binding a partially populated descriptor array would let the guest's
             // own index select a slot prosper never resolved, which renders confidently wrong
@@ -5893,7 +5913,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 // inversion as the unsupported case below, one category over, so it declines the
                 // whole table exactly as it did before this change.
                 if (!guest_readable(entry_addr, static_cast<uint32_t>(sizeof(words)))) {
-                    if (std::getenv("PROSPER_DBG"))
+                    if (table_log)
                         std::fprintf(stderr,
                                      "[srt] selected-table pc=%u REJECTED unreadable-record "
                                      "index=%u addr=0x%llx\n",
@@ -5907,14 +5927,28 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 entry = decode_buffer_descriptor(words.data());
                 // Only a record we READ and that does not look like a descriptor at all may be
                 // nulled: a stale arena slot the guest never indexes.
-                const bool not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
+                // A record whose BASE IS NOT MAPPED cannot be a descriptor the guest would select:
+                // selecting it would fault on first access. It is a stale arena slot, which is
+                // exactly the case this classification exists to null. Without this test the
+                // heuristic is `base > 0x10000 && size != 0`, which ordinary float data passes
+                // trivially -- measured on PPSA04263, `0x413ce6000` pc=156 declines its whole table
+                // on records like `base=0x4d0cbd9054e2 size=4294967295`, an 85 TiB address that is
+                // plainly not a descriptor. Declining the table there converts a nullable stale slot
+                // into a rejected program (#2481).
+                //
+                // Only the FIRST dword pair is probed, not the whole span: a descriptor's declared
+                // size may legitimately exceed what is currently resident, and requiring the entire
+                // range to be mapped would decline real tables.
+                const bool base_mapped = guest_readable(entry.base, 4u);
+                const bool not_a_descriptor =
+                    entry.base <= 0x10000u || entry.size_bytes == 0u || !base_mapped;
                 const bool unsupported_descriptor = !not_a_descriptor &&
                     (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
                 if (unsupported_descriptor) {
                     // Decline the WHOLE table, as before this change. A >256 MiB buffer or an
                     // unrepresentable DST_SEL / USCALED-SSCALED 2_10_10_10 is a descriptor the guest
                     // may well select.
-                    if (std::getenv("PROSPER_DBG"))
+                    if (table_log)
                         std::fprintf(stderr,
                                      "[srt] selected-table pc=%u REJECTED unsupported-record "
                                      "index=%u base=0x%llx size=%u fallback=%d\n",
@@ -5924,11 +5958,14 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                     break;
                 }
                 const bool usable = !not_a_descriptor;
-                if (!usable && std::getenv("PROSPER_DBG"))
+                if (!usable && table_log)
                     std::fprintf(stderr,
-                                 "[srt] selected-table pc=%u NULL-SLOT index=%u "
+                                 "[srt] selected-table pc=%u NULL-SLOT index=%u why=%s "
                                  "words=%08x:%08x:%08x:%08x\n",
-                                 u.use_pc, index, words[0], words[1], words[2], words[3]);
+                                 u.use_pc, index,
+                                 entry.base <= 0x10000u ? "low-base"
+                                     : entry.size_bytes == 0u ? "zero-size" : "base-unmapped",
+                                 words[0], words[1], words[2], words[3]);
                 ShaderBufferTableEntry slot;
                 if (usable) {
                     slot.vsharp = words;
