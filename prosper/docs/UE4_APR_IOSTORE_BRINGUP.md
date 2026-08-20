@@ -17,7 +17,7 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
   [#1673](https://github.com/mattias800/prosper/issues/1673): CRI ADX2 binds through the `id != 0`
   branch with a literal zero tag, so its high-water mark never advances, every completion posted an
   identical `(ident, filter, data=0)` event, and `eq_post`'s level coalescing collapsed N discrete
-  completions into one delivery. A by-hand instance in `tests/test_apr_equeue_completion.cpp`
+  completions into one delivery. A by-hand instance in `tests/hle/test_apr_equeue_completion.cpp`
   reproduces it on the pre-fix code. **But it never fires on the measured PPSA19991 route.** Two
   independent 150–180 s headless `boot_trace` runs with `PROSPER_EVLOG=1`: **0** coalesce-replace
   events on the APR filter (`-24`), and the CRI equeue's waits and deliveries balance exactly

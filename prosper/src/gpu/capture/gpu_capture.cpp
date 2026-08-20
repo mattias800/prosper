@@ -41,7 +41,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/uio.h>
 #include <unistd.h>
-#include "host/posix_shim.hpp"
+#include "host/platform/posix_shim.hpp"
 #endif
 
 namespace prosper::gpu {

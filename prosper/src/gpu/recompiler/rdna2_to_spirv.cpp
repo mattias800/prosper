@@ -16834,7 +16834,7 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // (This paragraph used to end "and covering all three emitters means the answer is not confined to
 // one lowering path" — the very claim the paragraph above corrects. The correction landed two lines
 // up and the boast survived underneath it, which is how a retracted statement keeps being read as
-// current. `tests/test_cfg_trip_bound.cpp` now pins both halves: a structured loop is unchanged when
+// current. `tests/shared/diagnostics/test_cfg_trip_bound.cpp` now pins both halves: a structured loop is unchanged when
 // armed, a dispatcher loop is not.)
 //
 // Unset, nothing is emitted and modules are byte-identical. It is NOT a fix: truncating a guest

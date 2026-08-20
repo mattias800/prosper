@@ -3,7 +3,7 @@
 // Built only when -DPROSPER_PAD_SDL3=ON. Installs an SDL_Gamepad-backed PadBackend so a real
 // controller drives the guest. SDL_Gamepad is cross-platform (Windows/Linux/macOS) and ships a
 // controller-mapping database, so it needs no per-device button/axis guesswork. The core HLE
-// (src/hle/hle_pad.cpp) has no knowledge of SDL — this frontend lives outside prosper_core and
+// (src/hle/input/hle_pad.cpp) has no knowledge of SDL — this frontend lives outside prosper_core and
 // plugs in at runtime.
 #pragma once
 

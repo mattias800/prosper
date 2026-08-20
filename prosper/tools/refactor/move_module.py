@@ -23,6 +23,13 @@ the test suite decide whether it was right. A pure move has two independent chec
 `verify_pure_move.py` for textual identity and ctest for behavioural identity -- and neither depends
 on anyone reading a large diff carefully.
 
+DRY-RUN COUNTS OVERSTATE THE PATH PASS, and the mechanism is worth knowing before you read one as
+a preview. The passes run in order -- includes, then paths -- and a dry run applies neither, so the
+path pass still sees include lines the include pass would have already rewritten. `#include
+"../src/hle/dispatch/dispatch.hpp"` contains `src/hle/dispatch/dispatch.hpp` as a substring, so it is counted twice.
+Measured on the src/hle move: 240 path citations predicted, 45 actual. The dry run is exact for the
+moves and the includes; treat its path number as an upper bound.
+
   # dry run first, always
   python3 prosper/tools/refactor/move_module.py --plan prosper/tools/refactor/gpu_layout.txt --dry-run
   python3 prosper/tools/refactor/move_module.py --plan prosper/tools/refactor/gpu_layout.txt
@@ -37,6 +44,24 @@ import subprocess
 import sys
 
 SUFFIXES = (".cpp", ".hpp", ".h")
+
+
+def read_exact(path: pathlib.Path) -> str:
+    """Read without newline translation.
+
+    `Path.read_text()` opens in universal-newline mode, which turns every CRLF into LF in the string
+    it returns; writing that back produces LF. So merely LOADING a CRLF file to rewrite one include
+    rewrites every line in it. Measured: docs/ROADMAP.md came back as 312 insertions and 312
+    deletions for a one-line path citation, and the resulting diff is unreviewable -- which is
+    exactly when a real change hides.
+    """
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def write_exact(path: pathlib.Path, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
 
 
 def repo_root() -> pathlib.Path:
@@ -71,7 +96,8 @@ def tracked_text_files(root: pathlib.Path, keep: tuple[str, ...]) -> list[pathli
 SOURCE_SUFFIXES = (".cpp", ".hpp", ".h")
 # The path pass reaches further than the include pass on purpose: the ledgers it must keep honest
 # are .txt and .py, and the citations it must keep resolvable are .md.
-CITING_SUFFIXES = SOURCE_SUFFIXES + (".txt", ".cmake", ".md", ".py", ".ps1", ".json", ".yml", ".yaml")
+CITING_SUFFIXES = SOURCE_SUFFIXES + (".txt", ".cmake", ".md", ".py", ".ps1", ".sh", ".json",
+                                    ".yml", ".yaml")
 
 
 def main() -> int:
@@ -103,24 +129,66 @@ def main() -> int:
     missing: list[str] = []
     for name, folder in sorted(assignment.items()):
         found = False
-        for s in SUFFIXES:
-            here, there = src_root / f"{name}{s}", src_root / folder / f"{name}{s}"
-            if here.exists():
+        for suffix in SUFFIXES:
+            # Search the WHOLE subtree, not just its top level. A plan is re-run after it is edited
+            # -- a test placed in the wrong folder has to move from where it IS, not from where it
+            # started -- and a top-level-only lookup reports every already-moved module as missing,
+            # which prints as a warning and then does nothing.
+            here = src_root / f"{name}{suffix}"
+            if not here.exists():
+                matches = sorted(src_root.rglob(f"{name}{suffix}"))
+                if len(matches) > 1:
+                    sys.exit(f"{name}{suffix} exists at {len(matches)} paths under {src_root}: "
+                             f"{', '.join(str(m) for m in matches)}; the plan is keyed by module "
+                             f"name and cannot express that")
+                if not matches:
+                    continue
+                here = matches[0]
+            there = src_root / folder / f"{name}{suffix}"
+            found = True
+            if here.resolve() != there.resolve():
                 moves.append((here, there))
-                found = True
-            elif args.paths_only and there.exists():
-                moves.append((here, there))   # already moved; the pair is still what rewrites need
-                found = True
+            elif args.paths_only:
+                moves.append((src_root / f"{name}{suffix}", there))
         if not found:
             missing.append(name)
     if missing:
         print(f"  WARNING {len(missing)} module(s) in the plan do not exist: {' '.join(missing)}")
 
     header_names = {p.name for p, _ in moves if p.suffix in (".hpp", ".h")}
-    include_target = {p.name: f"{args.include_prefix}/{assignment[p.stem]}/{p.name}"
+    # An EMPTY prefix is meaningful, not a mistake: prosper/tests is itself the include root (it is
+    # already one for 8 targets), so its canonical form is `fixtures/render_runner.h` with no
+    # subsystem component. Joining unconditionally produced a leading slash and an absolute path.
+    def canonical(name: str, folder: str) -> str:
+        return "/".join(x for x in (args.include_prefix, folder, name) if x)
+
+    include_target = {p.name: canonical(p.name, assignment[p.stem])
                       for p, _ in moves if p.suffix in (".hpp", ".h")}
 
     print(f"  {len(moves)} file(s) to move into {len(set(assignment.values()))} folder(s)")
+
+    # --- the guard that makes the include rewrite safe ------------------------------------------
+    # The include rewrite anchors on the header's BASENAME, which is what lets it collapse every
+    # spelling a consumer happened to use -- `"x.hpp"`, `"../src/gpu/x.hpp"`, `"../../hle/x.hpp"` --
+    # into one canonical form without knowing which. That is only sound while a basename names
+    # exactly one header in the repository. If two directories both hold `audio.hpp`, the rewrite
+    # would silently repoint the OTHER one's consumers at the moved file: a different translation
+    # unit, no error, and it still compiles. Nothing downstream can see that -- not the build, not
+    # the suite, not a reviewer reading a diff of 400 identical-looking include lines.
+    #
+    # So the precondition is checked rather than assumed. Measured on this repository: zero
+    # duplicate header basenames, which is why the rewrite is safe here and why an abort is the
+    # right response to that ceasing to be true.
+    all_headers: dict[str, list[str]] = {}
+    for path in tracked_text_files(root, (".hpp", ".h")):
+        all_headers.setdefault(path.name, []).append(str(path.relative_to(root)))
+    collisions = {n: v for n, v in all_headers.items()
+                  if n in {p.name for p, _ in moves if p.suffix in (".hpp", ".h")} and len(v) > 1}
+    if collisions:
+        for name, paths in sorted(collisions.items()):
+            print(f"  [FAIL] {name} names {len(paths)} headers: {', '.join(paths)}")
+        sys.exit("a moved header's basename is not unique; the include rewrite would silently "
+                 "repoint the other one's consumers. Rename one, or move them together.")
 
     # --- 1. the moves ---------------------------------------------------------------------------
     for old, new in moves:
@@ -140,7 +208,7 @@ def main() -> int:
     rewritten_lines = 0
     for path in tracked_text_files(root, SOURCE_SUFFIXES):
         try:
-            text = path.read_text()
+            text = read_exact(path)
         except UnicodeDecodeError:
             continue
 
@@ -159,8 +227,55 @@ def main() -> int:
         if new_text != text:
             rewritten_files += 1
             if not args.dry_run:
-                path.write_text(new_text)
+                write_exact(path, new_text)
     print(f"  {rewritten_lines} include(s) rewritten across {rewritten_files} file(s)")
+
+    # --- 2b. relative includes inside the moved files -------------------------------------------
+    # Pass 2 fixes how the WORLD includes a moved header. This fixes how a moved file includes
+    # everything else: `#include "../self/module.hpp"` resolved from src/hle, and resolves from
+    # nowhere once the file sits in src/hle/dispatch. Every such include is broken by the move, and
+    # each one costs a full build to discover -- the compiler reports the first and stops.
+    #
+    # Resolved, not pattern-matched. Each relative include is resolved against the file's OLD
+    # directory; if the result is a real file under src, it is rewritten to its src-relative form,
+    # which is depth-independent and so survives the next move too. A hardcoded list of subsystem
+    # names would have been shorter and would silently skip anything not on the list -- and an
+    # include the tool declines to fix is one the build reports as the tool's success.
+    rel_re = re.compile(r'#include\s+"([^"<>]+)"')
+    src_dir = root / "prosper" / "src"
+    fixed_rel = 0
+    unresolved: list[str] = []
+    for old, new_path in moves:
+        if new_path.suffix not in SOURCE_SUFFIXES or args.dry_run or not new_path.exists():
+            continue
+        text = read_exact(new_path)
+
+        def fix(m: re.Match) -> str:
+            nonlocal fixed_rel
+            spelling = m.group(1)
+            if not spelling.startswith((".", "/")) and "/" in spelling:
+                return m.group(0)          # already a src-relative form
+            target = (old.parent / spelling).resolve()
+            if not target.exists():
+                if spelling.startswith("."):
+                    unresolved.append(f"{new_path.name}: {spelling}")
+                return m.group(0)
+            try:
+                canonical = target.relative_to(src_dir.resolve())
+            except ValueError:
+                return m.group(0)          # outside src: leave it to the author
+            if str(canonical) == spelling:
+                return m.group(0)
+            fixed_rel += 1
+            return f'#include "{canonical}"'
+
+        new_text = rel_re.sub(fix, text)
+        if new_text != text:
+            write_exact(new_path, new_text)
+    print(f"  {fixed_rel} relative include(s) inside moved files re-anchored to src")
+    if unresolved:
+        print(f"  WARNING {len(unresolved)} relative include(s) could not be resolved and were left "
+              f"alone: {', '.join(unresolved[:6])}")
 
     # --- 3. path citations ----------------------------------------------------------------------
     # A move invalidates far more than `#include` lines, and the remainder is where a move goes
@@ -183,7 +298,7 @@ def main() -> int:
     path_edits = 0
     for path in tracked_text_files(root, CITING_SUFFIXES):
         try:
-            text = path.read_text()
+            text = read_exact(path)
         except UnicodeDecodeError:
             continue
         new_text, edits = text, 0
@@ -194,7 +309,7 @@ def main() -> int:
             path_files += 1
             path_edits += edits
             if not args.dry_run:
-                path.write_text(new_text)
+                write_exact(path, new_text)
     print(f"  {path_edits} path citation(s) rewritten across {path_files} file(s)")
 
     if args.dry_run:

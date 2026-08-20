@@ -426,7 +426,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     wrong, and this line kept publishing it for a day after it was retracted.** The capture predated
     #2243's backend sub-buckets, so the only buffer figure in it was the *frontend* materializer's,
     while the leaf two lanes were actually optimising — `res_buffer_copy_ms`, the backend memcpy at
-    `tests/render_runner.h:5199` — was invisible to it. Re-captured with the sub-buckets live and the
+    `tests/fixtures/render_runner.h:5199` — was invisible to it. Re-captured with the sub-buckets live and the
     collapse confirmed by flip rate (1.59/s): `setup_resources 801.9ms [buffer=673.4 (copy=539.2) …]`,
     i.e. **~67%**, not 2.4%. Two independent instruments agree it is large in the collapsed regime and
     on both platforms — `PROSPER_RENDER_TIMING` gives copy/backend **15.7%** on Linux and **18.5%** on
@@ -443,8 +443,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   to run the live renderer and `PROSPER_GFXLOG=1` for graphics diagnostics.
   - **`PROSPER_GUEST_FS=1` is NOT needed on Linux or Windows, and this line used to say it was.** Guest
     initial-exec TLS is **enabled by default** there; the environment variable actually read is the
-    **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/guest_tls.cpp:58`,
-    `:240`; `src/hle/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
+    **opt-OUT** `PROSPER_NO_GUEST_FS`, kept for compatibility bisection (`src/host/tls/guest_tls.cpp:58`,
+    `:240`; `src/hle/dispatch/dispatch.hpp:218`). `PROSPER_GUEST_FS` is never read as an env var on those
     platforms — setting it is harmless but does nothing, and *believing* it is required is not: it
     turns a default-on path into one people think they are enabling, so nobody checks it when a guest
     TLS problem is the actual cause. On **macOS/Rosetta** `PROSPER_GUEST_FS` does remain the opt-in for
@@ -472,7 +472,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   lines from the live backend, then implement it with a round-trip/execution test — do not leave it skipped.
 - **Entitlement and add-content APIs answer from LOCAL INVENTORY — never blanket-approve.** When a
   title asks whether an add-on or entitlement is owned, prosper answers from the content actually
-  declared and present locally (`src/hle/hle_addcontent.cpp` parses real entitlement labels and keys
+  declared and present locally (`src/hle/service/hle_addcontent.cpp` parses real entitlement labels and keys
   and rejects malformed or duplicated ones). That is the right design for a preservation tool, and it
   is deliberate: a compatibility layer must keep working when the licensing service it would
   otherwise consult no longer exists, so the answer has to be derivable offline.

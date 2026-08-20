@@ -1,7 +1,7 @@
 // nid_census — which of a title's imports fall to the dispatcher's return-0 default?
 //
 // An import prosper does not register never reaches a handler: `prosper_on_unimpl` logs it once and
-// returns 0 (src/hle/dispatch.cpp). For a contract whose success code is 0 — i.e. most `SCE_OK`
+// returns 0 (src/hle/dispatch/dispatch.cpp). For a contract whose success code is 0 — i.e. most `SCE_OK`
 // functions — that 0 IS "success", so the guest is told an operation completed that never ran, and
 // any out-parameter the call was supposed to fill is left holding whatever was already there. That
 // is strictly worse than an error return: the failure is silent at the call site and surfaces
@@ -42,10 +42,10 @@
 // pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
 // any disagreement: the name table is the instrument this tool reads the census through, so it
 // gets a control of its own rather than being trusted.
-#include "host/boot_program.hpp"
+#include "host/image/boot_program.hpp"
 #include "../common/nid_stub_names.hpp"
-#include "../../src/hle/dispatch.hpp"
-#include "../../src/hle/nid.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
 #include "../../src/loader/linker.hpp"
 #include "../../src/self/module.hpp"
 

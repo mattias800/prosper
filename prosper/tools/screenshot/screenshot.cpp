@@ -47,11 +47,11 @@
 // For other titles, set the appropriate env before running (e.g. a UE4 title:
 // PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1).
 #include "loader/linker.hpp"          // Program
-#include "host/boot_program.hpp"       // boot_program
-#include "host/exec_image.hpp"         // run_entry
+#include "host/image/boot_program.hpp"       // boot_program
+#include "host/image/exec_image.hpp"         // run_entry
 #include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
 #include "gpu/timeline/gpu_timeline.hpp"
-#include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
+#include "shared/live/live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode

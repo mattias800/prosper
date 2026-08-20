@@ -116,7 +116,7 @@ replay uses the same volume footprint. CONFIDENCE: HIGH for the observed 16-pipe
 `src/gpu/texture/tile.cpp` — `kSw64kS` / `kSw64kRX` tables + `sw64kb_copy` walk; dispatched from
 `tile_mode_is_tiled` / `tiled_surface_bytes` / `detile_surface` / `tile_surface` /
 `tiled_elements_bytes` / `detile_elements`. The SW_4KB_S path is untouched (The Messenger
-regression-verified). Tests: `tests/test_tile.cpp` (round-trips at all 5 element sizes for both
+regression-verified). Tests: `tests/gpu/texture/test_tile.cpp` (round-trips at all 5 element sizes for both
 modes + addrlib golden byte positions). Refs: #288 (this work), #282 (the reframe), #119/#118
 (the 4KB groundwork).
 

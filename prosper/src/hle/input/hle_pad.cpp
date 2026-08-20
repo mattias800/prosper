@@ -1,0 +1,623 @@
+// hle_pad.cpp — libScePad HLE: real game-controller input.
+//
+// Replaces the earlier zero-filling pad stubs (hle_service.cpp) with a correct ScePadData/
+// ScePadControllerInformation contract. Input comes from a pluggable PadBackend (input/pad.hpp):
+// prosper_core's default is neutral/disconnected, and a host frontend (SDL3 gamepad or Linux evdev,
+// under frontends/) installs itself from the harness — so this file, and all of prosper_core, is
+// free of host-device code and fully unit-testable.
+//
+// This also fixes a latent stub bug: the old scePadReadState wrote only 48 of the 120-byte struct,
+// leaving connected/timestamp/count uninitialized. The full struct is now filled.
+//
+// Diagnostics: PROSPER_PADLOG traces calls; PROSPER_PAD_PRESS injects a connected pad with CROSS
+// held (hardware-free way to drive a "Press [button]" screen / verify the full path). CONFIDENCE:
+// HIGH (contract), MED (which titles gate on `connected`).
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "input/pad.hpp"
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace prosper {
+
+using namespace prosper::input;
+
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5)
+#define PW(x) ((void*)(uintptr_t)(x))
+
+namespace {
+
+std::atomic<int> g_pad_handle{1};
+std::mutex g_pad_handle_mx;
+
+// The (userId, portType, index) triple a handle was opened with. scePadGetHandle asks "which handle
+// did THIS process already open for this triple?", so an open handle is only answerable through the
+// arguments that created it -- a bare set of handles cannot answer that question truthfully.
+struct PadOpenKey {
+    int32_t user_id;
+    int32_t type;
+    int32_t index;
+    bool operator==(const PadOpenKey& o) const {
+        return user_id == o.user_id && type == o.type && index == o.index;
+    }
+};
+// handle -> the triple it was opened with. Membership is still "this handle is open".
+std::unordered_map<int32_t, PadOpenKey> g_pad_handles;
+
+constexpr uint64_t kPadErrorInvalidHandle =
+    (uint64_t)(int64_t)(int32_t)0x80920003u;
+
+// Retain handle validity through each input operation so Close cannot retire the handle between
+// validation and its poll/output side effects.
+class PadHandleGuard {
+public:
+    explicit PadHandleGuard(uint64_t handle)
+        : lock_(g_pad_handle_mx),
+          valid_(g_pad_handles.contains((int32_t)handle)) {}
+
+    bool valid() const { return valid_; }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    bool valid_;
+};
+
+// PROSPER_PADLOG=1: trace pad calls (rate-limited) so a boot run shows the game polling input.
+bool padlog() { static const bool on = getenv("PROSPER_PADLOG") != nullptr; return on; }
+bool pad_script_log() { static const bool on = getenv("PROSPER_PAD_SCRIPT_LOG") != nullptr; return on; }
+void padlog_once(const char* what, const HostPadState* s) {
+    if (!padlog()) return;
+    static std::atomic<int> n{0};
+    int i = n.fetch_add(1);
+    if (i < 8 || (i % 512) == 0) {
+        if (s) fprintf(stderr, "[pad] %s call#%d connected=%d buttons=0x%x lx=%02x ly=%02x\n",
+                       what, i, (int)s->connected, s->buttons, s->left_x, s->left_y);
+        else   fprintf(stderr, "[pad] %s call#%d\n", what, i);
+    }
+}
+
+// Monotonic microsecond timestamp for the report (Sony fills a process-time stamp).
+uint64_t now_us() {
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// --- PROSPER_PAD_SCRIPT: hardware-free timed button sequence -------------------------------------
+// Drives a scripted controller so a headless run can navigate menus and gameplay with no host device.
+// Format: a ';'-separated list of "<anchor>:<action>[+..]" entries; actions are buttons or full-stick
+// directions such as "left-stick-left". Prefix with '@' to load a route
+// file; files may use newlines, comments, and explicit ranges such as "f300-340:cross" and
+// "p1200-1240:cross". Time points use PROSPER_PAD_HOLD ms (default 300); flip points use
+// PROSPER_PAD_FRAME_HOLD (default 8); pad-read points use PROSPER_PAD_READ_HOLD (default 8). When a
+// script is set the pad reports
+// CONNECTED for the whole run (a menu that gates on a controller sees one).
+//
+// Timing is anchored to the FIRST pad poll, not process start: the game only polls once it reaches
+// the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
+// CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
+// The parse + time-eval live in pad.cpp (pure, unit-tested); this file supplies getenv + the clock.
+double pad_hold_secs();
+int64_t pad_frame_hold();
+int64_t pad_read_hold();
+
+struct PadScriptFileStamp {
+    std::filesystem::file_time_type write_time{};
+    uintmax_t size = 0;
+
+    bool operator==(const PadScriptFileStamp& other) const {
+        return write_time == other.write_time && size == other.size;
+    }
+};
+
+std::optional<PadScriptFileStamp> pad_script_file_stamp(const std::filesystem::path& path,
+                                                        std::string& error) {
+    std::error_code ec;
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        error = "cannot stat route file: " + path.string() + ": " + ec.message();
+        return std::nullopt;
+    }
+    const uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        error = "cannot size route file: " + path.string() + ": " + ec.message();
+        return std::nullopt;
+    }
+    error.clear();
+    return PadScriptFileStamp{write_time, size};
+}
+
+// Long exploratory boots can discover a new prompt minutes into a route. Opt-in @file reload keeps
+// the original time/flip/read anchors while allowing future windows to be appended without rebooting.
+// A changed stamp must remain stable across two 250 ms polls, and a replacement is published only
+// after a complete read whose metadata is still unchanged. Pad readers serialize here, so no thread
+// can observe a vector while another replaces it.
+class PadScriptRuntime {
+public:
+    PadScriptRuntime() {
+        const char* env = getenv("PROSPER_PAD_SCRIPT");
+        if (!env || !*env) return;
+        source_ = env;
+        live_reload_ = source_[0] == '@' && getenv("PROSPER_PAD_SCRIPT_RELOAD") != nullptr;
+        if (source_[0] == '@') path_ = source_.substr(1);
+
+        std::string error;
+        script_ = load_pad_script(source_, &error);
+        const bool initial_load_succeeded = error.empty();
+        if (!error.empty()) log_error(error);
+        if (live_reload_) {
+            const auto stamp = pad_script_file_stamp(path_, error);
+            if (initial_load_succeeded) applied_stamp_ = stamp;
+            if (!error.empty()) log_error(error);
+            fprintf(stderr, "[pad] live route reload enabled for %s\n", path_.string().c_str());
+        }
+        // A route that loaded without error and still parsed to zero entries is configured-but-inert,
+        // and it used to be indistinguishable from a working one (#2439). The symptom is a title that
+        // sits on its first screen, which reads as a title or emulator defect and sends the reader
+        // after the guest. One measured instance: a 300 s GTA V run reached 13,320 frames at a
+        // sustained 62 fps with no phase change, because the route was passed without its leading '@'
+        // and was therefore parsed as an INLINE route that yields nothing.
+        if (initial_load_succeeded) {
+            const std::string warning =
+                pad_script_empty_route_warning(source_, script_.empty());
+            if (!warning.empty()) fprintf(stderr, "%s\n", warning.c_str());
+        }
+    }
+
+    bool configured() const { return !source_.empty(); }
+
+    PadScriptState state_at(double elapsed, int64_t frame, int64_t read) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refresh_locked();
+        return pad_script_state_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold(),
+                                   read, pad_read_hold());
+    }
+
+private:
+    void log_error(const std::string& error) {
+        if (error == last_error_) return;
+        last_error_ = error;
+        fprintf(stderr, "[pad] PROSPER_PAD_SCRIPT: %s\n", error.c_str());
+    }
+
+    void refresh_locked() {
+        if (!live_reload_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_check_) return;
+        next_check_ = now + std::chrono::milliseconds(250);
+
+        std::string error;
+        const auto stamp = pad_script_file_stamp(path_, error);
+        if (!stamp) {
+            log_error(error);
+            return;
+        }
+        if (applied_stamp_ && *stamp == *applied_stamp_) {
+            pending_stamp_.reset();
+            last_error_.clear();
+            return;
+        }
+        if (!pending_stamp_ || !(*stamp == *pending_stamp_)) {
+            pending_stamp_ = stamp;
+            return;
+        }
+
+        auto replacement = load_pad_script(source_, &error);
+        if (!error.empty()) {
+            log_error(error);
+            return;
+        }
+        const auto after = pad_script_file_stamp(path_, error);
+        if (!after) {
+            log_error(error);
+            return;
+        }
+        if (!(*after == *stamp)) {
+            pending_stamp_ = after;
+            return;
+        }
+
+        script_ = std::move(replacement);
+        applied_stamp_ = after;
+        pending_stamp_.reset();
+        last_error_.clear();
+        fprintf(stderr, "[pad] reloaded route %s (%zu entries)\n",
+                path_.string().c_str(), script_.size());
+    }
+
+    std::mutex mutex_;
+    std::string source_;
+    std::filesystem::path path_;
+    std::vector<PadScriptEntry> script_;
+    bool live_reload_ = false;
+    std::optional<PadScriptFileStamp> applied_stamp_;
+    std::optional<PadScriptFileStamp> pending_stamp_;
+    std::chrono::steady_clock::time_point next_check_{};
+    std::string last_error_;
+};
+
+PadScriptRuntime& pad_script_runtime() {
+    static PadScriptRuntime runtime;
+    return runtime;
+}
+
+double pad_hold_secs() {
+    static const double h = [] {
+        const char* e = getenv("PROSPER_PAD_HOLD");
+        return e ? atof(e) / 1000.0 : 0.30;   // ms -> s
+    }();
+    return h;
+}
+
+// t0 (us) of the first poll; 0 until set. steady_clock so it matches now_us().
+std::atomic<uint64_t> g_pad_t0_us{0};
+
+// Frame anchor: the flip count at the first poll, so `f<N>:` entries measure flips-since-first-poll.
+// prosper_vo_flip_count() is the guest's presented-frame counter (hle_graphics.cpp), boot-speed-
+// invariant — unlike wall-clock it lands the same input on the same game state across builds (#302).
+extern "C" uint64_t prosper_vo_flip_count();
+std::atomic<uint64_t> g_pad_flip0{std::numeric_limits<uint64_t>::max()};
+
+int64_t pad_frame_hold() {   // how many flips to hold a frame-anchored press (default 8)
+    static const int64_t h = [] { const char* e = getenv("PROSPER_PAD_FRAME_HOLD"); return e ? (int64_t)atoll(e) : 8; }();
+    return h;
+}
+
+int64_t pad_frame_now() {
+    const uint64_t flips = prosper_vo_flip_count();
+    uint64_t base = g_pad_flip0.load(std::memory_order_relaxed);
+    if (base == std::numeric_limits<uint64_t>::max()) {
+        g_pad_flip0.compare_exchange_strong(base, flips, std::memory_order_relaxed);
+        base = g_pad_flip0.load(std::memory_order_relaxed);
+    }
+    return flips >= base ? (int64_t)(flips - base) : 0;
+}
+
+// Pad-read anchor: each successful scePadRead/scePadReadState call is one read, numbered from zero.
+// Metadata queries and rejected reads do not consume it; it advances even when presentation is paused.
+std::atomic<uint64_t> g_pad_read_count{0};
+
+int64_t pad_read_hold() {
+    static const int64_t h = [] {
+        const char* e = getenv("PROSPER_PAD_READ_HOLD");
+        return e ? (int64_t)atoll(e) : 8;
+    }();
+    return h;
+}
+
+int64_t pad_read_now() {
+    const uint64_t read = g_pad_read_count.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t max = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    return read <= max ? static_cast<int64_t>(read) : std::numeric_limits<int64_t>::max();
+}
+
+// Overlay any active scripted press onto `s`. Returns true if a script is driving the pad.
+bool apply_pad_script(HostPadState& s, int64_t frame, int64_t read) {
+    auto& script = pad_script_runtime();
+    if (!script.configured()) return false;
+    s.connected = true;                                     // a controller is present for the whole run
+    uint64_t t0 = g_pad_t0_us.load(std::memory_order_relaxed);
+    if (t0 == 0) {                                          // anchor to this first poll
+        uint64_t expect = 0, now = now_us();
+        if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
+    }
+    double elapsed = (now_us() - t0) / 1e6;
+    const PadScriptState scripted = script.state_at(elapsed, frame, read);
+    if (pad_script_log()) {
+        const auto encoded_direction = [](int8_t value) { return uint64_t(uint8_t(value + 1)); };
+        const uint64_t signature = uint64_t(scripted.button_mask) |
+            (uint64_t(scripted.axis_mask) << 32) | (encoded_direction(scripted.left_x) << 40) |
+            (encoded_direction(scripted.left_y) << 42) | (encoded_direction(scripted.right_x) << 44) |
+            (encoded_direction(scripted.right_y) << 46);
+        static std::atomic<uint64_t> previous{std::numeric_limits<uint64_t>::max()};
+        const uint64_t observed = previous.exchange(signature, std::memory_order_relaxed);
+        if (observed != signature) {
+            const std::string buttons = pad_button_names(scripted.button_mask);
+            std::string axes;
+            auto append_axis = [&](const char* name) { if (!axes.empty()) axes += '+'; axes += name; };
+            if (scripted.axis_mask & PAD_SCRIPT_LEFT_X)
+                append_axis(scripted.left_x < 0 ? "left-stick-left" : scripted.left_x > 0 ? "left-stick-right" : "left-stick-x-center");
+            if (scripted.axis_mask & PAD_SCRIPT_LEFT_Y)
+                append_axis(scripted.left_y < 0 ? "left-stick-up" : scripted.left_y > 0 ? "left-stick-down" : "left-stick-y-center");
+            if (scripted.axis_mask & PAD_SCRIPT_RIGHT_X)
+                append_axis(scripted.right_x < 0 ? "right-stick-left" : scripted.right_x > 0 ? "right-stick-right" : "right-stick-x-center");
+            if (scripted.axis_mask & PAD_SCRIPT_RIGHT_Y)
+                append_axis(scripted.right_y < 0 ? "right-stick-up" : scripted.right_y > 0 ? "right-stick-down" : "right-stick-y-center");
+            fprintf(stderr, "[pad-script] elapsed=%.3f frame=%lld read=%lld buttons=%s%s%s\n", elapsed,
+                    (long long)frame, (long long)read, buttons.empty() ? "neutral" : buttons.c_str(),
+                    axes.empty() ? "" : " axes=", axes.c_str());
+        }
+    }
+    pad_apply_script_state(s, scripted);
+    return true;
+}
+
+PadRecordAxis pad_record_axis() {
+    static const PadRecordAxis axis = [] {
+        const char* configured = getenv("PROSPER_PAD_RECORD_AXIS");
+        if (!configured || !*configured || strcmp(configured, "flip") == 0)
+            return PadRecordAxis::display_flip;
+        if (strcmp(configured, "pad-read") == 0) return PadRecordAxis::pad_read;
+        fprintf(stderr,
+                "[pad] PROSPER_PAD_RECORD_AXIS: unknown value '%s'; using flip\n", configured);
+        return PadRecordAxis::display_flip;
+    }();
+    return axis;
+}
+
+// Record the final button stream as explicit flip or successful-pad-read ranges. Completed intervals
+// are flushed immediately; only a button still held when a process is force-killed can be absent from
+// the route tail. Metadata polls do not initialize or advance a pad-read-axis recording.
+void pad_record(int64_t frame, int64_t read, uint32_t buttons) {
+    static const char* output = getenv("PROSPER_PAD_RECORD");
+    if (!output || !*output) return;
+    const PadRecordAxis axis = pad_record_axis();
+    if (axis == PadRecordAxis::pad_read && read < 0) return;
+    const int64_t position = axis == PadRecordAxis::pad_read ? read : frame;
+    struct Recorder {
+        explicit Recorder(PadRecordAxis selected) : state(selected) {}
+        std::mutex mutex;
+        bool initialized = false;
+        FILE* file = nullptr;
+        PadRecordState state;
+    };
+    static Recorder recorder(axis);
+    std::lock_guard<std::mutex> lock(recorder.mutex);
+    if (!recorder.initialized) {
+        recorder.initialized = true;
+        std::filesystem::path path(output);
+        std::error_code ec;
+        if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) {
+            fprintf(stderr, "[pad] PROSPER_PAD_RECORD: cannot create '%s': %s\n",
+                    path.parent_path().string().c_str(), ec.message().c_str());
+        } else if ((recorder.file = fopen(output, "w"))) {
+            if (axis == PadRecordAxis::pad_read) {
+                fprintf(recorder.file,
+                        "# recorded PROSPER_PAD_SCRIPT route; pN is successful pad reads since first input-state read\n");
+            } else {
+                fprintf(recorder.file,
+                        "# recorded PROSPER_PAD_SCRIPT route; fN is display flips since first pad poll\n");
+            }
+            fflush(recorder.file);
+            fprintf(stderr, "[pad] recording input route (%s axis) -> %s\n",
+                    axis == PadRecordAxis::pad_read ? "pad-read" : "flip", output);
+        } else {
+            fprintf(stderr, "[pad] PROSPER_PAD_RECORD: cannot open '%s': %s\n",
+                    output, strerror(errno));
+        }
+    }
+    if (!recorder.file) return;
+    const std::string completed = recorder.state.observe(position, buttons);
+    if (completed.empty()) return;
+    fputs(completed.c_str(), recorder.file);
+    fflush(recorder.file);
+}
+
+// Snapshot the controller for a given pad handle via the installed backend. With no host frontend
+// installed, prosper_core's default backend reports ONE connected controller with neutral input (a PS5
+// title can gate progression on a pad being present, so dev/testing needs one). PROSPER_PAD_PRESS adds
+// a synthetic CROSS; PROSPER_PAD_SCRIPT adds a timed controller sequence — device-independent test drivers.
+HostPadState poll_controller(int /*handle*/, const char* what, bool consume_input_read) {
+    HostPadState s;   // filled by the backend below (default: one connected, neutral controller)
+    pad_backend()->poll(0, s);
+    if (getenv("PROSPER_PAD_PRESS")) {
+        s.connected = true;
+        s.buttons  |= SCE_PAD_BUTTON_CROSS;
+    }
+    // Preserve the established seconds/flip origins and recording behavior on every pad poll. A
+    // metadata query evaluates those axes with no read index, so only successful input-state calls
+    // can activate or advance pN routes.
+    const int64_t frame = pad_frame_now();
+    const int64_t read = consume_input_read ? pad_read_now() : -1;
+    apply_pad_script(s, frame, read);
+    pad_record(frame, read, s.buttons);
+    padlog_once(what, &s);
+    return s;
+}
+
+} // namespace
+
+// scePadInit / effector no-ops -> OK.
+HLE(pad_ok) { if (padlog()) fprintf(stderr, "[pad] init/ok call\n"); return 0; }
+
+// scePadOpen(userId, type, index, param) -> positive handle.
+HLE(pad_open) {
+    const int h = g_pad_handle.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+        g_pad_handles.emplace(h, PadOpenKey{(int32_t)a0, (int32_t)a1, (int32_t)a2});
+    }
+    if (padlog()) fprintf(stderr, "[pad] OPEN userId=%llu type=%llu index=%llu -> handle=%d\n",
+                          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, h);
+    return (uint64_t)h;
+}
+
+// scePadClose(handle) -> OK exactly once, then INVALID_HANDLE for an unknown/retired handle.
+HLE(pad_close) {
+    const int32_t handle = (int32_t)a0;
+    std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    if (g_pad_handles.erase(handle) == 0) return kPadErrorInvalidHandle;
+    if (padlog()) fprintf(stderr, "[pad] CLOSE handle=%d\n", handle);
+    return 0;
+}
+
+// scePadGetHandle(userId, type, index) -> the handle THIS process already opened for that triple,
+// or a negative error when it has opened none.  It is a lookup, not an open: it never creates a
+// handle, so answering it with a constant is answering "a pad is already open" to a caller whose
+// whole reason for asking is to find out.
+//
+// The unconditional `return 1` this replaces did exactly that, and it silently killed all input in
+// Worms Armageddon: Anniversary Edition (PPSA20052, #1592).  Its pad manager (eboot+0x7fa30) opens
+// controllers with, per login user id:
+//
+//     call scePadGetHandle(userId, 0, 0)   ; eboot+0x7fd5c
+//     test eax,eax
+//     jns  <skip open>                     ; eboot+0x7fd63: non-negative == already open
+//     call scePadOpen(userId, 0, 0, 0)     ; eboot+0x7fd6d
+//
+// so the fabricated handle 1 made every boot conclude a pad was already open; scePadOpen was never
+// called, and every later scePadReadState(1) failed with INVALID_HANDLE because nothing was open.
+// The title sat on "PRESS X TO START GAME" forever with `[pad] init/ok call` as its only pad log.
+// The same disassembly fixes the sign convention from the guest side: a usable handle is positive
+// (its close path at eboot+0x7fc7b takes `jle` -- 0 and below are "nothing to close"), and negative
+// means "no handle".
+//
+// Several open handles can share one triple: nothing stops a guest from calling scePadOpen twice
+// with the same (userId, portType, index), and prosper mints a fresh handle each time, so every one
+// of them matches this lookup.  Answering with the first match the container iterates makes the
+// reply depend on std::unordered_map's unspecified order -- it moves with insertion history, with
+// rehashes, and with the standard-library version -- so one route could answer differently across
+// runs, and a guest that closes what it was handed and keeps reading the other loses input for the
+// rest of the run, intermittently (#1624).  Answer with the LOWEST matching handle instead: since
+// scePadOpen mints from a monotonically increasing counter, that is the oldest still-open pad for
+// the triple, which is the one a caller asking "did I already open this?" is asking about.
+// CONFIDENCE: HIGH that a shared triple must resolve deterministically (a nondeterministic reply is
+// wrong under any semantics).  MED on picking the oldest: prosper has no primary evidence for what
+// hardware does with a repeated open -- rejecting the second open is at least as plausible, and the
+// PS5 3.20 export list names scePadOpen without a body or an error code, so nothing local settles
+// it.  Both are unobserved so far: no local dump double-opens a triple today.
+//
+// CONFIDENCE: HIGH on the lookup semantics and the sign convention (both read directly off the
+// guest's own use above, and Sony pad handles are positive with 0x8092xxxx errors).  MED on the
+// exact errno: prosper cannot establish SCE_PAD_ERROR_NO_HANDLE's value from primary evidence, so
+// this reuses the libScePad error prosper already defends for "no open pad names this" rather than
+// inventing a constant.  Only the sign is load-bearing for the guest.
+HLE(pad_get_handle) {
+    const PadOpenKey key{(int32_t)a0, (int32_t)a1, (int32_t)a2};
+    std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    int32_t found = 0;
+    bool have = false;
+    for (const auto& [handle, opened] : g_pad_handles) {
+        if (!(opened == key)) continue;
+        if (!have || handle < found) { found = handle; have = true; }
+    }
+    if (have) {
+        if (padlog()) fprintf(stderr, "[pad] GETHANDLE userId=%d type=%d index=%d -> handle=%d\n",
+                              key.user_id, key.type, key.index, found);
+        return (uint64_t)(int64_t)found;
+    }
+    if (padlog()) fprintf(stderr, "[pad] GETHANDLE userId=%d type=%d index=%d -> no open handle\n",
+                          key.user_id, key.type, key.index);
+    return kPadErrorInvalidHandle;
+}
+
+// scePadIsValidHandle(handle) -> nonzero only while the handle remains open.
+HLE(pad_is_valid_handle) {
+    std::lock_guard<std::mutex> lock(g_pad_handle_mx);
+    return g_pad_handles.contains((int32_t)a0) ? 1 : 0;
+}
+
+// scePadReadState(handle, ScePadData* out) -> 0 on success. One current snapshot.
+HLE(pad_read_state) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    if (!a1) return 0;
+    HostPadState s = poll_controller((int)a0, __func__, true);
+    pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
+    return 0;
+}
+
+// scePadRead(handle, ScePadData* out, int num) -> number of states written (>=1). We report the
+// single current state (no historical buffering yet), which is a valid, common driver behavior.
+HLE(pad_read) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    int num = (int)(int64_t)a2;
+    if (!a1 || num < 1) return 0;
+    HostPadState s = poll_controller((int)a0, __func__, true);
+    pad_fill_data((ScePadData*)PW(a1), s, now_us(), s.connected ? 1 : 0);
+    return 1;   // one state written
+}
+
+// scePadGetControllerInformation(handle, ScePadControllerInformation* out) -> 0.
+HLE(pad_get_info) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    if (!a1) return 0;
+    HostPadState s = poll_controller((int)a0, __func__, false);
+    pad_fill_controller_info((ScePadControllerInformation*)PW(a1), s.connected, s.connected ? 1 : 0);
+    return 0;
+}
+
+// scePadGetExtControllerInformation(handle, ScePadExtendedControllerInformation* out) -> 0.
+// The inherited public layout is exactly 0x2c bytes: the 0x1c controller-info base followed by
+// padType1/padType2, capability, alignment, and an 8-byte device-class union. A standard pad has no
+// device-class extension, so the tail remains zero while the base reports current connection state.
+HLE(pad_get_ext_controller_info) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    if (!a1) return 0;
+    HostPadState s = poll_controller((int)a0, __func__, false);
+    pad_fill_extended_controller_info((ScePadExtendedControllerInformation*)PW(a1), s.connected,
+                                      s.connected ? 1 : 0);
+    return 0;
+}
+
+// scePadDeviceClassGetExtendedInformation(handle, out*) -> 0. Report a zeroed extended-info block
+// (standard device class, no extra capabilities). OrbisPadDeviceClassExtendedInformation is exactly
+// 20 bytes (0x14): deviceClass(4) + reserved[4](4) + a 12-byte classData union (shadPS4 pad.h). Writing
+// 0x20 overran a guest-stack-allocated struct by 12 bytes → stack-canary smash (the #283 class); write
+// only the real 0x14 (under-writing is safe, over-writing is not — same lesson as pad_parse below).
+HLE(pad_ext_info) { if (a1) memset(PW(a1), 0, 0x14); return 0; }
+
+// scePadDeviceClassParseData(handle, const OrbisPadData* in, OrbisPadDeviceClassData* out) -> 0.
+// Parses a raw device-class HID report (steering wheels, guitars, etc.) into a structured form. A
+// standard DualSense carries NO device-class payload, so the correct answer is "no valid data": clear
+// the out's leading fields — deviceClass (u32 @0) = STANDARD/0 and bDataValid (bool @4) = false — so a
+// game's `if (out.bDataValid)` sees false rather than consuming uninitialized memory. Bounded 8-byte
+// write (never the full union) per the oversized-write lesson; cross-checked vs shadPS4 pad.cpp
+// (returns OK). CONFIDENCE: MED — normal input still flows through scePadRead.
+HLE(pad_class_parse) { if (a2) memset(PW(a2), 0, 8); return 0; }
+
+// scePadGetTriggerEffectState(handle, ScePadTriggerEffectState* out) -> 0. DualSense adaptive-trigger
+// feedback state. No reference layout (PS5-only; absent from shadPS4/Kyty) and The Messenger is a 2D
+// platformer that does not drive adaptive triggers, so report a neutral/zeroed state and succeed.
+// Bounded 8-byte clear at the out pointer avoids leaving garbage without risking an overrun of an
+// unknown-size struct. CONFIDENCE: LOW — arg/layout unverified; never called on this title.
+HLE(pad_trigger_state) { if (a1) memset(PW(a1), 0, 8); return 0; }
+
+void register_pad_hle() {
+    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    R("scePadInit", pad_ok);
+    R("scePadOpen", pad_open);
+    R("scePadOpenExt", pad_open);              // was MISSING -> returned 0 (read as a valid handle 0 / error)
+    R("scePadIsValidHandle", pad_is_valid_handle);   // was MISSING -> 0 = "invalid"
+    R("scePadClose", pad_close);
+    R("scePadGetHandle", pad_get_handle);
+    R("scePadGetControllerInformation", pad_get_info);
+    R("scePadGetExtControllerInformation", pad_get_ext_controller_info);
+    R("scePadDeviceClassGetExtendedInformation", pad_ext_info);
+    R("scePadReadState", pad_read_state);
+    R("scePadRead", pad_read);
+    // Effectors we accept but don't yet drive on the host (vibration/lightbar/motion): return OK so
+    // the game's setup path proceeds. Force feedback via evdev EV_FF is a follow-up.
+    R("scePadSetVibration", pad_ok);
+    R("scePadSetMotionSensorState", pad_ok);
+    R("scePadSetTiltCorrectionState", pad_ok);
+    R("scePadSetAngularVelocityDeadbandState", pad_ok);
+    R("scePadResetLightBar", pad_ok);
+    R("scePadSetLightBar", pad_ok);
+    R("scePadResetOrientation", pad_ok);
+    R("scePadSetVibrationMode", pad_ok);       // vibration-mode config (output) — accept, no-op
+    R("scePadSetTriggerEffect", pad_ok);       // DualSense adaptive-trigger effect (output) — accept, no-op
+    R("scePadDeviceClassParseData", pad_class_parse);   // raw device-class report -> "no valid data"
+    R("scePadGetTriggerEffectState", pad_trigger_state);// adaptive-trigger state -> zeroed/neutral
+    #undef R
+}
+
+} // namespace prosper

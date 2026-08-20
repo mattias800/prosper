@@ -5,8 +5,8 @@
 // modal), records the result, and reports FINISHED; the next poll returns it.
 #include "dialog_sdl3.hpp"
 #include "dialog_helpers.hpp"
-#include "hle/dispatch.hpp"
-#include "hle/platform_ui.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/service/platform_ui.hpp"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <atomic>

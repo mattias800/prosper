@@ -76,7 +76,7 @@ against the same title are instant.
 
 ## The stub-unwind rule (how the bridge works)
 
-The `%fs`-swap stub (`emit_swap_stub` in `src/host/exec_image_linux.cpp`) pushes five qwords
+The `%fs`-swap stub (`emit_swap_stub` in `src/host/image/exec_image_linux.cpp`) pushes five qwords
 (`r11` + the four re-pushed stack args) and then `call`s the HLE. So at the stub's return site the
 guest caller's frame is a fixed distance away:
 

@@ -37,7 +37,7 @@ PROSPER_SAVE0=<PRIVATE_SAVE_ROOT> PROSPER_FILELOG=1 \
 
 `PROSPER_SAVE0` is **not optional discipline** — its default `/tmp/prosper-savedata0` is one flat
 directory shared by every title on the box, with no title id anywhere in the host path
-(`src/hle/hle_file.cpp:814`, `:879`). Another title's save can present as this title's corruption. #2734.
+(`src/hle/fs/hle_file.cpp:814`, `:879`). Another title's save can present as this title's corruption. #2734.
 
 ### The progression oracle: Unity scene index == `Media/levelNN`
 
@@ -713,7 +713,7 @@ HLE registration. #1599, #1884.
    operation to `prosper::video::VideoBackend` (a defaulted virtual, so the Media Foundation and
    VideoToolbox backends keep compiling), implement it in `frontends/video_vaapi` (seek the container,
    flush the decoder, drop the queued frames, clear EOF), and register `XC9wM+xULz8` in
-   `src/hle/hle_service.cpp` so it seeks and reports a real error when the backend cannot. The guest's
+   `src/hle/service/hle_service.cpp` so it seeks and reports a real error when the backend cannot. The guest's
    acceptance test is exact and observable: the post-jump frame's `timeStamp` must be at or past the
    requested target, after which `sceAvPlayerResume` must appear in `PROSPER_AVPLOG`. Until Resume
    appears, nothing downstream can be measured. Items 1-4 below belong to the superseded

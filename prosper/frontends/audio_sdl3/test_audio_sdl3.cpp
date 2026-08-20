@@ -2,10 +2,10 @@
 // audio driver (set by the ctest env). Installs the SDL3 sink, drives the real sceAudioOut HLE
 // through the dispatch table, and asserts a full port lifecycle flows through SDL with no device.
 #include "audio_sdl3.hpp"
-#include "../../src/hle/dispatch.hpp"
-#include "../../src/hle/nid.hpp"
-#include "../../src/hle/audio.hpp"
-#include "../../src/host/lifecycle.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "hle/audio/audio.hpp"
+#include "host/platform/lifecycle.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>

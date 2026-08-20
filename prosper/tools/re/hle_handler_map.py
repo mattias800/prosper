@@ -100,14 +100,14 @@ import nid_gate_scan as G                                            # noqa: E40
 # ---------------------------------------------------------------- NID hashing
 
 SONY_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
-# Sony's published 16-byte NID salt, the same constant `src/hle/nid.cpp` uses.
+# Sony's published 16-byte NID salt, the same constant `src/hle/dispatch/nid.cpp` uses.
 NID_SALT = bytes([0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1,
                   0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30])
 NID_RE = re.compile(r"^[A-Za-z0-9+\-]{11}$")
 
 
 def nid_hash(name):
-    """Sony's symbol NID for `name` — a Python port of `prosper::nid_hash` (src/hle/nid.cpp:66).
+    """Sony's symbol NID for `name` — a Python port of `prosper::nid_hash` (src/hle/dispatch/nid.cpp:66).
 
     SHA-1 over name||salt, first 8 digest bytes reversed to little-endian, Sony-alphabet base64
     without padding, first 11 characters. Ported rather than shelled out to so the tool needs no
@@ -555,15 +555,32 @@ class Scan:
 def scan_tree(src_hle, platform):
     """Parse every `.cpp` under `src_hle` for the chosen platform arm."""
     sc = Scan()
-    hpp = os.path.join(src_hle, "dispatch.hpp")
-    if not os.path.isfile(hpp):
-        raise SystemExit("refused: %s not found — is --src the prosper source root?" % hpp)
+    # Located by search, not by a fixed path. dispatch.hpp lives in src/hle/dispatch/ since the
+    # HLE surface was foldered; a hardcoded join is a path-keyed dependency that no build can see.
+    hpp = None
+    for base, _dirs, files in os.walk(src_hle):
+        if "dispatch.hpp" in files:
+            hpp = os.path.join(base, "dispatch.hpp")
+            break
+    if hpp is None:
+        raise SystemExit("refused: no dispatch.hpp anywhere under %s — is --src the prosper "
+                         "source root?" % src_hle)
     sc.apis = discover_apis(strip_comments(open(hpp, errors="ignore").read()))
     if not sc.apis:
         raise SystemExit("refused: no `static register_*` in dispatch.hpp's class Hle — "
                          "the registration API moved and every count below would be zero")
 
-    paths = sorted(p for p in os.listdir(src_hle) if p.endswith(".cpp"))
+    # RECURSIVE, which this function's own docstring has always claimed and os.listdir never did.
+    # The difference was invisible while src/hle was flat and is total now that it is not: a
+    # non-recursive listing returns ZERO .cpp files, and every count this tool reports would be a
+    # confident, well-formed zero rather than an error. Names are kept relative to src_hle so a
+    # reported file is still one a reader can find.
+    paths = sorted(os.path.relpath(os.path.join(base, f), src_hle)
+                   for base, _dirs, files in os.walk(src_hle)
+                   for f in files if f.endswith(".cpp"))
+    if not paths:
+        raise SystemExit("refused: no .cpp under %s — a scan of nothing reports every count as "
+                         "zero, which is indistinguishable from a clean result" % src_hle)
     for fn in paths:
         path = os.path.join(src_hle, fn)
         raw = open(path, errors="ignore").read()

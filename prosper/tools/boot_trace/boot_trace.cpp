@@ -3,10 +3,10 @@
 // plus, on a fault, the register state and an rbp-chain backtrace classified by module. The primary bring-up debugging
 // tool. Linux only. Usage: boot_trace <dump-root> [--capture-first-frame [output.bmp]]
 #include "loader/linker.hpp"
-#include "host/exec_image.hpp"
-#include "host/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
+#include "host/image/exec_image.hpp"
+#include "host/image/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
 #include "first_frame_capture.hpp"         // --capture-first-frame observer (isolated)
-#include "hle/dispatch.hpp"
+#include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <string>
 #include <cstdint>
@@ -41,10 +41,10 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #include "gpu/texture/bc_decode.hpp"              // BC1/2/3 block decompression -> RGBA8 (#121)
 #include "gpu/resources/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
 #include "gpu/recompiler/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
-#include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
-#include "../../frontends/shared/frame_dump_policy.hpp" // explicit periodic-BMP policy
-#include "../../frontends/shared/live_renderer.hpp"   // shared live renderer (also used by prosper-app)
-#include "../../frontends/shared/live_compute.hpp"    // synchronous AGC compute execution
+#include "fixtures/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
+#include "shared/diagnostics/frame_dump_policy.hpp" // explicit periodic-BMP policy
+#include "shared/live/live_renderer.hpp"   // shared live renderer (also used by prosper-app)
+#include "shared/live/live_compute.hpp"    // synchronous AGC compute execution
 #include <atomic>
 #include <cstdlib>
 #include <cstring>

@@ -144,7 +144,7 @@ case("a decimal measurement is not a citation",
 
 # THE discriminating false positive. `s_trap` is an RDNA2 instruction mnemonic and appears in the
 # shader recompiler's tests; without the identifier-character lookbehind the real corpus reports
-# three spurious references (`prosper/tests/test_rdna2_to_spirv.cpp` among them), and both of these
+# three spurious references (`prosper/tests/gpu/recompiler/test_rdna2_to_spirv.cpp` among them), and both of these
 # cases fail. Mutation-checked: deleting `(?<![A-Za-z0-9_])` makes exactly these two go red.
 #
 # The operand here is deliberately a number the table does NOT hold. The repository's actual text is

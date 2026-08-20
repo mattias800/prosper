@@ -28,7 +28,7 @@ the environment section first if you are setting up the new machine.
 
 | PR | What | Reject count |
 |----|------|--------------|
-| **#1028** | Compute storage-image **formats**: `Uint8/Sint8/Uint16/Sint16/Unorm2_10_10_10` pack/unpack in `frontends/shared/live_compute.cpp`. DOLL's 3D color-grading LUT / exposure / volume dispatches were *skipped* (`storage format has no channel pack/unpack yet`). | (skips) 5 → 0 |
+| **#1028** | Compute storage-image **formats**: `Uint8/Sint8/Uint16/Sint16/Unorm2_10_10_10` pack/unpack in `frontends/shared/live/live_compute.cpp`. DOLL's 3D color-grading LUT / exposure / volume dispatches were *skipped* (`storage format has no channel pack/unpack yet`). | (skips) 5 → 0 |
 | **#1041** | Recompiler: integer sub-dword **`buffer_load_format`** at a runtime byte address (`dyn_int` path in `src/gpu/recompiler/rdna2_to_spirv.cpp`). A stride-1 `Uint8` table load rejected as `[mubuf-unaligned]`. | 4 → 3 |
 | **#1044** | Recompiler: the full **MUBUF 32-bit atomic RMW family** (`swap/add/sub/smin/umin/smax/umax/and/or/xor` → `OpAtomic*`). Only `umax` was implemented before; DOLL uses `buffer_atomic_add` (op 0x32). | 3 → 2 |
 | **#1053** | Recompiler: integer sub-dword **`buffer_store_format`** via race-free `atomicAnd(clear field)` + `atomicOr(set field)` (`dyn_int_store` path). A stride-2 `Uint16` store rejected as `[mubuf-unaligned]`. | 2 → 1 |
@@ -43,7 +43,7 @@ not a silent skip.* And the split "opcode coverage vs CFG structurizing" is now 
   it is the one remaining gap.
 
 Each recompiler PR shipped with a real-Vulkan **execution** test in
-`tests/test_rdna2_to_spirv.cpp` (e.g. the atomic accumulates 128×3=384; the sub-dword store lands two
+`tests/gpu/recompiler/test_rdna2_to_spirv.cpp` (e.g. the atomic accumulates 128×3=384; the sub-dword store lands two
 disjoint 16-bit fields into a shared dword). Each was independently code-reviewed.
 
 ---
@@ -225,7 +225,7 @@ All gated, off by default. Names are `PROSPER_*` env vars unless noted.
 
 ## Key source locations
 
-- `prosper/frontends/shared/live_compute.cpp` — the live Vulkan compute backend. Storage-image
+- `prosper/frontends/shared/live/live_compute.cpp` — the live Vulkan compute backend. Storage-image
   format pack/unpack (`storage_(un)pack_texel`, `storage_(un)pack_supported`), upload/writeback,
   tiling, DCC.
 - `prosper/src/gpu/recompiler/rdna2_to_spirv.cpp` — the RDNA2→SPIR-V recompiler.
@@ -238,7 +238,7 @@ All gated, off by default. Names are `PROSPER_*` env vars unless noted.
   (~1964), the compute dispatch path + the `PROSPER_DYNTRACE_FAIL` dump (~2942).
 - `prosper/src/gpu/agc/agc_shader_layout.cpp` — `decode_buffer_descriptor` (~116), `rdna2_buffer_format`
   (the V# format-field → `DataFormat` table), `gen5_image_format`.
-- `prosper/tests/test_rdna2_to_spirv.cpp` — recompiler execution-differential tests (the atomic +
+- `prosper/tests/gpu/recompiler/test_rdna2_to_spirv.cpp` — recompiler execution-differential tests (the atomic +
   sub-dword store cases added this session are near the "kernel 24" block).
 - `prosper/tools/shader_inspect/` — the offline RDNA2 decoder.
 

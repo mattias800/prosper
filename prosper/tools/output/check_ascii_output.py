@@ -481,12 +481,12 @@ QUARANTINE = {
     "src/gpu/timeline/gpu_timeline.cpp": 4,
     "src/gpu/execute/mb3_freelist.cpp": 4,
     "src/gpu/state/render_state.cpp": 1,
-    "frontends/shared/live_compute.cpp": 2,
-    "frontends/shared/live_renderer.cpp": 6,
-    "tests/render_runner.h": 2,
-    "tests/test_descriptor_array_emit.cpp": 1,
-    "tests/test_descriptor_array_render.cpp": 1,
-    "tests/test_rdna2_to_spirv.cpp": 2,
+    "frontends/shared/live/live_compute.cpp": 2,
+    "frontends/shared/live/live_renderer.cpp": 6,
+    "tests/fixtures/render_runner.h": 2,
+    "tests/gpu/test_descriptor_array_emit.cpp": 1,
+    "tests/gpu/state/test_descriptor_array_render.cpp": 1,
+    "tests/gpu/recompiler/test_rdna2_to_spirv.cpp": 2,
 }
 
 

@@ -5,7 +5,7 @@
 // compute shader (b[i] = a[i]*2 + 1); once the RDNA2->SPIR-V recompiler lands, its emitted SPIR-V
 // swaps in here and the same assertions verify the recompile is numerically correct.
 #include <vulkan/vulkan.h>
-#include "spirv_compute.h"
+#include "fixtures/spirv_compute.h"
 #include <cstdio>
 #include <cstdint>
 #include <cmath>

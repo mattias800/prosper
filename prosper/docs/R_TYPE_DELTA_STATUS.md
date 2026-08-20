@@ -605,7 +605,7 @@ rejecting real multi-layer arrays, whose slices are not one contiguous plane. `d
 **equality** with 1, not `<= 1`: the descriptor decoder emits `depth = LAST_ARRAY - BASE_ARRAY + 1`
 for an array type and **zero** when `LAST_ARRAY < BASE_ARRAY`, so zero is a malformed inverted array
 range rather than a single layer and must keep failing visibly. The classification
-moved to `frontends/shared/avplayer_plane_policy.hpp` with a unit test whose primary arm is R-Type's
+moved to `frontends/shared/media/avplayer_plane_policy.hpp` with a unit test whose primary arm is R-Type's
 exact live descriptors; reverting the predicate to `img_dim == 1` fails 11 of its checks, and
 loosening `depth == 1` to `depth <= 1` fails the three `depth == 0` rejections.
 

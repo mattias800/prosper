@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refuse to cache a PROSPER_* variable that something arms at RUNTIME.
 
-PROSPER_ENV_ON / PROSPER_ENV_VALUE (src/hle/dispatch.hpp) sample getenv ONCE, at first use, and
+PROSPER_ENV_ON / PROSPER_ENV_VALUE (src/hle/dispatch/dispatch.hpp) sample getenv ONCE, at first use, and
 return that value forever. That is correct for a boot-time diagnostic switch and wrong for any
 variable written after the process starts -- the later write is simply never observed.
 

@@ -611,13 +611,13 @@ One line per falsified hypothesis, with the evidence that killed it.
   | coverage predicate | `src/gpu/recompiler/rdna2_to_spirv.cpp:16031` (`i.mimg_dim == 1u`) | no |
   | lowering gate | `src/gpu/recompiler/rdna2_to_spirv.cpp:10209` (`atomic_2d_array`) | **yes, #2272** |
   | validator carve-out | `src/gpu/resources/shader_resources.cpp:1031` (`r.img_dim == 1 && r.depth == 1`) | no |
-  | backend materialization | `frontends/shared/live_compute.cpp:4304` (same clause) | no |
+  | backend materialization | `frontends/shared/live/live_compute.cpp:4304` (same clause) | no |
 
   So the lowering emits the buffer-backed binding for a 2D_ARRAY atomic and the validator then
   rejects that exact binding as `WrongType`. That is why the capture shows `recompiled=yes` with
   `descriptors=20` **and** a descriptor-contract failure -- a pair that reads as contradictory until
   the three sites are read together. Buffer-flattening is the **designed** path for
-  `image_atomic_add`, not a fallback (`tests/test_rdna2_spirv_struct.cpp:3483` requires
+  `image_atomic_add`, not a fallback (`tests/gpu/test_rdna2_spirv_struct.cpp:3483` requires
   `kind == StorageBuffer` with `atomic_access` and `report.ok()`); it exists as the RADV
   image-atomic workaround. **This is #2293's defect one iteration later** -- that PR is titled *"the
   image-atomic opcode list existed in THREE places and all three had to agree"*, and the same triple

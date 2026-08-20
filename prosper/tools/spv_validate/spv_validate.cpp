@@ -6,7 +6,7 @@
 //
 // This gate has two failure modes of its own, and #1711 is what both of them cost. That defect —
 // an OpAccessChain in build_compute_compare_uvec4() whose result type disagreed with the type it
-// walked — shipped to real devices through frontends/shared/live_compute.cpp and was found by a
+// walked — shipped to real devices through frontends/shared/live/live_compute.cpp and was found by a
 // Vulkan validation LAYER, not here, because:
 //
 //   1. the corpus only ever walked recompile_*, so spirv_builder.cpp's hand-assembled modules were
@@ -734,7 +734,7 @@ int main(int argc, char** argv) {
 
     // --- Emitters that are NOT the RDNA2 recompiler ---
     // spirv_builder.cpp hand-assembles compute modules that the live frontend creates at runtime
-    // (frontends/shared/live_compute.cpp: prepare_compare_pipeline / the scale-bias probe), so they
+    // (frontends/shared/live/live_compute.cpp: prepare_compare_pipeline / the scale-bias probe), so they
     // reach vkCreateShaderModule exactly like a recompiled shader. #1711 lived here.
     dump(dir, "builder_scale_bias", build_compute_scale_bias(2.0f, 0.5f),
          "build_compute_scale_bias");

@@ -429,7 +429,7 @@ old report conflated sampled binding 14 (`0x21159d0000`) with storage binding 23
 `0x2110310000` is `fmt=122` = `R11G11B10_FLOAT` (`VK_FORMAT_B10G11R11_UFLOAT_PACK32`).
 `LiveTargetPixelFormat` (`src/gpu/execute/gpu_execute.hpp:566`) has three members, and `R11G11B10Float` is
 plumbed through the snapshot reader (`live_renderer.cpp:699`), the direct GPU importer
-(`live_renderer.cpp:763`) and 16 sites in `frontends/shared/live_compute.cpp`.
+(`live_renderer.cpp:763`) and 16 sites in `frontends/shared/live/live_compute.cpp`.
 
 **One path was missed** — `set_live_target_image_written_notifier`, `live_renderer.cpp:811`:
 
@@ -455,7 +455,7 @@ Same class as Dead Cells #773 (native-format loss): RGBA16F was plumbed through 
 was not. Map all three enumerators and fail closed on an unknown one, the way the importer at
 `live_renderer.cpp:757-764` already does; prefer a shared helper over a third inline ternary.
 
-`tests/test_game_compute.cpp` already drives `LiveTargetPixelFormat::R11G11B10Float` (lines 301, 358,
+`tests/gpu/recompiler/test_game_compute.cpp` already drives `LiveTargetPixelFormat::R11G11B10Float` (lines 301, 358,
 2156). A regression should assert that a mirrored compute write to an R11G11B10F live target
 republishes the RTT entry and that the following sample reads the written pixels — and that it **fails**
 on current master while the RGBA8/RGBA16F equivalents pass, so the test proves the format gap rather

@@ -1,5 +1,5 @@
 #include "../tools/gpu_replay/resource_override.hpp"
-#include "test_scratch.h"
+#include "fixtures/test_scratch.h"
 
 #include <cstdio>
 #include <cstring>

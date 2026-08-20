@@ -1,0 +1,917 @@
+// hle_libc.cpp — HLE implementations of the common libc functions the guest imports.
+// The guest ABI == host SysV ABI, so most of these are thin thunks straight to the
+// host C library. Registered by NID so the loader binds imports directly to them.
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
+#include <cstring>
+#include <cstdlib>
+#include <cstdint>
+#include <cstdio>
+#include <cstdarg>
+#include <cmath>
+#include <cwchar>
+#include <cerrno>
+#include <cstddef>
+#if !defined(_WIN32)
+// malloc_usable_size / malloc_size: the only portable way to bound a copy out of a block whose
+// original request size the caller does not carry (reallocalign, #2185).
+#  if defined(__APPLE__)
+#    include <malloc/malloc.h>
+#    define PROSPER_USABLE_SIZE(p) malloc_size(p)
+#  else
+#    include <malloc.h>
+#    define PROSPER_USABLE_SIZE(p) malloc_usable_size(p)
+#  endif
+#endif
+#include <array>
+#include <limits>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+// setjmp/longjmp — the guest's Boehm GC calls setjmp to flush callee-saved registers to a
+// buffer so it can scan them as GC roots (and the runtime uses it for exception unwinding).
+// A stub returning 0 silently breaks that. We implement the real thing: because our HLE
+// stubs *tail-jump* into the handler (movabs rax,fn; jmp rax — rsp and all callee-saved regs
+// are exactly the guest caller's), setjmp entered here sees the caller's true context. We
+// save only the SysV callee-saved set + rsp + return address (64 bytes) — well within the
+// guest's FreeBSD jmp_buf — and never touch the signal mask (matched pair, self-consistent).
+#if (defined(__linux__) || defined(__APPLE__)) && defined(__x86_64__)
+extern "C" uint64_t prosper_setjmp(void*);
+extern "C" void     prosper_longjmp(void*, uint64_t);
+// Mach-O C symbols carry a leading underscore; ELF ones don't.
+#ifdef __APPLE__
+#define PSJ(x) "_" x
+#else
+#define PSJ(x) x
+#endif
+__asm__(
+    ".text\n"
+    ".globl " PSJ("prosper_setjmp") "\n.p2align 4\n"
+    PSJ("prosper_setjmp") ":\n"
+    "    movq (%rsp), %rax\n"        // guest return address (stub jmp'd here, so [rsp]=caller ret)
+    "    movq %rbx,  0(%rdi)\n"
+    "    movq %rbp,  8(%rdi)\n"
+    "    movq %r12, 16(%rdi)\n"
+    "    movq %r13, 24(%rdi)\n"
+    "    movq %r14, 32(%rdi)\n"
+    "    movq %r15, 40(%rdi)\n"
+    "    leaq 8(%rsp), %rcx\n"        // caller's rsp (after our eventual ret)
+    "    movq %rcx, 48(%rdi)\n"
+    "    movq %rax, 56(%rdi)\n"
+    "    xorl %eax, %eax\n"           // first return: 0
+    "    ret\n"
+    ".globl " PSJ("prosper_longjmp") "\n.p2align 4\n"
+    PSJ("prosper_longjmp") ":\n"
+    "    movq  0(%rdi), %rbx\n"
+    "    movq  8(%rdi), %rbp\n"
+    "    movq 16(%rdi), %r12\n"
+    "    movq 24(%rdi), %r13\n"
+    "    movq 32(%rdi), %r14\n"
+    "    movq 40(%rdi), %r15\n"
+    "    movq 48(%rdi), %rsp\n"
+    "    movq %rsi, %rax\n"           // return the longjmp value...
+    "    testq %rax, %rax\n"
+    "    jnz 1f\n"
+    "    movl $1, %eax\n"             // ...but never 0 (setjmp must see nonzero)
+    "1:  jmp *56(%rdi)\n"
+);
+#else
+extern "C" uint64_t prosper_setjmp(void*)          { return 0; }
+extern "C" void     prosper_longjmp(void*, uint64_t) {}
+#endif
+
+namespace prosper {
+#ifdef _WIN32
+// Keep every Windows guest allocation in one self-describing family. The Microsoft CRT documents
+// changing an `_aligned_realloc` block's alignment as an error, so a fixed-alignment realloc cannot
+// safely accept memalign/posix_memalign/aligned-new pointers. Store the original alignment and size
+// immediately before the payload; realloc can then preserve both without a process-global registry.
+struct alignas(std::max_align_t) GuestAllocHeader {
+    uint64_t magic;
+    void* raw;
+    size_t size;
+    size_t alignment;
+};
+constexpr uint64_t kGuestAllocMagic = 0x50523559414c4c4full; // "PR5YALLO"
+
+static GuestAllocHeader* guest_windows_header(void* p) {
+    return (GuestAllocHeader*)((uint8_t*)p - sizeof(GuestAllocHeader));
+}
+
+static void* guest_windows_alloc(size_t alignment, size_t size) {
+    if (alignment < alignof(std::max_align_t)) alignment = alignof(std::max_align_t);
+    if (alignment & (alignment - 1)) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    const size_t payload = size ? size : 1;
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if (alignment > maximum - sizeof(GuestAllocHeader) + 1) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    const size_t overhead = sizeof(GuestAllocHeader) + alignment - 1;
+    if (payload > maximum - overhead) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    void* raw = malloc(payload + overhead);
+    if (!raw) return nullptr;
+    const uintptr_t start = (uintptr_t)raw + sizeof(GuestAllocHeader);
+    const uintptr_t aligned = (start + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    auto* header = (GuestAllocHeader*)(aligned - sizeof(GuestAllocHeader));
+    *header = {kGuestAllocMagic, raw, size, alignment};
+    return (void*)aligned;
+}
+
+static bool guest_windows_free(void* p) {
+    if (!p) return true;
+    GuestAllocHeader* header = guest_windows_header(p);
+    if (header->magic != kGuestAllocMagic) {
+        errno = EINVAL;
+        return false;
+    }
+    void* raw = header->raw;
+    header->magic = 0;
+    free(raw);
+    return true;
+}
+#endif
+
+static void* aligned_alloc_portable(size_t align, size_t size) {
+#ifdef _WIN32
+    return guest_windows_alloc(align, size);
+#else
+    void* p = nullptr;
+    return posix_memalign(&p, align, size) == 0 ? p : nullptr;
+#endif
+}
+
+static void* guest_malloc_portable(size_t size) {
+#ifdef _WIN32
+    return guest_windows_alloc(alignof(std::max_align_t), size);
+#else
+    return malloc(size);
+#endif
+}
+
+static void* guest_calloc_portable(size_t count, size_t size) {
+    if (size && count > std::numeric_limits<size_t>::max() / size) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    const size_t bytes = count * size;
+    void* p = guest_malloc_portable(bytes);
+    if (p) memset(p, 0, bytes);
+    return p;
+}
+
+static void* guest_realloc_portable(void* p, size_t size) {
+#ifdef _WIN32
+    if (!p) return guest_malloc_portable(size);
+    GuestAllocHeader* header = guest_windows_header(p);
+    if (header->magic != kGuestAllocMagic) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    if (!size) {
+        guest_windows_free(p);
+        return nullptr;
+    }
+    const size_t old_size = header->size;
+    const size_t alignment = header->alignment;
+    void* replacement = guest_windows_alloc(alignment, size);
+    if (!replacement) return nullptr;
+    memcpy(replacement, p, old_size < size ? old_size : size);
+    guest_windows_free(p);
+    return replacement;
+#else
+    return realloc(p, size);
+#endif
+}
+
+// reallocalign(ptr, size, alignment): resize a block and give the RESULT the requested extended
+// alignment. Sony ships this as a function separate from realloc (libSceLibcInternal exports
+// `reallocalign` OGybVuPAhAY beside `realloc` Y7aJ1uydPMo, and pairs sceLibcMspaceRealloc with
+// sceLibcMspaceReallocalign) for the reason the C standard implies: a two-argument resize is never
+// told an alignment, so it cannot promise to carry one. C17 7.22.3p1 guarantees only fundamental
+// alignment (<= alignof(max_align_t), 6.2.8p2); 256 is an EXTENDED alignment (6.2.8p3) that plain
+// realloc may drop the moment the block relocates. See #2165 / #2185.
+//
+// Unregistered, this NID fell to the dispatcher's 0 — a NULL return, which an allocator caller reads
+// as OOM. That is a false FAILURE (a title treating allocation failure as fatal aborts), the mirror
+// of #2081's false successes.
+static void* guest_reallocalign_portable(void* p, size_t size, size_t alignment) {
+    // Raise a sub-fundamental alignment rather than rejecting it: erroring on alignment==8 would
+    // reintroduce the false-failure class this registration exists to remove. Note the consequence,
+    // because the ordering matters — every value below alignof(max_align_t) is raised FIRST, so
+    // 3, 5, 6, 7 and 9..15 are silently normalised to 16 and SUCCEED. Only a non-power-of-two at or
+    // above 16 is rejected. This matches guest_windows_alloc's existing behaviour.
+    if (alignment < alignof(std::max_align_t)) alignment = alignof(std::max_align_t);
+    if (alignment & (alignment - 1)) { errno = EINVAL; return nullptr; }
+#ifdef _WIN32
+    // Windows keeps size and alignment in a header ahead of the payload, so the old size is exact
+    // and the new alignment can differ from the old one without the CRT's _aligned_realloc
+    // restriction applying.
+    if (!p) return guest_windows_alloc(alignment, size);
+    GuestAllocHeader* header = guest_windows_header(p);
+    if (header->magic != kGuestAllocMagic) { errno = EINVAL; return nullptr; }
+    if (!size) { guest_windows_free(p); return nullptr; }
+    const size_t old_size = header->size;
+    void* replacement = guest_windows_alloc(alignment, size);
+    if (!replacement) return nullptr;                     // errno set by guest_windows_alloc
+    memcpy(replacement, p, old_size < size ? old_size : size);
+    guest_windows_free(p);
+    return replacement;
+#else
+    if (!p) return aligned_alloc_portable(alignment, size);
+    if (!size) { free(p); return nullptr; }
+    void* replacement = aligned_alloc_portable(alignment, size);
+    // Old block kept, per realloc's contract. NOTE: errno is NOT set here — aligned_alloc_portable
+    // wraps posix_memalign, which by spec returns its error code rather than setting errno, and the
+    // wrapper discards it. A caller reading errno after a null return sees a stale value.
+    if (!replacement) return nullptr;
+    // The old request size is not recoverable here, so copy what is provably READABLE in the old
+    // block, capped by the new one. malloc_usable_size is always >= the original request, so this
+    // never copies less than the payload; capping at `size` is what keeps it in bounds when the
+    // block shrinks. Copying more than the guest wrote is harmless — it is its own storage.
+    size_t old_readable = PROSPER_USABLE_SIZE(p);
+    memcpy(replacement, p, old_readable < size ? old_readable : size);
+    free(p);
+    return replacement;
+#endif
+}
+
+static void guest_free_portable(void* p) {
+#ifdef _WIN32
+    guest_windows_free(p);
+#else
+    free(p);
+#endif
+}
+} // namespace prosper
+
+namespace prosper {
+
+// All handlers use the full 6-arg HLE signature; extras are ignored (SysV-safe).
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5)
+#define P(x) ((void*)(uintptr_t)(x))
+#define CP(x) ((const void*)(uintptr_t)(x))
+#define CS(x) ((const char*)(uintptr_t)(x))
+
+HLE(h_memcpy)  { return (uint64_t)(uintptr_t)memcpy(P(a0), CP(a1), a2); }
+HLE(h_memmove) { return (uint64_t)(uintptr_t)memmove(P(a0), CP(a1), a2); }
+HLE(h_memset)  { return (uint64_t)(uintptr_t)memset(P(a0), (int)a1, a2); }
+HLE(h_memcmp)  { return (uint64_t)(int64_t)memcmp(CP(a0), CP(a1), a2); }
+HLE(h_memchr)  { return (uint64_t)(uintptr_t)memchr(CP(a0), (int)a1, a2); }
+HLE(h_strlen)  { return (uint64_t)strlen(CS(a0)); }
+HLE(h_strnlen) { return (uint64_t)strnlen(CS(a0), a1); }
+HLE(h_strcmp)  { return (uint64_t)(int64_t)strcmp(CS(a0), CS(a1)); }
+HLE(h_strncmp) { return (uint64_t)(int64_t)strncmp(CS(a0), CS(a1), a2); }
+HLE(h_strcpy)  { return (uint64_t)(uintptr_t)strcpy((char*)P(a0), CS(a1)); }
+HLE(h_strncpy) { return (uint64_t)(uintptr_t)strncpy((char*)P(a0), CS(a1), a2); }
+HLE(h_strcat)  { return (uint64_t)(uintptr_t)strcat((char*)P(a0), CS(a1)); }
+HLE(h_strncat) { return (uint64_t)(uintptr_t)strncat((char*)P(a0), CS(a1), a2); }
+HLE(h_strchr)  { return (uint64_t)(uintptr_t)strchr(CS(a0), (int)a1); }
+HLE(h_strrchr) { return (uint64_t)(uintptr_t)strrchr(CS(a0), (int)a1); }
+HLE(h_strstr)  { return (uint64_t)(uintptr_t)strstr(CS(a0), CS(a1)); }
+// BSD strlcpy/strlcat: bounded, always NUL-terminate; return the length they tried to build.
+HLE(h_strlcpy) {
+    const char* s = CS(a1); size_t n = a2, sl = strlen(s);
+    if (n) { size_t c = sl < n - 1 ? sl : n - 1; memcpy(P(a0), s, c); ((char*)P(a0))[c] = 0; }
+    return sl;
+}
+HLE(h_strlcat) {
+    char* d = (char*)P(a0); const char* s = CS(a1); size_t n = a2;
+    size_t dl = strnlen(d, n), sl = strlen(s);
+    if (dl < n) { size_t c = sl < n - dl - 1 ? sl : n - dl - 1; memcpy(d + dl, s, c); d[dl + c] = 0; }
+    return dl + sl;
+}
+// C11 Annex-K bounded functions (errno_t return; 0 == success), arg order (dst, dstsz, src[, n]). These
+// were MISSING -> the return-0 stub reported SUCCESS without copying, leaving the destination stale/
+// uninitialized -> silent data corruption far from the call site. Real, bounds-checked impls that never
+// write past dstsz (ERANGE=34 on overflow, zeroing the dst for the mem* forms per Annex-K).
+HLE(h_memcpy_s)  { size_t ds=a1,n=a3; if (n>ds) { memset(P(a0),0,ds); return 34; } memcpy(P(a0),CP(a2),n); return 0; }
+HLE(h_memmove_s) { size_t ds=a1,n=a3; if (n>ds) { memset(P(a0),0,ds); return 34; } memmove(P(a0),CP(a2),n); return 0; }
+HLE(h_memset_s)  { size_t ds=a1,n=a3; size_t c=n<ds?n:ds; memset(P(a0),(int)a2,c); return n>ds?34:0; }
+HLE(h_strcpy_s)  { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,i=0; if (ds){ while(i<ds-1&&s[i]){d[i]=s[i];i++;} d[i]=0; } return 0; }
+HLE(h_strncpy_s) { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,n=a3,lim=(ds?ds-1:0); if(n<lim)lim=n; size_t i=0; if (ds){ while(i<lim&&s[i]){d[i]=s[i];i++;} d[i]=0; } return 0; }
+HLE(h_strcat_s)  { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,dl=strnlen(d,ds),i=0; if (dl<ds){ while(dl+i<ds-1&&s[i]){d[dl+i]=s[i];i++;} d[dl+i]=0; } return 0; }
+HLE(h_strncat_s) { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,n=a3,dl=strnlen(d,ds),i=0; if (dl<ds){ while(dl+i<ds-1&&i<n&&s[i]){d[dl+i]=s[i];i++;} d[dl+i]=0; } return 0; }
+
+HLE(h_malloc)  { return (uint64_t)(uintptr_t)guest_malloc_portable(a0); }
+HLE(h_calloc)  { return (uint64_t)(uintptr_t)guest_calloc_portable(a0, a1); }
+HLE(h_realloc) { return (uint64_t)(uintptr_t)guest_realloc_portable(P(a0), a1); }
+HLE(h_free)    { guest_free_portable(P(a0)); return 0; }
+// reallocf(ptr, size): realloc, except that the ORIGINAL block is freed if the resize fails. BSD
+// ships it precisely because `p = realloc(p, n)` leaks `p` on failure, so a caller of reallocf has
+// **delegated** the free-on-failure to libc and will not do it itself. Returning NULL without
+// freeing therefore leaks the original block on every failure path — and unregistered it did worse
+// than that, because the dispatcher's default 0 is a NULL return the caller reads as OOM, so a
+// resize that should have succeeded reported allocation failure (#2203).
+//
+// CONFIDENCE: HIGH on the semantics — this is a published BSD interface with one definition, and
+// the PS5 libc lineage is FreeBSD. The argument order is realloc's, not an inference.
+//
+// The `a1` guard is not defensive noise, and the reason is a three-way platform split rather than
+// the two-way one an earlier revision of this comment claimed (CI on macOS corrected it):
+//
+//   glibc    realloc(p, 0) frees p and returns NULL
+//   Windows  guest_realloc_portable's `if (!size)` frees p and returns NULL, explicitly
+//   macOS    realloc(p, 0) returns a VALID minimum-size block and frees nothing
+//
+// C17 7.22.3.5 leaves the zero case implementation-defined, so all three conform. The guard is
+// correct under every one of them without a platform branch, because it keys on the RESULT rather
+// than on an assumption about it: where NULL comes back the block is already gone and `a1 == 0`
+// stops a double free; where a real block comes back `!r` is false and nothing is freed. Note this
+// means reallocf(p, 0) legitimately returns non-NULL on macOS — do not "fix" that to NULL.
+//
+// `P(a0)` guards the realloc(NULL, n) case, where there is nothing to release. On Windows a pointer
+// the header check rejects reaches guest_windows_free, which re-validates the magic and refuses
+// safely, so the BSD rule needs no platform-specific exception there either.
+HLE(h_reallocf) {
+    void* p = P(a0);
+    void* r = guest_realloc_portable(p, a1);
+    if (!r && p && a1) guest_free_portable(p);
+    return (uint64_t)(uintptr_t)r;
+}
+// reallocalign(ptr, size, alignment).
+//
+// CONFIDENCE: MED on the ARGUMENT ORDER, and deliberately not raised. The 3.20 library dump gives
+// NID<->name pairs and nothing else — it has no signatures, so it cannot establish an order and must
+// not be cited as though it does. The basis is the mspace sibling Sony documents,
+// `sceLibcMspaceReallocalign(msp, ptr, size, boundary)`: drop the mspace handle and (ptr, size,
+// alignment) is what remains. That is an inference from a related contract, not direct evidence.
+//
+// Nothing here can falsify it: test_reallocalign encodes the same order on both sides of the call,
+// so every arm passes whether this is right or reversed. Settling it needs a guest that imports
+// OGybVuPAhAY, traced at the call — #2185 records that none is known.
+//
+// The direction of the risk, stated because it argues against this registration rather than for it:
+// if the order IS reversed, we would read a size as an alignment and an alignment as a size, and a
+// caller asking for a large block with a power-of-two alignment would get a SMALL block back for a
+// large request — a guest heap overflow, where the unregistered status quo was a clean NULL. That is
+// worse than not registering. It is accepted here only because the mspace contract is a real basis
+// and the false-OOM it removes is a live defect; revisit the moment a title exercises this.
+HLE(h_reallocalign) { return (uint64_t)(uintptr_t)guest_reallocalign_portable(P(a0), a1, a2); }
+// memalign(alignment, size): aligned allocation. Normalize alignment to a valid
+// power-of-two >= sizeof(void*) for posix_memalign.
+HLE(h_memalign) {
+    uint64_t al = a0 < sizeof(void*) ? sizeof(void*) : a0;
+    if (al & (al - 1)) {
+        if (al > (uint64_t{1} << 63)) { errno = EINVAL; return 0; }
+        uint64_t p = sizeof(void*);
+        while (p < al) p <<= 1;
+        al = p;
+    }
+    return (uint64_t)(uintptr_t)aligned_alloc_portable(al, a1);
+}
+HLE(h_posix_memalign) {
+    // POSIX: EINVAL if the alignment isn't a power of two AND a multiple of sizeof(void*); ENOMEM only on
+    // an actual allocation failure. We returned ENOMEM for the bad-alignment case too, so a guest that
+    // branches on errno==EINVAL (validating its own request) took the wrong path.
+    if (a1 < sizeof(void*) || (a1 & (a1 - 1))) return 22;   // EINVAL
+    void* p = aligned_alloc_portable(a1, a2);
+    if (!p) return 12; // ENOMEM
+    *(void**)P(a0) = p;
+    return 0;
+}
+HLE(h_aligned_alloc)  { return (uint64_t)(uintptr_t)aligned_alloc_portable(a0, a1); }
+// C++ operators new/delete (the whole IL2CPP game is C++). Throwing operator new must never
+// return null: the caller would treat an illegal null as constructed storage instead of taking
+// its exception/termination path.
+// prosper cannot yet propagate a guest std::bad_alloc across the HLE boundary, so allocation
+// failure is fail-stop. The explicit nothrow overloads retain their required null return.
+[[noreturn]] static void guest_new_oom(uint64_t size, uint64_t alignment) {
+    if (alignment) {
+        fprintf(stderr, "[libc] throwing aligned operator new failed: size=%llu alignment=%llu\n",
+                (unsigned long long)size, (unsigned long long)alignment);
+    } else {
+        fprintf(stderr, "[libc] throwing operator new failed: size=%llu\n",
+                (unsigned long long)size);
+    }
+    abort();
+}
+HLE(h_new) {
+    void* p = guest_malloc_portable(a0 ? a0 : 1);
+    if (!p) guest_new_oom(a0, 0);
+    return (uint64_t)(uintptr_t)p;
+}
+HLE(h_new_nothrow) { return (uint64_t)(uintptr_t)guest_malloc_portable(a0 ? a0 : 1); }
+HLE(h_new_align) {
+    uint64_t alignment = a1 ? a1 : 16;
+    void* p = aligned_alloc_portable(alignment, a0 ? a0 : 1);
+    if (!p) guest_new_oom(a0, alignment);
+    return (uint64_t)(uintptr_t)p;
+}
+HLE(h_new_align_nothrow) {
+    return (uint64_t)(uintptr_t)aligned_alloc_portable(a1 ? a1 : 16, a0 ? a0 : 1);
+}
+HLE(h_delete)      { guest_free_portable(P(a0)); return 0; }
+
+// --- stdio ---
+// v*printf receive a guest-built va_list (a pointer to __va_list_tag under the SysV
+// ABI, which the host shares) — we can forward it directly.
+// --- byte ops / search (integer/pointer args → plain HLE thunks) ---
+HLE(h_bcmp)    { return (uint64_t)(int64_t)memcmp(CP(a0), CP(a1), a2); }   // bcmp == memcmp for equality
+HLE(h_bsearch) { // (key, base, nmemb, size, compar) — compar is a guest fn ptr; SysV ABI matches host
+    return (uint64_t)(uintptr_t)bsearch(CP(a0), CP(a1), a2, a3,
+                                        (int (*)(const void*, const void*))(uintptr_t)a4); }
+// --- integer conversion, sort, tokenize, wide/scan. All confirmed target imports that were MISSING
+// (routed to the return-0 stub) -> returned 0/garbage and left endptr/output args unwritten on parsing
+// paths (localization, save/config, gameplay data). Plain host thunks; guest pointers are identity-mapped
+// so endptr and buffers pass through directly. (strtod/strtof return in XMM -> native thunks, below.) ---
+HLE(h_strtol)   { return (uint64_t)(int64_t)strtol(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_strtoll)  { return (uint64_t)(int64_t)strtoll(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_strtoul)  { return (uint64_t)strtoul(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_strtoull) { return (uint64_t)strtoull(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_atoi)     { return (uint64_t)(int64_t)atoi(CS(a0)); }
+HLE(h_atol)     { return (uint64_t)(int64_t)atol(CS(a0)); }
+// rand/srand/rand_r were MISSING -> the return-0 stub made rand() a constant 0 and srand() a no-op, so any
+// guest RNG routed through libc (procedural effects, shuffles, jitter, retry backoff) was degenerate.
+HLE(h_rand)     { return (uint64_t)(int64_t)rand(); }
+HLE(h_srand)    { srand((unsigned)a0); return 0; }
+// rand_r is POSIX and absent on some MinGW toolchains (broke the Windows build, #488). Use the portable
+// glibc reference implementation so the reentrant PRNG is byte-identical to glibc's rand_r everywhere.
+static int prosper_rand_r(unsigned* seed) {
+    unsigned next = *seed;
+    int result;
+    next *= 1103515245u; next += 12345u; result  = (int)((next >> 16) & 0x7ffu);
+    next *= 1103515245u; next += 12345u; result <<= 10; result ^= (int)((next >> 16) & 0x3ffu);
+    next *= 1103515245u; next += 12345u; result <<= 10; result ^= (int)((next >> 16) & 0x3ffu);
+    *seed = next;
+    return result;
+}
+HLE(h_rand_r)   { return (uint64_t)(int64_t)prosper_rand_r((unsigned*)P(a0)); }
+// qsort: the comparator is a guest fn ptr; SysV ABI matches host, callable directly (cf. h_bsearch).
+HLE(h_qsort)    { qsort(P(a0), a1, a2, (int (*)(const void*, const void*))(uintptr_t)a3); return 0; }
+HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = guest_malloc_portable(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
+HLE(h_strtok)   { return (uint64_t)(uintptr_t)strtok((char*)P(a0), CS(a1)); }
+HLE(h_strspn)   { return (uint64_t)strspn(CS(a0), CS(a1)); }
+HLE(h_strcspn)  { return (uint64_t)strcspn(CS(a0), CS(a1)); }
+HLE(h_strpbrk)  { return (uint64_t)(uintptr_t)strpbrk(CS(a0), CS(a1)); }
+HLE(h_wcslen)   { return (uint64_t)wcslen((const wchar_t*)P(a0)); }   // host wchar_t is 32-bit == PS5/FreeBSD ABI
+HLE(h_vsscanf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsscanf(CS(a0), CS(a1), ap); }
+// _init_env / malloc_stats_fast: legitimately no-ops here (no PS5 process env vars; no malloc stats
+// sink). Registered so they resolve as real, intentional no-ops rather than logged "unimplemented".
+HLE(h_init_env)         { return 0; }
+HLE(h_malloc_stats_fast){ return 0; }
+// __error / __errno_location: FreeBSD/POSIX errno accessor — returns the address of the current
+// thread's errno. Guest threads ARE host pthreads, so the host's thread-local &errno is exactly
+// right, and it stays consistent with the errno our file/mem HLE thunks set. (A null stub here
+// would make the guest deref a null errno pointer.)
+HLE(h_errno_location)   { return (uint64_t)(uintptr_t)&errno; }
+
+// --- math (float/double args + returns travel in XMM regs). The HLE stub tail-jumps preserving
+// every register, so a handler with the correct native signature reads/writes the right regs and
+// is an exact host thunk. Registered by name; only the ones the guest imports actually bind. ---
+static float  m_sinf(float x){return sinf(x);}   static double m_sin(double x){return sin(x);}
+static float  m_cosf(float x){return cosf(x);}   static double m_cos(double x){return cos(x);}
+static float  m_tanf(float x){return tanf(x);}   static double m_tan(double x){return tan(x);}
+static float  m_asinf(float x){return asinf(x);} static double m_asin(double x){return asin(x);}
+static float  m_acosf(float x){return acosf(x);} static double m_acos(double x){return acos(x);}
+static float  m_atanf(float x){return atanf(x);} static double m_atan(double x){return atan(x);}
+static float  m_expf(float x){return expf(x);}   static double m_exp(double x){return exp(x);}
+static float  m_exp2f(float x){return exp2f(x);} static double m_exp2(double x){return exp2(x);}
+static float  m_logf(float x){return logf(x);}   static double m_log(double x){return log(x);}
+static float  m_log10f(float x){return log10f(x);}static double m_log10(double x){return log10(x);}
+static float  m_log2f(float x){return log2f(x);} static double m_log2(double x){return log2(x);}
+static float  m_sqrtf(float x){return sqrtf(x);} static double m_sqrt(double x){return sqrt(x);}
+static float  m_cbrtf(float x){return cbrtf(x);} static double m_cbrt(double x){return cbrt(x);}
+static float  m_floorf(float x){return floorf(x);}static double m_floor(double x){return floor(x);}
+static float  m_ceilf(float x){return ceilf(x);} static double m_ceil(double x){return ceil(x);}
+static float  m_roundf(float x){return roundf(x);}static double m_round(double x){return round(x);}
+static float  m_truncf(float x){return truncf(x);}static double m_trunc(double x){return trunc(x);}
+static float  m_fabsf(float x){return fabsf(x);} static double m_fabs(double x){return fabs(x);}
+static float  m_powf(float x,float y){return powf(x,y);}   static double m_pow(double x,double y){return pow(x,y);}
+static float  m_fmodf(float x,float y){return fmodf(x,y);} static double m_fmod(double x,double y){return fmod(x,y);}
+static float  m_atan2f(float x,float y){return atan2f(x,y);}static double m_atan2(double x,double y){return atan2(x,y);}
+static float  m_hypotf(float x,float y){return hypotf(x,y);}static double m_hypot(double x,double y){return hypot(x,y);}
+static void   m_sincosf(float x, float* s, float* c)   { *s = sinf(x); *c = cosf(x); }
+static void   m_sincos (double x, double* s, double* c){ *s = sin(x);  *c = cos(x);  }
+static double m_ldexp(double x,int n){return ldexp(x,n);}    static float  m_ldexpf(float x,int n){return ldexpf(x,n);}
+static double m_frexp(double x,int* e){return frexp(x,e);}   static float  m_frexpf(float x,int* e){return frexpf(x,e);}
+static double m_modf(double x,double* i){return modf(x,i);}  static float  m_modff(float x,float* i){return modff(x,i);}
+static double m_copysign(double x,double y){return copysign(x,y);} static float m_copysignf(float x,float y){return copysignf(x,y);}
+static double m_fmin(double x,double y){return fmin(x,y);}   static float  m_fminf(float x,float y){return fminf(x,y);}
+static double m_fmax(double x,double y){return fmax(x,y);}   static float  m_fmaxf(float x,float y){return fmaxf(x,y);}
+static double m_sinh(double x){return sinh(x);}   static float m_sinhf(float x){return sinhf(x);}
+static double m_cosh(double x){return cosh(x);}   static float m_coshf(float x){return coshf(x);}
+static double m_tanh(double x){return tanh(x);}   static float m_tanhf(float x){return tanhf(x);}
+static double m_log1p(double x){return log1p(x);} static float m_log1pf(float x){return log1pf(x);}
+static double m_expm1(double x){return expm1(x);} static float m_expm1f(float x){return expm1f(x);}
+// strtod/strtof return a double/float in XMM0 (which the return-0 stub never set -> garbage float for
+// every text-parsed number). Native-signature thunks land the result in the right register; endptr is a
+// guest pointer, passed through. (Also fixes float.Parse / Atof / JSON numeric fields across all titles.)
+static double m_strtod(const char* s, char** e){ return strtod(s, e); }
+static float  m_strtof(const char* s, char** e){ return strtof(s, e); }
+
+HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
+HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
+// Variadic forms: REAL C variadic functions, not the old 3-int-register forward (which dropped
+// %f/XMM args, all stack args, and %s past the 4th argument -> garbage output or a SIGSEGV on a
+// bogus %s pointer). The import stub TAIL-JUMPS into these with the guest's SysV call frame intact
+// (GP regs + XMM + AL + overflow stack), so the compiler-generated variadic prologue captures the
+// full argument set and va_start/v*printf format it correctly. Guest pointers are identity-mapped
+// (guest VA == host VA), so the buffer, format string, and any %s arguments are usable host
+// pointers directly — no P() translation needed (the tail-jump passes the raw guest values).
+// CONFIDENCE: HIGH for register + XMM args (the overwhelmingly common case, correct on both the
+// tail-jmp and GUEST_FS swap-stub paths). MED only for args that spill to the STACK (>6 GP or
+// >8 FP) under the GUEST_FS swap stub, whose reframing shifts the overflow area — rare for a
+// format call, and still strictly better than the old register-only truncation.
+static uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsnprintf((char*)buf, n, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+static uint64_t h_sprintf(void* buf, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsprintf((char*)buf, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+
+namespace {
+// A %n conversion writes through a guest pointer while formatting. The capture adapter must never
+// evaluate it speculatively, so conservatively leave such calls on the original one-pass vprintf path.
+bool format_may_write_n(const char* format) {
+    if (!format) return false;
+    constexpr const char* conversions = "diouxXfFeEgGaAcspnm%";
+    for (const char* p = format; *p; ++p) {
+        if (*p != '%') continue;
+        ++p;
+        if (!*p) break;
+        if (*p == '%') continue;
+        while (*p) {
+            if (std::strchr(conversions, *p)) {
+                if (*p == 'n') return true;
+                break;
+            }
+            ++p;
+        }
+        if (!*p) break;
+    }
+    return false;
+}
+
+int capture_aware_vprintf(const char* format, va_list args) {
+    if (!prosper::gpu::guest_log_capture_bundle_enabled() || format_may_write_n(format))
+        return vprintf(format, args);
+
+    // One byte beyond the accepted line limit is enough to put the bounded observer into its
+    // overlong-line state. Ordinary guest log calls fit and are formatted exactly once; unusually
+    // large calls fall back to the original vprintf for complete stdout fidelity, while the observer
+    // consumes only this bounded prefix and marks the omitted suffix as a safe discontinuity.
+    std::vector<char> formatted(prosper::gpu::kGuestLogCaptureMaxLineBytes + 2);
+    va_list observed;
+    va_copy(observed, args);
+    const int wanted = vsnprintf(formatted.data(), formatted.size(), format, observed);
+    va_end(observed);
+    if (wanted < 0) return vprintf(format, args);
+
+    if (static_cast<size_t>(wanted) < formatted.size()) {
+        const size_t bytes = static_cast<size_t>(wanted);
+        const size_t written = fwrite(formatted.data(), 1, bytes, stdout);
+        if (written) prosper::gpu::observe_guest_log_for_capture(
+            formatted.data(), written, prosper::gpu::GuestLogCaptureSource::Printf);
+        return written == bytes ? wanted : -1;
+    }
+
+    const int result = vprintf(format, args);
+    if (result >= 0) {
+        prosper::gpu::observe_guest_log_for_capture(
+            formatted.data(), formatted.size() - 1,
+            prosper::gpu::GuestLogCaptureSource::Printf);
+        prosper::gpu::observe_guest_log_capture_gap();
+    }
+    return result;
+}
+
+void observe_guest_c_string(const char* text, bool known_newline,
+                            prosper::gpu::GuestLogCaptureSource source) {
+    if (!text || !prosper::gpu::guest_log_capture_bundle_enabled()) return;
+    const size_t probe = prosper::gpu::kGuestLogCaptureMaxLineBytes + 1;
+    const size_t bytes = strnlen(text, probe);
+    prosper::gpu::observe_guest_log_for_capture(text, bytes, source);
+    if (bytes == probe) prosper::gpu::observe_guest_log_capture_gap();
+    if (known_newline) prosper::gpu::observe_guest_log_for_capture("\n", 1, source);
+}
+} // namespace
+
+static uint64_t h_printf(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = capture_aware_vprintf(fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+// sscanf: a REAL variadic host thunk (like the *printf family) — the import stub tail-jumps with the
+// guest's full SysV frame so va_start captures every arg. Output pointer args are guest pointers
+// (identity-mapped), so vsscanf writes through them directly. MISSING before -> returned 0 leaving ALL
+// output args uninitialized (the guest consumed uninit memory as parsed values).
+static uint64_t h_sscanf(const char* s, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsscanf(s, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+HLE(h_puts)      { const char* s = (const char*)P(a0); int r = fputs(s, stdout); int nl = fputc('\n', stdout);
+                   if (r != EOF && nl != EOF) observe_guest_c_string(
+                       s, true, prosper::gpu::GuestLogCaptureSource::Puts);
+                   return (uint64_t)(int64_t)r; }
+HLE(h_putchar)   { int r = putchar((int)a0); if (r != EOF) { const char c = (char)a0;
+                   prosper::gpu::observe_guest_log_for_capture(
+                       &c, 1, prosper::gpu::GuestLogCaptureSource::Putchar); }
+                   return (uint64_t)(int64_t)r; }
+HLE(h_fputs)     { const char* s = (const char*)P(a0); FILE* stream = a1 ? (FILE*)P(a1) : stdout;
+                   int r = fputs(s, stream); if (r != EOF && stream == stdout) observe_guest_c_string(
+                       s, false, prosper::gpu::GuestLogCaptureSource::Fputs);
+                   return (uint64_t)(int64_t)r; }
+
+// --- locale / ctype (Dinkumware CRT: _Getpctype/_Getpt{o,}lower return table ptrs) ---
+// The 257-entry C-locale table and masks match Dinkumware 5.00: _XD=0x01, _UP=0x02,
+// _SP=0x04, _PU=0x08, _LO=0x10, _DI=0x20, _CN=0x40, _BB=0x80, _XS=0x100,
+// _XA=0x200, and _XB=0x400. A captured PS5 guest inline isspace uses test 0x144,
+// exactly _CN|_SP|_XS, which pins Sony's contract. CONFIDENCE: HIGH.
+// Element [-1] is the EOF slot; bytes 0x80..0xff are unclassified in the C locale.
+namespace {
+    using CtypeTable = std::array<short, 257>;
+
+    constexpr CtypeTable make_ctype_table() {
+        CtypeTable table{};
+        for (int c = 0; c < 128; ++c) {
+            short mask = 0;
+            if (c <= 0x08 || (c >= 0x0e && c <= 0x1f) || c == 0x7f) mask |= 0x080; // _BB
+            if (c >= 0x09 && c <= 0x0d) mask |= 0x0c0;                              // _BB|_CN
+            if (c == '\t') mask |= 0x400;                                           // _XB
+            if (c == ' ') mask |= 0x004;                                            // _SP
+            if ((c >= '!' && c <= '/') || (c >= ':' && c <= '@') ||
+                (c >= '[' && c <= '`') || (c >= '{' && c <= '~')) mask |= 0x008;   // _PU
+            if (c >= '0' && c <= '9') mask |= 0x021;                                // _DI|_XD
+            if (c >= 'A' && c <= 'Z') mask |= short(0x002 | (c <= 'F' ? 0x001 : 0)); // _UP|_XD
+            if (c >= 'a' && c <= 'z') mask |= short(0x010 | (c <= 'f' ? 0x001 : 0)); // _LO|_XD
+            table[c + 1] = mask;
+        }
+        return table;
+    }
+
+    constexpr CtypeTable make_case_table(bool upper) {
+        CtypeTable table{};
+        table[0] = -1; // EOF
+        for (int c = 0; c < 256; ++c) {
+            if (upper && c >= 'a' && c <= 'z') table[c + 1] = short(c - ('a' - 'A'));
+            else if (!upper && c >= 'A' && c <= 'Z') table[c + 1] = short(c + ('a' - 'A'));
+            else table[c + 1] = short(c);
+        }
+        return table;
+    }
+
+    constexpr CtypeTable g_ctype = make_ctype_table();
+    constexpr CtypeTable g_tolow = make_case_table(false);
+    constexpr CtypeTable g_toup = make_case_table(true);
+}
+HLE(h_getpctype)  { return (uint64_t)(uintptr_t)(g_ctype.data() + 1); }
+HLE(h_getptolow)  { return (uint64_t)(uintptr_t)(g_tolow.data() + 1); }
+HLE(h_getptoup)   { return (uint64_t)(uintptr_t)(g_toup.data() + 1); }
+// glibc contract: __ctype_get_mb_cur_max returns the VALUE of MB_CUR_MAX (size_t),
+// not a pointer. 1 in the "C" locale we present via setlocale.
+HLE(h_mbcurmax)   { return 1; }
+HLE(h_setlocale)  { static char c[] = "C"; return (uint64_t)(uintptr_t)c; }
+
+// C++/CRT lifecycle: we don't run global destructors, so registration is a no-op.
+HLE(h_atexit)      { return 0; }
+HLE(h_cxa_atexit)  { return 0; }
+HLE(h_cxa_finalize){ return 0; }
+// Itanium C++ ABI static-init guards: byte 0 of the guard = "initialized", byte 1 = an init is in
+// flight. The old implementation was a non-atomic check with no blocking, so two threads racing an
+// uninitialized function-local static BOTH got "you initialize" — concurrent double-construction
+// (torn singletons) in the guest's 15-thread IL2CPP pool. Real contract: acquire returns 1 to
+// exactly one thread and blocks the rest until release/abort. Contenders park on one global
+// mutex/condvar pair (init is cold; the winner runs its constructor OUTSIDE the lock, so
+// independent guards cannot deadlock each other); the fast path stays a lock-free acquire-load.
+//
+// Recursion (#979): the thread that claimed a guard runs the initializer; if THAT initializer
+// re-enters the SAME guard (a lazy singleton whose constructor touches itself), the old code saw
+// busy=1 (which the thread itself set) and blocked on the condvar — a self-deadlock (it waits for
+// itself to release). The Itanium C++ ABI forbids recursive initialization; PS5's libc++abi aborts
+// with "recursive_init". We track the claiming thread per in-flight guard/flag in g_init_owner and,
+// on re-entry by the same thread, break the deadlock without re-running the initializer (guard ->
+// return 0 "don't run", once -> return 1 "already done") and log loudly rather than aborting the
+// whole emulator over one guest's dubious static. A different thread contending is unchanged: it is
+// not the owner, so it falls through to wait() exactly as before. The map only ever holds the
+// handful of guards/flags CURRENTLY initializing (an entry is erased on release/abort/completion),
+// so it cannot grow unboundedly. CONFIDENCE: MED — correct guests never take this path (they would
+// abort on hardware too); the value is converting a silent hang into a visible, non-fatal event.
+namespace {
+    std::mutex g_guard_mx;
+    std::condition_variable g_guard_cv;
+    // in-flight guard/flag address -> the thread that claimed it (recursion detection). Guarded by
+    // g_guard_mx. Keyed by host address; a guest thread runs its HLE calls on its own host thread,
+    // so std::this_thread::get_id() is a stable per-guest-thread identity across acquire/init/re-entry.
+    std::unordered_map<const void*, std::thread::id> g_init_owner;
+}
+HLE(h_guard_acquire) {
+    auto* g = (std::atomic<uint8_t>*)P(a0);
+    if (g->load(std::memory_order_acquire)) return 0;      // already initialized
+    std::unique_lock<std::mutex> lk(g_guard_mx);
+    for (;;) {
+        if (g->load(std::memory_order_acquire)) return 0;  // init finished while we waited
+        uint8_t* busy = (uint8_t*)g + 1;
+        if (!*busy) {                                      // we win: caller runs the initializer
+            *busy = 1;
+            g_init_owner[g] = std::this_thread::get_id();
+            return 1;
+        }
+        auto owner = g_init_owner.find(g);
+        if (owner != g_init_owner.end() && owner->second == std::this_thread::get_id()) {
+            // Same thread re-entering its own in-flight guard = recursive static init (ABI-illegal).
+            // Blocking here would deadlock on ourselves; return 0 (don't re-run) instead.
+            std::fprintf(stderr, "[hle] __cxa_guard_acquire: recursive initialization of guard %p by "
+                                 "the same thread (guest C++ ABI violation); not re-running\n", (void*)g);
+            return 0;
+        }
+        g_guard_cv.wait(lk);
+    }
+}
+HLE(h_guard_release) {
+    auto* g = (std::atomic<uint8_t>*)P(a0);
+    { std::lock_guard<std::mutex> lk(g_guard_mx);
+      ((uint8_t*)g)[1] = 0;
+      g_init_owner.erase(g);
+      g->store(1, std::memory_order_release); }
+    g_guard_cv.notify_all();
+    return 0;
+}
+HLE(h_guard_abort) {   // initializer threw: clear busy so another thread can retry
+    auto* g = (std::atomic<uint8_t>*)P(a0);
+    { std::lock_guard<std::mutex> lk(g_guard_mx); ((uint8_t*)g)[1] = 0; g_init_owner.erase(g); }
+    g_guard_cv.notify_all();
+    return 0;
+}
+
+// std::_Execute_once(once_flag&, int(*cb)(void*,void*,void**), void* arg) — the guts
+// of std::call_once. It MUST invoke the callback (which runs the real one-time init),
+// exactly once per flag, and return nonzero on success (call_once throws on 0). The old
+// check-then-run had no synchronization: concurrent first calls ran the initializer twice
+// in parallel. Flag word: 0 = not run, 2 = running, 1 = done; the callback runs OUTSIDE
+// the lock so once-inits that depend on other threads' progress can't deadlock.
+HLE(h_execute_once) {
+    auto* flag = (std::atomic<uint32_t>*)P(a0);
+    auto cb = (int (*)(void*, void*, void**))P(a1);
+    if (!flag) { void* ctx = nullptr; return (uint64_t)((!cb || cb(nullptr, (void*)P(a2), &ctx)) ? 1 : 0); }
+    for (;;) {
+        if (flag->load(std::memory_order_acquire) == 1) return 1;   // already executed
+        std::unique_lock<std::mutex> lk(g_guard_mx);
+        uint32_t v = flag->load(std::memory_order_acquire);
+        if (v == 1) return 1;
+        if (v == 2) {                                               // an init is running
+            auto owner = g_init_owner.find(flag);
+            if (owner != g_init_owner.end() && owner->second == std::this_thread::get_id()) {
+                // Same thread re-entering call_once on its own in-flight flag = recursive init
+                // (UB per the standard; would self-deadlock). Treat as done without re-running.
+                std::fprintf(stderr, "[hle] std::call_once: recursive execution of once_flag %p by the "
+                                     "same thread (guest UB); not re-running\n", (void*)flag);
+                return 1;
+            }
+            g_guard_cv.wait(lk); continue;                          // another thread is running it
+        }
+        flag->store(2, std::memory_order_relaxed);
+        g_init_owner[flag] = std::this_thread::get_id();
+        lk.unlock();
+        void* ctx = nullptr;
+        int r = cb ? cb((void*)P(a0), (void*)P(a2), &ctx) : 1;
+        lk.lock();
+        flag->store(r ? 1u : 0u, std::memory_order_release);        // failure -> retryable next call
+        g_init_owner.erase(flag);
+        lk.unlock();
+        g_guard_cv.notify_all();
+        return (uint64_t)(r ? 1 : 0);
+    }
+}
+// C++ exception refcounting — no-op is safe for the non-throwing boot path.
+HLE(h_cxa_dec_refcount) { return 0; }
+HLE(h_cxa_inc_refcount) { return 0; }
+
+// sceLibcHeapGetTraceInfo (libSceLibcInternalExt, NID NWtTN10cJzE) — the guest allocator's
+// malloc-trace coordination block. Contract (Kyty LibC.cpp:139 + shadPS4 kernel.cpp:161, identical):
+// the caller passes a 32-byte struct { u64 size(=32, caller-set); u32 flag; u32 getSegmentInfo;
+// u64* mspace_atomic_id_mask; u64* mstate_table } and the callee fills the two pointers with
+// PERSISTENT storage (Kyty: static u64 + static u64[64]) that the guest mspace allocator then
+// reads AND WRITES on allocation paths. Our previous behavior (unimplemented stub -> return 0,
+// struct untouched) handed the guest two garbage stack values as pointers: every subsequent
+// traced-mspace operation stored through random addresses — silent heap/stack corruption that
+// surfaces only under heavy allocation (e.g. the level1 resources.assets loader thread).
+// CONFIDENCE: HIGH — two independent references agree on layout and semantics.
+namespace { uint64_t g_mspace_atomic_id_mask = 0; uint64_t g_mstate_table[64] = {0}; }
+HLE(h_heap_get_trace_info) {
+    uint8_t* info = (uint8_t*)P(a0);
+    if (!info) return 0;
+    // The size field is caller-set; only fill the layout we know (exactly 32 bytes — never write
+    // past the caller's struct; cf. the f_fstat oversized-write lesson).
+    if (*(uint64_t*)info != 32) {
+        fprintf(stderr, "[prosper] sceLibcHeapGetTraceInfo: unexpected info->size=%llu (want 32) -- leaving untouched\n",
+                (unsigned long long)*(uint64_t*)info);
+        return 0;
+    }
+    *(uint32_t*)(info + 0x0c)  = 0;                        // getSegmentInfo: no segment-info callback
+    *(uint64_t**)(info + 0x10) = &g_mspace_atomic_id_mask; // persistent, zero-initialized
+    *(uint64_t**)(info + 0x18) = g_mstate_table;
+    return 0;
+}
+
+void register_builtin_hle() {
+    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // libSceLibcInternalExt heap-trace hookup (raw NID — guaranteed match; see handler comment).
+    Hle::register_fn("NWtTN10cJzE", (HleFn)h_heap_get_trace_info, "sceLibcHeapGetTraceInfo");
+    R("memcpy", h_memcpy);   R("memmove", h_memmove); R("memset", h_memset);
+    R("memcmp", h_memcmp);   R("memchr", h_memchr);
+    R("strlen", h_strlen);   R("strnlen", h_strnlen);
+    R("strcmp", h_strcmp);   R("strncmp", h_strncmp);
+    R("strcpy", h_strcpy);   R("strncpy", h_strncpy);
+    R("strcat", h_strcat);   R("strncat", h_strncat);
+    R("strchr", h_strchr);   R("strrchr", h_strrchr); R("strstr", h_strstr);
+    R("strlcpy", h_strlcpy); R("strlcat", h_strlcat);
+    // Annex-K bounded (secure-CRT) variants — were MISSING -> return-0 stub = "success" without copying
+    R("memcpy_s", h_memcpy_s);   R("memmove_s", h_memmove_s);   R("memset_s", h_memset_s);
+    R("strcpy_s", h_strcpy_s);   R("strncpy_s", h_strncpy_s);
+    R("strcat_s", h_strcat_s);   R("strncat_s", h_strncat_s);
+    R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
+    R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
+    R("reallocalign", h_reallocalign);
+    R("reallocf", h_reallocf);   // YMZO9ChZb0E, libSceLibcInternal (#2203)
+    // operator new / new[] (+ nothrow), and aligned variants
+    R("_Znwm", h_new); R("_Znam", h_new);
+    R("_ZnwmRKSt9nothrow_t", h_new_nothrow); R("_ZnamRKSt9nothrow_t", h_new_nothrow);
+    R("_ZnwmSt11align_val_t", h_new_align); R("_ZnamSt11align_val_t", h_new_align);
+    R("_ZnwmSt11align_val_tRKSt9nothrow_t", h_new_align_nothrow);
+    R("_ZnamSt11align_val_tRKSt9nothrow_t", h_new_align_nothrow);
+    // operator delete / delete[] (+ sized, aligned, nothrow) -> free
+    R("_ZdlPv", h_delete); R("_ZdaPv", h_delete);
+    R("_ZdlPvm", h_delete); R("_ZdaPvm", h_delete);
+    R("_ZdlPvSt11align_val_t", h_delete); R("_ZdaPvSt11align_val_t", h_delete);
+    R("_ZdlPvmSt11align_val_t", h_delete); R("_ZdaPvmSt11align_val_t", h_delete);
+    R("_ZdlPvRKSt9nothrow_t", h_delete); R("_ZdaPvRKSt9nothrow_t", h_delete);
+    // stdio
+    R("vsnprintf", h_vsnprintf); R("vsprintf", h_vsprintf);
+    R("snprintf", h_snprintf);   R("sprintf", h_sprintf);   R("snprintf_s", h_snprintf);
+    R("sprintf_s", h_snprintf);   // Annex-K sprintf_s(s, n, fmt, ...) has a size arg -> bounded snprintf, NOT sprintf
+    R("printf", h_printf);       R("puts", h_puts);
+    R("putchar", h_putchar);     R("fputs", h_fputs);
+    // locale / ctype
+    R("_Getpctype", h_getpctype); R("_Getptolower", h_getptolow); R("_Getptoupper", h_getptoup);
+    R("__ctype_get_mb_cur_max", h_mbcurmax); R("setlocale", h_setlocale);
+    R("atexit", h_atexit);   R("__cxa_atexit", h_cxa_atexit); R("__cxa_finalize", h_cxa_finalize);
+    R("__cxa_guard_acquire", h_guard_acquire);
+    R("__cxa_guard_release", h_guard_release);
+    R("__cxa_guard_abort",   h_guard_abort);
+    R("_ZSt13_Execute_onceRSt9once_flagPFiPvS1_PS1_ES1_", h_execute_once);  // std::call_once core
+    R("__cxa_decrement_exception_refcount", h_cxa_dec_refcount);
+    R("__cxa_increment_exception_refcount", h_cxa_inc_refcount);
+    // setjmp/longjmp family (real register-saving impl; used by Boehm GC root scanning)
+    R("setjmp", prosper_setjmp);   R("_setjmp", prosper_setjmp);   R("sigsetjmp", prosper_setjmp);
+    R("longjmp", prosper_longjmp); R("_longjmp", prosper_longjmp);  R("siglongjmp", prosper_longjmp);
+    // byte ops / search / env
+    R("bcmp", h_bcmp);   R("bsearch", h_bsearch);   R("qsort", h_qsort);
+    // conversion / tokenize / wide / scan (were MISSING -> 0/garbage on parsing paths; confirmed imports)
+    R("strtol", h_strtol);   R("strtoll", h_strtoll);
+    R("strtoul", h_strtoul); R("strtoull", h_strtoull);
+    R("strtod", m_strtod);   R("strtof", m_strtof);
+    R("atoi", h_atoi);       R("atol", h_atol);
+    R("rand", h_rand);       R("srand", h_srand);       R("rand_r", h_rand_r);   // were MISSING -> rand()==0
+    R("strdup", h_strdup);   R("strtok", h_strtok);
+    R("strspn", h_strspn);   R("strcspn", h_strcspn);   R("strpbrk", h_strpbrk);
+    R("wcslen", h_wcslen);
+    R("sscanf", h_sscanf);   R("vsscanf", h_vsscanf);
+    R("_init_env", h_init_env);   R("malloc_stats_fast", h_malloc_stats_fast);
+    R("__error", h_errno_location);  R("__errno_location", h_errno_location);  R("___errno", h_errno_location);
+    // math (real host thunks; float args in XMM survive the tail-jump stub)
+    R("sinf", m_sinf); R("cosf", m_cosf); R("tanf", m_tanf); R("asinf", m_asinf); R("acosf", m_acosf);
+    R("atanf", m_atanf); R("atan2f", m_atan2f); R("expf", m_expf); R("exp2f", m_exp2f); R("logf", m_logf);
+    R("log10f", m_log10f); R("log2f", m_log2f); R("sqrtf", m_sqrtf); R("cbrtf", m_cbrtf); R("powf", m_powf);
+    R("floorf", m_floorf); R("ceilf", m_ceilf); R("roundf", m_roundf); R("truncf", m_truncf);
+    R("fmodf", m_fmodf); R("fabsf", m_fabsf); R("hypotf", m_hypotf);
+    R("sin", m_sin); R("cos", m_cos); R("tan", m_tan); R("asin", m_asin); R("acos", m_acos);
+    R("atan", m_atan); R("atan2", m_atan2); R("exp", m_exp); R("exp2", m_exp2); R("log", m_log);
+    R("log10", m_log10); R("log2", m_log2); R("sqrt", m_sqrt); R("cbrt", m_cbrt); R("pow", m_pow);
+    R("floor", m_floor); R("ceil", m_ceil); R("round", m_round); R("trunc", m_trunc);
+    R("fmod", m_fmod); R("fabs", m_fabs); R("hypot", m_hypot);
+    R("sincosf", m_sincosf); R("sincos", m_sincos);
+    R("ldexp", m_ldexp); R("ldexpf", m_ldexpf); R("frexp", m_frexp); R("frexpf", m_frexpf);
+    R("modf", m_modf); R("modff", m_modff); R("copysign", m_copysign); R("copysignf", m_copysignf);
+    R("fmin", m_fmin); R("fminf", m_fminf); R("fmax", m_fmax); R("fmaxf", m_fmaxf);
+    R("sinh", m_sinh); R("sinhf", m_sinhf); R("cosh", m_cosh); R("coshf", m_coshf);
+    R("tanh", m_tanh); R("tanhf", m_tanhf); R("log1p", m_log1p); R("log1pf", m_log1pf);
+    R("expm1", m_expm1); R("expm1f", m_expm1f);
+    #undef R
+    register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
+    register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
+    register_http_hle();     // libSceHttp local URI parsing
+    register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
+    register_fiber_hle();    // libSceFiber cooperative guest-stack execution
+    register_ult_hle();      // libSceUlt: NOT implemented — fail-visible counted stubs (#1603)
+    register_pad_hle();      // libScePad: real game-controller input (input/pad.cpp)
+    register_audio_hle();    // libSceAudioOut backed by a headless/pluggable AudioSink
+    register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
+    register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
+    register_kernel_hle();   // libkernel primitives (pthread/sync/...)
+}
+
+} // namespace prosper

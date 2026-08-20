@@ -1,7 +1,7 @@
 # AGC command-packet sizes — the contract, the audit, and the instrument
 
 **Status: current.** Read this before changing any `begin_packet(a0, N, …)` count in
-`src/hle/hle_agc.cpp`, before implementing a new AGC builder, and before concluding that a title's
+`src/hle/graphics/hle_agc.cpp`, before implementing a new AGC builder, and before concluding that a title's
 command-buffer churn is the guest's own behaviour.
 
 ## The contract
@@ -246,7 +246,7 @@ that title happened to call.
 | builder absent as well | 34 | left alone: a size would be a guess, and the builder call fails anyway |
 
 (Count the delta and the total separately: **22 NIDs are added**, bringing the answered total from 6
-to 28. `git diff 928b21f5..HEAD -- prosper/src/hle/hle_agc.cpp | grep -c '^+ *RN(".*get_size'` is 22,
+to 28. `git diff 928b21f5..HEAD -- prosper/src/hle/graphics/hle_agc.cpp | grep -c '^+ *RN(".*get_size'` is 22,
 and the counter-arm — reverting only those registrations — fails exactly 22 assertions.)
 
 The fix needs no hardware size and cannot be wrong in the dangerous direction: the guest reserves

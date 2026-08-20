@@ -78,7 +78,7 @@ That line is also the built-in positive control for the mechanism — but **what
 should show depends on the mode.** `s_user_getevent` delivers the initial LOGIN
 event exactly once *per process* (returning 0) and reports NO_EVENT
 (`0x80960007`) forever after, and that "once per process" is a function-local
-`static` in `src/hle/hle_service.cpp`, not a per-window property:
+`static` in `src/hle/service/hle_service.cpp`, not a per-window property:
 
   * under `--launch` the window opens at the first instruction, so the single
     `0x0` falls inside it — a correct capture shows exactly one, and its absence

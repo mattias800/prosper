@@ -288,7 +288,7 @@ recognising them: `guest_write_watch.cpp:1372` and `gpu_timeline.cpp:2288`/`:274
 | --- | --- | --- | --- |
 | `src/gpu/execute/gpu_executor.cpp` (`[udtail]`) | the whole report | `PROSPER_UD_TAIL_ALIGN` **and** one of `PROSPER_GFXLOG` / `PROSPER_DYNTRACE_FAIL` / `PROSPER_DYNTRACE_FAIL_ADDR` | **open, #2146** — the charter requires `PROSPER_UD_TAIL_ALIGN` stay off, so the one report answering the #305 question is available only on runs the project disqualifies |
 | `src/gpu/execute/gpu_executor.cpp` (`[udcand]`) | `fresh_extent` | filled only under `PROSPER_UDPROV` / `PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE`, printed regardless | **open, #2149 inst. 3** — `fresh_extent=0` reads as *"the bind programmed nothing"* |
-| `src/hle/hle_agc.cpp` | unimplemented-NID call-count table | needed `PROSPER_PROGRESS` as well as `PROSPER_PROGRESS_UNIMPL` | **fixed** — the dump now has its own cadence |
+| `src/hle/graphics/hle_agc.cpp` | unimplemented-NID call-count table | needed `PROSPER_PROGRESS` as well as `PROSPER_PROGRESS_UNIMPL` | **fixed** — the dump now has its own cadence |
 | `src/gpu/execute/gpu_executor.cpp` (`record_guest_write`) | `color=…` | the `ColorTarget` recorder sat behind `PROSPER_PROVENANCE_DIM` | **fixed by #2143** — the scanner agrees: the post-fix shape produces no finding |
 
 ### The baseline key, and the two churn doors shut in it
@@ -306,7 +306,7 @@ hand, so both doors are shut:
 | **alternation membership** | this tree has a 28-alternative "some dump is on" predicate; the display form elides it as `..23more`, and that **count is membership** — adding one `PROSPER_DUMP_*` variable re-keys every finding depending on it | a clause with more than three alternatives renders as `(any)` in the key; presentation keeps the count, identity does not |
 
 The second door was measured rather than imagined: on the first baseline, **13 of 93 rows embedded
-an elision count, and all 13 were in one file** — `frontends/shared/live_renderer.cpp`, which was
+an elision count, and all 13 were in one file** — `frontends/shared/live/live_renderer.cpp`, which was
 under active edit in two open PRs at the time. One added variable would have moved all thirteen at
 once. The principle underneath both: **the conjunction is identity; a long alternation is
 presentation** — the same argument the display form makes for eliding it, since printing all 28
