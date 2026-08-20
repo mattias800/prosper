@@ -110,6 +110,36 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **Any predicate over `num_records` or `size_bytes` is UNFALSIFIABLE on the `reach-story-mode`
+  route — the run cannot contain a counterexample.** Four successive attempts to classify a
+  runtime-selected descriptor-table record as "not a descriptor" were refuted (#2481): page
+  residency, region identity, saturated size, and a `num_records` threshold drawn from a census.
+  The fourth is the instructive one, because the census *looked* like the two-population control the
+  first three lacked.
+
+  It was not, and the arithmetic shows why. `size_bytes = num_records × stride` with a **14-bit**
+  stride field, and a record is declined at `size_bytes > 256 MiB`. So a size-declined record must
+  carry `num_records ≥ 16,386`, and an accepted one `num_records ≤ 268,435,456` — the only window
+  where **either** label is attainable is `[16386, 268435456]`. Measured over 382 accepted and 54
+  declined records, accepts top out at **668** and declines start at **973 million**: every single
+  record fell *outside* that window. Consequently every threshold in `(668, 973M)` scores an
+  identical `54/54` with `0/382` false positives — 10,000, 65,535, 1 M, 200 M all tie. The scorecard
+  was measuring the decline filter, not the descriptors.
+
+  A `size > 256 MiB` row in the same table is worse still: ACCEPT is only reachable *past* that
+  exact test, so `0/382` there is forced by the source and could never have printed anything else.
+
+  And the threshold dies on a hand-built instance without needing a second title: with `stride == 0`
+  **`NUM_RECORDS` is a BYTE count** (RDNA3 §8.4.1, #2528), so any raw buffer ≥ 64 KiB carries
+  `num_records ≥ 65536` by definition of the field.
+
+  **So: the next proposal must use a field the decline filter does not, or a route that produces
+  records inside `[16386, 268435456]`.** What survives from the census as genuinely empirical is only
+  the accept-side observation that no accepted record exceeded 65535 — accepts were free to, since
+  `stride=16, num_records=1M` is 16 MiB and would be accepted — and that **two** accepted records are
+  legitimately formatless (`stride=112 records=267`), so `fmt == 0` is not a descriptor test either:
+  untyped loads move raw dwords regardless of declared format.
+
 - **`0x205b658800` is NOT the lighting pass.** It is a rejected full-screen 1080p compute in the
   submit whose 4K output is black, which made it an attractive candidate. Its 149 resources reference
   **none** of the surfaces the resolved-chain table names — not `0x20431c0000`, not `0x207de60000`,

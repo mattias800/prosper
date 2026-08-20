@@ -5965,9 +5965,13 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                     if (table_log)
                         std::fprintf(stderr,
                                      "[srt] selected-table pc=%u REJECTED unsupported-record "
-                                     "index=%u base=0x%llx size=%u fallback=%d\n",
+                                     "index=%u base=0x%llx size=%u stride=%u records=%u fmt=%u "
+                                     "comps=%u fallback=%d words=%08x:%08x:%08x:%08x\n",
                                      u.use_pc, index, (unsigned long long)entry.base,
-                                     entry.size_bytes, (int)entry.forbid_unknown_fallback);
+                                     entry.size_bytes, entry.stride, entry.num_records,
+                                     static_cast<unsigned>(entry.format), entry.num_components,
+                                     (int)entry.forbid_unknown_fallback,
+                                     words[0], words[1], words[2], words[3]);
                     unsupported_record = true;
                     break;
                 }
@@ -5975,9 +5979,28 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 if (!usable && table_log)
                     std::fprintf(stderr,
                                  "[srt] selected-table pc=%u NULL-SLOT index=%u why=%s "
+                                 "base=0x%llx size=%u stride=%u records=%u fmt=%u comps=%u "
                                  "words=%08x:%08x:%08x:%08x\n",
                                  u.use_pc, index,
                                  entry.base <= 0x10000u ? "low-base" : "zero-size",
+                                 (unsigned long long)entry.base, entry.size_bytes, entry.stride,
+                                 entry.num_records, static_cast<unsigned>(entry.format),
+                                 entry.num_components,
+                                 words[0], words[1], words[2], words[3]);
+                // The ACCEPTED population. Without it this report has only records that already
+                // FAILED some filter, and comparing two post-filter populations cannot produce a
+                // counterexample -- which is precisely how three successive predicates for "is this
+                // record a descriptor" were proposed and refuted on #2481. Every record inspected is
+                // now reported with the same decoded fields, from one run, with no filter between
+                // them.
+                if (usable && table_log)
+                    std::fprintf(stderr,
+                                 "[srt] selected-table pc=%u ACCEPT-SLOT index=%u "
+                                 "base=0x%llx size=%u stride=%u records=%u fmt=%u comps=%u "
+                                 "words=%08x:%08x:%08x:%08x\n",
+                                 u.use_pc, index, (unsigned long long)entry.base, entry.size_bytes,
+                                 entry.stride, entry.num_records,
+                                 static_cast<unsigned>(entry.format), entry.num_components,
                                  words[0], words[1], words[2], words[3]);
                 ShaderBufferTableEntry slot;
                 if (usable) {
