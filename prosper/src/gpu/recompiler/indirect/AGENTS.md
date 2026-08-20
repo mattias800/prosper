@@ -11,7 +11,7 @@ per invocation, and derives one bounded record per real invocation.
 
 **This is not the descriptor-table path.** A descriptor loaded with `s_load`/`s_buffer_load` from a
 user-data pointer at a constant immediate is a *scalar*, compile-time-constant offset, and is
-const-folded in `execute/` (see the `SrtUse` contract in `execute/gpu_execute.hpp`). This folder
+const-folded in `execute/` (see the `SrtUse` contract in `src/gpu/execute/gpu_execute.hpp`). This folder
 exists for the harder case where the address is not known until the wave runs.
 
 It deliberately does **not** grant arbitrary FLAT access: every relocated consumer keeps its exact PC,

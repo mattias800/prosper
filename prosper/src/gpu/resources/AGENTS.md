@@ -3,7 +3,8 @@
 Turns descriptors into resolved, bindable resources, and answers questions about their provenance.
 
 - `shader_resources` — `ShaderResource` / `ShaderResourceTable`. The table exposes **five** lookups
-  (`shader_resources.hpp:705,708,713,716,718`); the recompiler uses four of them — by fetch PC, by
+  (`by_srt_offset`, `by_sgpr_base`, `by_sgpr_base_cls`, `by_fetch_pc`, `by_binding`, all declared
+  together in `shader_resources.hpp`); the recompiler uses four of them — by fetch PC, by
   SRT byte offset (`by_srt_offset`), and by SGPR base in both the class-qualified
   (`by_sgpr_base_cls`) and bare (`by_sgpr_base`) forms.
   A resource carrying `srt=0xffffffff sgpr=0xffffffff` is unreachable by the three **key-based**
@@ -12,8 +13,9 @@ Turns descriptors into resolved, bindable resources, and answers questions about
   It is **not** unreachable in general, and getting that wrong sends you hunting a binding that is
   in fact resolving: `by_fetch_pc` consults neither field, so a resource with both sentinels plus a
   valid fetch PC still resolves — the header defines four such shapes, and the recompiler retrieves
-  them live (`rdna2_to_spirv.cpp:2153`'s `by_fetch_pc(153u)`, and `rdna2_emit_alu.cpp:4949`).
-  `by_binding` matches anything in the table at all.
+  them live — `grep -rn by_fetch_pc src/gpu/recompiler/` finds the call sites, including the
+  `by_fetch_pc(153u)` selected-descriptor lookup. `by_binding` matches anything in the table at
+  all.
 - `gpu_resources` — the resolved resource layer over guest memory.
 - `compressed_source_authority` — who is authoritative for a compressed surface's bytes.
 - `metadata_kind_correlation` — correlating a surface's metadata kind with how it is used.

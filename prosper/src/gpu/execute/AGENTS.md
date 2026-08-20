@@ -10,9 +10,17 @@ Where a decoded draw or dispatch becomes real GPU work.
   see a descriptor channel.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `mb3_freelist` — answers "is this guest pointer a free MallocBinned3 block". **Its callers are
-  elsewhere**: `src/gpu/pm4/command_processor.cpp` (21 references), `src/hle/graphics/hle_agc.cpp`
-  (4), `src/hle/kernel/hle_kernel.cpp` (3) and `src/host/image/exec_image_linux.cpp` (1, through
-  the weak `prosper_mb3_is_pool_candidate`) —
+  elsewhere** — `src/gpu/pm4/command_processor.cpp`, `src/hle/graphics/hle_agc.cpp`,
+  `src/hle/kernel/hle_kernel.cpp` and `src/host/image/exec_image_linux.cpp` (the last through the
+  weak `prosper_mb3_is_pool_candidate`). Re-derive rather than trusting this list, and grep the
+  module's declared symbols rather than the substring `mb3_`:
+  ```bash
+  grep -rlE "$(grep -oE '\b(prosper_)?mb3[a-z0-9_]*' src/gpu/execute/mb3_freelist.hpp \
+               | sort -u | paste -sd'|')" --include='*.cpp' src/ | grep -v mb3_freelist
+  ```
+  A count is deliberately not quoted: `command_processor.cpp` also defines its own
+  `mb3_freelist_guard` / `mb3_freelist_report` statics, so a substring count says 21 where module
+  references number 8, and three plausible counting rules give three different answers. —
   `gpu_executor.cpp` does not reference it. Note `src/hle/dispatch/dispatch.cpp` is **not** a caller: its only
   `mb3` token is `g_mb3_arm_hook`, the `PROSPER_MB3WATCH` write-watch hook, which is a different
   mechanism and catches a loose `mb3_` grep. So

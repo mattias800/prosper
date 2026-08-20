@@ -6,7 +6,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
-- `spirv_builder` — small hand-built SPIR-V modules. **One of them SHIPS**: `live_compute.cpp:2155` feeds
+- `spirv_builder` — small hand-built SPIR-V modules. **One of them SHIPS**:
+  `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. Treating
   them as test fixtures is what let an invalid `OpAccessChain` reach real devices (#1711), and
   `tools/spv_validate` exists to stop exactly that — so a change here is a change to shipped

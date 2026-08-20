@@ -5,9 +5,9 @@ with nothing armed, code in this folder can be removed or rate-limited without c
 rendered pixel.
 
 **One entry breaks the stronger form of that rule and you must know about it.**
-`compute_parent_walk_suspicious()` (`compute_parent_walk.cpp:117`) reaches `gpu_executor.cpp:10613`,
-which **skips a live compute dispatch** — it prints `DIAGNOSTIC-ONLY skip suspicious dispatch` and
-then does not run it. It is env-gated, so a default boot is unaffected, but an armed run is not
+`compute_parent_walk_suspicious()` in `compute_parent_walk.cpp` reaches the site in
+`execute/gpu_executor.cpp` that prints `DIAGNOSTIC-ONLY skip suspicious dispatch` and then
+**does not run the dispatch** — grep that string; it is unique. It is env-gated, so a default boot is unaffected, but an armed run is not
 merely observing. `compute_parent_walk.hpp` states this boundary; do not read the folder name as a
 guarantee.
 
