@@ -536,8 +536,11 @@ invariants. A change in frames, draws or wave64 skips is **not** evidence of any
   `120x68x32` grid at 4 and 32 B/cell, under a 3-D dispatch whose Z group count is 32. It rejects on
   `pc=646 words=856a0f0e` = **`s_cselect_b32 vcc_lo, s14, s15`** (llvm-mc, gfx1030), the
   `VCC_LO`-as-scalar-scratch shape `is_gtav_wave64_vcc_lo_scalar_cselect`
-  (`rdna2_to_spirv.cpp:4888`) declines because it requires inline-constant sources. The same class
+  (`rdna2_to_spirv.cpp:4888`) declined because it required inline-constant sources. The same class
   stops the same pass in *Plucky Squire*, *The Pathless* and *Little Nightmares III*. #2747, #2741.
+  **That predicate now admits scalar-data sources** (renamed `is_wave64_vcc_lo_scalar_cselect`,
+  `rdna2_alu_support.hpp`), so this program is expected to recompile — **not re-measured on this
+  title**, and #2747's prediction is explicitly that restoring the pass moves no title off its rung.
 - **"That missing fog is why this title has not reached gameplay."** **Not supported, and stated so
   it is not assumed.** Volumetric fog is a lighting pass, not a progression gate; the title screen and
   the first-run setup render with it absent, and the run above is clean end to end. The only other

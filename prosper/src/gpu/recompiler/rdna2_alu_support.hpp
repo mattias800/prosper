@@ -104,16 +104,33 @@ inline uint32_t mbcnt_source_bit(SpirvCompute& b, const RegState& rs, const Oper
     return found == rs.sreg_bool.end() ? 0 : found->second;
 }
 
-// GTA V uses S_CSELECT_B32 to recycle VCC_LO as ordinary scalar scratch. Inline integer and float
-// operands are exact dword constants, independent of their values. Whether the untouched VCC_HI
-// word may be discarded or must form a complete scalar pair is proved separately at each PC.
-inline bool is_gtav_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
+// S_CSELECT_B32 recycling VCC_LO as ordinary scalar scratch. GTA V selects inline constants; the
+// stock Unreal volumetric-fog kernel selects tracked SGPRs and then CHAINS through VCC_LO itself
+// (#2741: The Plucky Squire 0x3015fd0000 pc217/220/223 is a four-wide cascade -- an SGPR-only
+// widening fixes pc217 and re-rejects at pc220, whose second source decodes as Special 106).
+//
+// This is a SHAPE predicate over operand KINDS only. Whether a non-constant source actually HOLDS
+// scalar data is decided elsewhere and deliberately not duplicated here: the whole-stream pre-pass
+// answers it with source_is_scalar_word(), and emit_alu's operand_bits() rejects any source whose
+// dword is not representable in the per-invocation model. Acceptance additionally requires the
+// separate complete_scalar_pair / vcc_b32_low_only_pcs proof at each PC -- whether the untouched
+// VCC_HI word may be discarded or must form a complete scalar pair is never a property of the
+// select itself.
+//
+// VCC_HI (Special 107) is deliberately NOT admitted as a source. Where the low-only proof applies
+// it has just declared that word dead, and reading it back as data at native subgroup 64 would
+// materialize a ballot half the proof said nobody can observe. Two packet-drift guards in
+// test_rdna2_to_spirv.cpp exist to keep that fail-visible, and admitting Special 106..125 wholesale
+// breaks both.
+inline bool is_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
+    const auto scalar_source_kind = [](const Operand& o) {
+        return o.kind == OperandKind::InlineInt || o.kind == OperandKind::InlineFloat ||
+               o.kind == OperandKind::SGPR ||
+               (o.kind == OperandKind::Special && o.value == 106);
+    };
     return in.fmt == Rdna2Format::SOP2 && in.opcode == kSop2OpcodeCselectB32 &&
         in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
-        (in.src[0].kind == OperandKind::InlineInt ||
-         in.src[0].kind == OperandKind::InlineFloat) &&
-        (in.src[1].kind == OperandKind::InlineInt ||
-         in.src[1].kind == OperandKind::InlineFloat);
+        scalar_source_kind(in.src[0]) && scalar_source_kind(in.src[1]);
 }
 
 // IMAGE_GET_LOD currently models only the ordinary FP32 sampled-image form. Keep the unsupported
