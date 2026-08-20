@@ -1,0 +1,276 @@
+# R-Type Delta: HD Boosted (PPSA26414) -- reach stage 1 gameplay.
+#
+# MEASURED end to end on 2026-08-20 (tools/screenshot, page cache evicted with tools/dropcache.py,
+# unmodified binary, unmodified guest). The title's own module loads are the progress oracle -- the
+# shell loads one PRX per scene from /app0/prx and PROSPER_MODLOG=1 names each one:
+#
+#   t~1    OPTIONS answers the title screen's own "PRESS <glyph>" prompt. The glyph is the PS5
+#          OPTIONS icon (a filled vertical pill with three horizontal lines above it), read off
+#          assets/screenshots/rtype-delta-title.png. It is NOT Cross.
+#   t~14   main menu. The title draws a one-line English description of the highlighted entry at the
+#          bottom of the frame ("Start Game"), which is the state oracle this route was built against.
+#   t~14-50  Cross walks Start Game -> Select Slot to Create -> Enter Name -> back to Start Game, and
+#          writes <PROSPER_SAVE0>/PPSA26414/SaveData.dat. A FRESH save root has no pilot data, so the
+#          title diverts the first "Start Game" into its pilot-creation flow; Cross alone completes it.
+#   t~52   loadsel_Release.prx, then t~54 select_Release.prx -- the ship / Force-device select screen.
+#   t~66   loads1_Release.prx, then t~74 st1r9_Release.prx -- stage 1 with the R-9.
+#
+# loadsel_Release.prx and loads1_Release.prx are the discriminator against attract mode: a matched
+# NEUTRAL-INPUT control arm (neutral.pad, same command, same build) loaded title, select, st1r9, st2
+# and st5 with no input at all -- the attract loop plays stage demos -- but never loadsel or loads1,
+# and never wrote save data. So a stage PRX load on its own is NOT evidence of player-driven play;
+# these two, plus SaveData.dat, are.
+#
+# Anchors are SECONDS from the FIRST PAD POLL (prosper/src/input/pad.cpp: a bare number is seconds,
+# 'f' is flips, 'p' is pad reads). Windows are 0.3 s -- long enough that a 60 Hz poll cannot miss a
+# press, short enough that a menu's auto-repeat cannot advance a selector twice.
+#
+# THE ROUTE IS SAVE-STATE DEPENDENT. Run it with a FRESH PROSPER_SAVE0 (#2734 made that a root, with
+# saves namespaced <root>/PPSA26414/). With pilot data already present the title does not divert into
+# the creation flow and the same button sequence lands somewhere else.
+1-1.3:options
+4-4.3:options
+7-7.3:options
+10-10.3:cross
+13-13.3:cross
+16-16.3:cross
+19-19.3:cross
+22-22.3:cross
+25-25.3:cross
+28-28.3:cross
+31-31.3:cross
+34-34.3:cross
+37-37.3:cross
+40-40.3:cross
+43-43.3:cross
+46-46.3:cross
+49-49.3:cross
+52-52.3:cross
+55-55.3:cross
+58-58.3:cross
+61-61.3:cross
+64-64.3:cross
+67-67.3:cross
+70-70.3:cross
+73-73.3:cross
+76-76.3:cross
+79-79.3:cross
+82-82.3:cross
+# From here the R-9 is in stage 1. Cross keeps being pressed: which button the title binds to Shot
+# by default is NOT established here (its own Settings menu has a "Press Button to Assign <<Shot>>"
+# remapping screen, so a default exists but this route has not read it), and Cross is simply the
+# button already known to be accepted by every menu on the way in.
+86-86.4:cross
+87-87.4:cross
+88-88.4:cross
+89-89.4:cross
+90-90.4:cross
+91-91.4:cross
+92-92.4:cross
+93-93.4:cross
+94-94.4:cross
+95-95.4:cross
+96-96.4:cross
+97-97.4:cross
+98-98.4:cross
+99-99.4:cross
+100-100.4:cross
+101-101.4:cross
+102-102.4:cross
+103-103.4:cross
+104-104.4:cross
+105-105.4:cross
+106-106.4:cross
+107-107.4:cross
+108-108.4:cross
+109-109.4:cross
+110-110.4:cross
+111-111.4:cross
+112-112.4:cross
+113-113.4:cross
+114-114.4:cross
+115-115.4:cross
+116-116.4:cross
+117-117.4:cross
+118-118.4:cross
+119-119.4:cross
+120-120.4:cross
+121-121.4:cross
+122-122.4:cross
+123-123.4:cross
+124-124.4:cross
+125-125.4:cross
+126-126.4:cross
+127-127.4:cross
+128-128.4:cross
+129-129.4:cross
+130-130.4:cross
+131-131.4:cross
+132-132.4:cross
+133-133.4:cross
+134-134.4:cross
+135-135.4:cross
+136-136.4:cross
+137-137.4:cross
+138-138.4:cross
+139-139.4:cross
+140-140.4:cross
+141-141.4:cross
+142-142.4:cross
+143-143.4:cross
+144-144.4:cross
+145-145.4:cross
+146-146.4:cross
+147-147.4:cross
+148-148.4:cross
+149-149.4:cross
+150-150.4:cross
+151-151.4:cross
+152-152.4:cross
+153-153.4:cross
+154-154.4:cross
+155-155.4:cross
+156-156.4:cross
+157-157.4:cross
+158-158.4:cross
+159-159.4:cross
+160-160.4:cross
+161-161.4:cross
+162-162.4:cross
+163-163.4:cross
+164-164.4:cross
+165-165.4:cross
+166-166.4:cross
+167-167.4:cross
+168-168.4:cross
+169-169.4:cross
+170-170.4:cross
+171-171.4:cross
+172-172.4:cross
+173-173.4:cross
+174-174.4:cross
+175-175.4:cross
+176-176.4:cross
+177-177.4:cross
+178-178.4:cross
+179-179.4:cross
+180-180.4:cross
+181-181.4:cross
+182-182.4:cross
+183-183.4:cross
+184-184.4:cross
+185-185.4:cross
+186-186.4:cross
+187-187.4:cross
+188-188.4:cross
+189-189.4:cross
+190-190.4:cross
+191-191.4:cross
+192-192.4:cross
+193-193.4:cross
+194-194.4:cross
+195-195.4:cross
+196-196.4:cross
+197-197.4:cross
+198-198.4:cross
+199-199.4:cross
+200-200.4:cross
+201-201.4:cross
+202-202.4:cross
+203-203.4:cross
+204-204.4:cross
+205-205.4:cross
+206-206.4:cross
+207-207.4:cross
+208-208.4:cross
+209-209.4:cross
+210-210.4:cross
+211-211.4:cross
+212-212.4:cross
+213-213.4:cross
+214-214.4:cross
+215-215.4:cross
+216-216.4:cross
+217-217.4:cross
+218-218.4:cross
+219-219.4:cross
+220-220.4:cross
+221-221.4:cross
+222-222.4:cross
+223-223.4:cross
+224-224.4:cross
+225-225.4:cross
+226-226.4:cross
+227-227.4:cross
+228-228.4:cross
+229-229.4:cross
+230-230.4:cross
+231-231.4:cross
+232-232.4:cross
+233-233.4:cross
+234-234.4:cross
+235-235.4:cross
+236-236.4:cross
+237-237.4:cross
+238-238.4:cross
+239-239.4:cross
+240-240.4:cross
+241-241.4:cross
+242-242.4:cross
+243-243.4:cross
+244-244.4:cross
+245-245.4:cross
+246-246.4:cross
+247-247.4:cross
+248-248.4:cross
+249-249.4:cross
+250-250.4:cross
+251-251.4:cross
+252-252.4:cross
+253-253.4:cross
+254-254.4:cross
+255-255.4:cross
+256-256.4:cross
+257-257.4:cross
+258-258.4:cross
+259-259.4:cross
+260-260.4:cross
+261-261.4:cross
+262-262.4:cross
+263-263.4:cross
+264-264.4:cross
+265-265.4:cross
+266-266.4:cross
+267-267.4:cross
+268-268.4:cross
+269-269.4:cross
+270-270.4:cross
+271-271.4:cross
+272-272.4:cross
+273-273.4:cross
+274-274.4:cross
+275-275.4:cross
+276-276.4:cross
+277-277.4:cross
+278-278.4:cross
+279-279.4:cross
+280-280.4:cross
+281-281.4:cross
+282-282.4:cross
+283-283.4:cross
+284-284.4:cross
+285-285.4:cross
+286-286.4:cross
+287-287.4:cross
+288-288.4:cross
+289-289.4:cross
+290-290.4:cross
+291-291.4:cross
+292-292.4:cross
+293-293.4:cross
+294-294.4:cross
+295-295.4:cross
+296-296.4:cross
+297-297.4:cross
+298-298.4:cross
+299-299.4:cross
