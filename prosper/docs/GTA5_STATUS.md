@@ -150,8 +150,29 @@ conclusion; it sharpens what "essentially all black" looks like.
   the bound descriptor **range** equals the V#'s `num_records x stride` on the compute path. Vulkan
   bounds a robust access to the bound range, not to the guest's `NUM_RECORDS`, so a looser range would
   return neighbouring bytes where hardware returns 0 — and the FLAT path already documents a deliberate
-  "loose-bounds divergence from HW" of exactly this kind. That end-to-end contract has no test.
+  "loose-bounds divergence from HW" of exactly this kind. That end-to-end contract has no test (#2795).
   (2026-08-20.)
+
+- **FOLLOW-UP, and it closes the above as an explanation: the MUBUF out-of-bounds contract IS honoured
+  on the compute path, so a walk off the end of the traversal buffer DOES terminate.** Traced through
+  the source rather than measured, each link checked:
+  `pc=91` decodes as `buffer_load_dword v1, v1, s[0:3], 0` with **`idxen=1, offen=0`** (word0
+  `0xe0302000`, bit 13 set, bit 12 clear), so the address is a record *index* and hardware bounds it at
+  `index >= NUM_RECORDS`. `plan_storage_buffer_materialization` sets `binding_bytes = resource.size` on
+  the default path; `live_compute.cpp` then uses that same value for both `VkBufferCreateInfo::size`
+  and `VkDescriptorBufferInfo::range`, and enables `robustBufferAccess`. For this descriptor
+  (`stride=4, num_records=2063, size=8252`) the bound range is exactly 2063 dwords, the lowering is a
+  dword-indexed read, and index >= 2063 falls outside the range and reads 0 — which is the guest loop's
+  termination condition. The remaining `zero_pad_*` paths pad with **zeros**, so they preserve the same
+  answer rather than breaking it. Note the recompiler emits **no** runtime record-count bound at all
+  (`num_records` appears zero times in `rdna2_emit_alu.cpp`); the contract is delegated entirely to the
+  descriptor range, which is why it is worth having written down.
+  **Consequence for the hang:** the traversal has exactly two exits — a zero link and an out-of-range
+  index — and *both* work. So `0x413dc6700` can only spin on a table whose links form a cycle **inside**
+  `[0, 2063)`, which is what the parent-walk census independently reports (`cyclic-roots=2062,
+  oob-roots=0`). That makes the frontier a **data-production** question — what writes those values —
+  and not a translation or bounds question. Still untested end-to-end (#2795 stands as a coverage gap,
+  not as a suspected defect). (2026-08-21.)
 
 - **Any predicate over `num_records` or `size_bytes` is UNFALSIFIABLE on the `reach-story-mode`
   route — the run cannot contain a counterexample.** Four successive attempts to classify a
