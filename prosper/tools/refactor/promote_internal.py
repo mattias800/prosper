@@ -126,6 +126,23 @@ def anon_map(regions: list[dict]) -> dict[int, bool]:
     return out
 
 
+# LINKAGE COMES FROM THE USR, not from the anonymous-namespace walk alone. clang encodes it: an
+# external-linkage entity's USR starts `c:@`, an internal one is file-prefixed
+# (`c:file.cpp@F@name`). A `static` free function is internal WITHOUT being in an anonymous
+# namespace, so the `anon` test alone missed it -- and then the name grep held it back because some
+# unrelated file happens to define a same-named static. Measured: `make_probe_pipe` was excluded
+# because of a same-named static in exec_image_linux.cpp:152. A name is not an identity; the USR is.
+#
+# This lives at module scope rather than inside main() so the self-test can reach it. It was nested,
+# and a reviewer proved by mutation that reverting it left `--selftest` green -- the tool reported a
+# correction no arm could see.
+def region_is_external(region: dict, in_anon_namespace: bool) -> bool:
+    usr = region.get("usr") or ""
+    if usr:
+        return usr.startswith("c:@")
+    return not in_anon_namespace        # no USR recorded: fall back to the scope walk
+
+
 # `static` is NOT in this list, and that is the correction. A static function definition is fine in
 # a .cpp and is an ODR hazard in a .hpp: it has internal linkage, so each including translation unit
 # gets its own copy, and the moment an `inline` function in the same header odr-uses it the program
@@ -346,6 +363,21 @@ def selftest() -> int:
     check(anon[3] and anon[4], "regions inside `namespace {` are detected as internal")
     check(not anon[6], "a region outside it is not")
 
+    # LINKAGE. The `anon` walk above is NOT sufficient, and this is the arm that proves it: a
+    # `static` free function is internal linkage while sitting outside any anonymous namespace, so
+    # a predicate built on `anon` alone calls it external. Measured: mutating `region_is_external`
+    # back to `return not in_anon_namespace` turns the SECOND AND THIRD checks red by name and
+    # leaves the other two green -- those two pass under both implementations and so certify
+    # nothing on their own.
+    check(region_is_external({"usr": "c:@F@render_frame#"}, False),
+          "a USR starting `c:@` is external linkage")
+    check(not region_is_external({"usr": "c:live.cpp@F@helper#"}, False),
+          "a file-prefixed USR is internal linkage")
+    check(not region_is_external({"usr": "c:live.cpp@F@make_probe_pipe#"}, False),
+          "a `static` free function is INTERNAL even though it is outside `namespace { }`")
+    check(not region_is_external({}, True) and region_is_external({}, False),
+          "with no USR recorded the anonymous-namespace walk is the fallback, both ways")
+
     hdr, src, inl = build(SELF_MAP, SELF_SRC, [3, 4], "s_internal.hpp", "ns", "// note\n",
                           "s_internal.hpp")
     check(inl == ["helper"], f"the free function definition gains `inline` (got {inl})")
@@ -515,18 +547,8 @@ def main() -> int:
     # namespace names a DIFFERENT entity, so every use becomes "reference to X is ambiguous".
     # Measured: `make_shader_compile_key` was excluded because live_renderer.cpp mentions it in a
     # comment about CPU profiling.
-    # LINKAGE COMES FROM THE USR, not from the anonymous-namespace walk alone. clang encodes it:
-    # an external-linkage entity's USR starts `c:@`, an internal one is file-prefixed
-    # (`c:file.cpp@F@name`). A `static` free function is internal WITHOUT being in an anonymous
-    # namespace, so the `anon` test alone missed it -- and then the name grep held it back because
-    # some unrelated file happens to define a same-named static. Measured: `make_probe_pipe` was
-    # excluded because of a same-named static in exec_image_linux.cpp:152. A name is not an
-    # identity; the USR is.
     def externally_linked(i: int) -> bool:
-        usr = regions[i].get("usr") or ""
-        if usr:
-            return usr.startswith("c:@")
-        return not anon.get(i)          # no USR recorded: fall back to the scope walk
+        return region_is_external(regions[i], anon.get(i, False))
 
     public = [i for i in promote
               if externally_linked(i)
@@ -543,8 +565,13 @@ def main() -> int:
         # promote set after this filter had removed it -- five other translation units then failed
         # to link against a definition that had become `inline` in a header they do not include.
         excluded |= set(public)
-    internal = [i for i in promote if anon.get(i)]
-    external = [i for i in promote if not anon.get(i)]
+    # Report linkage with the SAME predicate the exclusion above uses. These two lines read
+    # `anon.get(i)` until a review pointed out that this file proves that predicate wrong six lines
+    # earlier: a `static` free function has internal linkage WITHOUT being in an anonymous namespace,
+    # so it was counted as "already external" and the one semantic change this tool makes -- internal
+    # linkage becoming external -- went unreported for exactly the case most likely to surprise.
+    internal = [i for i in promote if not externally_linked(i)]
+    external = [i for i in promote if externally_linked(i)]
     # An earlier version of this guard refused a set with no internal-linkage regions, reasoning
     # that promoting an already-external one is "a no-op reported as success". That is wrong, and it
     # blocked a legitimate use: moving an external definition into a header is not a no-op -- it

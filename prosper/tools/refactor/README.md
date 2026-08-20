@@ -81,7 +81,7 @@ caveats found by trying it:
 * **clangd refuses to extract from inside a lambda, and that rules out this codebase's giant
   functions.** From `clang-tools-extra/clangd/refactor/tweaks/ExtractFunction.cpp`, the tweak
   returns `nullptr` when a `LambdaExpr` is found — the comment is literally *"Don't extract from
-  lambdas"*. `register_live_renderer` is 8,222 lines of which **98.5%** is inside lambdas (8,101 of 8,221 lines, from the AST — 89% is the
+  lambdas"*. `register_live_renderer` spans 8,221 lines of which **98.5%** is inside lambdas (8,101 of 8,221, from the AST — 89% is the
   file-share figure in the table above, a different number) passed to registration calls, so every candidate worth extracting is in refused territory.
   `extract_function.py --probe` reports 0 of 10 accepted at its default bounds, and that is correct behaviour, not a bug.
 
@@ -95,13 +95,16 @@ caveats found by trying it:
   nest. That needs either restructuring the lambdas into named functions first (by hand, since that
   is the very operation being asked for), or an IDE plugin driving a refactoring engine without the
   lambda restriction. JetBrains' shipped MCP server does not offer one: across the IDE family its
-  entire refactoring surface is `rename_refactoring`, with extract-method an open request
-  (YouTrack LLM-25880 — which names extract *variable* and extract *parameter*, NOT extract
-  method, so it is not even a request for this). A community PyCharm plugin advertises Extract
-  Method over HTTP, which shows
-  the shape of that route — but it is a STUB: its `PyExtractMethodUtil.extractMethod` call is
-  commented out and it returns success with an empty parameter list. There is currently no
-  WORKING example of this route in any IDE, which raises its cost rather than lowering it.
+  entire refactoring surface is `rename_refactoring`, with AST-based refactoring an open request
+  (YouTrack LLM-25880, state Open). That issue's examples name rename, extract *variable*, extract
+  *parameter* and change signature; they are introduced by *"such as"*, so they are illustrative
+  rather than a scope boundary, and extract-method is neither promised nor excluded by them.
+  A community PyCharm plugin advertises Extract Method over HTTP, which shows the shape of that
+  route — but it is a STUB: its `PyExtractMethodUtil.extractMethod` call is commented out and it
+  returns success with an empty parameter list, which is where its advertised "automatic parameter
+  detection" comes from. (`extractVariable` in the same file is inert too.) No IDE-driven example
+  of this route was found working during this survey — which is a statement about what was checked,
+  not a proof that none exists — so the route's cost has to be treated as unmeasured rather than low.
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.
