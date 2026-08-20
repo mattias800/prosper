@@ -50,7 +50,7 @@ Last updated: 2026-08-17
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ First-level gameplay | [#1887](https://github.com/mattias800/prosper/issues/1887) |
 | *Rugrats: Adventure in Gameland* | `PPSA23396` | Unity / IL2CPP | ✅ First nursery level | [#1888](https://github.com/mattias800/prosper/issues/1888) |
 | *Syberia: Remastered* | `PPSA30140` | Unity / IL2CPP | 🚧 First playable scene | [#1811](https://github.com/mattias800/prosper/issues/1811) |
-| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Opening movie, title screen, EULA, menu, and options; the title screen needs no input, and movie frames render with collapsed chroma ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1889](https://github.com/mattias800/prosper/issues/1889) |
+| *Tales of Graces f Remastered* | `PPSA19991` | Unity / IL2CPP | 🚧 Lhant Hill prologue gameplay; movie frames render with collapsed chroma ([#2731](https://github.com/mattias800/prosper/issues/2731)) | [#1889](https://github.com/mattias800/prosper/issues/1889) |
 | *Astro Bot* | `PPSA21564` | ASOBI (in-house) | 🚧 Opening sequence and title screen | [#1809](https://github.com/mattias800/prosper/issues/1809) |
 | *The Forgotten City* | `PPSA03026` | Unreal Engine | 🚧 Title screen | [#1890](https://github.com/mattias800/prosper/issues/1890) |
 | *Tactics Ogre: Reborn* | `PPSA03839` | — | 🚧 First tutorial battle | [#1892](https://github.com/mattias800/prosper/issues/1892) |
@@ -402,6 +402,7 @@ The validated route reaches the title screen and first playable scene with real 
 
 ## Tales of Graces f Remastered — `PPSA19991`
 
+<p align="center"><img src="assets/screenshots/tales-graces-f-gameplay.png" alt="Tales of Graces f Remastered — Lhant Hill prologue gameplay"></p>
 <p align="center"><img src="assets/screenshots/tales-graces-f-publisher.png" alt="Tales of Graces f Remastered — publisher logo"></p>
 <p align="center"><img src="assets/screenshots/tales-graces-f-criware.png" alt="Tales of Graces f Remastered — CRIWARE logo"></p>
 <p align="center"><img src="assets/screenshots/tales-graces-f-title-no-input.png" alt="Tales of Graces f Remastered — title screen reached with no input"></p>
@@ -414,7 +415,9 @@ The validated route reaches the title screen and first playable scene with real 
 master; this one carries the `Press ✕` prompt and, more importantly, was reached with the pad
 unplugged.*
 
-A default launch with no input route renders the opening movie, then reaches the **title screen** on its own at roughly 220 s, and continues into the EULA, main menu and new-game Options screen at native 1920×1080. Movie frames composite with their chroma collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)). See the [tracker](https://github.com/mattias800/prosper/issues/1889).
+The route [`prosper/scripts/talesgraces/reach-gameplay.pad`](prosper/scripts/talesgraces/reach-gameplay.pad) reaches the **Lhant Hill prologue** — Asbel in a live 3D field at native 1920×1080 — reproduced 2 of 2, with no rejected shader or skipped dispatch in any run. A default launch with no input route still reaches the **title screen** on its own at roughly 220 s, then the EULA, main menu and new-game Options screen.
+
+**What held this title at a menu was input, not the renderer.** Two new-game screens bind their confirm action to the **OPTIONS** button and each raises a Yes/No dialog defaulting to **No**, so a Cross-only route loops forever and an OPTIONS+Cross route answers *No*. Movie frames composite with their chroma collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)). See [`prosper/docs/TALES_GRACES_STATUS.md`](prosper/docs/TALES_GRACES_STATUS.md) and the [tracker](https://github.com/mattias800/prosper/issues/1889).
 
 ## Astro Bot — `PPSA21564`
 
