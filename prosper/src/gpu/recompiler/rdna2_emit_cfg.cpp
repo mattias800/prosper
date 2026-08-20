@@ -2593,7 +2593,52 @@ bool emit_cfg_state_machine(
                         in.dst.value != 106 && in.dst.value != 107 &&
                         in.dst.value != 126 && in.dst.value != 127;
                 else if (!preserves_scc)
-                    scalar_scc = scalar_sources && mask_write < 0;
+                    // `mask_write < 0` is what keeps a B64 logical's cross-lane
+                    // SCC=(whole mask != 0) out of the scalar domain, and it must. It also fired on
+                    // the ONE mask classification that is not a wave reduction at all:
+                    // `b32_vcc_complete_scalar_pair` sets mask_write=106 precisely BECAUSE both
+                    // source dwords are proved scalar data, and on exactly that proof emit_alu
+                    // takes its scalar path and publishes `rs.scc = (complete 32-bit result != 0)`
+                    // — an ordinary one-dword compare with no cross-lane component. The mask
+                    // lifetime here is the SECOND, derived half of a dual-domain write, not
+                    // evidence that the result is a wave mask.
+                    //
+                    // Charging that write an SCC loss cost Sonic Frontiers five stage compute
+                    // programs, three hops downstream of the site (#2790). Every one of them runs
+                    //     s_or_b32 vcc_lo, vcc_hi, scc      <- dual-domain scalar pair, mask_write=106
+                    //     ... v_cmp_* vcc, 0, vcc_lo        <- ends both words' scalar lifetimes
+                    //     s_cselect_b32 vcc_hi, 1, 0        <- reads SCC: valid_scc_read was FALSE,
+                    //                                          so VCC_HI lost its scalar-word fact
+                    //     s_cmp_eq_u32 <imm>, sN            <- re-arms a perfectly scalar SCC
+                    //     s_or_b32 vcc_lo, scc, vcc_hi      <- REJECTED: VCC_HI is not a scalar word
+                    // and the reject is reported at the last line, whose own SCC is fine — measured
+                    // live, `scc` is a live SSA id there and both operands have scalar data. The
+                    // deliberate 64-bit-mask SCC poison in rdna2_emit_alu.cpp is NOT what stops
+                    // these programs; this transfer rule is.
+                    //
+                    // The SOP1 arm below already draws exactly this distinction for the identical
+                    // situation -- `s_not_b32 vcc_lo,vcc_lo` keeps its scalar SCC unless
+                    // `wave64_vcc_b32_mask_not` says the source really was a mask, rather than
+                    // being denied it for having a coexisting Bool lifetime. This makes the SOP2
+                    // arm agree with it. `dual_domain_scalar_write` above already publishes this
+                    // instruction's DESTINATION words on the same `b32_vcc_complete_scalar_pair`
+                    // proof; SCC was the one fact it withheld.
+                    //
+                    // That symmetry now holds FOR COMPUTE ONLY -- `dual_domain_scalar_write` is not
+                    // narrowed, this is. Do NOT "restore consistency" by dropping `b.is_compute`:
+                    // the asymmetry is deliberate and the reason is the next paragraph.
+                    //
+                    // `b.is_compute` is deliberately narrower than the rest of this transfer, which
+                    // also runs for Wave64 FRAGMENT. A fragment B32 VCC logical can instead be
+                    // claimed by emit_alu's Wave32-mask block, which publishes
+                    // `rs.scc = fragment_wave_any(...)` -- a vote, not `(result != 0)`. Reaching
+                    // that needs a source which is simultaneously a MUST scalar word and a live
+                    // B32 mask, which nobody has constructed; the measured case is compute, so the
+                    // exemption is granted only where the implication was actually traced. Review
+                    // of #2801.
+                    scalar_scc = scalar_sources &&
+                        (mask_write < 0 ||
+                         (b.is_compute && b32_vcc_complete_scalar_pair));
             } else if (in.fmt == Rdna2Format::SOP1) {
                 const bool preserves_scc =
                     in.opcode == kSop1OpcodeMovB32 ||
