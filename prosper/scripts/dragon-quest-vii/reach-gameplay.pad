@@ -1,0 +1,75 @@
+# Dragon Quest VII Reimagined (PPSA17942) — title -> new adventure log -> name entry ->
+# first-run System Settings -> opening chapter in Estard (T001).
+#
+# The first seven pulses are reach-title-screen.pad unchanged; everything after 35 s was
+# derived by watching a live-reloaded route (PROSPER_PAD_SCRIPT_RELOAD=1) frame by frame.
+# Read scripts/dragon-quest-vii/README.md for the control model before editing this:
+# in particular OPTIONS is the jump-to-OK shortcut on the name keyboard, and the two
+# System Settings menus have DIFFERENT row counts, so the down-counts are not the same.
+3:cross
+6:cross
+9:cross
+12:cross
+15:cross
+18:cross
+30:cross
+# title is up by ~34 s
+35:cross
+# "Create a new adventure log" -> the slot list, with "1: Unused" highlighted
+55:cross
+# confirm the slot -> the player-name keyboard, cursor on 'A'
+75:cross
+# enter one character
+100:cross
+# OPTIONS jumps the cursor to the on-screen OK cell (cross alone never leaves the grid)
+120:options
+# OK -> "Are you happy to proceed with the name 'A'?", Yes preselected
+140:cross
+# Yes
+160:cross
+# System Settings 1/4: intro message
+180:cross
+# 1/4: character voice language, English preselected
+195:cross
+# 2/4: play style, Happy Medium preselected
+210:cross
+# 3/4: camera menu — FOUR rows (vertical axis / horizontal axis / revert / confirm).
+# Cross on a row only toggles that row's value, so walk down to Confirm first.
+230:down
+238:down
+246:down
+254:cross
+# 4/4: brightness menu — THREE rows (bar / revert / confirm). One fewer down than 3/4;
+# a third down wraps back to the bar.
+270:down
+278:down
+286:cross
+# "Adventure log successfully created." -> the save is written and the level load starts
+305:cross
+320:cross
+# opening chapter CS_CP1_001_010 and the walk into Estard; keep advancing dialogue
+340:cross
+355:cross
+370:cross
+385:cross
+400:cross
+415:cross
+430:cross
+445:cross
+460:cross
+475:cross
+490:cross
+505:cross
+520:cross
+535:cross
+550:cross
+565:cross
+580:cross
+595:cross
+610:cross
+625:cross
+640:cross
+655:cross
+670:cross
+685:cross
+700:cross
