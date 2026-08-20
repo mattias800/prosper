@@ -78,19 +78,26 @@ caveats found by trying it:
   declaring a variable used after the span (that needs an out-parameter or a returned struct). Giant
   functions here are dense with both, so a candidate-finder must filter for what clangd accepts
   before offering it a span.
-* **Multi-statement extraction has not been made to fire on a real giant function, and the reason is
-  not yet known.** `extract_function.py --probe` asks clangd about every candidate it finds;
-  currently it accepts **0 of 8** in `register_live_renderer`. What is ruled out:
-  - not the file, and not the flags — clangd offers "Extract to function" at
-    `live_renderer.cpp:199` (a statement in a small function in the same file) and in
-    `gpu_dependency_graph.cpp`;
-  - not a truncated range — extending the selection past the statement's trailing `;` changes
-    nothing (`EXTRACT_END_SLACK`);
-  - not lambdas alone — a top-level run in the same function is also refused, though that particular
-    one declared a variable used later, so it is not a clean arm.
+* **clangd refuses to extract from inside a lambda, and that rules out this codebase's giant
+  functions.** From `clang-tools-extra/clangd/refactor/tweaks/ExtractFunction.cpp`, the tweak
+  returns `nullptr` when a `LambdaExpr` is found — the comment is literally *"Don't extract from
+  lambdas"*. `register_live_renderer` is 8,222 lines of which roughly 89% is inside lambdas passed
+  to registration calls, so every candidate worth extracting is in refused territory.
+  `extract_function.py --probe` reports 0 of 8 accepted, and that is correct behaviour, not a bug.
 
-  Single statements are accepted; every multi-statement run tried has been refused. That is the
-  shape of the open question, and it is worth answering before writing more candidate-finding logic.
+  Its other documented refusals matter for the same reason: **`requiresHoisting`** (*"cannot extract
+  declarations that will be needed in the original function after extraction"*), an unmatched
+  `break`/`continue`, a conditional `return`, a **templated** enclosing function, and extracting the
+  whole function body. Between them they exclude most spans in code shaped like this.
+
+  So clangd extract-method is genuinely useful — for normal-sized functions, where it does the
+  capture analysis correctly and safely. It is **not** the route to shrinking an 8,000-line lambda
+  nest. That needs either restructuring the lambdas into named functions first (by hand, since that
+  is the very operation being asked for), or an IDE plugin driving a refactoring engine without the
+  lambda restriction. JetBrains' shipped MCP server does not offer one: across the IDE family its
+  entire refactoring surface is `rename_refactoring`, with extract-method an open request
+  (YouTrack LLM-25880). A community PyCharm plugin does expose Extract Method over HTTP, which shows
+  the shape of that route and also its cost — a per-IDE plugin against the IDE's own API.
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.
