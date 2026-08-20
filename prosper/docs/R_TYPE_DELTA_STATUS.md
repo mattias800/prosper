@@ -942,3 +942,31 @@ differs, which is the control the defect needed.
   `st1r9_Release.prx`, `st2_Release.prx` and `st5_Release.prx` with the pad untouched. The
   discriminators are `loadsel_Release.prx` + `loads1_Release.prx` + `SaveData.dat`
   (`scripts/rtype-delta-PPSA26414/README.md`).
+
+### Bisected to `904e05ad`, with the instrument that got it wrong first
+
+The regression begins at **`904e05ad`** — `fix(recompiler): preserve GTA Wave64 scalar mask words`
+(2026-08-11, +363 lines in the RDNA2→SPIR-V recompiler, one of the `fix/issue-2481-*` GTA V Wave64
+mask series). Its **direct parent** `27dfd713` renders on this title's own route (peak 2,004,706
+non-black pixels, 11 distinct late frame CRCs); `904e05ad` freezes (1,166,928, **1** distinct).
+
+**What is not established:** that reverting it repairs current master. Reverting the *later*
+`86cbe9d3` hunk on master changed nothing, and at `94d36b03` the frame is entirely black from t=2 s —
+even the logo and movie stop — where master still renders them. Master may carry more than one
+regression in this family; re-measure after each candidate fix.
+
+**The discriminator, because the obvious one is void.** This defect freezes the composite and
+re-serves *one retained frame* forever, so a peak-brightness or peak-coverage statistic is exactly
+backwards: it cannot decay, and if the freeze caught the opening movie the retained frame is a
+letterboxed 1920×608 still worth **1,167,360 non-black pixels**, which passes any sane coverage
+threshold on every sample forever. A first bisect scored six frozen runs GOOD that way and returned a
+culprit whose own hunk, reverted, moved nothing — the mutation arm is what caught it. Use both
+numbers, over samples at t ≥ 30 s, straight from the capture manifest:
+
+```text
+peak non-black >= 1,200,000  AND  >= 3 distinct pixel_crc32   ->  renders
+```
+
+The three freeze signatures seen — 1,167,360 (frozen on the movie), 1,637 (frozen on the menu
+description line) and 0 (frozen before anything drew) — are one defect caught at three moments, and
+only the CRC count sees that.
