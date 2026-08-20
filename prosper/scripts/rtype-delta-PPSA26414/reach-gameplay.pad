@@ -1,8 +1,12 @@
 # R-Type Delta: HD Boosted (PPSA26414) -- reach stage 1 gameplay.
 #
-# MEASURED end to end on 2026-08-20 (tools/screenshot, page cache evicted with tools/dropcache.py,
-# unmodified binary, unmodified guest). The title's own module loads are the progress oracle -- the
-# shell loads one PRX per scene from /app0/prx and PROSPER_MODLOG=1 names each one:
+# The timeline below was MEASURED on 2026-08-20 (tools/screenshot, page cache evicted with
+# tools/dropcache.py, unmodified binary, unmodified guest). Its t=1..82 s menu phase is byte-identical
+# to explore-v2.pad, which is the file those runs used; what this file adds is the tail from t=86 s,
+# a 1 s Cross cadence for stage 1 rather than v2's 3 s menu cadence.
+#
+# The title's own module loads are the progress oracle -- the shell loads one PRX per scene from
+# /app0/prx and PROSPER_MODLOG=1 names each one:
 #
 #   t~1    OPTIONS answers the title screen's own "PRESS <glyph>" prompt. The glyph is the PS5
 #          OPTIONS icon (a filled vertical pill with three horizontal lines above it), read off
@@ -29,8 +33,9 @@
 # press, short enough that a menu's auto-repeat cannot advance a selector twice.
 #
 # THE ROUTE IS SAVE-STATE DEPENDENT. Run it with a FRESH PROSPER_SAVE0 (#2734 made that a root, with
-# saves namespaced <root>/PPSA26414/). With pilot data already present the title does not divert into
-# the creation flow and the same button sequence lands somewhere else.
+# saves namespaced <root>/PPSA26414/). Every arm behind the timeline above used an empty save root, so
+# the pilot-creation detour is part of what the Cross presses are timed against; what a run against an
+# ALREADY-WRITTEN save does has not been measured here, and should not be assumed to be the same.
 1-1.3:options
 4-4.3:options
 7-7.3:options
