@@ -4016,7 +4016,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             (in.src[0].kind == OperandKind::Special && in.src[0].value == 106))
                                                                           khi = known(in.src[0].value + 1, ahi);
                         else if (in.src[0].kind == OperandKind::InlineInt) { ahi = in.src[0].value < 0 ? 0xFFFFFFFFu : 0u; khi = true; }
-                        else                                               { ahi = 0; khi = true; }   // 32-bit literal
+                        // 32-bit literal -- and, since SCC became readable, also `Special{253}`.
+                        // Zero is right for both: a literal's upper half is zero-extended, and SCC
+                        // is a single bit.
+                        else                                               { ahi = 0; khi = true; }
                         if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
                         uint64_t src64 = (uint64_t)a | ((uint64_t)ahi << 32);
                         uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));

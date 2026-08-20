@@ -257,8 +257,11 @@ int main() {
 
     // NEGATIVE ARM: with SCC UNKNOWN the same shader must still fail closed. Without this, the fix
     // is indistinguishable from "always report SCC as 0" -- which would fold a wrong NUM_RECORDS
-    // and bind a descriptor the guest never described. `s_cbranch_scc0` is not modelled, so SCC is
-    // -1 at the OR; the only difference from the arm above is the missing s_cmp.
+    // and bind a descriptor the guest never described. SCC is -1 at the OR simply because NOTHING
+    // has written it since the fold initialised `int scc = -1` -- the only difference from the arm
+    // above is the missing s_cmp. (An earlier version of this comment blamed an unmodelled
+    // `s_cbranch_scc0`; there is no branch in this fixture at all. Asserting a mechanism without
+    // disassembling the words is how the wrong explanation gets into a test and outlives it.)
     const std::array<uint32_t, 4> scc_unknown_shader = {
         0x880A04FDu,               // pc0: s_or_b32 s10, scc, s4   -- SCC never set: unknown
         0xE0301000u, 0x80020000u,  // pc1: buffer_load_dword v0, v0, s[8:11], 0
