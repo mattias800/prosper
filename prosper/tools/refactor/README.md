@@ -29,14 +29,31 @@ spans plus one include.
 
 ## Ruled out
 
-* **`clang-refactor extract` cannot do extract-method here.** Its own help marks it *"(WIP action;
-  use with caution!)"*, and the caution is the whole story: it does not compute the captured
-  variables. Measured on a four-line function — extracting a loop that reads `v` and accumulates into
-  `total` produced `static void accumulate()` taking **no parameters**, referencing both names
-  undeclared, and discarding the mutation. It moves text; it does not do the data-flow analysis that
-  makes an extraction correct. Do not reach for it expecting IntelliJ's behaviour.
-* **`clang-move` does not help either.** It is class-oriented, so it cannot move free functions or
-  anything in an anonymous namespace — which is most of what these files are made of.
+* **`clang-refactor extract` cannot do extract-method — but `clangd` can, and that distinction is
+  the whole point.** They are different implementations and only one is usable.
+
+  `clang-refactor extract`'s own help marks it *"(WIP action; use with caution!)"*, and the caution
+  is the whole story: it does not compute captured variables. Measured on a four-line function --
+  extracting a loop that reads `v` and accumulates into `total` produced `static void accumulate()`
+  taking **no parameters**, referencing both names undeclared, and discarding the mutation. It moves
+  text.
+
+  **clangd's `ExtractFunction` tweak does it correctly.** Same input, driven over LSP:
+
+  ```cpp
+  void extracted(const std::vector<int> &v, int &total) { for (int x : v) { ... } }
+  extracted(v, total);
+  ```
+
+  `v` by const reference because it is only read, `total` by reference because it is mutated. That is
+  the analysis an IDE performs, and clangd has it. It is **not** reachable from a command line:
+  clangd exposes refactorings only as LSP code actions carrying a `clangd.applyTweak` command, so a
+  client has to speak the protocol and catch the `workspace/applyEdit` the server sends back.
+  Confirmed working against this project's own `compile_commands.json` on
+  `src/gpu/execute/gpu_dependency_graph.cpp`.
+
+* **`clang-move` is class-oriented**, so it cannot move free functions or anything in an anonymous
+  namespace — which is most of what these files are.
 
 ## What these tools do NOT address, and it is the larger half
 
@@ -52,10 +69,23 @@ function size. Measured after the recompiler split landed:
 | `main` | ~12,400 | `tests/gpu/recompiler/test_rdna2_to_spirv.cpp` | 98% |
 
 For `live_renderer.cpp` a structural split can achieve **nothing**: the file is one function. Moving
-it elsewhere renames the problem. Those files need extraction, which means data-flow analysis per
-span, which no available tool does — so it is careful incremental work, best done a few extractions
-at a time by whoever is already changing that code, not as a sweep.
+it elsewhere renames the problem. Those files need extraction — and per the ruled-out section above,
+clangd **does** perform the required analysis, so this is mechanisable rather than hand work. Two
+caveats found by trying it:
 
+* **clangd legitimately refuses many spans, and the refusals are correct.** It will not extract a
+  span containing `return`/`break`/`continue` (an early exit cannot be expressed as a call), nor one
+  declaring a variable used after the span (that needs an out-parameter or a returned struct). Giant
+  functions here are dense with both, so a candidate-finder must filter for what clangd accepts
+  before offering it a span.
+* **On `live_renderer.cpp` specifically, no span tried so far has been accepted**, including ones
+  passing those filters — while the same setup works on a 365-line file in the same project with the
+  same flags. That difference is NOT explained. It is the open question, not a settled limitation:
+  concluding "the file is too large" without evidence is exactly the kind of claim this document
+  exists to prevent.
+
+It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
+changing that code.
 **The invariant that makes incremental extraction safe is worth copying.** When a block was extracted
 out of `test_rdna2_to_spirv.cpp`'s `main`, the thing that made it checkable was a count of assertions
 *executed*, asserted as a per-block delta:
