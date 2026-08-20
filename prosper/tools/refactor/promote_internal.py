@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -40,6 +41,77 @@ import sys
 def repo_root() -> pathlib.Path:
     return pathlib.Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                        capture_output=True, text=True, check=True).stdout.strip())
+
+
+COND_OPEN = re.compile(r'^\s*#\s*(if|ifdef|ifndef)\b')
+COND_CLOSE = re.compile(r'^\s*#\s*endif\b')
+
+
+def conditional_depth(lines: list[str]) -> list[int]:
+    """#if nesting depth BEFORE each line (1-indexed)."""
+    depth = [0] * (len(lines) + 2)
+    cur = 0
+    for i, line in enumerate(lines, 1):
+        depth[i] = cur
+        if COND_OPEN.match(line):
+            cur += 1
+        elif COND_CLOSE.match(line):
+            cur = max(0, cur - 1)
+    depth[len(lines) + 1] = cur
+    return depth
+
+
+def prototype_of(region: dict, lines: list[str]) -> str | None:
+    """A forward declaration for a definition that is staying behind.
+
+    Promoted code can call a function this tool deliberately did NOT promote -- one other
+    translation units link against, whose single out-of-line definition must not move. The header
+    then needs its DECLARATION, or it names something nothing has declared. Built by taking the text
+    from the declaration line to the body's opening brace and terminating it with a semicolon.
+
+    Default arguments are dropped: the definition keeps them where it is, and repeating them in a
+    second declaration does not compile.
+    """
+    start = region["decl_line"] - 1
+    text: list[str] = []
+    for i in range(start, min(start + 12, len(lines))):
+        line = lines[i]
+        if "{" in line:
+            text.append(line[:line.index("{")].rstrip())
+            break
+        text.append(line.rstrip("\n"))
+    else:
+        return None
+    proto = " ".join(t.strip() for t in text if t.strip())
+    # Strip default arguments PER PARAMETER. A single regex over the whole joined signature ate the
+    # last parameter of make_shader_compile_key and emitted `bool fragment_wave32,;` -- syntactically
+    # broken in a way that only shows up at the include site, far from here. Splitting on top-level
+    # commas keeps each parameter's `= value` local to that parameter.
+    open_at = proto.index("(") if "(" in proto else -1
+    if open_at >= 0 and proto.endswith(")"):
+        headtxt, params = proto[:open_at + 1], proto[open_at + 1:-1]
+        out, depth, cur = [], 0, ""
+        for ch in params:
+            if ch in "(<[":
+                depth += 1
+            elif ch in ")>]":
+                depth -= 1
+            if ch == "," and depth == 0:
+                out.append(cur); cur = ""
+            else:
+                cur += ch
+        if cur.strip():
+            out.append(cur)
+        cleaned = [re.sub(r"\s*=.*$", "", x).strip() for x in out]
+        proto = headtxt + ", ".join(c for c in cleaned if c) + ")"
+    if not proto.endswith(")"):
+        return None
+    if region["kind"] == "VAR_DECL":
+        # `thread_local GuestGpuWriteJournal g_x;` -> `extern thread_local GuestGpuWriteJournal g_x;`
+        decl = lines[start].rstrip("\n")
+        decl = decl.split("=")[0].rstrip().rstrip(";").strip()
+        return "extern " + decl + ";" if decl else None
+    return proto + ";"
 
 
 def anon_map(regions: list[dict]) -> dict[int, bool]:
@@ -52,6 +124,23 @@ def anon_map(regions: list[dict]) -> dict[int, bool]:
         if r.get("role") == "close" and stack:
             stack.pop()
     return out
+
+
+# LINKAGE COMES FROM THE USR, not from the anonymous-namespace walk alone. clang encodes it: an
+# external-linkage entity's USR starts `c:@`, an internal one is file-prefixed
+# (`c:file.cpp@F@name`). A `static` free function is internal WITHOUT being in an anonymous
+# namespace, so the `anon` test alone missed it -- and then the name grep held it back because some
+# unrelated file happens to define a same-named static. Measured: `make_probe_pipe` was excluded
+# because of a same-named static in exec_image_linux.cpp:152. A name is not an identity; the USR is.
+#
+# This lives at module scope rather than inside main() so the self-test can reach it. It was nested,
+# and a reviewer proved by mutation that reverting it left `--selftest` green -- the tool reported a
+# correction no arm could see.
+def region_is_external(region: dict, in_anon_namespace: bool) -> bool:
+    usr = region.get("usr") or ""
+    if usr:
+        return usr.startswith("c:@")
+    return not in_anon_namespace        # no USR recorded: fall back to the scope walk
 
 
 # `static` is NOT in this list, and that is the correction. A static function definition is fine in
@@ -81,10 +170,21 @@ def needs_inline(region: dict, decl_text: str) -> bool:
     `constexpr` already implies inline. Struct and enum declarations need nothing, and member
     functions defined inside a class body are implicitly inline.
     """
-    if region["kind"] not in ("FUNCTION_DECL", "FUNCTION_TEMPLATE"):
+    if region["kind"] not in ("FUNCTION_DECL", "FUNCTION_TEMPLATE", "VAR_DECL"):
         return False
     if not region.get("is_definition"):
         return False
+    if region["kind"] == "VAR_DECL":
+        # A VARIABLE definition in a header is one object PER TRANSLATION UNIT, so the link fails
+        # with "multiple definition" -- and for `thread_local` it fails in .tbss, which reads as a
+        # TLS problem rather than as a promotion that took a variable along. C++17 inline variables
+        # are the fix, and `inline thread_local X y;` is the correct order.
+        #
+        # This was a known-latent gap: a reviewer noted the policy covered only functions, and it
+        # stayed latent exactly until a promotion first took a variable -- three of them here
+        # (g_guest_gpu_writes, g_guest_readable_cache, g_guest_writable_cache).
+        head = decl_text.lstrip()
+        return not head.startswith(("inline", "constexpr", "extern", "//", "/*", "*"))
     return not decl_text.lstrip().startswith(ALREADY_LINKED)
 
 
@@ -104,7 +204,8 @@ def canonical_include(source_rel: str, header_name: str) -> str:
 
 
 def build(map_data: dict, original: str, promote: list[int], header_rel: str,
-          namespace: str, guard_note: str, include_spelling: str = "") -> tuple[str, str, list[str]]:
+          namespace: str, guard_note: str, include_spelling: str = "",
+          forward_decls: list[str] | None = None) -> tuple[str, str, list[str]]:
     """Returns (header_text, new_source_text, inlined). Pure, so --selftest can drive it."""
     regions = {r["index"]: r for r in map_data["regions"]}
     lines = original.splitlines(keepends=True)
@@ -117,6 +218,11 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
     head = ["#pragma once\n", "\n", guard_note, "\n"]
     head += ["".join(lines[r["start"] - 1:r["end"]]) for r in preamble]
     head += ["\n", f"namespace {namespace} {{\n", "\n"]
+    if forward_decls:
+        head.append("// Declared here, DEFINED in the .cpp this header was lifted out of: other\n"
+                    "// translation units link against those definitions, so they must not move.\n")
+        head += [d + "\n" for d in forward_decls]
+        head.append("\n")
     inlined: list[str] = []
     for i in sorted(promote):
         r = regions[i]
@@ -257,6 +363,21 @@ def selftest() -> int:
     check(anon[3] and anon[4], "regions inside `namespace {` are detected as internal")
     check(not anon[6], "a region outside it is not")
 
+    # LINKAGE. The `anon` walk above is NOT sufficient, and this is the arm that proves it: a
+    # `static` free function is internal linkage while sitting outside any anonymous namespace, so
+    # a predicate built on `anon` alone calls it external. Measured: mutating `region_is_external`
+    # back to `return not in_anon_namespace` turns the SECOND AND THIRD checks red by name and
+    # leaves the other two green -- those two pass under both implementations and so certify
+    # nothing on their own.
+    check(region_is_external({"usr": "c:@F@render_frame#"}, False),
+          "a USR starting `c:@` is external linkage")
+    check(not region_is_external({"usr": "c:live.cpp@F@helper#"}, False),
+          "a file-prefixed USR is internal linkage")
+    check(not region_is_external({"usr": "c:live.cpp@F@make_probe_pipe#"}, False),
+          "a `static` free function is INTERNAL even though it is outside `namespace { }`")
+    check(not region_is_external({}, True) and region_is_external({}, False),
+          "with no USR recorded the anonymous-namespace walk is the fallback, both ways")
+
     hdr, src, inl = build(SELF_MAP, SELF_SRC, [3, 4], "s_internal.hpp", "ns", "// note\n",
                           "s_internal.hpp")
     check(inl == ["helper"], f"the free function definition gains `inline` (got {inl})")
@@ -270,6 +391,28 @@ def selftest() -> int:
     check("void user()" in src, "unpromoted code stays put")
     check(not verify(SELF_SRC, SELF_MAP, [3, 4], hdr, src, "s_internal.hpp"),
           "verification passes on a correct promotion")
+
+    # prototype_of is pure and therefore reachable from here, unlike the fixes that live in main().
+    # The fixture's default argument CONTAINS PARENTHESES, which is the shape that breaks the
+    # single-regex stripping this replaced: `[^,)]+` stops at the inner `(`, and the signature comes
+    # out as `void f(int a), bool b)`. A fixture with only plain defaults passes under BOTH
+    # implementations and would certify nothing -- checked by mutation, not assumed.
+    proto_lines = ["void f(int a = g(1),\n", "       bool b = false) {\n"]
+    proto = prototype_of({"kind": "FUNCTION_DECL", "is_definition": True, "decl_line": 1,
+                          "start": 1, "end": 2, "name": "f"}, proto_lines)
+    check(proto == "void f(int a, bool b);", f"defaults with parentheses strip cleanly (got {proto!r})")
+    check(proto and proto.count("(") == proto.count(")"),
+          f"the signature stays balanced (got {proto!r})")
+
+    # a promoted VARIABLE definition needs `inline` too, or the link fails with multiple definition
+    var_map = json.loads(json.dumps(SELF_MAP))
+    var_map["regions"][3] = {"index": 3, "start": 7, "end": 8, "role": "body", "name": "g_state",
+                             "kind": "VAR_DECL", "is_definition": True, "decl_line": 7}
+    var_src = SELF_SRC.replace("struct Shared { int x; };", "thread_local int g_state = 0;")
+    hdr_v, _s, inl_v = build(var_map, var_src, [3, 4], "s_internal.hpp", "ns", "// n\n",
+                             "s_internal.hpp")
+    check("inline thread_local int g_state" in hdr_v,
+          f"a promoted variable definition gains `inline` (got {inl_v})")
 
     # the static -> inline conversion, and the must-fail arm that makes the new policy checkable
     static_map = json.loads(json.dumps(SELF_MAP))
@@ -307,6 +450,11 @@ def main() -> int:
     ap.add_argument("--regions", help="comma-separated region indices to promote")
     ap.add_argument("--header", help="header filename, written beside the source")
     ap.add_argument("--namespace", default="prosper::gpu")
+    ap.add_argument("--exclude", default="",
+                    help="regions that must NOT be promoted even if they redeclare a promoted "
+                         "entity. A forward declaration belongs in the header and its definition "
+                         "may deliberately stay behind -- that pairing is the normal one, and "
+                         "pulling the definition along turns a 797-line function into header text.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -327,6 +475,7 @@ def main() -> int:
         sys.exit(f"refused: {map_data['file']} has changed since the map was made; re-run map_symbols")
     original = original_bytes.decode()
 
+    forward_decls: list[str] = []
     promote = [int(x) for x in args.regions.split(",") if x.strip()]
     regions = {r["index"]: r for r in map_data["regions"]}
 
@@ -340,10 +489,12 @@ def main() -> int:
     for r in map_data["regions"]:
         if r.get("usr") and r.get("role") == "body":
             by_usr[r["usr"]].append(r["index"])
+    excluded = {int(x) for x in args.exclude.split(",") if x.strip()}
+    promote = [i for i in promote if i not in excluded]
     added: list[int] = []
     for i in list(promote):
         for sibling in by_usr.get(regions[i].get("usr", ""), []):
-            if sibling not in promote:
+            if sibling not in promote and sibling not in excluded:
                 promote.append(sibling)
                 added.append(sibling)
     if added:
@@ -361,8 +512,66 @@ def main() -> int:
     #
     # What must still be refused is a promotion with no internal regions at all, which would mean
     # the tool ran for no reason and said so approvingly.
-    internal = [i for i in promote if anon.get(i)]
-    external = [i for i in promote if not anon.get(i)]
+    # DO NOT PROMOTE A SYMBOL OTHER TRANSLATION UNITS LINK AGAINST. Making a function `inline` in an
+    # internal header gives a definition to every TU that INCLUDES that header -- and takes away the
+    # single out-of-line definition every OTHER TU was linking to. gpu_executor.cpp defines
+    # guest_readable/guest_writable, which agc_shader_layout, command_processor, gpu_capture,
+    # hle_agc and hle_graphics all call through a public declaration: promoting them produced
+    # "undefined reference" from five files that this tool never touched, which points nowhere near
+    # the promotion.
+    #
+    # The test is whether the name appears in any tracked source outside this file. That
+    # over-detects -- a comment mentioning the name counts -- and over-detecting is right here: the
+    # cost is leaving a helper unpromoted, against a link failure diagnosed far from its cause.
+    # Scan SOURCE only, and skip this tool's own directory. A first version grepped all of
+    # `prosper`, which matched docs, CMakeLists, the header being generated -- and, best of all, the
+    # comment in THIS FILE naming `g_guest_gpu_writes` as an example. The tool's own documentation
+    # changed its classification, excluded the symbol from promotion, and produced 60 compile errors
+    # in the header that still referenced it.
+    def used_elsewhere(name: str) -> bool:
+        if not name or name == "<anonymous>":
+            return False
+        out = subprocess.run(["git", "grep", "-l", "-w", name, "--",
+                              "prosper/src", "prosper/frontends", "prosper/tests",
+                              "prosper/tools", ":!prosper/tools/refactor"],
+                             cwd=root, capture_output=True, text=True)
+        skip = {map_data["file"], str((source.parent / args.header).relative_to(root))}
+        files = [f for f in out.stdout.split()
+                 if f not in skip and f.endswith((".cpp", ".hpp", ".h", ".cc"))]
+        return bool(files)
+
+    # ONLY EXTERNAL-LINKAGE regions can be public. A symbol inside an anonymous namespace cannot be
+    # named from another translation unit at all, so a match elsewhere is necessarily a comment or
+    # an unrelated same-named entity -- and acting on it is actively harmful, not merely
+    # conservative: the symbol stays behind, and an `extern` declaration for it in the enclosing
+    # namespace names a DIFFERENT entity, so every use becomes "reference to X is ambiguous".
+    # Measured: `make_shader_compile_key` was excluded because live_renderer.cpp mentions it in a
+    # comment about CPU profiling.
+    def externally_linked(i: int) -> bool:
+        return region_is_external(regions[i], anon.get(i, False))
+
+    public = [i for i in promote
+              if externally_linked(i)
+              and regions[i]["kind"] in ("FUNCTION_DECL", "VAR_DECL")
+              and used_elsewhere(regions[i]["name"])]
+    if public:
+        print(f"  [ok]   {len(public)} region(s) are referenced outside this file and are NOT "
+              f"promoted; they keep their single out-of-line definition:")
+        for i in public[:8]:
+            print(f"           {regions[i]['kind']:<14s} {regions[i]['name']}")
+        promote = [i for i in promote if i not in public]
+        # A public symbol also bars the conditional-block expansion below from re-adding it: that
+        # expansion runs later and, left unchecked, put `guest_readable` straight back into the
+        # promote set after this filter had removed it -- five other translation units then failed
+        # to link against a definition that had become `inline` in a header they do not include.
+        excluded |= set(public)
+    # Report linkage with the SAME predicate the exclusion above uses. These two lines read
+    # `anon.get(i)` until a review pointed out that this file proves that predicate wrong six lines
+    # earlier: a `static` free function has internal linkage WITHOUT being in an anonymous namespace,
+    # so it was counted as "already external" and the one semantic change this tool makes -- internal
+    # linkage becoming external -- went unreported for exactly the case most likely to surprise.
+    internal = [i for i in promote if not externally_linked(i)]
+    external = [i for i in promote if externally_linked(i)]
     # An earlier version of this guard refused a set with no internal-linkage regions, reasoning
     # that promoting an already-external one is "a no-op reported as success". That is wrong, and it
     # blocked a legitimate use: moving an external definition into a header is not a no-op -- it
@@ -371,6 +580,108 @@ def main() -> int:
     if not promote:
         print("  [FAIL] nothing to promote")
         return 1
+    # EXPAND TO WHOLE CONDITIONAL BLOCKS before refusing. A platform `#if` in this codebase spans
+    # several regions -- gpu_executor.cpp has `#ifndef _WIN32 ... #else ... #endif` covering eight of
+    # them -- so a promotion that touches one must take all of them, directives included, or the
+    # `#if` and its `#endif` end up in different files. Refusing outright would be safe and useless;
+    # the block is exactly the unit the author wrote.
+    depth = conditional_depth(original.splitlines())
+    total_lines = len(original.splitlines())
+
+    def block_span(line: int) -> tuple[int, int]:
+        """The outermost #if..#endif containing LINE, as a line range."""
+        lo = line
+        while lo > 1 and depth[lo] != 0:
+            lo -= 1
+        hi = line
+        while hi < total_lines and depth[min(hi + 1, total_lines + 1)] != 0:
+            hi += 1
+        return lo, hi
+
+    grew = True
+    while grew:
+        grew = False
+        for i in sorted(promote):
+            r = regions[i]
+            if depth[r["start"]] == 0 and depth[min(r["end"] + 1, total_lines + 1)] == 0:
+                continue
+            lo, hi = block_span(r["start"] if depth[r["start"]] else r["end"])
+            for j, rj in regions.items():
+                if rj["role"] != "body" or j in promote or j in excluded:
+                    continue
+                if rj["start"] <= hi and rj["end"] >= lo:      # overlaps the conditional block
+                    promote.append(j)
+                    grew = True
+        promote = sorted(set(promote))
+    # A conditional block containing an excluded region cannot be lifted as a unit. Drop the WHOLE
+    # block rather than refusing the run: the block is one indivisible thing, and taking part of it
+    # is what separates an `#if` from its `#endif`.
+    incomplete: set[int] = set()
+    for i in list(promote):
+        r = regions[i]
+        if depth[r["start"]] == 0 and depth[min(r["end"] + 1, total_lines + 1)] == 0:
+            continue
+        lo, hi = block_span(r["start"] if depth[r["start"]] else r["end"])
+        members = {j for j, rj in regions.items()
+                   if rj["role"] == "body" and rj["start"] <= hi and rj["end"] >= lo}
+        if members - set(promote):
+            incomplete |= members
+    if incomplete:
+        dropped = sorted(set(promote) & incomplete)
+        print(f"  [ok]   {len(dropped)} region(s) dropped: they sit in a preprocessor block that "
+              f"also holds something excluded, so the block cannot move as a unit")
+        promote = [i for i in promote if i not in incomplete]
+
+    blocked = [i for i in promote
+               if depth[regions[i]["start"]] != 0
+               or depth[min(regions[i]["end"] + 1, total_lines + 1)] != 0]
+    if blocked:
+        print(f"  [ok]   {len(blocked)} region(s) lie inside a preprocessor conditional and are "
+              f"promoted together with it")
+
+    # Anything promoted code CALLS but that stayed behind needs a declaration in the header.
+    edges_all = {int(k): {int(t) for t in v} for k, v in map_data.get("edges", {}).items()}
+    wanted = {d for i in promote for d in edges_all.get(i, set()) if d in set(public)}
+    src_lines = original.splitlines(keepends=True)
+    protos = []
+    for i in sorted(wanted):
+        proto = prototype_of(regions[i], src_lines)
+        if proto:
+            protos.append(proto)
+        else:
+            print(f"  [warn] {regions[i]['name']} stays behind and is called from promoted "
+                  f"code, but no declaration could be derived; add one by hand")
+    if protos:
+        print(f"  [ok]   {len(protos)} forward declaration(s) emitted for definitions that "
+              f"stay behind")
+        forward_decls.extend(protos)
+
+
+    # A region whose start or end sits inside an `#if` cannot be lifted: the `#if` would stay in one
+    # file and the `#endif` land in the other. split_file.py has always checked this; the promotion
+    # path did not, and produced 73 compile errors headed "unterminated #ifndef" -- a message that
+    # points at the header rather than at the lift that broke it.
+    depth = conditional_depth(original.splitlines())
+    # After expansion, a straddle can only survive if completing the block was impossible -- an
+    # excluded region inside it, or a region the map does not cover. That is a real refusal.
+    covered = set(promote)
+    straddling = []
+    for i in promote:
+        r = regions[i]
+        if depth[r["start"]] == 0 and depth[min(r["end"] + 1, total_lines + 1)] == 0:
+            continue
+        lo, hi = block_span(r["start"] if depth[r["start"]] else r["end"])
+        if any(rj["role"] == "body" and rj["start"] <= hi and rj["end"] >= lo and j not in covered
+               for j, rj in regions.items()):
+            straddling.append(i)
+    if straddling:
+        for i in straddling[:8]:
+            r = regions[i]
+            print(f"  [FAIL] region {i} ({r['name']}) spans lines {r['start']}-{r['end']}, which "
+                  f"begin or end inside an #if; lifting it would separate the directive from its "
+                  f"#endif")
+        return 1
+
     print(f"  [ok]   {len(internal)} region(s) change linkage (internal -> external); "
           f"{len(external)} were already external and move so a second translation unit can see "
           f"them, or because the header sits above their definitions")
@@ -383,7 +694,7 @@ def main() -> int:
             "// recompiler: nothing outside src/gpu/recompiler/ should include this header.\n")
     spelling = canonical_include(map_data["file"], args.header)
     header_text, new_source, inlined = build(map_data, original, promote, args.header,
-                                             args.namespace, note, spelling)
+                                             args.namespace, note, spelling, forward_decls)
     print(f"  [ok]   include written as \"{spelling}\" (the canonical form the other tools read)")
     problems = verify(original, map_data, promote, header_text, new_source, spelling)
     if problems:
