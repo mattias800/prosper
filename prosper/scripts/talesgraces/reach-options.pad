@@ -13,6 +13,11 @@
 # any route that alternates Cross and Circle bounces off the EULA and oscillates back to the title
 # screen. Cross alone agrees and proceeds.
 #
+# SUPERSEDED FOR GAMEPLAY: this route stops on the new-game settings screen and CANNOT leave
+# it, because that screen binds "Confirm Settings" to the OPTIONS button rather than to Cross
+# (and the dialog it raises defaults to No). Use scripts/talesgraces/reach-gameplay.pad to
+# reach the Lhant Hill prologue; see docs/TALES_GRACES_STATUS.md.
+#
 # Presses are sparse and spread out on purpose — each screen needs one confirmation and then time
 # to load, and mashing re-enters submenus.
 4-5:cross
