@@ -78,11 +78,19 @@ caveats found by trying it:
   declaring a variable used after the span (that needs an out-parameter or a returned struct). Giant
   functions here are dense with both, so a candidate-finder must filter for what clangd accepts
   before offering it a span.
-* **On `live_renderer.cpp` specifically, no span tried so far has been accepted**, including ones
-  passing those filters — while the same setup works on a 365-line file in the same project with the
-  same flags. That difference is NOT explained. It is the open question, not a settled limitation:
-  concluding "the file is too large" without evidence is exactly the kind of claim this document
-  exists to prevent.
+* **Multi-statement extraction has not been made to fire on a real giant function, and the reason is
+  not yet known.** `extract_function.py --probe` asks clangd about every candidate it finds;
+  currently it accepts **0 of 8** in `register_live_renderer`. What is ruled out:
+  - not the file, and not the flags — clangd offers "Extract to function" at
+    `live_renderer.cpp:199` (a statement in a small function in the same file) and in
+    `gpu_dependency_graph.cpp`;
+  - not a truncated range — extending the selection past the statement's trailing `;` changes
+    nothing (`EXTRACT_END_SLACK`);
+  - not lambdas alone — a top-level run in the same function is also refused, though that particular
+    one declared a variable used later, so it is not a clean arm.
+
+  Single statements are accepted; every multi-statement run tried has been refused. That is the
+  shape of the open question, and it is worth answering before writing more candidate-finding logic.
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.
