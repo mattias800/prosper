@@ -5850,8 +5850,13 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             // project records as producing a ~1.5 GB log and desyncing the pad script badly enough
             // that the route never reaches the phase being diagnosed. A diagnostic reachable only by
             // a switch that destroys the repro is not reachable -- the same reasoning that ungated
-            // the `[compute-table]` block in this file. This switch costs nothing when unset and is
-            // bounded by the table count, not by the dispatch count.
+            // the `[compute-table]` block in this file.
+            //
+            // Volume, stated correctly: `realize_compute_dispatches` reaches this PER DISPATCH, so
+            // the output scales with dispatches that publish a selected table, not with the number
+            // of distinct tables. Measured on a 500 s routed GTA V route: 138 lines. That is small
+            // because few programs use the path, not because anything bounds it -- a title that used
+            // it widely would produce far more.
             const bool table_log =
                 std::getenv("PROSPER_SRTTABLE_LOG") || std::getenv("PROSPER_DBG");
             // #2481: a runtime-selected descriptor table. The element is chosen on the GPU, so the
@@ -5927,21 +5932,25 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 entry = decode_buffer_descriptor(words.data());
                 // Only a record we READ and that does not look like a descriptor at all may be
                 // nulled: a stale arena slot the guest never indexes.
-                // A record whose BASE IS NOT MAPPED cannot be a descriptor the guest would select:
-                // selecting it would fault on first access. It is a stale arena slot, which is
-                // exactly the case this classification exists to null. Without this test the
-                // heuristic is `base > 0x10000 && size != 0`, which ordinary float data passes
-                // trivially -- measured on PPSA04263, `0x413ce6000` pc=156 declines its whole table
-                // on records like `base=0x4d0cbd9054e2 size=4294967295`, an 85 TiB address that is
-                // plainly not a descriptor. Declining the table there converts a nullable stale slot
-                // into a rejected program (#2481).
+                // DO NOT add a `guest_readable(entry.base, …)` term here. It looks obviously right
+                // -- a record whose base is unmapped cannot be a descriptor, because selecting it
+                // would fault -- and it is WRONG on this platform, in two independent ways:
                 //
-                // Only the FIRST dword pair is probed, not the whole span: a descriptor's declared
-                // size may legitimately exceed what is currently resident, and requiring the entire
-                // range to be mapped would decline real tables.
-                const bool base_mapped = guest_readable(entry.base, 4u);
-                const bool not_a_descriptor =
-                    entry.base <= 0x10000u || entry.size_bytes == 0u || !base_mapped;
+                //  * `exec_image_linux.cpp`'s SIGSEGV handler maps a fresh RW page for ANY unmapped
+                //    SEGV_MAPERR in [GPU_VA_LO, GPU_VA_HI) = [4 GiB, 64 GiB), unconditionally and
+                //    not env-gated. Faulting is the TRIGGER FOR LAZY BACKING, not evidence of
+                //    invalidity -- and `0x413ce6000`, the program that motivated the idea, sits
+                //    inside that window at ~16.3 GiB.
+                //  * `guest_readable` cannot see through that anyway: its Linux arm probes with a
+                //    `write()` to a pipe, so the kernel returns EFAULT via copy_from_user and no
+                //    SIGSEGV is ever delivered to the process. The probe reports "unmapped" for an
+                //    address the guest can legitimately touch.
+                //
+                // Page RESIDENCY is not the oracle; region IDENTITY is. `prosper_reserved_range_state`
+                // exists on both platforms for that. Whatever replaces this needs a mutation arm too:
+                // the existing coverage in `test_dynfetch_fold.cpp` builds its garbage with `base = 0`,
+                // so a residency term can be deleted with the whole suite still green (#2481).
+                const bool not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
                 const bool unsupported_descriptor = !not_a_descriptor &&
                     (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
                 if (unsupported_descriptor) {
@@ -5963,8 +5972,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                  "[srt] selected-table pc=%u NULL-SLOT index=%u why=%s "
                                  "words=%08x:%08x:%08x:%08x\n",
                                  u.use_pc, index,
-                                 entry.base <= 0x10000u ? "low-base"
-                                     : entry.size_bytes == 0u ? "zero-size" : "base-unmapped",
+                                 entry.base <= 0x10000u ? "low-base" : "zero-size",
                                  words[0], words[1], words[2], words[3]);
                 ShaderBufferTableEntry slot;
                 if (usable) {
