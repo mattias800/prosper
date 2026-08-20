@@ -4246,6 +4246,78 @@ inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = 
     rs.sreg_wave64_mask_half_index.erase(reg);
 }
 
+// The same architectural transfer function as expire_wave64_mask_half, for the ORDINARY saved B64
+// mask spelling, and deliberately NARROWER than it: a saved wave mask names the bits currently in a
+// physical SGPR pair, so a scalar write over the register it is keyed on ends that lifetime. It is
+// not provenance attached to the register number forever. (expire_wave64_mask_half expires on either
+// word of the pair; only the ROOT word ends it here -- see the comment on expire_saved_b64_mask.)
+//
+// Without this, `sreg_bool` outlives its register and every later consumer reads a mask the hardware
+// no longer holds. Two of them are load-bearing: `operand_bits` rejects an ordinary data read of
+// such a word ("a persisted B64 wave mask has no ordinary scalar dword"), and the SOP2 mask lambdas
+// would silently substitute the dead mask for a live one. R-Type Delta's sprite vertex shader is the
+// worked example (#2783): it saves `s_cselect_b64 s[0:1], exec, 0` in its NGG fetch prologue, then
+// rebuilds its PC-relative embedded-table address in that same s[0:1] with `s_getpc_b64` /
+// `s_add_u32 s0, lit, s0`, and the whole shader was rejected at that add -- which dropped every
+// sprite draw in the title.
+//
+// `snapshot_saved_b64_masks` must be taken BEFORE emit_alu, because emit_alu materializes the new
+// lifetime for the same instruction. The staleness test is exactly "present in the snapshot AND its
+// Bool id is unchanged", which is a PROXY for "this instruction did not publish it": every publisher
+// either stores a fresh id or is named by `preserved_pair`. Classifying publishers syntactically
+// instead is not sufficient -- `scalar_write_is_b64_mask` knows the SOP1/SOP2/VOPC/VOP3B mask
+// writers, but the `vgpr_lane_mask_slots` reload in rdna2_emit_alu.cpp republishes a spilled alias
+// from v_readlane with no syntactic marker at all. That same reload is the one publisher that could
+// in principle re-store an IDENTICAL id (it would have to reload a mask into a register that already
+// held that exact mask). If it were reached the alias would be dropped -- and the outcome is
+// FAIL-VISIBLE, not silent: `src_mask` resolves a missing `sreg_bool` entry to 0 and every
+// Bool-domain consumer then clears `ok` (rdna2_emit_alu.cpp :794, :817, :873, :1058, :1074), so the
+// stage rejects. Silent zero is the DATA-domain outcome only. So the residual is bounded by being
+// loud rather than by being harmless, and it is the same failure class this function repairs.
+//
+// VCC (106/107) is deliberately out of scope, and NOT because it is unreachable -- SGPR-kind
+// operands really can carry 106/107 (`sgpr()` masks to 7 bits, rdna2_decode.cpp), and SOPK's
+// read-modify-write forms read their own destination through `val(in.dst)`, so
+// `s_mulk_i32 vcc_lo, imm` does reach operand_bits with an SGPR-kind 106. What makes VCC different
+// is that its mask state is mirrored in `rs.vcc`, and expiring `sreg_bool[106]` without a matching
+// policy for `rs.vcc` would leave the two spellings disagreeing. That is a separate change with its
+// own risk -- it would also alter established behavior for every `s_bfe_u32 vcc_lo` NGG preamble --
+// and no observed defect requires it: reaching the reject through VCC additionally needs a writer
+// that overwrites VCC_LO while leaving no scalar SSA value behind, since operand_bits consults
+// `rs.sreg` first. Tracked in #2804. Wave32 B32 aliases are likewise left to
+// record_scalar_write's own (narrower) rules.
+struct SavedB64MaskSnapshot {
+    // (root, Bool id). At most a few entries: only the roots this one instruction can overwrite.
+    std::vector<std::pair<int, uint32_t>> entries;
+};
+
+inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& before, int reg,
+                                  int preserved_pair = -1) {
+    // The ROOT word only, and this is measured rather than reasoned. Expiring on EITHER word of the
+    // pair rejected 19 arms of test_recompile_coverage. Traced on the first of them ("a nested
+    // varying-VCC compute CFG preserves spilled EXEC"): its Wave64 EXEC reload keys the
+    // reconstructed mask on the LOW word (`v_readlane s14` -> `sreg_bool[14]`, the non-native
+    // `vgpr_lane_mask_slots` branch, which erases `sreg_wave64_mask_half` so the
+    // `publishes_wave64_mask_half` guard below does not apply) and then writes the HIGH word
+    // (`v_readlane s15`). Treating that high-word write as an end-of-life destroyed the alias the
+    // very next instruction consumes, and `s_mov_b64 exec, s[14:15]` rejected.
+    //
+    // So a high-word-only overwrite by unrelated scalar data keeps its established (conservative)
+    // behavior. That is a PRE-EXISTING gap, not one introduced here -- before this function nothing
+    // ended a B64 alias at all -- and #2783's defect is entirely in the root word.
+    const int root = reg;
+    if (root < 0 || root > 105 || root == preserved_pair) return;
+    const auto mask = rs.sreg_bool.find(root);
+    if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) return;
+    // Present AND unchanged across emit_alu -- otherwise this instruction published it itself.
+    bool stale = false;
+    for (const auto& [snapshot_root, snapshot_id] : before.entries)
+        if (snapshot_root == root && snapshot_id == mask->second) stale = true;
+    if (!stale) return;
+    rs.sreg_bool.erase(root);
+    rs.sreg_bool_narrowed.erase(root);
+}
+
 // Is SGPR `R` provably DEAD at pc `target` — i.e. redefined before any read on the fall-through, so a
 // write to it inside a divergent (execz) block linearized before `target` cannot be observed by later
 // code? Sound/conservative: we only scan formats whose complete scalar read/write ranges are decoded,
@@ -4335,6 +4407,23 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
                               vop3b_fresh_carry_output(in)) ? 1u : 2u);
 }
 
+inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const Rdna2Inst& in) {
+    SavedB64MaskSnapshot snapshot;
+    // The widest write form is deliberate: this set only FILTERS what record_scalar_write may
+    // expire, and that function applies its own exact `effective_width`, so an extra candidate root
+    // here can never widen the erase set.
+    for_each_scalar_write(in, [&](int base, uint32_t width) {
+        for (uint32_t word = 0; word < width; ++word) {
+            const int root = base + static_cast<int>(word);
+            if (root > 105 || rs.sreg_bool_b32.contains(root)) continue;
+            const auto mask = rs.sreg_bool.find(root);
+            if (mask != rs.sreg_bool.end())
+                snapshot.entries.emplace_back(root, mask->second);
+        }
+    }, /*wave32_one_word_masks*/false);
+    return snapshot;
+}
+
 // True when this explicit scalar destination is written in the per-lane B64 mask domain.  Keep
 // this classification independent of the post-emission SSA maps: folded/data writers such as
 // s_getpc_b64 intentionally leave no scalar value behind, so absence from `sreg` cannot identify a
@@ -4391,7 +4480,8 @@ inline bool allows_compute_scalar_vcc_bridge(const SpirvCompute& b) {
 }
 
 inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
-                         bool allow_compute_scalar_vcc_bridge) {
+                         bool allow_compute_scalar_vcc_bridge,
+                         const SavedB64MaskSnapshot& saved_b64_masks_before) {
     // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
     // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
     // keeping either would let a later descriptor use observe the pre-overwrite value.
@@ -4472,6 +4562,8 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
                 expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
+                expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
+                                      writes_b64_mask ? base : -1);
             }
             if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
                 continue;
