@@ -360,6 +360,18 @@ def selftest() -> int:
     check(not verify(SELF_SRC, SELF_MAP, [3, 4], hdr, src, "s_internal.hpp"),
           "verification passes on a correct promotion")
 
+    # prototype_of is pure and therefore reachable from here, unlike the fixes that live in main().
+    # The fixture's default argument CONTAINS PARENTHESES, which is the shape that breaks the
+    # single-regex stripping this replaced: `[^,)]+` stops at the inner `(`, and the signature comes
+    # out as `void f(int a), bool b)`. A fixture with only plain defaults passes under BOTH
+    # implementations and would certify nothing -- checked by mutation, not assumed.
+    proto_lines = ["void f(int a = g(1),\n", "       bool b = false) {\n"]
+    proto = prototype_of({"kind": "FUNCTION_DECL", "is_definition": True, "decl_line": 1,
+                          "start": 1, "end": 2, "name": "f"}, proto_lines)
+    check(proto == "void f(int a, bool b);", f"defaults with parentheses strip cleanly (got {proto!r})")
+    check(proto and proto.count("(") == proto.count(")"),
+          f"the signature stays balanced (got {proto!r})")
+
     # a promoted VARIABLE definition needs `inline` too, or the link fails with multiple definition
     var_map = json.loads(json.dumps(SELF_MAP))
     var_map["regions"][3] = {"index": 3, "start": 7, "end": 8, "role": "body", "name": "g_state",
@@ -503,8 +515,21 @@ def main() -> int:
     # namespace names a DIFFERENT entity, so every use becomes "reference to X is ambiguous".
     # Measured: `make_shader_compile_key` was excluded because live_renderer.cpp mentions it in a
     # comment about CPU profiling.
+    # LINKAGE COMES FROM THE USR, not from the anonymous-namespace walk alone. clang encodes it:
+    # an external-linkage entity's USR starts `c:@`, an internal one is file-prefixed
+    # (`c:file.cpp@F@name`). A `static` free function is internal WITHOUT being in an anonymous
+    # namespace, so the `anon` test alone missed it -- and then the name grep held it back because
+    # some unrelated file happens to define a same-named static. Measured: `make_probe_pipe` was
+    # excluded because of a same-named static in exec_image_linux.cpp:152. A name is not an
+    # identity; the USR is.
+    def externally_linked(i: int) -> bool:
+        usr = regions[i].get("usr") or ""
+        if usr:
+            return usr.startswith("c:@")
+        return not anon.get(i)          # no USR recorded: fall back to the scope walk
+
     public = [i for i in promote
-              if not anon.get(i)
+              if externally_linked(i)
               and regions[i]["kind"] in ("FUNCTION_DECL", "VAR_DECL")
               and used_elsewhere(regions[i]["name"])]
     if public:

@@ -81,9 +81,9 @@ caveats found by trying it:
 * **clangd refuses to extract from inside a lambda, and that rules out this codebase's giant
   functions.** From `clang-tools-extra/clangd/refactor/tweaks/ExtractFunction.cpp`, the tweak
   returns `nullptr` when a `LambdaExpr` is found — the comment is literally *"Don't extract from
-  lambdas"*. `register_live_renderer` is 8,222 lines of which roughly 89% is inside lambdas passed
-  to registration calls, so every candidate worth extracting is in refused territory.
-  `extract_function.py --probe` reports 0 of 8 accepted, and that is correct behaviour, not a bug.
+  lambdas"*. `register_live_renderer` is 8,222 lines of which **98.5%** is inside lambdas (8,101 of 8,221 lines, from the AST — 89% is the
+  file-share figure in the table above, a different number) passed to registration calls, so every candidate worth extracting is in refused territory.
+  `extract_function.py --probe` reports 0 of 10 accepted at its default bounds, and that is correct behaviour, not a bug.
 
   Its other documented refusals matter for the same reason: **`requiresHoisting`** (*"cannot extract
   declarations that will be needed in the original function after extraction"*), an unmatched
@@ -96,8 +96,12 @@ caveats found by trying it:
   is the very operation being asked for), or an IDE plugin driving a refactoring engine without the
   lambda restriction. JetBrains' shipped MCP server does not offer one: across the IDE family its
   entire refactoring surface is `rename_refactoring`, with extract-method an open request
-  (YouTrack LLM-25880). A community PyCharm plugin does expose Extract Method over HTTP, which shows
-  the shape of that route and also its cost — a per-IDE plugin against the IDE's own API.
+  (YouTrack LLM-25880 — which names extract *variable* and extract *parameter*, NOT extract
+  method, so it is not even a request for this). A community PyCharm plugin advertises Extract
+  Method over HTTP, which shows
+  the shape of that route — but it is a STUB: its `PyExtractMethodUtil.extractMethod` call is
+  commented out and it returns success with an empty parameter list. There is currently no
+  WORKING example of this route in any IDE, which raises its cost rather than lowering it.
 
 It stays incremental work regardless: a few extractions at a time, verified, by whoever is already
 changing that code.
