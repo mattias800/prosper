@@ -55,6 +55,16 @@ std::string resolve_root(const char* env_name, const char* leaf, const char* las
     // path so saving still works, and say so — on the development box that location is a RAM-backed
     // tmpfs, so "your saves are somewhere that does not survive a reboot" is exactly the sort of
     // thing that must not be discovered later.
+    //
+    // Once per variable. The roots are re-derived on every call by design, so an ungated warning
+    // here would print on every save operation and, being a real warning, would train the reader to
+    // scroll past it.
+    static std::mutex warned_mx;
+    static std::set<std::string> warned;
+    {
+        std::lock_guard<std::mutex> lock(warned_mx);
+        if (!warned.insert(env_name).second) return last_resort;
+    }
     std::fprintf(stderr,
                  "[savedata] no per-user data location (neither %s is set); falling back to %s, "
                  "which may not survive a reboot. Set %s to keep saves somewhere durable.\n",
