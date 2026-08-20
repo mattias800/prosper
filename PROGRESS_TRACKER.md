@@ -76,6 +76,7 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | Grand Theft Auto V | `PPSA04263` | 3 | `123---` | - | none | [#2429](https://github.com/mattias800/prosper/issues/2429) | [#1873](https://github.com/mattias800/prosper/issues/1873) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Syberia: Remastered | `PPSA30140` | 3 | `123---` | - | none | [#1790](https://github.com/mattias800/prosper/issues/1790), [#1627](https://github.com/mattias800/prosper/issues/1627), [#1737](https://github.com/mattias800/prosper/issues/1737), [#1628](https://github.com/mattias800/prosper/issues/1628) | [#1811](https://github.com/mattias800/prosper/issues/1811) | [`SYBERIA_STATUS.md`](prosper/docs/SYBERIA_STATUS.md) |
 | Tactics Ogre: Reborn | `PPSA03839` | 3 | `123---` | - | none | [#1913](https://github.com/mattias800/prosper/issues/1913), [#1784](https://github.com/mattias800/prosper/issues/1784) | [#1892](https://github.com/mattias800/prosper/issues/1892) | - |
+| Tales of Graces f Remastered | `PPSA19991` | 3 | `123---` | - | none | [#1688](https://github.com/mattias800/prosper/issues/1688), [#1673](https://github.com/mattias800/prosper/issues/1673), [#2731](https://github.com/mattias800/prosper/issues/2731) | [#1889](https://github.com/mattias800/prosper/issues/1889) | - |
 | The House of the Dead 2: Remake | `PPSA24203` | 3 | `123---` | - | none | [#1907](https://github.com/mattias800/prosper/issues/1907) | [#1896](https://github.com/mattias800/prosper/issues/1896) | - |
 | Astro Bot | `PPSA21564` | 2 | `12----` | - | none | [#1732](https://github.com/mattias800/prosper/issues/1732), [#1459](https://github.com/mattias800/prosper/issues/1459), [#1730](https://github.com/mattias800/prosper/issues/1730), [#1731](https://github.com/mattias800/prosper/issues/1731) | [#1809](https://github.com/mattias800/prosper/issues/1809) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Bendy and the Dark Revival | `PPSA27624` | 2 | `12----` | - | none | [#1979](https://github.com/mattias800/prosper/issues/1979), [#1955](https://github.com/mattias800/prosper/issues/1955) | [#1897](https://github.com/mattias800/prosper/issues/1897) | - |
@@ -88,7 +89,6 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | R-Type Delta: HD Boosted | `PPSA26414` | 2 | `12----` | - | none | [#1746](https://github.com/mattias800/prosper/issues/1746), [#1591](https://github.com/mattias800/prosper/issues/1591) | [#1810](https://github.com/mattias800/prosper/issues/1810) | [`R_TYPE_DELTA_STATUS.md`](prosper/docs/R_TYPE_DELTA_STATUS.md) |
 | Sonic Frontiers | `PPSA03831` | 2 | `12----` | - | none | [#2206](https://github.com/mattias800/prosper/issues/2206), [#657](https://github.com/mattias800/prosper/issues/657) | [#1891](https://github.com/mattias800/prosper/issues/1891) | [`SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) |
 | Sonic Racing: CrossWorlds | `PPSA08804` | 2 | `12----` | - | none | [#2361](https://github.com/mattias800/prosper/issues/2361), [#2362](https://github.com/mattias800/prosper/issues/2362), [#2363](https://github.com/mattias800/prosper/issues/2363), [#2309](https://github.com/mattias800/prosper/issues/2309), [#2303](https://github.com/mattias800/prosper/issues/2303) | [#1895](https://github.com/mattias800/prosper/issues/1895) | [`SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md) |
-| Tales of Graces f Remastered | `PPSA19991` | 2 | `12----` | - | none | [#1688](https://github.com/mattias800/prosper/issues/1688), [#1673](https://github.com/mattias800/prosper/issues/1673), [#2731](https://github.com/mattias800/prosper/issues/2731) | [#1889](https://github.com/mattias800/prosper/issues/1889) | - |
 | The Forgotten City | `PPSA03026` | 2 | `12----` | - | none | [#1961](https://github.com/mattias800/prosper/issues/1961), [#1945](https://github.com/mattias800/prosper/issues/1945), [#1226](https://github.com/mattias800/prosper/issues/1226) | [#1890](https://github.com/mattias800/prosper/issues/1890) | - |
 | The Oregon Trail | `PPSA19244` | 2 | `12----` | - | none | [#1945](https://github.com/mattias800/prosper/issues/1945), [#1606](https://github.com/mattias800/prosper/issues/1606), [#1641](https://github.com/mattias800/prosper/issues/1641), [#1634](https://github.com/mattias800/prosper/issues/1634) | [#1886](https://github.com/mattias800/prosper/issues/1886) | [`OREGON_TRAIL_STATUS.md`](prosper/docs/OREGON_TRAIL_STATUS.md) |
 | The Pathless | `PPSA01826` | 2 | `12----` | - | none | [#1570](https://github.com/mattias800/prosper/issues/1570), [#1213](https://github.com/mattias800/prosper/issues/1213) | [#1883](https://github.com/mattias800/prosper/issues/1883) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
@@ -102,8 +102,8 @@ cannot parse and writes no file at all, so a row that is present is a row that w
 | --- | --- |
 | 6 -- reviewed automatic gameplay snapshot guard | 14 |
 | 4 -- manual visual verification | 1 |
-| 3 -- gameplay with real GPU draws | 6 |
-| 2 -- title screen | 16 |
+| 3 -- gameplay with real GPU draws | 7 |
+| 2 -- title screen | 15 |
 | 1 -- any real graphics | 1 |
 | 0 -- not started | 1 |
 
