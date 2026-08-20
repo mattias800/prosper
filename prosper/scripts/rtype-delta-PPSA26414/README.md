@@ -26,9 +26,11 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 ```
 
 Eviction is one-shot — the run re-warms the cache, so repeat it before every launch — and it is not a
-guaranteed win on a busy host. Measured on 2026-08-20: **4 consecutive launches lost the race** with
-eviction alone on a quiet box, and **3 of 3 won it** when the launch was additionally throttled by 12
-busy loops pinned to the same 4 logical CPUs as prosper for the first 12 seconds, which is the lever
+guaranteed win. Measured on 2026-08-20, on a box shared with one other agent lane (1-minute load
+average 3.9-6.6 across the arms): with eviction alone, **1 launch in 6 won the race** (one arm lost
+once then won; the next lost 4 consecutively). With the launch *additionally* throttled by 12 busy
+loops pinned to the same 4 logical CPUs as prosper for the first 12 seconds, **4 of 4 won it on the
+first attempt**. That throttle is the lever
 `R_TYPE_DELTA_STATUS.md` § *The race is decided by host single-thread CPU speed* documents with an
 executed positive arm. That throttle changes the **host** only: unmodified binary, unmodified guest,
 no patched bytes, no capped guest sleep. A lost launch is unambiguous — it faults at `eboot+0x24055`
