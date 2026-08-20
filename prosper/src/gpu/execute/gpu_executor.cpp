@@ -5955,7 +5955,21 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                 // exists on both platforms for that. Whatever replaces this needs a mutation arm too:
                 // the existing coverage in `test_dynfetch_fold.cpp` builds its garbage with `base = 0`,
                 // so a residency term can be deleted with the whole suite still green (#2481).
-                const bool not_a_descriptor = entry.base <= 0x10000u || entry.size_bytes == 0u;
+                // `size_bytes == 0xFFFFFFFF` is the all-ones word, not an allocation. It is what
+                // random data reads as, and it cannot be a buffer the guest selects: measured over a
+                // routed PPSA04263 route, the 359 descriptors prosper actually resolved and bound
+                // top out at 66,355,200 bytes -- 24.7% of the 256 MiB cap below -- while every
+                // offending record was either this exact pattern or ~996 MiB. So this is nulled as a
+                // stale slot rather than declining the whole table (#2481).
+                //
+                // Deliberately the EXACT pattern, not a threshold. The >256 MiB case below keeps
+                // declining, because "large" really can be a descriptor the guest selects and the
+                // fail-visible path must survive for it; 0xFFFFFFFF cannot, being 4 GiB - 1 exactly.
+                // This tests the BYTES, which is why it works identically live, offline and in a
+                // fixture -- unlike page residency and region identity, both falsified on #2481.
+                const bool all_ones_record = entry.size_bytes == 0xFFFFFFFFu;
+                const bool not_a_descriptor =
+                    entry.base <= 0x10000u || entry.size_bytes == 0u || all_ones_record;
                 const bool unsupported_descriptor = !not_a_descriptor &&
                     (entry.size_bytes > 0x10000000u || entry.forbid_unknown_fallback);
                 if (unsupported_descriptor) {
@@ -5977,7 +5991,8 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                  "[srt] selected-table pc=%u NULL-SLOT index=%u why=%s "
                                  "words=%08x:%08x:%08x:%08x\n",
                                  u.use_pc, index,
-                                 entry.base <= 0x10000u ? "low-base" : "zero-size",
+                                 entry.base <= 0x10000u ? "low-base"
+                                     : entry.size_bytes == 0u ? "zero-size" : "all-ones-size",
                                  words[0], words[1], words[2], words[3]);
                 ShaderBufferTableEntry slot;
                 if (usable) {

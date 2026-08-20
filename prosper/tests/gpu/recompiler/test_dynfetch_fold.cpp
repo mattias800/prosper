@@ -2738,6 +2738,81 @@ int main() {
               !selected_table_xyz1_spirv.empty(),
           "a three-component DST_SEL still binds its descriptor table for untyped loads");
 
+    // #2481: ONE stale record must null its own slot, not decline the whole table. GTA V reuses a
+    // 600-byte arena allocation for these tables, so a slot the dispatch never indexes routinely
+    // holds ordinary float data -- which reads as `num_records = 0xFFFFFFFF`, i.e. size 4 GiB - 1.
+    // That is the all-ones word, not an allocation, and it cannot be a buffer the guest selects:
+    // over a routed PPSA04263 route the 359 descriptors prosper resolved and bound top out at
+    // 66,355,200 bytes, 24.7% of the >256 MiB cap that still declines.
+    //
+    // Only record 2 is spoiled. The table must still bind with its arity intact -- five entries, so
+    // a runtime index cannot land on a slot that was silently dropped -- with entry 2 nulled and
+    // every other entry byte-identical to the clean case.
+    //
+    // MUTATION: delete `all_ones_record` from `not_a_descriptor` in gpu_executor.cpp and this arm
+    // goes red, because the record then reaches the `size_bytes > 0x10000000` branch and declines the
+    // entire table, leaving `selected_table_stale_resource` null. The pre-existing arms above cannot
+    // detect that -- they build every record well-formed -- which is why this one is here.
+    alignas(16) static uint32_t selected_table_stale[5][30]{};
+    std::memcpy(selected_table_stale, selected_table_records, sizeof(selected_table_records));
+    selected_table_stale[2][4] = 0xffffffffu;          // NUM_RECORDS all ones -> stale arena slot
+    const uint64_t selected_table_stale_base = reinterpret_cast<uint64_t>(selected_table_stale);
+    uint32_t selected_table_stale_seed[16]{};
+    std::memcpy(selected_table_stale_seed, selected_table_seed, sizeof(selected_table_seed));
+    selected_table_stale_seed[0] = static_cast<uint32_t>(selected_table_stale_base);
+    selected_table_stale_seed[1] =
+        (static_cast<uint32_t>(selected_table_stale_base >> 32) & 0xffffu) | (120u << 16);
+    ShaderResourceTable selected_table_stale_rt;
+    add_compute_buffer_resources(
+        selected_table_stale_rt, selected_table_shader.data(), selected_table_shader.size(),
+        selected_table_stale_seed, std::size(selected_table_stale_seed));
+    assign_convention_bindings(selected_table_stale_rt, 2);
+    const ShaderResource* selected_table_stale_resource =
+        selected_table_stale_rt.by_fetch_pc(5u);
+    bool stale_slot_nulled = false, stale_others_intact = false;
+    if (selected_table_stale_resource &&
+        selected_table_stale_resource->table_entries.size() == 5u) {
+        const auto& e = selected_table_stale_resource->table_entries;
+        stale_slot_nulled = e[2].gpu_addr == 0u && e[2].size == 0u;
+        stale_others_intact = true;
+        for (uint32_t entry = 0; entry < 5u; ++entry) {
+            if (entry == 2u) continue;
+            stale_others_intact &=
+                e[entry].gpu_addr == reinterpret_cast<uint64_t>(selected_table_payload[entry]) &&
+                e[entry].size == 64u && e[entry].stride == 16u;
+        }
+    }
+    CHECK(selected_table_stale_resource &&
+              selected_table_stale_resource->table_index_count == 5u &&
+              stale_slot_nulled && stale_others_intact,
+          "one all-ones record nulls its own slot and the table still binds with exact arity");
+
+    // NEGATIVE ARM, and this is the one that stops the change from being "delete the decline". A
+    // record that is genuinely LARGE rather than all-ones must still decline the WHOLE table: a
+    // >256 MiB buffer can be a descriptor the guest selects, so it has to stay fail-visible rather
+    // than becoming a silent null. Same fixture, same shader, one word different from the arm above.
+    alignas(16) static uint32_t selected_table_big[5][30]{};
+    std::memcpy(selected_table_big, selected_table_records, sizeof(selected_table_records));
+    // 0x2000000 records x 16-byte stride = 512 MiB, comfortably over the 256 MiB cap and WITHOUT
+    // overflowing the uint32 size. The first version of this arm used 0x20000000, whose product is
+    // 8 GiB and truncates to exactly 0 in 32 bits -- so the record was nulled as zero-size and the
+    // arm failed. Worth keeping in the comment: a negative arm that constructs an impossible value
+    // tests nothing, and this one caught its own fixture bug.
+    selected_table_big[2][4] = 0x2000000u;
+    const uint64_t selected_table_big_base = reinterpret_cast<uint64_t>(selected_table_big);
+    uint32_t selected_table_big_seed[16]{};
+    std::memcpy(selected_table_big_seed, selected_table_seed, sizeof(selected_table_seed));
+    selected_table_big_seed[0] = static_cast<uint32_t>(selected_table_big_base);
+    selected_table_big_seed[1] =
+        (static_cast<uint32_t>(selected_table_big_base >> 32) & 0xffffu) | (120u << 16);
+    ShaderResourceTable selected_table_big_rt;
+    add_compute_buffer_resources(
+        selected_table_big_rt, selected_table_shader.data(), selected_table_shader.size(),
+        selected_table_big_seed, std::size(selected_table_big_seed));
+    assign_convention_bindings(selected_table_big_rt, 2);
+    CHECK(selected_table_big_rt.by_fetch_pc(5u) == nullptr,
+          "a genuinely oversized record still declines the whole table, fail-visible");
+
     // Same-site mutation: shrink the outer V# so the element at +8 no longer fits inside one
     // record. The selection is then not expressible as an array index and must fail visibly rather
     // than binding a differently-shaped table.
