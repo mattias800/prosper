@@ -114,8 +114,14 @@ class IoStoreToc:
         if len(d) < 144 or d[0:16] != TOC_MAGIC:
             raise TocError(f'{self.path}: not an IoStore .utoc (bad magic)')
         self.version = d[16]
+        # Read the container flags before validating the version: an unsupported container is very
+        # often ALSO encrypted, and "version 6" alone would send the next reader off to implement a
+        # newer header for a container whose names they still could not recover.
+        flags_at = 20 + 36 + 8 + 16
+        early_flags = d[flags_at] if len(d) > flags_at else 0
         if not 1 <= self.version <= 5:
-            raise TocError(f'{self.path}: unsupported .utoc version {self.version}')
+            extra = ' (and its directory index is encrypted)' if early_flags & FLAG_ENCRYPTED else ''
+            raise TocError(f'{self.path}: unsupported .utoc version {self.version}{extra}')
         (self.header_size, self.entry_count, self.block_count, self.block_entry_size,
          self.method_count, self.method_length, self.compression_block_size,
          self.dir_index_size, self.partition_count) = struct.unpack_from('<9I', d, 20)
