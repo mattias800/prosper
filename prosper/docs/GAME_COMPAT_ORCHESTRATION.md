@@ -676,6 +676,28 @@ instrument that separated the two runs above; the successful one went Loading ->
 the others Loading -> `SoloCoopMenu` -> stuck. Full derivation in
 [`ASTERIX_BABYLON_STATUS.md`](ASTERIX_BABYLON_STATUS.md); the route-reliability defect it exposed is #2743.
 
+**For Unreal titles the equivalent is the IoStore package stream, and it is now tooled.** Ten of the
+fifteen titles still at rung 2 are Unreal, so the Unity oracle covers none of them. The Unreal
+analogue is *which package the guest read*, decoded from a `PROSPER_FILELOG=1` stream by
+`tools/re/iostore_index.py` (`--maps` for just the `.umap` sequence). It is self-checking in the same
+way: Unreal cooked package paths are semantic, so on `PPSA17942` the title screen reads
+`Map/Product/Title/Title_PL.umap` — which `DefaultEngine.ini`'s own `GameDefaultMap` names as the
+startup map — and a town reads a cluster of `Map/Product/World/Field/F001/C001/C001_M_Env_*.umap`
+sub-levels. A mis-derived mapping produces nonsense rather than a plausible wrong answer.
+
+Two things make this different from just pointing `pak_index.py` at the container. First, an
+IoStore title's `.pak` holds **no packages at all** — only configs, fonts and localization — so
+`pak_index.py` correctly reports zero maps and names nothing; the packages are in the `.ucas`.
+Second, a chunk's offset in the `.utoc` is in the container's **logical** space while a read syscall
+carries a **physical** offset into the packed `.ucas`, and on `PPSA17942` the two differ by 4.1 GB at
+the startup map alone — so a one-step lookup misnames most of a stream while still looking plausible.
+`iostore_index.py --self-test` pins that mapping and is registered in ctest.
+
+Validate it the way the `## Ruled out` rule requires: build a positive instance **by hand from the
+container index**, outside any run — compute a known package's physical offset and check that
+`--resolve` names it back — rather than trusting that the instrument fires because a run produced
+some output.
+
 ## The orchestration contract
 
 ### Orchestrator responsibilities

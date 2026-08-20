@@ -275,25 +275,38 @@ _READ_RE = re.compile(
     r'\[apr\] read-submit id=(?P<id>\d+) (?P<path>\S+) -> dst=\S+ '
     r'off=(?P<off>0x[0-9a-fA-F]+) size=(?P<size>\d+) got=(?P<got>\d+) (?P<status>\S+)')
 
-_PREAD_RE = re.compile(
-    r'\[file\] (?:aio-\w+|pread) fd=\d+ off=(?P<off>0x[0-9a-fA-F]+) n=(?P<size>0x[0-9a-fA-F]+)')
+# Not every Unreal title streams IoStore through APR: an ordinary pread/read carries the same
+# information under PROSPER_FILELOG=1, with the resolved host path attached to the fd.
+_FD_READ_RE = re.compile(
+    r"\[file\] (?:pread|read) fd=\d+ path='(?P<path>[^']*)' "
+    r"off=(?P<off>0x[0-9a-fA-F]+) count=(?P<size>0x[0-9a-fA-F]+) -> (?P<got>-?\d+)")
 
 
 def parse_read_log(path: str, container_stem: str = None):
     """Yield (offset, size, got, status) for read lines that name this container.
 
-    `container_stem` filters `[apr] read-submit` lines by host path, so a title that streams from
-    several `.ucas` files does not attribute one container's offsets to another's index.
+    Both the `[apr] read-submit` and the ordinary `[file] pread/read` forms are accepted, because
+    which one a title uses is a property of the title, not of the container.
+
+    `container_stem` filters by host path, so a title that streams from several `.ucas` files does
+    not attribute one container's offsets to another's index.
     """
     with open(path, 'r', errors='replace') as f:
         for line in f:
             m = _READ_RE.search(line)
-            if not m:
+            if m:
+                if container_stem and container_stem not in m.group('path'):
+                    continue
+                yield (int(m.group('off'), 16), int(m.group('size')),
+                       int(m.group('got')), m.group('status'))
                 continue
-            if container_stem and container_stem not in m.group('path'):
-                continue
-            yield (int(m.group('off'), 16), int(m.group('size')),
-                   int(m.group('got')), m.group('status'))
+            m = _FD_READ_RE.search(line)
+            if m:
+                if container_stem and container_stem not in m.group('path'):
+                    continue
+                got = int(m.group('got'))
+                yield (int(m.group('off'), 16), int(m.group('size'), 16),
+                       max(got, 0), 'OK' if got >= 0 else 'FAIL')
 
 
 def _self_test():
@@ -333,6 +346,26 @@ def _self_test():
     assert f.resolve(47) == ('B.umap', True)
     assert f.physical_to_logical(48) == 65568
     assert f.resolve(48)[1] is False
+
+    # Both read-log dialects decode, and the container filter uses the host path from each.
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as fh:
+        fh.write("[apr] read-submit id=1 /d/pakchunk0-ps5.ucas -> dst=0x30(guest) "
+                 "off=0x1000 size=64 got=64 OK method=id requested=64\n")
+        fh.write("[apr] read-submit id=1 /d/other.ucas -> dst=0x30(guest) "
+                 "off=0x2000 size=8 got=8 OK method=id requested=8\n")
+        fh.write("[file] pread fd=7 path='/d/pakchunk0-ps5.ucas' off=0x3000 count=0x40 "
+                 "-> 64 error=0\n")
+        fh.write("[file] pread fd=7 path='/d/other.ucas' off=0x4000 count=0x40 -> 64 error=0\n")
+        # The sibling .pak shares the container's stem and has a completely different offset
+        # space; matching it would name pak offsets against the IoStore index.
+        fh.write("[apr] read-submit id=2 /d/pakchunk0-ps5.pak -> dst=0x30(guest) "
+                 "off=0x5000 size=8 got=8 OK method=id requested=8\n")
+        log = fh.name
+    got = list(parse_read_log(log, 'pakchunk0-ps5.ucas'))
+    assert got == [(0x1000, 64, 64, 'OK'), (0x3000, 64, 64, 'OK')], got
+    assert len(list(parse_read_log(log))) == 5
+    os.unlink(log)
 
     print('self-test OK')
 
@@ -395,7 +428,10 @@ def main(argv=None):
         return 0
 
     if args.log:
-        stem = None if args.all_containers else os.path.basename(args.utoc)[:-len('.utoc')]
+        # Match the container's own `.ucas`, not merely its stem: a title normally ships
+        # `pakchunk0-ps5.pak` beside `pakchunk0-ps5.ucas`, and a stem filter would feed the pak's
+        # own offsets to this index and name them confidently and wrongly.
+        stem = None if args.all_containers else os.path.basename(args.utoc)[:-len('.utoc')] + '.ucas'
         reads = list(parse_read_log(args.log, stem))
         if not reads:
             print('no [apr] read-submit result lines matched — was PROSPER_FILELOG=1 set, and does '
