@@ -94,6 +94,56 @@ def _read_fstring(buf: bytes, off: int):
     return text, off
 
 
+def _walk_directory(dirs, files, strings, mount, path):
+    """Flatten an FIoDirectoryIndexResource into {UserData -> full path}.
+
+    Split out from the parser so the cycle and range guards below are directly testable:
+    a guard whose failure mode is an infinite loop cannot be checked by running the parser
+    on a real container, because a real container never trips it.
+    """
+    prefix = mount if mount.endswith('/') else mount + '/'
+    paths = {}
+    # Iterative sibling/child walk: the tree is ~100k nodes deep-ish and recursion would need a
+    # raised limit to survive a deeply nested content tree.
+    #
+    # The two `seen` sets are not defensive programming for its own sake. `NextSiblingEntry` and
+    # `NextFileEntry` are raw indices with no structural guarantee that they move forward, so a
+    # corrupt or hostile container can point one back at a node already visited — and the walk
+    # would then spin forever with no output. A tool whose failure mode is an infinite loop gets
+    # read as "the container is huge" rather than as a defect, which is the worst way to fail.
+    # An out-of-range index is an error rather than a skip, for the same reason the layout walk
+    # is: silently dropping part of the index would produce a smaller, plausible, wrong answer.
+    seen_dirs = set()
+    seen_files = set()
+    stack = [(0, prefix)]
+    while stack:
+        index, parent = stack.pop()
+        while index != INVALID:
+            if index >= len(dirs):
+                raise TocError(f'{path}: directory entry {index} out of range '
+                               f'({len(dirs)} entries)')
+            if index in seen_dirs:
+                raise TocError(f'{path}: cycle in the directory index at entry {index}')
+            seen_dirs.add(index)
+            name, first_child, next_sibling, first_file = dirs[index]
+            here = parent if name == INVALID else parent + strings[name] + '/'
+            file_index = first_file
+            while file_index != INVALID:
+                if file_index >= len(files):
+                    raise TocError(f'{path}: file entry {file_index} out of range '
+                                   f'({len(files)} entries)')
+                if file_index in seen_files:
+                    raise TocError(f'{path}: cycle in the file list at entry {file_index}')
+                seen_files.add(file_index)
+                fname, next_file, user_data = files[file_index]
+                paths[user_data] = here + strings[fname]
+                file_index = next_file
+            if first_child != INVALID:
+                stack.append((first_child, here))
+            index = next_sibling
+    return paths
+
+
 class IoStoreToc:
     """Parsed `.utoc`: chunk extents, the physical<->logical block map, and the directory index."""
 
@@ -223,25 +273,7 @@ class IoStoreToc:
             raise TocError(f'{self.path}: directory index tail mismatch '
                            f'({off} != {self.dir_off + self.dir_index_size})')
 
-        prefix = self.mount if self.mount.endswith('/') else self.mount + '/'
-        paths = {}
-        # Iterative sibling/child walk: the tree is ~100k nodes deep-ish and recursion would need a
-        # raised limit to survive a deeply nested content tree.
-        stack = [(0, prefix)]
-        while stack:
-            index, parent = stack.pop()
-            while index != INVALID:
-                name, first_child, next_sibling, first_file = dirs[index]
-                here = parent if name == INVALID else parent + strings[name] + '/'
-                file_index = first_file
-                while file_index != INVALID:
-                    fname, next_file, user_data = files[file_index]
-                    paths[user_data] = here + strings[fname]
-                    file_index = next_file
-                if first_child != INVALID:
-                    stack.append((first_child, here))
-                index = next_sibling
-        self.paths = paths
+        self.paths = _walk_directory(dirs, files, strings, self.mount, self.path)
 
     # ---- resolution ---------------------------------------------------------------------
     def physical_to_logical(self, offset: int):
@@ -352,6 +384,45 @@ def _self_test():
     assert f.resolve(47) == ('B.umap', True)
     assert f.physical_to_logical(48) == 65568
     assert f.resolve(48)[1] is False
+
+    # The directory walk. First a well-formed index — root with one child directory, two files —
+    # so the guards below are shown NOT to fire on a valid tree.
+    #   dirs:  (Name, FirstChildEntry, NextSiblingEntry, FirstFileEntry)
+    #   files: (Name, NextFileEntry, UserData)
+    strings = ['Content', 'a.uasset', 'b.umap']
+    dirs = [(INVALID, 1, INVALID, INVALID), (0, INVALID, INVALID, 0)]
+    files = [(1, 1, 10), (2, INVALID, 11)]
+    got = _walk_directory(dirs, files, strings, '../../../', 'fixture')
+    assert got == {10: '../../../Content/a.uasset', 11: '../../../Content/b.umap'}, got
+
+    # Mutation arms: each of these makes the pre-guard walk loop forever or index out of range,
+    # so they fail loudly if a guard is ever removed. An infinite loop cannot be caught by a
+    # timeout-free test, which is exactly why the walk was split out to be driven directly.
+    cyclic_siblings = [(INVALID, 1, INVALID, INVALID), (0, INVALID, 1, INVALID)]  # 1 -> itself
+    try:
+        _walk_directory(cyclic_siblings, files, strings, '/', 'fixture')
+        raise AssertionError('a directory-index cycle must be refused, not walked forever')
+    except TocError as exc:
+        assert 'cycle in the directory index' in str(exc), exc
+
+    cyclic_files = [(2, 0, 0)]                                                   # file 0 -> itself
+    try:
+        _walk_directory([(INVALID, INVALID, INVALID, 0)], cyclic_files, strings, '/', 'fixture')
+        raise AssertionError('a file-list cycle must be refused, not walked forever')
+    except TocError as exc:
+        assert 'cycle in the file list' in str(exc), exc
+
+    try:
+        _walk_directory([(INVALID, 7, INVALID, INVALID)], files, strings, '/', 'fixture')
+        raise AssertionError('an out-of-range directory entry must be refused, not skipped')
+    except TocError as exc:
+        assert 'directory entry 7 out of range' in str(exc), exc
+
+    try:
+        _walk_directory([(INVALID, INVALID, INVALID, 9)], files, strings, '/', 'fixture')
+        raise AssertionError('an out-of-range file entry must be refused, not skipped')
+    except TocError as exc:
+        assert 'file entry 9 out of range' in str(exc), exc
 
     # Both read-log dialects decode, and the container filter uses the host path from each.
     import tempfile
