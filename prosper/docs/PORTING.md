@@ -67,7 +67,7 @@ suggests:
 
 **Already portable by design:**
 - `src/gpu/` is Vulkan-free data translation (PM4→draw state, RDNA2→SPIR-V). No OS calls.
-- The Vulkan edge (`tests/render_runner.h`, `frontends/shared/live_renderer.cpp`) is **headless
+- The Vulkan edge (`tests/render_runner.h`, `frontends/shared/live/live_renderer.cpp`) is **headless
   Vulkan 1.1**, requiring only `robustBufferAccess` (+ optional `VK_EXT_image_robustness`,
   `samplerAnisotropy`). No geometry shaders, no descriptorIndexing, no BDA. Extremely portable.
 - Presentation (`frontends/prosper-app`) is **SDL3** with a deliberately separate present device;

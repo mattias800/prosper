@@ -1,6 +1,6 @@
 #pragma once
 
-#include "compute_timing_selector.hpp"
+#include "shared/compute/compute_timing_selector.hpp"
 
 #include <cstdint>
 

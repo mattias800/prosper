@@ -1,6 +1,6 @@
-#include "performance_capture.hpp"
-#include "performance_timing_gate.hpp"
-#include "performance_timing_policy.hpp"
+#include "shared/perf/performance_capture.hpp"
+#include "shared/perf/performance_timing_gate.hpp"
+#include "shared/perf/performance_timing_policy.hpp"
 
 #include <chrono>
 #include <filesystem>

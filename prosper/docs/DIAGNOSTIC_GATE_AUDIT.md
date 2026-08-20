@@ -306,7 +306,7 @@ hand, so both doors are shut:
 | **alternation membership** | this tree has a 28-alternative "some dump is on" predicate; the display form elides it as `..23more`, and that **count is membership** — adding one `PROSPER_DUMP_*` variable re-keys every finding depending on it | a clause with more than three alternatives renders as `(any)` in the key; presentation keeps the count, identity does not |
 
 The second door was measured rather than imagined: on the first baseline, **13 of 93 rows embedded
-an elision count, and all 13 were in one file** — `frontends/shared/live_renderer.cpp`, which was
+an elision count, and all 13 were in one file** — `frontends/shared/live/live_renderer.cpp`, which was
 under active edit in two open PRs at the time. One added variable would have moved all thirteen at
 once. The principle underneath both: **the conjunction is identity; a long alternation is
 presentation** — the same argument the display form makes for eliding it, since printing all 28

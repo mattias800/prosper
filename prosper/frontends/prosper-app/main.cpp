@@ -19,8 +19,8 @@
 #include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
-#include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
-#include "present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
+#include "shared/present/present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
+#include "shared/present/present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
 #include "hle/sync/sync_futex.hpp"         // dump_guest_sync_trace (PROSPER_SYNC_RING deadlock history)
 #include "host/platform/lifecycle.hpp"          // frontend-owned stop/pause gates
 #include "host/image/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
@@ -37,15 +37,15 @@
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + one exclusively claimed name pair per F9 grab
-#include "performance_capture.hpp"        // bounded F8 pre/post performance artifact
+#include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
 #include "performance_capture_schedule.hpp" // unattended elapsed-time trigger for the same artifact
 #include "app_config.hpp"                // persisted settings (games_dir), pure seam
 #ifdef PROSPER_HAVE_LIBRARY_UI
 #include "library_ui.hpp"                // the ImGui library grid drawn while no game is running
 #endif
 #ifdef PROSPER_HAVE_LIVE_RENDERER
-#include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
-#include "live_compute.hpp"            // flush compute-timing selector summary before _Exit
+#include "shared/live/live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
+#include "shared/live/live_compute.hpp"            // flush compute-timing selector summary before _Exit
 #endif
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"              // install_sdl3_audio_sink (route sceAudioOut to the host)

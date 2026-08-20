@@ -429,7 +429,7 @@ old report conflated sampled binding 14 (`0x21159d0000`) with storage binding 23
 `0x2110310000` is `fmt=122` = `R11G11B10_FLOAT` (`VK_FORMAT_B10G11R11_UFLOAT_PACK32`).
 `LiveTargetPixelFormat` (`src/gpu/execute/gpu_execute.hpp:566`) has three members, and `R11G11B10Float` is
 plumbed through the snapshot reader (`live_renderer.cpp:699`), the direct GPU importer
-(`live_renderer.cpp:763`) and 16 sites in `frontends/shared/live_compute.cpp`.
+(`live_renderer.cpp:763`) and 16 sites in `frontends/shared/live/live_compute.cpp`.
 
 **One path was missed** — `set_live_target_image_written_notifier`, `live_renderer.cpp:811`:
 

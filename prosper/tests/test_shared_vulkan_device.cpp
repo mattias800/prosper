@@ -7,7 +7,7 @@
 // adopting a different device would be worse than not adopting at all.
 #include "gpu/execute/gpu_execute.hpp"
 #include "render_runner.h"
-#include "../frontends/shared/live_renderer.hpp"
+#include "shared/live/live_renderer.hpp"
 #include <string>
 #include <cstdio>
 

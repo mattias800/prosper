@@ -3,16 +3,16 @@
 // pixels. Used to verify recompiled shaders end-to-end (render -> readback -> pixel asserts). The
 // including test links Vulkan::Vulkan.
 #pragma once
-#include "../frontends/shared/mrt_extent.hpp"
+#include "shared/rtt/mrt_extent.hpp"
 #include <vulkan/vulkan.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
-#include "../frontends/shared/rtt_scale.hpp"
-#include "../frontends/shared/vulkan_device_select.hpp"
-#include "../frontends/shared/performance_timing_gate.hpp"
-#include "../frontends/shared/performance_timing_policy.hpp"
+#include "shared/rtt/rtt_scale.hpp"
+#include "shared/device/vulkan_device_select.hpp"
+#include "shared/perf/performance_timing_gate.hpp"
+#include "shared/perf/performance_timing_policy.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>

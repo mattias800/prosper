@@ -53,7 +53,7 @@ inline constexpr uint32_t kComputeInternalGdsBinding = 127;
 //
 // The host SAVES these dwords, prepares them (field +3 to UINT32_MAX, so an atomic min is
 // meaningful), reads them after the dispatch, and RESTORES the saved values -- see
-// frontends/shared/trip_bound_witness.hpp. Two rules that are easy to state too weakly:
+// frontends/shared/diagnostics/trip_bound_witness.hpp. Two rules that are easy to state too weakly:
 //
 //   * The gate is whether a witness was actually EMITTED for this program
 //     (spirv_writes_trip_witness, read from the compiled module), never whether the selectors

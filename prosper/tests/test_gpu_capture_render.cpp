@@ -5,8 +5,8 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "hle/dispatch/dispatch.hpp"
-#include "../frontends/shared/live_compute.hpp"
-#include "../frontends/shared/live_renderer.hpp"
+#include "shared/live/live_compute.hpp"
+#include "shared/live/live_renderer.hpp"
 #include "render_runner.h"
 
 #include <algorithm>

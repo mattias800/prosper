@@ -1,7 +1,7 @@
 #pragma once
 
-#include "compute_authority_census.hpp"
-#include "compute_timing_selector.hpp"
+#include "shared/compute/compute_authority_census.hpp"
+#include "shared/compute/compute_timing_selector.hpp"
 
 #include <cstdint>
 #include <limits>

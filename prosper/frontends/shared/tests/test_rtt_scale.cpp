@@ -4,8 +4,8 @@
 // fall back to guest backing). Getting this wrong either blanks compute composites under scale>1 or
 // scales a stale, wrong-view snapshot, so the boundary is pinned here.
 
-#include "rtt_scale.hpp"
-#include "rtt_authority.hpp"
+#include "shared/rtt/rtt_scale.hpp"
+#include "shared/rtt/rtt_authority.hpp"
 
 #include <cstdio>
 

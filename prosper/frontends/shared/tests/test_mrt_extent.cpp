@@ -10,7 +10,7 @@
 // is actually present. A test that only asserted the new contract could stay green against an
 // implementation that never grew the guard at all.
 
-#include "mrt_extent.hpp"
+#include "shared/rtt/mrt_extent.hpp"
 
 #include <cstdint>
 #include <cstdio>

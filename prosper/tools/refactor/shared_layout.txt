@@ -1,0 +1,45 @@
+# The shared frontend: everything a frontend needs to turn decoded guest work into pixels.
+# Consumed by move_module.py.
+#
+# Format: `folder: module module module` -- module is the basename, without extension; the .cpp,
+# .hpp and .h of a module always travel together.
+#
+# The ordering principle is THE PATH OF A FRAME: the live renderer and compute backends translate
+# guest work (live/), render targets are resolved and scaled (rtt/), textures are decoded or
+# proven resident (texture/), compute writeback authority is decided (compute/), and the result is
+# blitted to a scanout slot and published (present/). perf/ and diagnostics/ observe that path;
+# media/ and device/ are the two seams that belong to neither.
+#
+# tests/ holds the unit tests of the policies above, which lived beside them in the same flat
+# directory. Co-located because that is where they are useful -- a policy and its test change
+# together -- but in a folder, so "the shared frontend" is 30 modules rather than 45 files.
+
+# --- translating guest work into Vulkan ---------------------------------------------------------
+live: live_renderer live_compute live_target_format
+
+# --- render targets: authority, scale, injection, MRT bindings ---------------------------------
+rtt: rtt_authority rtt_injection rtt_scale mrt_binding mrt_extent
+
+# --- guest texture bytes vs. their decoded residency -------------------------------------------
+texture: texture_decode_cache_policy texture_decode_diagnostic write_watch_policy seed_reprove
+
+# --- who owns a compute writeback --------------------------------------------------------------
+compute: compute_authority_census compute_authority_live_census compute_transfer_gate_census compute_timing_selector
+
+# --- scanout: blit, extent contract, readback, publishing the guest's own frame ----------------
+present: present_blit present_blit_policy present_extent guest_scanout_present readback_policy
+
+# --- F8 performance capture ---------------------------------------------------------------------
+perf: performance_capture performance_timing_gate performance_timing_policy
+
+# --- observation only ---------------------------------------------------------------------------
+diagnostics: diagnostic_window frame_dump_policy capture_renderer_policy trip_bound_witness
+
+# --- AvPlayer's NV12 plane ----------------------------------------------------------------------
+media: avplayer_plane_policy
+
+# --- physical-device choice ---------------------------------------------------------------------
+device: vulkan_device_select
+
+# --- unit tests of the policies above -----------------------------------------------------------
+tests: test_avplayer_plane_policy test_capture_renderer_policy test_diagnostic_window test_frame_dump_policy test_guest_scanout_present test_mrt_binding test_mrt_extent test_performance_capture test_present_blit_policy test_present_extent test_readback_policy test_rtt_injection test_rtt_scale test_texture_decode_diagnostic test_write_watch_policy

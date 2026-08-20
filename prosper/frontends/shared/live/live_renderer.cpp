@@ -1,22 +1,22 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
-#include "live_renderer.hpp"
+#include "shared/live/live_renderer.hpp"
 #include "hle/dispatch/dispatch.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
 #include "gpu/diagnostics/watch_list.hpp"                 // strict 0x-only watch parsing
-#include "rtt_authority.hpp"
-#include "rtt_injection.hpp"
-#include "rtt_scale.hpp"
-#include "mrt_extent.hpp"
-#include "mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
-#include "readback_policy.hpp"
-#include "capture_renderer_policy.hpp"
-#include "write_watch_policy.hpp"
-#include "live_compute.hpp"
-#include "live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
-#include "performance_capture.hpp"      // bounded F8 post-trigger renderer timing
-#include "performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
-#include "performance_timing_policy.hpp" // retain timing across split semantic submits
+#include "shared/rtt/rtt_authority.hpp"
+#include "shared/rtt/rtt_injection.hpp"
+#include "shared/rtt/rtt_scale.hpp"
+#include "shared/rtt/mrt_extent.hpp"
+#include "shared/rtt/mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
+#include "shared/present/readback_policy.hpp"
+#include "shared/diagnostics/capture_renderer_policy.hpp"
+#include "shared/texture/write_watch_policy.hpp"
+#include "shared/live/live_compute.hpp"
+#include "shared/live/live_target_format.hpp"       // the one LiveTargetPixelFormat mapping (exhaustive)
+#include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger renderer timing
+#include "shared/perf/performance_timing_gate.hpp"  // turn on render_runner's existing backend clocks
+#include "shared/perf/performance_timing_policy.hpp" // retain timing across split semantic submits
 
 #include "gpu/execute/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/timeline/gpu_timeline.hpp"         // phase-gated detailed-capture policy
@@ -28,12 +28,12 @@
 #include "gpu/resources/shader_resources.hpp"     // ShaderResourceTable / ResourceClass
 #include "gpu/recompiler/rdna2_to_spirv.hpp"       // recompile_fragment (diagnostic solid-color PS)
 #include "gpu/present/videoout_present.hpp"     // present_front_index (flip-anchored present selection)
-#include "present_blit.hpp"             // GPU scanout handoff (#1270 unified-device present)
-#include "present_blit_policy.hpp"      // flip-anchored scanout publication policy
-#include "present_extent.hpp"           // the publish extent contract with the caller (#1986)
-#include "avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
-#include "guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
-#include "diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
+#include "shared/present/present_blit.hpp"             // GPU scanout handoff (#1270 unified-device present)
+#include "shared/present/present_blit_policy.hpp"      // flip-anchored scanout publication policy
+#include "shared/present/present_extent.hpp"           // the publish extent contract with the caller (#1986)
+#include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
+#include "shared/present/guest_scanout_present.hpp"    // publishing the guest's own flipped buffer (#1968)
+#include "shared/diagnostics/diagnostic_window.hpp"        // census window by callback ordinal or by elapsed time
 #include "gpu/diagnostics/diag_ratelimit.hpp"       // ordinal + sparse tail for capped diagnostics
 #include "host/memory/guest_write_watch.hpp"
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
@@ -6238,7 +6238,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // of starting from the diagnostic clear. Real RT memory persists exactly this way.
                 static const bool seed_rtt = getenv("PROSPER_RTT_NOSEED") == nullptr;
                 // Pass grouping and same-pass feedback detection must not disagree about what an
-                // active binding is, so both go through frontends/shared/mrt_binding.hpp. These
+                // active binding is, so both go through frontends/shared/rtt/mrt_binding.hpp. These
                 // were duplicated lambdas; a second, looser copy in the feedback path classified
                 // stale named state as a live binding (#2550 review).
                 auto color_binding = [](const prosper::gpu::DrawItem& draw, uint32_t slot) {

@@ -3,7 +3,7 @@
 
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/state/render_state.hpp"
-#include "mrt_extent.hpp"
+#include "shared/rtt/mrt_extent.hpp"
 
 // THE definition of an active colour binding.
 //

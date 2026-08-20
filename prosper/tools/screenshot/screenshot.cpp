@@ -51,7 +51,7 @@
 #include "host/image/exec_image.hpp"         // run_entry
 #include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
 #include "gpu/timeline/gpu_timeline.hpp"
-#include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
+#include "shared/live/live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode

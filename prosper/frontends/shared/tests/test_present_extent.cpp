@@ -17,7 +17,7 @@
 // renderer registration and no guest. `want_bytes == 0` (no contract) is exercised as its own arm
 // because it is a real path — gpu_replay's ordered-prefix inspection and the render_submit_items
 // tests consume the last pass at its own extent — not a degenerate one.
-#include "present_extent.hpp"
+#include "shared/present/present_extent.hpp"
 
 #include <cstdio>
 #include <string_view>

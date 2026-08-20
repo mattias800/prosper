@@ -1,16 +1,16 @@
-#include "live_compute.hpp"
-#include "trip_bound_witness.hpp"
-#include "compute_authority_live_census.hpp"
-#include "compute_timing_selector.hpp"
-#include "compute_transfer_gate_census.hpp"
-#include "live_target_format.hpp"
-#include "rtt_scale.hpp"
-#include "rtt_authority.hpp"
-#include "seed_reprove.hpp"
-#include "vulkan_device_select.hpp"
-#include "write_watch_policy.hpp"
-#include "performance_capture.hpp"      // bounded F8 post-trigger compute timing
-#include "performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
+#include "shared/live/live_compute.hpp"
+#include "shared/diagnostics/trip_bound_witness.hpp"
+#include "shared/compute/compute_authority_live_census.hpp"
+#include "shared/compute/compute_timing_selector.hpp"
+#include "shared/compute/compute_transfer_gate_census.hpp"
+#include "shared/live/live_target_format.hpp"
+#include "shared/rtt/rtt_scale.hpp"
+#include "shared/rtt/rtt_authority.hpp"
+#include "shared/texture/seed_reprove.hpp"
+#include "shared/device/vulkan_device_select.hpp"
+#include "shared/texture/write_watch_policy.hpp"
+#include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger compute timing
+#include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
 
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/capture/gpu_capture.hpp"

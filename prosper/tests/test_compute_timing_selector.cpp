@@ -1,5 +1,5 @@
-#include "compute_timing_selector.hpp"
-#include "compute_transfer_gate_census.hpp"
+#include "shared/compute/compute_timing_selector.hpp"
+#include "shared/compute/compute_transfer_gate_census.hpp"
 
 #include <cstdint>
 #include <cstdio>

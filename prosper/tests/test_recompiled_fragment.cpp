@@ -1033,7 +1033,7 @@ int main() {
             }
         }
 
-        // The backend colour-format mapping that frontends/shared/mrt_binding.hpp's active-binding
+        // The backend colour-format mapping that frontends/shared/rtt/mrt_binding.hpp's active-binding
         // rule depends on. It is TOTAL: every unrecognised raw value, zero included, maps to
         // R8G8B8A8_UNORM, so the format term in that rule never rejects a slot. Pinned here, in a
         // test that actually links the backend, because mrt_binding's own test must model the

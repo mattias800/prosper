@@ -1,4 +1,4 @@
-#include "frame_dump_policy.hpp"
+#include "shared/diagnostics/frame_dump_policy.hpp"
 
 #include <cstdio>
 #include <cstring>

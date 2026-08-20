@@ -1,5 +1,5 @@
-#include "compute_authority_census.hpp"
-#include "compute_authority_live_census.hpp"
+#include "shared/compute/compute_authority_census.hpp"
+#include "shared/compute/compute_authority_live_census.hpp"
 
 #include <cstdint>
 #include <cstdio>

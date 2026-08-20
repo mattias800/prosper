@@ -19,8 +19,8 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "render_runner.h"
-#include "../frontends/shared/live_renderer.hpp"
-#include "../frontends/shared/live_target_format.hpp"
+#include "shared/live/live_renderer.hpp"
+#include "shared/live/live_target_format.hpp"
 
 #include <cstdio>
 #include <cstdlib>

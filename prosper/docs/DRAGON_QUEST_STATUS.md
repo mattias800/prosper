@@ -181,7 +181,7 @@ and the timeline shows the guest had previously rendered a real 24-draw **1920×
 base (`producer … submit=921 draw=23 target=…98330000/1920x1080 writes=24`). Two things are wrong here
 and either could be the fix:
 
-1. `g_rtt` (`frontends/shared/live_renderer.cpp`) is keyed by **base address alone**, so the later
+1. `g_rtt` (`frontends/shared/live/live_renderer.cpp`) is keyed by **base address alone**, so the later
    3840×2160 RGBA16F pass replaced the earlier 1920×1080 surface. A sample of the still-live 1920×1080
    view then gets a foreign extent (nearest-rescaled) instead of its own surface.
 2. The one-off 4K pass produced only alpha where the identical pass at the two ping-pong addresses

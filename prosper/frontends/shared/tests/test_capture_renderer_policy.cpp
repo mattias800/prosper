@@ -1,4 +1,4 @@
-#include "capture_renderer_policy.hpp"
+#include "shared/diagnostics/capture_renderer_policy.hpp"
 
 #include <cstdio>
 

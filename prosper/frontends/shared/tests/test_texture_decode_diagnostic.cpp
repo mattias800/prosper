@@ -1,5 +1,5 @@
-#include "texture_decode_diagnostic.hpp"
-#include "texture_decode_cache_policy.hpp"
+#include "shared/texture/texture_decode_diagnostic.hpp"
+#include "shared/texture/texture_decode_cache_policy.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 
 #include <cstdio>

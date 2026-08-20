@@ -1,7 +1,7 @@
 // Runtime-selected storage-buffer arrays through the production compute backend. The pure plan
 // assertions pin the one source of truth used by pool/layout/write sizing; the Vulkan execution arm
 // proves each concrete table entry reaches its descriptor slot instead of being collapsed to one.
-#include "../frontends/shared/live_compute.hpp"
+#include "shared/live/live_compute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 

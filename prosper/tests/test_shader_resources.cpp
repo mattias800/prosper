@@ -2,7 +2,7 @@
 // and the recompiler/pipeline lookups both halves rely on. Pure (no Vulkan), runs in CI.
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/execute/gpu_execute.hpp"
-#include "../frontends/shared/live_compute.hpp"
+#include "shared/live/live_compute.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>

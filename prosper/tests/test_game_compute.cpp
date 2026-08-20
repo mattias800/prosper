@@ -7,8 +7,8 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/tile.hpp"
 #include "host/memory/guest_write_watch.hpp"
-#include "live_compute.hpp"
-#include "seed_reprove.hpp"
+#include "shared/live/live_compute.hpp"
+#include "shared/texture/seed_reprove.hpp"
 #include "gta5_cf9200_fixture.hpp"
 #include "test_scratch.h"
 

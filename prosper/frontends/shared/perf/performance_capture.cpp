@@ -1,4 +1,4 @@
-#include "performance_capture.hpp"
+#include "shared/perf/performance_capture.hpp"
 #include "build_revision.hpp"
 
 #include <algorithm>

@@ -19,8 +19,8 @@
 // present_blit — but fix #1716 before trusting this test to report a *new* layout hazard, because
 // today's finding would bury one.
 #include "render_runner.h"
-#include "../frontends/shared/live_renderer.hpp"
-#include "../frontends/shared/present_blit.hpp"
+#include "shared/live/live_renderer.hpp"
+#include "shared/present/present_blit.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include <atomic>
 #include <cstdint>

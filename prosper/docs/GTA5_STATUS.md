@@ -143,7 +143,7 @@ different run whose trajectory changed when a program was declined, and submit o
 run to run on this title (#2516). Read the column as "where this run died", never as a progression.
 
 Filed as **#2690**. `PROSPER_COMPUTE_SKIP_PROGRAM` has always accepted a comma list
-(`frontends/shared/live_compute.cpp:4247`), but every run in this document's history declined only one
+(`frontends/shared/live/live_compute.cpp:4247`), but every run in this document's history declined only one
 program, which cannot reveal a second — it only moves the loss past where most captures stop. With all
 three declined a run reached **400 s** with zero losses, but that run was **capped at 400 s and did not
 finish the route**, so it is not a zero-loss completion and does not close the search. Read the two
@@ -2649,7 +2649,7 @@ use. All three sites (including the diagnostic classification) now use the all-s
 **3 (medium) — the feedback helper was a second, looser copy of "active".** It fell back to the named
 slot-0/1 mask whenever the array mask read zero and never required a defined format, where pass
 grouping falls back only when the array representation is ABSENT and requires base + format + mask.
-Extracted as `frontends/shared/mrt_binding.hpp`, used by both, and tested from a real `DrawItem`.
+Extracted as `frontends/shared/rtt/mrt_binding.hpp`, used by both, and tested from a real `DrawItem`.
 
 **4 (low) — `test_mrt_extent` printed `OK` before the new checks ran.** Third instance in this branch
 of a success signal placed ahead of the work it describes.

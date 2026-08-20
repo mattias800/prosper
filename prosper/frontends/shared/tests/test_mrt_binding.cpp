@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstdint>
 
-#include "mrt_binding.hpp"
+#include "shared/rtt/mrt_binding.hpp"
 
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { \

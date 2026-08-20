@@ -9,7 +9,7 @@
 //
 // Pure predicate, so no renderer, no device and no clock: `contains()` takes the elapsed time as an
 // argument precisely so the latch can be driven backwards, forwards and out of order under test.
-#include "diagnostic_window.hpp"
+#include "shared/diagnostics/diagnostic_window.hpp"
 
 #include <cstdio>
 

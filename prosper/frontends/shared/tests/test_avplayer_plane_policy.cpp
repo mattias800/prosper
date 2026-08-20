@@ -5,7 +5,7 @@
 // resulting picture keeps correct luma, detail and geometry and only its colour collapses onto a
 // single green<->magenta axis, so no draw census, colour count or non-black metric can detect it.
 // The descriptor-level classification is therefore what has to be asserted.
-#include "avplayer_plane_policy.hpp"
+#include "shared/media/avplayer_plane_policy.hpp"
 
 #include "gpu/texture/guest_texture_layout.hpp"
 

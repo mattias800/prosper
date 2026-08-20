@@ -13,7 +13,7 @@
 // Vulkan device, guest or renderer registration is involved. Each arm names the outcome it forbids,
 // and each is written so that flipping the input flips the verdict — a test that cannot show its
 // lever moved proves nothing about the mechanism.
-#include "guest_scanout_present.hpp"
+#include "shared/present/guest_scanout_present.hpp"
 
 #include <cstdio>
 #include <string_view>

@@ -78,7 +78,7 @@ in-bounds, rule out upstream guards). All CLEAN on current master except the edg
 | Guest memory-management HLE | `src/hle/memory/hle_kernel_mem.cpp` | CLEAN — WriteAddress fixed-8B `process_vm_writev`, VirtualQuery clamped, dmem allocator pool-bounded, every `addr+len` guarded |
 | GPU command processor / PM4 | `src/gpu/pm4/command_processor.cpp` | **#1200** SetRegsIndirect `guest_readable` guard; **#1202** WriteData null-src stale-tail `memset` |
 | GPU executor / shader decode | `src/gpu/execute/gpu_executor.cpp` | CLEAN (canonical wrap-safe form throughout); **#1210** diagnostic-dump OOB clamp |
-| Compute dispatch sizing | `frontends/shared/live_compute.cpp` | CLEAN |
+| Compute dispatch sizing | `frontends/shared/live/live_compute.cpp` | CLEAN |
 | RDNA2→SPIR-V recompiler | `src/gpu/recompiler/rdna2_to_spirv.cpp` | CLEAN — literal/branch/register/CFG all upstream-bounded |
 | Tile / detile swizzle | `src/gpu/texture/tile.cpp` | CLEAN — every tiled access guarded `if (tiled + bpe <= tiled_bytes)`; mismatch drops, never OOB |
 | Descriptor decode | `src/gpu/agc/agc_shader_layout.cpp` | CLEAN — see the dimension-clamp section above |
