@@ -55,11 +55,27 @@ BANNER = """<!--
 
 
 def run(args: list[str], repo: pathlib.Path) -> str:
-    out = subprocess.run(
-        ["git", "-C", str(repo)] + args,
-        capture_output=True, text=True, check=True,
+    """Run git, and turn a failure into a usable message rather than a traceback.
+
+    This tool is a CI gate. A Python traceback in a CI log tells the reader that something
+    broke and nothing about what to do; the two failures that actually happen here -- not a
+    repository, and a clone too shallow for a history scan -- both have one-line remedies.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo)] + args, capture_output=True, text=True,
     )
-    return out.stdout
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        hint = ""
+        if "not a git repository" in err:
+            hint = "\n       --repo must point at a git repository (default: this file's repo root)."
+        elif "shallow" in err or "unknown revision" in err:
+            hint = ("\n       A shallow clone has no history to scan. Deepen it first:\n"
+                    "         git fetch --unshallow --filter=blob:none origin <branch>")
+        raise SystemExit(
+            f"error: git {' '.join(args[:3])} ... failed (exit {proc.returncode})\n"
+            f"       {err.splitlines()[0] if err else '(no stderr)'}{hint}")
+    return proc.stdout
 
 
 def tracked_images(repo: pathlib.Path, ref: str) -> set[str]:
@@ -226,11 +242,19 @@ def main() -> int:
     if args.check:
         current = target.read_text() if target.exists() else ""
         if current != text:
+            # Name BOTH sides. --check compares a file on disk against history read from --ref,
+            # and those can legitimately differ (CI deliberately checks a PR branch's copy against
+            # master's images). Reporting only "STALE" sent me chasing a phantom when the real
+            # cause was a working tree that simply predated the file.
+            state = "absent" if not target.exists() else f"{len(current.splitlines())} lines"
             print(
-                f"error: {OUT} is STALE -- it does not match the images in the tree.\n"
-                f"       Fix: python3 prosper/tools/docs/gen_screenshot_feed.py\n"
-                f"       then commit the result.", file=sys.stderr)
-            print(f"{n} image(s) scanned", file=sys.stderr)
+                f"error: {OUT} does not match the images in `{args.ref}`.\n"
+                f"       compared: {target} ({state})\n"
+                f"       against:  {n} image(s) in the tree at `{args.ref}`\n"
+                f"       If those two are meant to describe the same commit, regenerate:\n"
+                f"         python3 prosper/tools/docs/gen_screenshot_feed.py\n"
+                f"       If the file is simply older than `{args.ref}` (a stale checkout), update\n"
+                f"       the checkout first -- this is not a drift.", file=sys.stderr)
             return 1
         print(f"{OUT} is up to date with the tree ({n} images).")
         return 0
