@@ -1,0 +1,197 @@
+# Sonic Frontiers (PPSA03831) -- title screen to gameplay (Cyber Space stage w6d01).
+#
+# Anchors are DISPLAY FLIPS ('f'), not seconds: the guest's own presented-frame counter is
+# boot-speed invariant, and this title runs ~30 flips/s on a CPU-only boot_trace arm against
+# ~3 flips/s on a live 3840x2160 renderer arm, so a wall-clock route cannot serve both.
+#
+# Route shape, and why each step exists (every claim below is measured, see
+# docs/SONIC_FRONTIERS_STATUS.md):
+#
+#   f1100-f1540   Twelve confirms, 40 flips apart, clear the twelve-page boot notice queue
+#                 ("Extras", "Update notification", "Game update", "Update Details", "Update",
+#                 "Additional options", "Action Marks", "New Game+", ...). The queue advances one
+#                 page per FACE-button press; the d-pad does NOT advance it, so directional entries
+#                 here would silently do nothing. The queue is modal over the title screen and is
+#                 what a no-input arm sits behind forever.
+#   f1700-f1940   Five 'up'. With the queue cleared the main-menu cursor rests on "Extras", the
+#                 last of six entries (New Game, Language, Carry over from PlayStation(R)4,
+#                 Copyright, User manual, Extras), so five 'up' land on "New Game" whether or not
+#                 the list wraps. 60 flips apart: a single 4-flip press moves exactly one entry,
+#                 while a long hold auto-repeats and lands somewhere else.
+#   f2100         Confirm "New Game" -> a confirmation dialog opens.
+#   f2300         Answer the dialog.
+#   f2600         -> GameModeOpening: raw/ui/ui_gamemodeopening*.pac and raw/event/scene/ev0020*.
+#   f2900         Skip into the stage -> GameModeStage: raw/ui/ui_gamemodestage*.pac,
+#                 raw/stage/w6d01/w6d01_trr_s*.pac terrain sectors, raw/gedit/w6d01_gedit*.pac.
+#   f3100+        Spare confirms for any further prompt, then left-stick input so the capture shows
+#                 a moving player rather than a paused first frame.
+#
+# The main-menu entry list does not render its text on this build (#2206), so the cursor is moved
+# blind and counted; the cursor bar itself does render and was used to verify the five moves.
+#
+# Fresh-save arms and inherited-save arms are NOT the same route: pass an isolated
+# PROSPER_SAVE0=<private dir> so the notice queue is the measured twelve pages.
+
+# --- boot notice queue: twelve confirms -------------------------------------------------------
+f1100-1103:cross
+f1140-1143:cross
+f1180-1183:cross
+f1220-1223:cross
+f1260-1263:cross
+f1300-1303:cross
+f1340-1343:cross
+f1380-1383:cross
+f1420-1423:cross
+f1460-1463:cross
+f1500-1503:cross
+f1540-1543:cross
+
+# --- main menu: "Extras" -> "New Game" --------------------------------------------------------
+f1700-1703:up
+f1760-1763:up
+f1820-1823:up
+f1880-1883:up
+f1940-1943:up
+
+# --- New Game, its confirmation dialog, the opening, then the stage ---------------------------
+f2100-2103:cross
+f2300-2303:cross
+f2600-2603:cross
+f2900-2903:cross
+f3100-3103:cross
+f3300-3400:cross
+f3600-3700:cross
+f3900-4000:cross
+f4200-4300:cross
+f4500-4600:cross
+f4800-4900:cross
+
+# --- in the stage: hold forward, with a jump every so often, so any capture window lands on a
+# moving player rather than a paused first frame. The blocks continue far past the point where
+# control is handed over because the flip at which the post-cutscene load completes depends on
+# how fast the host streams the stage, not on the route.
+
+f5200-5500:left-stick-up
+f5540-5543:cross
+f5600-5900:left-stick-up
+f5940-5943:cross
+f6000-6300:left-stick-up
+f6340-6343:cross
+f6400-6700:left-stick-up
+f6740-6743:cross
+f6800-7100:left-stick-up
+f7140-7143:cross
+f7200-7500:left-stick-up
+f7540-7543:cross
+f7600-7900:left-stick-up
+f7940-7943:cross
+f8000-8300:left-stick-up
+f8340-8343:cross
+f8400-8700:left-stick-up
+f8740-8743:cross
+f8800-9100:left-stick-up
+f9140-9143:cross
+f9200-9500:left-stick-up
+f9540-9543:cross
+f9600-9900:left-stick-up
+f9940-9943:cross
+f10000-10300:left-stick-up
+f10340-10343:cross
+f10400-10700:left-stick-up
+f10740-10743:cross
+f10800-11100:left-stick-up
+f11140-11143:cross
+f11200-11500:left-stick-up
+f11540-11543:cross
+f11600-11900:left-stick-up
+f11940-11943:cross
+f12000-12300:left-stick-up
+f12340-12343:cross
+f12400-12700:left-stick-up
+f12740-12743:cross
+f12800-13100:left-stick-up
+f13140-13143:cross
+f13200-13500:left-stick-up
+f13540-13543:cross
+f13600-13900:left-stick-up
+f13940-13943:cross
+f14000-14300:left-stick-up
+f14340-14343:cross
+f14400-14700:left-stick-up
+f14740-14743:cross
+f14800-15100:left-stick-up
+f15140-15143:cross
+f15200-15500:left-stick-up
+f15540-15543:cross
+f15600-15900:left-stick-up
+f15940-15943:cross
+f16000-16300:left-stick-up
+f16340-16343:cross
+f16400-16700:left-stick-up
+f16740-16743:cross
+f16800-17100:left-stick-up
+f17140-17143:cross
+f17200-17500:left-stick-up
+f17540-17543:cross
+f17600-17900:left-stick-up
+f17940-17943:cross
+f18000-18300:left-stick-up
+f18340-18343:cross
+f18400-18700:left-stick-up
+f18740-18743:cross
+f18800-19100:left-stick-up
+f19140-19143:cross
+f19200-19500:left-stick-up
+f19540-19543:cross
+f19600-19900:left-stick-up
+f19940-19943:cross
+f20000-20300:left-stick-up
+f20340-20343:cross
+f20400-20700:left-stick-up
+f20740-20743:cross
+f20800-21100:left-stick-up
+f21140-21143:cross
+f21200-21500:left-stick-up
+f21540-21543:cross
+f21600-21900:left-stick-up
+f21940-21943:cross
+f22000-22300:left-stick-up
+f22340-22343:cross
+f22400-22700:left-stick-up
+f22740-22743:cross
+f22800-23100:left-stick-up
+f23140-23143:cross
+f23200-23500:left-stick-up
+f23540-23543:cross
+f23600-23900:left-stick-up
+f23940-23943:cross
+f24000-24300:left-stick-up
+f24340-24343:cross
+f24400-24700:left-stick-up
+f24740-24743:cross
+f24800-25100:left-stick-up
+f25140-25143:cross
+f25200-25500:left-stick-up
+f25540-25543:cross
+f25600-25900:left-stick-up
+f25940-25943:cross
+f26000-26300:left-stick-up
+f26340-26343:cross
+f26400-26700:left-stick-up
+f26740-26743:cross
+f26800-27100:left-stick-up
+f27140-27143:cross
+f27200-27500:left-stick-up
+f27540-27543:cross
+f27600-27900:left-stick-up
+f27940-27943:cross
+f28000-28300:left-stick-up
+f28340-28343:cross
+f28400-28700:left-stick-up
+f28740-28743:cross
+f28800-29100:left-stick-up
+f29140-29143:cross
+f29200-29500:left-stick-up
+f29540-29543:cross
+f29600-29900:left-stick-up
+f29940-29943:cross
