@@ -5,6 +5,7 @@
 #define _GNU_SOURCE   // pthread_getattr_np (bound the PREADLOG/DEEPTRACE stack walk to the real stack)
 #endif
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
@@ -477,22 +478,21 @@ namespace {
     // Host directory backing guest "/savedata0" — the mounted save-data area that
     // sceSaveDataMount3 (hle_service.cpp) reports to the game. One save dir is mounted at a
     // time (DOLL's wrapper umounts id 0 before the next mount); the current mount's host dir
-    // is swapped in here. Root override: PROSPER_SAVE0.
+    // is swapped in here.
+    //
+    // The base is PER TITLE — <PROSPER_SAVE0 or the per-user default>/<TITLE_ID> — because the
+    // subdirectory below it is the GUEST's own dirName and several titles pick the same one
+    // (#2734). It is deliberately NOT cached in a static here: the title component comes from
+    // set_app0_root()'s param.json parse, so a cached base would freeze whichever title happened to
+    // resolve it first, and any later application switch — which today means a test, since
+    // prosper-app boots one title per process — would silently write one title's saves into
+    // another's directory, the exact defect.
     std::mutex g_save0_mx;
     std::string g_save0;   // host dir for the CURRENT /savedata0 mount ("" = nothing mounted)
-    std::string save0_base() {
-        static std::string base;
-        if (base.empty()) {
-            const char* e = getenv("PROSPER_SAVE0");
-            base = e ? e : "/tmp/prosper-savedata0";
-#ifdef _WIN32
-            _mkdir(base.c_str());
-#else
-            ::mkdir(base.c_str(), 0777);
-#endif
-        }
-        return base;
-    }
+    // Never creates anything. A UE4 title probes open-mode several times before it ever creates a
+    // save (see docs/UE4_APR_IOSTORE_BRINGUP.md), and a probe that manufactures an empty directory
+    // for the title makes a later "does this save exist?" answer depend on how often it was asked.
+    std::string save0_base() { return savedata0_dir(); }
     // PROSPER_DENY_SUBSTR: comma-separated substrings; any guest path containing one is
     // redirected to a guaranteed-missing host path, so open/stat fail with ENOENT.
     // Diagnostic knob (off by default) — used to A/B whether the title's boot flow gates on a
@@ -578,7 +578,13 @@ namespace {
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
-        if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) g_app0 = e; }
+        // The documented env spelling of the /app0 root. Route it through set_app0_root() rather
+        // than assigning g_app0 here: that is what runs the single sce_sys/param.json parse, and
+        // everything derived from the application's own declaration hangs off it — the app-param
+        // SKU answers, the add-content inventory, and (since #2734) the per-title save namespace.
+        // Assigning directly left all three unconfigured, so this path silently saved into the
+        // unknown-title namespace while the normal boot path did not.
+        if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) set_app0_root(e); }
         if (deny_path(p)) {
             if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
             return "/prosper-denied" + p;
@@ -825,6 +831,9 @@ SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy po
     bool created = false;
     if (!exists) {
         if (policy == SaveDataMountPolicy::Open) return SaveDataMountOutcome::NotFound;
+        // Only now, on the path that really creates a save, is the per-title directory brought into
+        // existence. mkdir below is a single level, so its parent must already be there.
+        if (savedata0_ensure_dir().empty()) return SaveDataMountOutcome::NotFound;
 #ifdef _WIN32
         created = _mkdir(d.c_str()) == 0;
         if (!created) {

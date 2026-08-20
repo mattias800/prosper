@@ -28,7 +28,6 @@ struct GpuCaptureMetadata {
 inline constexpr const char* kGpuReplayScanoutAddressEnv =
     "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
 inline constexpr const char* kGpuCaptureSave0Env = "PROSPER_SAVE0";
-inline constexpr const char* kGpuCaptureDefaultSave0Root = "/tmp/prosper-savedata0";
 inline constexpr const char* kGpuCaptureResourceProvenanceEnv =
     "PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE";
 
@@ -38,6 +37,22 @@ void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata);
 
 // Capture the effective host root behind guest /savedata0. This is distinct from savedata_dir,
 // which describes the SaveDataMemory API, and is cached independently by the HLE runtime.
+//
+// It records the ROOT, not the per-title directory the guest actually wrote into
+// (<root>/<TITLE_ID>/... since #2734). The entry is stored in renderer_env under the literal name
+// PROSPER_SAVE0 and gpu_replay reports it as that variable, so the value must be one the variable
+// could have held; a per-title directory recorded under that key would name a path that, fed back
+// in, would namespace a second time. It keeps the entry symmetric with metadata.savedata_dir, which
+// is also a root. The directory the guest used is the root plus the running title's id. Note that
+// metadata.title_id does NOT reliably supply that: it is PROSPER_CAPTURE_TITLE, which only a handful
+// of documented recipes set, so a default boot_trace run or an F9 grab records a root and no title.
+// That is master's long-standing behaviour and not a regression -- before #2734 the recorded save
+// root was equally title-less -- but do not read the pair as a complete identification of the save
+// state. Sourcing metadata.title_id from save_title_namespace() when the env var is unset would fix
+// it, and is deliberately left out of the #2734 change as a behaviour change to capture metadata.
+//
+// The root is re-derived through hle/fs/save_paths.hpp rather than restated here: a second copy of
+// the default in this header could disagree with the one the guest actually wrote to.
 void annotate_gpu_capture_save_roots(GpuCaptureMetadata& metadata);
 
 // Parse the replay-only front-buffer identity. Bundle replay updates this value at each captured

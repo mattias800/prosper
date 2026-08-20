@@ -786,6 +786,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_ime PRIVATE prosper_core)
   add_test(NAME savedata_ime COMMAND test_savedata_ime)
 
+  # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
+  # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
+  # application roots over one guest name, because a single-title round trip passes on the broken code.
+  add_executable(test_savedata_title_namespace tests/hle/test_savedata_title_namespace.cpp)
+  target_include_directories(test_savedata_title_namespace PRIVATE tests)
+  target_link_libraries(test_savedata_title_namespace PRIVATE prosper_core)
+  add_test(NAME savedata_title_namespace COMMAND test_savedata_title_namespace)
+
   # libSceIme keyboard API (#186): reports a consistent "no keyboard connected" state (empty resource
   # array + disconnected info, bounds-checked) so the per-frame input poll never reads garbage.
   add_executable(test_ime_keyboard tests/hle/service/test_ime_keyboard.cpp)

@@ -32,6 +32,11 @@ struct AppParamDeclaration {
     // sce_sys/param.json was present and parsed. False means there is no local declaration to answer
     // from at all, and every app-param query must fail rather than invent one.
     bool declared = false;
+    // The application's own titleId, empty when absent or malformed. Published here so that
+    // everything needing to know WHICH title is running -- the add-content content_id cross-check
+    // and the per-title save namespace (hle/fs/save_paths.hpp, #2734) -- reads the one parse rather
+    // than opening param.json a second time and getting a second chance to disagree.
+    std::string title_id;
     // Absent when param.json declares no applicationDrmType, or declares one prosper has no evidence
     // for. Either way the SKU is unknown and the queries fail visibly instead of reporting a value.
     std::optional<AppSkuFlag> sku_flag;
@@ -45,6 +50,12 @@ struct AppParamDeclaration {
 // Published by addcontent_configure_for_app0 from the same single param.json parse the add-content
 // inventory uses. Safe to call from any guest thread.
 AppParamDeclaration app_param_declaration();
+
+// A PS5 application title id as param.json spells it: "PPSA" followed by exactly five digits. Shared
+// so that the add-content authorization check and the save-path namespace cannot drift apart about
+// what counts as a title id -- save_paths.cpp uses it to tell a per-title save directory apart from a
+// leftover guest-chosen slot name in the same root.
+bool valid_title_id(std::string_view value);
 
 enum class AddcontentInventoryState {
     None,       // no dlc_emu.ini: this title has no locally declared add-content

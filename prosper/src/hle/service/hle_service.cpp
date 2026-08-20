@@ -5,6 +5,7 @@
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/service/hle_addcontent.hpp"
+#include "hle/fs/save_paths.hpp"   // per-title save roots (#2734)
 #include "hle/util/hle_json2.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // libkernel error encoding (libSceRandom reject arms)
@@ -3864,32 +3865,45 @@ HLE(s_savedata_txres_del) {
 //   OrbisSaveDataMemoryGet2:  userId@0 [pad@4] data@8(ptr) param@16 icon@24 slotId@32
 namespace {
     std::mutex g_savemem_mx;
-    std::unordered_map<uint64_t, std::vector<uint8_t>> g_savemem;   // key = (userId<<32)|slotId
-    uint64_t savemem_key(int32_t userId, uint32_t slotId) {
-        return ((uint64_t)(uint32_t)userId << 32) | slotId;
+    // The in-process view of the SaveDataMemory slots. Keyed by TITLE as well as (userId, slotId),
+    // because (userId, slotId) is not unique across titles — every Unity title uses user 1, slot 0.
+    //
+    // No shipping frontend boots two titles in one process today: prosper-app's start_guest()
+    // latches g_boot_attempted on the ATTEMPT and routes the second title through
+    // relaunch_with_dump(), i.e. a new process. So this is not fixing a reachable collision; it is
+    // keeping the cache and the on-disk layout partitioned the SAME way, so the cache cannot become
+    // a second source of truth that disagrees with the files. What does exercise it is
+    // test_savedata_title_namespace, which drives two application roots through one process — and a
+    // cache that outlived the title switch would hand title B title A's block while the files were
+    // correctly separated, which is a harder bug to see than the one being fixed.
+    std::unordered_map<std::string, std::vector<uint8_t>> g_savemem;
+    std::string savemem_key(int32_t userId, uint32_t slotId) {
+        char suffix[48];
+        snprintf(suffix, sizeof suffix, "/%d:%u", (int)userId, (unsigned)slotId);
+        return save_title_namespace() + suffix;
     }
     // Host file backing one SaveDataMemory slot, so a save survives a process restart (the API is the
     // ENTIRE save path for the Unity titles — no file Mount — so without this every relaunch looks like
-    // a fresh console and the game restarts from scratch; likely root of #299). Dir: PROSPER_SAVEDATA_DIR
-    // (default /tmp/prosper-savedata-mem), one file per (userId, slotId).
-    std::string savemem_path(int32_t userId, uint32_t slotId) {
-        static const std::string base = [] {
-            const char* e = getenv("PROSPER_SAVEDATA_DIR");
-            std::string b = e ? e : "/tmp/prosper-savedata-mem";
-#ifdef _WIN32
-            _mkdir(b.c_str());
-#else
-            mkdir(b.c_str(), 0777);
-#endif
-            return b;
-        }();
+    // a fresh console and the game restarts from scratch; likely root of #299).
+    //
+    // PER TITLE: <PROSPER_SAVEDATA_DIR or the per-user default>/<TITLE_ID>/savemem_<user>_<slot>.bin.
+    // (userId, slotId) is not unique across titles — every Unity title writes user 1 slot 0 — so a
+    // flat directory made two titles share one save file (#2734). Not cached in a static: the title
+    // component comes from set_app0_root()'s param.json parse, and caching would freeze whichever
+    // title resolved it first. `create` is passed only by the writer, so reading a slot for a title
+    // that has never saved does not manufacture a directory for it.
+    std::string savemem_path(int32_t userId, uint32_t slotId, bool create = false) {
+        const std::string base = create ? savedata_mem_ensure_dir() : savedata_mem_dir();
+        if (base.empty()) return {};
         char name[64];
         snprintf(name, sizeof name, "/savemem_%d_%u.bin", (int)userId, (unsigned)slotId);
         return base + name;
     }
     std::vector<uint8_t> savemem_load(int32_t userId, uint32_t slotId) {
         std::vector<uint8_t> v;
-        if (FILE* f = fopen(savemem_path(userId, slotId).c_str(), "rb")) {
+        const std::string path = savemem_path(userId, slotId);
+        if (path.empty()) return v;
+        if (FILE* f = fopen(path.c_str(), "rb")) {
             fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
             if (n > 0) { v.resize((size_t)n); if (fread(v.data(), 1, (size_t)n, f) != (size_t)n) v.clear(); }
             fclose(f);
@@ -3897,7 +3911,9 @@ namespace {
         return v;
     }
     void savemem_store(int32_t userId, uint32_t slotId, const std::vector<uint8_t>& buf) {
-        if (FILE* f = fopen(savemem_path(userId, slotId).c_str(), "wb")) {
+        const std::string path = savemem_path(userId, slotId, /*create=*/true);
+        if (path.empty()) return;
+        if (FILE* f = fopen(path.c_str(), "wb")) {
             if (!buf.empty()) fwrite(buf.data(), 1, buf.size(), f);
             fclose(f);
         }

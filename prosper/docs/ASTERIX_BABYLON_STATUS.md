@@ -35,9 +35,11 @@ PROSPER_SAVE0=<PRIVATE_SAVE_ROOT> PROSPER_FILELOG=1 \
     --seconds 10 --count 60 --out <OUT> --timeout 700
 ```
 
-`PROSPER_SAVE0` is **not optional discipline** — its default `/tmp/prosper-savedata0` is one flat
-directory shared by every title on the box, with no title id anywhere in the host path
-(`src/hle/fs/hle_file.cpp:814`, `:879`). Another title's save can present as this title's corruption. #2734.
+`PROSPER_SAVE0` gives this arm a private save root, which is still worth doing for a first-boot
+measurement. It is no longer *required* for correctness: since #2734 the host save path carries the
+title id (`<root>/<TITLE_ID>/<dirName>`, `prosper/docs/SAVE_DATA_LAYOUT.md`), so another title's save
+can no longer present as this title's corruption. Note that `PROSPER_SAVE0` is now the ROOT the
+per-title directory is created under, not the directory itself.
 
 ### The progression oracle: Unity scene index == `Media/levelNN`
 
