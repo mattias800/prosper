@@ -1,9 +1,9 @@
-// test_spirv_builder — proves our own SPIR-V emitter (src/gpu/spirv_builder.cpp) produces valid,
+// test_spirv_builder — proves our own SPIR-V emitter (src/gpu/recompiler/spirv_builder.cpp) produces valid,
 // correct, runnable SPIR-V by executing it: build a compute shader (b[i] = a[i]*scale + bias) with
 // the builder, run it on real Vulkan compute over known inputs, and assert the numeric outputs.
 // This is the code-generation foundation for the RDNA2->SPIR-V recompiler, verified end-to-end
 // (emit -> Vulkan accepts it -> numbers are right), and it validated structurally with spirv-val.
-#include "../src/gpu/spirv_builder.hpp"
+#include "gpu/recompiler/spirv_builder.hpp"
 #include "compute_runner.h"
 #include <cstdio>
 #include <cmath>

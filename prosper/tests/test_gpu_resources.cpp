@@ -1,7 +1,7 @@
 // test_gpu_resources — the resource-layer contract: create/track resources, look them up by handle,
 // enforce handle validity. This is the front-half↔back-half integration point (gpu_resources.hpp);
 // the test fixes its behavior so both halves can rely on it as we build the Vulkan backing.
-#include "../src/gpu/gpu_resources.hpp"
+#include "gpu/resources/gpu_resources.hpp"
 #include <cstdio>
 
 using namespace prosper::gpu;

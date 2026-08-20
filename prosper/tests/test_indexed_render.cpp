@@ -10,9 +10,9 @@
 // Case B — indices are actually applied: indices [1,2,3] select the fullscreen triangle stored at VB
 // records 1..3 (record 0 is an off-screen decoy). A path that ignored the indices would draw records
 // 0..2 instead and leave the sampled corners blue.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
-#include "../src/gpu/render_state.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/state/render_state.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>

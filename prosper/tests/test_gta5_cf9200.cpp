@@ -1,8 +1,8 @@
-#include "gpu/gpu_execute.hpp"
-#include "gpu/rdna2_decode.hpp"
-#include "gpu/rdna2_gta5_cf9200_contract.hpp"
-#include "gpu/rdna2_to_spirv.hpp"
-#include "gpu/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gta5_cf9200_fixture.hpp"
 
 #include <algorithm>

@@ -13,9 +13,9 @@
 // rely on the historical coverage broadcast for their own two-channel surfaces.
 #pragma once
 
-#include "gpu/shader_resources.hpp"
-#include "gpu/guest_texture_layout.hpp"
-#include "gpu/tile.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/texture/guest_texture_layout.hpp"
+#include "gpu/texture/tile.hpp"
 
 #include <cstdint>
 #include <vector>

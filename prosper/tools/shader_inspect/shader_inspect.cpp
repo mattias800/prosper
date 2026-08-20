@@ -1,6 +1,6 @@
 // shader_inspect - print the decoded RDNA2 stream and resolved control-flow targets from a raw dump.
-#include "../../src/gpu/rdna2_decode.hpp"
-#include "../../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <algorithm>
 #include <cstdint>

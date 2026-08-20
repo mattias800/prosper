@@ -6,8 +6,8 @@
 // window, pixels checked programmatically. The RDNA2->SPIR-V recompiler will later replace the
 // placeholder shaders; the fixed-function state already comes from the real register translation.
 #include <vulkan/vulkan.h>
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/vk_translate.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/state/vk_translate.hpp"
 #include "spirv_triangle.h"
 #include <cstdio>
 #include <cstdint>

@@ -9,7 +9,7 @@ element order published in any open-source emulator/addrlib, so it is written up
 
 On a real PS5, the GPU's texture unit de-swizzles tiled textures in hardware when a shader samples them.
 prosper runs on a desktop GPU (llvmpipe/Vulkan) with a *different* native layout, so we must de-swizzle
-PS5-tiled bytes into linear ourselves before upload (`src/gpu/tile.cpp`). If that de-swizzle is even
+PS5-tiled bytes into linear ourselves before upload (`src/gpu/texture/tile.cpp`). If that de-swizzle is even
 slightly wrong, pixels land in *almost* the right place in a **regular repeating pattern**.
 
 Our previous order was a plain "Y in the low bit" Morton (`[y0,x0,y1,x1,y2,x2,y3,x3,y4,x4]`). It got the
@@ -110,7 +110,7 @@ term. Mixing the two sent this investigation down a long detour.
 
 ## Where it lives
 
-`src/gpu/tile.cpp` → `sw4kb_morton()`. Golden asserts in `tests/test_tile.cpp` (`gpu_surface_detile`).
+`src/gpu/texture/tile.cpp` → `sw4kb_morton()`. Golden asserts in `tests/test_tile.cpp` (`gpu_surface_detile`).
 Diagnostics: `PROSPER_DUMP_RAWTILE`, `PROSPER_DUMP_ATLAS`, and `deswizzle_sweep.py` (offline order sweep).
 
 Refs: #118 (dither), #102 (missing text — same root).

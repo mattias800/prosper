@@ -3,7 +3,7 @@
 // host C library. Registered by NID so the loader binds imports directly to them.
 #include "dispatch.hpp"
 #include "nid.hpp"
-#include "gpu/gpu_timeline.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>

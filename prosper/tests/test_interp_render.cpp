@@ -7,7 +7,7 @@
 // triangle; the PS reads attr0.x and writes it to the red channel. A working interpolation therefore
 // produces a red GRADIENT (min != max across the viewport); a broken/flat path would be uniform. Green
 // and blue stay ~0, proving the output is the interpolated attribute, not garbage.
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "render_runner.h"
 #include <algorithm>
 #include <cstdio>

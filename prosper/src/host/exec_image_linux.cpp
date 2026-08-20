@@ -955,7 +955,7 @@ namespace {
         }
     }
 
-    // GPU write-attribution ring scanner (src/gpu/command_processor.cpp). Weak: tools that link
+    // GPU write-attribution ring scanner (src/gpu/pm4/command_processor.cpp). Weak: tools that link
     // the host exec image without the gpu lib get a null and skip the scan.
     extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
         __attribute__((weak));

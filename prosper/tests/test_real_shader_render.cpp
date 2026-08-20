@@ -13,7 +13,7 @@
 // which is exactly the class the boot wall is stuck on. We render a real one where available, pairing
 // with a minimal synthetic partner only if the game lacks a recompilable shader of that stage.
 #include "../src/self/module.hpp"
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdlib>

@@ -1,5 +1,5 @@
-#include "../src/gpu/gpu_timeline.hpp"
-#include "../src/gpu/gpu_capture.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
+#include "gpu/capture/gpu_capture.hpp"
 #include "test_scratch.h"
 
 #include <cstdio>

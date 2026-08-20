@@ -4,9 +4,9 @@
 // color that is impossible unless both draws hit the same accumulating target (a fresh clear per draw
 // would leave only the last draw's green). This exercises the multi-draw spine independently of the
 // game's per-draw register-snapshot resolution.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "render_runner.h"
 #include <algorithm>
 #include <cstdio>

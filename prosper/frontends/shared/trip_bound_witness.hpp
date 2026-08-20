@@ -4,8 +4,8 @@
 // Header-only and separate from live_compute.cpp so the contract that matters here -- that guest GDS
 // is byte-identical after an instrumented dispatch -- can be asserted by a test instead of resting on
 // a reading of the code. See tests/test_cfg_trip_bound.cpp.
-#include "gpu/gpu_execute.hpp"
-#include "gpu/rdna2_to_spirv.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <cstdint>
 #include <cstdio>

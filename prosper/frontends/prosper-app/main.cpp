@@ -14,10 +14,10 @@
 // Real game boots normally adopt the renderer's Vulkan device and pass its front image directly to
 // the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
 // two-device path, where frames cross as shared immutable CPU pixels.
-#include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
-#include "gpu/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
-#include "gpu/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
-#include "gpu/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
+#include "gpu/present/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
+#include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
+#include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
+#include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips

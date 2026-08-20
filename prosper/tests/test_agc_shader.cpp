@@ -1,8 +1,8 @@
 // test_agc_shader -- focused guards for sceAgcCreateShader's guest-visible side effects.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/gpu_capture.hpp"
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

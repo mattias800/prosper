@@ -9,10 +9,10 @@
 //   v_fma_f32 v0, v0, v3, v1  ; v0 = v0*a3 + a1
 //   s_endpgm
 // => out = ((a0+a1)*a2)*a3 + a1
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/rdna2_decode.hpp"
-#include "../src/gpu/agc_shader_layout.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "compute_runner.h"
 #include "gta5_compute_cfg_fixture.hpp"
 #include <algorithm>

@@ -2,8 +2,8 @@
 // Vulkan-ready pipeline state. Pure (no Vulkan), so it runs on every host. Inputs are chosen so the
 // RDNA2->Vulkan mappings are NON-identity (e.g. RDNA2 triangle-strip=6 -> VK topology 4; DstColor
 // blend=8 -> VK DST_COLOR=4; Min comb=2 -> VK MIN=3) — proving translation, not passthrough.
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/vk_translate.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/state/vk_translate.hpp"
 #include <array>
 #include <cstdio>
 #include <utility>

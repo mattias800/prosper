@@ -8,7 +8,7 @@
 
 **Purpose.** Unblock the format/descriptor-dependent shader memory instructions — `s_buffer_load_*`
 (multi-buffer uniforms), `buffer_load_format_*` (vertex fetch), and `image_sample`/`image_load`
-(textures) — *correctly*, without guessing formats. The seam is `src/gpu/shader_resources.hpp`.
+(textures) — *correctly*, without guessing formats. The seam is `src/gpu/resources/shader_resources.hpp`.
 
 ## Why a contract (the core problem)
 

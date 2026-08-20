@@ -42,7 +42,7 @@ blockIndex = (y / blockH) * ceil(pitch / blockW) + (x / blockW)
   (`ADDR_BIT_SETTING`; the z/slice and s/sample masks vanish for 2D 1-sample). The low
   `log2(bpe)` bits are zero (byte-within-element).
 - The offset is XOR-separable: `off(x,y) = fx(x) ^ fy(y)` — prosper precomputes `fx[]`/`fy[]`
-  per row/column (`src/gpu/tile.cpp: sw64kb_copy`).
+  per row/column (`src/gpu/texture/tile.cpp: sw64kb_copy`).
 
 ### SW_64KB_S (tile_mode 9) — element order per bpe
 
@@ -67,7 +67,7 @@ Same block layout; the micro-tile is display-ordered, and offset bits 8..(8+log2
 **pipe bits**: `bit(8+i) = x(3+i) ^ y(3+i) ^ z(...)` style XOR terms (z = 0 for 2D). E.g. at 4 bpe
 with 8 pipes: bits 8..10 = `x3^y3, x4^y4, x5^y5`, then bit 11 = `x3`, 12 = `y4`, 13 = `x5`,
 14 = `y6`, 15 = `x6`. The full table for pipes ∈ {1..64} × bpe ∈ {1..16} is in
-`src/gpu/tile.cpp: kSw64kRX`.
+`src/gpu/texture/tile.cpp: kSw64kRX`.
 
 The **pipe count is the one free parameter** (fixed PS5 hardware, not publicly documented).
 Default: **16 pipes** — PS5's Oberon is Navi10-class (36-40 CU, 256-bit GDDR6, 64 ROPs / 16 RBs),
@@ -113,7 +113,7 @@ replay uses the same volume footprint. CONFIDENCE: HIGH for the observed 16-pipe
 
 ## Where it lives
 
-`src/gpu/tile.cpp` — `kSw64kS` / `kSw64kRX` tables + `sw64kb_copy` walk; dispatched from
+`src/gpu/texture/tile.cpp` — `kSw64kS` / `kSw64kRX` tables + `sw64kb_copy` walk; dispatched from
 `tile_mode_is_tiled` / `tiled_surface_bytes` / `detile_surface` / `tile_surface` /
 `tiled_elements_bytes` / `detile_elements`. The SW_4KB_S path is untouched (The Messenger
 regression-verified). Tests: `tests/test_tile.cpp` (round-trips at all 5 element sizes for both

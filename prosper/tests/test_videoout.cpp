@@ -3,8 +3,8 @@
 // (swapchain scaffolding) must record the surface the game set up. Drives the functions through the
 // NID registry exactly as the guest does, then asserts the reported display + recorded buffers.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/videoout_present.hpp"
-#include "../src/gpu/tile.hpp"              // tile/detile round trip for the flipped-buffer image
+#include "gpu/present/videoout_present.hpp"
+#include "gpu/texture/tile.hpp"              // tile/detile round trip for the flipped-buffer image
 #include "../src/host/guest_memory_map.hpp" // the registered-mapping proof for the padded read
 #include "../src/host/precise_sleep.hpp"    // #1765: which primitive WaitVblank actually waited on
 #include <algorithm>

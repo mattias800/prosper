@@ -21,7 +21,7 @@
 #include "render_runner.h"
 #include "../frontends/shared/live_renderer.hpp"
 #include "../frontends/shared/present_blit.hpp"
-#include "../src/gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>

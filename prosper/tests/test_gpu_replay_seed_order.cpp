@@ -1,5 +1,5 @@
-#include "../src/gpu/gpu_capture.hpp"
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "test_scratch.h"
 
 #include <algorithm>

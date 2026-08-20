@@ -11,13 +11,13 @@
 #include "dispatch.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle_kernel_time.hpp"
-#include "gpu/pm4_registers.hpp"
-#include "gpu/command_processor.hpp"
-#include "gpu/pm4_decode.hpp"
-#include "gpu/gpu_execute.hpp"
-#include "gpu/gpu_timeline.hpp"
-#include "gpu/videoout_present.hpp"
-#include "gpu/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
+#include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
+#include "gpu/present/videoout_present.hpp"
+#include "gpu/execute/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

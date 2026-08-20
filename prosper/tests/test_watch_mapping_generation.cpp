@@ -59,7 +59,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include "host/guest_memory_map.hpp"
 
 // Armed by the AGC fence builder in production; called directly here because the arm's mprotect is

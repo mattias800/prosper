@@ -79,7 +79,7 @@ V#/T#/S# through that table: `MIMG`, `MUBUF` and `MTBUF` in every stage, and add
 passes `allow_smem = true`, so constant-buffer loads are fine there — but compute image and buffer ops
 still need the table.
 
-The gates live in `emit_alu` in `src/gpu/rdna2_to_spirv.cpp` (MIMG rejects on `!allow_smem || !rt`,
+The gates live in `emit_alu` in `src/gpu/recompiler/rdna2_to_spirv.cpp` (MIMG rejects on `!allow_smem || !rt`,
 SMEM on `!allow_smem`); the per-stage `allow_smem` values are set by `recompile_fragment_impl` and
 `recompile_vertex_impl` (`rt != nullptr`) versus `recompile_compute` (`true`). Those functions are named
 rather than cited by line because line numbers drift — grep the names.

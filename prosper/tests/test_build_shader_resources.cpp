@@ -3,8 +3,8 @@
 // places real V# descriptors in the user-data SGPR block, and asserts build_shader_resources decodes
 // base/stride/size/format and assigns provenance (srt_offset) + bindings — the contract the recompiler
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
-#include "../src/gpu/agc_shader_layout.hpp"
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/agc/agc_shader_layout.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "gpu/gpu_capture.hpp"
-#include "gpu/shader_resources.hpp"
-#include "gpu/tile.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/texture/tile.hpp"
 
 #include <algorithm>
 #include <cmath>

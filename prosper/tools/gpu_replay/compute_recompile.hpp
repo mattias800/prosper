@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gpu/gpu_capture.hpp"
+#include "gpu/capture/gpu_capture.hpp"
 
 #include <algorithm>
 

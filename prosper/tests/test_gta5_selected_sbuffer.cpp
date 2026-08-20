@@ -1,7 +1,7 @@
-#include "gpu/gpu_execute.hpp"
-#include "gpu/rdna2_gta5_compute_contracts.hpp"
-#include "gpu/rdna2_to_spirv.hpp"
-#include "gpu/shader_resources.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <array>
 #include <cstdint>

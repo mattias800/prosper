@@ -8,8 +8,8 @@
 // dref 0.5, texels darker than 0.5 pass (1.0) and brighter texels fail (0.0). Both S# filter paths
 // are covered: NEAREST remains a single comparison, while LINEAR compare-before-filter PCF produces
 // a fractional 0.5 result at the boundary between passing and failing texels (#1394).
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdlib>

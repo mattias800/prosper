@@ -4,7 +4,7 @@
 // assembled by llvm-mc for gfx1030, recompiled to SPIR-V by recompile_vertex/recompile_fragment,
 // and run through a real Vulkan pipeline. The fullscreen triangle covers the whole viewport, so we
 // assert every sampled pixel is GREEN — proving RDNA2 vertex+pixel -> our SPIR-V -> rendered frame.
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>

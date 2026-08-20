@@ -16,8 +16,8 @@
 // is the one that fails on the unpatched notifier, so the test proves the format gap rather than
 // the general path. No Vulkan device is required: the persistent-target cache is seeded directly,
 // exactly as tests/test_shared_vulkan_device.cpp already does for the same restore contract.
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/gpu_capture.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/gpu_capture.hpp"
 #include "render_runner.h"
 #include "../frontends/shared/live_renderer.hpp"
 #include "../frontends/shared/live_target_format.hpp"

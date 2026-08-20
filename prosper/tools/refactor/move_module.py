@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""move_module.py -- relocate source modules into folders, mechanically.
+
+A 116k-line restructure cannot be hand-edited, and hand-moving is how this project's recorded traps
+happen: a whole-file `git checkout` that silently reverts another lane's edits, and "clean merge,
+broken file", where two branches both merge cleanly into something wrong. So the moves run through
+this, and the diff a reviewer reads is `git mv` plus include rewrites -- never retyped code.
+
+What it does, for each module NAME assigned to folder F under a root R (default prosper/src/gpu):
+
+  1. `git mv R/NAME.{cpp,hpp,h}` -> `R/F/NAME.{cpp,hpp,h}`, preserving history.
+  2. Rewrites every `#include` of those headers, repo-wide, into ONE canonical form.
+  3. Rewrites the paths in CMakeLists.txt.
+
+The canonical include form is `gpu/F/NAME.hpp`, i.e. relative to `src`, which `prosper_core` puts on
+the include path (`target_include_directories(prosper_core PUBLIC src)`). That form resolves
+identically from src/gpu, frontends/, tools/ and tests/, so a file can move again later without
+touching its consumers' spelling. Bare same-directory includes (`"NAME.hpp"`) stop working the moment
+a file moves into a subfolder, which is exactly why they are normalised away rather than patched.
+
+VERIFICATION IS NOT THIS TOOL'S JOB, and that is deliberate. It reports what it changed; the build and
+the test suite decide whether it was right. A pure move has two independent checks available --
+`verify_pure_move.py` for textual identity and ctest for behavioural identity -- and neither depends
+on anyone reading a large diff carefully.
+
+  # dry run first, always
+  python3 prosper/tools/refactor/move_module.py --plan prosper/tools/refactor/gpu_layout.txt --dry-run
+  python3 prosper/tools/refactor/move_module.py --plan prosper/tools/refactor/gpu_layout.txt
+
+A plan file is `folder: name name name`, one group per line, `#` comments ignored.
+"""
+
+import argparse
+import pathlib
+import re
+import subprocess
+import sys
+
+SUFFIXES = (".cpp", ".hpp", ".h")
+
+
+def repo_root() -> pathlib.Path:
+    out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True, check=True)
+    return pathlib.Path(out.stdout.strip())
+
+
+def read_plan(path: pathlib.Path) -> dict[str, str]:
+    """folder -> [names] flattened to name -> folder, rejecting duplicates loudly."""
+    assignment: dict[str, str] = {}
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" not in line:
+            sys.exit(f"{path}:{lineno}: expected 'folder: name name', got {raw!r}")
+        folder, names = line.split(":", 1)
+        for name in names.split():
+            if name in assignment:
+                sys.exit(f"{path}:{lineno}: {name} already assigned to {assignment[name]}")
+            assignment[name] = folder.strip()
+    return assignment
+
+
+def tracked_text_files(root: pathlib.Path, keep: tuple[str, ...]) -> list[pathlib.Path]:
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True)
+    return [root / p for p in out.stdout.decode().split("\0")
+            if p and p.endswith(keep)]
+
+
+SOURCE_SUFFIXES = (".cpp", ".hpp", ".h")
+# The path pass reaches further than the include pass on purpose: the ledgers it must keep honest
+# are .txt and .py, and the citations it must keep resolvable are .md.
+CITING_SUFFIXES = SOURCE_SUFFIXES + (".txt", ".cmake", ".md", ".py", ".ps1", ".json", ".yml", ".yaml")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--plan", required=True, type=pathlib.Path)
+    ap.add_argument("--source-root", default="prosper/src/gpu",
+                    help="directory the modules currently live in")
+    ap.add_argument("--include-prefix", default="gpu",
+                    help="canonical include prefix, relative to the include path root")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--paths-only", action="store_true",
+                    help="skip the git mv; rewrite includes and path citations for files already "
+                         "moved. Exists because the path-citation pass was added after a move had "
+                         "already landed, and re-running the whole tool would have found nothing "
+                         "to move and therefore nothing to rewrite.")
+    args = ap.parse_args()
+
+    root = repo_root()
+    src_root = root / args.source_root
+    if not src_root.is_dir():
+        sys.exit(f"no such directory: {src_root}")
+
+    assignment = read_plan(args.plan)
+
+    # Only move what exists; report the rest rather than silently doing nothing, because a typo'd
+    # module name would otherwise look like a successful no-op.
+    moves: list[tuple[pathlib.Path, pathlib.Path]] = []
+    missing: list[str] = []
+    for name, folder in sorted(assignment.items()):
+        found = False
+        for s in SUFFIXES:
+            here, there = src_root / f"{name}{s}", src_root / folder / f"{name}{s}"
+            if here.exists():
+                moves.append((here, there))
+                found = True
+            elif args.paths_only and there.exists():
+                moves.append((here, there))   # already moved; the pair is still what rewrites need
+                found = True
+        if not found:
+            missing.append(name)
+    if missing:
+        print(f"  WARNING {len(missing)} module(s) in the plan do not exist: {' '.join(missing)}")
+
+    header_names = {p.name for p, _ in moves if p.suffix in (".hpp", ".h")}
+    include_target = {p.name: f"{args.include_prefix}/{assignment[p.stem]}/{p.name}"
+                      for p, _ in moves if p.suffix in (".hpp", ".h")}
+
+    print(f"  {len(moves)} file(s) to move into {len(set(assignment.values()))} folder(s)")
+
+    # --- 1. the moves ---------------------------------------------------------------------------
+    for old, new in moves:
+        if args.dry_run or args.paths_only:
+            print(f"    git mv {old.relative_to(root)} -> {new.relative_to(root)}")
+            continue
+        new.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "mv", str(old.relative_to(root)), str(new.relative_to(root))],
+                       cwd=root, check=True)
+
+    # --- 2. include rewrites --------------------------------------------------------------------
+    # Match any existing spelling of the header -- bare, `gpu/X`, `../src/gpu/X`, deeper relatives --
+    # and collapse them all to the canonical form. Anchoring on the basename is what makes this
+    # independent of how many `../` a given consumer happened to use.
+    include_re = re.compile(r'#include\s+"([^"]*?)([A-Za-z0-9_]+\.(?:hpp|h))"')
+    rewritten_files = 0
+    rewritten_lines = 0
+    for path in tracked_text_files(root, SOURCE_SUFFIXES):
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+
+        def replace(m: re.Match) -> str:
+            nonlocal rewritten_lines
+            prefix, base = m.group(1), m.group(2)
+            if base not in header_names:
+                return m.group(0)
+            canonical = include_target[base]
+            if prefix + base == canonical:
+                return m.group(0)
+            rewritten_lines += 1
+            return f'#include "{canonical}"'
+
+        new_text = include_re.sub(replace, text)
+        if new_text != text:
+            rewritten_files += 1
+            if not args.dry_run:
+                path.write_text(new_text)
+    print(f"  {rewritten_lines} include(s) rewritten across {rewritten_files} file(s)")
+
+    # --- 3. path citations ----------------------------------------------------------------------
+    # A move invalidates far more than `#include` lines, and the remainder is where a move goes
+    # quietly wrong rather than loudly. The repository carries PATH-KEYED LEDGERS whose keys are
+    # `src/gpu/NAME.cpp` -- check_ascii_output.py's quarantine and tools/env/diag_gate_baseline.txt.
+    # A stale key does not error. It reads as "that file has no findings", so the ledger silently
+    # stops describing the tree it exists to describe, which is the precise failure both gates were
+    # built to prevent. (Measured: this restructure orphaned 7 quarantine rows and 34 baseline rows.)
+    # Docs and code comments that cite a moved file are the same defect with a slower fuse.
+    #
+    # `\b` after the extension is what separates `.h` from the `.h` inside `.hpp`: in
+    # `gpu_execute.hpp` that `h` is followed by `p`, both word characters, so no boundary exists and
+    # no match is made. Anchoring on the TAIL means a `prosper/`-prefixed citation is rewritten by
+    # the same rule, and so is a CMake source list -- which is why this replaces the CMake-only pass
+    # it grew out of rather than sitting beside it.
+    path_rules = [(re.compile(re.escape(str(old.relative_to(root / "prosper"))) + r"\b"),
+                   str(new.relative_to(root / "prosper")))
+                  for old, new in moves]
+    path_files = 0
+    path_edits = 0
+    for path in tracked_text_files(root, CITING_SUFFIXES):
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        new_text, edits = text, 0
+        for rx, repl in path_rules:
+            new_text, n = rx.subn(repl, new_text)
+            edits += n
+        if edits:
+            path_files += 1
+            path_edits += edits
+            if not args.dry_run:
+                path.write_text(new_text)
+    print(f"  {path_edits} path citation(s) rewritten across {path_files} file(s)")
+
+    if args.dry_run:
+        print("  (dry run -- nothing written)")
+    else:
+        print("  now BUILD and run ctest; this tool does not verify its own work")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

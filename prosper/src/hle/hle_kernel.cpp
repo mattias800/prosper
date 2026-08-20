@@ -21,8 +21,8 @@
 #include "pthread_slot.hpp"   // #2596: the two guest-slot resolvers are defined here
 #include "sync_futex.hpp"
 #include "sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
-#include "../gpu/mb3_freelist.hpp"
-#include "../gpu/gpu_execute.hpp"   // gpu::guest_writable — validate guest out-pointers (#1963)
+#include "gpu/execute/mb3_freelist.hpp"
+#include "gpu/execute/gpu_execute.hpp"   // gpu::guest_writable — validate guest out-pointers (#1963)
 #include "../host/exec_image.hpp"
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t

@@ -1,4 +1,4 @@
-#include "gpu/compute_parent_walk.hpp"
+#include "gpu/diagnostics/compute_parent_walk.hpp"
 
 #include <array>
 #include <cstdio>

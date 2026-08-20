@@ -1068,7 +1068,7 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
 // Fire the registered EOP events — called when a submit completes. Posts TriggerEvent(ident=id,
 // filter=GraphicsCore, data=id, udata) to each registered equeue, matching shadPS4's IRQ handler.
 // Inert if none registered.
-// GPU pipe-drain completion-write drain (src/gpu/command_processor.cpp, #312): an EOP EVENT must
+// GPU pipe-drain completion-write drain (src/gpu/pm4/command_processor.cpp, #312): an EOP EVENT must
 // never overtake its submit's fence/label WRITES — drain the write queue before posting. Weak so
 // binaries that link the kernel HLE without the gpu lib still link.
 extern "C" void prosper_gpu_drain_completion_writes() __attribute__((weak));

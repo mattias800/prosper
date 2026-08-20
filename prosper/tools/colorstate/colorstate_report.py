@@ -4,7 +4,7 @@ what colour state?
 
 (Suppression is the guest mask, not CB_COLOR_CONTROL.MODE -- see #1724.)
 `PROSPER_COLORSTATETRACE=1|all|WxH` makes the live backend emit one raw-to-resolved
-colour/depth record per matching draw (see `prosper/src/gpu/gpu_execute.hpp`). On a
+colour/depth record per matching draw (see `prosper/src/gpu/execute/gpu_execute.hpp`). On a
 4K title that is millions of lines, which is unreadable by hand. This tool answers
 the questions those lines exist to answer:
 

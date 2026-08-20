@@ -11,8 +11,8 @@
 // The vertex buffer holds a fullscreen triangle {(-1,-1),(3,-1),(-1,3)}, so a correct fetch covers the
 // whole viewport -> every pixel green. A broken/empty fetch collapses the triangle to the origin ->
 // the frame stays blue (clear). Green-everywhere therefore proves the fetch delivered real data.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>

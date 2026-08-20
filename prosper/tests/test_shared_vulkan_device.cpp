@@ -5,7 +5,7 @@
 // leaves every other test green while the optimization silently reverts to two devices and the
 // host round trip it exists to remove. The published handles must also be the renderer's own, since
 // adopting a different device would be worse than not adopting at all.
-#include "../src/gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include "render_runner.h"
 #include "../frontends/shared/live_renderer.hpp"
 #include <string>
