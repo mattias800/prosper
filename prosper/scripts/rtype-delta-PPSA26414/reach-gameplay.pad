@@ -1,9 +1,17 @@
 # R-Type Delta: HD Boosted (PPSA26414) -- reach stage 1 gameplay.
 #
-# The timeline below was MEASURED on 2026-08-20 (tools/screenshot, page cache evicted with
-# tools/dropcache.py, unmodified binary, unmodified guest). Its t=1..82 s menu phase is byte-identical
-# to explore-v2.pad, which is the file those runs used; what this file adds is the tail from t=86 s,
-# a 1 s Cross cadence for stage 1 rather than v2's 3 s menu cadence.
+# MEASURED on 2026-08-20 (tools/screenshot, page cache evicted with tools/dropcache.py, unmodified
+# binary, unmodified guest). THIS FILE was run twice back to back and reached stage 1 both times --
+# 60 samples each, 45 and 46 distinct frames over the samples at t >= 30 s, peak 2,073,478 and
+# 2,073,475 non-black pixels, five scene modules loaded ending in st1r9_Release.prx. The last frame of
+# run A is the R-9 over the city with the stage HUD ("2 BEAM", charge gauge, score); run B was a few
+# seconds earlier in the same stage, on its READY banner.
+#
+# BOTH VALIDATION RUNS WERE ON 27dfd713, NOT ON MASTER. On master the same route reaches the same
+# place in the guest and prosper draws none of it (#2783), so the route can be validated end to end
+# only on a build from before that regression. The timeline below is from master runs of
+# explore-v2.pad, with which this file's t=1..82 s menu phase is byte-identical; what this file adds
+# is the tail from t=86 s, a 1 s Cross cadence for stage 1 rather than v2's 3 s menu cadence.
 #
 # The title's own module loads are the progress oracle -- the shell loads one PRX per scene from
 # /app0/prx and PROSPER_MODLOG=1 names each one:

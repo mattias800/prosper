@@ -6,7 +6,7 @@ seconds, `f` is guest flips, `p` is pad reads).
 
 | file | what it is |
 | --- | --- |
-| `reach-gameplay.pad` | the route. OPTIONS clears the title screen, then Cross walks the pilot-registration flow, the ship / Force-device select and into stage 1. |
+| `reach-gameplay.pad` | the route. OPTIONS clears the title screen, then Cross walks the pilot-registration flow, the ship / Force-device select and into stage 1. Run **twice** back to back on `27dfd713`; both runs reached stage 1 (45 and 46 distinct frames over the samples at t ≥ 30 s, peak 2,073,478 / 2,073,475 non-black pixels, five scene modules ending in `st1r9_Release.prx`). Both validation runs are on `27dfd713` and **not** on master, because on master #2783 draws none of it. The checked-in `assets/screenshots/rtype-delta-stage1-gameplay.png` is from the `explore-v2.pad` arm on `83e3383a`, not from these two runs — its commit caption names that head, and both heads are simply pre-#2783 builds. |
 | `neutral.pad` | the matched **neutral-input control**. Delivers nothing inside any bounded run, but keeps a route configured so the arm differs from `reach-gameplay.pad` only in the buttons. |
 | `explore-v1.pad`, `explore-v2.pad` | the two probes the route was derived from. Both were **run**, and each header records what its run measured. |
 
