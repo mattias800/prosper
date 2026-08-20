@@ -176,6 +176,14 @@ if(Python3_Interpreter_FOUND)
   # test reads the produced bytes at their gABI offsets; nothing else can see this class of bug.
   add_test(NAME il2cpp_prx_to_elf_header
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/il2cpp/test_prx_to_elf.py")
+  # resolve.py's other half: the nearest-preceding lookup that turns an address into a method NAME.
+  # Every way it can be wrong is silent -- a window off by one, the bisect tie rule, or a dropped
+  # record filter each yield a plausible name rather than an error, and that name is what a reader
+  # trusts to place a breakpoint. The window arms sit exactly ON the 0x8000 edge for that reason:
+  # an arm a byte outside it passes whether the comparison is `<` or `<=`, which is how the first
+  # version of this file reported a green boundary test it could not actually fail (#2526).
+  add_test(NAME il2cpp_resolve_lookup
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/il2cpp/test_il2cpp_tools.py")
   # hle_calls decides, per run, whether a reader should TRUST an entire measurement -- a nine-state
   # verdict machine whose most consequential branch is VOID vs VIOLATED ("this run cannot say" vs
   # "distrust every value in it"). It had no test at all, because hle_calls_gdb.py does `import gdb`
