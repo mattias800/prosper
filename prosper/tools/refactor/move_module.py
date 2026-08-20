@@ -271,7 +271,7 @@ def main() -> int:
 
         new_text = rel_re.sub(fix, text)
         if new_text != text:
-            new_write_exact(path, new_text)
+            write_exact(new_path, new_text)
     print(f"  {fixed_rel} relative include(s) inside moved files re-anchored to src")
     if unresolved:
         print(f"  WARNING {len(unresolved)} relative include(s) could not be resolved and were left "

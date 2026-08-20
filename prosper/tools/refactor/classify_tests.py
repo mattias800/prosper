@@ -36,7 +36,10 @@ import re
 import subprocess
 import sys
 
-PREFIXES = ("gpu", "hle", "host", "shared", "self", "loader")
+# Every subsystem directory, including the two a hand-written list kept missing. An include
+# of an unlisted subsystem is not an error here -- it is simply not counted, so the omission
+# shows up as a test that looks like it has no evidence.
+PREFIXES = ("gpu", "hle", "host", "shared", "self", "loader", "diagnostics", "input")
 # A folder-qualified project include: subsystem/folder/header.
 INC = re.compile(r'#include\s+"(' + "|".join(PREFIXES) + r')/([^/"]+)/([^"]+)"')
 # A subsystem that is still flat (src/self, src/loader) has no folder component. Classified at
@@ -70,8 +73,19 @@ def is_fixture(name: str) -> bool:
             or (name.endswith((".h", ".hpp")) and not name.startswith("test_")))
 
 
-def classify(texts: dict[str, str], depth: int = 2, rival_ratio: float = 0.85):
-    """Returns (assignment, ambiguous, unclassified). Pure, so --selftest can drive it."""
+def classify(texts: dict[str, str], depth: int = 2, rival_ratio: float = 0.85,
+             header_home: dict[str, str] | None = None):
+    """Returns (assignment, ambiguous, unclassified). Pure, so --selftest can drive it.
+
+    HEADER_HOME maps a module stem to the folder its header lives in, and takes precedence over
+    everything below. `test_command_processor.cpp` is a test OF `command_processor.hpp`; that is a
+    statement by the person who named the file, and it beats any amount of inference from which
+    other headers the test happens to include. Frequency analysis is the fallback for tests whose
+    name matches no module -- which is most of them, but not the ones it was getting wrong: a
+    review measured 13 of 45 name-matched tests filed away from their own header's folder, because
+    a single subject header was outvoted by incidental ones.
+    """
+    header_home = header_home or {}
     df: collections.Counter = collections.Counter()
     for name, text in texts.items():
         if is_fixture(name):
@@ -93,6 +107,9 @@ def classify(texts: dict[str, str], depth: int = 2, rival_ratio: float = 0.85):
         stem = name.rsplit(".", 1)[0]
         if is_fixture(name):
             assignment[stem] = "fixtures"
+            continue
+        if stem.startswith("test_") and stem[len("test_"):] in header_home:
+            assignment[stem] = header_home[stem[len("test_"):]]
             continue
         ev = evidence(text)
         if not ev:
@@ -183,6 +200,13 @@ SELFTESTS = [
      {"gta5_x_fixture": "fixtures", "compute_runner": "fixtures"}),
 ]
 
+SELFTESTS.append(
+    ("a test named after a module is filed with that module, outvoted or not",
+     _corpus({"test_command_processor.cpp":
+              '#include "gpu/timeline/a.hpp"\n#include "gpu/timeline/b.hpp"\n'
+              '#include "gpu/timeline/c.hpp"\n#include "gpu/pm4/command_processor.hpp"\n'}),
+     {"test_command_processor": "gpu/pm4"}))
+
 NEGATIVE = [
     ("a ubiquitous header never decides a folder on its own",
      {f"test_{i}.cpp": '#include "hle/dispatch/dispatch.hpp"\n' for i in range(10)},
@@ -194,8 +218,9 @@ NEGATIVE = [
 
 def selftest() -> int:
     bad = 0
+    home = {"command_processor": "gpu/pm4"}
     for name, texts, expected in SELFTESTS:
-        got, _amb, _un = classify(texts)
+        got, _amb, _un = classify(texts, header_home=home)
         for stem, want in expected.items():
             if got.get(stem) != want:
                 print(f"  [FAIL] {name}: {stem} -> {got.get(stem)!r}, expected {want!r}")
@@ -243,7 +268,20 @@ def main() -> int:
         sys.exit(f"refused: {len(files) - len(texts)} duplicate basename(s) under {tdir}; the plan "
                  f"is keyed by module name and could not express them")
 
-    assignment, ambiguous, unclassified = classify(texts, args.depth)
+    # stem -> "subsystem/folder", from the headers themselves.
+    header_home: dict[str, str] = {}
+    for area, prefix_depth in (("src", 2), ("frontends", 2)):
+        for header in sorted((root / "prosper" / area).rglob("*.h*")):
+            rel = header.relative_to(root / "prosper" / area)
+            if len(rel.parts) != prefix_depth + 1:
+                continue                       # not subsystem/folder/header.hpp
+            sub, folder = rel.parts[0], rel.parts[1]
+            if sub not in PREFIXES:
+                continue
+            header_home.setdefault(header.stem, f"{sub}/{folder}")
+    print(f"   {len(header_home)} module header(s) available for name matching")
+
+    assignment, ambiguous, unclassified = classify(texts, args.depth, header_home=header_home)
 
     counts = collections.Counter(assignment.values())
     print(f"== {len(files)} file(s) scanned: {len(assignment)} classified, "

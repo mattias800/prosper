@@ -145,7 +145,8 @@ def main() -> int:
     # its dependents NOTHING. A closure that ignores the keyword propagates it anyway, and every
     # dependent then looks satisfied -- which is how test_shared_vulkan_device passed this check and
     # failed the build on `fixtures/render_runner.h`: it links prosper_live_renderer, whose `tests`
-    # entry is PRIVATE (prosper/CMakeLists.txt:1755). So two sets per target: what it can USE, and
+    # entries are PRIVATE (prosper/CMakeLists.txt:1765 and :1990 -- it is declared twice, and a
+    # citation naming only one of them is half an answer). So two sets per target: what it can USE, and
     # the strictly smaller set it EXPORTS.
     own: dict[str, set[str]] = {}        # usable when compiling this target
     exported: dict[str, set[str]] = {}   # inherited by anything linking it

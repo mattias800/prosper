@@ -294,7 +294,7 @@ frame — and the title double-buffers its scanout. In the white grab the two bu
 are one correct System Settings screen (7,410 distinct colours) and one **single-colour pure white** plane,
 which is the buffer that submit renders into. That is the flashing.
 
-`tests/gpu/test_render_state.cpp` used to assert `occurrence_count(..., "MODE=2 ") == 1` under the message
+`tests/gpu/state/test_render_state.cpp` used to assert `occurrence_count(..., "MODE=2 ") == 1` under the message
 "unmodeled CB modes log once per distinct value while retaining fallback behavior". That asserted the
 **log-dedupe mechanism**, never the draw behaviour, and its "retaining fallback behavior" clause was not
 tested at all. The history settles the intent: #919 introduced the block over modes **2 and 3** as

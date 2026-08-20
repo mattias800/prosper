@@ -438,7 +438,7 @@ if(TARGET prosper_core)
              test_module "${GAME_DUMP}/eboot.bin")
   endif()
 
-  add_executable(test_nid tests/self/test_nid.cpp)
+  add_executable(test_nid tests/hle/dispatch/test_nid.cpp)
   target_link_libraries(test_nid PRIVATE prosper_core)
   if(HAVE_GAME_DUMP)
     add_test(NAME nid_hash_matches_imports
@@ -458,7 +458,7 @@ if(TARGET prosper_core)
   # Runtime IL2CPP symbolication (#2551): name the C# method containing a live guest PC. The
   # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
   # into a silent skip. The binary doubles as the probe the agreement test drives.
-  add_executable(test_il2cpp_symbols tests/host/image/test_il2cpp_symbols.cpp)
+  add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
   add_test(NAME il2cpp_symbol_resolution
            COMMAND test_il2cpp_symbols
@@ -746,7 +746,7 @@ if(TARGET prosper_core)
   # FreeBSD errno numbering across the libkernel 0x80020000|errno family (#1612). Pins the encoding
   # vocabulary, the host->FreeBSD table, and the guest-observable values on the paths a Linux/macOS
   # host can actually reach (sem trywait, timed mutex, wait-on-address, POSIX setcancelstate).
-  add_executable(test_sce_errno tests/hle/sync/test_sce_errno.cpp)
+  add_executable(test_sce_errno tests/hle/kernel/test_sce_errno.cpp)
   target_link_libraries(test_sce_errno PRIVATE prosper_core)
   add_test(NAME sce_errno_freebsd COMMAND test_sce_errno)
 
@@ -799,7 +799,7 @@ if(TARGET prosper_core)
   add_test(NAME pthread_cond_clock COMMAND test_cond_clock)
 
   # libScePad controller input: ScePadData layout + HostPadState mapping + HLE fill contract (pure).
-  add_executable(test_pad tests/hle/test_pad.cpp)
+  add_executable(test_pad tests/input/test_pad.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_pad PRIVATE tests)
   target_link_libraries(test_pad PRIVATE prosper_core)
@@ -1096,18 +1096,18 @@ if(TARGET prosper_core)
   add_test(NAME module_path_case COMMAND test_module_path_case)
 
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
-  add_executable(test_diagnostics_disabled tests/test_diagnostics_disabled.cpp)
+  add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
   target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)
   add_test(NAME diagnostics_disabled_stubs COMMAND test_diagnostics_disabled)
 
   # Diagnostics: enabled-path and JSON tests (only when feature is built).
   if(PROSPER_DIAGNOSTICS)
-    add_executable(test_diagnostics_enabled tests/test_diagnostics_enabled.cpp)
+    add_executable(test_diagnostics_enabled tests/diagnostics/test_diagnostics_enabled.cpp)
     target_link_libraries(test_diagnostics_enabled PRIVATE prosper_core)
     target_compile_definitions(test_diagnostics_enabled PRIVATE PROSPER_DIAGNOSTICS)
     add_test(NAME diagnostics_enabled_capture COMMAND test_diagnostics_enabled)
 
-    add_executable(test_diagnostics_json tests/test_diagnostics_json.cpp)
+    add_executable(test_diagnostics_json tests/diagnostics/test_diagnostics_json.cpp)
     target_link_libraries(test_diagnostics_json PRIVATE prosper_core)
     target_compile_definitions(test_diagnostics_json PRIVATE PROSPER_DIAGNOSTICS)
     add_test(NAME diagnostics_json_format COMMAND test_diagnostics_json)
@@ -1319,7 +1319,7 @@ if(TARGET prosper_core)
   add_test(NAME wait_barrier COMMAND test_wait_barrier)
 
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
-  add_executable(test_render_state tests/gpu/test_render_state.cpp)
+  add_executable(test_render_state tests/gpu/state/test_render_state.cpp)
   target_link_libraries(test_render_state PRIVATE prosper_core)
   add_test(NAME render_state_extract COMMAND test_render_state)
 
@@ -1492,7 +1492,7 @@ if(TARGET prosper_core)
   # so the decision table also builds where the handler does not. The source path is handed to the
   # wiring check, which confirms the production handler still calls the shared predicate.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(test_trap_arbitration tests/host/test_trap_arbitration.cpp)
+    add_executable(test_trap_arbitration tests/host/fault/test_trap_arbitration.cpp)
     # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
     target_include_directories(test_trap_arbitration PRIVATE src)
     target_compile_definitions(test_trap_arbitration PRIVATE
@@ -1541,7 +1541,7 @@ if(TARGET prosper_core)
 
   # Resource-binding contract (shader_resources.hpp): format sizing + the provenance/binding lookups
   # the recompiler and pipeline share. Pure/cross-platform. See docs/RESOURCE_BINDING.md.
-  add_executable(test_shader_resources tests/shared/live/test_shader_resources.cpp)
+  add_executable(test_shader_resources tests/gpu/resources/test_shader_resources.cpp)
   # Spells a `shared/...` include, which resolves from `frontends`.
   target_include_directories(test_shader_resources PRIVATE frontends)
   target_link_libraries(test_shader_resources PRIVATE prosper_core)
@@ -1549,13 +1549,13 @@ if(TARGET prosper_core)
 
   # Versioned realized-draw capture: explicit round-trip, overlapping-resource alias preservation,
   # owned replay backing, and corrupt/truncated input rejection. Pure; no Vulkan or game dump.
-  add_executable(test_gpu_capture tests/gpu/test_gpu_capture.cpp)
+  add_executable(test_gpu_capture tests/gpu/capture/test_gpu_capture.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
 
-  add_executable(test_gpu_capture_bundle tests/gpu/test_gpu_capture_bundle.cpp)
+  add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_gpu_capture_bundle PRIVATE tests)
   target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
@@ -1563,7 +1563,7 @@ if(TARGET prosper_core)
 
   # Native-speed append-only submit/present timeline: portable framing, checksums, and truncated-tail
   # recovery are pure and must not depend on Vulkan or a game dump.
-  add_executable(test_gpu_timeline tests/gpu/test_gpu_timeline.cpp)
+  add_executable(test_gpu_timeline tests/gpu/timeline/test_gpu_timeline.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_gpu_timeline PRIVATE tests)
   target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
@@ -1642,7 +1642,7 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_replay_pixel_inputs PRIVATE prosper_core)
   add_test(NAME gpu_replay_pixel_inputs COMMAND test_gpu_replay_pixel_inputs)
 
-  add_executable(test_gpu_dependency_graph tests/gpu/test_gpu_dependency_graph.cpp)
+  add_executable(test_gpu_dependency_graph tests/gpu/execute/test_gpu_dependency_graph.cpp)
   target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
   add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)
 
@@ -2275,7 +2275,7 @@ if(TARGET prosper_core)
       add_test(NAME gpustate_render COMMAND test_gpustate_render)
 
       # GPU-executor core (Stage A): GpuState -> execute_gpustate() -> render -> present round-trip.
-      add_executable(test_gpu_execute tests/misc/test_gpu_execute.cpp)
+      add_executable(test_gpu_execute tests/gpu/execute/test_gpu_execute.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
       target_include_directories(test_gpu_execute PRIVATE tests)
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.

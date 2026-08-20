@@ -154,7 +154,7 @@ def selftest():
         ("source plus a test", [("A", "prosper/src/diagnostics/foo.cpp"),
                                 ("A", "prosper/tests/test_foo.cpp")]),
         ("source plus a MODIFIED test", [("A", "prosper/src/foo.cpp"),
-                                         ("M", "prosper/tests/gpu/test_gpu_capture.cpp")]),
+                                         ("M", "prosper/tests/gpu/capture/test_gpu_capture.cpp")]),
         ("modifying an existing source, no test", [("M", "prosper/src/gpu/capture/gpu_capture.cpp")]),
         ("docs only", [("M", "prosper/docs/GAME_COMPAT_ORCHESTRATION.md")]),
         ("root-level markdown", [("A", "CONTRIBUTING.md")]),
