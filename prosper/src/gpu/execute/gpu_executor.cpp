@@ -5857,6 +5857,11 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             // of distinct tables. Measured on a 500 s routed GTA V route: 138 lines. That is small
             // because few programs use the path, not because anything bounds it -- a title that used
             // it widely would produce far more.
+            //
+            // EVERY report in this block is routed through it, including the SUCCESS line -- not
+            // only the declines. A switch that speaks solely on failure cannot distinguish "this
+            // table was accepted" from "this table was never published", which is the same
+            // silent-`continue` ambiguity that motivated the switch in the first place.
             const bool table_log =
                 std::getenv("PROSPER_SRTTABLE_LOG") || std::getenv("PROSPER_DBG");
             // #2481: a runtime-selected descriptor table. The element is chosen on the GPU, so the
@@ -5986,7 +5991,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             }
             if (unsupported_record) continue;
             if (resolved == 0u) {
-                if (std::getenv("PROSPER_DBG"))
+                if (table_log)
                     std::fprintf(stderr,
                                  "[srt] selected-table pc=%u REJECTED base=0x%llx stride=%u "
                                  "records=%u resolved=%u\n",
@@ -6017,7 +6022,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             }
             homogeneous &= have_first;
             if (!homogeneous) {
-                if (std::getenv("PROSPER_DBG"))
+                if (table_log)
                     std::fprintf(stderr,
                                  "[srt] selected-table pc=%u REJECTED heterogeneous entries\n",
                                  u.use_pc);
@@ -6047,14 +6052,14 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
             // Failing to publish costs exactly what the previous behaviour cost: an unresolved
             // descriptor at the consumer, fail-visible.
             if (!valid_shader_buffer_table_contract(r)) {
-                if (std::getenv("PROSPER_DBG"))
+                if (table_log)
                     std::fprintf(stderr,
                                  "[srt] selected-table pc=%u REJECTED contract stride=%u fmt=%u "
                                  "comps=%u\n",
                                  u.use_pc, r.stride, (unsigned)r.format, r.num_components);
                 continue;
             }
-            if (std::getenv("PROSPER_DBG"))
+            if (table_log)
                 std::fprintf(stderr,
                              "[srt] selected-table pc=%u producer=%u base=0x%llx stride=%u "
                              "records=%u resolved=%u element=+0x%x\n",
