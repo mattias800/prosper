@@ -110,6 +110,44 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **Every one of the EIGHT programs that write the traversal table has a fully-covered VECTOR data
+  path — the link values cannot be wrong through a dropped VALU or a dropped memory op.** First
+  census of the whole writer set rather than of `0x413dc6700` alone, made possible by the
+  all-sites enumeration in #2798; before it, only the first blocked site of each program was visible.
+  Raw programs extracted from the capture with `gpu_replay --dump-compute-raw` (the *programs* are
+  real even though that capture's descriptors are empty — see the EMPTY-SRT row above) and censused
+  with `shader_inspect`:
+
+  | program | dwords | blocked sites | of which VALU |
+  | --- | ---: | ---: | ---: |
+  | `0x413ce3400` | 507 | 22 | **0** |
+  | `0x413ce6000` | 276 | 10 | **0** |
+  | `0x413cea300` | 1 | 0 | **0** |
+  | `0x413cee500` | 279 | 2 | **0** |
+  | `0x413d88400` | 372 | 12 | **0** |
+  | `0x413dc3400` | 882 | 23 | **0** |
+  | `0x413dc6700` | 903 | 27 | **0** |
+  | `0x413e1c300` | 179 | 6 | **0** |
+
+  `0x413cea300` decoding to a single dword independently corroborates this document's own
+  description of it as "the terminator-only program, whose whole body is one `s_endpgm`", which is
+  what makes the extraction trustworthy rather than merely self-consistent.
+
+  Across all 102 blocked sites the classes are: **85 scalar branches** (SOPP `0x8`/`0x2`/`0x4`/`0x6`/
+  `0x5`), **8 SMEM `0x01`** descriptor loads (misfiled — #2797), and **9 scalar ALU** (SOP1: seven
+  `s_bitset1_b32`, one `s_ff1_i32_b64`, one `s_bcnt1_i32_b64`). **Zero vector ALU and zero
+  MUBUF/MTBUF/MIMG data operations.** Since each record's link value is computed in VGPRs and stored
+  from a VGPR, the vector data path of every writer is entirely inside the recompiler's
+  per-instruction coverage.
+
+  **Two limits, because this census is easy to over-read.** (a) *Scalar* arithmetic is NOT zero — the
+  nine SOP1 sites are data-path ops, and a VALU may consume an SGPR one of them produced, so a scalar
+  contribution to a wrong link value is possible and unexamined. "No VALU" is not "no arithmetic".
+  (b) The shell's classification is **context-free**: it runs table-less, so a site it calls blocked
+  may be handled by the real emitter given a resource table, and conversely this census cannot see a
+  program that recompiles but emits something wrong. It bounds where a *translation gap* could be; it
+  does not certify the emitted values. (2026-08-21, #2798.)
+
 - **The offline dissection of `0x413dc6700` describes the EMPTY-SRT startup variant, not the hanging
   one.** `dc6700.prgcap` was taken with `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` and **no**
   `PROSPER_GPU_CAPTURE_AT=`, so it fired inside the first-88-fold window that
