@@ -201,6 +201,47 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   lane reports an A/B to you, land it in the doc or the issue before the session ends. Read the
   `## Ruled out` section of every doc you are about to work in **before** forming a hypothesis.
 
+- **File and folder structure mirrors the logical architecture, and you are expected to refactor
+  toward that as you go.** A directory is a claim about what belongs together. When the claim is
+  false the tree actively misleads, because "where does this live?" gets answered by the wrong
+  place — and the cost lands on whoever arrives next, not on whoever left it. So put new code in the
+  folder its architecture implies rather than beside whatever file you happened to open, split a file
+  that has grown a second responsibility, and move a module that sits in the wrong folder.
+
+  **You do not need permission or a dedicated task for this.** An incidental, mechanical restructure
+  alongside the work you are already doing is welcome, and is how the tree stays honest between the
+  occasional large passes. Two limits keep it from becoming a hazard:
+  - **Move with tools, never by retyping.** `prosper/tools/refactor/` exists for exactly this:
+    `move_module.py` (relocate a module and rewrite every include and path citation repo-wide),
+    `split_file.py` (a split that proves it was a pure move), `promote_internal.py` (lift
+    internal-linkage declarations into a header). Hand-editing a restructure is how this project's
+    recorded traps happen — a whole-file `git checkout` that silently reverted another lane's edits
+    (trap 41), and a clean merge into a broken file.
+  - **Keep the move separable from the behaviour change.** Put it in its own commit so a reviewer
+    reads `git mv` plus include rewrites instead of a diff that mixes relocation with logic. If the
+    restructure is big enough to conflict with other lanes, it is its own PR.
+
+  `CMakeLists.txt:71` is `file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)`, so a new
+  subfolder under `src/` needs no source-list edit. Other roots are listed explicitly; check before
+  assuming.
+
+- **Every folder holding real content carries an `AGENTS.md` saying what lives there and what
+  belongs there.** The point is navigation: an agent should be able to understand a folder's job
+  without opening a source file. A paragraph or two — the folder's responsibility, its boundary
+  against its siblings, and anything a newcomer would otherwise learn only by getting it wrong.
+
+  It is a **map, not documentation of the code**. The code documents itself; a per-function summary
+  here is stale the first time somebody edits it, and a stale map is worse than none because it is
+  believed. Write about what the folder is *for*.
+
+  Measured 2026-08-20: **2 `AGENTS.md` files against 89 source directories** under `src/`,
+  `frontends/` and `tools/`. Write one when you work in a folder that lacks it; correct the existing
+  one when you change what the folder means.
+
+  *"Within reason"* is part of the rule: a folder holding a single file, or a leaf whose name already
+  says everything, does not need one. If you cannot write a sentence the reader would not have
+  guessed, skip it.
+
 - **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
   run this repo concurrently, so the main working directory and its build dir are contended:
   branch-switching, staging, or `cmake --build` there collides with whatever someone else is
@@ -243,6 +284,26 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     worktree-local directory". Move anything you want to keep out of the tree, or `git worktree lock`
     it. On macOS and Windows the tool classifies but never removes: the in-use guard needs `/proc`,
     and without it the tool cannot prove nobody is inside, so it fails closed.
+  - **Teardown is part of finishing a PR, and neither half happens by itself.** When your PR merges,
+    delete the remote branch and remove your worktree:
+    ```bash
+    gh pr merge <N> --squash --delete-branch   # the LOCAL half fails if master is checked out
+    git ls-remote origin refs/heads/<branch>   # ...so verify; empty output means it really went
+    git push origin --delete <branch>          # and do it explicitly if it did not
+    cd <anywhere outside the tree>             # removing the tree your shell sits in wedges it
+    git worktree remove <path>
+    git branch -d <branch>
+    ```
+    **A subagent's worktree is yours to remove too.** The harness auto-cleans an
+    `isolation: "worktree"` tree only when it is **unchanged** — so a subagent that did any real work
+    leaves its tree behind permanently, and the agent that spawned it is the only one who knows it is
+    finished.
+    Why this is spelled out rather than left to the sweeper: measured 2026-08-20, **48 registered
+    worktrees occupying 101 GB**, from which `worktree_reclaim.py` could reclaim exactly **one**. It
+    was blocked on **35 trees classified DIRTY** — uncommitted or untracked files. Automation cannot
+    fix that and never will, because refusing a dirty tree is the guard that stops it destroying
+    someone's work. **So commit, stash or discard before you leave a tree**, or you are the only one
+    who will ever be able to clean it up.
 - **On a Windows host, run git through PowerShell (Windows git), not WSL.** The repo lives on the
   Windows filesystem (`C:\...` = `/mnt/c/...`), and worktrees created from Windows store a
   Windows-path gitdir link (`gitdir: C:/Users/.../.git/worktrees/<name>`). WSL's git can't resolve
