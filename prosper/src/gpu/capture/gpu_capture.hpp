@@ -43,8 +43,13 @@ void annotate_gpu_capture_scanout(GpuCaptureMetadata& metadata);
 // PROSPER_SAVE0 and gpu_replay reports it as that variable, so the value must be one the variable
 // could have held; a per-title directory recorded under that key would name a path that, fed back
 // in, would namespace a second time. It keeps the entry symmetric with metadata.savedata_dir, which
-// is also a root. The directory the guest used is the root plus the title, and metadata.title_id
-// carries the title.
+// is also a root. The directory the guest used is the root plus the running title's id. Note that
+// metadata.title_id does NOT reliably supply that: it is PROSPER_CAPTURE_TITLE, which only a handful
+// of documented recipes set, so a default boot_trace run or an F9 grab records a root and no title.
+// That is master's long-standing behaviour and not a regression -- before #2734 the recorded save
+// root was equally title-less -- but do not read the pair as a complete identification of the save
+// state. Sourcing metadata.title_id from save_title_namespace() when the env var is unset would fix
+// it, and is deliberately left out of the #2734 change as a behaviour change to capture metadata.
 //
 // The root is re-derived through hle/fs/save_paths.hpp rather than restated here: a second copy of
 // the default in this header could disagree with the one the guest actually wrote to.

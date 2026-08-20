@@ -213,7 +213,8 @@ int main() {
                "cannot discriminate here and is SKIPPED, not passed.\n",
                visible_to_a.size());
     } else {
-        CHECK(true, "title A sees both of its own saves (positive control for this arm)");
+        CHECK(enumeration_works,
+              "title A sees both of its own saves (positive control for this arm)");
         set_app0_root(app0_b);
         const std::vector<std::string> visible_to_b = savedata0_list_dirs();
         CHECK(contains(visible_to_b, kSharedSlot),

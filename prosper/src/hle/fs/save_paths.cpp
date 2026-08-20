@@ -160,8 +160,9 @@ std::string save_title_namespace() {
         std::fprintf(stderr,
                      "[savedata] this application declares no usable titleId, so its saves go to "
                      "the shared \"%s\" namespace and CAN still collide with another such "
-                     "application's (#2734). A dump with a valid sce_sys/param.json does not hit "
-                     "this.\n",
+                     "application's (#2734). A dump whose sce_sys/param.json declares a well-formed "
+                     "titleId does not hit this -- note that a param.json which parses but simply "
+                     "omits the key does.\n",
                      kUnknownTitleNamespace);
     });
     return kUnknownTitleNamespace;
