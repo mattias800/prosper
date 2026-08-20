@@ -29,3 +29,8 @@ does this frame look wrong", the split matters: a wrong *descriptor* is usually 
 
 Build note: `CMakeLists.txt:71` globs `src/*.cpp` recursively with `CONFIGURE_DEPENDS`, so a new
 subfolder here needs no source-list edit.
+
+**Do not confuse `src/gpu/diagnostics/` with `src/diagnostics/`.** They are different folders with
+opposite build treatment: `CMakeLists.txt:75-77` excludes `src/diagnostics/` unless
+`PROSPER_DIAGNOSTICS` is on (default OFF at `:21`), and that exclusion's pattern does **not** match
+this one, which always builds.

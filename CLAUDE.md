@@ -234,9 +234,11 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   here is stale the first time somebody edits it, and a stale map is worse than none because it is
   believed. Write about what the folder is *for*.
 
-  Measured 2026-08-20: **2 `AGENTS.md` files against 89 source directories** under `src/`,
-  `frontends/` and `tools/`. Write one when you work in a folder that lacks it; correct the existing
-  one when you change what the folder means.
+  Measured 2026-08-20 on the commit before this rule landed: **2 `AGENTS.md` files against 89 source
+  directories** under `src/`, `frontends/` and `tools/`. The commit that added this rule also seeded
+  all of `src/gpu`, taking it to 16 — so treat the ratio as the starting point it described, not as a
+  current figure, and re-measure rather than quoting it. Write one when you work in a folder that
+  lacks it; correct the existing one when you change what the folder means.
 
   *"Within reason"* is part of the rule: a folder holding a single file, or a leaf whose name already
   says everything, does not need one. If you cannot write a sentence the reader would not have
@@ -298,9 +300,11 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     `isolation: "worktree"` tree only when it is **unchanged** — so a subagent that did any real work
     leaves its tree behind permanently, and the agent that spawned it is the only one who knows it is
     finished.
-    Why this is spelled out rather than left to the sweeper: measured 2026-08-20, **48 registered
-    worktrees occupying 101 GB**, from which `worktree_reclaim.py` could reclaim exactly **one**. It
-    was blocked on **35 trees classified DIRTY** — uncommitted or untracked files. Automation cannot
+    Why this is spelled out rather than left to the sweeper: measured 2026-08-20, **49 registered
+    worktrees**, from which `worktree_reclaim.py` could reclaim exactly **one** — blocked on **35
+    trees classified DIRTY**, i.e. holding uncommitted or untracked files. Disk, and note the
+    scoping: **101 GB under `.claude/worktrees/`**, plus **13 registered trees living outside that
+    subtree** carrying roughly 33 GB more, so about **141 GB** in total. Automation cannot
     fix that and never will, because refusing a dirty tree is the guard that stops it destroying
     someone's work. **So commit, stash or discard before you leave a tree**, or you are the only one
     who will ever be able to clean it up.

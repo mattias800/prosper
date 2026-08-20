@@ -1,8 +1,15 @@
 # `diagnostics` — observation only
 
-**Nothing in this folder is on a rendering path.** That is the folder's defining property: code here
-may be removed, gated off or rate-limited without changing a single rendered pixel. If something here
-starts affecting output, it belongs somewhere else.
+**Nothing here is on a rendering path AT DEFAULT SETTINGS**, and that is the intended property:
+with nothing armed, code in this folder can be removed or rate-limited without changing a single
+rendered pixel.
+
+**One entry breaks the stronger form of that rule and you must know about it.**
+`compute_parent_walk_suspicious()` (`compute_parent_walk.cpp:117`) reaches `gpu_executor.cpp:10613`,
+which **skips a live compute dispatch** — it prints `DIAGNOSTIC-ONLY skip suspicious dispatch` and
+then does not run it. It is env-gated, so a default boot is unaffected, but an armed run is not
+merely observing. `compute_parent_walk.hpp` states this boundary; do not read the folder name as a
+guarantee.
 
 - `diagnostic_selectors` — choosing what to observe.
 - `diag_ratelimit` — rate limiting. **Check a diagnostic's rate limit before quoting its volume as a

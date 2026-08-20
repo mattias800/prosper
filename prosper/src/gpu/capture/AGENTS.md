@@ -5,7 +5,7 @@ into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline an
 
 - `gpu_capture` — the capture itself.
 - `gpu_capture_bundle` — bundle format and manifest.
-- `capture_compute_policy` — what compute state a capture retains.
+- `capture_compute_policy` — the policy governing compute capture.
 - `writer_provenance` — which pass wrote a given range, so a replay can attribute a pixel.
 
 This is the highest-leverage debugging path in the project: press **F9** in `prosper-app` (or use the

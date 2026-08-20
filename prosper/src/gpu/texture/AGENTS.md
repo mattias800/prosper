@@ -10,6 +10,7 @@ Tiling bugs are **visually distinctive and diagnostically misleading**: the cont
 correctly coloured but spatially scrambled, which reads as a geometry or UV problem. If a surface
 looks like the right image cut into blocks, start here.
 
-Layouts are generic where possible. A title-specific tiling special case is a strong signal the
-general rule is wrong — one recorded fix replaced a per-title hack with generic 4 KiB mip-tail tiling
-and resolved a whole title at once.
+Layouts are generic where possible, and a title-specific tiling special case is a strong signal the
+general rule is wrong. Worked example: #1578 (`336ea104`) fixed a wrong block-to-element multiplier
+in the **shared generic** path and resolved a whole title at once — the defect was in the rule
+everyone used, not in a per-title hack.
