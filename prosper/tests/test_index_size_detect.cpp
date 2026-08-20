@@ -5,7 +5,7 @@
 // 32-bit index is misread as two 16-bit ones — collapsing the banner quad to a degenerate triangle
 // (the #304 "flat wedge"). index_buffer_is_unannounced_32bit() recovers the real size from the
 // buffer bytes. These vectors are the exact ones captured live from the DOLL boot.
-#include "../src/gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <vector>

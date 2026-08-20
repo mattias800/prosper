@@ -1,4 +1,4 @@
-#include "gpu/capture_compute_policy.hpp"
+#include "gpu/capture/capture_compute_policy.hpp"
 
 #include <cstdio>
 

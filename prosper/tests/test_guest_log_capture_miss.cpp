@@ -9,7 +9,7 @@
 //
 // This test lives apart from test_guest_log_capture because the gate is a process-wide one-shot:
 // that test's marker MATCHES, and a fired gate has nothing to report by construction.
-#include "../src/gpu/gpu_timeline.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
 
 #include <chrono>
 #include <cstdio>

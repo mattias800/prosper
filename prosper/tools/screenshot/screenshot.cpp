@@ -49,8 +49,8 @@
 #include "loader/linker.hpp"          // Program
 #include "host/boot_program.hpp"       // boot_program
 #include "host/exec_image.hpp"         // run_entry
-#include "gpu/videoout_present.hpp"    // present_count / present_readback / present_width/height
-#include "gpu/gpu_timeline.hpp"
+#include "gpu/present/videoout_present.hpp"    // present_count / present_readback / present_width/height
+#include "gpu/timeline/gpu_timeline.hpp"
 #include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
 #ifdef PROSPER_VIDEO_MF

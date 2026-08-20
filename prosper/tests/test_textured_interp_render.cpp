@@ -3,8 +3,8 @@
 // samples a texture at the interpolated UV (image_sample), and the mapped texture reaches the
 // framebuffer. This exercises VS param export + rasterizer interpolation + MIMG sampling together —
 // the shape of a real Unity textured draw. Also writes a PPM screenshot for human inspection.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdlib>

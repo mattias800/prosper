@@ -19,9 +19,9 @@
 // Both are closed below: check_emitter_coverage() reads every `src/gpu/*.hpp` and fails on any
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
-#include "../../src/gpu/rdna2_to_spirv.hpp"
-#include "../../src/gpu/shader_resources.hpp"
-#include "../../src/gpu/spirv_builder.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/recompiler/spirv_builder.hpp"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>

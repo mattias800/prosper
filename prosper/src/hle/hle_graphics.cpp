@@ -14,9 +14,9 @@
 #include "nid.hpp"
 #include "../host/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/exec_image.hpp"
-#include "gpu/videoout_present.hpp"
-#include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
-#include "gpu/tile.hpp"             // de-swizzle a TILE-mode scanout into a linear image
+#include "gpu/present/videoout_present.hpp"
+#include "gpu/execute/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
+#include "gpu/texture/tile.hpp"             // de-swizzle a TILE-mode scanout into a linear image
 #include "host/guest_memory_map.hpp" // guest_readable_mapping_containing (real over-read proof)
 #include "host/precise_sleep.hpp"   // #1765: a vblank wait whose resolution is not the Win32 tick
 #include <cstdlib>

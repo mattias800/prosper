@@ -56,7 +56,7 @@ defeats a later `<=` check is the classic loader/GPU OOB.
 ## Descriptor dimension clamps (the load-bearing GPU invariant)
 
 The entire GPU guest-input bounds argument rests on `decode_image_descriptor` /
-`decode_buffer_descriptor` (`src/gpu/agc_shader_layout.cpp`) clamping guest T#/V# fields at the source:
+`decode_buffer_descriptor` (`src/gpu/agc/agc_shader_layout.cpp`) clamping guest T#/V# fields at the source:
 width/height are 14-bit fields `+1` → **≤ 16384**, depth 13-bit `+1` → **≤ 8192**, format masked to
 9 bits, `num_components ∈ {0..4}`, buffer `size_bytes` computed in `uint64_t` and clamped to
 `0xFFFFFFFF`. Downstream code multiplies these into host allocation/copy/detile bounds and rejects
@@ -76,12 +76,12 @@ in-bounds, rule out upstream guards). All CLEAN on current master except the edg
 | Loader bounds primitives | `src/self/module.{hpp,cpp}` | **#1198** `self_read_ok` (replaces wrap-prone `off+need<=size`) |
 | Host image map + ABI stubs | `src/host/exec_image_linux.cpp` `map_image`/`install_stubs` | CLEAN — `img.mem`-sized copy; stub region = import-count×stub_size (count clamped by #1219) |
 | Guest memory-management HLE | `src/hle/hle_kernel_mem.cpp` | CLEAN — WriteAddress fixed-8B `process_vm_writev`, VirtualQuery clamped, dmem allocator pool-bounded, every `addr+len` guarded |
-| GPU command processor / PM4 | `src/gpu/command_processor.cpp` | **#1200** SetRegsIndirect `guest_readable` guard; **#1202** WriteData null-src stale-tail `memset` |
-| GPU executor / shader decode | `src/gpu/gpu_executor.cpp` | CLEAN (canonical wrap-safe form throughout); **#1210** diagnostic-dump OOB clamp |
+| GPU command processor / PM4 | `src/gpu/pm4/command_processor.cpp` | **#1200** SetRegsIndirect `guest_readable` guard; **#1202** WriteData null-src stale-tail `memset` |
+| GPU executor / shader decode | `src/gpu/execute/gpu_executor.cpp` | CLEAN (canonical wrap-safe form throughout); **#1210** diagnostic-dump OOB clamp |
 | Compute dispatch sizing | `frontends/shared/live_compute.cpp` | CLEAN |
-| RDNA2→SPIR-V recompiler | `src/gpu/rdna2_to_spirv.cpp` | CLEAN — literal/branch/register/CFG all upstream-bounded |
-| Tile / detile swizzle | `src/gpu/tile.cpp` | CLEAN — every tiled access guarded `if (tiled + bpe <= tiled_bytes)`; mismatch drops, never OOB |
-| Descriptor decode | `src/gpu/agc_shader_layout.cpp` | CLEAN — see the dimension-clamp section above |
+| RDNA2→SPIR-V recompiler | `src/gpu/recompiler/rdna2_to_spirv.cpp` | CLEAN — literal/branch/register/CFG all upstream-bounded |
+| Tile / detile swizzle | `src/gpu/texture/tile.cpp` | CLEAN — every tiled access guarded `if (tiled + bpe <= tiled_bytes)`; mismatch drops, never OOB |
+| Descriptor decode | `src/gpu/agc/agc_shader_layout.cpp` | CLEAN — see the dimension-clamp section above |
 | Resource/descriptor layer, GPU capture parser | `src/gpu/*` | CLEAN |
 | HLE getters (audio/service/http/json) | `src/hle/*` | CLEAN — output params fully initialized |
 | SELF/save path traversal | `src/hle/hle_file.cpp` | **#1204** savedata `dirName` guard; **#1206** `translate()` `..` normalization |

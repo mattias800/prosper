@@ -1,0 +1,55 @@
+# The GPU stack's architecture, as folders. Consumed by move_module.py.
+#
+# Format: `folder: module module module` -- module is the basename, without extension; the .cpp,
+# .hpp and .h of a module always travel together.
+#
+# The ordering principle is the DIRECTION OF DATA THROUGH THE STACK: a guest command buffer is
+# decoded (pm4), its shader descriptors are read (agc), its shaders are recompiled (recompiler), its
+# resources and render state are resolved (resources, state, texture), and the result is executed
+# (execute) and presented (present). capture/, timeline/ and diagnostics/ observe that pipeline
+# rather than participating in it.
+#
+# A folder is a claim about coupling: things in one folder are expected to change together. Where
+# that turned out to be false, the seam belongs on #2739 rather than being smoothed over here.
+
+# --- the guest command stream -----------------------------------------------------------------
+pm4: pm4_decode pm4_registers command_processor
+
+# --- Sony AGC / Gen5 descriptor formats --------------------------------------------------------
+agc: agc_shader_layout
+
+# --- RDNA2 -> SPIR-V ---------------------------------------------------------------------------
+recompiler: rdna2_to_spirv rdna2_decode spirv_builder
+
+# Title-specific compute contracts. Kept apart because they are evidence-driven and churn on a
+# different cadence from the translator itself.
+recompiler/gta5: rdna2_gta5_cf9200_contract rdna2_gta5_compute_contracts rdna2_gta5_packed_pointer
+
+# Indirect-pointer descriptor machinery: analysis, relocation, the buffer shadow, ranges.
+recompiler/indirect: rdna2_indirect_buffer_shadow rdna2_indirect_pointer_analysis rdna2_indirect_pointer_descriptor_range rdna2_indirect_pointer_relocation
+
+# --- what a shader binds -----------------------------------------------------------------------
+resources: shader_resources gpu_resources compressed_source_authority metadata_kind_correlation
+
+# --- fixed-function render state ---------------------------------------------------------------
+state: render_state vk_translate
+
+# --- guest texture memory: tiling, block compression, layout -----------------------------------
+texture: tile bc_decode guest_texture_layout
+
+# --- capture / replay serialization ------------------------------------------------------------
+capture: gpu_capture gpu_capture_bundle capture_compute_policy writer_provenance
+
+# --- submission and execution ------------------------------------------------------------------
+# mb3_freelist is here rather than under resources: it answers "is this guest pointer a free block
+# of MallocBinned3", which is a question the executor asks before trusting a pointer.
+execute: gpu_execute gpu_executor gpu_dependency_graph mb3_freelist
+
+# --- scanout -----------------------------------------------------------------------------------
+present: videoout_present
+
+# --- frame timeline / bundles ------------------------------------------------------------------
+timeline: gpu_timeline
+
+# --- observation only: nothing here is on a rendering path -------------------------------------
+diagnostics: diagnostic_selectors diag_ratelimit watch_list compute_tree_watch compute_parent_walk

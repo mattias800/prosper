@@ -9,10 +9,10 @@
 // Observable output: the V# a buffer_load_format_x resolves to. Each kernel builds s[8:11] from
 // tracked values, routing the s_bfe_u64 result into V#.dword3 (desc_v3). All encodings assembled /
 // round-trip verified with llvm-mc -mcpu=gfx1030.
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/rdna2_decode.hpp"
-#include "../src/gpu/rdna2_gta5_compute_contracts.hpp"
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gta5_nullable_output_fixture.hpp"
 #include "gta5_zero_record_execz_fixture.hpp"
 #include <algorithm>

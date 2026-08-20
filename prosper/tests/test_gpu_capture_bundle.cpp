@@ -1,6 +1,6 @@
-#include "../src/gpu/gpu_capture_bundle.hpp"
-#include "../src/gpu/gpu_timeline.hpp"     // interactive F9 whole-frame grab state machine
-#include "../src/gpu/tile.hpp"
+#include "gpu/capture/gpu_capture_bundle.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"     // interactive F9 whole-frame grab state machine
+#include "gpu/texture/tile.hpp"
 
 #include <chrono>
 #include <cstdio>

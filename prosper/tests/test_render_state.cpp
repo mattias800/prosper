@@ -1,12 +1,12 @@
-// test_render_state — validates the render-state extractor (src/gpu/render_state.cpp) end-to-end:
+// test_render_state — validates the render-state extractor (src/gpu/state/render_state.cpp) end-to-end:
 // build a command buffer that sets real RDNA2 registers (shader program addresses, color target,
 // primitive type, depth/blend state) via the AGC Dcb builders, replay it into a GpuState, then
 // extract the semantic RenderState and assert every field (addresses use the RDNA2 <<8|<<40 rule).
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/command_processor.hpp"
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/vk_translate.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/state/vk_translate.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdint>

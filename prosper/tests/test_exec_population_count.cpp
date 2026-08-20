@@ -14,8 +14,8 @@
 // from the cause. Synthetic reproductions of the shape were tried first and every one of them
 // compiled on BOTH sides of the fix, because the structured routes claim them before the dispatcher
 // ever runs. So this pins the exact production kernel and its exact routed resource table.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <cstdint>
 #include <cstdio>

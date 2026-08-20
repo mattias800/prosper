@@ -116,7 +116,7 @@ inline void advance_guest_mapping_generation() {
 // is traced in full on notify_guest_page_protection_changed() below; read it before reordering
 // anything here.
 //
-// Two thread-local caches in src/gpu/gpu_executor.cpp memoize positive answers -- "this span is
+// Two thread-local caches in src/gpu/execute/gpu_executor.cpp memoize positive answers -- "this span is
 // readable", "this span is writable" -- and drop everything when this counter moves. They are
 // pure memoization of an OS query, so the counter is their ONLY staleness guard. A protection
 // change that does not advance it leaves them answering the OLD permission until something

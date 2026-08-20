@@ -81,7 +81,7 @@ s_and_b32   vcc_hi, vcc_hi, 0x1f0                  ; vcc_hi = (s64<<4) & 0x1f0  
 s_load_dwordx4 s[8:11], s[24:25], vcc_hi           ; load the vertex-buffer V# from table s[24:25] at vcc_hi
 buffer_load_format_xyzw v[0:3], v0, s[8:11] idxen  ; fetch THROUGH the dynamically-loaded V#
 ```
-The recompiler (`src/gpu/rdna2_to_spirv.cpp`) resolves a `buffer_load_format`'s descriptor by matching the
+The recompiler (`src/gpu/recompiler/rdna2_to_spirv.cpp`) resolves a `buffer_load_format`'s descriptor by matching the
 SRSRC SGPR's provenance: either a **static** s_load immediate offset (`rs.sreg_srt[dst] = in.literal`, then
 `rt->by_srt_offset(literal)`) or a direct user-data SGPR index (`rt->by_sgpr_base(sgpr)`). Here the offset
 is `vcc_hi` — a **runtime-computed** value, not an immediate — so neither matches, and the op stays
@@ -107,9 +107,9 @@ address → read the 4-dword V# from guest memory → emit a `VertexBuffer` `Sha
 `s[8:11]` so `buffer_load_format` resolves. Bind its bytes at the vertex-buffer binding.
 - Scope it to **uniform scalar** setup only (bail if a value depends on a VGPR / lane id). That's enough
   for descriptor-table indexing, which is wave-uniform.
-- Files: `src/gpu/rdna2_to_spirv.cpp` (the SMEM/`sreg_srt` provenance + a new const-eval pass over the
-  prologue), `src/gpu/agc_shader_layout.cpp` (`decode_buffer_descriptor` for the read-back V#),
-  `src/gpu/gpu_executor.cpp` `build_stage_table` (supply the guest-memory reader + user-data pointers).
+- Files: `src/gpu/recompiler/rdna2_to_spirv.cpp` (the SMEM/`sreg_srt` provenance + a new const-eval pass over the
+  prologue), `src/gpu/agc/agc_shader_layout.cpp` (`decode_buffer_descriptor` for the read-back V#),
+  `src/gpu/execute/gpu_executor.cpp` `build_stage_table` (supply the guest-memory reader + user-data pointers).
 - Verify with a synthetic unit test: a hand-written prologue that computes an offset and s_loads a V#
   from an in-test table, asserting the recompiler resolves the fetch (SPIR-V non-empty, `spirv-val` clean).
 
@@ -155,11 +155,11 @@ This mirrors how real drivers stage a fetch shader. Needs the draw's vertex-buff
 ## Reference index
 | Thing | Location |
 |---|---|
-| Executor entry (recompile+resolve+render) | `src/gpu/gpu_execute.hpp` `execute_gpustate` |
-| Live-renderer registry + table builder | `src/gpu/gpu_executor.cpp` `build_stage_table` |
-| Descriptor decode + table build | `src/gpu/agc_shader_layout.cpp` `build_shader_resources`, `decode_buffer_descriptor`, `decode_image_descriptor` |
-| Recompiler SRT/SGPR provenance (extend here) | `src/gpu/rdna2_to_spirv.cpp` SMEM/`MUBUF` cases (`sreg_srt`, `by_srt_offset`, `by_sgpr_base`) |
-| Register-state fold (SET_SH_REG range fix) | `src/gpu/pm4_decode.cpp` (`IT_SET_SH_REG`), `command_processor.cpp` (`SetShRegDirect`) |
+| Executor entry (recompile+resolve+render) | `src/gpu/execute/gpu_execute.hpp` `execute_gpustate` |
+| Live-renderer registry + table builder | `src/gpu/execute/gpu_executor.cpp` `build_stage_table` |
+| Descriptor decode + table build | `src/gpu/agc/agc_shader_layout.cpp` `build_shader_resources`, `decode_buffer_descriptor`, `decode_image_descriptor` |
+| Recompiler SRT/SGPR provenance (extend here) | `src/gpu/recompiler/rdna2_to_spirv.cpp` SMEM/`MUBUF` cases (`sreg_srt`, `by_srt_offset`, `by_sgpr_base`) |
+| Register-state fold (SET_SH_REG range fix) | `src/gpu/pm4/pm4_decode.cpp` (`IT_SET_SH_REG`), `command_processor.cpp` (`SetShRegDirect`) |
 | Shader-header lookup by code addr | `src/hle/hle_agc.cpp` `prosper_agc_shader_header_for_code` |
 | Live renderer + BMP dump | `tools/boot_trace/boot_trace.cpp` (`PROSPER_RENDER`), `tests/render_runner.h` |
 | Independent evidence | Captured shader headers/ISA, guest wrapper disassembly, AMD RDNA2 documentation |

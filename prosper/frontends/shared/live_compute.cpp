@@ -12,15 +12,15 @@
 #include "performance_capture.hpp"      // bounded F8 post-trigger compute timing
 #include "performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
 
-#include "gpu/bc_decode.hpp"
-#include "gpu/gpu_capture.hpp"
-#include "gpu/gpu_execute.hpp"
-#include "gpu/rdna2_decode.hpp"
-#include "gpu/rdna2_gta5_cf9200_contract.hpp"
-#include "gpu/shader_resources.hpp"
-#include "gpu/spirv_builder.hpp"
-#include "gpu/tile.hpp"
-#include "gpu/writer_provenance.hpp"
+#include "gpu/texture/bc_decode.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include "gpu/recompiler/spirv_builder.hpp"
+#include "gpu/texture/tile.hpp"
+#include "gpu/capture/writer_provenance.hpp"
 #include "host/guest_write_watch.hpp"
 
 #include <vulkan/vulkan.h>

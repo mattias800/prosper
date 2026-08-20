@@ -1,6 +1,6 @@
 // Externally triggered headless whole-frame capture. Pure/offline: no guest or Vulkan device.
-#include "../src/gpu/gpu_capture_bundle.hpp"
-#include "../src/gpu/gpu_timeline.hpp"
+#include "gpu/capture/gpu_capture_bundle.hpp"
+#include "gpu/timeline/gpu_timeline.hpp"
 
 #include <chrono>
 #include <cstdio>

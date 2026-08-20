@@ -3,8 +3,8 @@
 // label address that is unmapped (mis-decoded packet, or freed+decommitted between decode and
 // apply) must be skipped, not dereferenced: before the fix each case below SIGSEGVs.
 // The mapped-target cases assert the guard introduces no false skips (liveness).
-#include "../src/gpu/command_processor.hpp"
-#include "../src/gpu/pm4_decode.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>

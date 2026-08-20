@@ -1,0 +1,365 @@
+#include "gpu/execute/gpu_dependency_graph.hpp"
+#include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
+#include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
+#include "gpu/state/vk_translate.hpp"
+
+#include <algorithm>
+#include <limits>
+#include <unordered_map>
+
+namespace prosper::gpu {
+namespace {
+
+struct Writer {
+    uint32_t operation = 0;
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool image = false;
+};
+
+struct DependencyImageFormat {
+    DataFormat format = DataFormat::Unknown;
+    uint32_t components = 0;
+    uint32_t bytes_per_pixel = 4;
+    bool srgb = false;
+};
+
+DependencyImageFormat dependency_image_format(uint32_t raw_format) {
+    switch (static_cast<VkFormat>(raw_format)) {
+        case VkFormat::R8_UNORM:
+            return {DataFormat::Unorm8, 1, 1, false};
+        case VkFormat::R8G8B8A8_UNORM:
+        case VkFormat::B8G8R8A8_UNORM:
+            return {DataFormat::Unorm8, 4, 4, false};
+        case VkFormat::R8G8B8A8_SRGB:
+        case VkFormat::B8G8R8A8_SRGB:
+            return {DataFormat::Unorm8, 4, 4, true};
+        case VkFormat::R16G16B16A16_SFLOAT:
+            return {DataFormat::Float16, 4, 8, false};
+        case VkFormat::B10G11R11_UFLOAT_PACK32:
+            return {DataFormat::Float10_11_11, 3, 4, false};
+        case VkFormat::R32_UINT:
+            return {DataFormat::Uint32, 1, 4, false};
+        default:
+            // Preserve the graph's historical four-byte conservative span while leaving an
+            // unrecognised view ineligible for exact-format RTT seed closure.
+            return {};
+    }
+}
+
+uint64_t span_end(uint64_t addr, uint64_t size) {
+    return size > std::numeric_limits<uint64_t>::max() - addr
+        ? std::numeric_limits<uint64_t>::max() : addr + size;
+}
+
+bool overlaps(uint64_t a_addr, uint64_t a_size, uint64_t b_addr, uint64_t b_size) {
+    return a_addr < span_end(b_addr, b_size) && b_addr < span_end(a_addr, a_size);
+}
+
+bool writer_matches(const GpuDependencyAccess& access, const Writer& writer) {
+    const bool image_access = access.width && access.height &&
+        (access.resource_class == ResourceClass::Texture ||
+         access.resource_class == ResourceClass::StorageImage);
+    // The live RTT cache and replay seed contract identify images by their programmed base. An
+    // interior byte overlap with another image allocation cannot be imported as that texture and
+    // must not be advertised as a closed temporal dependency.
+    if (image_access && writer.image) return access.addr == writer.addr;
+    return overlaps(access.addr, access.size, writer.addr, writer.size);
+}
+
+uint64_t resource_size(const ShaderResource& resource) {
+    // The appended packed slots are a dispatch-owned representation of lane-zero pointers, not guest
+    // bytes following the source table's address. Dependency closure remains on the logical table.
+    if (is_gta5_packed_pointer_resource(resource)) return resource.size;
+    if (is_indirect_pointer_relocation_resource(resource)) return resource.size;
+    const uint64_t scalar_bytes = resource.scalar_buffer_dword_count
+        ? shader_resource_buffer_binding_bytes(resource) : 0u;
+    if (resource.host_data_size) return std::max(resource.host_data_size, scalar_bytes);
+    if (scalar_bytes) return scalar_bytes;
+    if (resource.size) return resource.size;
+    if (resource.width && resource.height)
+        return static_cast<uint64_t>(resource.width) * resource.height * 4;
+    return 0;
+}
+
+bool append_accesses(const ShaderResourceTable* table, const char* stage,
+                     std::vector<GpuDependencyAccess>& accesses,
+                     std::string& error) {
+    if (!table) return true;
+    for (const auto& resource : table->resources) {
+        if (!valid_shader_buffer_table_contract(resource)) {
+            error = "resource has an invalid buffer descriptor-table dependency contract";
+            return false;
+        }
+        if (resource.scalar_buffer_dword_count &&
+            !shader_resource_buffer_binding_bytes(resource)) {
+            error = "resource has invalid scalar-buffer dependency metadata";
+            return false;
+        }
+        if (resource.table_index_count) {
+            for (const ShaderBufferTableEntry& entry : resource.table_entries) {
+                const uint64_t size = entry.size;
+                if (!entry.gpu_addr || !size) continue;
+                accesses.push_back({entry.gpu_addr, size, 0, 0, resource.binding,
+                                    resource.cls, stage, resource.format,
+                                    resource.num_components, resource.srgb});
+            }
+            continue;
+        }
+        const uint64_t size = resource_size(resource);
+        if (!resource.gpu_addr || !size || resource.cls == ResourceClass::Sampler) continue;
+        accesses.push_back({resource.gpu_addr, size, resource.width, resource.height,
+                            resource.binding, resource.cls, stage, resource.format,
+                            resource.num_components, resource.srgb});
+    }
+    return true;
+}
+
+bool append_compute_accesses(const ComputeItem& compute,
+                             std::vector<GpuDependencyAccess>& reads,
+                             std::vector<Writer>& writes,
+                             std::string& error) {
+    const ShaderResourceTable* table = compute.resources.get();
+    if (!table) return true;
+    auto append_relocation_segments = [&]() {
+        for (const ShaderResource& resource : table->resources) {
+            if (!is_indirect_pointer_relocation_resource(resource)) continue;
+            IndirectBufferRelocationInfo info;
+            const IndirectBufferRelocationLayout* layout =
+                resource.indirect_pointer_relocation.carrier_version ==
+                        kIndirectPointerStaticFootprintLayout.version
+                    ? &kIndirectPointerStaticFootprintLayout
+                    : resource.indirect_pointer_relocation.carrier_version ==
+                            kIndirectPointerDescriptorRangeLayout.version
+                        ? &kIndirectPointerDescriptorRangeLayout
+                        : nullptr;
+            if (!layout || !inspect_indirect_buffer_relocation(
+                    resource, resource.host_data, resource.host_data_size,
+                    *layout, info))
+                continue;
+            for (const auto& segment : info.segments)
+                reads.push_back({segment.guest_address, segment.byte_count, 0, 0,
+                                 resource.binding, ResourceClass::ConstantBuffer,
+                                 "cs", DataFormat::Unknown, 1u, false});
+        }
+    };
+    for (const ShaderResource& resource : table->resources) {
+        if (!valid_shader_buffer_table_contract(resource)) {
+            error = "resource has an invalid buffer descriptor-table dependency contract";
+            return false;
+        }
+        if (resource.scalar_buffer_dword_count &&
+            !shader_resource_buffer_binding_bytes(resource)) {
+            error = "resource has invalid scalar-buffer dependency metadata";
+            return false;
+        }
+    }
+    const DescriptorValidationReport reflected = validate_spirv_descriptor_interface(
+        compute.spirv, table, 0, SpirvShaderStage::Compute, false);
+    if (!compute.spirv.empty() && reflected.ok()) {
+        for (const auto& descriptor : reflected.descriptors) {
+            const ShaderResource* resource = table->by_binding(descriptor.binding);
+            if (!resource) continue;  // reflected.ok() normally makes this unreachable
+            if (resource->table_index_count) {
+                for (const ShaderBufferTableEntry& entry : resource->table_entries) {
+                    const uint64_t size = entry.size;
+                    if (!entry.gpu_addr || !size) continue;
+                    if (descriptor.readable)
+                        reads.push_back({entry.gpu_addr, size, 0, 0, resource->binding,
+                                         resource->cls, "cs", resource->format,
+                                         resource->num_components, resource->srgb});
+                    if (descriptor.writable)
+                        writes.push_back({0, entry.gpu_addr, size, 0, 0, false});
+                }
+                continue;
+            }
+            const uint64_t size = resource_size(*resource);
+            if (!resource->gpu_addr || !size) continue;
+            if (descriptor.readable)
+                reads.push_back({resource->gpu_addr, size, resource->width, resource->height,
+                                 resource->binding, resource->cls, "cs", resource->format,
+                                 resource->num_components, resource->srgb});
+            if (descriptor.writable)
+                writes.push_back({0, resource->gpu_addr, size, resource->width,
+                                  resource->height,
+                                  resource->cls == ResourceClass::StorageImage});
+        }
+        append_relocation_segments();
+        return true;
+    }
+
+    // Hand-built fixtures and legacy diagnostic captures may not carry a reflectable module.
+    // Preserve their historical conservative graph instead of hiding every resource.
+    if (!append_accesses(table, "cs", reads, error)) return false;
+    for (const auto& access : reads)
+        writes.push_back({0, access.addr, access.size, access.width, access.height,
+                          access.resource_class == ResourceClass::StorageImage});
+    append_relocation_segments();
+    return true;
+}
+
+} // namespace
+
+bool gpu_dependency_rtt_seed_matches(const GpuDependencyAccess& access,
+                                     const GpuCaptureRttSeed& seed) {
+    if (!access.addr || !access.width || !access.height || access.srgb ||
+        seed.guest_addr != access.addr || seed.width != access.width ||
+        seed.height != access.height)
+        return false;
+    switch (seed.format) {
+        case GpuCaptureColorFormat::Rgba8Unorm:
+            return access.format == DataFormat::Unorm8 && access.num_components == 4;
+        case GpuCaptureColorFormat::Rgba16Float:
+            return access.format == DataFormat::Float16 && access.num_components == 4;
+        case GpuCaptureColorFormat::R11G11B10Float:
+            return access.format == DataFormat::Float10_11_11 && access.num_components == 3;
+        case GpuCaptureColorFormat::R8Unorm:
+            return access.format == DataFormat::Unorm8 && access.num_components == 1;
+        case GpuCaptureColorFormat::R32Uint:
+            return access.format == DataFormat::Uint32 && access.num_components == 1;
+    }
+    return false;
+}
+
+bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
+                                GpuDependencyGraph& graph, std::string& error) {
+    graph = {};
+    error.clear();
+    std::unordered_map<uint64_t, const DrawItem*> draws;
+    std::unordered_map<uint64_t, const ComputeItem*> computes;
+    for (const auto& draw : replay.items) draws.emplace(draw.draw_index, &draw);
+    for (const auto& compute : replay.computes) computes.emplace(compute.dispatch_index, &compute);
+
+    std::vector<Writer> writers;
+    graph.nodes.reserve(replay.operations.size());
+    for (size_t operation_index = 0; operation_index < replay.operations.size(); ++operation_index) {
+        const auto& operation = replay.operations[operation_index];
+        graph.nodes.push_back({static_cast<uint32_t>(operation_index), operation.kind,
+                               operation.source_index, operation.command_order, operation.realized});
+        if (!operation.realized) continue;
+
+        std::vector<GpuDependencyAccess> reads;
+        std::vector<Writer> writes;
+        if (operation.kind == SubmitOperationKind::Draw) {
+            auto it = draws.find(operation.source_index);
+            if (it == draws.end()) {
+                error = "realized draw operation has no materialized item";
+                return false;
+            }
+            const DrawItem& draw = *it->second;
+            auto append_target = [&](uint64_t base, uint32_t width, uint32_t height,
+                                     uint32_t write_mask) {
+                if (!write_mask || !base || !width || !height ||
+                    std::any_of(writes.begin(), writes.end(),
+                        [&](const auto& write) { return write.addr == base; })) return;
+                writes.push_back({0, base, static_cast<uint64_t>(width) * height * 4,
+                                  width, height, true});
+            };
+            auto color_binding = [&](size_t slot) {
+                DrawItem::ColorTargetBinding binding = draw.color_targets[slot];
+                // Direct graph callers and captures through v33 may populate only the named aliases.
+                if (!binding.base && !binding.width && !binding.height && slot == 0)
+                    binding = {draw.color0_base, draw.color0_width, draw.color0_height};
+                else if (!binding.base && !binding.width && !binding.height && slot == 1)
+                    binding = {draw.color1_base, draw.color1_width, draw.color1_height};
+                return binding;
+            };
+            auto color_format = [&](size_t slot) {
+                const uint32_t format = draw.ps.color_targets[slot].format;
+                if (format || slot > 1) return format;
+                return slot == 0 ? draw.ps.color0_format : draw.ps.color1_format;
+            };
+            if (draw.ps.cb_resolve) {
+                // CB_COLOR_CONTROL.MODE=RESOLVE is fixed-function work, not a shader draw. The live
+                // backend copies color0 into the raw color1 identity even though the pixel shader
+                // exports nothing and color1_write_mask is therefore zero. Reading this as an
+                // ordinary draw makes the graph claim that color0 was written, leaves color1
+                // external, and reports the resolve's never-executed VS/PS resources as inputs.
+                const auto source = color_binding(0);
+                const auto destination = color_binding(1);
+                if (source.base && source.width && source.height) {
+                    const auto source_format = dependency_image_format(color_format(0));
+                    reads.push_back({source.base,
+                                     static_cast<uint64_t>(source.width) * source.height *
+                                         source_format.bytes_per_pixel,
+                                     source.width, source.height, 0, ResourceClass::Texture,
+                                     "resolve-src", source_format.format,
+                                     source_format.components, source_format.srgb});
+                }
+                append_target(destination.base, destination.width, destination.height, 0xf);
+            } else {
+                if (!append_accesses(draw.vrt.get(), "vs", reads, error) ||
+                    !append_accesses(draw.prt.get(), "ps", reads, error))
+                    return false;
+                for (size_t slot = 0; slot < draw.color_targets.size(); ++slot) {
+                    const auto target = color_binding(slot);
+                    append_target(target.base, target.width, target.height,
+                                  draw.ps.color_targets[slot].write_mask);
+                }
+                append_target(draw.color0_base, draw.color0_width, draw.color0_height,
+                              draw.ps.color_write_mask);
+                append_target(draw.color1_base, draw.color1_width, draw.color1_height,
+                              draw.ps.color1_write_mask);
+            }
+        } else if (operation.kind == SubmitOperationKind::Dispatch) {
+            auto it = computes.find(operation.source_index);
+            if (it == computes.end()) {
+                error = "realized dispatch operation has no materialized item";
+                return false;
+            }
+            if (!append_compute_accesses(*it->second, reads, writes, error)) return false;
+        } else {
+            if (operation.source_index >= replay.dma_copies.size()) {
+                error = "realized DMA operation has no materialized copy";
+                return false;
+            }
+            const ReplayDmaCopy& copy = replay.dma_copies[operation.source_index];
+            reads.push_back({copy.src, copy.bytes, 0, 0, 0,
+                             ResourceClass::ConstantBuffer, "dma-src"});
+            writes.push_back({0, copy.dst, copy.bytes, 0, 0, false});
+        }
+
+        for (const auto& access : reads) {
+            auto producer = std::find_if(writers.rbegin(), writers.rend(), [&](const Writer& writer) {
+                return writer_matches(access, writer);
+            });
+            if (producer == writers.rend()) {
+                auto leaf = std::find_if(graph.external_leaves.begin(), graph.external_leaves.end(),
+                    [&](const GpuDependencyLeaf& candidate) {
+                        return candidate.access.addr == access.addr &&
+                               candidate.access.size == access.size &&
+                               candidate.access.width == access.width &&
+                               candidate.access.height == access.height &&
+                               candidate.access.resource_class == access.resource_class &&
+                               candidate.access.format == access.format &&
+                               candidate.access.num_components == access.num_components &&
+                               candidate.access.srgb == access.srgb;
+                    });
+                if (leaf == graph.external_leaves.end())
+                    graph.external_leaves.push_back({access, {static_cast<uint32_t>(operation_index)}, UINT32_MAX});
+                else if (leaf->consumer_operations.empty() ||
+                         leaf->consumer_operations.back() != operation_index)
+                    leaf->consumer_operations.push_back(static_cast<uint32_t>(operation_index));
+            } else
+                graph.edges.push_back({producer->operation, static_cast<uint32_t>(operation_index), access});
+        }
+        for (auto write : writes)
+            if (write.addr && write.size) {
+                write.operation = static_cast<uint32_t>(operation_index);
+                writers.push_back(write);
+            }
+    }
+    for (auto& leaf : graph.external_leaves) {
+        const uint32_t first_consumer = leaf.consumer_operations.front();
+        auto future = std::find_if(writers.begin(), writers.end(), [&](const Writer& writer) {
+            return writer.operation >= first_consumer &&
+                   writer_matches(leaf.access, writer);
+        });
+        if (future != writers.end()) leaf.first_future_writer = future->operation;
+    }
+    return true;
+}
+
+} // namespace prosper::gpu

@@ -6,7 +6,7 @@
 // says not to rely on). It exercises the exact front-half -> back-half handoff: Dcb build -> PM4 ->
 // decode -> GpuState.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/command_processor.hpp"
+#include "gpu/pm4/command_processor.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>

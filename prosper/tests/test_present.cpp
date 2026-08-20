@@ -4,7 +4,7 @@
 // layer scans out the flipped buffer and reads back exactly its pixels. This proves the present
 // plumbing end-to-end headlessly — the surface the renderer will present real frames to.
 #include "../src/hle/dispatch.hpp"
-#include "../src/gpu/videoout_present.hpp"
+#include "gpu/present/videoout_present.hpp"
 #include "../src/host/lifecycle.hpp"
 #include <chrono>
 #include <cstdio>

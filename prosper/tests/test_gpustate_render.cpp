@@ -6,9 +6,9 @@
 // blobs at 256-byte-aligned addresses, encode those addresses into SPI_SHADER_PGM_{LO,HI}_{ES,PS}
 // (the RDNA2 (lo<<8)|((hi&0xff)<<40) convention), and let the bridge read them straight back out —
 // the same path a real submitted command buffer will drive once the boot clears resource residency.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/render_state.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/state/render_state.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>

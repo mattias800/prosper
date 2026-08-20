@@ -20,7 +20,7 @@
 
 #include <vulkan/vulkan.h>
 
-#include "gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 
 namespace prosper::frontend {
 

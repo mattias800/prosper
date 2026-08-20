@@ -13,7 +13,7 @@
 // call. A timing assertion would be flaky in CI, so these tests pin CORRECTNESS and the os_probe
 // count pins that the cache is actually engaged.
 
-#include "gpu/gpu_execute.hpp"
+#include "gpu/execute/gpu_execute.hpp"
 #include "host/guest_memory_map.hpp"
 
 #include <cstdint>

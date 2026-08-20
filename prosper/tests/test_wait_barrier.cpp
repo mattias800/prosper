@@ -19,9 +19,9 @@
 //   5. A barrier that never satisfies releases via the bounded timeout (liveness backstop), so a
 //      guest polling a gated label can wait at most one timeout.
 //   6. A SATISFIED wait is a pass-through no-op (the fast path every healthy frame takes).
-#include "../src/gpu/command_processor.hpp"
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/pm4_decode.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include "../src/hle/hle_kernel_time.hpp"
 #include <cstdio>
 #include <cstdint>

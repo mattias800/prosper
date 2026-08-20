@@ -18,7 +18,7 @@
 // The counter-arm is the same chain with the poison removed: it must report zero while the census
 // shows the same nodes were walked, so a pass cannot come from a scan that silently did nothing.
 
-#include "../src/gpu/mb3_freelist.hpp"
+#include "gpu/execute/mb3_freelist.hpp"
 
 #include <cstdio>
 #include <cstring>

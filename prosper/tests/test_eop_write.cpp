@@ -4,10 +4,10 @@
 // This hand-builds the exact packet layout hle_agc.cpp's builders emit (the
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
-#include "../src/gpu/command_processor.hpp"
-#include "../src/gpu/gpu_execute.hpp"
-#include "../src/gpu/mb3_freelist.hpp"
-#include "../src/gpu/pm4_decode.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/mb3_freelist.hpp"
+#include "gpu/pm4/pm4_decode.hpp"
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/guest_memory_topology.hpp"
 #include "../src/hle/nid.hpp"

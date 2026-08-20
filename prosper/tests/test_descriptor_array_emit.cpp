@@ -17,8 +17,8 @@
 //   4. THE CONTROL, and the one that makes the rest mean anything: an ordinary resource emits NONE of
 //      it. If the capability leaked into every module, arm 1 would pass for the wrong reason and every
 //      existing shader would start demanding an extension it does not use.
-#include "../src/gpu/rdna2_to_spirv.hpp"
-#include "../src/gpu/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <vector>

@@ -4,7 +4,7 @@
 // Vulkan boilerplate lives in one place. Header-only; the including test links Vulkan::Vulkan.
 #pragma once
 #include <vulkan/vulkan.h>
-#include "../src/gpu/rdna2_to_spirv.hpp"   // kComputeInternalGdsBinding
+#include "gpu/recompiler/rdna2_to_spirv.hpp"   // kComputeInternalGdsBinding
 #include <cstdint>
 #include <cstring>
 #include <vector>

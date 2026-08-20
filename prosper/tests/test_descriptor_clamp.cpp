@@ -14,7 +14,7 @@
 // This drift guard pins the exact ceilings (constructed from all-ones / max-field descriptor blobs) so
 // such a change fails loudly here first. Pure decode; no guest memory or GPU state involved.
 
-#include "../src/gpu/agc_shader_layout.hpp"
+#include "gpu/agc/agc_shader_layout.hpp"
 
 #include <cstdint>
 #include <cstdio>

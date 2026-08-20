@@ -4,9 +4,9 @@
 // Jump depth, direct-vs-indirect write path, and write-vs-draw order.  A plausible value alone is
 // not evidence of where it came from, so this test drives the real AGC packet builders and PM4
 // decoder, then checks the maps retained by the draw snapshots.
-#include "../src/gpu/command_processor.hpp"
-#include "../src/gpu/gpu_capture.hpp"
-#include "../src/gpu/pm4_registers.hpp"
+#include "gpu/pm4/command_processor.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include "../src/hle/dispatch.hpp"
 #include <algorithm>
 #include <array>

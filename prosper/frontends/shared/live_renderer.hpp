@@ -14,7 +14,7 @@
 #include "frame_dump_policy.hpp"
 #include "texture_decode_cache_policy.hpp"
 #include "texture_decode_diagnostic.hpp"
-#include "gpu/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
+#include "gpu/execute/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
 
 namespace prosper::frontend {
 

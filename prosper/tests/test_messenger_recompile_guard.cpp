@@ -15,7 +15,7 @@
 // NOT (unsupported), independent of any table. The #199-class regression flips an instruction the
 // Messenger uses into `unsupported`, which this test catches. The with-table recompile is covered by
 // the local golden-image snapshot guard (tools/snapshot, from #227); this is its dump-free CI half.
-#include "../src/gpu/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <string>

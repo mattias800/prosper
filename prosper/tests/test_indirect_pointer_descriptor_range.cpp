@@ -1,9 +1,9 @@
-#include "gpu/gpu_capture.hpp"
-#include "gpu/gpu_capture_bundle.hpp"
-#include "gpu/rdna2_decode.hpp"
-#include "gpu/rdna2_indirect_pointer_analysis.hpp"
-#include "gpu/rdna2_to_spirv.hpp"
-#include "gpu/shader_resources.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/capture/gpu_capture_bundle.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "../tools/gpu_replay/compute_recompile.hpp"
 
 #include <algorithm>

@@ -1,4 +1,4 @@
-#include "../src/gpu/writer_provenance.hpp"
+#include "gpu/capture/writer_provenance.hpp"
 
 #include <cstdio>
 #include <string>

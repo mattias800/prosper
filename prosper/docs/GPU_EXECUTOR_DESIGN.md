@@ -51,8 +51,8 @@ with "the app expects the driver to do the completion plumbing".
 
 ## Design — staged, each stage independently testable
 **Stage A — live device + execute on submit (no behavior risk; pure back-half wiring). DONE.**
-Implemented as the Vulkan-agnostic core `execute_gpustate()` (`src/gpu/gpu_execute.hpp`) plus the live-submit
-registry `set_submit_renderer`/`execute_and_present` (`src/gpu/gpu_executor.cpp`): whoever owns a device (the
+Implemented as the Vulkan-agnostic core `execute_gpustate()` (`src/gpu/execute/gpu_execute.hpp`) plus the live-submit
+registry `set_submit_renderer`/`execute_and_present` (`src/gpu/execute/gpu_executor.cpp`): whoever owns a device (the
 runtime binary at startup, or a test) registers a `LiveRenderFn`; `agc_driver_submit_dcb` calls
 `execute_and_present(state, present_width(), present_height())` after folding, gated on
 `have_submit_renderer() && draws>0`, so it is inert on the game path until a device is wired yet fully

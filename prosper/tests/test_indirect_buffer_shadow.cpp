@@ -1,5 +1,5 @@
-#include "gpu/rdna2_indirect_buffer_shadow.hpp"
-#include "gpu/shader_resources.hpp"
+#include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <array>
 #include <cstdint>

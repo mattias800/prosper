@@ -1,6 +1,6 @@
 // test_bc_decode — verify BC1/BC2/BC3 block decompression against hand-built blocks with known output.
 // Exit code 0 = pass. Pure, no Vulkan/game dump.
-#include "../src/gpu/bc_decode.hpp"
+#include "gpu/texture/bc_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
