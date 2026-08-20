@@ -110,6 +110,49 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **The offline dissection of `0x413dc6700` describes the EMPTY-SRT startup variant, not the hanging
+  one.** `dc6700.prgcap` was taken with `PROSPER_GPU_CAPTURE_COMPUTE_ADDR` and **no**
+  `PROSPER_GPU_CAPTURE_AT=`, so it fired inside the first-88-fold window that
+  § *The first 88 folds see an EMPTY SRT* describes. Measured on the derived disassembly: **45**
+  `StorageBuffer` variables declared, **exactly one** access chain into any of them, 980 Workgroup,
+  0 image ops — against **41** guest MUBUF sites (`shader_inspect` on the same raw dump). That is the
+  empty-SRT signature exactly, down to the single surviving non-MUBUF chain. Two consequences:
+  (a) the *"the pc88..97 cycle appears to TERMINATE"* reading is explained rather than in tension with
+  the device witness — the pointer chase folded to a constant, so the loop exits for that reason and
+  says nothing about the resolved variant; (b) the proposed ctest that embeds the program's 903 raw
+  dwords is **void as specified**, since raw dwords carry no descriptors and recompiling them
+  reproduces the terminating variant. `shader_inspect` states this on the dump itself:
+  `status=undetermined-no-resource-table`, `table_dependent=41`, and the rejection is
+  **unattributable**. Any arm must supply a *resolved* table. (2026-08-20, #2542.)
+
+- **`dispatch-range=N..M` in a `[cfg-trip-bound] HIT` line does NOT bound the runaway cycle.** It is an
+  atomic min/max over switch-case ordinals observed across *all* invocations of that dispatch, so a wave
+  that walks 0->8 and then spins, while other invocations run to the end, prints `0..14` — the whole
+  table — for a two-block cycle. Phase 0's dispatcher graph, derived from every write of the next-block
+  variable (the constant writes plus the taken/untaken pair the vote resolves), is:
+  `0->{1,6} 1->{2,3} 2->3 3->{4,5} 4->5 5->6 6->{7,11} 7->8 8->{9,10} 9->8 10->11 11->{12,13} 12->13
+  13->14 14->exit`. **The only cycle is 8<->9**; every other edge moves strictly forward and there is no
+  back edge to block 0. This is the third direction in which this witness's fields have been misread —
+  see trap 172. (2026-08-20, #2542.)
+
+- **"The vote never resolves, so the dispatcher re-enters the same block" is not the mechanism.** The
+  vote's final write of the next-block variable is guarded by a conjunction of the has-branch flag and
+  the negations of two others; those two are stored `false` in the phase preamble and never rewritten
+  anywhere in phase 0, while every branching block sets the has-branch flag, so the guard reduces to
+  that flag alone and the branch target *is* applied. (2026-08-20, #2542.)
+
+- **`robustBufferAccess` is enabled on the compute device, so "OOB buffer loads are undefined here" is
+  not available as an explanation for the traversal failing to terminate.** `live_compute.cpp` checks
+  `supported.robustBufferAccess`, refuses the device without it, sets `enabled.robustBufferAccess =
+  VK_TRUE`, and passes it through `pEnabledFeatures`. This matters because the guest loop's only exit is
+  the `v_cmpx_ne_u32` on the loaded link, so a load returning 0 past the record count is *what
+  terminates it on hardware*, and that contract is switched on. **Not checked, and still open:** whether
+  the bound descriptor **range** equals the V#'s `num_records x stride` on the compute path. Vulkan
+  bounds a robust access to the bound range, not to the guest's `NUM_RECORDS`, so a looser range would
+  return neighbouring bytes where hardware returns 0 — and the FLAT path already documents a deliberate
+  "loose-bounds divergence from HW" of exactly this kind. That end-to-end contract has no test.
+  (2026-08-20.)
+
 - **Any predicate over `num_records` or `size_bytes` is UNFALSIFIABLE on the `reach-story-mode`
   route — the run cannot contain a counterexample.** Four successive attempts to classify a
   runtime-selected descriptor-table record as "not a descriptor" were refuted (#2481): page
