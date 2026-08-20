@@ -2160,6 +2160,13 @@ if(TARGET prosper_core)
       target_link_libraries(test_cfg_trip_bound PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME cfg_trip_bound_exec COMMAND test_cfg_trip_bound)
 
+      # The same loop shape, but CHASING A REAL BUFFER through a V# -- the half test_cfg_trip_bound
+      # deliberately leaves out ("decrements the index instead of chasing a buffer").
+      add_executable(test_traversal_chase tests/gpu/recompiler/test_traversal_chase.cpp)
+      target_include_directories(test_traversal_chase PRIVATE tests)
+      target_link_libraries(test_traversal_chase PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME traversal_chase_exec COMMAND test_traversal_chase)
+
       # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
       add_executable(test_recompiled_fragment tests/gpu/recompiler/test_recompiled_fragment.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
