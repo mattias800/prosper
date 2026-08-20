@@ -50,7 +50,7 @@ the string's only occurrence, which is the exact failure a grep-able citation wa
 It happened to this very paragraph's flagship example. `tools/AGENTS.md` records the same class
 from the other direction: a doc that prettifies a literal defeats a grep for the line the tool
 actually printed.
-The two `CMakeLists.txt` line numbers below are the deliberate exception, and even those should be
+The `CMakeLists.txt` line numbers below are the deliberate exception, and even those should be
 confirmed by grepping the construct rather than trusted.
 
 **Do not confuse `src/gpu/diagnostics/` with `src/diagnostics/`.** They are different folders with
