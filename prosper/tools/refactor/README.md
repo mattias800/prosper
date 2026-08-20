@@ -62,7 +62,7 @@ function size. Measured after the recompiler split landed:
 
 | function | lines | file | share of its file |
 | --- | --- | --- | --- |
-| `register_live_renderer` | 8,222 | `frontends/shared/live/live_renderer.cpp` | 89% |
+| `register_live_renderer` | 8,221 | `frontends/shared/live/live_renderer.cpp` | 89% |
 | `emit_alu` | 7,544 | `src/gpu/recompiler/rdna2_emit_alu.cpp` | 97% |
 | `execute_item` | 4,536 | `frontends/shared/live/live_compute.cpp` | 47% |
 | `emit_cfg_state_machine` | 4,419 | `src/gpu/recompiler/rdna2_emit_cfg.cpp` | 64% |
@@ -83,7 +83,12 @@ caveats found by trying it:
   returns `nullptr` when a `LambdaExpr` is found — the comment is literally *"Don't extract from
   lambdas"*. `register_live_renderer` spans 8,221 lines of which **98.5%** is inside lambdas (8,101 of 8,221, from the AST — 89% is the
   file-share figure in the table above, a different number) passed to registration calls, so every candidate worth extracting is in refused territory.
-  `extract_function.py --probe` reports 0 of 10 accepted at its default bounds, and that is correct behaviour, not a bug.
+  `extract_function.py --probe` reports 0 of 10 accepted at its default bounds, and that is correct
+  behaviour, not a bug. **That figure alone does not establish it**: a hand-built lambda-free
+  25-line function also probes 0 of 1, while the same clangd session returns
+  `['Extract to function']` for a sub-range of it — so the zero is partly produced by the
+  candidate geometry this tool generates. The conclusion rests on clangd's own source and on the
+  hand-built lambda control, not on the count.
 
   Its other documented refusals matter for the same reason: **`requiresHoisting`** (*"cannot extract
   declarations that will be needed in the original function after extraction"*), an unmatched

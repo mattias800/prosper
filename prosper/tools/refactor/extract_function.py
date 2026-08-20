@@ -3,7 +3,7 @@
 
 The other tools here move whole declarations between files. They cannot make a FUNCTION smaller, and
 several functions in this codebase are the size of a normal source file on their own --
-`register_live_renderer` is 8,222 lines, 89% of live_renderer.cpp, so no amount of file-splitting
+`register_live_renderer` is 8,221 lines, 89% of live_renderer.cpp, so no amount of file-splitting
 touches it.
 
 Extract-method is the operation that does, and it is not something to hand-roll: deciding which
@@ -146,7 +146,7 @@ def candidates(path: pathlib.Path, func: str, flags: list[str], min_stmts: int,
         sys.exit(f"{func} has no body")
 
     # SCAN THE LAMBDA BODIES TOO -- that is where the lines actually are. register_live_renderer has
-    # 40 direct statements across 8,217 lines, because 19 of them are `auto x = [](...){ ... };` with
+    # 40 direct statements across the same 8,221 lines, because 19 of them are `auto x = [](...){ ... };` with
     # hundreds of lines inside. Treating only the top level as extractable finds one candidate: the
     # whole function.
     scopes = [body]
