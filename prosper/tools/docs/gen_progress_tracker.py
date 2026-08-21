@@ -34,6 +34,15 @@ The distinction the tool draws, and it is deliberate:
     fail the run, and the header of the generated file says which is which so a reader
     cannot mistake "-" for "the generator gave up".
 
+`FPS record:` is optional but STRICTLY VALIDATED when it is there, and that combination is
+deliberate. Making it required would break all 39 trackers at once on the day it landed, and
+the tool writes no file at all on any parse failure -- so a newly required field takes the
+whole projection down until every tracker is edited. But a framerate carried as free text
+degrades into a bare number within a release or two, and a bare framerate is not a
+measurement: it is meaningless without the resolution, what was on screen, which frontend
+measured it and when. So the line is optional, `none` is an explicit absence, and anything
+else must be the full form. A malformed one is a hard error that names the tracker.
+
 NOT DERIVED, AND WHY -- read before adding a column
 ---------------------------------------------------
 "Engine" and "latest verified master" were both considered and both deliberately LEFT
@@ -91,6 +100,39 @@ TITLE_RE = re.compile(r"^\[Game tracker\]\s+(?P<name>.+?)\s+\((?P<tid>PPSA\d{5})
 LADDER_HEADING_RE = re.compile(r"^#{2,3}\s+Progress ladder\s*$", re.M)
 RUNG_RE = re.compile(r"^-\s+\[(?P<mark>[ xX])\]\s+Rung\s+(?P<n>\d+)\b", re.M)
 ORACLE_RE = re.compile(r"^Oracle record:\s*(?P<value>\S.*?)\s*$", re.M)
+FPS_RE = re.compile(r"^FPS record:\s*(?P<value>\S.*?)\s*$", re.M)
+
+# The one accepted shape of a non-`none` FPS record. Semicolons separate the fields because a
+# GFM table cell splits on `|` and a comma is too likely to appear inside a scene description.
+#
+#   FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; screenshot; 2026-08-21
+#
+# `distinct` counts guest frames whose CONTENT changed; `presented` counts publications. Both are
+# required and the record is rejected if distinct exceeds presented, because that ordering is the
+# entire point: prosper re-publishes its retained frame when a submit produces no present source, so
+# a presented rate reads full speed for a frozen title (prosper/src/gpu/present/present_frame_rate.hpp,
+# instrument trap 90, #2783). A record carrying only one number could not show that, and a reader
+# would have no way to tell which number they had been given.
+FPS_RECORD_RE = re.compile(
+    r"^(?P<distinct>\d+(?:\.\d+)?)\s+distinct\s*/\s*(?P<presented>\d+(?:\.\d+)?)\s+presented"
+    r"\s+at\s+(?P<width>\d+)x(?P<height>\d+)"
+    r"\s*;\s*(?P<scene>[^;]+?)"
+    r"\s*;\s*(?P<frontend>[^;]+?)"
+    r"\s*;\s*(?P<date>\d{4}-\d{2}-\d{2})$"
+)
+
+FPS_FORM = ("FPS record: <distinct> distinct / <presented> presented at <W>x<H>; "
+            "<what was running>; <frontend>; <YYYY-MM-DD>")
+
+# Common resolutions get their usual short name so the column stays narrow; anything else is
+# printed verbatim rather than rounded to the nearest familiar label.
+RESOLUTION_NAMES = {
+    (3840, 2160): "4K",
+    (2560, 1440): "1440p",
+    (1920, 1080): "1080p",
+    (1600, 900): "900p",
+    (1280, 720): "720p",
+}
 BLOCKER_HEADING_RE = re.compile(r"^#{2,3}\s+Current blockers?\s*$", re.M | re.I)
 ANY_HEADING_RE = re.compile(r"^#{1,6}\s+", re.M)
 ISSUE_REF_RE = re.compile(r"#(\d{2,6})\b")
@@ -248,6 +290,61 @@ def _blocker_refs(body: str, self_number: int) -> list[int]:
     return seen
 
 
+def parse_fps_record(body: str, where: str, name: str) -> dict | None:
+    """Parse `FPS record:` -- absent, `none`, or the full form. Anything else is an error.
+
+    Returns None for "no line at all" and {"none": True} for an explicit `none`. The two are
+    rendered differently on purpose: `-` means nobody has written the line, `none` means somebody
+    looked and there is no measurement. That distinction is exactly what `Oracle record:` exists to
+    make for hardware comparisons (#2730), and it is worth as much here -- "we have never measured
+    this title" and "this title has no framerate worth recording" are different states, and a single
+    blank cell would collapse them.
+    """
+    lines = FPS_RE.findall(body)
+    if not lines:
+        return None
+    if len(lines) > 1:
+        raise ParseError(
+            "%s (%s): found %d 'FPS record:' lines, expected at most 1.\n"
+            "        Two records cannot both be current, and this tool will not guess which."
+            % (where, name, len(lines))
+        )
+    value = lines[0].strip()
+    if value == "none":
+        return {"none": True}
+
+    m = FPS_RECORD_RE.match(value)
+    if not m:
+        raise ParseError(
+            "%s (%s): the 'FPS record:' line does not match the required form.\n"
+            "        Found: %r\n"
+            "        Wanted: %s\n"
+            "        Or 'FPS record: none' if this title has no measurement. A bare number is\n"
+            "        rejected deliberately: a framerate without its resolution, its scene, the\n"
+            "        frontend that measured it and the date is not a measurement anybody can use."
+            % (where, name, value, FPS_FORM)
+        )
+    distinct = float(m.group("distinct"))
+    presented = float(m.group("presented"))
+    if distinct > presented:
+        raise ParseError(
+            "%s (%s): the 'FPS record:' line reports %.1f distinct frames per second against\n"
+            "        %.1f presented. Distinct publications are a SUBSET of publications, so this\n"
+            "        is either a transposed pair or two numbers from different runs."
+            % (where, name, distinct, presented)
+        )
+    return {
+        "none": False,
+        "distinct": distinct,
+        "presented": presented,
+        "width": int(m.group("width")),
+        "height": int(m.group("height")),
+        "scene": m.group("scene").strip(),
+        "frontend": m.group("frontend").strip(),
+        "date": m.group("date"),
+    }
+
+
 def parse_tracker(issue: dict, guards_by_title: dict[str, list[str]]) -> dict:
     number = issue["number"]
     where = "tracker #%d" % number
@@ -304,6 +401,9 @@ def parse_tracker(issue: dict, guards_by_title: dict[str, list[str]]) -> dict:
         )
     oracle = oracles[0].strip()
 
+    # --- optional, but strictly validated when present: the framerate record --------------
+    fps = parse_fps_record(body, where, name)
+
     # --- required: a blockers section (its CONTENT may legitimately be empty) ----------
     if _section(body, BLOCKER_HEADING_RE) is None:
         raise ParseError(
@@ -328,6 +428,7 @@ def parse_tracker(issue: dict, guards_by_title: dict[str, list[str]]) -> dict:
         "rung": max([i + 1 for i, t in enumerate(ticked) if t], default=0),
         "ladder": "".join(str(i + 1) if t else "-" for i, t in enumerate(ticked)),
         "oracle": oracle,
+        "fps": fps,
         "blocker_refs": _blocker_refs(body, number),
         "guards": guards_by_title.get(title_id, []),
         "status_doc": status_doc,
@@ -411,12 +512,44 @@ user-facing overview, and its markers are a chart, not a rung scale.
 | **Rung** | The highest **ticked** rung, 0 if none. |
 | **Ladder** | Every ticked rung, `-` for unticked. **The ladder is legitimately non-contiguous** on some titles -- PR #1696 and #1676 deliberately took titles from rung 3/4 to rung 6 without rung 5, because a reviewed gameplay guard is evidenced by its own route and thresholds and never depended on a hardware oracle. `1234-6` is a real state, not an editing slip. |
 | **Guard** | From `prosper/tools/snapshot/snapshots.json`, matched on title ID -- not from the tracker's prose, so it cannot disagree with the registry. |
+| **FPS** | The tracker's `FPS record:` line. `-` means **no tracker line exists**; `none` means somebody looked and there is no measurement. See below. |
 | **Oracle** | The tracker's `Oracle record:` line, verbatim. `none` means **no PS5 hardware comparison is on record** (see #2730). Not to be confused with `snapshots.json`'s `structural_references`, which are luminance signatures generated from prosper's own runs -- a *regression* reference, not a hardware oracle. |
 | **Open blockers** | Issues/PRs cited in the tracker's `## Current blocker(s)` section that are still open. Cited-and-closed entries are omitted; a tracker citing nothing shows `-`. |
 | **Status doc** | First `prosper/docs/*_STATUS.md` referenced by the tracker, else its first `prosper/docs/*.md`. `-` means the tracker references neither. |
 
 A `-` is an **explicit absence**, never a parse failure: the generator aborts on anything it
 cannot parse and writes no file at all, so a row that is present is a row that was read.
+
+### The FPS column: two numbers, and the first one is the honest one
+
+`**3.4** / 59.8 fps` reads **3.4 distinct frames per second, 59.8 publications per second**, and the
+gap between them is information rather than noise. prosper re-publishes the frame it retained
+whenever a submit produces no usable present source, and that re-serve goes through the ordinary
+publish path -- so a title whose picture is completely frozen keeps publishing at the display's
+rate. A framerate counted from publications reads **full speed for a frozen title**; that is
+instrument trap 90, and it is exactly the R-Type Delta regression #2783, which hid for nine days
+behind a healthy-looking present rate. **Quote the first number. When the two are far apart, the
+title has a defect and neither number is its framerate.**
+(`prosper/src/gpu/present/present_frame_rate.hpp` carries the argument in full.)
+
+The rest of the cell is not decoration: a framerate means nothing without its conditions. Resolution,
+what was on screen, and which frontend measured it all move the number by more than the differences
+anybody is trying to see, and a date is what stops a figure from a fixed-since regression being read
+as current.
+
+To record one, add exactly one line anywhere in the tracker body:
+
+```
+FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; screenshot; 2026-08-21
+FPS record: none
+```
+
+The line is **optional** -- a tracker without one renders `-` and parses fine -- but it is **strictly
+validated when present**, and a malformed one fails the whole run and names the tracker. That is on
+purpose: a required field would take the entire projection down the day it landed, while a loosely
+parsed one would decay into bare numbers, and a bare framerate is not a measurement. Get both rates
+from `tools/screenshot`'s summary line or the `distinct_fps` / `presented_fps` fields of its manifest,
+or from `prosper-app --fps`.
 
 """
 
@@ -441,6 +574,28 @@ def _cell(text: str) -> str:
     repo's own docs gate exists because six rows were truncated that way for months.
     """
     return text.replace("|", "\\|")
+
+
+def _fps_cell(fps: dict | None) -> str:
+    """Render one framerate record for the table.
+
+    BOTH rates are shown, distinct first and bold. Showing only the distinct rate would be tidier
+    and would throw away the diagnostic: a large gap between the two means prosper was re-publishing
+    a retained frame rather than the title running fast, which is a defect the table can surface for
+    free. No threshold is applied here on purpose -- a judgment call encoded in the generator would
+    be a second, drifting copy of the one in
+    prosper/src/gpu/present/present_frame_rate.hpp. The reader compares two numbers.
+    """
+    if fps is None:
+        return "-"
+    if fps["none"]:
+        return "none"
+    resolution = RESOLUTION_NAMES.get(
+        (fps["width"], fps["height"]), "%dx%d" % (fps["width"], fps["height"])
+    )
+    return "**%.1f** / %.1f fps · %s · %s · %s · %s" % (
+        fps["distinct"], fps["presented"], resolution, fps["scene"], fps["frontend"], fps["date"]
+    )
 
 
 def _issue_link(n: int) -> str:
@@ -470,12 +625,13 @@ def render(records: list[dict], ref_states: dict[str, str]) -> str:
         )
 
         rows.append(
-            "| %s | `%s` | %d | `%s` | %s | %s | %s | [#%d](%s) | %s |"
+            "| %s | `%s` | %d | `%s` | %s | %s | %s | %s | [#%d](%s) | %s |"
             % (
                 _cell(r["name"]),
                 r["title_id"],
                 r["rung"],
                 r["ladder"],
+                _cell(_fps_cell(r["fps"])),
                 _cell(guards),
                 _cell(oracle_cell),
                 ", ".join(_issue_link(n) for n in open_blockers) or "-",
@@ -486,8 +642,8 @@ def render(records: list[dict], ref_states: dict[str, str]) -> str:
         )
 
     table = (
-        "| Title | Title ID | Rung | Ladder | Guard | Oracle | Open blockers | Tracker | Status doc |\n"
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n" + "\n".join(rows) + "\n"
+        "| Title | Title ID | Rung | Ladder | FPS | Guard | Oracle | Open blockers | Tracker | Status doc |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n" + "\n".join(rows) + "\n"
     )
 
     by_rung: dict[int, int] = {}
@@ -563,6 +719,29 @@ def _issue(number=9001, title="[Game tracker] Example (PPSA99999)", body=_GOOD_B
     }
 
 
+# Column ordinal of the FPS cell in a rendered data row, counting the empty field before the leading
+# `|`. Kept beside render() so the two move together.
+_FPS_COLUMN = 5
+
+
+def _rendered_fps_cell(record: dict) -> str:
+    """The FPS cell of `record`'s row, extracted BY POSITION.
+
+    This is positional rather than a substring search over `render()`'s output, and that is not
+    fastidiousness -- the substring version was written first and was VOID. `render()` returns
+    HEADER + table + footer, and the header documents this column with a worked example, so
+    `"**3.4** / 59.8 fps" in render(...)` matched the prose no matter what the row contained: it
+    passed unchanged under a mutation that made the cell show only the presented rate. The same
+    applies to `"| - |"` and `"| none |"`, which the Guard, Oracle and Open-blockers columns produce
+    for the very fixture this arm uses.
+    """
+    rendered = render([record], {"4242": "OPEN", "4243": "CLOSED"})
+    for line in rendered.splitlines():
+        if line.startswith("| ") and record["title_id"] in line:
+            return line.split("|")[_FPS_COLUMN].strip()
+    return "<no row rendered>"
+
+
 def _parses(issue) -> tuple[bool, str]:
     try:
         return True, "" if parse_tracker(issue, {}) else ""
@@ -584,10 +763,82 @@ def selftest() -> int:
     if not ok:
         failures.append("compliant tracker was REJECTED: %s" % err)
 
+    # A tracker with NO `FPS record:` line must still parse. This arm is the one that stops the
+    # field being quietly promoted to required: 39 trackers have no line, and the tool writes no file
+    # at all on any parse failure, so a required field takes the whole projection down on day one.
+    ok, err = _parses(_issue(body=_GOOD_BODY))
+    if not ok:
+        failures.append("a tracker with no FPS record was REJECTED: %s" % err)
+    if parse_tracker(_issue(), {})["fps"] is not None:
+        failures.append("a tracker with no FPS record did not parse as absent")
+
+    fps_line = ("FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; "
+                "screenshot; 2026-08-21\n")
+    recorded = parse_tracker(_issue(body=_GOOD_BODY + fps_line), {})["fps"]
+    for field, got, want in [
+        ("fps.distinct", recorded["distinct"], 3.4),
+        ("fps.presented", recorded["presented"], 59.8),
+        ("fps.width", recorded["width"], 3840),
+        ("fps.height", recorded["height"], 2160),
+        ("fps.scene", recorded["scene"], "gameplay"),
+        ("fps.frontend", recorded["frontend"], "screenshot"),
+        ("fps.date", recorded["date"], "2026-08-21"),
+    ]:
+        if got != want:
+            failures.append("parsed %s = %r, expected %r" % (field, got, want))
+
+    none_record = parse_tracker(_issue(body=_GOOD_BODY + "FPS record: none\n"), {})["fps"]
+    if none_record != {"none": True}:
+        failures.append("'FPS record: none' did not parse as an explicit absence")
+
+    # `-` and `none` must RENDER differently, or the distinction the field exists to make is lost at
+    # the last step. This is the arm a "simplification" that collapsed them would fail.
+    absent_cell = _rendered_fps_cell(parse_tracker(_issue(), {}))
+    none_cell = _rendered_fps_cell(
+        parse_tracker(_issue(body=_GOOD_BODY + "FPS record: none\n"), {}))
+    if absent_cell != "-":
+        failures.append("a tracker with no FPS record rendered as %r, expected '-'" % absent_cell)
+    if none_cell != "none":
+        failures.append("'FPS record: none' rendered as %r, expected 'none'" % none_cell)
+
+    # Both numbers, distinct first and bold. A cell carrying only the presented rate would report a
+    # frozen title as fast, which is the whole reason this column stores two numbers (#2783).
+    recorded_cell = _rendered_fps_cell(parse_tracker(_issue(body=_GOOD_BODY + fps_line), {}))
+    if not recorded_cell.startswith("**3.4** / 59.8 fps"):
+        failures.append("the FPS cell is %r; it must LEAD with the distinct rate" % recorded_cell)
+    for condition in ("4K", "gameplay", "screenshot", "2026-08-21"):
+        if condition not in recorded_cell:
+            failures.append("the FPS cell dropped %r -- the number is meaningless without it"
+                            % condition)
+
     violations = [
         (
             "free-form issue title",
             _issue(title="Blue Prince progress"),
+        ),
+        (
+            "a bare FPS number with no conditions",
+            _issue(body=_GOOD_BODY + "FPS record: 3.4\n"),
+        ),
+        (
+            "an FPS record missing its date",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: 3.4 distinct / 59.8 presented at 3840x2160; gameplay; screenshot\n"),
+        ),
+        (
+            "an FPS record with only one rate",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: 3.4 fps at 3840x2160; gameplay; screenshot; 2026-08-21\n"),
+        ),
+        (
+            "more distinct frames than published ones",
+            _issue(body=_GOOD_BODY +
+                   "FPS record: 59.8 distinct / 3.4 presented at 3840x2160; gameplay; "
+                   "screenshot; 2026-08-21\n"),
+        ),
+        (
+            "two FPS records",
+            _issue(body=_GOOD_BODY + fps_line + fps_line),
         ),
         (
             "no ladder heading",
@@ -628,6 +879,7 @@ def selftest() -> int:
         ("title_id", rec["title_id"], "PPSA99999"),
         ("name", rec["name"], "Example"),
         ("oracle", rec["oracle"], "none"),
+        ("fps", rec["fps"], None),
         ("blocker_refs", rec["blocker_refs"], [4242, 4243]),
         ("guards", rec["guards"], ["example-guard"]),
         ("status_doc", rec["status_doc"], "prosper/docs/EXAMPLE_STATUS.md"),
