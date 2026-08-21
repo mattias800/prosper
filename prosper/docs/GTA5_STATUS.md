@@ -110,6 +110,39 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **`0x413dc6700`'s SRT slot dw0 carries a LOW-BIT TAG on exactly half its observations — and
+  prosper's GTA V packed-pointer path is never reached on this run.** `PROSPER_SRTDUMP=1` on a routed
+  run with the other three hangers declined:
+
+  | SRT slot | pointer observations | low bit set |
+  | --- | ---: | ---: |
+  | **dw0** | 2,140 | **1,074 (50%)** |
+  | dw12 | 88 | **0 (0%)** |
+
+  A 50/50 split on one slot and 0/88 on another is a **flag**, not corruption or misalignment — the
+  addresses read `…c1`, `…741`, `…8c1`, `…081`, each exactly +1 from the `…c0/…740/…8c0/…080` that
+  prosper's own writeback lines use for the same buffers, so prosper is already dropping the bit
+  somewhere. **1,793 of the dumps report `nz=2/2`** (non-empty payloads), so this is the resolved
+  regime and not the empty-SRT startup window that has voided earlier readings here.
+
+  **Why this is the most promising lead on the table.** This program is the one whose
+  register→base assignment splits into *two orientations* (§ *What the descriptor shape
+  establishes*, 144 folds against 120). A low bit that alternates 50/50 on the slot the five V#s are
+  built from is exactly the shape of a **double-buffer parity selector**. If it is one and prosper
+  masks it away, prosper resolves both orientations to the same buffer — which would make it read the
+  buffer being written and write the one being read. That is a producer/consumer gap by construction,
+  and it would explain, with one mechanism, why one buffer is always cyclic while its partner never
+  is, why prosper's own writes are clean 43/43, and why no *program* could ever be found to blame.
+
+  **`packed_pointer` logs zero lines in this run**, so `rdna2_gta5_packed_pointer.cpp` — prosper's
+  existing facility for exactly this class of GTA V pointer — is not engaged for this program.
+
+  **What is measured and what is not.** Measured: the counts above, the +1 relationship to the
+  writeback addresses, the non-empty regime, the zero packed-pointer hits. **Not** measured, and not
+  to be assumed: that the bit *means* parity, that masking it is wrong, or that honouring it would
+  change which buffer resolves. The next arm is direct — correlate the bit against the observed
+  orientation fold by fold; if the bit tracks the A/B split, it is the selector. (2026-08-21.)
+
 - **The overlapping views carry DIFFERENT STRIDES — 16 and 4 — over the same guest memory, and the
   four "ping-pong" buffers land at offsets 0, 8252, 33024 and 66044 from one span base.** Measured
   2026-08-21 from the binding declarations, all exact:
