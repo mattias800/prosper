@@ -9,7 +9,7 @@
 
 **Every screenshot checked into this repository, most recent first.** Read down from the top and stop when you reach one you have already seen.
 
-**137 images**, most recent **2026-08-20**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
+**138 images**, most recent **2026-08-21**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
 
 This file is generated from git history by [`prosper/tools/docs/gen_screenshot_feed.py`](prosper/tools/docs/gen_screenshot_feed.py) and is regenerated and diffed in CI, so it cannot drift from the tree. [`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table; this is only a reverse-chronological index of the images themselves.
 
@@ -17,6 +17,16 @@ This file is generated from git history by [`prosper/tools/docs/gen_screenshot_f
 > a claim about the title's current state — for that, read the tracker. An image is never
 > removed from this feed when a title moves on, because the point of a feed is that it is
 > a record of *when* things happened.
+
+## 2026-08-21
+
+### rtype-delta-stage1-restored.png
+
+<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.png" alt="rtype delta stage1 restored"></p>
+
+fix(recompiler): a saved wave-mask alias must not outlive its SGPR pair — R-Type Delta's whole post-title render, blank for nine days (#2799)
+
+`e653f271` · [`assets/screenshots/rtype-delta-stage1-restored.png`](assets/screenshots/rtype-delta-stage1-restored.png)
 
 ## 2026-08-20
 
