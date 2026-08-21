@@ -286,6 +286,18 @@ HLE(audiodec_create_decoder) {
         fprintf(stderr, "[audiodec] sceAudiodecCreateDecoder: no host codec backend installed\n");
         return kErrNoCodec;
     }
+    // Real hardware very likely requires sceAudiodecInitLibrary first, but nothing in the observed
+    // guest establishes that, and refusing on an unevidenced precondition would be inventing a
+    // contract. Report it once instead: if a title ever reaches here without initialising, that log
+    // line is the evidence needed to decide, and until then this stays a diagnostic.
+    if (!g_library_ready.load(std::memory_order_acquire)) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            fprintf(stderr, "[audiodec] sceAudiodecCreateDecoder called before a successful "
+                            "sceAudiodecInitLibrary. Proceeding -- prosper does not enforce an "
+                            "ordering it has no evidence for.\n");
+        });
+    }
     // The index -> Hz mapping is the published MPEG-4 table. An index the table cannot name means
     // the parameter block is not the layout recovered here, so refuse instead of decoding at a rate
     // nobody chose.
@@ -385,8 +397,12 @@ HLE(audiodec_decode) {
     std::vector<uint8_t> au(au_size);
     if (au_size && (!au_addr || !audio_read_bytes(au_addr, au.data(), au_size))) return kErrInvalid;
 
-    // Decode under the instance lock: the guest may run several streams, and a StreamDecoder holds
-    // parser and codec state that no two threads may advance concurrently.
+    // Decode under the registry lock. A StreamDecoder holds parser and codec state that no two
+    // threads may advance concurrently, and holding the registry lock also keeps the instance alive
+    // against a concurrent sceAudiodecDeleteDecoder. This serialises decoders against each other,
+    // which is coarser than it needs to be; the observed titles run one movie stream at a time, so
+    // splitting it into a per-instance lock is a change that should wait for a title that shows the
+    // contention rather than being made on principle.
     uint32_t produced_bytes = 0, consumed_bytes = 0, sample_rate = 0, channels = 0;
     std::vector<int16_t> pcm(pcm_capacity / sizeof(int16_t));
     {
