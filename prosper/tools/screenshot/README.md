@@ -139,8 +139,8 @@ rate, and that rate is not the title's gameplay framerate.** Measured on *The Me
 
 3.0 fps is a true average and a useless summary. The per-sample counters show why: the distinct rate
 is either ~15-23 fps or exactly 0, with nothing in between. 120 consecutive seconds sat on the title
-screen — a still image, where **not one of roughly 24,000 publications differed from its
-predecessor**, which is the counter working correctly on a genuinely static picture. Averaging that
+screen — a still image, across which **25,015 publications carried exactly one change**, which is
+the counter working correctly on a genuinely static picture. Averaging that
 against the animated stretches produces a number that describes neither.
 
 **No statistic repairs a mixed window; only a narrower window does.** A framerate means something

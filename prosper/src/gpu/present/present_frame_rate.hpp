@@ -32,7 +32,8 @@
 // Both rates above are averages over wall clock, and that makes them a bad summary of any route
 // that pauses. Measured on *The Messenger* over 380 s at native 1080p: `distinct 3.0 fps`, while the
 // per-sample counters show the rate was either ~15-23 fps or EXACTLY zero, with nothing in between
-// — 120 consecutive seconds of it a title screen where not one of ~24,000 publications differed.
+// — 120 consecutive seconds of it a title screen across which 25,015 publications carried exactly
+// ONE change.
 // 3.0 is a true average of a bimodal signal and describes neither mode. It also contradicts the
 // July performance pass, which measured this title's first level at 12-24 fps; a reader would
 // reasonably conclude a regression that never happened.

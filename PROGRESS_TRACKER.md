@@ -74,7 +74,7 @@ Three states, and the column has to keep them apart:
 already committed to that: measure `gameplay` over gameplay. Mixing regimes is what makes a
 framerate meaningless, and no choice of statistic repairs it -- *The Messenger* measured 3.0 fps
 averaged over 380 s while alternating between ~15-23 fps and **exactly zero**, including 120
-consecutive seconds where not one of roughly 24,000 publications differed from its predecessor. The
+consecutive seconds across which 25,015 publications carried exactly one change. The
 July performance pass measured that title's first level at 12-24 fps, so filing 3.0 would have
 manufactured a regression that never happened.
 
