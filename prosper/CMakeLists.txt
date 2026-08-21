@@ -153,6 +153,18 @@ if(Python3_Interpreter_FOUND)
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_SOURCE_DIR}/tools/test_worktree_reclaim.py")
   endif()
+
+  # lanekill SIGNALS processes, so its arms are refusals first: a process in another worktree, a
+  # path that attributes to nothing, and a lookalike directory sharing a name prefix. Same
+  # Linux-only reasoning as above and for the same reason -- attribution reads /proc, and without
+  # one the tool fails closed rather than guessing. That fail-closed path is the one arm that
+  # runs on every platform, because it is the property protecting the platforms that cannot run
+  # the rest.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME lanekill_tool
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_SOURCE_DIR}/tools/test_lanekill.py")
+  endif()
   add_test(NAME re_edis_mapping
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_edis.py")
   # nid_gate_scan answers "does this title BRANCH on an imported function's return value?", and a
