@@ -1172,6 +1172,24 @@ if(TARGET prosper_core)
   target_link_libraries(test_module_path_case PRIVATE prosper_core)
   add_test(NAME module_path_case COMMAND test_module_path_case)
 
+  # Module path policy: prosper links guest modules only from the dump locations it names
+  # (eboot.bin, sce_module/, Media/Modules/, Media/Plugins/), rejects everything else by default,
+  # and never links a Sony-named library out of the wholesale-auto-linked Media directories. Some
+  # dumps ship third-party replacements of libSceAppContent / libSceNpEntitlementAccess /
+  # libSceAmpr; loading one would shadow prosper's own implementation and answer the guest with
+  # somebody else's stub. Pure string policy plus one end-to-end arm against a temp tree.
+  add_executable(test_module_path_policy tests/host/image/test_module_path_policy.cpp)
+  target_include_directories(test_module_path_policy PRIVATE tests)
+  target_link_libraries(test_module_path_policy PRIVATE prosper_core)
+  add_test(NAME module_path_policy COMMAND test_module_path_policy)
+
+  # dump_hygiene classifies files in a game dump that prosper must never load, and can delete them.
+  # Its control arms matter more than its positive ones: during development it twice classified
+  # AUTHENTIC dump content as removable. The suite pins both regressions and the guards behind them.
+  add_test(NAME dump_hygiene_classifier
+           COMMAND ${Python3_EXECUTABLE} -m unittest tests.tools.test_dump_hygiene
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
   target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)

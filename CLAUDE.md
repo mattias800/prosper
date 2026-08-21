@@ -2,9 +2,9 @@
 
 ## What this project is
 
-**prosper is a PS5→PC compatibility layer — "Wine/Proton for PS5."** It runs a **legally-owned** PS5 game
-(*The Messenger*, `PPSA24651`) natively on Linux/Windows by reimplementing Sony's published user-space
-library interfaces and translating the console's GPU command stream + RDNA2 shaders to Vulkan/SPIR-V.
+**prosper is a PS5→PC compatibility layer — "Wine/Proton for PS5."** It runs PS5 games natively on
+Linux/Windows by reimplementing Sony's published user-space library interfaces and translating the
+console's GPU command stream + RDNA2 shaders to Vulkan/SPIR-V.
 
 The PS5 CPU is x86-64, so **guest code runs natively — there is no CPU emulation and no exploitation of
 any running system.** The engineering is: ELF/SELF loading, multi-module linking, ABI/API reimplementation
@@ -25,9 +25,23 @@ and target are what distinguish work like this from anything harmful — and her
 - **Interoperability & preservation, not exploitation.** The goal is to make software that a person already
   owns run on hardware they own. Nothing is attacked; nothing external or third-party is touched. Every
   tool runs against *this* emulator's own process.
-- **No DRM circumvention, no piracy.** The target dump's SELF segments are **already unencrypted**; the
-  project uses **no console keys, no signature bypass, no copy-protection defeat**. The game dump is the
-  developer's own legally-obtained copy, is **never redistributed**, and is gitignored.
+- **No DRM circumvention — and none delegated, either.** The project uses **no console keys, no
+  signature bypass, no copy-protection defeat**, and prosper contains no decryption of any kind. The
+  SELF segments it reads are already unencrypted, which is now *measured* rather than assumed: across
+  the whole local corpus every eboot carries plaintext code (Shannon entropy 6.4–6.8 bits/byte), and
+  the two dumps that preserve an untouched console original show that original at **8.000**,
+  indistinguishable from `/dev/urandom`. Game content is **never redistributed** and is gitignored.
+  The second half of this is the part that needs enforcing, because not circumventing is not enough on
+  its own. Some dumps ship third-party replacements of Sony libraries — `dlc_emu` and `ampr_emu` build
+  stand-ins for `libSceAppContent`, `libSceNpEntitlementAccess`, `libSceGameUpdate` and `libSceAmpr`
+  that answer platform queries from a local file. **prosper implements those APIs itself and refuses
+  to link any of them.** `src/host/image/module_path_policy.hpp` is a reject-by-default allowlist of
+  the dump locations a module may come from, applied at the one point where the link list is complete
+  and before anything parses a module, with no environment variable to switch it off;
+  `tests/host/image/test_module_path_policy.cpp` reddens if the guard is removed, and
+  `tools/dump_hygiene.py` finds such files on disk. An emulator that loaded somebody else's bypass
+  would be performing the circumvention by proxy — and would also invalidate its own measurements,
+  since the guest would then be answered by a stub instead of by prosper.
 - **No Sony code, firmware, or keys** are included or reproduced. prosper reimplements *published* library
   interfaces from scratch (clean-room-style), the way Wine reimplements the Win32 API.
 - **The low-level tooling** (`PROSPER_HWBP` hardware breakpoints, `fault_handler` SIGSEGV handling,
