@@ -68,7 +68,11 @@ deliberately broke the thing it was pinning — it was asserting "did the progra
 program does not compile for an unrelated reason, so it could never have failed. It asks the detector
 directly now.
 
-With both cleared, all three programs vanish from the skipped list — they recompile and they run:
+With both cleared, all three programs vanish from the skipped list — they recompile and they run.
+(Only one of the two is fixed here. The other is still open, so this measurement was taken with a
+throwaway build that waves the mip instruction through at level zero — deliberately wrong output,
+never merged, run where nothing is submitted. It answers "is anything else in the way", and the
+answer is no.)
 
 ```text
 before   [compute-census] 65536 dispatch decisions over 30 program(s)   13 programs listed, all executed=0

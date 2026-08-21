@@ -358,9 +358,18 @@ it generalise:
   table descriptor carries `DST_SEL = (X, 0, 0, 0)`, so a four-component fetch through it would return
   one stored dword and three constant zeroes.
 
-#2859, PR #2861. `tests/gpu/test_recompile_coverage.cpp` carries four arms, two of them negative
-(a converting format, and a non-identity DST_SEL), because without those the change is
-indistinguishable from "accept every MTBUF".
+#2859, PR #2861. `tests/gpu/test_recompile_coverage.cpp` carries **five programs and ten checks**,
+three of the programs negative controls — a converting format, a non-identity DST_SEL, and a branch
+target entering after the `s_getpc_b64` — because without those the change is indistinguishable from
+"accept every MTBUF". Each control is mutation-verified: breaking its predicate reddens its arms and
+nothing else.
+
+**Ask the detector, not the compile.** The branch-entry arm was first written as a
+`recompile_vertex(...).empty()` check and it passed under a mutation reverting the exact predicate it
+was meant to pin — that program does not compile anyway, because its forward branch is unlowerable,
+so the assertion could never have failed. `detect_pcrel_tables` is pure, so the arms call it directly
+and assert the recorded map. A recompile-outcome assertion cannot discriminate a change that only
+decides whether a table was recorded.
 
 ## Ruled out
 
