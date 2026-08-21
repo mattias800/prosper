@@ -1259,7 +1259,30 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
                 return source == 0 ? 1u : (source == 1 ? 2u : UINT32_MAX);
             if (in.opcode == 0x101)
                 return source < 2 ? 1u : 2u; // cndmask data is B32; condition is a pair
-            if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x347 ||
+            // B32 VOP3 forms, each of whose sources is ONE dword. The list is an allowlist over a
+            // deliberately fail-closed `return 2` default: every consumer of this width treats a
+            // wider answer as "prove more" (a pair read blocks `sgpr_dead_at_merge`'s
+            // MaskDomainOnly relaxation, and demands both physical words be MUST scalar data in the
+            // Wave64 transfer), so over-reporting only costs acceptances while under-reporting
+            // would be unsound. Entries are therefore added on evidence, one op at a time.
+            //
+            // V_LSHL_ADD_U32 is the direct sibling of V_ADD_LSHL_U32 below it and was the one
+            // missing: `D.u32 = (S0.u32 << S1.u32[4:0]) + S2.u32`, three 32-bit operands (RDNA2 ISA
+            // 70648). Sonic Frontiers' Cyber Space stage runs the byte-identical idiom in all three
+            // of its scene-target-width kernels (#2790) --
+            //
+            //     s_mul_i32      vcc_lo, s16, 12          VCC_LO as ordinary scalar scratch
+            //     s_mov_b64      s[6:7], exec
+            //     v_lshl_add_u32 v7, v6, 2, vcc_lo        a 32-BIT read of that scratch dword
+            //
+            // -- and charging that read the pair made the CFG dispatcher demand VCC_HI, which is a
+            // live mask half at that join and can never be a scalar word. All three declined with
+            // `wave64-ambiguous-mask-read`, then fell to the straight-line emitter, where the
+            // reported reject is whatever it reaches first: `s_cbranch_execz` at pc28 in two of them
+            // and `image_load_mip` at pc33 in the third. Neither is the defect -- the same
+            // "a reject PC names where a fact was consumed, not where it was lost" as #2481/#2801.
+            if (in.opcode == 0x141 || in.opcode == 0x143 ||
+                in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
                 in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||
                 in.opcode == kVop3OpcodeAndOrB32)
                 return 1;

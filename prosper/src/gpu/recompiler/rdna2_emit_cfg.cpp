@@ -6416,7 +6416,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // The neighbouring `[compute-cfg]` line prints `structured_wave=` as a single bool, which
         // cannot name a conjunct at all.
         if (b.is_compute && exact_compute_wave_cfg && !structured_compute_wave_cfg &&
-            getenv("PROSPER_DBG") && b.diagnostic.program_address != 0) {
+            recompile_diagnostic_verbose(b.diagnostic.program_address) &&
+            b.diagnostic.program_address != 0) {
             const char* outcome =
                 !allow_cfg_dispatcher
                     ? "dispatcher withheld for this sub-stream; emission continues here"
@@ -6448,7 +6449,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                              (unsigned long long)b.diagnostic.program_address, c.first, outcome);
             }
         }
-        if (b.is_compute && cfg_branches && getenv("PROSPER_DBG"))
+        if (b.is_compute && cfg_branches && recompile_diagnostic_verbose(b.diagnostic.program_address))
             std::fprintf(stderr,
                          "[compute-cfg] branches=%zu backedge=%d dispatch_safe=%d complex=%d "
                          "structured_ifs=%zu loops=%zu cf_rejected=%d exact_wave=%d "
@@ -6457,7 +6458,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                          Fs.size(), Ls.size(), cf_rejected, exact_compute_wave_cfg,
                          structured_compute_wave_cfg,
                          b.local_count, b.wave_size);
-        if (graphics_cfg && cfg_branches && getenv("PROSPER_DBG"))
+        if (graphics_cfg && cfg_branches && recompile_diagnostic_verbose(b.diagnostic.program_address))
             std::fprintf(stderr,
                          "[graphics-cfg] stage=%s branches=%zu backedge=%d complex=%d "
                          "structured_ifs=%zu loops=%zu cf_rejected=%d\n",

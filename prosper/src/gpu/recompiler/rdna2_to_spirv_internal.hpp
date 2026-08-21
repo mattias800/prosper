@@ -82,6 +82,41 @@ inline void record_terminal_reject_reason(uint64_t program_address, const char* 
     reasons[program_address] = std::string(tag) + " " + payload;
 }
 
+// Is the VERBOSE recompiler diagnostic stream enabled for this guest program?
+//
+// `PROSPER_DBG` turns it on for every program, which is the right default for a focused offline
+// repro and the wrong one for a routed title: the stream is ~1.5 GB on a Sonic Frontiers arm and
+// slow enough to desync the pad script that reaches the phase being diagnosed. So the one question
+// an investigation actually has -- "which route declined THIS program, on the run that reaches it"
+// -- was the question the instrument could not be pointed at, and offline reproduction is not a
+// substitute: `shader_inspect` supplies a default `ComputeShaderConfig` and no resource table, so
+// the MUST dataflow starts from an empty scalar-word set and can decline at a site the live
+// translation never reaches.
+//
+// `PROSPER_DBG_PROGRAM=0x2005717e00[,0x...]` enables the same lines for the listed program
+// addresses only. Parsed once into a function-local static: this predicate sits on the reject path
+// of every recompile, and re-reading the environment per call is the cost #2214 removed elsewhere.
+inline bool recompile_diagnostic_verbose(uint64_t program_address) {
+    static const bool all = std::getenv("PROSPER_DBG") != nullptr;
+    if (all) return true;
+    static const std::vector<uint64_t> selected = [] {
+        std::vector<uint64_t> out;
+        const char* list = std::getenv("PROSPER_DBG_PROGRAM");
+        if (!list) return out;
+        for (const char* cursor = list; *cursor;) {
+            char* end = nullptr;
+            const unsigned long long value = std::strtoull(cursor, &end, 0);
+            if (end == cursor) break;            // not a number: stop rather than spin
+            out.push_back(static_cast<uint64_t>(value));
+            cursor = end;
+            while (*cursor == ',' || *cursor == ' ') ++cursor;
+        }
+        return out;
+    }();
+    if (selected.empty() || !program_address) return false;
+    return std::find(selected.begin(), selected.end(), program_address) != selected.end();
+}
+
 inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnostic,
                               const char* tag, const char* role, const char* format, ...) {
     // Formatted BEFORE the PROSPER_DBG gate: the terminal reason has to be recorded whether or not
@@ -101,7 +136,7 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
     if (role && std::strcmp(role, "consequent") != 0)
         record_terminal_reject_reason(diagnostic.program_address, tag, payload);
 
-    if (!std::getenv("PROSPER_DBG")) return;
+    if (!recompile_diagnostic_verbose(diagnostic.program_address)) return;
     size_t payload_size = std::strlen(payload);
     while (payload_size && (payload[payload_size - 1] == '\n' ||
                             payload[payload_size - 1] == '\r'))

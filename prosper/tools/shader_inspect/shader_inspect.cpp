@@ -162,6 +162,30 @@ int main(int argc, char** argv) {
                 config.wave_size = static_cast<uint32_t>(std::strtoul(wave, nullptr, 0));
             if (const char* native = std::getenv("PROSPER_SHADER_INSPECT_NATIVE_SUBGROUP"))
                 config.native_subgroup_size = static_cast<uint32_t>(std::strtoul(native, nullptr, 0));
+            // A default-constructed config launches with NO user SGPRs and no workgroup-id
+            // registers, so every SGPR the guest reads as a launch input is absent from the
+            // recompiler's initial RegState -- and the Wave64 MUST dataflow therefore starts with an
+            // empty scalar-word set. That is not a neutral simplification: an ordinary
+            // `s_add_i32 vcc_lo, s14, 1` then has a non-scalar source, VCC_LO never becomes a MUST
+            // scalar word, and the analysis declines at a site the live translation never reaches.
+            // A reader who does not know that reads the decline as a shader defect. These make the
+            // launch shape supplied rather than assumed; leave them unset for the historical
+            // behaviour.
+            if (const char* user = std::getenv("PROSPER_SHADER_INSPECT_USER_SGPRS"))
+                config.user_sgprs.assign(std::strtoul(user, nullptr, 0), 0u);
+            if (const char* tgid = std::getenv("PROSPER_SHADER_INSPECT_TGID")) {
+                config.tgid_x_en = std::strchr(tgid, 'x') != nullptr;
+                config.tgid_y_en = std::strchr(tgid, 'y') != nullptr;
+                config.tgid_z_en = std::strchr(tgid, 'z') != nullptr;
+            }
+            if (const char* local = std::getenv("PROSPER_SHADER_INSPECT_LOCAL")) {
+                char* cursor = nullptr;
+                config.local_x = static_cast<uint32_t>(std::strtoul(local, &cursor, 0));
+                if (cursor && *cursor)
+                    config.local_y = static_cast<uint32_t>(std::strtoul(cursor + 1, &cursor, 0));
+                if (cursor && *cursor)
+                    config.local_z = static_cast<uint32_t>(std::strtoul(cursor + 1, &cursor, 0));
+            }
             spirv = recompile_compute(words.data(), words.size(), nullptr, config);
         }
         stage_ok = !spirv.empty();
