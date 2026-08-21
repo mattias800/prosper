@@ -159,6 +159,7 @@ of its manifest.
 | Judgment | `PPSA02739` | 0 | `------` | none | - | none | - | [#2880](https://github.com/mattias800/prosper/issues/2880) | - |
 | Little Nightmares II | `PPSA02154` | 0 | `------` | none | - | none | - | [#2884](https://github.com/mattias800/prosper/issues/2884) | - |
 | Metaphor: ReFantazio | `PPSA20800` | 0 | `------` | none | - | none | - | [#2876](https://github.com/mattias800/prosper/issues/2876) | - |
+| PGA TOUR 2K25 | `PPSA17952` | 0 | `------` | none | - | none | [#2894](https://github.com/mattias800/prosper/issues/2894) | [#2895](https://github.com/mattias800/prosper/issues/2895) | [`PGA_TOUR_2K25_STATUS.md`](prosper/docs/PGA_TOUR_2K25_STATUS.md) |
 | Sifu | `PPSA03001` | 0 | `------` | none | - | none | - | [#2885](https://github.com/mattias800/prosper/issues/2885) | - |
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | - | [#2867](https://github.com/mattias800/prosper/issues/2867) | - |
 | Spacebase Startopia | `PPSA02846` | 0 | `------` | none | - | none | - | [#2887](https://github.com/mattias800/prosper/issues/2887) | - |
@@ -175,8 +176,8 @@ of its manifest.
 | 3 -- gameplay with the scene rendering | 8 |
 | 2 -- title screen | 14 |
 | 1 -- any real graphics | 1 |
-| 0 -- not started | 11 |
+| 0 -- not started | 12 |
 
-**4 of 50** trackers record a PS5 hardware-oracle comparison; the rest carry
+**4 of 51** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
