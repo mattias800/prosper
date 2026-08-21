@@ -154,6 +154,7 @@ of its manifest.
 | The Plucky Squire | `PPSA15319` | 2 | `12----` | - | - | none | [#1390](https://github.com/mattias800/prosper/issues/1390) | [#1882](https://github.com/mattias800/prosper/issues/1882) | [`GAME_COMPAT_ORCHESTRATION.md`](prosper/docs/GAME_COMPAT_ORCHESTRATION.md) |
 | Sonic Origins | `PPSA05325` | 1 | `1-----` | - | - | none | [#2267](https://github.com/mattias800/prosper/issues/2267), [#2731](https://github.com/mattias800/prosper/issues/2731), [#1905](https://github.com/mattias800/prosper/issues/1905), [#1720](https://github.com/mattias800/prosper/issues/1720) | [#1871](https://github.com/mattias800/prosper/issues/1871) | [`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) |
 | ArcRunner | `PPSA21406` | 0 | `------` | - | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/ARCRUNNER_STATUS.md) |
+| Judgment | `PPSA02739` | 0 | `------` | none | - | none | - | [#2880](https://github.com/mattias800/prosper/issues/2880) | - |
 | Metaphor: ReFantazio | `PPSA20800` | 0 | `------` | none | - | none | - | [#2876](https://github.com/mattias800/prosper/issues/2876) | - |
 | Sniper Ghost Warrior Contracts 2 | `PPSA03130` | 0 | `------` | none | - | none | - | [#2867](https://github.com/mattias800/prosper/issues/2867) | - |
 | Yakuza Kiwami | `PPSA31334` | 0 | `------` | none | - | none | - | [#2864](https://github.com/mattias800/prosper/issues/2864) | - |
@@ -167,8 +168,8 @@ of its manifest.
 | 3 -- gameplay with the scene rendering | 8 |
 | 2 -- title screen | 13 |
 | 1 -- any real graphics | 1 |
-| 0 -- not started | 4 |
+| 0 -- not started | 5 |
 
-**4 of 42** trackers record a PS5 hardware-oracle comparison; the rest carry
+**4 of 43** trackers record a PS5 hardware-oracle comparison; the rest carry
 `Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
