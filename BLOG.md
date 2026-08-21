@@ -35,6 +35,63 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-21
 
+### Our first CryEngine title deadlocks 81 ms in, on a library it never asked for
+
+No picture this time — the interesting thing about *Sniper Ghost Warrior Contracts 2* (`PPSA03130`)
+is that there was nothing to photograph, and *why* there was nothing.
+
+The first boot attempt produced no screenshots, no log past the renderer line, and an empty
+manifest. That is a shape worth recognising, because it reads like a defect and is not one: the run
+had been killed from outside. `tools/screenshot --timeout` cannot fire during boot — the deadline is
+checked inside the sampling loop, and that loop is only reached after `boot_program()` returns.
+`boot_program()` ends by running the guest's own module initialisers, so a title can sit inside it
+forever with the tool's own limit inoperative.
+
+prosper has recorded seven boot phases for a long time. It turned out **no build the project ships
+could print any of them** — the feature was compile-time optional, the default build excluded the
+whole folder from `prosper_core`, `enable()` was never called anywhere in the tree, and nothing
+subscribed to the event bus. Four independent reasons, any one sufficient. `PROSPER_BOOTPHASE=1` now
+prints them, and the answer arrived in one run:
+
+```text
+[bootphase] +80.6ms MODULES_MAPPED
+[bootphase] +81.0ms STUBS_INSTALLED
+[bootphase] +81.1ms GUEST_INITS_RUNNING     <- and BOOT_COMPLETE never comes
+```
+
+Not slow, not starved — **stuck**. Over 221 s the process used 0.00 s of CPU and read 0 bytes, with
+every thread parked in a futex. `guest_bt` named the frame: the `module_start` of
+`sce_module/libSceNpCppWebApi.prx`, a library this title **does not import** (its own NP library is
+the unrelated `libSceNpWebApi2`). prosper preloads it because the file exists, under a rule added for
+*Sonic Origins*, which really does import it. Remove that one file from the tree and the same binary
+reaches `BOOT_COMPLETE` in 70 ms and runs.
+
+So a module preloaded for one title had been silently wedging another, and the fix is to preload it
+only when something actually imports it.
+
+Which raised the obvious question a reviewer asked and I had not: *how many titles does that change?*
+I had checked two. The answer is a census — of 47 dumps here, 42 ship that PRX, 40 keep it, and two
+lose it: this title, and **Sonic Frontiers**, which nobody had looked at and which has no snapshot
+guard to notice. It appears to be harmless (import resolution is by NID, and not one of the 41,638
+NIDs that module exports is imported by anything in Frontiers' link graph) but "appears to be" is the
+honest phrasing, and a confirming boot of Frontiers belongs to the lane that owns it. A flag on a
+shared list is never a two-title question.
+
+Behind that wall the title is still at rung 0, and honestly so. On the real dump with the fix in, it
+boots in 91 ms, streams its assets, and drives a 4K present loop at ~21 flips a second — while prosper
+composites exactly nothing. Every sample is a raw guest scanout: one distinct colour, zero non-black
+pixels, `published_frames=0`. Two runs on two different trees agree, so it is not an artifact. The
+next wall is that no pass produces a present source at all — an ordinary graphics problem, and a much
+better place to be than a deadlock.
+
+One footnote worth keeping, because it nearly became a finding. Mid-run the thing looked *parked*: 1 %
+CPU, no disk reads, eighteen threads asleep, and exactly one of them — Wwise's `AK::BankManager` —
+blocked on a mutex while everything else waited on conditions. That asymmetry reads like a deadlock
+with a culprit's name attached. It wasn't; the run resumed thirty seconds later. The box was 70-90 %
+I/O-stalled by an unrelated archive extraction the whole time, and a warm page cache meant the "no
+disk reads" number was measuring the wrong thing entirely — the read *syscalls* were climbing fine.
+A mutex wait is not proof of a deadlock. The holder may just be slow.
+
 ### Sonic Frontiers' black world had two locks on the door, not one
 
 No picture in this one — the world is still black. What changed is that we now know how far away it
@@ -86,6 +143,7 @@ yesterday and was not true yesterday. And we know what it has to read: the guest
 write each one, plus one whole-chain view to read the finished thing back. The levels are sitting in
 guest memory the whole time, at offsets prosper already computes correctly for each of those twelve
 single-level descriptors. It just has never been able to look at them together.
+
 
 ### The Messenger's title screen runs at 206 fps and 0 fps at the same time
 

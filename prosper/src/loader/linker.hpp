@@ -29,6 +29,30 @@ struct LinkInput {
     // module handle it was asked through. Deduplicating on filename cannot see that (the names
     // genuinely differ); deduplicating on exports is what the hazard actually is.
     bool skip_on_export_collision = false;
+
+    // This input is a bundled SUPPORT PRX that is only worth loading when another module actually
+    // imports it by name. Skip it entirely — no image, no exports, no init function — when no other
+    // accepted input names its library in its own import table.
+    //
+    // Distinct from `skip_on_export_collision`, and NOT a rule that may be generalised to the other
+    // optional preloads above it. The Unity FMOD/Wwise/PSN plugins are preloaded precisely BECAUSE
+    // nothing imports them statically: they are reached through `sceKernelDlsym` P/Invoke at
+    // runtime, so they appear in no import table and this test would wrongly drop every one of them.
+    // It applies only where the preload exists to satisfy a real static import.
+    //
+    // The hazard it removes is that loading a module is not free and not silent: prosper runs its
+    // `module_start`, which is guest code. *Sniper Ghost Warrior Contracts 2* (PPSA03130) ships
+    // `sce_module/libSceNpCppWebApi.prx` and never imports it — its own NP library is the unrelated
+    // `libSceNpWebApi2` — and that module's `module_start` deadlocks in a condition wait 81 ms into
+    // the boot, before `run_entry`, taking the whole title to rung 0. The preload was added for
+    // *Sonic Origins*, which does import it and keeps it.
+    //
+    // **Setting this flag changes every title that ships the file, so census them.** For this one:
+    // of 47 dumps, 42 ship it, 40 keep it, and **two** lose it — PPSA03130 and `PPSA03831`
+    // *Sonic Frontiers*, which is a tracked title with no snapshot guard. See
+    // `loader/support_modules.hpp` for the full census and the NID-overlap analysis behind
+    // "believed safe".
+    bool only_if_imported = false;
 };
 
 struct Program {

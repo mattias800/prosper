@@ -2,6 +2,7 @@
 
 #include "context.hpp"
 #include "event_bus.hpp"
+#include "../boot_phase_log.hpp"
 
 namespace prosper::diagnostics {
 
@@ -60,6 +61,10 @@ void DiagnosticContext::clear() {
 }
 
 void record_boot_phase(BootPhase phase) {
+    // Logged unconditionally of the context's enabled_ flag, and BEFORE recording: the phase line
+    // is the only part of this subsystem that is reachable in a default build, and gating it on a
+    // flag that nothing in the tree ever sets is how it came to be unreachable in the first place.
+    log_boot_phase(static_cast<unsigned>(phase));
     DiagnosticContext::instance().record_phase(phase);
 }
 
