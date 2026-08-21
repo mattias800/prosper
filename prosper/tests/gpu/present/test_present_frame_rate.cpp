@@ -250,6 +250,15 @@ void a_title_that_pauses_reports_its_producing_rate() {
           "distinguishable from fast-then-idle only because both numbers are reported");
     CHECK(slow_rate.typical_fps < rate.typical_fps && slow_rate.active_fraction > rate.active_fraction,
           "the slow title and the paused title differ in BOTH fields, in opposite directions");
+
+    // THE C++ HALF OF A CROSS-LANGUAGE CONTRACT. gen_progress_tracker.py's grammar accepts
+    // "<n> fps while producing frames, <n>% active" because that is what this function prints, and
+    // its selftest pins the ACCEPTING side. Nothing there can observe this formatter, so if the
+    // wording changed the Python arm would keep passing while the grammar silently stopped accepting
+    // the tool's own output -- which is exactly the defect that grammar was fixed for. This is the
+    // side that can move, so this is where it is pinned.
+    CHECK(format_frame_rate(rate).find(" fps while producing frames,") != std::string::npos,
+          "the summary phrasing gen_progress_tracker.py's FPS_RECORD_RE accepts is still emitted");
 }
 
 // The recovered rate must match a known input to within the tolerance the header states. Without

@@ -72,6 +72,13 @@
 // THIS module could have told you that, and a black-screened title rendering a changing black
 // screen would report exactly the same 95%.
 //
+// It is equally blind to whether frames are NOVEL or merely alternating, and that shape is likelier
+// to fool a reader because it produces a textbook-clean measurement. "Distinct" here means "differs
+// from the IMMEDIATELY PRECEDING publication", so a title flipping A,B,A,B at 60 Hz reports ~60 fps
+// typical at ~100% active with perfect homogeneity — which is also what a two-frame flicker, a stale
+// double-buffered pair, or an alternating composite looks like. **The metric answers "did the bytes
+// change", never "was progress made".**
+//
 // Content is `tools/screenshot`'s job and it already measures it: `distinct_rgb_colors` and
 // `nonblack_rgb_pixels` per sample, and the pixel-distinct assertions. Pair a rate with those before
 // believing a scene was rendered — a framerate is a statement about time, never about pixels.
@@ -147,11 +154,13 @@ constexpr size_t kFrameSignatureBytesPerBlock = 16;
 //
 // THE GROWTH FACTOR IS THE ACCURACY OF EVERY FRAMERATE THIS MODULE REPORTS, and the bound is
 // analytic rather than tuned. A true interval anywhere in a bucket is reported as that bucket's
-// geometric midpoint sqrt(lo*hi), and the bucket spans [lo, lo*growth], so the worst case is at
-// either edge and equals sqrt(growth) - 1 exactly:
+// geometric midpoint sqrt(lo*hi), and the bucket spans [lo, lo*growth], so the error is largest at
+// an edge -- and the two edges are NOT symmetric. A true interval at the lower edge is over-reported
+// by sqrt(growth) - 1; one at the upper edge is under-reported by 1/sqrt(growth) - 1, which is
+// smaller. The bound below is the larger of the two, attained at the lower edge only:
 //
-//     growth 1.10  ->  sqrt(1.10) - 1  =  4.88%     <- chosen
-//     growth 1.25  ->  sqrt(1.25) - 1  = 11.80%
+//     growth 1.10  ->  +4.88% at the lower edge, -4.65% at the upper     <- chosen
+//     growth 1.25  ->  +11.80%              ,     -10.56%
 //
 // 1.25 was the first choice and it was too coarse: it recovered a known 1.000 fps signal as 1.106
 // fps, caught by the accuracy arm below. These figures get filed in game trackers and compared

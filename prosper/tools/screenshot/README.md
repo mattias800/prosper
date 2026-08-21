@@ -154,9 +154,12 @@ describing a title screen.
 the rate is worth quoting; well below means it was not.
 
 **It is not a check that anything was on screen.** "95% active" means frames kept *changing*, not
-that they showed a scene — a title rendering a changing black screen reads as 95% active. Pair the
-rate with `distinct_rgb_colors` / `nonblack_rgb_pixels` and open the PNGs before claiming a scene was
-rendered. A framerate is a statement about time, never about pixels.
+that they showed a scene — a title rendering a changing black screen reads as 95% active. It is also
+blind to whether frames are *novel*: "distinct" means "differs from the immediately preceding
+publication", so a title flipping between two images at 60 Hz reports ~60 fps at ~100% active, which
+is a perfectly clean measurement of a flicker. **The metric answers "did the bytes change", never
+"was progress made".** Pair the rate with `distinct_rgb_colors` / `nonblack_rgb_pixels` and open the
+PNGs before claiming a scene was rendered.
 
 ```bash
 python3 - <<'EOF'

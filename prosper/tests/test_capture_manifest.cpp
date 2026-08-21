@@ -390,6 +390,12 @@ int main() {
         prosper::gpu::PresentRateSnapshot live;
         live.published = 600; live.distinct = 600;
         live.first_publication_seconds = 0; live.now_seconds = 10.0;
+        // Without these two the snapshot leaves `typical_interval_seconds` at 0, and EVERY fixture in
+        // this block would exercise only the emitter's unmeasured branch -- so the branch that writes
+        // a real rate would be executed by no test in the suite.
+        live.typical_interval_seconds = 1.0 / 60.0;
+        live.active_seconds = 9.8;
+        live.interval_samples = 599;
         const prosper::gpu::FrameRate live_rate =
             prosper::gpu::frame_rate_since_first_publication(live);
 
@@ -408,6 +414,14 @@ int main() {
               live_summary.find("\"frame_rate_measured\":true") != std::string::npos &&
               live_summary.find("\"mostly_unchanged\":false") != std::string::npos,
               "a live title's summary reports both rates at ~60 fps");
+        // The HEADLINE fields, in the artifact machines read. Everything else about the `--`
+        // contract has an arm -- both formatters, and the tracker cell positionally -- and this is
+        // the one consumer that had none.
+        CHECK(live_summary.find("\"typical_fps\":60.000") != std::string::npos &&
+              live_summary.find("\"typical_fps_measured\":true") != std::string::npos &&
+              live_summary.find("\"interval_samples\":599") != std::string::npos &&
+              live_summary.find("\"active_fraction\":0.9800") != std::string::npos,
+              "the measured branch of the emitter writes the typical rate and its active share");
 
         const std::string frozen_summary = manifest_summary_json(
             5, 5, SamplingStop::RequestSatisfied, tracker, ok_verdict, running, false, frozen_rate);
@@ -424,6 +438,19 @@ int main() {
         CHECK(unmeasured.find("\"frame_rate_measured\":false") != std::string::npos &&
               unmeasured.find("\"distinct_fps\":0.000") != std::string::npos,
               "a run that published nothing reports NOT MEASURED rather than a confident 0 fps");
+        // `null`, not 0.000. This is the canonical silently-revertible change: fold the if/else back
+        // into a plain `<<` for tidiness and the measurement returns with nothing reddening.
+        CHECK(unmeasured.find("\"typical_fps\":null") != std::string::npos &&
+              unmeasured.find("\"typical_fps_measured\":false") != std::string::npos,
+              "an ABSENT typical rate is spelled null, never as a rate of zero");
+        // ...and the stream state must not leak out of that branch onto the next field.
+        CHECK(unmeasured.find("\"typical_interval_seconds\":0.000000") != std::string::npos,
+              "the field after the null is still formatted with its own precision");
+
+        // A frozen title reaches the manifest through the same branch, which is the case the whole
+        // `--` contract exists for.
+        CHECK(frozen_summary.find("\"typical_fps\":null") != std::string::npos,
+              "a frozen title's typical rate is null in the manifest too");
 
         CaptureObservation timed;
         timed.width = 1920; timed.height = 1080;
