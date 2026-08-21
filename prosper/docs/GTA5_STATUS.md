@@ -110,6 +110,39 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **The cyclic table holds STRUCTURED data, not uninitialised garbage — and every cycle sampled is a
+  2-CYCLE between a pair of records whose words differ only in bit 30.** `[parentscan-ring]` samples
+  from the run that took the device loss (2026-08-21):
+
+  ```
+  idx=412 word=0x00000cf2 -> next=414      idx=414 word=0x40000ce2 -> next=412
+  idx=420 word=0x00000d32 -> next=422      idx=422 word=0x40000d22 -> next=420
+  idx=428 word=0x00000d72 -> next=430      idx=430 word=0x40000d62 -> next=428
+  ```
+
+  Read against the guest's own extract (`v_bfe_u32 v1, v1, 3, 27` at pc95 — bits [3:29], so bit 30 is
+  masked off): `0x00000cf2 >> 3 = 414` and `0x40000ce2 >> 3 & 0x7ffffff = 412`. The pair points at
+  itself.
+
+  **What the shape rules out.** Every sampled word carries low-three-bits `= 2` and each pair
+  differs by exactly `0x10` in the index field and by bit 30 (`0x40000000`); the pairs are
+  `(n, n+2)` and the pairs themselves are spaced 8 apart. Uninitialised memory does not look like
+  this, and neither does a random functional graph — whose cycle-length distribution would not be
+  uniformly 2. So **"prosper never populated this allocation" is dead**, and so is "the traversal
+  walks noise". The records are real and regular.
+
+  **What it does not establish**, and this is where the next session should start rather than
+  assume: whether bit 30 is a flag the *consumer* is meant to honour (a parent/last-sibling marker,
+  say), whether the traversal is reading the intended field at all, or whether prosper's V# base or
+  stride for this binding is off by a record so that each entry returns its neighbour's link. All
+  three produce exactly this signature. The guest's own extract ignores bit 30, so if the pairing is
+  real data correctly read, the same 2-cycle would hang a PS5 — which makes "correctly read" the
+  least likely of the three and puts the *addressing* of this binding first in line.
+
+  Cheap next arm: dump the same records through a different binding's view of that memory (§ *four
+  span granularities*, above) and compare — if the neighbouring 33,024-byte view yields different
+  words at the same guest addresses, the addressing is wrong; if identical, the data is. (2026-08-21.)
+
 - **A STABLE 840 s baseline exists: decline all FOUR hanging programs and the route runs clean, with
   a composite that never stales.** Measured 2026-08-21, `tools/screenshot`,
   `PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700,0x413e14900,0x413e16400,0x413d88400`:
