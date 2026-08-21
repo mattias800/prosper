@@ -1281,6 +1281,12 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             // reported reject is whatever it reaches first: `s_cbranch_execz` at pc28 in two of them
             // and `image_load_mip` at pc33 in the third. Neither is the defect -- the same
             // "a reject PC names where a fact was consumed, not where it was lost" as #2481/#2801.
+            //
+            // Known remainder, recorded rather than fixed: `0x345`, `0x363`, `0x364`, `0x372` and
+            // `0x178` are B32 VOP3 forms still falling to the default. No live title has been
+            // observed reading a mask half through one, so they stay out of the list under the
+            // add-on-evidence rule above -- but the next investigation that meets one has the set
+            // rather than re-deriving it (review of #2820).
             if (in.opcode == 0x141 || in.opcode == 0x143 ||
                 in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
                 in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||

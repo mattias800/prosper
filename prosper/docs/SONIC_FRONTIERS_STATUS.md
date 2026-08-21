@@ -156,22 +156,39 @@ of the recognised provably-zero shapes. `rdna2_emit_alu.cpp` only ever specialis
 proving the mip is zero and the resource is single-level; a 12-mip resource has no such proof, so it
 declines. Implementing it means lowering a real guest LOD, not widening the proof —
 `CLAUDE.md`'s standing rule applies: do not make the reject accept by substituting a plausible
-constant. Tracked as
-[#2818](https://github.com/mattias800/prosper/issues/2818), which records why the existing
-"prove the mip is zero" route cannot simply be widened: the live backend creates every guest
-texture and storage image with **`ici.mipLevels = 1`** — hard-coded, at the single
-`VkImageCreateInfo` for guest images (`frontends/shared/live/live_compute.cpp:7089`) — so there is
-no chain for a nonzero LOD to address. `declared_mip_levels` is parsed from the T# and used only as
-a decline *guard*, never to build one.
+constant, and there is a specific trap
+behind that here. Tracked as [#2818](https://github.com/mattias800/prosper/issues/2818).
+
+**What the renderer can and cannot do with mips today**, because getting this wrong sends the next
+investigation to the wrong file:
+
+* The **graphics** path does build chains, gated to plain-2D (`img_dim == 1`), depth-1, non-storage,
+  non-RTT, RGBA8 sampled textures declaring `declared_mip_levels > 1`
+  (`tests/fixtures/render_runner.h:6044-6055` — that file is the live offscreen Vulkan backend,
+  included by `frontends/shared/live/live_renderer.cpp:39`). `tests/gpu/test_texture_mip_render.cpp`
+  is a registered ctest asserting a declared 3-level chain samples level 2.
+* The **compute** path does not: its single `VkImageCreateInfo` for guest images sets
+  `ici.mipLevels = 1` unconditionally (`frontends/shared/live/live_compute.cpp:7089`).
+* **And the graphics chain is GENERATED, not uploaded.** Staging carries level 0 only; levels
+  1..N-1 come from a linear-filtered `vkCmdBlitImage` cascade at upload time
+  (`render_runner.h:6257-6259`, `:7245`).
+
+Frontiers' resource misses that gate on two counts at once — it is `img_dim=5` (2D_ARRAY) and it is
+a compute binding. But the third bullet is the one that matters most for whoever takes #2818:
+widening the gate would produce levels **synthesized by downsampling level 0**, not the guest's own
+mip data. That would render, and it would be wrong, in the exact way the "no plausible constants"
+rule exists to prevent.
 
 **The census did not move when the MUST defect was fixed** — 14 programs, all `executed=0`, before
 and after at the same denominator — and neither did the composite. Both were measured, not assumed.
 
 ## Ruled out
 
-Thirteen rows, one line per falsified hypothesis with the evidence that killed it. Read this before
-forming a new one. The first row is this document's own; the other twelve were established on #1968
-/ #2023 and are copied here so they survive those issues being closed.
+One line per falsified hypothesis with the evidence that killed it. Read this before forming a new
+one. Twelve of them were established on #1968 / #2023 and are copied here so they survive those
+issues being closed; the rest belong to this document. **Do not restate the row count in this
+paragraph** — every lane that adds a row has to remember to update it, and the last one did not
+(review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |

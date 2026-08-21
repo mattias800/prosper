@@ -179,12 +179,29 @@ int main(int argc, char** argv) {
                 config.tgid_z_en = std::strchr(tgid, 'z') != nullptr;
             }
             if (const char* local = std::getenv("PROSPER_SHADER_INSPECT_LOCAL")) {
+                // Each axis must parse to a non-zero extent. A silently-accepted zero would be
+                // worse than the default it replaced: a workgroup of 0 is not a launch shape any
+                // guest has, and the whole point of this switch is to stop the tool reasoning from
+                // a shape nobody supplied (review of #2820).
                 char* cursor = nullptr;
-                config.local_x = static_cast<uint32_t>(std::strtoul(local, &cursor, 0));
-                if (cursor && *cursor)
-                    config.local_y = static_cast<uint32_t>(std::strtoul(cursor + 1, &cursor, 0));
-                if (cursor && *cursor)
-                    config.local_z = static_cast<uint32_t>(std::strtoul(cursor + 1, &cursor, 0));
+                unsigned long axis[3] = {config.local_x, config.local_y, config.local_z};
+                const char* at = local;
+                bool ok = true;
+                for (int i = 0; i < 3 && ok; ++i) {
+                    axis[i] = std::strtoul(at, &cursor, 0);
+                    ok = cursor != at && axis[i] != 0;
+                    if (!ok || !*cursor) break;
+                    at = cursor + 1;
+                }
+                if (!ok) {
+                    std::fprintf(stderr,
+                                 "PROSPER_SHADER_INSPECT_LOCAL='%s' is not XxYxZ with non-zero "
+                                 "extents -- the launch shape is left at its default\n", local);
+                } else {
+                    config.local_x = static_cast<uint32_t>(axis[0]);
+                    config.local_y = static_cast<uint32_t>(axis[1]);
+                    config.local_z = static_cast<uint32_t>(axis[2]);
+                }
             }
             spirv = recompile_compute(words.data(), words.size(), nullptr, config);
         }

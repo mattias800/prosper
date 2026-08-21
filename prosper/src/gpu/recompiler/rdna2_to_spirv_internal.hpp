@@ -28,6 +28,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -96,6 +97,16 @@ inline void record_terminal_reject_reason(uint64_t program_address, const char* 
 // `PROSPER_DBG_PROGRAM=0x2005717e00[,0x...]` enables the same lines for the listed program
 // addresses only. Parsed once into a function-local static: this predicate sits on the reject path
 // of every recompile, and re-reading the environment per call is the cost #2214 removed elsewhere.
+// (The `PROSPER_DBG` latch is therefore also read once, where its two remaining neighbours in
+// `rdna2_emit_cfg.cpp` still call `getenv` per site. Only a mid-process `setenv` could tell the
+// difference, and nothing in prosper does that.)
+//
+// Each comma-separated element goes through `parse_diagnostic_uint64` -- the same strict parser
+// every other PROSPER_* selector uses -- rather than a local `strtoull`. A hand-rolled loop accepts
+// a malformed separator by stopping at it, so `PROSPER_DBG_PROGRAM=0xA;0xB` would silently select
+// only the first address and the run would look like the second program simply never compiled.
+// A rejected element is announced and the whole list refused, because a diagnostic that quietly
+// narrows its own selector is the class of instrument this file exists to avoid (review of #2820).
 inline bool recompile_diagnostic_verbose(uint64_t program_address) {
     static const bool all = std::getenv("PROSPER_DBG") != nullptr;
     if (all) return true;
@@ -103,13 +114,25 @@ inline bool recompile_diagnostic_verbose(uint64_t program_address) {
         std::vector<uint64_t> out;
         const char* list = std::getenv("PROSPER_DBG_PROGRAM");
         if (!list) return out;
-        for (const char* cursor = list; *cursor;) {
-            char* end = nullptr;
-            const unsigned long long value = std::strtoull(cursor, &end, 0);
-            if (end == cursor) break;            // not a number: stop rather than spin
-            out.push_back(static_cast<uint64_t>(value));
-            cursor = end;
-            while (*cursor == ',' || *cursor == ' ') ++cursor;
+        const std::string_view text(list);
+        size_t start = 0;
+        while (start <= text.size()) {
+            size_t comma = text.find(',', start);
+            if (comma == std::string_view::npos) comma = text.size();
+            std::string_view element = text.substr(start, comma - start);
+            while (!element.empty() && element.front() == ' ') element.remove_prefix(1);
+            while (!element.empty() && element.back() == ' ') element.remove_suffix(1);
+            uint64_t value = 0;
+            if (!parse_diagnostic_uint64(element, value)) {
+                std::fprintf(stderr,
+                             "[recompile-diag] PROSPER_DBG_PROGRAM element '%.*s' is not a program "
+                             "address -- the whole selector is ignored rather than silently "
+                             "truncated\n",
+                             static_cast<int>(element.size()), element.data());
+                return std::vector<uint64_t>{};
+            }
+            out.push_back(value);
+            start = comma + 1;
         }
         return out;
     }();
