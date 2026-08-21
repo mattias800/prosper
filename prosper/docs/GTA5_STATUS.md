@@ -146,6 +146,19 @@ conclusion; it sharpens what "essentially all black" looks like.
   starting point with a working recipe, not as a contradiction. The artifact is retained on the dev
   box so the survey does not need another 14-minute route run. (2026-08-21.)
 
+  **Cost note for whoever runs the full survey — do NOT scan operations blindly.** Each
+  `--output-target-after` invocation re-loads the whole `.prgcap` (116 MB for one submit here), so a
+  descending scan over a 300-operation submit is 300 full loads for a single target. A sweep written
+  that way does not finish. Take the writing draw index `D` straight out of the `--inspect-only`
+  listing instead and scan the narrow window `D .. D+80`: operation and draw indices differ only by
+  the number of interleaved computes, measured at +5 in one submit here and +17 in another, so a
+  window that size is generous. The addresses to cover are the ones whose draws carry a non-zero
+  `cwm`; in this frame's post chain that is `0x2056740000`, `0x2058720000`, `0x205a700000`,
+  `0x205f1a0000`, `0x205fa20000`, `0x20602a0000`, plus `0x215ed10000` and `0x20471e0000`. And record
+  the extent the dump ACTUALLY returned: `0x205f1a0000` declares `extent=3840x2160` on its draws and
+  came back 1920x1080 at operation 61, so an address does not pin a resolution within a frame.
+  (2026-08-21.)
+
 - **`0x413dc6700`'s SRT slot dw0 carries a LOW-BIT TAG on exactly half its observations — and
   prosper's GTA V packed-pointer path is never reached on this run.** `PROSPER_SRTDUMP=1` on a routed
   run with the other three hangers declined:
