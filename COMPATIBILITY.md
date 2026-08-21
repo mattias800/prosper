@@ -66,6 +66,7 @@ Last updated: 2026-08-17
 | *Beneath* | `PPSA27640` | Unity / IL2CPP | 🚧 Opening dive gameplay aboard the science ship | [#1898](https://github.com/mattias800/prosper/issues/1898) |
 | *Yakuza Kiwami* | `PPSA31334` | Ryu Ga Gotoku (PAR) | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2864](https://github.com/mattias800/prosper/issues/2864) |
 | *Sniper Ghost Warrior Contracts 2* | `PPSA03130` | CryEngine | 🔬 Rung 0 — boots in 91 ms and drives a 4K present loop at ~21 flips/s, but every frame is black: no pass produces a present source ([#2871](https://github.com/mattias800/prosper/issues/2871)). The boot deadlock in a preloaded PRX the title never imports is fixed | [#2867](https://github.com/mattias800/prosper/issues/2867) |
+| *Metaphor: ReFantazio* | `PPSA20800` | Atlus GFD | 🔬 Not yet booted — dump added 2026-08-21, nothing run against it | [#2876](https://github.com/mattias800/prosper/issues/2876) |
 
 ## At a glance
 
@@ -86,7 +87,7 @@ land here first.
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
 | **Not yet booted** — dump present, never run | 2 |
-| Total tracked | 41 |
+| Total tracked | 42 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is
