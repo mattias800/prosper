@@ -18,6 +18,7 @@
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/execute/mb3_freelist.hpp"   // #1226: per-submit POOLSHIFT window probe
+#include "hle/graphics/render_cadence.hpp"  // #2837: is a requested render cadence actually sparse?
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1854,6 +1855,62 @@ void start_defer_watchdog() {
 }
 }
 
+// How a requested render cadence actually resolved, per draw submit.
+//
+// PROSPER_RENDER_EVERY asks for a sparse phase, but `ordered_dma_requires_render` below can override
+// it per submit, and a title whose every draw submit also carries a retained DMA copy therefore gets
+// NO sparse phase at all while still reporting `every=N` everywhere. That failure is silent in both
+// directions that matter: throughput does not improve, and the frames are cadence-1 frames, so an
+// agent who set the variable to accelerate a long intro concludes the intro is simply slow.
+//
+// The periodic line is opt-in (PROSPER_RENDER_CADENCE_LOG). The one-shot warning is NOT: an inert
+// accelerator is exactly the case that must announce itself, because nothing else in the run does.
+static void report_render_cadence(unsigned requested_cadence, bool cadence_wanted_skip,
+                                  bool overridden) {
+    static const bool log_enabled = getenv("PROSPER_RENDER_CADENCE_LOG") != nullptr;
+    constexpr uint64_t kLogInterval = 2048;           // periodic line, opt-in
+    constexpr uint64_t kWarnAfterSkipsWanted = 256;   // enough to be a rate, not a coincidence
+    // Cadence 1 with logging off is the default path of every ordinary run: there is no sparse phase
+    // to be inert and no line to print, so take nothing on the submit path. This also means the
+    // counters freeze where PROSPER_RENDER_EVERY_FOR_MS hands the cadence back, which is the honest
+    // denominator for a "% of requested skips" figure -- the cadence-1 tail requested no skips.
+    if (requested_cadence <= 1 && !log_enabled) return;
+    static std::mutex mu;
+    static prosper::RenderCadenceCounters counters;
+    static bool warned = false;
+
+    prosper::RenderCadenceCounters snapshot;
+    bool warn_now = false, log_now = false;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        ++counters.draw_submits;
+        if (cadence_wanted_skip) ++counters.skips_wanted;
+        if (overridden) ++counters.dma_forced;
+        snapshot = counters;
+        if (!warned && prosper::render_cadence_is_inert(requested_cadence, counters,
+                                                        kWarnAfterSkipsWanted))
+            warned = warn_now = true;
+        log_now = log_enabled && (counters.draw_submits % kLogInterval) == 0;
+    }
+
+    if (warn_now)
+        fprintf(stderr,
+                "[render-cadence] WARNING: PROSPER_RENDER_EVERY=%u is INERT on this title -- a "
+                "retained DMA copy forced a full render on all %llu of the first %llu submits the "
+                "cadence asked to skip. This run's throughput and frames are a cadence-1 run's; do "
+                "not read it as an accelerated one.\n",
+                requested_cadence, (unsigned long long)snapshot.dma_forced,
+                (unsigned long long)snapshot.skips_wanted);
+    if (log_now)
+        fprintf(stderr,
+                "[render-cadence] draw_submits=%llu cadence_now=%u skips_wanted=%llu "
+                "dma_forced=%llu (%.1f%% of requested skips)\n",
+                (unsigned long long)snapshot.draw_submits, requested_cadence,
+                (unsigned long long)snapshot.skips_wanted,
+                (unsigned long long)snapshot.dma_forced,
+                prosper::render_cadence_override_percent(snapshot));
+}
+
 static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned& draw_submits) {
     // Native-speed semantic capture happens before renderer sampling. PROSPER_RENDER_EVERY and
     // warmup may skip Vulkan work, but must not erase submit/present history from the timeline.
@@ -1892,9 +1949,17 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // cannot discard that producer and then let DMA read the previous cached target version.
     const bool ordered_dma_requires_render = !st.dma_copies.empty() && !st.draws.empty();
     bool render = false;
+    bool cadence_overridden = false;
     if (gpu::have_submit_renderer() && !st.draws.empty()) {
         const bool cadence_render = (draw_submits++ % cadence) == 0;
         render = ordered_dma_requires_render || cadence_render;
+        const bool cadence_wanted_skip = !cadence_render;
+        cadence_overridden = ordered_dma_requires_render && cadence_wanted_skip;
+        // A requested sampling cadence that never actually skips is INVISIBLE without this: the run
+        // behaves as if PROSPER_RENDER_EVERY were unset, its throughput and frames are a cadence-1
+        // run's, and every other line still says "every=N". Report the cadence actually in effect so
+        // an accelerated route can PROVE it was accelerated instead of assuming it (#2837).
+        report_render_cadence(cadence, cadence_wanted_skip, cadence_overridden);
     }
     if (!render) {
         if (!st.dispatches.empty() || !st.dma_copies.empty()) {
