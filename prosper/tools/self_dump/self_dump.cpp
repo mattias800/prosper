@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
     // standard tags or Sony's DT_SCE_* aliases for the same tables, so both are read and the
     // standard tag wins when a module declares both.
     // CONFIDENCE: HIGH for the standard tags (every dump checked uses them);
-    // CONFIDENCE: MED for the DT_SCE_* aliases — no title in testdata/ exercises them, so they are
+    // CONFIDENCE: MED for the DT_SCE_* aliases — no title in the local corpus exercises them, so they are
     // a documented fallback rather than a verified path, and --import-slots names which tag it read.
     uint64_t jmprel_va = 0, jmprel_sz = 0, rela_va = 0, rela_sz = 0, relaent = 24;
     bool jmprel_sce = false, rela_sce = false;
