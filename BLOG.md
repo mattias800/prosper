@@ -35,6 +35,48 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 
 ## 2026-08-21
 
+### Our first CryEngine title deadlocks 81 ms in, on a library it never asked for
+
+No picture this time — the interesting thing about *Sniper Ghost Warrior Contracts 2* (`PPSA03130`)
+is that there was nothing to photograph, and *why* there was nothing.
+
+The first boot attempt produced no screenshots, no log past the renderer line, and an empty
+manifest. That is a shape worth recognising, because it reads like a defect and is not one: the run
+had been killed from outside. `tools/screenshot --timeout` cannot fire during boot — the deadline is
+checked inside the sampling loop, and that loop is only reached after `boot_program()` returns.
+`boot_program()` ends by running the guest's own module initialisers, so a title can sit inside it
+forever with the tool's own limit inoperative.
+
+prosper has recorded seven boot phases for a long time. It turned out **no build the project ships
+could print any of them** — the feature was compile-time optional, the default build excluded the
+whole folder from `prosper_core`, `enable()` was never called anywhere in the tree, and nothing
+subscribed to the event bus. Four independent reasons, any one sufficient. `PROSPER_BOOTPHASE=1` now
+prints them, and the answer arrived in one run:
+
+```text
+[bootphase] +80.6ms MODULES_MAPPED
+[bootphase] +81.0ms STUBS_INSTALLED
+[bootphase] +81.1ms GUEST_INITS_RUNNING     <- and BOOT_COMPLETE never comes
+```
+
+Not slow, not starved — **stuck**. Over 221 s the process used 0.00 s of CPU and read 0 bytes, with
+every thread parked in a futex. `guest_bt` named the frame: the `module_start` of
+`sce_module/libSceNpCppWebApi.prx`, a library this title **does not import** (its own NP library is
+the unrelated `libSceNpWebApi2`). prosper preloads it because the file exists, under a rule added for
+*Sonic Origins*, which really does import it. Remove that one file from the tree and the same binary
+reaches `BOOT_COMPLETE` in 70 ms and runs.
+
+So a module preloaded for one title had been silently wedging another, and the fix is to preload it
+only when something actually imports it.
+
+Behind that wall the title is still at rung 0, and honestly so: it boots, streams assets, and drives
+a 4K present loop at ~19 flips a second — 2,054 flips in one run — while prosper composites exactly
+nothing. Every sample is a raw guest scanout, one distinct colour, zero non-black pixels. The next
+wall is that no pass produces a present source at all. That is the interesting problem, and it is a
+much better place to be than a deadlock.
+
+## 2026-08-21
+
 ### The Messenger's title screen runs at 206 fps and 0 fps at the same time
 
 <p align="center"><img src="assets/screenshots/messenger-title-fps-overlay.png" alt="The Messenger's title screen with a burned-in overlay reading 2.9 FPS (206.3 PRESENTED) 1920X1080"></p>
