@@ -6,7 +6,135 @@ own embedded shader source paths (`Library\hedgehog\…`, `Library\needle\…`) 
 `NeedleShader.pac` / `raw/hedgehog/` asset trees, not assumed from the publisher. *Sonic Origins*
 (#1871) and *Sonic Racing: CrossWorlds* (#1895) share parts of the same stack.
 
-## Current rung — 2 (title screen reached and rendered)
+## Current rung — gameplay reached, world not rendered
+
+A committed input route (`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`) takes the title
+from boot to **`GameModeStage` running a Cyber Space stage (`w6d01`)** with real GPU work: the
+guest streams all one hundred `w6d01_trr_s00..s99` terrain sectors plus `w6d01_gedit`, loads
+`ui_gamemodestage*.pac`, streams `sound/cyber_sound/bgm_cyber.awb`, and its submitted draw rate
+rises from **48 draws/flip on the title screen to a sustained 449 draws/flip** in the stage.
+
+The gameplay HUD composites correctly at 3840x2160 — ring counter, the five Red Star Ring slots,
+the boost gauge, and **a stage timer that advances monotonically with the guest's flips**
+(00:52.39 -> 00:56.76 across one 55-sample capture; 01:02.36 -> 01:05.83 across a second run).
+A running stage clock is the discriminator this title offers and a menu cannot fake it: no
+aggregate frame metric was used to make the call. Checked-in capture:
+`assets/screenshots/sonic-frontiers-cyberspace-hud.png` (direct unmodified `tools/screenshot` frame,
+3840x2160, route arm, stage clock at 00:55.89).
+
+**What is not there is the world.** The 3840x2160 frame is black behind the HUD, because
+**16 of the stage's 32 compute programs never execute** (#2790). See the section below. So the rung is deliberately not
+ticked as a rendered-gameplay milestone: the route reaches gameplay, and a rendering defect stands
+between that and a gameplay screenshot.
+
+## What stood between the title screen and gameplay: a twelve-page boot notice queue
+
+A no-input arm never leaves the title screen because a **modal notice queue** opens over it and
+stays. Its pages are the game's own post-update notices — "Extras", "Update notification",
+"Game update", "Update Details", "Update", "Additional options", "Action Marks", "New Game+" — each
+a blue header band over a full-width body panel. Measured behaviour, all from live captures:
+
+| Question | Answer, and how it was measured |
+| --- | --- |
+| How many pages? | **Twelve.** Confirms 40 flips apart: presses 1-12 each advance one page and press 13 activates a main-menu entry. |
+| What advances it? | **Face buttons only.** A single-button sweep (triangle, square, circle, options, touchpad, l1, r1, right, left, down, up, cross, 60 flips apart) advanced the panel on every face button and on **none** of the four d-pad directions — `right`, `left`, `down` and `up` left the header on "Update Details" for 240 flips, then `cross` advanced it. |
+| Where is the cursor afterwards? | On **"Extras"**, the last of the six main-menu entries, so five `up` reach "New Game" whether or not the list wraps. |
+| Is the queue route-stable? | Only against an isolated save area. `PROSPER_SAVE0` selects it, as it selects the rest of this title's route. |
+
+This is why 405 dense confirms (one every 20 flips) got no further than six did: the pages are
+consumed one per press with an animation between them, so spacing, not volume, is what clears the
+queue. It is also why the earlier reading of this panel as "renders almost no text" (#2206) is
+incomplete — see below.
+
+## Route
+
+`scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad`, flip-anchored, with a header explaining
+every window. The shape:
+
+| Flips | Input | Reaches |
+| --- | --- | --- |
+| f1100-f1540 | 12 x `cross`, 40 apart | clears the boot notice queue |
+| f1700-f1940 | 5 x `up`, 60 apart | main-menu cursor "Extras" -> "New Game" |
+| f2100 | `cross` | confirmation dialog |
+| f2300 | `cross` | answers it |
+| f2600 | `cross` | `GameModeOpening` + `raw/event/scene/ev0020*` |
+| f2900 | `cross` | `GameModeStage` + `w6d01` terrain + `gedit` + stage HUD pack |
+| f3300+ | held `cross` | skips the in-engine opening into the stage |
+| f5200+ | `left-stick-up` blocks | forward motion under player control |
+
+```bash
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
+PROSPER_PAD_SCRIPT=@prosper/scripts/sonic-frontiers-PPSA03831/reach-gameplay.pad \
+PROSPER_SAVE0=~/frontiers-work/save/run1 \
+  ./build/screenshot <DUMP_ROOT>/PPSA03831-app0 \
+  --warmup-seconds 420 --seconds 3 --count 55 --out ~/frontiers-work/shots/run1
+```
+
+**Reproduction:** the file-oracle result reproduced on four CPU-only `boot_trace` arms and the live
+HUD-with-running-clock result on two `tools/screenshot` arms. The `--warmup-seconds` figure is a
+host-speed convenience, not part of the route — the route itself is flip-anchored and the same
+windows drive a CPU-only arm at ~30 flips/s and a live 3840x2160 arm at ~3 flips/s unchanged.
+
+## The world is black in the stage — 16 of 32 compute programs never execute (#2790)
+
+The gameplay HUD is correct and complete; behind it the frame is black. The cause is upstream of the
+composite: with `PROSPER_COMPUTE_PROGRAM_CENSUS=1` in the stage the final census block reads
+
+```
+[compute-census] 131072 dispatch decisions over 32 program(s)
+```
+
+and **sixteen programs are listed with `executed=0`** — the census prints per-program detail only for
+programs that skipped at least once (#2745), so sixteen of the thirty-two never ran at all. Three of
+them dispatch **2880 threads wide**, the exact width of this title's scene target, so they are
+screen-space passes over the frame the player is supposed to see.
+
+The reject classes, and their share of the sixteen:
+
+| Reject | Programs | Encoding |
+| --- | --- | --- |
+| `unresolved-operand`, SOP2 reading **SCC** (`ssrc0=253`) | 5 | `886a6bfd` `fmt=0 op=0x10` |
+| `unresolved-operand`, SOPP `s_cbranch_execz` | 2 | `bf880027` `fmt=4 op=0x8` |
+| `unresolved-operand`, SOP2 | 2 | `856a802b` / `856a802f` `fmt=0 op=0xa` |
+| `unresolved-operand`, MIMG | 2 | `f0040308,00000101` `op=0x1 dim=1`; `f0380328,00091103` `op=0xe dim=5` |
+| `unresolved-operand`, SOP1 writing `dst=126` (EXEC_LO) | 1 | `befe3bff,00000000` `fmt=1 op=0x3b` |
+| `unresolved-operand`, VOP1 with SDWA | 1 | `7e2c0ef9,00061216` `fmt=7 op=0x7` |
+| `compute-cfg-reject reason=exact-wave-dispatcher-unsafe guest-barrier=1` | 2 | — |
+| `unrecorded` | 1 | — |
+
+The SCC group is not an unknown encoding: `rdna2_emit_alu.cpp:764-792` deliberately **poisons** the
+tracked SCC when a wave-mask op writes `SCC = (mask != 0)`, because that is a cross-lane reduction
+the per-invocation model cannot form, "so a later consumer … rejects instead of misreading". The
+poison is the right default; the cost here is five whole programs, and the `s_cbranch_execz` pair
+looks like the same family reached through EXECZ. So the largest single lever is plausibly
+**wave-level SCC/EXECZ semantics for compute** rather than sixteen unrelated gaps.
+`CONFIDENCE: MED` on that grouping — the SOP2 operand decode and the family argument are inference;
+the census numbers and encodings are measured.
+
+### What the presented frame looks like, and what it rules out
+
+- Almost every published frame is `guest_scanout` — prosper composited nothing for that flip and
+  republished the guest's own display buffer, which holds only the HUD. In the stage window:
+  3 composited of 55 samples, 2 of 50, and 3 of 100 across three arms.
+- The guest-composited HUD spans `x[64..3776] y[59..2090]` of 3840x2160 — full frame, correctly
+  placed, about 1% of pixels non-black.
+- The frames prosper *does* composite are confined to the top-left **2880x1620**, exactly 75% of each
+  axis and unscaled, and contain a flat blue-grey gradient — sky and fog with no geometry, which is
+  what a scene target looks like when its shading passes never ran. 2880x1620 is Hedgehog Engine 2
+  dynamic resolution at 75%; `CONFIDENCE: MED` that the missing step is the guest's own
+  upscale/resolve.
+- **The present path is not broken in general.** In the same arms prosper composites the in-engine
+  *cutscene* correctly at full width (`x[0..3839] y[272..1887]`, letterboxed). Only the stage fails.
+- **It is not a `--warmup-seconds` artifact.** The control arm used `--warmup-seconds 90`, so the
+  renderer was live continuously from flip 1517 — before `GameModeStage` loaded at flip ~2900 — and
+  produced the same HUD-over-black frames from flip 3429 to 4325 and the same 2880-wide rect.
+
+This is the frontier for this title, and it is plausibly a **Hedgehog Engine 2** finding rather than
+a Frontiers one: *Sonic Origins* (#1871) and *Sonic Racing: CrossWorlds* (#1895) share the Needle
+stack, and CrossWorlds' "the composite then goes uniform" (#2013) deserves a census taken the same
+way before it is treated as unrelated.
+
+## Rung 2 — title screen and main menu (still current, still checked in)
 
 A default launch reaches the whole 4K opening sequence, the auto-save notice screen, the title
 screen and the main menu. Checked-in captures, all direct unmodified `tools/screenshot` frames from
@@ -55,7 +183,7 @@ commit (`PROSPER_NO_COMPUTE=1 PROSPER_FILELOG=1 PROSPER_PROGRESS=5 PROSPER_PROGR
 | last content opened | `/gamedata` (ENOENT, forever) | `ui_gamemodetitle_en.pac`, `bgm.awb` |
 | `draws_cum` at t=60 s | 53,459 | **94,842** |
 
-## Reproduction
+## Reproduction — title screen only (no input)
 
 ```bash
 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
@@ -99,7 +227,7 @@ so it no longer has to be taken on the hand-read. `--no-follow-arms` reproduces 
 no constants — so what it means is unresolved. Start from this rather than from
 `0x809F0008` if a title ever turns out to need the exact code. (Review of PR #2208.)
 
-## Known defects at rung 2
+## Known defects on the title screen
 
 - The title-screen heading renders the string **"Try Again"** where the SONIC FRONTIERS logo
   belongs, in large blue type. The surrounding menu strings are correct and legible ("New Game",
@@ -185,10 +313,10 @@ and after at the same denominator — and neither did the composite. Both were m
 ## Ruled out
 
 One line per falsified hypothesis with the evidence that killed it. Read this before forming a new
-one. Twelve of them were established on #1968 / #2023 and are copied here so they survive those
-issues being closed; the rest belong to this document. **Do not restate the row count in this
-paragraph** — every lane that adds a row has to remember to update it, and the last one did not
-(review of #2820).
+one. Twelve rows were established on #1968 / #2023 and are copied here so they survive those issues
+being closed; the rest are this document's own. **Do not restate the row count in this paragraph** —
+a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
+to remember to update it. The last one did not (review of #2820).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
@@ -205,5 +333,12 @@ paragraph** — every lane that adds a row has to remember to update it, and the
 | Same defect as Little Nightmares III (#1962) | **Falsified — the opposite shape.** Here `present_count` climbed while `frame_seq` froze and submits kept arriving; there both froze together. |
 | `pixel_crc32=666f7b3f` links this to #1962 / #1982 | **No — it is just "black 3840×2160"** and recurs on unrelated titles. Never group by a black-frame hash. |
 | The frame going black shortly *before* the publish wall shares the wall's cause | **Falsified.** With the publish wall removed (#1990) the black survived unchanged; the last publishable frame was already black. Two defects. |
+| A no-input arm sits on the title screen because prosper stalls, or because the menu is unreachable | **Falsified.** A twelve-page modal notice queue is open over the menu. Twelve confirms clear it and the thirteenth activates a menu entry; the same binary then reaches `GameModeStage`. Nothing in the emulator was changed. (This document.) |
+| The panel over the menu "renders almost none of its text" (#2206) | **Incomplete rather than wrong.** With any face button pressed, the same panel renders its header *and* body correctly — "Extras: The acquired additional content will be accessible from the Extras menu.", "Update Details: The following content has been added in the update: -Action Chain Challenge -New Koco -Birthday Decorations -Status map -New Game+". The blank panel is the *no-input* state of a queue nobody had advanced. |
+| The title heading permanently draws "Try Again" instead of the logo (#2206) | **State-dependent, not permanent.** With the notice queue cleared, the SONIC FRONTIERS logo renders correctly at 3840x2160. In the same frames the six main-menu entries do *not* render their text, while the original rung-2 capture rendered the entries and got the heading wrong — the two are anti-correlated, which points at string/element resolution rather than at the text renderer. |
+| The d-pad can drive the boot notice queue | **Falsified.** A twelve-button sweep advanced the panel on every face button and on none of `up`, `down`, `left`, `right`. A route that used directional windows there would silently deliver nothing. |
+| Pressing confirm often enough clears the notice queue | **Falsified.** 405 confirms at 20-flip spacing reached exactly the same state as 6 did; 12 confirms at 40-flip spacing cleared it. Presses landing inside a page's transition animation are discarded, so spacing decides the outcome and volume does not. |
+| The black world in the stage is an artifact of `--warmup-seconds` skipping the renderer past the stage's setup | **Falsified by a control arm.** With `--warmup-seconds 90` the renderer is live continuously from flip 1517, before `GameModeStage` loads at flip ~2900, and the same HUD-over-black frames appear from flip 3429 to 4325 with the same 2880-wide composited rect. (#2790.) |
+| The black world is a compositing/present defect | **Falsified as the primary cause.** Sixteen of the stage's thirty-two compute programs have `executed=0`, three of them 2880-thread-wide screen-space passes; and the same build composites the in-engine cutscene correctly at full width. The composite is downstream of a scene target that was never shaded. (#2790.) |
 | The three scene-target-width stage programs are blocked by `s_cbranch_execz` and `image_load_mip`, the encodings their reject lines name | **Half falsified.** Both were reported by the straight-line emitter, two routes downstream of the decline that mattered. Live, with `PROSPER_DBG_PROGRAM` on each address, the CFG dispatcher declined `wave64-ambiguous-mask-read` at pc481 / pc481 / pc471 — one missing entry in `scalar_alu_source_words`, which charged `v_lshl_add_u32 v7, v6, 2, vcc_lo` (a 32-bit read of VCC_LO used as scalar scratch) the whole VCC pair. With it fixed that decline occurs **0** times, all three reach the dispatcher body, and all three converge on `image_load_mip` alone. **`s_cbranch_execz` is dead as a lever here** — the dispatcher lowers it fine. See `RECOMPILER_REMAINING.md` § Ruled out. |
 | Fixing a recompiler decline that unblocks these programs will change the frame | **Not established, and twice now it has not.** #2758 took `executed=0` to `executed=6` with no image change; #2801 cleared five SCC-site declines with no image change; this change cleared three dispatcher declines with **no census change at all** (14 listed, all `executed=0`, both arms at `262144 dispatch decisions over 32 program(s)`) and no composite change. Measure the composite separately — non-black percentage and bounding box — before claiming anything about the world. |
