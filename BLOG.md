@@ -71,6 +71,11 @@ method call dereferences it. Still rung 0 — but the fault moved from the memor
 asset loader, which is the direction that counts. Tracker
 [#2864](https://github.com/mattias800/prosper/issues/2864).
 
+One footnote worth having: this turned out not to be a one-title fix. *Judgment* (`PPSA02739`),
+onboarded the same day, imports **all seven** of the same AMM entry points — and both of the follow-up
+gaps too, the scatter/gather read and AMM's `Unmap`. Checked by NID against its own import table,
+not inferred from the shared publisher.
+
 ### Our first CryEngine title deadlocks 81 ms in, on a library it never asked for
 
 No picture this time — the interesting thing about *Sniper Ghost Warrior Contracts 2* (`PPSA03130`)

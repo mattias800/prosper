@@ -170,11 +170,20 @@ int main() {
     }
     release_dmem(dirty, kDirtyLen, 0, 0, 0, 0);
 
+    constexpr uint64_t kPoolLen = 0x1000000ull;   // 16 MiB
+    // A call that cannot deliver its result must not report success — and must not consume the pool
+    // on the way to saying so. Both halves matter: the return value alone would still let a handler
+    // take the memory first and refuse afterwards, which is how the guest ends up owning a pool it
+    // was never told the address of. The second half is checked by the arms that follow: if this
+    // call had consumed 16 MiB and published it, the real GiveDirectMemory below would be refused
+    // as a non-contiguous second pool and every arm after it would redden. Raised in review.
+    CHECK(give_dmem(0, 16ull << 30, kPoolLen, 0x200000, 1, /*out=*/0) == kEinval,
+          "GiveDirectMemory refuses a call with no out-parameter instead of reporting success");
+
     // Shape taken verbatim from the live call under PROSPER_AMPRLOG:
     //   Q07J7XpvhrU a0=0x0 a1=0x400000000 a2=0x280000000 a3=0x200000 a4=0x1 a5=<out>
     // i.e. (searchStart, searchEnd, len, ALIGNMENT, MEMORY TYPE, off_t* out) — the kernel
     // allocator's order. A smaller len keeps the test from claiming the whole pool.
-    constexpr uint64_t kPoolLen = 0x1000000ull;   // 16 MiB
     uint64_t phys = kPoison;
     CHECK(give_dmem(0, 16ull << 30, kPoolLen, 0x200000, 1, (uint64_t)&phys) == 0,
           "GiveDirectMemory claims a physical pool");
@@ -211,6 +220,17 @@ int main() {
           "the completion-id store is 32 bits wide and does not reach the adjacent dword");
     CHECK(amm_wait(slots[0], 0, 0, 0, 0, 0) == 0,
           "WaitCommandBufferCompletion accepts the id the submit handed out");
+    // The same rule for the submit's own out-parameter: no slot to write the completion id into
+    // means the guest would wait on residue, so this refuses rather than answering SCE_OK. And it
+    // must not answer EAGAIN either — that is the retry sentinel the guest spins on.
+    const uint64_t no_slot_rc = amm_submit(0x7f0000020000ull, 0x20, 0, 0, /*outCompletionId=*/0, 0);
+    CHECK(no_slot_rc == kEinval,
+          "SubmitCommandBuffer2 refuses a call with no completion-id out-parameter");
+    CHECK(no_slot_rc != kEagain, "...and does not answer with the guest's retry sentinel");
+    uint64_t ranges_bad[2] = { kPoison, kPoison };
+    CHECK(get_ranges(0, (uint64_t)&ranges_bad[1], 0, 0, 0, 0) == kEinval &&
+              ranges_bad[1] == kPoison,
+          "GetVirtualAddressRanges refuses a call with no out-parameter for the window base");
 
     // The whole point: the guest can use the page. Fresh direct memory reads back zero on hardware,
     // and this range was filled with 0xa5 and released above, so a pool that skips the punch shows
@@ -231,11 +251,13 @@ int main() {
     // Without this, the window is not inert: exec_image_linux.cpp's SIGSEGV handler backs any touch
     // of a tracked-but-uncommitted range above 0x1000000000 with a 64 KiB anonymous page, which
     // would turn every REFUSED map below into a silent substitution the guest cannot detect (it
-    // does not test Map's return value). State 3 is what declines it. Raised in review.
-    CHECK(prosper_reserved_range_state(window_base + kMapLen) == 3,
+    // does not test Map's return value). State 4 is what declines it — 4 and not 3, because 3 is
+    // the Windows arm's "committed sparse direct page", a sub-case of a different parent. Both
+    // points raised in review.
+    CHECK(prosper_reserved_range_state(window_base + kMapLen) == 4,
           "an unmapped page of the AMM window declines lazy commit, so a refused map faults at the "
           "guest's own address instead of being backed with anonymous memory");
-    CHECK(prosper_reserved_range_state(window_end - 0x4000) == 3,
+    CHECK(prosper_reserved_range_state(window_end - 0x4000) == 4,
           "...at the far end of the window too");
     CHECK(prosper_reserved_range_state(window_base) == 2,
           "...while a page this run actually mapped reads as committed");

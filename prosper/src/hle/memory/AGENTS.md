@@ -48,7 +48,9 @@ committed" and backs it with a 64 KiB anonymous read/write page. Several titles'
 depends on that, so it stays the default — but it means a range you reserved to hold a *particular*
 kind of memory will be silently filled with a different kind the moment anything touches an unmapped
 part of it, and the guest cannot tell. Register such a range as declining lazy commit
-(`g_no_lazy_commit_*`, which makes `prosper_reserved_range_state` answer **3** instead of 1) so the
-touch faults where it happened. This is the thing a newcomer gets wrong here, and it was found in
+(`g_amm_no_lazy_commit_base`, which makes `prosper_reserved_range_state` answer **4** instead of 1)
+so the touch faults where it happened. That function's return values are one contract shared by both
+platform arms and they are **not** dense — 3 refines "committed" and belongs to the Windows arm,
+4 refines "reserved" — so read its table before adding a value. This is the thing a newcomer gets wrong here, and it was found in
 review rather than by testing, because every symptom of getting it wrong looks like a bug somewhere
 else.

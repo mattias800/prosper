@@ -2321,9 +2321,17 @@ HLE(k_ampr_push_map) {
 // only a log line to say so. Raised in review of the AMM change; the AMM window is the first
 // occupant, and one range is enough until there is a second.
 //
-// Written once, before the window is published, and read from a SIGNAL HANDLER — hence atomics
+// Written once, before the window is published, and read from a SIGNAL HANDLER — hence an atomic
 // rather than the mutex the rest of this file uses.
-std::atomic<uint64_t> g_no_lazy_commit_base{0}, g_no_lazy_commit_end{0};
+//
+// ONE atomic, not a base/end pair. A pair has to be published in some order, and both orders are
+// wrong here: base-first leaves a window in which the range does not yet decline, and end-first
+// leaves one in which `addr >= 0 && addr < end` matches EVERY low address, so unrelated
+// reservations would briefly decline lazy commit and other titles' allocator bring-up would break.
+// The extent is a compile-time constant (kAmmWindowSize), so deriving the end removes the question
+// rather than answering it. Raised in review; the suggested end-first ordering is the wider blast
+// radius of the two, which is why this took neither.
+std::atomic<uint64_t> g_amm_no_lazy_commit_base{0};
 
 // --- libSceAmpr AMM (asynchronous memory manager) ----------------------------------------------
 //
@@ -2438,8 +2446,7 @@ namespace {
             // Order matters: decline lazy commit BEFORE the range becomes a tracked reservation,
             // because the instant `track` publishes it the fault handler would otherwise treat any
             // touch of the still-unmapped remainder as a page to back with anonymous memory.
-            g_no_lazy_commit_base.store((uint64_t)p, std::memory_order_relaxed);
-            g_no_lazy_commit_end.store((uint64_t)p + kAmmWindowSize, std::memory_order_relaxed);
+            g_amm_no_lazy_commit_base.store((uint64_t)p, std::memory_order_relaxed);
             state.va_base = (uint64_t)p;
             state.va_size = kAmmWindowSize;
             track(state.va_base, state.va_size, 0, 0, false, "ampr-amm-window");
@@ -2529,6 +2536,18 @@ namespace {
 // CONFIDENCE: LOW on r2/r3 specifically; HIGH that writing something defined beats writing nothing.
 HLE(k_amm_get_va_ranges) {
     ampr_arglog("wkQR9+xTFKY(AmmGetVirtualAddressRanges)", a0, a1, a2, a3, a4, a5);
+    // Same rule as GiveDirectMemory below, applied to the two slots the guest demonstrably reads:
+    // reporting SCE_OK for a window we did not write is the silent-error class the whole change is
+    // about, and it does not become acceptable because the pointer was the guest's mistake rather
+    // than ours. a2/a3 stay optional — their meaning is unknown, so requiring them would be
+    // inventing a contract; they are written when they are plausible and that is all that can
+    // honestly be said. The SDK wrapper derives all four from one struct pointer
+    // (eboot+0xcc4c10), so in practice they are plausible together or not at all.
+    if (a0 <= 0xffff || a1 <= 0xffff) {
+        amm_say(true, "REFUSED get-virtual-address-ranges: no plausible out-parameters for the "
+                      "window", a0, a1, a2);
+        return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
+    }
     uint64_t base = 0, size = 0;
     const bool ok = amm_window_ensure(base, size);
     // The out-parameters are written on EVERY path, including the failure one. Returning an error
@@ -2539,14 +2558,20 @@ HLE(k_amm_get_va_ranges) {
     // residue exactly as before. An all-zero window is also the answer that makes the guest fail
     // SAFELY: it stores the base at state+0xeca8, and its heap-grow path tests that slot for zero
     // (eboot+0xdbbdc6) and takes its own no-AMM branch. Raised in review.
-    if (a0 > 0xffff) *(uint64_t*)a0 = ok ? base : 0;
-    if (a1 > 0xffff) *(uint64_t*)a1 = ok ? base + size : 0;
+    *(uint64_t*)a0 = ok ? base : 0;          // both validated above, before anything was reserved
+    *(uint64_t*)a1 = ok ? base + size : 0;
     if (a2 > 0xffff) *(uint64_t*)a2 = 0;
     if (a3 > 0xffff) *(uint64_t*)a3 = 0;
     return ok ? 0 : 0x8002000cull;   // SCE_KERNEL_ERROR_ENOMEM
 }
 
-// sceAmprAmmGiveDirectMemory(searchStart, searchEnd, len, memoryType, alignment, off_t* physOut).
+// sceAmprAmmGiveDirectMemory(searchStart, searchEnd, len, alignment, memoryType, off_t* physOut).
+// ALIGNMENT then TYPE — the kernel allocator's own order, established from the live call
+// (a3 = 0x200000, a4 = 1) and re-derived at eboot+0xdbf4e6/0xdbf4f1. This line said the opposite
+// until review caught it, which is worth a sentence rather than a silent correction: it is the
+// first thing a reader sees, it survived a review pass AND a fix pass, and a signature comment that
+// disagrees with its own body is worse than none because it is believed instead of checked.
+//
 // Claims `len` bytes of the direct-memory pool for AMM and remembers the range; every later map
 // carves its pages out of it, so the guest's own residency budget is enforced by physics rather
 // than by trust. Failure is reported as ENOMEM, which the guest handles by abandoning AMM init —
@@ -2566,6 +2591,20 @@ HLE(k_amm_give_dmem) {
     const int type = a4 <= (uint64_t)kMaxDirectMemoryType ? (int)a4 : 0;
     if (!a2 || (a2 & (kGuestPageSize - 1)) != 0) {
         amm_say(true, "REFUSED give-direct-memory: length is not a 16 KiB multiple", a2, align, a4);
+        return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
+    }
+    // EVERY validation happens BEFORE the pool is touched, and the out-parameter is checked here
+    // rather than at the write. This ordering is the contract, not a style choice: an implausible
+    // a5 discovered after dmem_take/dmem_zero/amm_pool_publish would leave the pool consumed and
+    // handed to AMM while the guest is told SCE_OK with its slot untouched — and the guest tests
+    // only for a negative return (eboot+0xdbf4fe is `test %eax,%eax; js`), so it would then read an
+    // uninitialised qword. That is the 0x1d0000 mechanism this whole change exists to remove,
+    // reintroduced one layer up. This file already carries the same lesson at valid_dmem_allocation
+    // (`phys_out > 0xffff`, checked before k_alloc_dmem's dmem_take), and k_alloc_dmem avoids the
+    // trap only by that ordering. Raised in review.
+    if (a5 <= 0xffff) {
+        amm_say(true, "REFUSED give-direct-memory: no plausible out-parameter for the physical "
+                      "offset", a2, align, a5);
         return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
     }
     uint64_t phys = 0;
@@ -2588,7 +2627,7 @@ HLE(k_amm_give_dmem) {
         dmem_release(phys, a2);
         return 0x8002000cull;                                   // SCE_KERNEL_ERROR_ENOMEM
     }
-    if (a5 > 0xffff) *(uint64_t*)a5 = phys;
+    *(uint64_t*)a5 = phys;   // unconditional: a5 was validated above, before anything was consumed
     fprintf(stderr, "[amm] direct-memory pool [0x%llx,0x%llx) (%llu MiB, type %d, align 0x%llx)\n",
             (unsigned long long)phys, (unsigned long long)(phys + a2),
             (unsigned long long)(a2 >> 20), type, (unsigned long long)align);
@@ -2661,9 +2700,20 @@ HLE(k_amm_cb_map) {
 // and it spins on it (eboot+0xdbbe90) sleeping a second per attempt.
 HLE(k_amm_submit2) {
     ampr_arglog("OJf3vCckPAM(AmmSubmitCommandBuffer2)", a0, a1, a2, a3, a4, a5);
+    // a4 is the slot the guest reads back and hands to WaitCommandBufferCompletion
+    // (eboot+0xdbbea3 loads it with a 32-bit `mov` immediately after this call returns). Answering
+    // SCE_OK without writing it would leave the guest waiting on residue — a silent error, and the
+    // reason this refuses instead. NOT EAGAIN: that is the guest's retry sentinel and it spins on
+    // it (eboot+0xdbbe90), so the one wrong answer here is the one that looks like backpressure.
+    // a3 stays optional for the same reason as GetVirtualAddressRanges' a2/a3 — no call site reads
+    // it, so its meaning is unestablished and demanding it would be inventing a contract.
+    if (a4 <= 0xffff) {
+        amm_say(true, "REFUSED submit: no plausible out-parameter for the completion id", a0, a1, a4);
+        return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
+    }
     const uint32_t id = amm().next_completion.fetch_add(1, std::memory_order_relaxed);
     if (a3 > 0xffff) *(uint32_t*)a3 = 0;
-    if (a4 > 0xffff) *(uint32_t*)a4 = id;
+    *(uint32_t*)a4 = id;
     return 0;
 }
 
@@ -2693,10 +2743,22 @@ HLE(k_release_dmem) {
     return 0;
 }
 
-// Most-specific tracked-mapping state at `addr` for the fault handler's lazy-commit probe:
-// 0 = untracked, 1 = reserved-but-uncommitted, 2 = committed, 3 = reserved and DECLINING lazy
-// commit (see above). Every caller tests `== 1`, so 3 declines everywhere at once — which is the
-// point: a range prosper will not back itself must not be backed by the APR completion write or the
+// Most-specific tracked-mapping state at `addr` for the fault handler's lazy-commit probe. The
+// numbering is ONE contract shared by both platform arms, and it is written out here in full
+// because it is not: 3 was already taken.
+//
+//   0  untracked
+//   1  reserved, uncommitted            — the lazy-commit target; every caller tests for exactly 1
+//   2  committed
+//   3  committed, sparse direct page awaiting host commitment   (WINDOWS arm only)
+//   4  reserved, uncommitted, DECLINING lazy commit             (POSIX arm only, see above)
+//
+// 3 and 4 are sub-cases of DIFFERENT parents — 3 refines "committed", 4 refines "reserved" — so
+// they are not interchangeable and a reader who assumes the values are dense will get it wrong.
+// The AMM change originally allocated 3 for the decline, which collided; review caught it.
+//
+// Every caller tests `== 1`, so any other value declines the lazy commit, which is the point: a
+// range prosper will not back itself must not be backed by the APR completion write or the
 // file-read destination commit either. Called from a signal handler on the FAULTING thread — that
 // thread is in guest code, so it cannot itself hold g_mx (only HLE memory entry points take it,
 // briefly); a contended lock just waits for the other thread's release.
@@ -2712,8 +2774,9 @@ extern "C" int prosper_reserved_range_state(uint64_t addr) {
     const bool contains = addr >= mapping.base && addr - mapping.base < mapping.size;
     if (!contains) return 0;
     if (mapping.committed) return 2;
-    return (addr >= g_no_lazy_commit_base.load(std::memory_order_relaxed) &&
-            addr < g_no_lazy_commit_end.load(std::memory_order_relaxed)) ? 3 : 1;
+    const uint64_t decline_base = g_amm_no_lazy_commit_base.load(std::memory_order_relaxed);
+    return (decline_base && addr >= decline_base &&
+            addr - decline_base < kAmmWindowSize) ? 4 : 1;
 }
 
 // sceKernelBatchMap(SceKernelBatchMapEntry* entries, int numberOfEntries, int* numberOfEntriesOut)
@@ -5727,8 +5790,13 @@ extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t l
 }
 
 // Fault-handler lazy-commit probe parity (Linux exports this for its SIGSEGV handler). The Windows
-// VEH uses this to back reserved guest pages on first touch: 0 = untracked, 1 = reserved,
-// 2 = committed, 3 = guest-committed sparse direct page awaiting host commitment.
+// VEH uses this to back reserved guest pages on first touch. The value numbering is ONE contract
+// shared with the POSIX arm — see the full table there; the short form is
+//   0 untracked, 1 reserved-uncommitted, 2 committed,
+//   3 committed sparse direct page awaiting host commitment (this arm only),
+//   4 reserved-uncommitted and DECLINING lazy commit        (POSIX arm only, libSceAmpr AMM).
+// 3 and 4 refine different parents and are not interchangeable. This arm cannot answer 4 because it
+// does not implement AMM; if it ever does, 4 is the value to use rather than a second private one.
 extern "C" int prosper_reserved_range_state(uint64_t addr) {
     bool tracked = false;
     bool committed = false;

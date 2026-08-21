@@ -334,11 +334,25 @@ int main(int argc, char** argv) {
            (unsigned long long)r.rdx, (unsigned long long)r.rbp, (unsigned long long)r.rsp);
     printf("  backtrace (%zu frames):\n", r.backtrace.size());
     for (uint64_t a : r.backtrace) printf("    %-12s +0x%llx\n", cls(a), (unsigned long long)bof(a));
-    // Classify the fault address vs our tracked guest mappings (0=untracked/gap, 1=reserved-uncommitted,
-    // 2=committed). A write at a page boundary whose predecessor byte is committed but which is itself
-    // reserved/untracked pinpoints a guest run-off-the-end-of-a-region (Windows memory-model diagnosis).
+    // Classify the fault address vs our tracked guest mappings. A write at a page boundary whose
+    // predecessor byte is committed but which is itself reserved/untracked pinpoints a guest
+    // run-off-the-end-of-a-region (Windows memory-model diagnosis).
+    //
+    // Every state prosper_reserved_range_state can return is named here. It used to name three of
+    // them and fold the rest into "untracked/gap", which is the worst possible default for a
+    // fault-diagnosis tool: it reports the OPPOSITE of what happened (the range is tracked) and it
+    // did so for the Windows arm's sparse-direct-page state as well as for the AMM decline. Both of
+    // those are states a fault is LIKELY to land in, which is the whole reason they exist.
     if (r.kind == 2 && r.fault_addr) {
-        auto st = [](int s){ return s==2?"committed":s==1?"reserved":"untracked/gap"; };
+        auto st = [](int s){
+            switch (s) {
+                case 1: return "reserved";
+                case 2: return "committed";
+                case 3: return "committed(sparse-direct, awaiting host commit)";
+                case 4: return "reserved(declines lazy commit -- libSceAmpr AMM window)";
+                default: return "untracked/gap";
+            }
+        };
         printf("  [memclass] fault_addr=%s  fault_addr-8=%s  fault_addr-0x1000=%s\n",
                st(prosper_reserved_range_state(r.fault_addr)),
                st(prosper_reserved_range_state(r.fault_addr - 8)),
