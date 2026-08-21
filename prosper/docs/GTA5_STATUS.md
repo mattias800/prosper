@@ -110,6 +110,50 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **PROSPER'S OWN WRITES ARE CLEAN: every table it actually writes comes out acyclic and fully
+  terminating, 43 of 43.** This is the causal test done *within a single dispatch* — scanning the
+  table after the dispatch that wrote it — so it is immune to the cross-dispatch attribution error
+  that produced the retracted root cause. Routed run, Linux/RADV, `reach-story-mode`,
+  `PROSPER_COMPUTE_PARENTSCAN=413dc6700`, **with no dispatch skipping** (the parent-walk lever is
+  deliberately absent, because arming it declines dispatches and would remove the very writes under
+  test).
+
+  **140 post-dispatch scans**, 35 each on four bindings/addresses:
+
+  | outcome | count |
+  | --- | ---: |
+  | `cyclic=0 terminating=2063` | **138** |
+  | `cyclic=156 terminating=1907` | 2 |
+  | scans where the dispatch **changed** the table | 43 |
+  | …of those, acyclic | **43 / 43** |
+
+  A representative clean write: `binding=4 addr=0x20f848a240 records=2063 terminating=2063 cyclic=0
+  longest=13 changed=2062`. So when this program runs and writes, it produces a well-formed tree.
+
+  **The two cyclic scans are the whole story, and they both carry `changed=0`:**
+
+  ```
+  [parentscan-after] submit=5160 dispatch=38 binding=8 addr=0x20f848417c cyclic=156 cycle-nodes=104 longest=57 changed=0
+  [parentscan-after] submit=5160 dispatch=39 binding=4 addr=0x20f848417c cyclic=156 cycle-nodes=104 longest=57 changed=0
+  [compute] fatal Vulkan device loss ... program=0x413dc6700 submit=5160 dispatch=39
+  ```
+
+  The table was **not written by those dispatches** — it arrived cyclic — and the device loss lands on
+  exactly the dispatch that consumes it.
+
+  **So the frontier is now the PRODUCER of `0x20f848417c`'s cyclic content, and it is not this
+  program's execution.** Combined with the two results above — translation cannot silently corrupt
+  these tables, and the adjacent-program attribution is dead over 1,507 measurements — what remains is
+  a producer/consumer question: the traversal consumes a buffer that nobody in the measured compute
+  chain wrote correctly, while the buffers that *are* written come out clean. That is the same shape
+  as the open producer/consumer gap on the shadow atlas.
+
+  **Bounds on this.** 35 scans per binding is a modest sample from one run, and the run took a device
+  loss (after which live compute is disabled process-wide, so nothing later is measured). The scan
+  fires only for `stride == 4` resources, so it says nothing about the 64-byte record buffer. And it
+  reports the state *after* the dispatch, which is not the same as proving no other agent wrote
+  between the scan and the next read. (2026-08-21.)
+
 - **The adjacent-program attribution for the cyclic table is DEAD, now with the negative case the
   earlier retraction demanded.** Routed run, Linux/RADV, `reach-story-mode`, 800 s, two other hanging
   programs declined, `PROSPER_COMPUTE_PARENT_WALK` armed on `0x413dc6700` — **1,507 walk
