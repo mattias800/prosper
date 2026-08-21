@@ -72,15 +72,36 @@ is indistinguishable, from the screenshots alone, from a title that reads them a
 
 ## Not yet routed
 
-**Rung 3.** The list above is the options/extras menu; starting a game needs Up/Down navigation plus
-Cross rather than the flat alternation here. That is now a menu-navigation problem against a working
-frontend, not a graphics one.
+**Rung 3.** This section previously said that starting a game "needs Up/Down navigation plus Cross"
+and was "a menu-navigation problem against a working frontend, not a graphics one". **Both halves are
+falsified** (2026-08-21, `docs/EARTHION_STATUS.md`):
+
+* The list above is the **wrapper's** menu and contains no start item — every row is a wrapper
+  control (`Reset`, `Game Version`, `Audio`, `Visuals`, `Language`, `Extras`, `How to Play`). No
+  amount of directional navigation reaches gameplay from it.
+* The title's own **HOW TO PLAY page states the binding**: `Open Menu` is **OPTIONS** and **`Start`
+  is the TOUCHPAD**. `pad_button_by_name` accepts `touchpad`.
+* Start has been delivered and is not the missing step. A route pressing it every 8 s ran 320 s;
+  `PROSPER_PAD_SCRIPT_LOG=1` shows the guest **read** 13 `buttons=touchpad` states, and the picture
+  inside the bezel is black in every frame bar one narration line.
+
+The real frontier is that the game picture never leaves the narration sequence, which recurs on a
+**~60 s cycle**. Read `docs/EARTHION_STATUS.md` § Ruled out before forming a hypothesis.
 
 ## Known-unrelated diagnostic noise
 
 One pixel shader (`ps=0x4101c1f00`) is rejected every frame throughout this route, reaching
 `occurrence=32768` in five minutes, because the guest binds a render-target index its own group never
-created and hands the descriptor slot 32 bytes of uninitialised stack (#1590 — a guest defect;
-#1773 is the separate recompiler gap). **The menu renders in full colour regardless.** Do not read
-those reject lines as the reason for anything black on screen; that inference is what cost #1590 its
-first several sessions.
+created and hands the descriptor slot 32 bytes of uninitialised stack (#1590 — a guest defect).
+**The menu renders in full colour regardless.** Do not read those reject lines as the reason for
+anything black on screen; that inference is what cost #1590 its first several sessions.
+
+#1773, the separate recompiler gap that the same draw exercised, is **fixed** — a direct user-data
+descriptor staged with `s_mov_b32` now keeps its provenance, and on this title the recompiler
+recovers `ud_alias=s9` (the declared `offset_dw`). The draw is still declined, because the resource
+at that offset is dropped upstream by the guest defect above, and the route's frames are **28/28
+pixel-identical** before and after. Both facts are in `docs/EARTHION_STATUS.md`.
+
+Those counts are for **this** route. A route that never opens the wrapper menu exercises a different
+program set: the touch-pad route produces exactly one `[mimg-unresolved]` line and zero
+`[recompile-reject]` lines in a whole run. Name the route before quoting a reject volume.
