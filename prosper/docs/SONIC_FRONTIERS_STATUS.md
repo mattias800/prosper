@@ -158,8 +158,11 @@ declines. Implementing it means lowering a real guest LOD, not widening the proo
 `CLAUDE.md`'s standing rule applies: do not make the reject accept by substituting a plausible
 constant. Tracked as
 [#2818](https://github.com/mattias800/prosper/issues/2818), which records why the existing
-"prove the mip is zero" route cannot simply be widened: `ResourceDesc::mip_levels` is interface-only
-and prosper materialises single-level images.
+"prove the mip is zero" route cannot simply be widened: the live backend creates every guest
+texture and storage image with **`ici.mipLevels = 1`** — hard-coded, at the single
+`VkImageCreateInfo` for guest images (`frontends/shared/live/live_compute.cpp:7089`) — so there is
+no chain for a nonzero LOD to address. `declared_mip_levels` is parsed from the T# and used only as
+a decline *guard*, never to build one.
 
 **The census did not move when the MUST defect was fixed** — 14 programs, all `executed=0`, before
 and after at the same denominator — and neither did the composite. Both were measured, not assumed.
