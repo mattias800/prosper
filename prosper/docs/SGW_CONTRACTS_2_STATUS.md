@@ -17,7 +17,7 @@ With it fixed, a default launch reaches `BOOT_COMPLETE` in **91 ms**, streams it
 **4K present loop at ~21 flips/s** — and every frame is black, because no pass produces a present
 source at all. The title still renders nothing, so the rung does not move; but the frontier has moved
 from "the boot never starts" to "the renderer draws nothing", which is an ordinary graphics problem
-with concrete leads.
+with concrete leads. That frontier is [#2871](https://github.com/mattias800/prosper/issues/2871).
 
 ### The measurement
 
