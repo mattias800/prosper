@@ -2812,7 +2812,7 @@ int main() {
     // and the table's dword index are unchanged and the ONLY difference is the load instruction.
     const uint32_t pcrel_table_vs_typed_xyzw[] = {
         0xb0020010u,               // s_movk_i32 s2, 16 bytes
-        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe8303ffu, 0x10005facu,  // s_mov_b32 s3, V# config (DST_SEL identity XYZW)
         0xbe801f00u,               // s_getpc_b64 s[0:1] (next PC byte = 16)
         0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0 (table byte = 56)
         0x82010180u,               // s_addc_u32 s1, 0, s1
@@ -2833,7 +2833,7 @@ int main() {
     // indistinguishable from "accept every MTBUF".
     const uint32_t pcrel_table_vs_typed_converting[] = {
         0xb0020010u,               // s_movk_i32 s2, 16 bytes
-        0xbe8303ffu, 0x10005004u,  // s_mov_b32 s3, V# config
+        0xbe8303ffu, 0x10005facu,  // s_mov_b32 s3, V# config (DST_SEL identity XYZW)
         0xbe801f00u,               // s_getpc_b64 s[0:1]
         0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0
         0x82010180u,               // s_addc_u32 s1, 0, s1
@@ -2866,6 +2866,27 @@ int main() {
     CHECK(!recompile_vertex(pcrel_table_vs_typed_x,
                             std::size(pcrel_table_vs_typed_x), nullptr).empty(),
           "Sonic Frontiers' own tbuffer_load_format_x embedded-table word folds (#2859)");
+
+    // A FORMAT load applies the descriptor's DST_SEL and a raw load does not, so the typed fold has
+    // to prove the routing is identity as well as the format. Same program as the arm above with
+    // DST_SEL_X = SQ_SEL_0 (constant zero) instead of SQ_SEL_X: the fetch would return 0 rather than
+    // the stored dword, so the fold must not be offered and the getpc must still reject.
+    const uint32_t pcrel_table_vs_typed_x_swizzled[] = {
+        0xb0020010u,               // s_movk_i32 s2, 16 bytes
+        0xbe8303ffu, 0x10005000u,  // s_mov_b32 s3, V# config -- DST_SEL_X = 0 (constant zero)
+        0xbe801f00u,               // s_getpc_b64 s[0:1]
+        0x800000ffu, 0x00000028u,  // s_add_u32 s0, 40, s0
+        0x82010180u,               // s_addc_u32 s1, 0, s1
+        0x7e080280u,               // v_mov_b32 v4, 0
+        0xe8b01000u, 0x80000004u,  // tbuffer_load_format_x v0, v4, s[0:3], 0 fmt:32_FLOAT offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf80008cfu, 0x00000000u,  // exp pos0, v0, v0, v0, v0
+        0xbf810000u,               // s_endpgm
+        0xbf800000u, 0xbf800000u, 0u, 0x3f800000u,
+    };
+    CHECK(recompile_vertex(pcrel_table_vs_typed_x_swizzled,
+                           std::size(pcrel_table_vs_typed_x_swizzled), nullptr).empty(),
+          "a non-identity DST_SEL is refused the typed embedded-table fold (#2859)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

@@ -1649,6 +1649,23 @@ inline bool rdna2_buffer_format_is_raw_dwords(uint32_t format, uint32_t componen
     }
 }
 
+// True when a V# word3's DST_SEL routes the first `components` channels straight through, so a
+// TYPED fetch returns the stored dwords in their stored order.
+//
+// This does not apply to the untyped fold: a raw `buffer_load_dword*` ignores DST_SEL entirely. A
+// FORMAT load does not, and getting it wrong is silent -- Sonic Frontiers' own embedded-table V#
+// carries word3 = 0x10005004, i.e. DST_SEL = (X, 0, 0, 0), so a four-component typed fetch through
+// that same descriptor would return the stored X and three CONSTANT ZEROES, not four dwords. Its
+// actual load is `tbuffer_load_format_x`, which writes only X, and X is identity -- but a fold that
+// checked only the format would have been wrong for the neighbouring shape and could not have said
+// so. Selector fields for components the opcode does not write are not examined.
+// DST_SEL is v[3][11:0], three bits per channel; SQ_SEL identity is 4/5/6/7 (X/Y/Z/W).
+inline bool rdna2_buffer_dst_sel_is_identity(uint32_t descriptor_word3, uint32_t components) {
+    for (uint32_t channel = 0; channel < components && channel < 4u; ++channel)
+        if (((descriptor_word3 >> (3u * channel)) & 0x7u) != 4u + channel) return false;
+    return true;
+}
+
 inline PcrelTables detect_pcrel_tables(
         const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords,
         size_t* required_dwords = nullptr) {
@@ -1781,14 +1798,18 @@ inline PcrelTables detect_pcrel_tables(
                 const uint32_t components = in.opcode + 1u;
                 if (!rdna2_buffer_format_is_raw_dwords(in.mtbuf_format, components)) break;
                 const int sb = in.src[1].value;
-                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
+                // word3 is required here and not in the untyped case below: a FORMAT load applies the
+                // descriptor's DST_SEL and a raw load does not.
+                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2) ||
+                    !kconst.count(sb + 3) ||
+                    !rdna2_buffer_dst_sel_is_identity(kconst[sb + 3], components)) break;
                 const uint32_t nrec = kconst[sb + 2];
                 const bool idxen = (in.literal >> 13) & 1u;
                 const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
                                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                 const uint64_t off = pcoff[sb];
                 uint32_t newest = 0;
-                for (int r : {sb, sb + 1, sb + 2}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
+                for (int r : {sb, sb + 1, sb + 2, sb + 3}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
                 bool entered = false;
                 for (uint32_t t : br_targets) if (t > newest && t <= in.pc) { entered = true; break; }
                 if (entered) break;
