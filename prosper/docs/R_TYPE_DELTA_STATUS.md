@@ -455,6 +455,9 @@ It also has two immediate practical consequences:
 | The flat composite is a wrong sampler LOD, a wrong image view, or a degenerate/uncovered quad | **Falsified.** `PROSPER_GEOM_PROBE=1780` returns a correct full-screen quad (6/6 vertices on-screen, clip bbox exactly ±1), and `PROSPER_FS_TAP=1780:12/:13` shows the interpolated coordinate is constant at the source rect's own origin — the sample location never varies, so nothing downstream of it can be the cause. | `gpu_replay` probes on `c9e2588e`, #2006 |
 | The post-movie collapse shares #2005's cause (the AvPlayer chroma plane declared as a one-layer 2D array) | **Falsified before the fix, by a lane that landed #2037 and re-measured.** With the chroma fix on the branch the movie reaches 315,101 distinct colours while the post-movie phase stayed at exactly 1 colour for 39 consecutive samples. Two independent defects. | #2037 branch route on `e58d387c`, #2006 |
 | Prosper's guest reads are unrealistically fast because they come from the host page cache, so a storage-latency model is the missing fidelity | **Half true, and it still is not the fix.** Page-cache state really does decide this race: with only the dump's pages evicted, INPUT→`DLLInit` is 779–1158 ms across five arms and the title **boots** every time, against 289–362 ms and five SIGSEGVs warm — and the least-contended pair points the same way (warm at load 13.4 faults, cold at load 14.7 boots), so it is not peer CPU load. But the cold arm is this box's **external USB SSD** at ~0.25 GB/s, not a PS5: a PS5 internal SSD delivers the same 101.4 MB in tens of ms, i.e. it behaves like the *warm* arm. A PS5-faithful storage model would therefore add almost nothing and cannot be justified by this race. The measurable consequence is an instrument rule, not a fix: **no startup-timing number for this title is valid unless the page-cache state is recorded.** | cold/warm A/B on `4d7a2ded`, § Host page-cache state, #1746 |
+| Cross answers the title screen's `PRESS` prompt, as it does on most titles | **Falsified.** The prompt's glyph is the PS5 **OPTIONS** icon (a filled vertical pill with three horizontal lines above it, `assets/screenshots/rtype-delta-title.png` at 1060,740-1180,870 under 4x). A Cross-only arm never leaves the title screen; OPTIONS leaves it on the first press. Inside the menu OPTIONS is *back*, not confirm. | routed arms on `82baa409`, `scripts/rtype-delta-PPSA26414/README.md` |
+| A stage PRX load, a high draw count, or a frame full of ships and explosions separates player-driven play from attract mode on this title | **Falsified.** With **no input at all** (`neutral.pad`, same command and build) the attract loop loaded `title`, `select`, `st1r9`, `st2` and `st5` -- it plays demos of stages 1, 2 and 5 and shows the Force-device screen. The discriminator that survives is `loadsel_Release.prx` + `loads1_Release.prx` (the title's own loading-screen modules, reached only through the menu path) plus `<PROSPER_SAVE0>/PPSA26414/SaveData.dat`; the neutral arm produced none of the three. | neutral control arm on `82baa409` |
+| The post-title frame freeze on master is caused by configuring an input route -- a connected controller changes the title's flow | **Falsified twice.** It reproduces with `neutral.pad`, which delivers no input; and prosper's default pad backend already reports **one connected controller with neutral input** when no route is configured (`src/hle/input/hle_pad.cpp`, `poll_controller`), so `PROSPER_PAD_SCRIPT` changes the buttons, not the connection. The cause is a renderer regression against `83e3383a`. | #2783 |
 
 ## Next frontier
 
@@ -786,6 +789,80 @@ distinguishable from a winning one by exit status alone.
 Rung 3 (gameplay with real GPU draws) is the next step and needs an input route: the title screen
 waits on a button press.
 
+## The input route (2026-08-20): OPTIONS, then Cross — and what a stage PRX does NOT prove
+
+The route the line above asks for is `prosper/scripts/rtype-delta-PPSA26414/reach-gameplay.pad`; that
+directory's README is the reference and carries its own `## Ruled out`. Two findings from building it
+belong here because they are about the title rather than about the route file.
+
+**The title screen's prompt is OPTIONS.** The `PRESS <glyph>` prompt renders the PS5 **OPTIONS**
+glyph — a filled vertical pill with three horizontal lines above it — visible at 1060,740–1180,870 in
+`assets/screenshots/rtype-delta-title.png` under 4× magnification. That is what the prompt **names**;
+no Cross-only arm was run, so it is not a claim about what the title would accept. What is measured
+about behaviour is a two-arm A/B on the menus: an arm that alternated OPTIONS and Cross 5 s apart
+never advanced past the first two states — it oscillated between `Start Game` and
+`Select Slot to Create` with a 15 s period, three times its own cycle — while the same file with
+OPTIONS removed after t=7 s walked the whole flow into stage 1. OPTIONS therefore **undoes** menu
+progress and the route presses it only until the title is cleared.
+
+**The title reads out its own menu state.** It draws a one-line English description of the highlighted
+entry at the bottom centre of the frame (`Start Game`, `Select Slot to Create`, `Enter Name`). That
+line survives even when nothing else in the menu draws, which is what made the route derivable at all
+while #2783 was suppressing the rest of the frame.
+
+**Attract mode loads the stage PRXs.** This is the trap on this title, and it defeats every frame-based
+discriminator: the attract loop *is* gameplay, played by the title. A neutral-input control arm
+(`neutral.pad`, same command, same build, no input) loaded `title_Release.prx`,
+`select_Release.prx`, `st1r9_Release.prx`, `st2_Release.prx` and `st5_Release.prx` — with the pad
+untouched. Those are module loads, not frames: #2783 had frozen that arm's composite before any of
+them, so what the attract loop *looked* like there was not observed. That the Force-device scene
+belongs to the attract loop is corroborated separately by
+`assets/screenshots/rtype-delta-force-select.png`, captured on a default, unrouted run. So **a stage module load, a high
+draw count, or a frame full of ships is not evidence of player-driven play here.**
+
+What the neutral arm never did, and every routed run does: load **`loadsel_Release.prx`** and
+**`loads1_Release.prx`** (the title's own two loading-screen modules, which only the
+menu → select → stage path passes through) and write **`<PROSPER_SAVE0>/PPSA26414/SaveData.dat`**.
+Those three together are the discriminator to use.
+
+## Everything after the title screen stopped rendering (2026-08-20, #2783)
+
+> **Superseded by the section below.** This records the symptom as observed on 2026-08-20,
+> before the cause was found. It is kept because the observations are the evidence the bisect
+> was built on; for the mechanism and the repair, read *The nine-day blank after the title
+> screen was a recompiler regression*.
+On master `82baa409` the title reaches stage 1 under the route above — `PROSPER_MODLOG=1` records
+`title` → `loadsel` (t=52 s) → `select` (t=54 s) → `loads1` (t=66 s) → `st1r9` (t=74 s), and the run
+writes its save file — while **every presented frame from t=52 s to t=180 s is pixel-identical**
+(`crc=9e16e1a3`, 90 samples, ~1,571 non-black pixels: one line of menu text on black). The same is
+true with no input at all: the attract loop advances through three stage demos while 60 of 66 samples
+are the byte-identical title logo.
+
+The renderer reports it directly, on every flip once the freeze starts:
+
+```text
+[rtt] PRESENT SOURCE EXTENT MISMATCH #N: no pass produced a 1920x1080 (8294400-byte) present source
+      — px_front=none px_vo=none px_last=none, offered 0 bytes; serving the retained frame instead
+      (published so far: fresh=4766 retained=4096)
+```
+
+`px_front=none px_vo=none px_last=none` with `offered 0 bytes` is *no pass recorded at all*, not a
+pass at the wrong extent, and `fresh` stops climbing exactly at the freeze.
+
+**It is a regression, not the title's ceiling.** At `83e3383a` — the #2061 merge, the head this
+document's `## Rung 2 reached` section was written against — the identical command, dump and route
+file render the whole flow: the `R-TYPE Δ MENU`, the `REGISTER PILOT` character grid, the launch-deck
+sequence, the Force-device select, the stage-1 briefing card, and **stage 1 itself** (`1ST CONTACT`,
+the R-9 over the city) at 88,000–157,000 distinct colours per frame. Peak `nonblack_rgb_pixels` over
+samples at t ≥ 20 s: **2,073,474 at `83e3383a` against 2,728 on master**, three orders of magnitude
+apart on the same route.
+
+Do not read the pre-#2783 rung-2 record as describing current master, and do not attribute this to
+the input route: it reproduces with `neutral.pad`, and prosper's default pad backend already reports
+one connected controller with neutral input when no route is configured at all
+(`src/hle/input/hle_pad.cpp`, `poll_controller`), so a route changes the buttons and not the
+connection.
+
 ## The nine-day blank after the title screen was a recompiler regression (2026-08-21, #2783)
 
 From `904e05ad` (2026-08-11) until the fix, this title rendered its publisher logo, its opening movie
@@ -865,3 +942,31 @@ differs, which is the control the defect needed.
   `st1r9_Release.prx`, `st2_Release.prx` and `st5_Release.prx` with the pad untouched. The
   discriminators are `loadsel_Release.prx` + `loads1_Release.prx` + `SaveData.dat`
   (`scripts/rtype-delta-PPSA26414/README.md`).
+
+### Bisected to `904e05ad`, with the instrument that got it wrong first
+
+The regression begins at **`904e05ad`** — `fix(recompiler): preserve GTA Wave64 scalar mask words`
+(2026-08-11, +363 lines in the RDNA2→SPIR-V recompiler, one of the `fix/issue-2481-*` GTA V Wave64
+mask series). Its **direct parent** `27dfd713` renders on this title's own route (peak 2,004,706
+non-black pixels, 11 distinct late frame CRCs); `904e05ad` freezes (1,166,928, **1** distinct).
+
+**What is not established:** that reverting it repairs current master. Reverting the *later*
+`86cbe9d3` hunk on master changed nothing, and at `94d36b03` the frame is entirely black from t=2 s —
+even the logo and movie stop — where master still renders them. Master may carry more than one
+regression in this family; re-measure after each candidate fix.
+
+**The discriminator, because the obvious one is void.** This defect freezes the composite and
+re-serves *one retained frame* forever, so a peak-brightness or peak-coverage statistic is exactly
+backwards: it cannot decay, and if the freeze caught the opening movie the retained frame is a
+letterboxed 1920×608 still worth **1,167,360 non-black pixels**, which passes any sane coverage
+threshold on every sample forever. A first bisect scored six frozen runs GOOD that way and returned a
+culprit whose own hunk, reverted, moved nothing — the mutation arm is what caught it. Use both
+numbers, over samples at t ≥ 30 s, straight from the capture manifest:
+
+```text
+peak non-black >= 1,200,000  AND  >= 3 distinct pixel_crc32   ->  renders
+```
+
+The three freeze signatures seen — 1,167,360 (frozen on the movie), 1,637 (frozen on the menu
+description line) and 0 (frozen before anything drew) — are one defect caught at three moments, and
+only the CRC count sees that.
