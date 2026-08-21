@@ -4785,18 +4785,21 @@ a new one** — and note which entries are *solid* versus *void*, because a void
 falsification.
 
 - **The one JumpPatchTarget call per run that hands a non-Jump header (`0x3e718000`) is patching
-  somewhere inside a known DCB — a recycled ring, a mid-packet offset, or a second packet shape.**
-  *All three falsified together, because the premise under them is false.* They were inferred from
-  `patch_target_writable` not refusing, but that predicate has **two** paths to true — the DCB ring
-  registry and the `guest_writable` OS probe — and only the first means "command buffer". Instrumented
-  to report which one answered: it is **the OS probe**, so the pointer is ordinary writable guest
-  memory and there is no packet there to be recycled, mis-offset or reshaped. `0x3e718000` is a
-  well-formed float (0.235839844) inside a mixed int/float record. Across two routed runs the
-  **address moves** (`0x203f517d34` → `0x203fa17d34`) while the **contents stay bit-identical**, which
-  is a stable heap object rather than a position in a command stream; the call's own arguments
-  (`target=0x20408d0080`, `ndw=3650`) are meanwhile plausible, so the guest means a jump and it is the
-  `cmd` pointer that does not land on a packet. Not a live defect while prosper never decodes that
-  memory. #2715.
+  somewhere inside a known DCB.** *VOID, not falsified — and the first attempt to kill it was wrong in
+  the opposite direction.* An instrumented run showed `patch_target_writable` answering through the
+  `guest_writable` OS probe rather than the ring registry, and that was published as "not a command
+  buffer, so all three candidates die". **It does not support that.** `remember_dcb_extent` has a
+  **single call site** (`hle_agc.cpp:581`, inside `set_regs_indirect`), the array is `thread_local`,
+  and it holds **four FIFO slots** evicted oldest-first — so a miss means only "not among ≤4 recently
+  registered extents on this thread that had a RegsIndirect packet built into them", which says almost
+  nothing about whether the bytes are a command stream. The dump's own window in fact points the other
+  way: at `cmd-2`/`cmd-1` it holds `c0001000 6875000d`, and `0xC0001000` is exactly
+  `PM4(2, IT_NOP, 0)` while `0x6875000d` is the 2-dword NOP marker **prosper itself** emits in
+  `sceAgcCbSetShRegisterRangeDirect` (`hle_agc.cpp:1603`) — so `cmd` sits at a packet **boundary** in a
+  real AGC stream. The address delta across runs was misread too: `0x203f517d34` → `0x203fa17d34` is
+  exactly `0x500000` with **identical low 20 bits**, the signature of the same offset into a relocated
+  allocation rather than of a heap object. **Candidate 1 (a consumed packet / recycled ring) is now the
+  leading reading, not a dead one.** #2715, #2856.
 
 - **`0x413dc6700` contains no guest barriers, so all eight emitted `OpControlBarrier` are emulation
   scaffolding.** *Falsified — and it was a grep artifact, not a measurement.* The program contains
