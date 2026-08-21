@@ -89,6 +89,21 @@ Derived offline from the dump, with no prosper involved, and self-checking:
 (`Science_Remake2`) first, and `level7` (`LoadShip`) is the loading screen that immediately precedes
 it — the pair is itself a small consistency check on the mapping.
 
+### The runtime cross-check: FMOD banks name the scene the guest just opened
+
+The `.resS` partition is derived from the same file listing as the index itself. A **runtime** check
+that shares nothing with it falls out of the same `PROSPER_FILELOG=1` trace, because this title
+loads a per-area FMOD bank immediately after the scene that needs it:
+
+| scene file opens | the very next bank opened |
+| --- | --- |
+| `Media/level5` | `Media/StreamingAssets/`**`Intro`**`.bank` |
+| `Media/level14` | `Media/StreamingAssets/`**`Science_Ship`**`.bank` |
+
+`level5` is `INTRO/Intro.unity` and `level14` is `SCIENCE_SHIP/Science_Remake2.unity` under the
+offline mapping, and the guest independently names both at runtime. Two indices derived one way,
+confirmed by a completely different mechanism.
+
 **The oracle discriminates here, and that had to be established rather than assumed.** It has
 failed twice on other titles: *Tales of Graces f* ships exactly one level file, so the index is a
 constant and the oracle is void; *Bendy and the Ink Machine*'s layout does not transfer to its own
