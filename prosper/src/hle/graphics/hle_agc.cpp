@@ -3208,13 +3208,104 @@ HLE(agc_patch_release_mem_data) {
 // is logged rather than stored — a slot invented for it here would be read by nothing.
 // CONFIDENCE: HIGH on the argument roles and the packet shape (both measured); MED on cache policy
 // being safely ignorable, which holds only while the decoder has no policy semantics.
+// #2715 forensics: say WHAT the refused location actually is, in one line, on the cold refusal path.
+//
+// The open question is why exactly one call per run hands this handler a non-Jump header (0x3e718000,
+// PM4 type 0), bit-identically across runs with different skip sets. The three candidates -- a recycled
+// ring, a pointer that is not a packet start, and a second packet shape sharing this NID -- cannot be
+// told apart from the header alone, so this prints the evidence that separates them.
+//
+// It also corrects a premise the issue was filed on. `patch_target_writable` returning true was read
+// as "the pointer is inside a known DCB", but it has TWO paths to true: the ring registry, and the
+// `guest_writable` OS probe. The second only establishes "writable guest memory", which any heap
+// allocation satisfies -- so which predicate answered is the single highest-value bit here, and it is
+// free to recover: `in_known_dcb` is a pure range compare and nothing between the two calls mutates
+// the registry.
+//
+// Reads are bounded by what has already been PROVEN readable: the surrounding window is dumped only
+// when a ring supplies real bounds, and is clamped to them; otherwise only the four dwords
+// patch_target_writable just validated are shown. A forensic dump that itself faults would replace the
+// question with a different one.
+inline void jump_patch_refusal_detail(const uint32_t* cmd, uint64_t policy, uint64_t target, uint64_t ndw) {
+    static std::atomic<int> budget{0};
+    if (budget.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+
+    const auto p = (uintptr_t)cmd;
+    const DcbExtent* ring = nullptr;
+    for (const auto& e : g_dcb_extents)
+        if (e.bottom && p >= e.bottom && p < e.top) { ring = &e; break; }
+
+    float as_float = 0.0f;
+    memcpy(&as_float, &cmd[0], sizeof(as_float));
+    fprintf(stderr,
+            "[agc] JumpPatchTarget REFUSED-DETAIL cmd=%p hdr=0x%08x type=%u (as f32 %.9g)\n"
+            "      writable-via=%s\n"
+            "      args: policy=0x%llx target=0x%llx ndw=%llu -> target-in-known-dcb=%s target-writable=%s\n",
+            (const void*)cmd, cmd[0], (unsigned)(cmd[0] >> 30), (double)as_float,
+            ring ? "DCB-ring-registry" : "guest_writable OS probe ONLY (NOT a known command buffer)",
+            (unsigned long long)policy, (unsigned long long)target, (unsigned long long)ndw,
+            in_known_dcb((uintptr_t)target, 4) ? "YES" : "no",
+            gpu::guest_writable(target, 4) ? "YES" : "no");
+
+    if (!ring) {
+        // No ring means no bounds to clamp to, so extend only as far as the guest-memory probe
+        // itself proves writable, one dword at a time, and stop at the first refusal. Four dwords
+        // are already known good; anything beyond them has to earn it.
+        fprintf(stderr, "      dw[0..3]= %08x %08x %08x %08x\n", cmd[0], cmd[1], cmd[2], cmd[3]);
+        fprintf(stderr, "      probed:");
+        for (int i = -4; i < 16; i++) {
+            const uint64_t a = (uint64_t)p + (int64_t)i * (int64_t)sizeof(uint32_t);
+            if (!gpu::guest_writable(a, sizeof(uint32_t))) { fprintf(stderr, " |unreadable@%+d|", i); continue; }
+            uint32_t v = 0;
+            memcpy(&v, (const void*)(uintptr_t)a, sizeof(v));
+            fprintf(stderr, " %s%08x%s", i == 0 ? "[" : "", v, i == 0 ? "]" : "");
+        }
+        fprintf(stderr, "\n");
+        return;
+    }
+
+    const auto* base = (const uint32_t*)ring->bottom;
+    const size_t ring_dw = (size_t)(ring->top - ring->bottom) / sizeof(uint32_t);
+    const size_t at     = (size_t)(cmd - base);
+    fprintf(stderr, "      ring=[0x%llx,0x%llx) dw %zu of %zu (byte off 0x%zx)\n",
+            (unsigned long long)ring->bottom, (unsigned long long)ring->top,
+            at, ring_dw, at * sizeof(uint32_t));
+
+    // Walk back for the nearest type-3 header and ask whether its own length covers `cmd`. A hit that
+    // spans us means this pointer is mid-packet (an offset error); a miss, or a hit that stops short,
+    // means it is a packet boundary holding something that is not a Jump -- i.e. recycled or data.
+    const size_t kBack = 64;
+    const size_t lo = at > kBack ? at - kBack : 0;
+    bool spanned = false;
+    for (size_t i = at; i-- > lo;) {
+        if ((base[i] >> 30) != 3u) continue;
+        const uint32_t ndw = ((base[i] >> 16) & 0x3fffu) + 2u;
+        const uint32_t op  = (base[i] >> 8) & 0xffu;
+        const uint32_t r   = (base[i] >> 2) & (R_NUM - 1u);
+        spanned = (i + ndw) > at;
+        fprintf(stderr, "      back-scan: type3 at dw-%zu hdr=0x%08x op=0x%x r=0x%x (%s) ndw=%u spans-cmd=%s\n",
+                at - i, base[i], op, r,
+                op == IT_NOP ? dcb_subop_name(r) : "non-NOP", ndw, spanned ? "YES" : "no");
+        break;
+    }
+    if (!spanned)
+        fprintf(stderr, "      back-scan: no type-3 header within %zu dwords covers cmd\n", kBack);
+
+    fprintf(stderr, "      window:");
+    const size_t wlo = at > 8 ? at - 8 : 0;
+    const size_t whi = (at + 8) < ring_dw ? at + 8 : ring_dw;
+    for (size_t i = wlo; i < whi; i++)
+        fprintf(stderr, " %s%08x%s", i == at ? "[" : "", base[i], i == at ? "]" : "");
+    fprintf(stderr, "\n");
+}
+
 HLE(agc_jump_patch_target) {
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     // FOUR dwords, not kDwJump: this handler reads cmd[0] and writes cmd[1..3], and the span contract
     // above is the dwords each handler actually TOUCHES rather than the packet's nominal length.
     // cmd[4] is deliberately outside it -- predication belongs to sceAgcSetPacketPredication.
     if (!patch_target_writable(a0, 4u * sizeof(uint32_t), "JumpPatchTarget")) return 0;
-    if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) return 0;
+    if (!patch_check(cmd, R_JUMP, "JumpPatchTarget")) { jump_patch_refusal_detail(cmd, a1, a2, a3); return 0; }
     const uint32_t pre_lo = cmd[1], pre_hi = cmd[2], pre_ndw = cmd[3];
     cmd[1] = (uint32_t)(a2 & 0xffffffffu);
     cmd[2] = (uint32_t)(a2 >> 32u);

@@ -4784,6 +4784,20 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **The one JumpPatchTarget call per run that hands a non-Jump header (`0x3e718000`) is patching
+  somewhere inside a known DCB — a recycled ring, a mid-packet offset, or a second packet shape.**
+  *All three falsified together, because the premise under them is false.* They were inferred from
+  `patch_target_writable` not refusing, but that predicate has **two** paths to true — the DCB ring
+  registry and the `guest_writable` OS probe — and only the first means "command buffer". Instrumented
+  to report which one answered: it is **the OS probe**, so the pointer is ordinary writable guest
+  memory and there is no packet there to be recycled, mis-offset or reshaped. `0x3e718000` is a
+  well-formed float (0.235839844) inside a mixed int/float record. Across two routed runs the
+  **address moves** (`0x203f517d34` → `0x203fa17d34`) while the **contents stay bit-identical**, which
+  is a stable heap object rather than a position in a command stream; the call's own arguments
+  (`target=0x20408d0080`, `ndw=3650`) are meanwhile plausible, so the guest means a jump and it is the
+  `cmd` pointer that does not land on a packet. Not a live defect while prosper never decodes that
+  memory. #2715.
+
 - **`0x413dc6700` contains no guest barriers, so all eight emitted `OpControlBarrier` are emulation
   scaffolding.** *Falsified — and it was a grep artifact, not a measurement.* The program contains
   **two** `s_barrier` (SOPP `0x0a`, encoded `0xbf8a0000`), at **pc 116 and pc 129** — which are exactly
