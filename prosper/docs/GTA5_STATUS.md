@@ -110,6 +110,39 @@ conclusion; it sharpens what "essentially all black" looks like.
 
 ## Ruled out (2026-08-19)
 
+- **The overlapping views carry DIFFERENT STRIDES — 16 and 4 — over the same guest memory, and the
+  four "ping-pong" buffers land at offsets 0, 8252, 33024 and 66044 from one span base.** Measured
+  2026-08-21 from the binding declarations, all exact:
+
+  | resource | base | size | stride | records |
+  | --- | --- | ---: | ---: | ---: |
+  | `0x413e1c300`'s span | `0x20f8482140` | 33,024 | **16** | 2064 |
+  | the traversal table | `0x20f848417c` | 8,252 | **4** | 2063 |
+
+  Placing the four observed buffer addresses against that span base gives offsets **0**, **8,252**,
+  **33,024** and **66,044**. Three of those are exact structure: 8,252 is one table-size in;
+  33,024 is *precisely* the span's end address, i.e. the next block's base. **The fourth is not:
+  66,044 is 2 x 33,024 minus 4 — one 4-byte record short.**
+
+  So the memory is simultaneously described as 2064 records of 16 bytes and as 2063 records of
+  4 bytes, and the "ping-pong pair" is not two instances of one field: `…417c` is *one table into
+  block 0* while `…a240` is *offset 0 of block 1*. That is an odd shape for a double-buffer, and it
+  sits directly on the addressing suspicion raised by the 2-cycle structure above.
+
+  **What this is and is not.** The strides, sizes, bases and offsets are read from the run's own
+  binding declarations and the arithmetic is exact. **Not** established: that a regular array is
+  intended, that the 4-byte shortfall at 66,044 is wrong rather than deliberate, or which of the two
+  strides describes the guest's real record. All of that needs the guest's own structure, not more
+  address arithmetic — and address arithmetic is precisely where a plausible-looking wrong answer is
+  easiest to produce.
+
+  **Instrument note, because it cost a run.** `[parentscan]` is gated on `stride == 4`
+  (`buffer.resource->stride == 4u`), so it **cannot** scan the stride-16 span. An attempt to read the
+  neighbouring view of the same bytes with `PROSPER_COMPUTE_PARENTSCAN=413e1c300` produced **zero**
+  scan lines for ten minutes — inert by construction, not a negative result. The "compare the two
+  views" arm named above therefore needs an instrument that does not assume a 4-byte record.
+  (2026-08-21.)
+
 - **The cyclic table holds STRUCTURED data, not uninitialised garbage — and every cycle sampled is a
   2-CYCLE between a pair of records whose words differ only in bit 30.** `[parentscan-ring]` samples
   from the run that took the device loss (2026-08-21):
