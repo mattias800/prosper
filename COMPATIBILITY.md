@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-08-17
+Last updated: 2026-08-22
 
 ## Summary
 
@@ -74,6 +74,7 @@ Last updated: 2026-08-17
 | *Spacebase Startopia* | `PPSA02846` | Unity 2020.3.1 / IL2CPP | 🔬 Not yet booted — nothing run against it yet | [#2887](https://github.com/mattias800/prosper/issues/2887) |
 | *Sifu* | `PPSA03001` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2885](https://github.com/mattias800/prosper/issues/2885) |
 | *Unbound: Worlds Apart* | `PPSA03274` | Unreal Engine 4 | 🔬 Not yet booted — nothing run against it yet | [#2886](https://github.com/mattias800/prosper/issues/2886) |
+| *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 
 ## At a glance
 
@@ -93,7 +94,7 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 14 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
 | **Not yet booted** — tracked, no run attempted yet | 9 |
-| Total tracked | 49 |
+| Total tracked | 50 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 **Rung 3 requires the gameplay scene to actually render, not merely to be reached.** The bar is

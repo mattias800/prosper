@@ -3,6 +3,7 @@
 // (Linux/macOS: exec_image_linux.cpp; Windows: exec_image_win.cpp).
 #include "host/image/boot_program.hpp"
 #include "host/image/module_path_policy.hpp"
+#include "host/image/module_start_params.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -377,12 +378,17 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // Enable real runtime PRX loading now that the fixed set is linked, mapped and stubbed (#639).
     runtime_module_loader_init(&p);
 
-    // PSN.prx / SaveData.prx native plugins validate a module-param descriptor and null-fault if
-    // started with (argc=0, argp=NULL). Register their guest ranges so run_guest_inits starts them
-    // with the real descriptor. Skipped when PROSPER_NO_PSN drops them.
+    // Native Unity PSN/SaveData plugins validate a module-param descriptor at module_start and
+    // null-fault if started with (argc=0, argp=NULL). Register their guest ranges so run_guest_inits
+    // starts them with the real descriptor. Which ranges, and why each one, is module_start_params.
+    // Skipped when PROSPER_NO_PSN drops them.
+    //
+    // Every module prosper links has DT_INIT at image+0x10 and an EMPTY DT_INIT_ARRAY, so a range
+    // there selects exactly one function — the module's real module_start — and never a C++ static
+    // constructor. A module_start that ignores its arguments is unaffected either way: (0x10, &desc)
+    // and (0, NULL) are both just unread registers to it.
     if (!getenv("PROSPER_NO_PSN"))
-        set_module_start_param_ranges({ { BOOT_PSN, BOOT_SAVEDATA }, { BOOT_SAVEDATA, BOOT_LIBC },
-                                        { BOOT_PSNCORE, 0x490000000ull }, { BOOT_PSNCOMMON, 0x4b0000000ull } });
+        set_module_start_param_ranges(module_start_param_ranges());
 
     // Diagnostics: guest initialization running.
     diagnostics::record_boot_phase(diagnostics::BootPhase::GUEST_INITS_RUNNING);

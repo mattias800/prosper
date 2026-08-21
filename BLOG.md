@@ -33,6 +33,51 @@ this is the real scene, not a cutscene. Tracker [#1898](...).
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-08-22
+
+### PGA TOUR 2K25 told us exactly what was wrong, in English, and it was not what it said
+
+No picture with this one — the title still does not render. The finding is what moved.
+
+A new Unity 6 / IL2CPP title, 35 GB, and it died 1.2 seconds into every boot. What made it unusual
+is that it *announced* the crash first:
+
+```
+ERROR...
+ PSN is an old version that cannot be used by the current player runtime.
+ Please update the PSN native module and any associated managed assemblies to the latest versions
+```
+
+That message is a lie in the most useful possible way. Nothing is old, and no module is missing.
+The string is not in the dump anywhere as plain text — it lives compressed inside the Unity data —
+so it had to be chased through the disassembly of `Il2cppUserAssemblies.prx` instead, which is where
+it turned into an exact mechanism. The game holds two globals: an argument count and a pointer to a
+"plugin args" struct. It checks the count has a bit above the low nibble, then checks the struct
+says `size == 0x10` and `version == 0x200`. Both globals were zero, so it took the mismatch branch —
+and the mismatch branch's own third `printf`, the one that would have politely told us which version
+it found, reads that version straight off the NULL pointer. The error handler is the crash.
+
+`tools/re/xref.py` found exactly one writer of the pointer, and it was a two-instruction function
+that stores `rdi` and `rsi` and returns: the module's `module_start(size_t argc, const void *argp)`.
+prosper was starting the module with `(0, NULL)`.
+
+The good part is what was already in the tree. prosper has had that exact descriptor —
+`{size = 0x10, version = 0x200, callback = 0}` — since the PSN.prx work, sitting in
+`exec_image_linux.cpp` under a comment reading *"the descriptor Sony's PSN/SaveData plugin
+module_start validates"*. Same two constants. The Unity PSN package simply does not always ship as
+its own `PSN.prx`: with IL2CPP its native half can be linked straight into the user-assemblies
+module, and then the handshake belongs to *that* module's `module_start`. It only ever needed to be
+told about one more module.
+
+With that fixed the title runs six times longer, streams its assets through Ampr, brings up the
+compute backend and submits over a thousand draws — and then dies again, on a thread called
+`Background Job.`, in a loop scanning for `:` and CRLF. An HTTP header parser, walking a NULL
+buffer, because `sceHttp2SendRequest` returned `0` for a request that was never sent, `0` is
+`SCE_OK`, and `sceHttp2GetAllResponseHeaders` then reported success without writing anything to its
+out-parameters. Rung 0 still, but every metre of that is now named:
+[#2894](https://github.com/mattias800/prosper/issues/2894), tracker
+[#2895](https://github.com/mattias800/prosper/issues/2895).
+
 ## 2026-08-21
 
 ### Yakuza Kiwami allocates its entire game heap through a Sony API nobody had implemented
