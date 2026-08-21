@@ -186,6 +186,11 @@ uint64_t ampr_cb_offset(uint64_t cb) {
 void ampr_cb_set_buffer(uint64_t cb, uint64_t base, uint64_t size) {
     if (!cb) return;
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
+    // #2878: this eviction picks an ARBITRARY victim, and adding buffer_base to the record made
+    // that newly consequential — an evicted victim's GetBufferBaseAddress answers 0, which on the
+    // AMM submit path is a null command stream. Latent (no title comes near 4096 live command
+    // buffers; PPSA31334 constructs two) and left as-is here rather than swapped for a different
+    // arbitrary rule without evidence.
     if (g_ampr_cb_state.size() >= 4096 && !g_ampr_cb_state.count(cb))
         g_ampr_cb_state.erase(g_ampr_cb_state.begin());
     auto& state = g_ampr_cb_state[cb];
@@ -2304,6 +2309,22 @@ HLE(k_ampr_push_map) {
     return 0;
 }
 
+// A reservation prosper made for ITSELF, which the fault handler must never silently back.
+//
+// The default for a tracked-but-uncommitted range is the opposite: exec_image_linux.cpp's SIGSEGV
+// handler treats state 1 above 0x1000000000 as "the guest touched a page it believes it committed"
+// and MAP_FIXEDs a 64 KiB anonymous read/write page over it. Several titles' allocator bring-up
+// depends on that, so it is right as a default — but it is exactly wrong for a window prosper
+// reserved to hold a specific kind of memory, because it converts a REFUSED mapping into a silently
+// substituted one: the guest gets anonymous pages with no physical alias, no write-watch coverage,
+// and a g_maps record still saying "uncommitted", and the run continues on divergent memory with
+// only a log line to say so. Raised in review of the AMM change; the AMM window is the first
+// occupant, and one range is enough until there is a second.
+//
+// Written once, before the window is published, and read from a SIGNAL HANDLER — hence atomics
+// rather than the mutex the rest of this file uses.
+std::atomic<uint64_t> g_no_lazy_commit_base{0}, g_no_lazy_commit_end{0};
+
 // --- libSceAmpr AMM (asynchronous memory manager) ----------------------------------------------
 //
 // AMM is the memory-mapping sibling of the APR file reader above (and in hle_file.cpp): the guest
@@ -2355,7 +2376,21 @@ HLE(k_ampr_push_map) {
 // the window prosper itself reserved for AMM. That window is a PROT_NONE reservation prosper tracks
 // as UNCOMMITTED, so map_phys_at's no-clobber discipline (#137, and the clobbers it exists to stop
 // — #88, #107) independently refuses to place a mapping anywhere else. Two guards, either of which
-// alone turns a wrong VA into a loud refusal instead of a MAP_FIXED over live guest memory.
+// alone turns a wrong VA into a refusal instead of a MAP_FIXED over live guest memory.
+//
+// A refusal is only *visible* because of the third thing, and this paragraph claimed the opposite
+// until review caught it. On Linux a tracked-but-uncommitted range above 0x1000000000 is a
+// LAZY-COMMIT TARGET: exec_image_linux.cpp's SIGSEGV handler backs a touch of one with a 64 KiB
+// anonymous page and re-executes. Left that way, a refused AMM map would be silently rescued with
+// memory that has no physical alias, no write-watch coverage and a g_maps record still reading
+// "uncommitted" — and the guest could not tell, because it does not test Map's return value
+// (eboot+0xdbbe64 is followed straight by a `lea`, with no `test %eax,%eax` before eax is
+// clobbered). So the window is registered as DECLINING lazy commit (g_no_lazy_commit_*), which
+// turns a refused map into a fault at the exact VA the guest asked for, with this file's log line
+// naming the reason immediately above it. That also closes a straddle: the lazy commit rounds to
+// 64 KiB while a map is only required to be 16 KiB aligned, so a fault in the uncommitted half of a
+// 64 KiB page could otherwise have MAP_FIXED anonymous memory over the committed half — the #88 /
+// #107 clobber class arriving through the fault handler rather than through map_at.
 // CONFIDENCE: HIGH on the argument layouts (SDK wrappers + nine consistent call sites), MED on the
 // window's size and placement (prosper chooses those; the guest only requires the span), LOW on
 // the meaning of the three out-parameters this title never reads — see each below.
@@ -2375,7 +2410,10 @@ namespace {
         uint64_t va_base = 0, va_size = 0;                   // the reported window
         uint64_t pool_base = 0, pool_end = 0, pool_cursor = 0; // physical pool from GiveDirectMemory
         std::atomic<uint32_t> next_completion{1};
-        int refusals = 0;
+        // Separate counters: a run that trips the protection-0 NOTE sixteen times must not go on to
+        // swallow the first real REFUSED line, which is the one that explains a fault. Raised in
+        // review.
+        int refusals = 0, notes = 0;
     };
     // Never destroyed: guest threads can still be inside an AMM call during process teardown.
     AmmState& amm() { static AmmState* state = new AmmState; return *state; }
@@ -2383,6 +2421,9 @@ namespace {
     // Reserve the window on first use and publish it. PROT_NONE + a tracked UNCOMMITTED record is
     // the same shape sceKernelReserveVirtualRange produces, which is exactly what makes
     // map_phys_at willing to commit inside it and unwilling to commit outside it.
+    // Lock order is AmmState::mx -> g_mx: map_guest_from and track both take g_mx underneath this
+    // lock. Nothing takes g_mx and then calls into AMM, so there is no cycle — written down rather
+    // than left to be re-derived, because that is the property a future edit could break silently.
     bool amm_window_ensure(uint64_t& base_out, uint64_t& size_out) {
         AmmState& state = amm();
         std::lock_guard<std::mutex> lk(state.mx);
@@ -2394,6 +2435,11 @@ namespace {
                         (unsigned long long)kAmmWindowSize);
                 return false;
             }
+            // Order matters: decline lazy commit BEFORE the range becomes a tracked reservation,
+            // because the instant `track` publishes it the fault handler would otherwise treat any
+            // touch of the still-unmapped remainder as a page to back with anonymous memory.
+            g_no_lazy_commit_base.store((uint64_t)p, std::memory_order_relaxed);
+            g_no_lazy_commit_end.store((uint64_t)p + kAmmWindowSize, std::memory_order_relaxed);
             state.va_base = (uint64_t)p;
             state.va_size = kAmmWindowSize;
             track(state.va_base, state.va_size, 0, 0, false, "ampr-amm-window");
@@ -2460,15 +2506,16 @@ namespace {
     // Bounded so a guest that asks for something impossible in a loop cannot flood the log, but
     // never silent for the first few: a refused map is a page the guest believes it owns, and the
     // fault it produces later is meaningless without this line. `what` carries its own verb.
-    void amm_say(const char* what, uint64_t a, uint64_t b, uint64_t c) {
+    void amm_say(bool is_refusal, const char* what, uint64_t a, uint64_t b, uint64_t c) {
         AmmState& state = amm();
         int n;
-        { std::lock_guard<std::mutex> lk(state.mx); n = state.refusals++; }
+        { std::lock_guard<std::mutex> lk(state.mx);
+          n = is_refusal ? state.refusals++ : state.notes++; }
         if (n < 16)
             fprintf(stderr, "[amm] %s (0x%llx, 0x%llx, 0x%llx)\n", what,
                     (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
         else if (n == 16)
-            fprintf(stderr, "[amm] further AMM complaints suppressed\n");
+            fprintf(stderr, "[amm] further %s suppressed\n", is_refusal ? "refusals" : "notes");
     }
 }
 
@@ -2483,12 +2530,20 @@ namespace {
 HLE(k_amm_get_va_ranges) {
     ampr_arglog("wkQR9+xTFKY(AmmGetVirtualAddressRanges)", a0, a1, a2, a3, a4, a5);
     uint64_t base = 0, size = 0;
-    if (!amm_window_ensure(base, size)) return 0x8002000cull;   // SCE_KERNEL_ERROR_ENOMEM
-    if (a0 > 0xffff) *(uint64_t*)a0 = base;
-    if (a1 > 0xffff) *(uint64_t*)a1 = base + size;
+    const bool ok = amm_window_ensure(base, size);
+    // The out-parameters are written on EVERY path, including the failure one. Returning an error
+    // without writing them would be byte-for-byte the defect this handler exists to remove — and
+    // worse than it looks, because the guest never reads the return value: eboot+0xdbf4d4 is
+    // followed immediately by `call 0xe8fcc0`, with no `test %eax,%eax` in between. An unwritten
+    // slot would therefore be indistinguishable from success and the allocator would walk stack
+    // residue exactly as before. An all-zero window is also the answer that makes the guest fail
+    // SAFELY: it stores the base at state+0xeca8, and its heap-grow path tests that slot for zero
+    // (eboot+0xdbbdc6) and takes its own no-AMM branch. Raised in review.
+    if (a0 > 0xffff) *(uint64_t*)a0 = ok ? base : 0;
+    if (a1 > 0xffff) *(uint64_t*)a1 = ok ? base + size : 0;
     if (a2 > 0xffff) *(uint64_t*)a2 = 0;
     if (a3 > 0xffff) *(uint64_t*)a3 = 0;
-    return 0;
+    return ok ? 0 : 0x8002000cull;   // SCE_KERNEL_ERROR_ENOMEM
 }
 
 // sceAmprAmmGiveDirectMemory(searchStart, searchEnd, len, memoryType, alignment, off_t* physOut).
@@ -2510,16 +2565,25 @@ HLE(k_amm_give_dmem) {
                             (a3 & (kGuestPageSize - 1)) == 0) ? a3 : kGuestPageSize;
     const int type = a4 <= (uint64_t)kMaxDirectMemoryType ? (int)a4 : 0;
     if (!a2 || (a2 & (kGuestPageSize - 1)) != 0) {
-        amm_say("REFUSED give-direct-memory: length is not a 16 KiB multiple", a2, align, a4);
+        amm_say(true, "REFUSED give-direct-memory: length is not a 16 KiB multiple", a2, align, a4);
         return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
     }
     uint64_t phys = 0;
     if (!dmem_take(a2, align, type, phys, a0, a1 ? a1 : ~0ull)) {
-        amm_say("REFUSED give-direct-memory: the direct-memory pool cannot satisfy it", a2, align, a1);
+        amm_say(true, "REFUSED give-direct-memory: the direct-memory pool cannot satisfy it", a2, align, a1);
         return 0x8002000cull;                                   // SCE_KERNEL_ERROR_ENOMEM
     }
+    // Fresh direct memory reads back ZERO on hardware, and prosper's pool is one process-wide memfd
+    // that RETAINS bytes across release and reuse (see dmem_zero). Every other fresh-allocation path
+    // in this file punches the range; this one must too, or an AMM pool landing on previously
+    // released offsets hands the guest's heap allocator somebody else's bytes. Raised in review; the
+    // test that appeared to cover it could not, because a fresh test process reads zero through
+    // sparseness whether or not this call happens. Cheap on Linux (a hole punch, and the range stays
+    // sparse); the Darwin branch memsets through a scratch mapping, which a multi-GiB pool makes
+    // genuinely expensive — worth knowing, not worth skipping.
+    dmem_zero(phys, a2);
     if (!amm_pool_publish(phys, a2)) {
-        amm_say("REFUSED give-direct-memory: AMM already holds a pool and this one is not "
+        amm_say(true, "REFUSED give-direct-memory: AMM already holds a pool and this one is not "
                 "contiguous with it -- prosper tracks a single span", phys, a2, 0);
         dmem_release(phys, a2);
         return 0x8002000cull;                                   // SCE_KERNEL_ERROR_ENOMEM
@@ -2546,17 +2610,17 @@ HLE(k_amm_cb_map) {
     ampr_arglog("JEVYGhDc97M(AmmCommandBufferMap)", a0, a1, a2, a3, a4, a5);
     const uint64_t va = a1, len = a2;
     if (!va || !len || (va & (kGuestPageSize - 1)) != 0 || (len & (kGuestPageSize - 1)) != 0) {
-        amm_say("REFUSED map: address or length is not 16 KiB aligned", va, len, a0);
+        amm_say(true, "REFUSED map: address or length is not 16 KiB aligned", va, len, a0);
         return 0x80020016ull;                                   // SCE_KERNEL_ERROR_EINVAL
     }
     uint64_t window_base = 0, window_size = 0;
     if (!amm_window_ensure(window_base, window_size) || !amm_window_contains(va, len)) {
-        amm_say("REFUSED map: target is OUTSIDE the AMM window", va, len, window_base);
+        amm_say(true, "REFUSED map: target is OUTSIDE the AMM window", va, len, window_base);
         return 0x80020016ull;
     }
     uint64_t phys = 0;
     if (!amm_pool_take(len, phys)) {
-        amm_say("REFUSED map: AMM's own direct-memory pool is exhausted", va, len, 0);
+        amm_say(true, "REFUSED map: AMM's own direct-memory pool is exhausted", va, len, 0);
         return 0x8002000cull;                                   // SCE_KERNEL_ERROR_ENOMEM
     }
     int prot = host_prot(a4);
@@ -2568,13 +2632,13 @@ HLE(k_amm_cb_map) {
         // unexplainable SIGSEGV inside guest code instead of as a diagnosable refusal here, so
         // fall back to read/write — and say so, because a fallback nobody sees is a fallback
         // nobody fixes. CONFIDENCE: LOW (the zero case has never been observed).
-        amm_say("NOTE map: protection 0 decodes to no access; mapping read/write instead",
+        amm_say(false, "NOTE map: protection 0 decodes to no access; mapping read/write instead",
                 va, len, a4);
         prot = PROT_READ | PROT_WRITE;
     }
     void* p = map_phys_at(va, len, prot, phys);
     if (!p) {
-        amm_say("REFUSED map: the host refused the mapping (target is not a free reservation)", va, len, phys);
+        amm_say(true, "REFUSED map: the host refused the mapping (target is not a free reservation)", va, len, phys);
         amm_pool_untake(phys, len);
         return 0x8002000cull;
     }
@@ -2630,9 +2694,12 @@ HLE(k_release_dmem) {
 }
 
 // Most-specific tracked-mapping state at `addr` for the fault handler's lazy-commit probe:
-// 0 = untracked, 1 = reserved-but-uncommitted, 2 = committed. Called from a signal handler on the
-// FAULTING thread — that thread is in guest code, so it cannot itself hold g_mx (only HLE memory
-// entry points take it, briefly); a contended lock just waits for the other thread's release.
+// 0 = untracked, 1 = reserved-but-uncommitted, 2 = committed, 3 = reserved and DECLINING lazy
+// commit (see above). Every caller tests `== 1`, so 3 declines everywhere at once — which is the
+// point: a range prosper will not back itself must not be backed by the APR completion write or the
+// file-read destination commit either. Called from a signal handler on the FAULTING thread — that
+// thread is in guest code, so it cannot itself hold g_mx (only HLE memory entry points take it,
+// briefly); a contended lock just waits for the other thread's release.
 extern "C" int prosper_reserved_range_state(uint64_t addr) {
     std::lock_guard<std::mutex> lk(g_mx);
     const auto after = std::upper_bound(
@@ -2643,7 +2710,10 @@ extern "C" int prosper_reserved_range_state(uint64_t addr) {
     if (after == g_maps.begin()) return 0;
     const Mapping& mapping = *std::prev(after);
     const bool contains = addr >= mapping.base && addr - mapping.base < mapping.size;
-    return contains ? (mapping.committed ? 2 : 1) : 0;
+    if (!contains) return 0;
+    if (mapping.committed) return 2;
+    return (addr >= g_no_lazy_commit_base.load(std::memory_order_relaxed) &&
+            addr < g_no_lazy_commit_end.load(std::memory_order_relaxed)) ? 3 : 1;
 }
 
 // sceKernelBatchMap(SceKernelBatchMapEntry* entries, int numberOfEntries, int* numberOfEntriesOut)
@@ -3086,10 +3156,15 @@ void register_kernel_mem_hle() {
     //   M-VFI2DJWQA  sceAmprAmmCommandBufferUnmap      (7 call sites in PPSA31334)
     // Unmap is k_amm_cb_map's symmetric operation and its absence LEAKS: the guest believes a range
     // went back to AMM's pool while prosper keeps it mapped and keeps its pages carved out of
-    // amm_pool_take's bump cursor. That is a bounded, NAMED leak (the pool-exhausted refusal above
-    // is what it eventually looks like) rather than a corruption, which is why a boot can proceed
-    // without it — but it is the next thing to implement, and implementing it means giving
-    // amm_pool_take a real free list. Tracked as #2873.
+    // amm_pool_take's bump cursor.
+    //
+    // That is a bounded leak rather than a corruption, and the reason is the bump cursor itself: it
+    // only ever moves forward, and amm_pool_untake rewinds only its own just-taken tail, so a page
+    // carved for a VA the guest later "unmaps" is NEVER reissued to a second VA. The failure mode is
+    // exhaustion, not aliasing, and both ends of it are named in the log — a re-map of a still-mapped
+    // VA is refused as "target is not a free reservation", and the pool running dry is refused as
+    // "AMM's own direct-memory pool is exhausted". Spelled out here (raised in review) so the next
+    // reader does not have to re-derive that the leak cannot alias. Tracked as #2873.
 }
 
 // #1755 test hook: exposes the internal scan clamp so a unit test can prove the walk stays inside

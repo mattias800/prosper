@@ -41,3 +41,14 @@ subsystem. New mapping code goes through those two functions.
 **A "reservation" is a real, tracked object.** `track(..., committed=false, ...)` plus a `PROT_NONE`
 mapping is what makes a range later commitable in place; a bare `mmap(PROT_NONE)` that nobody
 tracked is indistinguishable from somebody else's memory.
+
+**And a tracked reservation is NOT inert — on Linux it is a lazy-commit target.** The SIGSEGV
+handler treats a fault above `0x1000000000` inside one as "the guest touched a page it believes it
+committed" and backs it with a 64 KiB anonymous read/write page. Several titles' allocator bring-up
+depends on that, so it stays the default — but it means a range you reserved to hold a *particular*
+kind of memory will be silently filled with a different kind the moment anything touches an unmapped
+part of it, and the guest cannot tell. Register such a range as declining lazy commit
+(`g_no_lazy_commit_*`, which makes `prosper_reserved_range_state` answer **3** instead of 1) so the
+touch faults where it happened. This is the thing a newcomer gets wrong here, and it was found in
+review rather than by testing, because every symptom of getting it wrong looks like a bug somewhere
+else.

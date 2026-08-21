@@ -27,6 +27,11 @@
 
 using namespace prosper;
 
+// The memory HLE's lazy-commit probe, as the SIGSEGV handler sees it. Declared here rather than
+// pulled from a header because that is how every other caller declares it (exec_image_linux.cpp,
+// hle_file.cpp).
+extern "C" int prosper_reserved_range_state(uint64_t addr);
+
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
                          else       { std::printf("  [ok]   %s\n", m); } } while (0)
@@ -111,6 +116,60 @@ int main() {
           "the window is stable across calls (the guest caches r0 and classifies pointers against it)");
 
     // ---- the physical pool -----------------------------------------------------------------
+    // Two properties of GiveDirectMemory are asserted below, and NEITHER can be observed against a
+    // virgin direct-memory pool — which is how both of them were void in the first version of this
+    // test, and is worth stating because the failure is invisible rather than wrong:
+    //
+    //   * the ALIGNMENT arm. The pool's first-fit gap starts at kDmemBase = 0x10000000, which is
+    //     already 2 MiB aligned, so honouring a 2 MiB alignment and silently falling back to the
+    //     16 KiB granule produce the SAME offset. Fix: hold a 16 KiB allocation so the next gap
+    //     starts at 0x10004000, where the two answers differ.
+    //   * the ZEROING arm further down. prosper's pool is one process-wide memfd that retains bytes
+    //     across release and reuse; in a fresh test process nothing has ever written it, so it reads
+    //     back zero through sparseness whether or not the allocator punches the range. Fix: dirty
+    //     the physical range first, then release it, then let the AMM pool land on it.
+    //
+    // Both were raised in review as same-source positive controls (the charter's instrument trap
+    // 122): a control drawn from the same source as the null it validates tests the discriminator,
+    // never the domain.
+    HleFn alloc_dmem   = Hle::lookup("rTXw65xmLIA");   // sceKernelAllocateDirectMemory
+    HleFn map_dmem     = Hle::lookup("L-Q3LEjIbgA");   // sceKernelMapDirectMemory
+    // NIDs resolved from the PS5 3.20 firmware export database, not guessed — the first draft of
+    // this line carried an invented NID for munmap and would have silently skipped the dirtying
+    // step, leaving the zero arm exactly as void as it was before.
+    HleFn munmap_fn    = Hle::lookup("cQke9UuBQOk");   // sceKernelMunmap
+    HleFn release_dmem = Hle::lookup("MBuItvba6z8");   // sceKernelReleaseDirectMemory
+    CHECK(alloc_dmem && map_dmem && munmap_fn && release_dmem,
+          "the direct-memory NIDs this test builds its preconditions from are registered");
+    if (!(alloc_dmem && map_dmem && munmap_fn && release_dmem)) {
+        std::printf("FAILED\n");
+        return 1;
+    }
+
+    // (1) Hold a 16 KiB block forever, so the pool's first free gap is no longer 2 MiB aligned.
+    uint64_t pin = 0;
+    CHECK(alloc_dmem(0, 16ull << 30, 0x4000, 0x4000, 0, (uint64_t)&pin) == 0,
+          "a 16 KiB direct-memory block can be pinned to unalign the pool's first free gap");
+    CHECK((pin & (0x200000ull - 1)) == 0 && pin != 0,
+          "...and it starts at the pool base, so the gap after it is NOT 2 MiB aligned");
+
+    // (2) Dirty the physical range the AMM pool is about to be carved from, then release it. This
+    // is what makes the zero-read arm below a statement about the allocator rather than about an
+    // untouched file.
+    constexpr uint64_t kDirtyLen = 0x400000ull;       // 4 MiB, spanning the next 2 MiB boundary
+    uint64_t dirty = 0;
+    CHECK(alloc_dmem(0, 16ull << 30, kDirtyLen, 0x4000, 0, (uint64_t)&dirty) == 0,
+          "a scratch direct-memory block can be allocated over the pool's next gap");
+    uint64_t dirty_va = 0;
+    const uint64_t map_rc = map_dmem((uint64_t)&dirty_va, kDirtyLen, /*prot=*/0x3, /*flags=*/0,
+                                     dirty, 0x4000);
+    CHECK(map_rc == 0 && dirty_va != 0, "the scratch block maps");
+    if (map_rc == 0 && dirty_va) {
+        std::memset((void*)(uintptr_t)dirty_va, 0xa5, (size_t)kDirtyLen);
+        munmap_fn(dirty_va, kDirtyLen, 0, 0, 0, 0);
+    }
+    release_dmem(dirty, kDirtyLen, 0, 0, 0, 0);
+
     // Shape taken verbatim from the live call under PROSPER_AMPRLOG:
     //   Q07J7XpvhrU a0=0x0 a1=0x400000000 a2=0x280000000 a3=0x200000 a4=0x1 a5=<out>
     // i.e. (searchStart, searchEnd, len, ALIGNMENT, MEMORY TYPE, off_t* out) — the kernel
@@ -121,12 +180,14 @@ int main() {
           "GiveDirectMemory claims a physical pool");
     CHECK(phys != kPoison && phys != 0,
           "GiveDirectMemory WRITES the physical offset out-parameter");
-    // The alignment argument is honoured, which is the arm that separates the two readings of
-    // a3/a4: with them swapped, a3 = 1 is rejected as an alignment and the carve falls back to the
-    // 16 KiB granule, so a 2 MiB-aligned offset stops being guaranteed. (a4 = 1 as an alignment
-    // would be rejected too, so this cannot pass by accident either way round.)
-    CHECK((phys & (0x200000ull - 1)) == 0,
+    // Now discriminating, thanks to the pin above: the first fit is somewhere in [0x10004000, …),
+    // so an honoured 2 MiB alignment lands on 0x10200000 and a 16 KiB fallback does not. Reading
+    // a3/a4 the other way round rejects a3 = 1 as an alignment and reddens exactly here.
+    CHECK(phys > pin && (phys & (0x200000ull - 1)) == 0,
           "the physical offset honours the 2 MiB alignment the guest asked for in a3");
+    CHECK(phys >= dirty && phys + 0x40000ull <= dirty + kDirtyLen,
+          "...and the pool's first 256 KiB lands inside the range the scratch block dirtied, so "
+          "the zero arm below can actually fail");
 
     // ---- record, submit, wait, and then actually use the memory -----------------------------
     constexpr uint64_t kCb = 0x7f0000030000ull;
@@ -151,14 +212,33 @@ int main() {
     CHECK(amm_wait(slots[0], 0, 0, 0, 0, 0) == 0,
           "WaitCommandBufferCompletion accepts the id the submit handed out");
 
-    // The whole point: the guest can use the page. Fresh direct memory reads back zero on hardware.
+    // The whole point: the guest can use the page. Fresh direct memory reads back zero on hardware,
+    // and this range was filled with 0xa5 and released above, so a pool that skips the punch shows
+    // it here rather than reading zero from an untouched file.
     volatile uint64_t* mapped = (volatile uint64_t*)(uintptr_t)window_base;
-    CHECK(mapped[0] == 0 && mapped[(kMapLen / 8) - 1] == 0,
-          "the mapped range reads back zero across its whole length");
+    bool all_zero = true;
+    for (uint64_t i = 0; i < kMapLen / 8; ++i)
+        if (mapped[i] != 0) { all_zero = false; break; }
+    CHECK(all_zero,
+          "the mapped range reads back zero across its whole length, over physical memory that "
+          "held 0xa5 before it was released");
     mapped[0] = 0x0123456789abcdefull;
     mapped[(kMapLen / 8) - 1] = 0xfedcba9876543210ull;
     CHECK(mapped[0] == 0x0123456789abcdefull && mapped[(kMapLen / 8) - 1] == 0xfedcba9876543210ull,
           "the mapped range is writable and reads back what was written");
+
+    // ---- the window declines lazy commit ------------------------------------------------------
+    // Without this, the window is not inert: exec_image_linux.cpp's SIGSEGV handler backs any touch
+    // of a tracked-but-uncommitted range above 0x1000000000 with a 64 KiB anonymous page, which
+    // would turn every REFUSED map below into a silent substitution the guest cannot detect (it
+    // does not test Map's return value). State 3 is what declines it. Raised in review.
+    CHECK(prosper_reserved_range_state(window_base + kMapLen) == 3,
+          "an unmapped page of the AMM window declines lazy commit, so a refused map faults at the "
+          "guest's own address instead of being backed with anonymous memory");
+    CHECK(prosper_reserved_range_state(window_end - 0x4000) == 3,
+          "...at the far end of the window too");
+    CHECK(prosper_reserved_range_state(window_base) == 2,
+          "...while a page this run actually mapped reads as committed");
 
     // ---- the corruption guard ---------------------------------------------------------------
     // A map whose target is OUTSIDE the window must be refused as a BAD ADDRESS, before any
