@@ -1165,3 +1165,21 @@ For a differential replay, `PROSPER_STENCIL_CLEAR=<0..255>` overrides the initia
 value and `PROSPER_STENCIL_REPLACE=<0..255>` overrides the replacement reference of an
 ALWAYS+REPLACE stencil-prime draw. These are diagnostic controls only; they do not change guest-state
 extraction or the default render path.
+
+## Shared-box hygiene
+
+Several agents and the human run this repo at once, so anything that kills a process is a
+cross-lane operation whether or not you meant it that way.
+
+- **`lanekill.py`** — kill processes matching a name that belong to **your** worktree, and refuse
+  the ones that do not. `pkill`'s two selectors both answer *what* a process is and neither answers
+  *whose* it is: `-f` over-matches substrings and its own shell, `-x` matches accurately and still
+  kills every lane's copy. On 2026-08-21 a `pkill -x screenshot` took a concurrent lane's
+  measurement sweep at 36 of 64 frames (instrument trap 213). Census by default; `--yes` to signal;
+  `--any-tree REASON` to override, loudly. Attribution reuses `worktree_reclaim.py`'s scanner, which
+  matches by inode rather than path string — necessary because `/home` is a symlink on the host and
+  a real bind mount inside the ps5ys distrobox, so the same directory has two spellings.
+- **`worktree_reclaim.py`** — census and removal of stale worktrees, with the same in-use guard.
+
+Both fail closed where `/proc` is unreadable: without it, ownership cannot be established, and
+"I could not tell whose this is" must never render as "it is yours".
