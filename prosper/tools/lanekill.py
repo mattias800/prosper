@@ -18,7 +18,7 @@ ones inside yours.
 
     lanekill.py screenshot            # census; kills nothing
     lanekill.py screenshot --yes      # kill the ones in this worktree
-    lanekill.py screenshot --yes --any-tree   # loud override; needs a stated reason
+    lanekill.py screenshot --yes --any-tree   # loud override; signals other lanes' matches too
 
 Attribution reuses `worktree_reclaim.py`'s process scanner rather than reimplementing it. That
 matters more than code reuse: that scanner matches by (st_dev, st_ino) rather than by path
@@ -126,7 +126,12 @@ def attribute(trees: list[Worktree]) -> tuple[dict[int, Worktree], dict[int, str
         if len(reals) == 1:
             owner[pid] = by_real[next(iter(reals))]
         else:
-            why[pid] = f"cwd and exe disagree across {len(reals)} worktrees"
+            # Name them. "disagree across 2 worktrees" tells the operator there is an ambiguity
+            # but not how to resolve it; naming the trees lets them recognise their own cwd at a
+            # glance and reach for `kill <pid>` themselves. A refusal should be a prompt, not a
+            # wall -- a wall is what trains people to reach for `command pkill` instead.
+            names = ", ".join(sorted(os.path.basename(r.rstrip("/")) or r for r in reals))
+            why[pid] = f"cwd and exe disagree across {len(reals)} worktrees ({names})"
     for pid in weak - set(strong):
         why[pid] = "only an open fd or a mapping points into a worktree, which is not ownership"
     return owner, why

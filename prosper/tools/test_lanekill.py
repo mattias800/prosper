@@ -26,9 +26,12 @@ should not take, so that case is covered by `worktree_reclaim.py`'s live measure
 ino=10784453 reached by both spellings) and not by an arm here. The two arms below are the
 cheap approximations of it; the docstring in the tool carries the real evidence.
 
-Linux only, deliberately, and that is a statement about the tool. Its attribution reads /proc;
-without one it cannot establish ownership and fails closed. The fail-closed path itself is
-covered by an arm that runs everywhere.
+Linux only, deliberately, and that is a statement about the tool: attribution reads /proc.
+
+**The fail-closed arm is Linux-only too, which is a deliberate narrowing.** It used to run
+everywhere by installing a stub and asserting the stub's own return values — which said nothing
+about lanekill and stayed green when a reviewer deleted the gate. It now calls `main()` against a
+live process, which needs a real process, so it cannot run where the rest cannot.
 """
 
 from __future__ import annotations
@@ -155,7 +158,14 @@ def test_fails_closed_without_a_process_scan(root: Path) -> None:
     this repository keeps paying for -- an assertion whose subject was never the code under test.
 
     So: run `main()` for real with the scan forced unsupported, against a process that IS in this
-    worktree and WOULD be signalled if the gate were gone. The survivor is the assertion.
+    worktree and WOULD be signalled if the gate were gone.
+
+    Precisely: **`rc == 2` is the discriminator**, not the survivor. With the scan stubbed the
+    victim cannot be reached whatever the tool does, so its survival is guaranteed by the stub
+    rather than earned by the gate — an earlier version of this docstring said "the survivor is
+    the assertion", which is the same overclaim this file exists to warn about. The live process
+    is here so the arm exercises the real matching path up to the refusal, not because its
+    survival proves anything.
     """
     repo = build_repo(root)
     wt = root / "wt-fc"
@@ -271,6 +281,16 @@ def test_end_to_end_spares_the_other_lane(root: Path) -> None:
         check("census kills nothing (mine alive)", mine.poll(), None)
         check("census kills nothing (theirs alive)", other.poll(), None)
 
+        # A LOOKALIKE IN MY OWN TREE. `lanekill.py:main` matches `comm == pattern`; changing that
+        # to `pattern in comm` reintroduces exactly the `pkill -f` over-match this tool contrasts
+        # itself against, and the ownership filter would NOT save it -- the blast radius is my own
+        # worktree, where everything is fair game. Nothing else in the suite notices.
+        import shutil
+        lookalike_bin = a / "sleepx"
+        shutil.copy("/bin/sleep", str(lookalike_bin))
+        lookalike = subprocess.Popen([str(lookalike_bin), "120"], cwd=str(a))
+        time.sleep(0.4)
+
         run = subprocess.run([sys.executable, str(HERE / "lanekill.py"), "sleep", "--yes"],
                              cwd=str(a), capture_output=True, text=True)
         time.sleep(0.5)
@@ -278,11 +298,76 @@ def test_end_to_end_spares_the_other_lane(root: Path) -> None:
         check("MY process was signalled", mine.poll() is not None, True)
         check("THE OTHER LANE'S process survived", other.poll(), None)
         check("output names the other lane", "ANOTHER LANE" in run.stdout, True)
+        check("a LOOKALIKE name in my own tree is untouched", lookalike.poll(), None)
     finally:
-        for pr in (mine, other):
+        for pr in (mine, other, lookalike):
             if pr.poll() is None:
                 pr.kill()
             pr.wait()
+
+
+def test_nested_worktree_topology(root: Path) -> None:
+    """A worktree INSIDE the main checkout -- which is what `.claude/worktrees/*` actually are.
+
+    Every other arm builds siblings, so `my_worktree()` taking the OUTERMOST match instead of the
+    innermost passed the whole suite. The direct effect of that is over-refusal rather than
+    over-killing, but it is the topology every real invocation runs in and nothing saw it.
+    """
+    repo = build_repo(root)
+    nest = repo / "inner"
+    git(repo, "worktree", "add", "-q", "-b", "inner", str(nest))
+
+    trees = list_worktrees(str(repo))
+    inner = lanekill.my_worktree(trees, str(nest))
+    outer = lanekill.my_worktree(trees, str(repo))
+    check("a nested tree resolves to ITSELF, not the enclosing checkout",
+          inner.real if inner else None, os.path.realpath(str(nest)))
+    check("the enclosing checkout resolves to itself",
+          outer.real if outer else None, os.path.realpath(str(repo)))
+    check("they are different trees", (inner.real != outer.real) if inner and outer else False, True)
+
+
+def test_any_tree_sweeps_undecidable_too(root: Path) -> None:
+    """`--any-tree` must sweep the UNDECIDABLE matches, not only other trees' -- through main().
+
+    My first attempt at this arm rebuilt the sweep from `classify()` output and asserted the
+    reconstruction covered every pid. That passed while `main()` dropped `unattributed` from its
+    target list, because the reconstruction was not the code. Same mistake as the one this whole
+    review was about, one level down: an assertion whose subject is a copy of the logic.
+
+    So this builds a genuinely undecidable process -- binary in one tree, cwd in another, which is
+    the ambiguity `attribute()` refuses -- and drives the real tool twice.
+    """
+    import shutil
+
+    repo = build_repo(root)
+    a, b = root / "wt-a", root / "wt-b"
+    git(repo, "worktree", "add", "-q", "-b", "at-a", str(a))
+    git(repo, "worktree", "add", "-q", "-b", "at-b", str(b))
+
+    binary = b / "psplit"                      # exe lives in wt-b ...
+    shutil.copy("/bin/sleep", str(binary))
+    proc = subprocess.Popen([str(binary), "120"], cwd=str(a))   # ... cwd is wt-a
+    time.sleep(0.4)
+    try:
+        refuse = subprocess.run([sys.executable, str(HERE / "lanekill.py"), "psplit", "--yes"],
+                                cwd=str(a), capture_output=True, text=True)
+        time.sleep(0.3)
+        check("a split cwd/exe process is refused by --yes alone", refuse.returncode, 1)
+        check("and it is still running", proc.poll(), None)
+        check("the refusal names both trees", ("at-a" in refuse.stdout or "wt-a" in refuse.stdout)
+              and ("at-b" in refuse.stdout or "wt-b" in refuse.stdout), True)
+
+        sweep = subprocess.run(
+            [sys.executable, str(HERE / "lanekill.py"), "psplit", "--yes", "--any-tree"],
+            cwd=str(a), capture_output=True, text=True)
+        time.sleep(0.5)
+        check("--any-tree signals the undecidable match", proc.poll() is not None, True)
+        check("--any-tree exits 0 having refused nothing", sweep.returncode, 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
 
 
 def main() -> int:
@@ -297,6 +382,8 @@ def main() -> int:
         test_outside_any_worktree_is_undecidable,
         test_end_to_end_spares_the_other_lane,
         test_fails_closed_without_a_process_scan,
+        test_nested_worktree_topology,
+        test_any_tree_sweeps_undecidable_too,
     ):
         print(f"{fn.__name__}:")
         with tempfile.TemporaryDirectory() as td:
