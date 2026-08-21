@@ -9,7 +9,7 @@
 
 **Every screenshot checked into this repository, most recent first.** Read down from the top and stop when you reach one you have already seen.
 
-**140 images**, most recent **2026-08-21**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
+**141 images**, most recent **2026-08-21**. Captions are the subject line of the commit that added each image, so they say what the change was rather than what the picture is.
 
 This file is generated from git history by [`prosper/tools/docs/gen_screenshot_feed.py`](prosper/tools/docs/gen_screenshot_feed.py) and is regenerated and diffed in CI, so it cannot drift from the tree. [`COMPATIBILITY.md`](COMPATIBILITY.md) remains the per-title overview and [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) the per-title rung table; this is only a reverse-chronological index of the images themselves.
 
@@ -19,6 +19,14 @@ This file is generated from git history by [`prosper/tools/docs/gen_screenshot_f
 > a record of *when* things happened.
 
 ## 2026-08-21
+
+### rtype-delta-stage1-gameplay.png
+
+<p align="center"><img src="assets/screenshots/rtype-delta-stage1-gameplay.png" alt="rtype delta stage1 gameplay"></p>
+
+scripts+docs(rtype-delta): an input route for PPSA26414 that reaches stage 1 — and the regression (#2783) that stops master drawing any of it (#2784)
+
+`6dd608bb` · [`assets/screenshots/rtype-delta-stage1-gameplay.png`](assets/screenshots/rtype-delta-stage1-gameplay.png)
 
 ### sonic-frontiers-cyberspace-hud.png
 

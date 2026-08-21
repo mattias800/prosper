@@ -47,8 +47,8 @@ Last updated: 2026-08-17
 | *The Plucky Squire* | `PPSA15319` | Unreal Engine 4 | 🚧 Title and save/play-style menus | [#1882](https://github.com/mattias800/prosper/issues/1882) |
 | *The Pathless* | `PPSA01826` | Unreal Engine 4 | 🚧 Title screen | [#1883](https://github.com/mattias800/prosper/issues/1883) |
 | *ArcRunner* | `PPSA21406` | Unreal Engine 4 | 🚧 Intro cinematic and title screen; needs one default-off switch, not the throttle | [#1817](https://github.com/mattias800/prosper/issues/1817) |
-| *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 Logo movies, intro cutscene, and title menu | [#1884](https://github.com/mattias800/prosper/issues/1884) |
-| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Title screen and attract mode | [#1810](https://github.com/mattias800/prosper/issues/1810) |
+| *Asterix &amp; Obelix: Babylon Mission* | `PPSA30490` | Unity 6 / IL2CPP | 🚧 `World_3_10` harbour-level gameplay, reached 1 run in 5 | [#1884](https://github.com/mattias800/prosper/issues/1884) |
+| *R-Type Delta: HD Boosted* | `PPSA26414` | Custom | 🚧 Stage 1 gameplay on a scripted route | [#1810](https://github.com/mattias800/prosper/issues/1810) |
 | *Nikoderiko: The Magical World* | `PPSA23760` | Unreal Engine 4 | 🚧 Title screen and EULA | [#1885](https://github.com/mattias800/prosper/issues/1885) |
 | *The Oregon Trail* | `PPSA19244` | Unreal Engine 4 | 🚧 Title screen reached and rendered | [#1886](https://github.com/mattias800/prosper/issues/1886) |
 | *Greak: Memories of Azur* | `PPSA02849` | Unity / IL2CPP | ✅ First-level gameplay | [#1887](https://github.com/mattias800/prosper/issues/1887) |
@@ -68,33 +68,37 @@ Last updated: 2026-08-17
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
 ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-seven of the twenty-one titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
+twelve of the twenty-six titles that reach gameplay are marked 🚧 rather than ✅, and the two 🔬 rows sit
 at two different rungs. Counting markers gives a different — and wrong — answer.
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached** with real GPU draws (rung 3 or better) | 21 |
-| **Title screen or menu** reached, gameplay not yet reached (rung 2) | 17 |
+| **Gameplay reached** with real GPU draws (rung 3 or better) | 26 |
+| **Title screen or menu** reached, gameplay not yet reached (rung 2) | 12 |
 | **Below a title screen** — logo or splash only (rung 1) | 1 |
 | Total tracked | 39 |
 
 "Gameplay reached" is the ladder's rung 3 and says nothing about how complete the rendered scene is.
 It includes *Grand Theft Auto V*, which enters Story Mode with a correct HUD and radar over an absent
-3D world, and *Syberia: Remastered*, whose gameplay composite is degraded.
+3D world, *Sonic Frontiers*, which reaches a running Cyber Space stage whose world is entirely black,
+and *Syberia: Remastered*, whose gameplay composite is degraded. **Three of the 23 therefore reach
+gameplay without a visible world.** That is a deliberate reading of the ladder, not an oversight: rung
+3 asks for gameplay with real GPU draws, and a HUD over a running stage clock is real draws. If the
+project would rather rung 3 require a visible world, all three rows move together.
 
 ### Where the titles accumulate
 
-The 17 titles that stop at a title screen or menu, by the engine recorded in the table:
+The 12 titles that stop at a title screen or menu, by the engine recorded in the table:
 
 | Engine | Titles |
 | --- | --- |
 | Unreal Engine — 8 × UE4, 1 × UE5, 1 unversioned | 10 |
-| Unity / IL2CPP, including Unity 6 | 3 |
-| Hedgehog Engine 2, Custom, Custom (Ancient), ASOBI — one each | 4 |
+| Custom (Ancient), ASOBI — one each | 2 |
 
 **Every Unreal title in the table is in this group.** Ten of the 39 rows are Unreal; all ten reach a
 title screen and none has reached gameplay. The distribution is the mirror image on the other side:
-16 of the 21 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows.
+19 of the 26 titles at gameplay are Unity-family, as are 12 of the 14 ✅ rows — and **no Unity title
+remains below gameplay.** The rung-2 group is now ten Unreal titles plus *Earthion* and *Astro Bot*.
 
 **This is an observation about where titles accumulate, not a claim that the ten Unreal titles share
 one root cause.** A common cause is an untested hypothesis, and the per-title records currently cut
@@ -361,16 +365,22 @@ This is not yet counted as a title screen on a default launch, because it still 
 
 <p align="center"><img src="assets/screenshots/asterix-babylon-intro-cutscene.png" alt="Asterix &amp; Obelix: Babylon Mission — narrated intro cutscene"></p>
 <p align="center"><img src="assets/screenshots/asterix-babylon-title.png" alt="Asterix &amp; Obelix: Babylon Mission — title screen and main menu"></p>
+<p align="center"><img src="assets/screenshots/asterix-babylon-gameplay.png" alt="Asterix &amp; Obelix: Babylon Mission — the World_3_10 harbour level, both character portraits with heart meters, Asterix and Obelix among NPCs with parallax and water"></p>
 
-Both publisher logo movies, the narrated intro cutscene and the title screen with its `ADVENTURE` / `OPTIONS` menu render at native 1920×1080. See the [tracker](https://github.com/mattias800/prosper/issues/1884).
+Both publisher logo movies, the narrated intro cutscene and the title screen with its `ADVENTURE` / `OPTIONS` menu render at native 1920×1080, and the route crosses them into the `World_3_10` harbour level — both character portraits with heart meters, Asterix and Obelix in a composed scene with NPCs, parallax, water and rotating Roman-helmet collectibles, inspected over 43 samples in 430 s with no black or flat frame.
+
+**Gameplay here is demonstrated rather than reproducible**, which is why the row is 🚧: the committed route reaches it **1 run in 5**, and the other four stop on the `SoloCoopMenu` character-select screen while the guest is *observed* receiving 66 Cross presses ([#2743](https://github.com/mattias800/prosper/issues/2743)). The nondeterminism sits below the route, so a rerun is not a fix. See the [tracker](https://github.com/mattias800/prosper/issues/1884).
 
 ## R-Type Delta: HD Boosted — `PPSA26414`
 
 <p align="center"><img src="assets/screenshots/rtype-delta-opening-movie-colour.png" alt="R-Type Delta — the opening movie's R-9 hangar shot in full colour"></p>
 <p align="center"><img src="assets/screenshots/rtype-delta-title.png" alt="R-Type Delta: HD Boosted — title screen"></p>
 <p align="center"><img src="assets/screenshots/rtype-delta-force-select.png" alt="R-Type Delta — attract-mode demonstration, the R-9 and its Force device"></p>
+<p align="center"><img src="assets/screenshots/rtype-delta-stage1-restored.png" alt="R-Type Delta — stage 1 gameplay: the R-9 and its Force device over the sunset cityscape, enemy formations, and the BEAM and score HUD"></p>
 
-The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour, and the run continues into the **title screen** and the attract-mode demonstration. Gameplay has not yet been reached.
+The Clear River Games publisher logo and the full opening movie — the R-9 fighter in its hangar — render live at 1920×1080 from the real GPU command stream, in full colour, and the run continues into the **title screen**, the attract-mode demonstration and **stage 1 gameplay**.
+
+Gameplay needs the scripted route [`prosper/scripts/rtype-delta-PPSA26414/reach-gameplay.pad`](prosper/scripts/rtype-delta-PPSA26414/reach-gameplay.pad): the title screen's prompt is the PS5 **OPTIONS** glyph rather than Cross, so a Cross-only arm never clears it. Player control is distinguished from the attract loop — which plays stage 1 by itself with the pad untouched — by three things a neutral-input control arm never produces: `loadsel_Release.prx`, `loads1_Release.prx` and a `SaveData.dat` write.
 
 Reaching this needs the game's files **evicted from the host page cache** first, which takes one command and no change to how the title is launched:
 
